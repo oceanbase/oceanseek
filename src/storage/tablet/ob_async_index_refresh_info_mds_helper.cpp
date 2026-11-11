@@ -684,6 +684,10 @@ int ObTabletAsyncIndexRefreshInfoMdsHelper::process(const char *buf, const int64
           }
         }
       }
+      if (OB_SUCC(ret)) {
+        // Isolate floor pins to apply a pre-replay barrier without affecting ordinary refreshes.
+        ctx.set_needs_own_log(arg.floor_pin_only_);
+      }
     } else {
       ObTabletAsyncIndexRefreshInfoReplayExecutor replay_executor;
       if (OB_FAIL(replay_executor.init(ctx, scn, arg.info_, arg.floor_pin_only_))) {

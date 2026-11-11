@@ -24,6 +24,8 @@
 #include "storage/tx_storage/ob_ls_service.h"
 #include "storage/tablet/ob_async_index_refresh_info_mds_helper.h"
 #include "storage/tablet/ob_async_index_refresh_info_replay_executor.h"
+#include "storage/tx/ob_trans_part_ctx.h"
+#include "storage/multi_data_source/buffer_ctx.h"
 
 namespace oceanbase
 {
@@ -196,6 +198,85 @@ TEST_F(TestAsyncIndexRefreshInfoMds, add_tenant)
   ASSERT_EQ(OB_SUCCESS, disk_mgr->get_tenant_unit_data_disk_size(
       R.tenant_id_, configured_size, actual_size));
   ASSERT_EQ(OB_SUCCESS, disk_mgr->resize_total_disk_size_(configured_size, resized));
+}
+
+// Check the real registration callback, including the floor-pin no-op branch.
+// The packing UT separately verifies how this context flag becomes a log barrier.
+TEST_F(TestAsyncIndexRefreshInfoMds, registration_marks_only_floor_pins_standalone)
+{
+  common::ObMySQLProxy &sql_proxy = get_curr_simple_server().get_sql_proxy2();
+  int64_t affected_rows = 0;
+  EQ(OB_SUCCESS, sql_proxy.write("drop table if exists t_async_pin_barrier", affected_rows));
+  EQ(OB_SUCCESS, sql_proxy.write("create table t_async_pin_barrier(c1 int)", affected_rows));
+  ObTabletID tablet_id;
+  ObLSID ls_id;
+  EQ(OB_SUCCESS, get_tablet_and_ls("t_async_pin_barrier", tablet_id, ls_id));
+
+  // Commit the ordinary refresh at 200, then abort both pin transactions:
+  // 100 exercises merge/write; 250 exercises skip because 200 already protects it.
+  const int64_t snapshots[] = {200, 100, 250};
+  for (int64_t i = 0; i < 3; ++i) {
+    SCOPED_TRACE(i);
+    ObTabletAsyncIndexRefreshInfoArg arg;
+    arg.ls_id_ = ls_id;
+    arg.tablet_id_ = tablet_id;
+    arg.floor_pin_only_ = (i != 0);
+    arg.info_.set_has_async_index(true);
+    EQ(OB_SUCCESS, arg.info_.append_refresh_snapshot(snapshots[i]));
+    char buf[512];
+    int64_t pos = 0;
+    EQ(OB_SUCCESS, arg.serialize(buf, sizeof(buf), pos));
+    ObMySQLTransaction trans;
+    EQ(OB_SUCCESS, trans.start(GCTX.sql_proxy_, R.tenant_id_));
+    auto *conn = static_cast<observer::ObInnerSQLConnection *>(trans.get_connection());
+    ObRegisterMdsFlag flag;
+    const int register_ret = conn->register_multi_data_source(
+        R.tenant_id_, ls_id, ObTxDataSourceType::ASYNC_INDEX_REFRESH_INFO, buf, pos, flag);
+    if (OB_SUCCESS == register_ret) {
+      auto check_context = [&]() {
+        int ret = OB_SUCCESS;
+        MTL_SWITCH(R.tenant_id_) {
+          ObLSHandle ls_handle;
+          EQ(OB_SUCCESS, MTL(ObLSService *)->get_ls(ls_id, ls_handle, ObLSGetMod::TRANS_MOD));
+          ObLS &ls = *ls_handle.get_ls();
+          ObPartTransCtx *tx_ctx = nullptr;
+          EQ(OB_SUCCESS, ls.get_tx_ctx(conn->get_session().get_tx_id(), false, tx_ctx));
+          struct RevertCtx {
+            ObLS &ls_;
+            ObPartTransCtx *ctx_;
+            ~RevertCtx() { EXPECT_EQ(OB_SUCCESS, ls_.revert_tx_ctx(ctx_)); }
+          } revert{ls, tx_ctx};
+          ASSERT_NE(nullptr, tx_ctx);
+          CtxLockGuard guard(tx_ctx->lock_);
+          int64_t found = 0;
+          auto check_node = [&](const ObTxBufferNode &node) {
+            if (node.get_data_source_type() == ObTxDataSourceType::ASYNC_INDEX_REFRESH_INFO) {
+              ++found;
+              const auto *ctx = node.get_buffer_ctx_node().get_ctx();
+              ASSERT_NE(nullptr, ctx);
+              EXPECT_EQ(arg.floor_pin_only_, ctx->needs_own_log());
+            }
+          };
+          // A background flush may already have moved the node to the durable array.
+          for (auto it = tx_ctx->mds_cache_.mds_list_.begin();
+               it != tx_ctx->mds_cache_.mds_list_.end(); ++it) {
+            check_node(*it);
+          }
+          for (int64_t j = 0; j < tx_ctx->exec_info_.multi_data_source_.count(); ++j) {
+            check_node(tx_ctx->exec_info_.multi_data_source_.at(j));
+          }
+          EXPECT_EQ(1, found);
+        }
+        EQ(OB_SUCCESS, ret);
+      };
+      check_context();
+    }
+    const int end_ret = trans.end(OB_SUCCESS == register_ret && i == 0 && !HasFailure());
+    EQ(OB_SUCCESS, register_ret);
+    EQ(OB_SUCCESS, end_ret);
+    ASSERT_FALSE(HasFailure());
+  }
+  // Keep the tablet for subsequent LS reboot tests; suite teardown cleans it up.
 }
 
 // ---------------------------------------------------------------

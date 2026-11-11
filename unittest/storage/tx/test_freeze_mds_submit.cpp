@@ -194,6 +194,54 @@ TEST_F(TestFreezeMdsSubmit, reloc_final_is_packed_alone_after_freeze_retry)
   EXPECT_EQ(logservice::ObReplayBarrierType::PRE_BARRIER, barrier);
 }
 
+// Exercise the real packing path: ordinary refreshes must not inherit the
+// floor pin's barrier, regardless of which side of the pin they are queued on.
+TEST_F(TestFreezeMdsSubmit, floor_pin_barrier_does_not_affect_ordinary_refresh)
+{
+  storage::mds::MdsCtx contexts[5];
+  // The registration helper marks only the floor pin as standalone.
+  contexts[2].set_needs_own_log(true);
+  auto &cache = ctx_->mds_cache_;
+  for (int i = 0; i < 5; ++i) {
+    ObTxBufferNode node;
+    ASSERT_EQ(OB_SUCCESS, node.init(ObTxDataSourceType::ASYNC_INDEX_REFRESH_INFO,
+        ObString::make_string("refresh"), share::SCN::min_scn(), ObTxSEQ(i + 1, 0), &contexts[i]));
+    ASSERT_EQ(OB_SUCCESS, cache.insert_mds_node(node));
+  }
+
+  const int counts[] = {2, 1, 2};
+  const int first_seq[] = {1, 3, 4};
+  for (int i = 0; i < 3; ++i) {
+    ObTxMultiDataSourceLog log;
+    ObTxMDSRange range;
+    logservice::ObReplayBarrierType barrier;
+    share::SCN base_scn;
+    ASSERT_EQ(OB_SUCCESS, cache.fill_mds_log(ctx_.get(), log, range, barrier, base_scn));
+    ASSERT_EQ(counts[i], log.count());
+    EXPECT_EQ(counts[i], range.count());
+    // Retry before submission, retaining the original node and its context.
+    log.reset();
+    ASSERT_EQ(OB_SUCCESS, cache.fill_mds_log(ctx_.get(), log, range, barrier, base_scn));
+    ASSERT_EQ(counts[i], log.count());
+    EXPECT_EQ(ObTxSEQ(first_seq[i], 0), log.get_data().at(0).get_seq_no());
+    EXPECT_EQ(i == 1 ? logservice::ObReplayBarrierType::PRE_BARRIER
+                     : logservice::ObReplayBarrierType::NO_NEED_BARRIER, barrier);
+
+    ObTxLogBlock block;
+    block.get_header().init(1, DATA_VERSION_4_6_3_1, 1, ObTransID(1),
+        ObAddr(ObAddr::IPV4, "127.0.0.1", 2882));
+    ASSERT_EQ(OB_SUCCESS, block.init_for_fill(ObTxAdaptiveLogBuf::MIN_LOG_BUF_SIZE));
+    ASSERT_EQ(OB_SUCCESS, block.add_new_log(log));
+    ASSERT_EQ(OB_SUCCESS, block.seal(1, barrier));
+    logservice::ObLogBaseHeader header;
+    int64_t pos = 0;
+    ASSERT_EQ(OB_SUCCESS, header.deserialize(block.get_buf(), block.get_size(), pos));
+    EXPECT_EQ(i == 1, header.need_pre_replay_barrier());
+    EXPECT_FALSE(header.need_post_replay_barrier());
+    ASSERT_EQ(OB_SUCCESS, range.range_submitted(cache));
+  }
+}
+
 TEST_F(TestFreezeMdsSubmit, blocked_active_does_not_hide_old_memtable_work)
 {
   block_ordinary_redo();

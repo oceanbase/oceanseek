@@ -328,6 +328,9 @@ int ObTxMDSCache::fill_mds_log(ObPartTransCtx *ctx,
         if (data_source_type == ObTxDataSourceType::LS_MDS_TABLET_RELOC_BATCH && needs_own_log) {
           // A V2 final may wait on another LS. Stop submitting later logs on this LS until it succeeds.
           tmp_barrier_type = logservice::ObReplayBarrierType::STRICT_BARRIER;
+        } else if (data_source_type == ObTxDataSourceType::ASYNC_INDEX_REFRESH_INFO && needs_own_log) {
+          // Replay merges the pin with the preceding committed MDS value.
+          tmp_barrier_type = logservice::ObReplayBarrierType::PRE_BARRIER;
         }
         if (!mds_base_scn.is_valid() && tmp_base_scn.is_valid()) {
           mds_base_scn = tmp_base_scn;
