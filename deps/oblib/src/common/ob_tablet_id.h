@@ -94,7 +94,7 @@ public:
   
   bool with_uncommit_sstable() const
   {
-    return !is_ls_inner_tablet() || is_ls_mds_tablet();
+    return !is_ls_tx_data_tablet() && !is_ls_tx_ctx_tablet() && !is_ls_lock_tablet();
   }
 
   bool is_valid_with_tenant(const uint64_t tenant_id) const
