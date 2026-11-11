@@ -1859,7 +1859,8 @@ int check_will_be_having_domain_index_operation(
       const bool is_oracle_mode,
       const share::schema::ObTableSchema &table_schema,
       common::ObIAllocator &allocator,
-      share::schema::ObColumnSchemaV2 &alter_column_schema);
+      share::schema::ObColumnSchemaV2 &alter_column_schema,
+      const share::schema::ObColumnSchemaV2 *orig_column_schema = nullptr);
   int resolve_orig_default_value(share::schema::ObColumnSchemaV2 &column_schema,
                                  const common::ObTimeZoneInfoWrap &tz_info_wrap,
                                  const common::ObString *nls_formats,

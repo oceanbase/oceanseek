@@ -4327,7 +4327,8 @@ int ObDDLService::check_alter_table_column(obrpc::ObAlterTableArg &alter_table_a
                                             is_oracle_mode,
                                             orig_table_schema,
                                             allocator,
-                                            *alter_column_schema))) {
+                                            *alter_column_schema,
+                                            orig_column_schema))) {
             LOG_WARN("failed to fill column collation", K(ret));
          } else if (OB_FAIL(check_alter_column_is_offline(
               orig_table_schema, schema_guard, *orig_column_schema, *alter_column_schema, is_offline))) {
@@ -9878,7 +9879,8 @@ int ObDDLService::fill_column_collation(
     const bool is_oracle_mode,
     const ObTableSchema &table_schema,
     common::ObIAllocator &allocator,
-    ObColumnSchemaV2 &column_schema)
+    ObColumnSchemaV2 &column_schema,
+    const ObColumnSchemaV2 *orig_column_schema)
 {
   int ret = OB_SUCCESS;
   ObObjTypeClass col_tc = column_schema.get_data_type_class();
@@ -9926,8 +9928,16 @@ int ObDDLService::fill_column_collation(
     ret = OB_ER_INVALID_USE_OF_NULL;
     LOG_WARN("alter table add geometry column can not has not null constraint", K(ret));
   } else if (ObCollectionSQLTC == col_tc && !column_schema.is_nullable()) {
-    ret = OB_ER_INVALID_USE_OF_NULL;
-    LOG_WARN("alter table add collectionsql column can not has not null constraint", K(ret));
+    // Renaming an existing NOT NULL collection does not require filling default values.
+    bool is_same_type = false;
+    if (OB_NOT_NULL(orig_column_schema) && !orig_column_schema->is_nullable()
+        && OB_FAIL(ObTableSchema::check_is_exactly_same_type(
+            *orig_column_schema, column_schema, is_same_type))) {
+      LOG_WARN("failed to check collection column type", K(ret));
+    } else if (!is_same_type) {
+      ret = OB_ER_INVALID_USE_OF_NULL;
+      LOG_WARN("alter table add collectionsql column can not has not null constraint", K(ret));
+    }
   }
   return ret;
 }
