@@ -13,6 +13,8 @@
 #include "lib/json_type/ob_json_parse.h"
 #include "lib/json_type/ob_json_base.h"
 #include "lib/json_type/ob_json_bin.h"
+#include "lib/udt/ob_array_binary.h"
+#include "lib/udt/ob_collection_type.h"
 #include "storage/lob/ob_lob_manager.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
 #undef private
@@ -81,6 +83,61 @@ TEST_F(TestSearchIndexEncoder, test_char_column_and_query_value_encoding)
       ASSERT_EQ(0, MEMCMP(column_value.ptr(), query_value.ptr(), column_value.length()));
       // A CHAR column is encodable, but a CHAR query input is not.
       ASSERT_EQ(OB_NOT_SUPPORTED, Encoder::encode_value(allocator, datum, column_meta, query_value));
+    }
+  }
+}
+
+TEST_F(TestSearchIndexEncoder, test_array_string_encoding)
+{
+  const ObCollationType collations[] = {
+      CS_TYPE_UTF8MB4_GENERAL_CI, CS_TYPE_UTF8MB4_BIN, CS_TYPE_BINARY,
+      CS_TYPE_GBK_CHINESE_CI, CS_TYPE_UTF16_GENERAL_CI, CS_TYPE_UTF16LE_BIN};
+  const ObString inputs[] = {
+      ObString(""), ObString("a"), ObString("A"), ObString("a "), ObString("a  "),
+      ObString("e"), ObString("\xc3\xa9"), ObString("\xe4\xb8\xad"), ObString(" "), ObString("  "),
+      ObString(1, "\0"), ObString(2, "\0\0"), ObString(2, "a\0"),
+      ObString(3, "a\0\0"), ObString(3, "a\0b")};
+  for (const ObCollationType collation : collations) {
+    SCOPED_TRACE(static_cast<int>(collation));
+    ObArenaAllocator allocator(ObModIds::TEST);
+    ObSqlCollectionInfo type_info(allocator);
+    type_info.set_name(ObString("ARRAY(VARCHAR(32))"));
+    ASSERT_EQ(OB_SUCCESS, type_info.parse_type_info());
+    auto *arr_type = static_cast<ObCollectionArrayType *>(type_info.collection_meta_);
+    auto *elem_type = static_cast<ObCollectionBasicType *>(arr_type->element_type_);
+    elem_type->basic_meta_.set_collation_type(collation);
+    ObIArrayType *arr_obj = nullptr;
+    ASSERT_EQ(OB_SUCCESS, ObArrayTypeObjFactory::construct(allocator, *arr_type, arr_obj));
+    auto *arr = static_cast<ObArrayBinary *>(arr_obj);
+    ASSERT_EQ(OB_SUCCESS, arr->push_null());
+    ObString values[ARRAYSIZEOF(inputs)];
+    for (int64_t i = 0; i < ARRAYSIZEOF(inputs); ++i) {
+      ASSERT_EQ(OB_SUCCESS, ObCharset::charset_convert(allocator, inputs[i], CS_TYPE_UTF8MB4_BIN,
+                                                       collation, values[i]));
+      ASSERT_EQ(OB_SUCCESS, arr->push_back(values[i]));
+      ASSERT_EQ(OB_SUCCESS, arr->push_back(values[i]));
+    }
+    ASSERT_EQ(OB_SUCCESS, arr->init());
+
+    ObObjMeta array_meta;
+    array_meta.set_type(ObCollectionSQLType);
+    ObSearchIndexRowGenerator::Generator generator(allocator, allocator);
+    ASSERT_EQ(OB_SUCCESS, generator.init(0, array_meta, arr_type));
+    ObSearchIndexRows rows;
+    ASSERT_EQ(OB_SUCCESS, generator.generate_rows_for_array_obj(42, arr, rows));
+    ASSERT_EQ(ARRAYSIZEOF(inputs) + 1, rows.count());
+    ASSERT_TRUE(rows.at(0).value_.is_null());
+
+    for (int64_t i = 0; i < ARRAYSIZEOF(inputs); ++i) {
+      for (int64_t j = 0; j < ARRAYSIZEOF(inputs); ++j) {
+        int cmp = 0;
+        ASSERT_EQ(OB_SUCCESS, arr->compare_at(i * 2 + 1, 1, j * 2 + 1, 1, *arr, cmp));
+        const int encoded_cmp = rows.at(i + 1).value_.get_string().compare(
+            rows.at(j + 1).value_.get_string());
+        EXPECT_EQ(cmp < 0, encoded_cmp < 0);
+        EXPECT_EQ(cmp == 0, encoded_cmp == 0);
+        EXPECT_EQ(cmp > 0, encoded_cmp > 0);
+      }
     }
   }
 }

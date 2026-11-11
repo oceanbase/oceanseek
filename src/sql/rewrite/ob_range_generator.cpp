@@ -2858,6 +2858,10 @@ int ObRangeGenerator::generate_tmp_search_index_domain_param(const ObRangeNode &
           if (OB_FAIL(arr_obj->elem_at(i, elem_obj))) {
             LOG_WARN("failed to get array element", K(ret), K(i));
           } else {
+            // ARRAY strings compare raw bytes; preserve that ordering when encoding query ranges.
+            if (elem_obj.is_varchar() || elem_obj.is_text()) {
+              elem_obj.set_collation_type(CS_TYPE_BINARY);
+            }
             objs_ptr[i] = elem_obj;
             if (OB_FAIL(tmp_in_param->in_param_.push_back(&objs_ptr[i]))) {
               LOG_WARN("failed to push back array element", K(ret));

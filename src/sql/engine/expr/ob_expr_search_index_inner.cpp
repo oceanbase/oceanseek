@@ -283,18 +283,24 @@ int ObExprSearchIndexInnerValue::calc_search_index_inner_value(const ObExpr &exp
   } else {
     ObEvalCtx::TempAllocGuard alloc_guard(ctx);
     ObString value;
-    // Check if cmp_type_datum is null - if null, use existing implementation
-    if (cmp_type_datum->is_null()) {
+    // A null comparison type selects scalar encoding; collection selects array-element
+    // encoding. In particular, array strings use byte comparison rather than collation.
+    const bool is_array = !cmp_type_datum->is_null()
+        && cmp_type_datum->get_int() == ObCollectionSQLType;
+    if (cmp_type_datum->is_null() || is_array) {
       ObIAllocator &calc_alloc = alloc_guard.get_allocator();
+      ObObjMeta obj_meta = expr.args_[0]->obj_meta_;
+      if (is_array && (obj_meta.is_varchar() || obj_meta.is_text())) {
+        obj_meta.set_collation_type(CS_TYPE_BINARY);
+      }
       if (OB_FAIL(ObSearchIndexValueEncoder::encode_value(calc_alloc,
                                                           *param_datum,
-                                                          expr.args_[0]->obj_meta_,
+                                                          obj_meta,
                                                           value))) {
         LOG_WARN("fail to calc search index value from obj", K(ret));
       }
     } else {
-      // When cmp_type_datum is not null (indicating JSON type)
-      // Convert param to JSON and use JSON encoding
+      // Convert JSON comparison parameters to JSON and use JSON encoding.
       uint64_t tenant_id = ObMultiModeExprHelper::get_tenant_id(ctx.exec_ctx_.get_my_session());
       MultimodeAlloctor tmp_allocator(alloc_guard.get_allocator(), expr.type_, tenant_id, ret);
       ObIJsonBase *j_base = NULL;

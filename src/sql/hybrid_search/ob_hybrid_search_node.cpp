@@ -3486,6 +3486,9 @@ int ObHybridSearchGenerator::split_array_contains_all(const ObDSLScalarQuery *sc
           LOG_WARN("failed to construct array obj", K(ret));
         } else if (OB_FAIL(arr_obj->init(data_str))) {
           LOG_WARN("failed to init array obj", K(ret));
+        } else if (arr_obj->size() == 0) {
+          // No scalar predicates to split. Keep the original filter so that
+          // empty candidates still match non-NULL arrays, including empty arrays.
         } else if (need_array_string_constraint &&
             OB_FAIL(ObSearchIndexConstraint::is_array_string_length_match(arr_obj, can_extract))) {
           LOG_WARN("failed to check array string length", K(ret));
