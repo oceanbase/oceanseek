@@ -451,7 +451,28 @@ int ObMPQuery::process_single_stmt(const ObMultiStmtItem &multi_stmt_item,
 {
   int ret = OB_SUCCESS;
   const bool enable_mem_perf = session.is_user_session() && session.get_optimizer_tracer().enable_mem_perf();
-  if (!enable_mem_perf) {
+  const uint64_t effective_tenant_id = session.get_effective_tenant_id();
+  // CHANGE TENANT updates the session and connection, but the remaining statements
+  // in one request still run on the original worker. Switch MTL for the entire
+  // statement, including local retries and cleanup.
+  MAKE_TENANT_SWITCH_SCOPE_GUARD(tenant_guard);
+  if (MTL_ID() != effective_tenant_id) {
+    // Sys-login sessions can switch between unrelated tenants.
+    const bool need_check_allow = OB_SYS_TENANT_ID != session.get_login_tenant_id();
+    if (OB_FAIL(tenant_guard.switch_to(effective_tenant_id, need_check_allow))) {
+      LOG_WARN("failed to switch tenant before processing statement", K(ret),
+               K(effective_tenant_id), "mtl_tenant_id", MTL_ID());
+    } else if (MTL_ID() != effective_tenant_id) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("statement tenant does not match MTL tenant", K(ret),
+               K(effective_tenant_id), "mtl_tenant_id", MTL_ID());
+    }
+  }
+  if (OB_FAIL(ret)) {
+    if (is_conn_valid() && !multi_stmt_item.is_batched_multi_stmt()) {
+      send_error_packet(ret, NULL);
+    }
+  } else if (!enable_mem_perf) {
     ret = do_process_single_stmt(multi_stmt_item,
                                  conn,
                                  session,
