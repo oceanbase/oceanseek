@@ -79,7 +79,12 @@ void ObOrcOutputStream::write(const void *buf, size_t length)
 /* ObArrowMemPool */
 void ObArrowMemPool::init(uint64_t tenant_id)
 {
-  mem_attr_ = ObMemAttr(tenant_id, "ArrowMemPool");
+  init(ObMemAttr(tenant_id, "ArrowMemPool"));
+}
+
+void ObArrowMemPool::init(const ObMemAttr &mem_attr)
+{
+  mem_attr_ = mem_attr;
 }
 
 arrow::Status ObArrowMemPool::Allocate(int64_t size, int64_t alignment, uint8_t** out)

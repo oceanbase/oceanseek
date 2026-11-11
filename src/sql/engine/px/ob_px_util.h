@@ -213,8 +213,8 @@ public:
                                                    ObExecContext &exec_ctx,
                                                    ObDfo &parent);
   static int find_reference_child(ObDfo &parent, ObDfo *&reference_child);
-  static int find_function_table_server_list(const ObOpSpec &op,
-                                             common::ObIArray<common::ObAddr> &server_list);
+  static int find_arrow_stream_server_list(const ObOpSpec &op,
+                                           common::ObIArray<common::ObAddr> &server_list);
   static int add_pdml_merge_gindex_locations(const ObTableModifySpec &dml_op,
                                              ObExecContext &ctx,
                                              ObDfo &dfo);

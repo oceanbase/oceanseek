@@ -6,10 +6,60 @@
 #define USING_LOG_PREFIX SQL_OPT
 #include "ob_log_select_into.h"
 #include "ob_log_table_scan.h"
+#include "ob_optimizer_util.h"
 
 using namespace oceanbase::sql;
 using namespace oceanbase::common;
 using namespace oceanbase::sql::log_op_def;
+
+int ObLogSelectInto::set_input_ordering(const ObLogicalOperator &input)
+{
+  int ret = OB_SUCCESS;
+  input_ordering_column_idxs_.reset();
+  input_ordering_directions_.reset();
+  const ObIArray<OrderItem> &input_ordering = input.get_op_ordering();
+  const EqualSets &input_equal_sets = input.get_output_equal_sets();
+  for (int64_t i = 0; OB_SUCC(ret) && i < input_ordering.count(); ++i) {
+    const OrderItem &order_item = input_ordering.at(i);
+    int64_t select_expr_idx = OB_INVALID_INDEX_INT64;
+    // Ordering is described by expressions, while Result Catalog metadata is
+    // described by result columns. Match the final child's order expression
+    // against this SELECT INTO's select_exprs_; the matched select-expression
+    // index is the result-column index used by the Parquet schema.
+    if (OB_ISNULL(order_item.expr_)
+        || order_item.order_type_ < NULLS_FIRST_ASC
+        || order_item.order_type_ >= UNORDERED
+        || !ObOptimizerUtil::find_equal_expr(select_exprs_,
+                                              order_item.expr_,
+                                              input_equal_sets,
+                                              select_expr_idx)) {
+      // Only an ordering prefix represented by the result schema can be
+      // advertised. Once a leading key is absent, later keys do not
+      // independently describe a sorted result.
+      break;
+    } else {
+      bool duplicate = false;
+      for (int64_t j = 0; !duplicate && j < input_ordering_column_idxs_.count(); ++j) {
+        duplicate = input_ordering_column_idxs_.at(j) == select_expr_idx;
+      }
+      if (duplicate) {
+        // Repeating an already-recorded key does not strengthen the ordering
+        // contract exposed by the result schema.
+      } else if (OB_FAIL(input_ordering_column_idxs_.push_back(select_expr_idx))) {
+        LOG_WARN("failed to save async result ordering column", K(ret), K(i), K(select_expr_idx));
+      } else if (OB_FAIL(input_ordering_directions_.push_back(
+                     static_cast<int64_t>(order_item.order_type_)))) {
+        LOG_WARN("failed to save async result ordering direction", K(ret), K(i),
+                 K(order_item.order_type_));
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+    input_ordering_column_idxs_.reset();
+    input_ordering_directions_.reset();
+  }
+  return ret;
+}
 
 int ObLogSelectInto::est_cost()
 {

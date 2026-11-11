@@ -316,6 +316,7 @@
 #include "ob_expr_xml_forest.h"
 #include "ob_expr_generator_func.h"
 #include "ob_expr_arrow_stream.h"
+#include "ob_expr_result_scan.h"
 #include "ob_expr_random.h"
 #include "ob_expr_randstr.h"
 #include "ob_expr_startup_mode.h"
@@ -1524,9 +1525,9 @@ ObExprRandCanonical::calc_random_expr_canonical,                    /* 890 */
   NULL, // ObExprVecIVFBase::eval_vec_ivf_cid,                        /* 924 */
   NULL, // ObExprVecIVFBase::eval_vec_ivf_data,                       /* 925 */
   ObExprDslMultiValueRange::eval_dsl_multi_value_range,               /* 926 */
-  NULL, // ObExprExternalLob::eval_external_lob,                       /* 927 */
-  NULL, // ObExprLobMeta::eval_lob_meta,                               /* 928 */
-  NULL, // ObExprResultScan::eval_result_scan,                         /* 929 */
+  NULL, // ObExprExternalLob::eval_external_lob,                      /* 927 */
+  NULL, // ObExprLobMeta::eval_lob_meta,                              /* 928 */
+  ObExprResultScan::eval_result_scan,                                 /* 929 */
   ObExprAIDecide::eval_ai_decide,                                     /* 930 */
   NULL, // ObExprDslParamValue::eval_value,                            /* 931 */
 };

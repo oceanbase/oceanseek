@@ -201,6 +201,8 @@ public:
 private:
   int flush_ncomp_dll_job();
   int create_logic_table_namespace_stats_job();
+  int ensure_async_query_result_database();
+  int ensure_async_result_cleanup_job();
   int finish_upgrade_for_add_sys_priv();
   int replace_unit_group_id_with_unit_list_();
 };

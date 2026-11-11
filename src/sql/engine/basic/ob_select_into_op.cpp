@@ -17,6 +17,8 @@
 #include <memory>
 
 #include "ob_select_into_op.h"
+#include "sql/result_catalog/ob_async_result_metadata.h"
+#include "sql/result_catalog/ob_async_result_parquet_writer.h"
 #include "sql/ob_sql_utils.h"
 #include "sql/engine/cmd/ob_variable_set_executor.h"
 #include "lib/alloc/alloc_assist.h"
@@ -402,11 +404,81 @@ int ObSelectIntoOp::init_odps_jni_tunnel()
 int ObSelectIntoOp::init_parquet_env()
 {
   int ret = OB_SUCCESS;
-  arrow_alloc_.init(MTL_ID());
-  if (OB_FAIL(setup_parquet_schema())) {
+  if (is_async_result_parquet_sink()) {
+    arrow_alloc_.init(ObMemAttr(MTL_ID(), "ResultArrow"));
+  } else {
+    arrow_alloc_.init(MTL_ID());
+  }
+  if (is_async_result_parquet_sink()) {
+    if (OB_FAIL(setup_async_result_arrow_schema())) {
+      LOG_WARN("failed to set up async result arrow schema", K(ret));
+    }
+  } else if (OB_FAIL(setup_parquet_schema())) {
     LOG_WARN("failed to set up parquet schema", K(ret));
   } else if (OB_FAIL(init_env_common())) {
     LOG_WARN("failed to init env common", K(ret));
+  }
+  if (OB_SUCC(ret) && is_async_result_parquet_sink() && OB_FAIL(init_env_common())) {
+    LOG_WARN("failed to init async result parquet env common", K(ret));
+  }
+  return ret;
+}
+
+bool ObSelectIntoOp::is_async_result_parquet_sink() const
+{
+  return MY_SPEC.async_result_target_.enabled_
+         && ObExternalFileFormat::FormatType::PARQUET_FORMAT == format_type_;
+}
+
+int ObSelectIntoOp::get_async_result_writer_identity(int64_t &sqc_id,
+                                                     int64_t &task_id)
+{
+  int ret = OB_SUCCESS;
+  const ObSelectIntoOpInput *input = static_cast<const ObSelectIntoOpInput *>(input_);
+  sqc_id = 0;
+  task_id = 0;
+  if (OB_UNLIKELY(!is_async_result_parquet_sink() || OB_ISNULL(input))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid async result writer input", K(ret), KP(input));
+  } else if (OB_NOT_NULL(ctx_.get_sqc_handler())) {
+    sqc_id = input->get_sqc_id();
+    task_id = input->get_task_id();
+    if (OB_UNLIKELY(sqc_id < 0 || task_id < 0)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid async result PX writer identity", K(ret), K(sqc_id), K(task_id));
+    }
+  }
+  return ret;
+}
+
+int ObSelectIntoOp::resolve_async_result_internal_uri()
+{
+  int ret = OB_SUCCESS;
+  ObSqlString relative_path;
+  if (OB_UNLIKELY(!is_async_result_parquet_sink())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("internal uri is only valid for the async result parquet sink", K(ret),
+             K(MY_SPEC.async_result_target_.enabled_), K(format_type_));
+  } else if (OB_FAIL(ObAsyncResultStorageUtils::build_result_data_relative_path(
+                         MY_SPEC.async_result_target_.tenant_id_,
+                         MY_SPEC.async_result_target_.job_id_,
+                         relative_path))) {
+    LOG_WARN("failed to build async result data path", KR(ret),
+             K(MY_SPEC.async_result_target_.tenant_id_),
+             K(MY_SPEC.async_result_target_.job_id_));
+  } else if (OB_FAIL(ObAsyncResultStorageUtils::resolve_internal_path(
+                         ctx_.get_allocator(),
+                         relative_path.string(),
+                         async_result_storage_dest_,
+                         basic_url_))) {
+    if (OB_NOT_SUPPORTED == ret) {
+      LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                     "using external async result store without shared storage mode is");
+    }
+    LOG_WARN("failed to resolve async result internal path", K(ret), K(relative_path));
+  } else if (OB_SUCC(ret)) {
+    access_info_ = async_result_storage_dest_.get_storage_info();
+    file_location_ = IntoFileLocation::REMOTE_S3;
   }
   return ret;
 }
@@ -486,7 +558,24 @@ int ObSelectIntoOp::calc_url_and_set_access_info()
   int ret = OB_SUCCESS;
   const ObItemType into_type = MY_SPEC.into_type_;
   ObString path = file_name_.get_varchar().trim();
-  if (path.prefix_match_ci(OB_S3_PREFIX)
+  const ObString internal_uri = ObAsyncResultStorageUtils::get_internal_uri();
+  bool is_async_result_internal_uri = false;
+  if (MY_SPEC.async_result_target_.enabled_
+      && ObExternalFileFormat::FormatType::PARQUET_FORMAT != format_type_) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "async result parquet sink requires PARQUET format");
+    LOG_WARN("async result parquet sink requires PARQUET format", K(ret), K(format_type_));
+  } else if (MY_SPEC.async_result_target_.enabled_) {
+    if (OB_FAIL(resolve_async_result_internal_uri())) {
+      LOG_WARN("failed to resolve async result internal uri", K(ret));
+    } else {
+      is_async_result_internal_uri = true;
+    }
+  } else if (path.prefix_match(internal_uri)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "internal async result URI");
+    LOG_WARN("internal async result uri is reserved for async query jobs", K(ret), K(path));
+  } else if (path.prefix_match_ci(OB_S3_PREFIX)
              || path.prefix_match(OB_S3A_PREFIX)
              || path.prefix_match(OB_S3N_PREFIX)) {
     file_location_ = IntoFileLocation::REMOTE_S3;
@@ -522,9 +611,17 @@ int ObSelectIntoOp::calc_url_and_set_access_info()
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("not support partition option on server disk", K(ret));
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "partition option on server disk");
-  } else if (T_INTO_OUTFILE == into_type && !MY_SPEC.is_single_ && OB_FAIL(calc_first_file_path(path))) {
+  } else if (is_async_result_internal_uri
+             && T_INTO_OUTFILE == into_type
+             && !MY_SPEC.is_single_
+             && OB_FAIL(calc_first_file_path(basic_url_))) {
+    LOG_WARN("failed to calc first async result internal file path", K(ret));
+  } else if (!is_async_result_internal_uri
+             && T_INTO_OUTFILE == into_type
+             && !MY_SPEC.is_single_
+             && OB_FAIL(calc_first_file_path(path))) {
     LOG_WARN("failed to calc first file path", K(ret));
-  } else if (file_location_ != IntoFileLocation::SERVER_DISK) {
+  } else if (!is_async_result_internal_uri && file_location_ != IntoFileLocation::SERVER_DISK) {
     const char *storage_ptr = path.reverse_find('?');
     ObString storage_info;
     access_info_ = (file_location_ == IntoFileLocation::REMOTE_HDFS)
@@ -573,7 +670,7 @@ int ObSelectIntoOp::calc_url_and_set_access_info()
       ret = OB_FILE_NOT_EXIST;
       LOG_WARN("file path not exist", K(ret), K(basic_url_), KP(access_info_));
     }
-  } else { // IntoFileLocation::SERVER_DISK
+  } else if (!is_async_result_internal_uri) { // IntoFileLocation::SERVER_DISK
     if (OB_FAIL(ob_write_string(ctx_.get_allocator(), path, basic_url_, true))) {
       LOG_WARN("failed to write string", K(ret));
     }
@@ -736,7 +833,11 @@ int ObSelectIntoOp::inner_get_next_batch(const int64_t max_row_cnt)
               LOG_WARN("csv into outfile batch failed", K(ret));
             }
           } else if (ObExternalFileFormat::FormatType::PARQUET_FORMAT == format_type_) {
-            if (OB_FAIL(into_outfile_batch_parquet(brs_, data_writer))) {
+            if (is_async_result_parquet_sink()) {
+              if (OB_FAIL(into_async_result_batch_parquet(brs_, data_writer))) {
+                LOG_WARN("async result parquet batch failed", K(ret));
+              }
+            } else if (OB_FAIL(into_outfile_batch_parquet(brs_, data_writer))) {
               LOG_WARN("parquet into outfile batch failed", K(ret));
             }
           } else if (ObExternalFileFormat::FormatType::ORC_FORMAT == format_type_) {
@@ -838,8 +939,32 @@ int ObSelectIntoOp::inner_close()
     if (OB_FAIL(data_writer_->close_data_writer(need_retry))) {
       LOG_WARN("failed to close data writer", K(ret));
     }
-    // insert into iceberg table not support partition now
-    if (OB_SUCC(ret) && share::is_iceberg_lake_table(MY_SPEC.lake_table_format_)) {
+    // Result files are task-owned objects. The coordinator sees their
+    // descriptors only after the task has closed each Parquet footer.
+    if (OB_SUCC(ret) && !need_retry && is_async_result_parquet_sink()) {
+      const ObIArray<ObAsyncResultFileDesc> &files =
+          static_cast<ObAsyncResultParquetWriter *>(data_writer_)->get_files();
+      if (files.empty()) {
+        // A zero-row result has no data file.
+      } else if (ctx_.get_sqc_handler() != NULL) {
+        ObSqcCtx &sqc_ctx = ctx_.get_sqc_handler()->get_sqc_ctx();
+        ObLockGuard<ObSpinLock> lock_guard(sqc_ctx.async_result_file_lock_);
+        for (int64_t i = 0; OB_SUCC(ret) && i < files.count(); ++i) {
+          if (OB_FAIL(sqc_ctx.async_result_files_.push_back(files.at(i)))) {
+            LOG_WARN("failed to retain async result file in SQC", K(ret), K(i));
+          }
+        }
+      } else {
+        ObPhysicalPlanCtx *phy_plan_ctx = ctx_.get_physical_plan_ctx();
+        if (OB_ISNULL(phy_plan_ctx)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("physical plan context is null", K(ret));
+        } else if (OB_FAIL(phy_plan_ctx->add_async_result_files(files))) {
+          LOG_WARN("failed to retain local async result files", K(ret));
+        }
+      }
+    } else if (OB_SUCC(ret)
+               && share::is_iceberg_lake_table(MY_SPEC.lake_table_format_)) {
       const ObIcebergDataGenerator& iceberg_data_generator =
                             static_cast<ObBatchFileWriter*>(data_writer_)->get_datafile_generator();
       if (iceberg_data_generator.get_data_files().empty()) {
@@ -974,7 +1099,17 @@ int ObSelectIntoOp::calc_first_file_path(ObString &path)
       } else {
         OZ(file_name_with_suffix.append_fmt("%.*s", input_file_name.length(), input_file_name.ptr()));
       }
-      if (MY_SPEC.parallel_ > 1) {
+      if (is_async_result_parquet_sink()) {
+        int64_t writer_sqc_id = 0;
+        int64_t writer_task_id = 0;
+        if (OB_FAIL(get_async_result_writer_identity(writer_sqc_id, writer_task_id))) {
+          LOG_WARN("failed to get async result writer identity", K(ret));
+        } else if (OB_NOT_NULL(ctx_.get_sqc_handler())) {
+          OZ(file_name_with_suffix.append_fmt("_%ld_%ld_0", writer_sqc_id, writer_task_id));
+        } else {
+          OZ(file_name_with_suffix.append("_0"));
+        }
+      } else if (MY_SPEC.parallel_ > 1) {
         OZ(file_name_with_suffix.append_fmt("_%ld_%ld_0", input->sqc_id_, input->task_id_));
       } else {
         OZ(file_name_with_suffix.append("_0"));
@@ -4306,6 +4441,64 @@ int ObSelectIntoOp::setup_parquet_schema()
   return ret;
 }
 
+int ObSelectIntoOp::setup_async_result_arrow_schema()
+{
+  int ret = OB_SUCCESS;
+  {
+    ObMallocHookAttrGuard guard(ObMemAttr(MTL_ID(), "ResultPlan"));
+    async_result_arrow_schema_.reset();
+  }
+  if (OB_FAIL(ObAsyncResultArrowCodec::build_write_plan(
+          ctx_,
+          MY_SPEC.select_exprs_,
+          MY_SPEC.alias_names_.strs_,
+          MY_SPEC.field_ids_,
+          async_result_arrow_write_plan_))) {
+    LOG_WARN("failed to build async result Arrow write plan", K(ret));
+  } else if (OB_ISNULL(async_result_arrow_schema_ =
+                 async_result_arrow_write_plan_.get_schema())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("async result Arrow write plan has no schema", K(ret));
+  }
+  return ret;
+}
+
+int ObSelectIntoOp::into_async_result_batch_parquet(const ObBatchRows &brs,
+                                                     ObExternalFileWriter *data_writer)
+{
+  int ret = OB_SUCCESS;
+  ObAsyncResultParquetWriter *async_writer = NULL;
+  std::shared_ptr<arrow::RecordBatch> record_batch;
+  if (!is_async_result_parquet_sink()
+      || OB_ISNULL(async_writer = static_cast<ObAsyncResultParquetWriter*>(data_writer))
+      || OB_ISNULL(async_result_arrow_schema_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid async result parquet sink", K(ret), KP(data_writer),
+             KP(async_result_arrow_schema_.get()));
+  } else if (OB_FAIL(async_result_arrow_write_plan_.build_batch(
+                 eval_ctx_, brs, &arrow_alloc_, record_batch))) {
+    LOG_WARN("failed to encode async result Arrow record batch", K(ret));
+  } else if (OB_ISNULL(record_batch)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("async result Arrow record batch is null", K(ret));
+  } else if (record_batch->num_rows() > 0
+             && async_writer->is_file_writer_null()
+             && OB_FAIL(async_writer->open_arrow_file_writer(
+                    arrow_alloc_,
+                    MY_SPEC.async_result_target_.parquet_row_group_rows_,
+                    external_properties_.parquet_format_.compress_type_index_))) {
+    LOG_WARN("failed to open async result parquet writer", K(ret));
+  } else if (record_batch->num_rows() > 0
+             && OB_FAIL(async_writer->write_record_batch(*record_batch))) {
+    LOG_WARN("failed to write async result record batch", K(ret));
+  } else if (record_batch->num_rows() > 0
+             && file_need_split(async_writer->get_file_size())
+             && OB_FAIL(split_file(*async_writer))) {
+    LOG_WARN("failed to split async result parquet file", K(ret));
+  }
+  return ret;
+}
+
 int ObSelectIntoOp::into_outfile_batch_parquet(const ObBatchRows &brs, ObExternalFileWriter *data_writer)
 {
   int ret = OB_SUCCESS;
@@ -5429,9 +5622,25 @@ int ObSelectIntoOp::new_data_writer(ObExternalFileWriter *&data_writer)
     }
     case ObExternalFileFormat::FormatType::PARQUET_FORMAT:
     {
-      if (OB_ISNULL(data_writer = OB_NEWx(ObParquetFileWriter, &ctx_.get_allocator(),
-                                          access_info_, file_location_, parquet_writer_schema_,
-                                          MY_SPEC.lake_table_format_))) {
+      if (is_async_result_parquet_sink()) {
+        int64_t writer_sqc_id = 0;
+        int64_t writer_task_id = 0;
+        if (OB_FAIL(get_async_result_writer_identity(writer_sqc_id, writer_task_id))) {
+          LOG_WARN("failed to get async result writer identity", K(ret));
+        } else if (OB_ISNULL(data_writer = OB_NEWx(ObAsyncResultParquetWriter,
+                                                  &ctx_.get_allocator(),
+                                                  access_info_,
+                                                  file_location_,
+                                                  async_result_arrow_schema_,
+                                                  writer_sqc_id,
+                                                  writer_task_id))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("failed to allocate async result parquet data writer",
+                   K(ret), K(sizeof(ObAsyncResultParquetWriter)));
+        }
+      } else if (OB_ISNULL(data_writer = OB_NEWx(ObParquetFileWriter, &ctx_.get_allocator(),
+                                                  access_info_, file_location_, parquet_writer_schema_,
+                                                  MY_SPEC.lake_table_format_))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
         LOG_WARN("failed to allocate parquet data writer", K(ret), K(sizeof(ObParquetFileWriter)));
       }
@@ -5603,6 +5812,11 @@ void ObSelectIntoOp::destroy()
   {
     ObMallocHookAttrGuard guard(ObMemAttr(MTL_ID(), "IntoOrc"));
     orc_schema_.reset();
+  }
+  {
+    ObMallocHookAttrGuard guard(ObMemAttr(MTL_ID(), "ResultPlan"));
+    async_result_arrow_schema_.reset();
+    async_result_arrow_write_plan_.reset();
   }
   external_properties_.~ObExternalFileFormat();
   partition_map_.destroy();

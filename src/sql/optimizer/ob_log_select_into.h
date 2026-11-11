@@ -43,6 +43,11 @@ public:
         external_partition_(),
         alias_names_(plan.get_allocator()),
         field_ids_(plan.get_allocator()),
+        async_result_(false),
+        async_result_tenant_id_(common::OB_INVALID_TENANT_ID),
+        async_result_job_id_(common::OB_INVALID_ID),
+        input_ordering_column_idxs_(plan.get_allocator()),
+        input_ordering_directions_(plan.get_allocator()),
         lake_table_metadata_(NULL)
   {
   }
@@ -218,6 +223,26 @@ public:
   {
     return field_ids_;
   }
+  inline void set_async_result_identity(const bool async_result,
+                                        const uint64_t tenant_id,
+                                        const uint64_t job_id)
+  {
+    async_result_ = async_result;
+    async_result_tenant_id_ = tenant_id;
+    async_result_job_id_ = job_id;
+  }
+  inline bool is_async_result() const { return async_result_; }
+  inline uint64_t get_async_result_tenant_id() const { return async_result_tenant_id_; }
+  inline uint64_t get_async_result_job_id() const { return async_result_job_id_; }
+  int set_input_ordering(const ObLogicalOperator &input);
+  const common::ObIArray<int64_t> &get_input_ordering_column_idxs() const
+  {
+    return input_ordering_column_idxs_;
+  }
+  const common::ObIArray<int64_t> &get_input_ordering_directions() const
+  {
+    return input_ordering_directions_;
+  }
   inline const share::ObILakeTableMetadata* get_lake_table_metadata() const
   {
     return lake_table_metadata_;
@@ -250,6 +275,13 @@ private:
   common::ObString external_partition_;
   ObSqlArray<common::ObString> alias_names_;
   ObSqlArray<uint64_t> field_ids_;
+  bool async_result_;
+  uint64_t async_result_tenant_id_;
+  uint64_t async_result_job_id_;
+  // Result Catalog only: output-column positions and directions copied from
+  // the finalized child's input ordering after all exchanges are allocated.
+  ObSqlArray<int64_t> input_ordering_column_idxs_;
+  ObSqlArray<int64_t> input_ordering_directions_;
   const share::ObILakeTableMetadata *lake_table_metadata_;
 };
 }

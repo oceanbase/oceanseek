@@ -337,6 +337,16 @@ ob_set_subtarget(ob_sql engine_basic
   engine/basic/ob_hybrid_fusion_op.cpp
 )
 
+ob_set_subtarget(ob_sql result_catalog
+  result_catalog/ob_async_result_arrow_codec.cpp
+  result_catalog/ob_async_result_granule_splitter.cpp
+  result_catalog/ob_async_result_metadata.cpp
+  result_catalog/ob_async_result_parquet_table_row_iter.cpp
+  result_catalog/ob_async_result_parquet_writer.cpp
+  result_catalog/ob_result_file_pruner.cpp
+  result_catalog/ob_result_scan_catalog.cpp
+)
+
 if(OB_BUILD_OBSERVER_FLIGHT_SQL)
   ob_set_subtarget(ob_sql arrow_converter
     engine/basic/arrow_converter/ob_arrow_batch_converter.cpp
@@ -866,6 +876,7 @@ ob_set_subtarget(ob_sql engine_expr
   engine/expr/ob_expr_substr.cpp
   engine/expr/ob_expr_generator_func.cpp
   engine/expr/ob_expr_arrow_stream.cpp
+  engine/expr/ob_expr_result_scan.cpp
   engine/expr/ob_expr_zipf.cpp
   engine/expr/ob_expr_uniform.cpp
   engine/expr/ob_expr_normal.cpp

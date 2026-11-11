@@ -16,6 +16,7 @@ namespace oceanbase
 namespace sql
 {
 class ObExecEnv;
+class ObFreeSessionCtx;
 }
 namespace dbms_scheduler
 {
@@ -54,4 +55,3 @@ private:
 }
 }
 #endif /* SRC_OBSERVER_DBMS_SCHED_JOB_EXECUTOR_H_ */
-

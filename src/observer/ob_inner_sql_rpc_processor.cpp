@@ -429,6 +429,7 @@ int ObInnerSqlRpcP::process()
       }
     }
     if (OB_NOT_NULL(conn)) {
+      conn->set_async_select_query(false);
       bool need_reuse_conn = true;
       const bool is_start_trans = ObInnerSQLTransmitArg::OPERATION_TYPE_START_TRANSACTION
                                     == transmit_arg.get_operation_type();
@@ -468,6 +469,7 @@ int ObInnerSqlRpcP::set_session_param_to_conn(
     LOG_WARN("conn is null", K(ret));
   } else {
     conn->set_is_load_data_exec(transmit_arg.get_is_load_data_exec());
+    conn->set_async_select_query(transmit_arg.get_async_select_query());
     conn->set_nls_formats(transmit_arg.get_nls_formats());
     const bool need_update_lower_case_table_names = transmit_arg.get_name_case_mode() != OB_NAME_CASE_INVALID;
     const bool need_enable_index_direct_select = transmit_arg.get_select_index_enabled();
@@ -516,4 +518,3 @@ int ObInnerSqlRpcP::process_inner_tablet_write(
 
 }
 } // namespace oceanbase
-

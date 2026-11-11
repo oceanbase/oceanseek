@@ -605,8 +605,13 @@ Timestamp{whitespace}?\"[^\"]*\" {
 }
 
 {identifer} {
-  int32_t token = mysql_sql_reserved_keyword_lookup(yytext);
-  if (token < 0) {
+  int32_t token = -1;
+  if (0 == strcasecmp(yytext, "with")) {
+    // Keep WITH visible to the PL grammar so SUBMIT JOB can distinguish its
+    // option clause from the SQL statement that follows it.  sql_stmt_prefix
+    // still accepts WITH for ordinary CTE statements.
+    token = WITH;
+  } else if ((token = mysql_sql_reserved_keyword_lookup(yytext)) < 0) {
     const NonReservedKeyword *word = NULL;
     if (NULL == (word = mysql_pl_non_reserved_keyword_lookup(yytext)))
     {

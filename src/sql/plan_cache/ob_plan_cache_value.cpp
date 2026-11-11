@@ -501,7 +501,8 @@ int ObPlanCacheValue::choose_plan(ObPlanCacheCtx &pc_ctx,
   if (OB_ISNULL(session = pc_ctx.exec_ctx_.get_my_session())) {
     ret = OB_ERR_UNEXPECTED;
     SQL_PC_LOG(ERROR, "got session is NULL", K(ret));
-  } else if (OB_UNLIKELY(force_miss_match_)) {
+  } else if (OB_UNLIKELY(force_miss_match_ || session->is_async_result_parquet())) {
+    // Plan tracing may probe cache even when ob_enable_plan_cache is off.
     ret = OB_OLD_SCHEMA_VERSION;
   } else if (FALSE_IT(orig_rich_format_status = session->get_force_rich_format_status())) {
   } else if (FALSE_IT(session->set_stmt_type(stmt_type_))) {
@@ -2667,7 +2668,12 @@ int ObPlanCacheValue::check_need_force_miss_match(const ObPlanCacheCtx &pc_ctx,
   int ret = OB_SUCCESS;
   const ObQueryCtx *query_ctx = NULL;
   force_miss_match_ = false;
-  if (ObPlanCache::is_contains_external_object(plan.get_dependency_table())) {
+  if (OB_NOT_NULL(pc_ctx.sql_ctx_.session_info_)
+      && pc_ctx.sql_ctx_.session_info_->is_async_result_parquet()) {
+    // The generated OUTFILE plan contains a job-specific result destination.
+    // Keep it unmatchable even if plan tracing adds it for comparison.
+    force_miss_match_ = true;
+  } else if (ObPlanCache::is_contains_external_object(plan.get_dependency_table())) {
     force_miss_match_ = true;
   } else if (OB_ISNULL(pc_ctx.sql_ctx_.cur_stmt_)
              || OB_ISNULL(query_ctx = pc_ctx.sql_ctx_.cur_stmt_->get_query_ctx())) {
@@ -2675,6 +2681,7 @@ int ObPlanCacheValue::check_need_force_miss_match(const ObPlanCacheCtx &pc_ctx,
     LOG_DEBUG("failed to get query ctx", K(ret), K(pc_ctx.sql_ctx_.cur_stmt_), K(query_ctx));
   } else if ((query_ctx->is_mview_refresh_sql()
               && OB_USE_PLAN_CACHE_INVALID == query_ctx->get_global_hint().plan_cache_policy_)
+             || query_ctx->has_result_scan_table()
              || (pc_ctx.sql_ctx_.cur_stmt_->is_dml_stmt()
                  && static_cast<const ObDMLStmt *>(pc_ctx.sql_ctx_.cur_stmt_)
                         ->has_arrow_stream_function_table())) {

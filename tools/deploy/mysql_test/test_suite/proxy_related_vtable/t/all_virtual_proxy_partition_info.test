@@ -135,4 +135,10 @@ connection default;
 drop table if exists proxy_list_hash;
 --enable_warnings
 
+--disable_query_log
+--disable_warnings
+drop table if exists proxy_constrain_part_pruning_t, default_value_t, default_value_null_t;
+--enable_warnings
+--enable_query_log
+
 disconnect obsys;

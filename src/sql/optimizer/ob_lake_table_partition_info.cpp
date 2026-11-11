@@ -23,6 +23,8 @@
 #include "sql/optimizer/file_prune/ob_ext_file_pruner.h"
 #include "sql/optimizer/file_prune/ob_hive_file_pruner.h"
 #include "sql/optimizer/file_prune/ob_lake_table_optimizer_utils.h"
+#include "sql/result_catalog/ob_async_result_metadata.h"
+#include "sql/result_catalog/ob_result_scan_catalog.h"
 #include "sql/optimizer/ob_optimizer_context.h"
 #include "sql/table_format/common/utils/ob_lake_table_executor.h"
 #include "sql/table_format/iceberg/ob_iceberg_table_metadata.h"
@@ -550,26 +552,68 @@ int ObLakeTablePartitionInfo::prune_file_and_select_location(ObSqlSchemaGuard &s
                                                              const uint64_t ref_table_id,
                                                              int64_t lake_table_snapshot_id,
                                                              const ObIArray<ObRawExpr*> &filter_exprs,
-                                                             int64_t estimated_parallel)
+                                                             int64_t estimated_parallel,
+                                                             const bool enable_result_scan_ordered_read)
 {
   int ret = OB_SUCCESS;
+  const TableItem *table_item = stmt.get_table_item_by_id(table_id);
+  const bool is_result_catalog = OB_NOT_NULL(table_item)
+      && OB_NOT_NULL(table_item->ext_table_def_)
+      && share::is_result_catalog_table(table_item->ext_table_def_->lake_table_format_);
   ObILakeTableMetadata *lake_table_metadata = nullptr;
-  // ODPS has no lake metadata; it materializes catalog metadata into the OB
-  // schema, so dispatch before the metadata fetch below.
-  // lake_table_format_ is not serialized, derive it from the schema.
   const ObTableSchema *table_schema = nullptr;
   share::ObLakeTableFormat lake_table_format = share::ObLakeTableFormat::INVALID;
-  if (OB_FAIL(sql_schema_guard.get_table_schema(ref_table_id, table_schema))) {
+  if (OB_ISNULL(table_item)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("lake table item is null", KR(ret), K(table_id), K(ref_table_id));
+  } else if (is_result_catalog) {
+    ObArray<ObHiveFileDesc> result_files(
+        OB_MALLOC_NORMAL_BLOCK_SIZE, ModulePageAllocator(allocator_));
+    ObILakeTableFilePruner *result_file_pruner = nullptr;
+    if (OB_FAIL(ObResultScanCatalog::prepare_lake_scan(
+            table_item->catalog_table_metadata_,
+            allocator_,
+            table_id,
+            ref_table_id,
+            result_files,
+            result_file_pruner))) {
+      LOG_WARN("failed to prepare Result Catalog lake scan", KR(ret), K(table_id),
+               K(ref_table_id));
+    } else {
+      const ObResultCatalogTableMetadata *result_metadata =
+          static_cast<const ObResultCatalogTableMetadata *>(table_item->catalog_table_metadata_);
+      const bool writer_ordered = enable_result_scan_ordered_read
+          && result_metadata->get_result_table_metadata().has_writer_file_ordering();
+      // ObHiveFileDesc / ObHiveScanTask are generic path-based task carriers.
+      // RESULT selects its private decoder from lake_table_format_.
+      if (writer_ordered) {
+        ret = select_location_for_ordered_result(exec_ctx, result_files);
+      } else {
+        ret = select_location_for_hive(exec_ctx, result_files);
+      }
+      if (OB_FAIL(ret)) {
+        LOG_WARN("failed to select Result Catalog file locations", KR(ret), K(writer_ordered));
+      } else {
+        candi_table_loc_.set_table_location_key(result_file_pruner->get_table_id(),
+                                                result_file_pruner->get_ref_table_id());
+        file_pruner_ = result_file_pruner;
+        LOG_TRACE("planned Result Catalog manifest through lake table path",
+                 K(table_id), K(ref_table_id), K(writer_ordered),
+                 "selected_file_count", result_files.count(),
+                 "candidate_location_count",
+                 candi_table_loc_.get_phy_part_loc_info_list().count());
+      }
+    }
+  } else if (OB_FAIL(sql_schema_guard.get_table_schema(ref_table_id, table_schema))) {
     LOG_WARN("failed to get table schema", K(ret), K(ref_table_id));
   } else if (OB_ISNULL(table_schema)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get null table schema", K(ret), K(ref_table_id));
-  } else if (OB_NOT_NULL(table_schema)
-             && OB_FAIL(ObSQLUtils::derive_lake_table_format(table_schema, lake_table_format))) {
+  } else if (OB_FAIL(ObSQLUtils::derive_lake_table_format(table_schema, lake_table_format))) {
     LOG_WARN("failed to derive lake table format", K(ret), K(ref_table_id));
-  }
-  if (OB_FAIL(ret)) {
   } else if (share::is_odps_lake_table(lake_table_format)) {
+    // ODPS materializes catalog metadata into the OB schema, so dispatch
+    // before fetching lake metadata.
     // ODPS lake branch: identical call chain to hive — prune -> sample filter
     // -> optimizer-time split fetch -> placement.
     ObODPSFilePruner *odps_file_pruner = NULL;
@@ -1204,6 +1248,82 @@ int ObLakeTablePartitionInfo::select_location_for_hive(ObExecContext *exec_ctx,
   return ret;
 }
 
+int ObLakeTablePartitionInfo::select_location_for_ordered_result(
+    ObExecContext *exec_ctx,
+    ObIArray<ObHiveFileDesc> &file_descs)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<ObAddr, 16> all_servers;
+  ObCandiTabletLocIArray &tablet_locs =
+      candi_table_loc_.get_phy_part_loc_info_list_for_update();
+  tablet_locs.reset();
+  ObDefaultLoadBalancer load_balancer;
+  if (OB_ISNULL(exec_ctx) || OB_ISNULL(exec_ctx->get_my_session())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("Result Catalog placement has no session", K(ret));
+  } else if (OB_FAIL(GCTX.location_service_->external_table_get(
+                 exec_ctx->get_my_session()->get_effective_tenant_id(), all_servers))) {
+    LOG_WARN("failed to get Result Catalog external table locations", K(ret));
+  } else if (OB_FAIL(load_balancer.add_server_list(all_servers))) {
+    LOG_WARN("failed to initialize Result Catalog load balancer", K(ret));
+  } else if (file_descs.empty()) {
+    // The empty result still needs a typed dummy scan task.
+    ObCandiTabletLoc *tablet_loc = tablet_locs.alloc_place_holder();
+    if (OB_ISNULL(tablet_loc)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate empty Result Catalog location", K(ret));
+    } else if (OB_FAIL(init_tablet_loc_by_addr(*tablet_loc, GCTX.self_addr(), 0))) {
+      LOG_WARN("failed to initialize empty Result Catalog location", K(ret));
+    }
+  } else {
+    int64_t partition_count = 0;
+    int64_t current_partition_id = -1;
+    for (int64_t i = 0; OB_SUCC(ret) && i < file_descs.count(); ++i) {
+      const ObHiveFileDesc &file = file_descs.at(i);
+      if (OB_UNLIKELY(file.part_id_ < 0
+                      || (current_partition_id >= 0
+                          && file.part_id_ < current_partition_id))) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("ordered Result Catalog files are not in partition order",
+                 K(ret), K(i), K(file.part_id_), K(current_partition_id));
+      } else if (file.part_id_ != current_partition_id) {
+        ++partition_count;
+        current_partition_id = file.part_id_;
+      }
+    }
+    // ObCandiTabletLoc is constructed with its allocator. Its ObSqlArray
+    // cannot grow after the first location has been constructed.
+    if (OB_SUCC(ret) && OB_FAIL(tablet_locs.reserve(partition_count))) {
+      LOG_WARN("failed to reserve ordered Result Catalog locations",
+               K(ret), K(partition_count));
+    }
+    current_partition_id = -1;
+    ObCandiTabletLoc *tablet_loc = nullptr;
+    for (int64_t i = 0; OB_SUCC(ret) && i < file_descs.count(); ++i) {
+      ObHiveFileDesc &file = file_descs.at(i);
+      if (file.part_id_ != current_partition_id) {
+        ObAddr addr;
+        if (OB_FAIL(load_balancer.select_server(file.file_path_, addr))) {
+          LOG_WARN("failed to place ordered Result Catalog writer", K(ret), K(i));
+        } else if (OB_ISNULL(tablet_loc = tablet_locs.alloc_place_holder())) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("failed to allocate ordered Result Catalog location", K(ret), K(i));
+        } else if (OB_FAIL(init_tablet_loc_by_addr(
+                       *tablet_loc, addr, static_cast<uint64_t>(file.part_id_) + 1))) {
+          LOG_WARN("failed to initialize ordered Result Catalog location",
+                   K(ret), K(i), K(file.part_id_));
+        } else {
+          current_partition_id = file.part_id_;
+        }
+      }
+      if (OB_SUCC(ret) && OB_FAIL(add_table_file_for_hive(*tablet_loc, file))) {
+        LOG_WARN("failed to append ordered Result Catalog file", K(ret), K(i));
+      }
+    }
+  }
+  return ret;
+}
+
 int ObLakeTablePartitionInfo::select_location_for_odps(ObExecContext *exec_ctx,
                                                        ObIArray<ObOptOdpsFile *> &odps_files,
                                                        ObIArray<int64_t> &slot_idxs)
@@ -1440,6 +1560,8 @@ int ObLakeTablePartitionInfo::add_table_file_for_hive(ObCandiTabletLoc &tablet_l
     hive_file->part_id_ = file_desc.part_id_;
     hive_file->file_size_ = file_desc.file_size_;
     hive_file->modification_time_ = file_desc.modify_ts_;
+    hive_file->first_lineno_ = file_desc.first_lineno_;
+    hive_file->last_lineno_ = file_desc.last_lineno_;
   }
   return ret;
 }

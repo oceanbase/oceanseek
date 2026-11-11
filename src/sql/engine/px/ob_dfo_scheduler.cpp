@@ -1432,19 +1432,18 @@ int ObParallelDfoScheduler::schedule_pair(ObExecContext &exec_ctx,
             LOG_WARN("fail alloc addr by data distribution", K(parent), K(child), K(ret));
           }
         } else {
-          // If the DFO contains a distributed function table (e.g. arrow_streams
-          // with server_cnt>1), allocate by its server list so each PX worker
-          // lands on a distinct node that owns a local ingest stream.
+          // If the DFO contains distributed arrow_streams, allocate by its
+          // server list so each PX worker lands on a node that owns an input stream.
           // Otherwise fall back to random distribution as before.
-          ObSEArray<ObAddr, 4> ft_servers;
+          ObSEArray<ObAddr, 4> arrow_stream_servers;
           const ObOpSpec *root_op = parent.get_root_op_spec();
-          if (OB_NOT_NULL(root_op) && OB_FAIL(ObPXServerAddrUtil::find_function_table_server_list(
-                  *root_op, ft_servers))) {
-            LOG_WARN("failed to find function table server list", K(ret), K(parent));
-          } else if (ft_servers.count() > 1) {
+          if (OB_NOT_NULL(root_op) && OB_FAIL(ObPXServerAddrUtil::find_arrow_stream_server_list(
+                  *root_op, arrow_stream_servers))) {
+            LOG_WARN("failed to find arrow stream server list", K(ret), K(parent));
+          } else if (arrow_stream_servers.count() > 1) {
             if (OB_FAIL(ObPXServerAddrUtil::alloc_by_data_distribution(
                     coord_info_.pruning_table_location_, exec_ctx, parent))) {
-              LOG_WARN("fail alloc by ft server list distribution", K(parent), K(ret));
+              LOG_WARN("fail alloc by arrow stream server list distribution", K(parent), K(ret));
             }
           } else if (OB_FAIL(ObPXServerAddrUtil::alloc_by_random_distribution(
                                  exec_ctx, child, parent, px_node_pool_))) {

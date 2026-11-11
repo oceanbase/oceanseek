@@ -2988,6 +2988,7 @@ public:
   int8_t get_min_const_integer_precision() const;
   bool get_extend_sql_plan_monitor_metrics() const;
   bool get_rowsets_enabled() const;
+  int64_t get_async_result_parquet_row_group_rows() const;
   int64_t get_hybrid_search_primary_get_ratio_default() const;
 };
 

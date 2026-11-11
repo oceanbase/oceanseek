@@ -393,11 +393,15 @@ public:
         sqc_fuse_row_cache_hit_(0),
         sqc_network_wait_time_(0),
         sqc_iceberg_data_files_(),
-        sqc_async_result_files_() {}
+        sqc_async_result_files_()
+  {
+    sqc_async_result_files_.set_attr(common::ObMemAttr(MTL_ID(), "ResultFiles"));
+  }
   virtual ~ObPxFinishSqcResultMsg() = default;
   const transaction::ObTxExecResult &get_trans_result() const { return trans_result_; }
   transaction::ObTxExecResult &get_trans_result() { return trans_result_; }
   int set_sqc_iceberg_data_files(const ObSqcCtx &sqc_ctx);
+  int set_sqc_async_result_files(const ObSqcCtx &sqc_ctx);
   void reset()
   {
     dfo_id_ = common::OB_INVALID_ID;

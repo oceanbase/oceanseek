@@ -147,6 +147,8 @@ public:
   const ObSessionDDLInfo &get_ddl_info() const { return ddl_info_; }
   ObSQLMode get_sql_mode() const { return sql_mode_; }
   bool get_is_load_data_exec() const { return is_load_data_exec_; }
+  void set_async_select_query(const bool v) { is_async_select_query_ = v; }
+  bool get_async_select_query() const { return is_async_select_query_; }
   const ObString *get_nls_formats() const { return nls_formats_; }
   bool get_use_external_session() const { return use_external_session_; }
   const ObNameCaseMode &get_name_case_mode() const { return name_case_mode_; }
@@ -170,7 +172,8 @@ public:
                K_(nls_formats),
                K_(use_external_session),
                K_(consumer_group_id),
-               K_(name_case_mode));
+               K_(name_case_mode),
+               K_(is_async_select_query));
 
 private:
   common::ObAddr ctrl_svr_;
@@ -193,7 +196,7 @@ private:
   uint64_t consumer_group_id_;
   ObNameCaseMode name_case_mode_;
   bool select_index_enabled_;
-  bool is_async_select_query_; // Serialization placeholder for async queries.
+  bool is_async_select_query_;
 };
 
 class ObInnerSQLTransmitResult

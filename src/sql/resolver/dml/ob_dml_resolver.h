@@ -992,6 +992,8 @@ private:
                                                       common::ObIArray<ColumnItem> &col_items);
   int resolve_function_table_column_item_arrow_streams(const TableItem &table_item,
                                                        common::ObIArray<ColumnItem> &col_items);
+  int resolve_function_table_column_item_result_scan(const TableItem &table_item,
+                                                      common::ObIArray<ColumnItem> &col_items);
   int add_column_ref_to_set(ObRawExpr *&expr, ObIArray<TableItem*> *table_list);
   int check_table_exist_or_not(int64_t tenant_id,
                                uint64_t catalog_id,

@@ -429,7 +429,7 @@ END_P SET_VAR DELIMITER
 %type <node> date_unit date_params timestamp_params
 %type <node> drop_table_stmt table_list drop_view_stmt table_or_tables
 %type <node> explain_stmt explainable_stmt format_name kill_stmt help_stmt create_outline_stmt alter_outline_stmt drop_outline_stmt opt_outline_target
-%type <node> expr_list expr expr_const conf_const simple_expr simple_expr_list expr_or_default bit_expr bool_pri predicate explain_or_desc pl_expr_stmt
+%type <node> expr_list expr expr_const conf_const simple_expr simple_expr_list expr_or_default bit_expr bool_pri predicate explain_or_desc desc_or_describe result_scan_table_expression pl_expr_stmt
 %type <node> column_ref multi_delete_table
 %type <node> case_expr func_expr in_expr sub_query_flag search_expr
 %type <node> case_arg when_clause_list when_clause case_default
@@ -534,7 +534,7 @@ END_P SET_VAR DELIMITER
 %type <node> lock_tables_stmt unlock_tables_stmt lock_type lock_table_list lock_table opt_local lock_mode
 %type <node> flashback_stmt purge_stmt opt_flashback_rename_table opt_flashback_rename_database opt_flashback_rename_tenant
 %type <node> tenant_name_list opt_tenant_list tenant_list_tuple cache_type flush_scope opt_zone_list backup_id_list delete_backup_all_type
-%type <node> into_opt into_clause field_opt field_term field_term_list line_opt line_term line_term_list into_var_list into_var file_partition_opt file_opt file_option_list file_option file_size_const binary_format
+%type <node> into_opt into_clause field_opt field_term field_term_list line_opt line_term line_term_list into_var_list into_var file_partition_opt file_opt file_option_list file_option file_size_const opt_into_outfile_hint global_hint_list_with_end opt_global_hint_list global_hint_options binary_format
 %type <node> string_list text_string string_val_list ulong_num
 %type <node> balance_task_type opt_balance_task_type balance_job_op
 %type <node> merge_update_clause merge_insert_clause opt_merge_update_delete
@@ -12877,6 +12877,18 @@ select_no_parens opt_when
 {
   $$ = $1;
 }
+| with_select into_clause
+{
+  $$ = $1;
+  if ($2 != NULL) {
+    if ($$->children_[PARSE_SELECT_INTO] != NULL) {
+      yyerror(&@2, result, "");
+      YYERROR;
+    } else {
+      $$->children_[PARSE_SELECT_INTO_EXTRA] = $2;
+    }
+  }
+}
 ;
 
 // for select_into
@@ -13355,16 +13367,16 @@ LIMIT limit_expr OFFSET limit_expr
 ;
 
 into_clause:
-INTO OUTFILE load_export_location_expr file_partition_opt opt_charset field_opt line_opt file_opt
+INTO OUTFILE load_export_location_expr file_partition_opt opt_charset field_opt line_opt file_opt opt_into_outfile_hint
 {
-  malloc_non_terminal_node($$, result->malloc_pool_, T_INTO_OUTFILE, 6, $3, $4, $5, $6, $7, $8);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_INTO_OUTFILE, 7, $3, $4, $5, $6, $7, $8, $9);
 }
-| INTO OUTFILE load_export_location_expr file_partition_opt FORMAT opt_equal_mark '(' external_file_format_list ')' file_opt
+| INTO OUTFILE load_export_location_expr file_partition_opt FORMAT opt_equal_mark '(' external_file_format_list ')' file_opt opt_into_outfile_hint
 {
   (void)($6);
   ParseNode *format_list = NULL;
   merge_nodes(format_list, result, T_EXTERNAL_FILE_FORMAT, $8);
-  malloc_non_terminal_node($$, result->malloc_pool_, T_INTO_OUTFILE, 4, $3, $4, format_list, $10);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_INTO_OUTFILE, 5, $3, $4, format_list, $10, $11);
 }
 | INTO DUMPFILE STRING_VALUE
 {
@@ -13387,6 +13399,57 @@ into_opt:
 | into_clause
 {
   $$ = $1;
+}
+;
+
+// The trailing HINT clause is intentionally limited to global hints.  The
+// scheduler uses it for a generated SELECT INTO without changing the source
+// SELECT (which may begin with a WITH clause).
+opt_into_outfile_hint:
+/* EMPTY */
+{
+  $$ = NULL;
+}
+| HINT_HINT_BEGIN global_hint_list_with_end
+{
+  $$ = $2;
+}
+;
+
+global_hint_list_with_end:
+opt_global_hint_list HINT_END
+{
+  if (NULL != $1) {
+    merge_nodes($$, result, T_HINT_OPTION_LIST, $1);
+  } else {
+    $$ = NULL;
+  }
+}
+;
+
+opt_global_hint_list:
+global_hint_options
+{
+  $$ = $1;
+}
+| opt_global_hint_list ',' global_hint_options
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+| /* EMPTY */
+{
+  $$ = NULL;
+}
+;
+
+global_hint_options:
+global_hint
+{
+  $$ = $1;
+}
+| global_hint_options global_hint
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $2);
 }
 ;
 
@@ -17394,6 +17457,14 @@ explain_or_desc relation_factor opt_desc_column_option
   malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_COLUMNS, 4, $$, $2, NULL, $3);
 }
 
+| desc_or_describe result_scan_table_expression opt_desc_column_option
+{
+  (void)($1);
+  malloc_terminal_node($$, result->malloc_pool_, T_INT);
+  $$->value_ = 0;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_COLUMNS, 4, $$, $2, NULL, $3);
+}
+
 | explain_or_desc explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, 0, $2, NULL, NULL);}
 | explain_or_desc PRETTY explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, T_PRETTY, $3, NULL, NULL);}
 | explain_or_desc PRETTY_COLOR explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, T_PRETTY_COLOR, $3, NULL, NULL);}
@@ -17437,6 +17508,18 @@ explain_or_desc:
 EXPLAIN {$$ = NULL;}
 | DESCRIBE {$$ = NULL;}
 | DESC  {$$ = NULL;}
+;
+
+desc_or_describe:
+DESCRIBE {$$ = NULL;}
+| DESC {$$ = NULL;}
+;
+
+result_scan_table_expression:
+TABLE '(' simple_expr ')' %prec LOWER_PARENS
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_TABLE_COLLECTION_EXPRESSION, 2, $3, NULL);
+}
 ;
 
 explainable_stmt:
@@ -17783,6 +17866,14 @@ SHOW opt_extended_or_full TABLES opt_from_or_in_catalog_database_clause opt_show
   $$->value_ = $2[0];
   malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_COLUMNS, 4, $$, $5, $6, $7);
 }
+| SHOW opt_extended_or_full columns_or_fields from_or_in result_scan_table_expression opt_from_or_in_database_clause opt_show_condition
+{
+  (void)$3;
+  (void)$4;
+  malloc_terminal_node($$, result->malloc_pool_, T_INT);
+  $$->value_ = $2[0];
+  malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_COLUMNS, 4, $$, $5, $6, $7);
+}
 | SHOW TABLE STATUS opt_from_or_in_database_clause opt_show_condition
 { malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_TABLE_STATUS, 2, $4, $5); }
 | SHOW PROCEDURE STATUS opt_from_or_in_database_clause opt_show_condition
@@ -17817,6 +17908,11 @@ SHOW opt_extended_or_full TABLES opt_from_or_in_catalog_database_clause opt_show
   malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_CREATE_CATALOG, 1, $4);
 }
 | SHOW create_with_opt_hint TABLE relation_factor
+{
+  (void)($2);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_CREATE_TABLE, 1, $4);
+}
+| SHOW create_with_opt_hint TABLE result_scan_table_expression
 {
   (void)($2);
   malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_CREATE_TABLE, 1, $4);

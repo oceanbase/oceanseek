@@ -181,16 +181,20 @@ struct ObOptHiveFile : public ObIOptLakeTableFile
 public:
   ObOptHiveFile()
   : ObIOptLakeTableFile(LakeFileType::HIVE),
-    file_url_(), file_size_(0), modification_time_(0), part_id_(OB_INVALID_PARTITION_ID)
+    file_url_(), file_size_(0), modification_time_(0), part_id_(OB_INVALID_PARTITION_ID),
+    first_lineno_(1), last_lineno_(INT64_MAX)
   {}
   virtual int assign(const ObIOptLakeTableFile &other) override;
   virtual void reset() override;
-  VIRTUAL_TO_STRING_KV(K_(type), K_(file_url), K_(file_size), K_(modification_time), K_(part_id));
+  VIRTUAL_TO_STRING_KV(K_(type), K_(file_url), K_(file_size), K_(modification_time), K_(part_id),
+                       K_(first_lineno), K_(last_lineno));
 
   ObString file_url_;
   int64_t file_size_;
   int64_t modification_time_;
   int64_t part_id_;
+  int64_t first_lineno_;
+  int64_t last_lineno_;
 };
 
 struct ObOptPluginFile : public ObIOptLakeTableFile
@@ -407,6 +411,7 @@ public:
   
   VIRTUAL_TO_STRING_KV(K_(file_url), K_(type), K_(file_size), K_(modification_time),
                       K_(file_id), K_(part_id), K_(content_digest), K_(record_count),
+                      K_(first_lineno), K_(last_lineno),
                       KPC_(parallel_parse_csv_info));
   // for parallel parse csv
   ObCsvParallelInfo *parallel_parse_csv_info_;

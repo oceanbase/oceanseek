@@ -2408,6 +2408,23 @@ int ObSqlParameterization::mark_tree(TransformTreeCtx &ctx, ParseNode *tree ,Sql
         if (OB_FAIL(mark_args(node[1], mark_arr, ARGS_NUMBER_ONE, sql_info))) {
           SQL_PC_LOG(WARN, "fail to mark arrow_stream(s) arg", K(ret));
         }
+      } else if (0 == func_name.case_compare("result_scan")
+                 && 1 == node[1]->num_child_) {
+        const int64_t ARGS_NUMBER_ONE = 1;
+        bool mark_arr[ARGS_NUMBER_ONE] = {1};
+        if (OB_FAIL(mark_args(node[1], mark_arr, ARGS_NUMBER_ONE, sql_info))) {
+          SQL_PC_LOG(WARN, "fail to mark result_scan query_id", K(ret));
+        }
+      } else if (0 == func_name.case_compare("result_scan")
+                 && 2 == node[1]->num_child_) {
+        // Both literals select statement-local Result Catalog metadata.  In
+        // particular, chunk_id changes the physical row-group task and its
+        // cardinality, so it must never become a plan-cache parameter.
+        const int64_t ARGS_NUMBER_TWO = 2;
+        bool mark_arr[ARGS_NUMBER_TWO] = {1, 1};
+        if (OB_FAIL(mark_args(node[1], mark_arr, ARGS_NUMBER_TWO, sql_info))) {
+          SQL_PC_LOG(WARN, "fail to mark result_scan query_id and chunk_id", K(ret));
+        }
       }
     }
   } else if (T_OP_LIKE == tree->type_) {

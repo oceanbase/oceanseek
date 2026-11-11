@@ -33,6 +33,9 @@ enum class ObLakeTableFormat : int32_t
   ICEBERG,
   HIVE,
   ODPS,
+  // Immutable async-query result described by Result Catalog metadata.json.
+  // It uses Parquet as its physical format, but requires the private
+  // Arrow-to-OB codec instead of the ordinary external-table type mapping.
   RESULT,
 };
 
@@ -76,6 +79,12 @@ inline bool is_hive_lake_table(const ObLakeTableFormat format)
   return ObLakeTableFormat::HIVE == format;
 }
 
+/// True iff `format` identifies a Result Catalog backed table.
+inline bool is_result_catalog_table(const ObLakeTableFormat format)
+{
+  return ObLakeTableFormat::RESULT == format;
+}
+
 /// True iff `format` identifies an ODPS lake table.
 inline bool is_odps_lake_table(const ObLakeTableFormat format)
 {
@@ -101,14 +110,14 @@ inline ObLakeTableFormat lake_plugin_format_of(const ObPluginSlot slot)
              : ObLakeTableFormat::INVALID;
 }
 
-/// Catalog-backed lake formats (Iceberg / Hive / C++ plugin) and ODPS. ODPS
-/// materializes catalog metadata into the OB schema but reads through the lake
-/// access path (ObODPSFilePruner + lake file map).
+/// Formats that use the lake-file planning path. RESULT is statement-local,
+/// while ODPS materializes catalog metadata into the OB schema.
 inline bool is_lake_external_table(const ObLakeTableFormat format)
 {
   return is_iceberg_lake_table(format)
          || is_hive_lake_table(format)
          || is_lake_plugin_table(format)
+         || is_result_catalog_table(format)
          || is_odps_lake_table(format);
 }
 

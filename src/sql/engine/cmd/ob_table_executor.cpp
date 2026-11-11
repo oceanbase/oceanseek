@@ -19,6 +19,7 @@
 #include "sql/resolver/ddl/ob_purge_stmt.h"
 #include "sql/resolver/ddl/ob_optimize_stmt.h"
 #include "sql/resolver/dml/ob_delete_resolver.h"
+#include "sql/session/ob_sql_session_info.h"
 #include "sql/engine/cmd/ob_partition_executor_utils.h"
 
 #include "sql/printer/ob_select_stmt_printer.h"
@@ -386,6 +387,7 @@ int ObCreateTableExecutor::execute_ctas(ObExecContext &ctx,
     create_table_arg.is_inner_ = my_session->is_inner();
     bool need_clean = true;
     bool sync_placeholder_created = false;
+    bool is_async_select_query = false;
     CK(OB_NOT_NULL(sql_proxy),
       OB_NOT_NULL(my_session),
       OB_NOT_NULL(gctx.schema_service_),
@@ -410,6 +412,10 @@ int ObCreateTableExecutor::execute_ctas(ObExecContext &ctx,
         LOG_WARN("init oracle sql proxy failed", K(ret));
       } else if (OB_FAIL(prepare_stmt(stmt, *my_session, ctx.get_sql_ctx()->schema_guard_, create_table_name))) {
         LOG_WARN("failed to prepare stmt", K(ret));
+      } else if (OB_FALSE_IT(is_async_select_query =
+                                 OB_NOT_NULL(my_session->get_job_info())
+                                 && my_session->get_job_info()->is_async_query_result_target(
+                                     stmt.get_database_name(), create_table_name))) {
       } else if (OB_FAIL(prepare_ins_arg(stmt, my_session, ctx.get_sql_ctx()->schema_guard_,
                                          &plan_ctx->get_param_store(), ins_sql, is_direct_load))) { //1, 参数准备;
         LOG_WARN("failed to prepare insert table arg", K(ret));
@@ -501,6 +507,7 @@ int ObCreateTableExecutor::execute_ctas(ObExecContext &ctx,
             } else if (OB_FALSE_IT(conn->set_check_priv(true))) {
               // enable privilege check so RLS bypass (BYPASSRLS) is evaluated against
               // the user's actual privileges, not assumed from PRIV_CHECK_FLAG_DISABLE
+            } else if (OB_FALSE_IT(conn->set_async_select_query(is_async_select_query))) {
             } else if (OB_FAIL(
                            conn->execute_write(tenant_id, ins_sql.ptr(), affected_rows, true))) {
               LOG_WARN("failed to exec sql", K(tenant_id), K(ins_sql), K(ret));
@@ -514,6 +521,7 @@ int ObCreateTableExecutor::execute_ctas(ObExecContext &ctx,
               }
             }
             if (OB_NOT_NULL(conn)) {
+              conn->set_async_select_query(false);
               user_sql_proxy->close(conn, true);
             }
           } 

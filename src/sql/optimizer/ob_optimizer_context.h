@@ -304,6 +304,7 @@ ObOptimizerContext(ObSQLSessionInfo *session_info,
     rtf_user_min_partition_count_(-1),
     enable_partial_group_by_pushdown_(true),
     enable_partial_limit_pushdown_(true),
+    enable_result_scan_ordered_read_(false),
     enable_storage_aggr_push_down_(false),
     enable_storage_group_by_push_down_(false),
     enable_index_merge_(false),
@@ -312,6 +313,7 @@ ObOptimizerContext(ObSQLSessionInfo *session_info,
     enable_runtime_filter_adaptive_apply_(true),
     enable_rich_vector_format_(false),
     rowsets_enabled_(false),
+    async_result_parquet_row_group_rows_(1024L * 1024),
     extend_sql_plan_monitor_metrics_(false),
     enable_delete_insert_scan_(false),
     is_weak_read_(false),
@@ -826,8 +828,14 @@ ObOptimizerContext(ObSQLSessionInfo *session_info,
   inline void set_enable_partial_group_by_pushdown(bool enabled) { enable_partial_group_by_pushdown_ = enabled; }
   inline bool enable_partial_limit_pushdown() const { return enable_partial_limit_pushdown_; }
   inline void set_enable_partial_limit_pushdown(bool enabled) { enable_partial_limit_pushdown_ = enabled; }
+  inline bool enable_result_scan_ordered_read() const { return enable_result_scan_ordered_read_; }
+  inline void set_enable_result_scan_ordered_read(bool enabled) { enable_result_scan_ordered_read_ = enabled; }
   inline bool get_rowsets_enabled() const { return rowsets_enabled_; }
   inline void set_rowsets_enabled(bool enabled) { rowsets_enabled_ = enabled; }
+  inline int64_t get_async_result_parquet_row_group_rows() const
+  { return async_result_parquet_row_group_rows_; }
+  inline void set_async_result_parquet_row_group_rows(int64_t row_group_rows)
+  { async_result_parquet_row_group_rows_ = row_group_rows; }
   inline bool enable_storage_aggr_pushdown() const { return enable_storage_aggr_push_down_; }
   inline void set_enable_storage_aggr_pushdown(bool enabled) { enable_storage_aggr_push_down_ = enabled; }
   inline bool enable_storage_groupby_pushdown() const { return enable_storage_group_by_push_down_; }
@@ -982,6 +990,7 @@ private:
   int64_t rtf_user_min_partition_count_;
   bool enable_partial_group_by_pushdown_;
   bool enable_partial_limit_pushdown_;
+  bool enable_result_scan_ordered_read_;
   bool enable_storage_aggr_push_down_;
   bool enable_storage_group_by_push_down_;
   bool enable_index_merge_;
@@ -990,6 +999,7 @@ private:
   bool enable_runtime_filter_adaptive_apply_;
   bool enable_rich_vector_format_;
   bool rowsets_enabled_;
+  int64_t async_result_parquet_row_group_rows_;
   bool extend_sql_plan_monitor_metrics_;
   bool enable_delete_insert_scan_;
   bool is_weak_read_;

@@ -313,6 +313,15 @@ int ObPxMsgProc::process_sqc_finish_msg_once(ObExecContext &ctx, const ObPxFinis
       LOG_TRACE("on_sqc_finish_msg gather iceberg data files", K(pkt.sqc_iceberg_data_files_));
     }
   }
+  if (OB_SUCC(ret) && pkt.sqc_async_result_files_.count() > 0) {
+    if (OB_ISNULL(ctx.get_physical_plan_ctx())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("physical plan context is null", K(ret));
+    } else if (OB_FAIL(ctx.get_physical_plan_ctx()->add_async_result_files(
+                   pkt.sqc_async_result_files_))) {
+      LOG_WARN("failed to gather SQC async result files", K(ret));
+    }
+  }
   if (OB_FAIL(ret)) {
   } else if (common::OB_INVALID_ID != pkt.temp_table_id_) {
     if (OB_FAIL(ctx.add_temp_table_interm_result_ids(pkt.temp_table_id_,

@@ -612,6 +612,7 @@ public:
   void destroy();
   void cancel();
   int wait(int64_t wait_ms);
+  int64_t timeout_ts() const;
   void finish(const ObIORetCode &ret_code, ObIORequest *req = nullptr);
   ObIOMode get_mode() const; // 2 mode : read and write
   ObIOGroupKey get_group_key() const;

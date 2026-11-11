@@ -188,7 +188,7 @@ void obpl_mysql_wrap_get_user_var_into_subquery(ObParseCtx *parse_ctx, ParseNode
 
 /*these tokens can't be used for obj names*/
 %token END_P
-%token SQL_KEYWORD SQL_TOKEN PARAM_ASSIGN_OPERATOR
+%token SQL_KEYWORD SQL_TOKEN PARAM_ASSIGN_OPERATOR WITH
 %token PARSER_SYNTAX_ERROR /*used internal*/
 %token <node> IDENT STRING INTNUM DECIMAL_VAL HEX_STRING_VALUE DATE_VALUE SYSTEM_VARIABLE USER_VARIABLE NULLX
 %token <node> USER_NAME
@@ -271,7 +271,7 @@ void obpl_mysql_wrap_get_user_var_into_subquery(ObParseCtx *parse_ctx, ParseNode
 %type <node> create_trigger_stmt drop_trigger_stmt plsql_trigger_source
 %type <node> trigger_definition trigger_event trigger_body pl_obj_access_ref
 %type <ival> trigger_time
-%type <node> submit_job_stmt cancel_job_stmt
+%type <node> submit_job_stmt submit_job_option_list submit_job_option cancel_job_stmt
 %type <node> create_event_stmt event_schedule event_time_expr opt_event_time_range event_start_time event_end_time event_on_completion opt_event_on_completion opt_event_status opt_event_comment event_body_stmts event_body
 %type <node> alter_event_stmt opt_event_alter_on_schedule_completion opt_event_rename opt_event_body
 %type <node> drop_event_stmt
@@ -398,6 +398,7 @@ sql_keyword:
 sql_stmt_prefix:
     '(' sql_stmt_prefix { $$ = NULL; }
   | SQL_KEYWORD { $$ = NULL; }
+  | WITH %prec LOWER_PARENS { $$ = NULL; }
   | INSERT { $$ = NULL; }
   | DELETE { $$ = NULL; }
   | UPDATE { $$ = NULL; }
@@ -3234,12 +3235,42 @@ scond_info_item_name:
 submit_job_stmt:
     SUBMIT JOB sql_stmt
     {
-      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_OLAP_ASYNC_JOB_SUBMIT, 1, $3);  
+      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_OLAP_ASYNC_JOB_SUBMIT, 2, NULL, $3);
       const char *stmt_str = parse_ctx->stmt_str_ + @3.first_column;
       int32_t str_len = @3.last_column - @3.first_column + 1;
       $$->str_value_ = parse_strndup(stmt_str, str_len, parse_ctx->mem_pool_);
       check_ptr($$->str_value_);
       $$->str_len_ = str_len;
+    }
+  | SUBMIT JOB WITH '(' submit_job_option_list ')' sql_stmt
+    {
+      ParseNode *option_list = NULL;
+      merge_nodes(option_list, parse_ctx->mem_pool_, T_SUBMIT_JOB_OPTION_LIST, $5);
+      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_OLAP_ASYNC_JOB_SUBMIT, 2,
+                               option_list, $7);
+      const char *stmt_str = parse_ctx->stmt_str_ + @7.first_column;
+      int32_t str_len = @7.last_column - @7.first_column + 1;
+      $$->str_value_ = parse_strndup(stmt_str, str_len, parse_ctx->mem_pool_);
+      check_ptr($$->str_value_);
+      $$->str_len_ = str_len;
+    }
+;
+
+submit_job_option_list:
+    submit_job_option
+    {
+      $$ = $1;
+    }
+  | submit_job_option_list ',' submit_job_option
+    {
+      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_LINK_NODE, 2, $1, $3);
+    }
+;
+
+submit_job_option:
+    ident '=' STRING
+    {
+      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_SUBMIT_JOB_OPTION, 2, $1, $3);
     }
 ;
 
@@ -3446,4 +3477,3 @@ void obpl_mysql_yyerror(YYLTYPE *yylloc, ObParseCtx *parse_ctx, char *s)
     }
   }
 }
-

@@ -125,6 +125,7 @@ ObInnerSQLConnection::ObInnerSQLConnection()
       last_query_timestamp_(0),
       force_remote_execute_(false),
       force_no_reuse_(false),
+      is_async_select_query_(false),
       use_external_session_(false),
       group_id_(0),
       user_timeout_(0),
@@ -237,6 +238,7 @@ int ObInnerSQLConnection::destroy()
     config_ = NULL;
     associated_client_ = NULL;
     ref_ctx_ = NULL;
+    is_async_select_query_ = false;
     user_timeout_ = 0;
     if (OB_NOT_NULL(diagnostic_info_)) {
       ObLocalDiagnosticInfo::dec_ref(diagnostic_info_);
@@ -538,7 +540,9 @@ int ObInnerSQLConnection::init_result(ObInnerSQLResult &res,
   res.sql_ctx().retry_times_ = retry_cnt;
   res.sql_ctx().session_info_ = &get_session();
   res.sql_ctx().disable_privilege_check_ = is_check_priv()
-                                            ? PRIV_CHECK_FLAG_NORMAL : PRIV_CHECK_FLAG_DISABLE;
+      ? (is_async_select_query_ ? PRIV_CHECK_FLAG_ASYNC_SELECT_QUERY
+                                : PRIV_CHECK_FLAG_NORMAL)
+      : PRIV_CHECK_FLAG_DISABLE;
   res.sql_ctx().secondary_namespace_ = secondary_namespace;
   res.sql_ctx().is_prepare_protocol_ = is_prepare_protocol;
   res.sql_ctx().is_prepare_stage_ = is_prepare_stage;
@@ -1735,6 +1739,7 @@ int ObInnerSQLConnection::execute_write_inner(const uint64_t tenant_id, const Ob
             THIS_WORKER.get_timeout_ts(), query_timeout, trx_timeout, sql_mode,
             ddl_info, is_load_data_exec, use_external_session_, consumer_group_id,
             name_case_mode, select_index_enabled);
+        arg.set_async_select_query(is_async_select_query_);
         arg.set_nls_formats(get_session().get_local_nls_date_format(),
                             get_session().get_local_nls_timestamp_format(),
                             get_session().get_local_nls_timestamp_tz_format());

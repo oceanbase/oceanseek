@@ -2589,7 +2589,8 @@ public:
   inline bool is_hidden() const
   {
     return is_recyclebin_database_id(database_id_)
-           || is_public_database_id(database_id_);
+           || is_public_database_id(database_id_)
+           || is_async_query_result_database_id(database_id_);
   }
 
   //get methods

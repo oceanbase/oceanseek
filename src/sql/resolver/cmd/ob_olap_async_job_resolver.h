@@ -23,6 +23,9 @@ private:
   static const int OB_JOB_NAME_MAX_LENGTH = 128;
   static const int OB_JOB_SQL_MAX_LENGTH = 4096;
   int resolve_submit_job_stmt(const ParseNode &parse_tree, ObOLAPAsyncSubmitJobStmt &stmt);
+  int resolve_submit_job_options(const ParseNode *option_list,
+                                 const bool is_async_query,
+                                 ObOLAPAsyncSubmitJobStmt &stmt);
   int resolve_cancel_job_stmt(const ParseNode &parse_tree, ObOLAPAsyncCancelJobStmt *stmt);
   int execute_submit_job(ObOLAPAsyncSubmitJobStmt &stmt);
   int init_select_stmt(ObOLAPAsyncSubmitJobStmt &stmt);

@@ -88,6 +88,7 @@ class ObArrowMemPool : public ::arrow::MemoryPool
 public:
   ObArrowMemPool() : total_alloc_size_(0), total_hold_size_(0), num_allocations_(0) {}
   void init(uint64_t tenant_id);
+  void init(const common::ObMemAttr &mem_attr);
   virtual arrow::Status Allocate(int64_t size, int64_t alignment, uint8_t** out) override;
 
   virtual arrow::Status Reallocate(int64_t old_size, int64_t new_size, int64_t alignment,

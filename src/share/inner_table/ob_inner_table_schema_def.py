@@ -19986,7 +19986,7 @@ def_table_schema(
   FROM oceanbase.__all_database a inner join oceanbase.__tenant_virtual_collation b ON a.collation_type = b.collation_type
   WHERE a.tenant_id = 0
     and in_recyclebin = 0
-    and a.database_name not in ('__recyclebin', '__public')
+    and a.database_name not in ('__recyclebin', '__public', '__ob_async_query_result')
     and 0 = sys_privilege_check('db_acc', 0, a.database_name)
   ORDER BY a.database_id
 """.replace("\n", " "),
@@ -48896,6 +48896,7 @@ def_table_schema(
   normal_columns  = [],
   gm_columns      = [],
   in_tenant_space = True,
+
   view_definition =
   """
     SELECT

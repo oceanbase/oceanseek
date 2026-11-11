@@ -11,6 +11,7 @@
 #include "src/sql/engine/px/ob_dfo.h"
 #include "src/sql/engine/px/ob_px_sqc_handler.h"
 #include "share/external_table/ob_external_table_utils.h"
+#include "share/catalog/ob_external_catalog.h"
 #include "share/external_table/ob_csv_table_utils.h"
 #include "share/external_table/ob_odps_table_utils.h"
 #include "share/external_table/ob_external_table_file_mgr.h"
@@ -37,6 +38,8 @@ int ObLakeGranuleHandler::split_granule_for_lake_table(ObExecContext &exec_ctx,
 {
   int ret = OB_SUCCESS;
   ObLakeTableFileMap *map = nullptr;
+  const bool is_result_catalog = OB_NOT_NULL(tsc)
+      && share::is_result_catalog_table(tsc->tsc_ctdef_.scan_ctdef_.lake_table_format_);
   if (OB_UNLIKELY(tablets.count() < 1)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("get invalid argument", K(tablets.count()));
@@ -97,23 +100,41 @@ int ObLakeGranuleHandler::split_granule_for_lake_table(ObExecContext &exec_ctx,
           LOG_WARN("failed to push back granule idx");
         }
       } else {
+        int64_t previous_result_part_id = -1;
         for (int64_t j = 0; OB_SUCC(ret) && j < files->count(); ++j) {
           ObFileScanTask *scan_task = static_cast<ObFileScanTask *>(files->at(j));
           if (OB_ISNULL(scan_task)) {
             ret = OB_ERR_UNEXPECTED;
             LOG_WARN("get null file");
-          } else if (FALSE_IT(scan_task->assign_granule_identity(j, tablet_loc->partition_id_))) {
-          } else if (OB_FAIL(granule_tablets.push_back(tablet_loc))) {
-            LOG_WARN("failed to push basck tablet loc");
-          } else if (OB_FAIL(granule_tasks.push_back(scan_task))) {
-            LOG_WARN("failed to push back range");
-          } else if (OB_FAIL(granule_idx.push_back(pk_idx))) {
-            LOG_WARN("failed to push back granule idx");
-          } else if (!force_partition_granule) {
-            pk_idx++;
+          } else if (is_result_catalog
+                     && (scan_task->part_id_ < 0
+                         || (previous_result_part_id >= 0
+                             && scan_task->part_id_ < previous_result_part_id))) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("Result Catalog files are not in manifest partition order",
+                     K(ret), K(j), K(scan_task->part_id_), K(previous_result_part_id));
+          } else {
+            // The manifest's partition ID is one writer stream for ordered
+            // results, or one independently schedulable file otherwise.
+            if (is_result_catalog && j > 0
+                && scan_task->part_id_ != previous_result_part_id) {
+              ++pk_idx;
+            }
+            scan_task->assign_granule_identity(j, tablet_loc->partition_id_);
+            if (OB_FAIL(granule_tablets.push_back(tablet_loc))) {
+              LOG_WARN("failed to push basck tablet loc");
+            } else if (OB_FAIL(granule_tasks.push_back(scan_task))) {
+              LOG_WARN("failed to push back range");
+            } else if (OB_FAIL(granule_idx.push_back(pk_idx))) {
+              LOG_WARN("failed to push back granule idx");
+            } else if (is_result_catalog) {
+              previous_result_part_id = scan_task->part_id_;
+            } else if (!force_partition_granule) {
+              ++pk_idx;
+            }
           }
         }
-        if (force_partition_granule) {
+        if (force_partition_granule || is_result_catalog) {
           pk_idx++;
         }
       }

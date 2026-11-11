@@ -36,11 +36,14 @@ ObSqcCtx::ObSqcCtx(ObPxRpcInitSqcArgs &sqc_arg) : msg_loop_(),
       lob_direct_load_mgr_handles_(nullptr),
       iceberg_data_files_(),
       iceberg_data_file_lock_(common::ObLatchIds::SQC_CTX_ICEBERG_DATA_FILES_LOCK),
+      async_result_files_(),
+      async_result_file_lock_(common::ObLatchIds::SQC_CTX_ICEBERG_DATA_FILES_LOCK),
       async_index_query_allocator_(),
       async_index_query_ctxs_()
 {
   arena_allocator_.set_attr(ObMemAttr(MTL_ID(),"DDL_DLM"));
   async_index_query_allocator_.set_attr(ObMemAttr(MTL_ID(), "DASAsyncSeg"));
+  async_result_files_.set_attr(ObMemAttr(MTL_ID(), "ResultFiles"));
 }
 
 void ObSqcCtx::reset()

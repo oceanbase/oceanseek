@@ -890,7 +890,8 @@ public:
       has_dynamic_partition_tier_(false),
       pl_sql_transpiled_exprs_(allocator),
       forbid_pl_sql_transpiler_(false),
-      is_mview_refresh_sql_(false)
+      is_mview_refresh_sql_(false),
+      has_result_scan_table_(false)
   {
   }
   TO_STRING_KV(N_PARAM_NUM, question_marks_count_,
@@ -945,6 +946,7 @@ public:
     pl_sql_transpiled_exprs_.reuse();
     forbid_pl_sql_transpiler_ = false;
     is_mview_refresh_sql_ = false;
+    has_result_scan_table_ = false;
   }
 
   int64_t get_new_stmt_id() { return stmt_count_++; }
@@ -1005,6 +1007,8 @@ public:
   }
   inline bool is_mview_refresh_sql() const { return is_mview_refresh_sql_; }
   inline void set_is_mview_refresh_sql(bool is_mview_refresh_sql) { is_mview_refresh_sql_ = is_mview_refresh_sql; }
+  bool has_result_scan_table() const { return has_result_scan_table_; }
+  void set_has_result_scan_table(bool has_result_scan_table) { has_result_scan_table_ = has_result_scan_table; }
 public:
   static const int64_t CALCULABLE_EXPR_NUM = 1;
   typedef ObSqlArray<ObHiddenColumnItem> CalculableItems;
@@ -1095,6 +1099,7 @@ public:
   ObSqlArray<ObUDFRawExpr *> pl_sql_transpiled_exprs_;
   bool forbid_pl_sql_transpiler_ = false;
   bool is_mview_refresh_sql_;
+  bool has_result_scan_table_;
 };
 
 template<typename... Args>

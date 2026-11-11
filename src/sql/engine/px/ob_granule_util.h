@@ -231,6 +231,7 @@ enum ObGranuleSplitterType
     * |       TABLE SCAN                |A         |
     */
   GIT_RANDOM,
+  // Async Result writer streams are assigned to workers without task stealing.
   GIT_RESULT_ORDERED,
 };
 

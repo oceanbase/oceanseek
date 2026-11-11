@@ -14,6 +14,8 @@
 #include "sql/privilege_check/ob_ora_priv_check.h"
 #include "sql/privilege_check/ob_privilege_check.h"
 #include "sql/engine/expr/ob_expr_align_date4cmp.h"
+#include "sql/engine/expr/ob_expr_result_scan.h"
+#include "sql/result_catalog/ob_result_scan_catalog.h"
 #include "share/vector_index/ob_vector_index_util.h"
 #include "share/schema/ob_schema_getter_guard.h"
 
@@ -37,6 +39,9 @@ int ObTransformPreProcess::transform_one_stmt(common::ObIArray<ObParentDMLStmt> 
       OB_ISNULL(stmt->get_query_ctx())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("unexpected NULL", K(ret), K(stmt), K(ctx_));
+  } else if (stmt->get_query_ctx()->has_result_scan_table()
+             && OB_FAIL(transform_result_scan_tables(stmt, is_happened))) {
+    LOG_WARN("failed to transform result_scan tables", K(ret));
   } else if (OB_FAIL(ObTransformUtils::right_join_to_left(stmt))) {
     LOG_WARN("failed to transform right join as left", K(ret));
   } else if (OB_FAIL(formalize_limit_expr(*stmt, parent_stmts.empty() && lib::is_oracle_mode()))) {
@@ -357,6 +362,142 @@ int ObTransformPreProcess::transform_one_stmt(common::ObIArray<ObParentDMLStmt> 
       //} else if (OB_FAIL(stmt->formalize_stmt_expr_reference())) {
       //  LOG_WARN("failed to formalize stmt reference", K(ret));
       }
+    }
+  }
+  return ret;
+}
+
+int ObTransformPreProcess::transform_result_scan_tables(ObDMLStmt *stmt,
+                                                         bool &trans_happened)
+{
+  int ret = OB_SUCCESS;
+  trans_happened = false;
+  if (OB_ISNULL(stmt)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("result_scan transform statement is null", KR(ret));
+  } else {
+    ObIArray<TableItem *> &table_items = stmt->get_table_items();
+    for (int64_t i = 0; OB_SUCC(ret) && i < table_items.count(); ++i) {
+      TableItem *table_item = table_items.at(i);
+      if (OB_ISNULL(table_item)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("result_scan transform table item is null", KR(ret), K(i));
+      } else if (table_item->is_function_table()
+                 && OB_NOT_NULL(table_item->function_table_expr_)
+                 && T_FUN_SYS_RESULT_SCAN == table_item->function_table_expr_->get_expr_type()) {
+        bool transformed = false;
+        if (OB_FAIL(transform_result_scan_table(*stmt, *table_item, transformed))) {
+          LOG_WARN("failed to transform result_scan table", KR(ret), K(i));
+        } else {
+          trans_happened |= transformed;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObTransformPreProcess::transform_result_scan_table(ObDMLStmt &stmt,
+                                                        TableItem &table_item,
+                                                        bool &trans_happened)
+{
+  int ret = OB_SUCCESS;
+  trans_happened = false;
+  const ObTableSchema *result_table_schema = nullptr;
+
+  if (OB_ISNULL(ctx_) || OB_ISNULL(ctx_->allocator_) || OB_ISNULL(ctx_->session_info_)
+      || OB_ISNULL(ctx_->schema_checker_) || OB_ISNULL(stmt.get_query_ctx())
+      || !table_item.is_function_table()
+      || OB_ISNULL(table_item.function_table_expr_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid result_scan transform input", KR(ret), KP(ctx_), K(table_item));
+  } else if (OB_UNLIKELY(OB_INVALID_ID == table_item.ref_id_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("result_scan table has no registered schema identity", KR(ret), K(table_item));
+  } else if (OB_FAIL(ctx_->schema_checker_->get_table_schema(
+                 ctx_->session_info_->get_effective_tenant_id(),
+                 table_item.ref_id_,
+                 result_table_schema))) {
+    LOG_WARN("failed to get registered result table schema", KR(ret),
+             "result_table_id", table_item.ref_id_);
+  } else if (OB_ISNULL(result_table_schema)) {
+    ret = OB_TABLE_NOT_EXIST;
+    LOG_WARN("registered result table schema is null", KR(ret),
+             "result_table_id", table_item.ref_id_);
+  } else {
+    ObSchemaObjVersion table_version;
+    table_version.object_id_ = result_table_schema->get_table_id();
+    table_version.object_type_ = DEPENDENCY_TABLE;
+    table_version.version_ = result_table_schema->get_schema_version();
+    table_version.is_db_explicit_ = true;
+    if (OB_FAIL(stmt.add_global_dependency_table(table_version))) {
+      LOG_WARN("failed to add result_scan result table dependency", KR(ret),
+               "result_table_id", table_item.ref_id_);
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    // Authorization and the function-table output schema were resolved before
+    // the normal statement privilege check.  The physical table is introduced
+    // only now, so its private-table SELECT privilege is never required.
+    if (share::is_result_catalog_table(result_table_schema->get_lake_table_format())
+        && OB_ISNULL(table_item.catalog_table_metadata_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("Result Catalog table has no statement-local metadata", KR(ret), K(table_item));
+    } else if (OB_ISNULL(table_item.ext_table_def_)
+               && OB_FAIL(table_item.alloc_ext_table_def(ctx_->allocator_))) {
+      LOG_WARN("failed to allocate external definition for Result Catalog table", KR(ret));
+    }
+    if (OB_SUCC(ret)) {
+      table_item.ext_table_def_->lake_table_format_ = result_table_schema->get_lake_table_format();
+      table_item.ext_table_def_->lake_table_snapshot_id_ = OB_INVALID_ID;
+    }
+    if (OB_SUCC(ret)) {
+    table_item.type_ = TableItem::ALIAS_TABLE;
+    table_item.ref_id_ = result_table_schema->get_table_id();
+    table_item.table_type_ = result_table_schema->get_table_type();
+    table_item.is_system_table_ = result_table_schema->is_sys_table();
+    table_item.is_view_table_ = false;
+    table_item.is_index_table_ = false;
+    table_item.ddl_schema_version_ = result_table_schema->get_schema_version();
+    table_item.database_name_.reset();
+    table_item.table_name_ = ObString::make_string("RESULT_SCAN");
+    table_item.function_table_expr_ = nullptr;
+
+    ObIArray<ColumnItem> &column_items = stmt.get_column_items();
+    for (int64_t i = 0; OB_SUCC(ret) && i < column_items.count(); ++i) {
+      ColumnItem &column_item = column_items.at(i);
+      if (column_item.table_id_ != table_item.table_id_) {
+        // Column belongs to another table.
+      } else if (OB_ISNULL(column_item.expr_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("result_scan column expression is null", KR(ret), K(i), K(column_item));
+      } else {
+        const ObColumnSchemaV2 *column_schema =
+            result_table_schema->get_column_schema(column_item.column_id_);
+        if (OB_ISNULL(column_schema) || column_schema->is_hidden()) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("result_scan column is absent from physical result schema",
+                   KR(ret), K(i), K(column_item), KPC(result_table_schema));
+        } else {
+          ObColumnRefRawExpr *column_expr = column_item.expr_;
+          column_expr->set_table_item_info(table_item);
+          column_expr->set_column_id(column_schema->get_column_id());
+          column_expr->set_column_name(column_schema->get_column_name_str());
+          column_expr->set_column_flags(static_cast<uint64_t>(column_schema->get_column_flags()));
+          column_expr->set_lob_column(is_lob_storage(column_schema->get_data_type()));
+          column_expr->set_hidden_column(false);
+          column_expr->set_is_rowkey_column(column_schema->is_rowkey_column());
+          column_item.column_id_ = column_schema->get_column_id();
+          column_item.column_name_ = column_schema->get_column_name_str();
+          column_item.base_tid_ = result_table_schema->get_table_id();
+          column_item.base_cid_ = column_schema->get_column_id();
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      trans_happened = true;
+    }
     }
   }
   return ret;

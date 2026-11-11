@@ -52,6 +52,9 @@ int ObSelectIntoItem::deep_copy(ObIAllocator &allocator,
   cs_type_ = other.cs_type_;
   file_partition_expr_ = other.file_partition_expr_;
   buffer_size_ = other.buffer_size_;
+  async_result_ = other.async_result_;
+  async_result_tenant_id_ = other.async_result_tenant_id_;
+  async_result_job_id_ = other.async_result_job_id_;
   user_vars_.assign(other.user_vars_);
   if (OB_FAIL(copier.copy(other.file_partition_expr_, file_partition_expr_))) {
     LOG_WARN("deep copy file partition expr failed", K(ret));

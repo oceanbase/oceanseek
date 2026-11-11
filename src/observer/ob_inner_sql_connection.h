@@ -182,6 +182,7 @@ public:
   virtual int set_tz_info_wrap(const ObTimeZoneInfoWrap &tz_info_wrap);
   virtual void set_nls_formats(const ObString *nls_formats);
   virtual void set_is_load_data_exec(bool v);
+  virtual void set_async_select_query(bool v) override { is_async_select_query_ = v; }
   virtual void set_force_remote_exec(bool v) { force_remote_execute_ = v; }
   virtual void set_use_external_session(bool v) { use_external_session_ = v; }
   virtual void set_ob_enable_pl_cache(bool v) override;
@@ -433,6 +434,7 @@ private:
   */
   bool force_remote_execute_;
   bool force_no_reuse_;
+  bool is_async_select_query_;
 
   // ask the inner sql connection to use external session instead of internal one
   // this enables show session / kill session using sql query command

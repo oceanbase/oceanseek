@@ -7,6 +7,7 @@
 #include "ob_log_plan.h"
 #include "sql/optimizer/ob_join_order.h"
 #include "share/stat/ob_opt_stat_manager.h"
+#include "share/catalog/ob_catalog_properties.h"
 #include "sql/optimizer/ob_log_table_scan.h"
 #include "sql/optimizer/ob_log_join_filter.h"
 #include "sql/optimizer/ob_log_sort.h"
@@ -5523,6 +5524,7 @@ int ObLogPlan::try_push_aggr_into_table_scan(ObLogicalOperator *top,
                scan_op->get_index_back() ||
                scan_op->is_text_retrieval_scan() ||
                scan_op->is_sample_scan() ||
+               share::is_result_catalog_table(scan_op->get_lake_table_type()) ||
                (scan_op->is_index_scan() && !groupby_columns.empty()) ||
                (is_descending_direction(scan_op->get_scan_direction()) && !groupby_columns.empty()) ||
                scan_op->has_func_lookup() ||
@@ -8449,13 +8451,26 @@ int ObLogPlan::allocate_select_into_as_top(ObLogicalOperator *&old_top)
       select_into->set_escaped_cht(into_item->escaped_cht_);
       select_into->set_cs_type(into_item->cs_type_);
       select_into->set_external_properties(into_item->external_properties_);
+      select_into->set_async_result_identity(into_item->async_result_,
+                                             into_item->async_result_tenant_id_,
+                                             into_item->async_result_job_id_);
       select_into->set_child(ObLogicalOperator::first_child, old_top);
       select_into->set_file_partition_expr(into_item->file_partition_expr_);
       // compute property
       if (OB_FAIL(select_into->compute_property())) {
         LOG_WARN("failed to compute equal set", K(ret));
       } else {
-        old_top = select_into;
+        ObLogicalOperator *final_child = select_into->get_child(ObLogicalOperator::first_child);
+        if (OB_ISNULL(final_child)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("select into has unexpected null child", K(ret), K(final_child));
+        } else if (select_into->is_async_result()
+                   && OB_FAIL(select_into->set_input_ordering(*final_child))) {
+          LOG_WARN("failed to set async result input ordering", K(ret));
+        }
+        if (OB_SUCC(ret)) {
+          old_top = select_into;
+        }
       }
     }
   }
@@ -11847,18 +11862,31 @@ int ObLogPlan::replace_generate_column_exprs(ObLogicalOperator *op)
       LOG_WARN("failed to replace generated tsc expr", K(ret));
     }
     if (OB_SUCC(ret) && EXTERNAL_TABLE == scan_op->get_table_type()) {
+      const bool is_result_catalog =
+          share::is_result_catalog_table(scan_op->get_lake_table_type());
       for (int i = 0; OB_SUCC(ret) && i < scan_op->get_access_exprs().count(); ++i) {
         ObColumnRefRawExpr *col_expr = NULL;
         if (scan_op->get_access_exprs().at(i)->is_column_ref_expr()
             && (col_expr = static_cast<ObColumnRefRawExpr*>(
-                  scan_op->get_access_exprs().at(i)))->is_stored_generated_column()) {
+                  scan_op->get_access_exprs().at(i)))
+            && (col_expr->is_stored_generated_column() || is_result_catalog)) {
           ObRawExpr *dep_expr = col_expr->get_dependant_expr();
-          if (OB_FAIL(scan_op->extract_file_column_exprs_recursively(dep_expr))) {
+          if (OB_ISNULL(dep_expr)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("external table column has no physical dependency",
+                     KR(ret), K(i), K(is_result_catalog), KPC(col_expr));
+          } else if (OB_FAIL(scan_op->extract_file_column_exprs_recursively(dep_expr))) {
             LOG_WARN("fail to extract file column expr", K(ret));
           } else if (OB_FAIL(scan_op->get_ext_column_dependent_exprs().push_back(dep_expr))) {
             LOG_WARN("fail to push back expr", K(ret));
           }
         }
+      }
+      if (OB_SUCC(ret) && is_result_catalog) {
+        LOG_TRACE("bound Result Catalog columns to physical file expressions",
+                 "access_column_count", scan_op->get_access_exprs().count(),
+                 "file_column_count", scan_op->get_ext_file_column_exprs().count(),
+                 "dependent_column_count", scan_op->get_ext_column_dependent_exprs().count());
       }
       // 新增：处理 pushdown_aggr_exprs_ 中的参数列
       for (int64_t i = 0; OB_SUCC(ret) && i < scan_op->get_pushdown_aggr_exprs().count(); ++i) {

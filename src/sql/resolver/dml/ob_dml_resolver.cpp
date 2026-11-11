@@ -30,6 +30,8 @@
 #include "share/external_table/ob_external_table_utils.h"
 #include "sql/engine/expr/ob_expr_regexp.h"
 #include "sql/engine/expr/ob_expr_arrow_stream.h"
+#include "sql/engine/expr/ob_expr_result_scan.h"
+#include "sql/result_catalog/ob_result_scan_catalog.h"
 #ifdef OB_BUILD_OBSERVER_FLIGHT_SQL
 #include "observer/flight_sql/ob_arrow_stream_catalog.h"
 #endif
@@ -12302,7 +12304,10 @@ int ObDMLResolver::resolve_external_table_generated_column(
                               table_item.table_id_, table_item.table_name_,
                               col.col_name_, cast_expr, column_schema,
                               column_index_type, file_column_idx, data_access_path,
-                              refined_expr_name, real_ref_expr))) {
+                              refined_expr_name,
+                              share::is_result_catalog_table(
+                                  table_schema->get_lake_table_format()),
+                              real_ref_expr))) {
             LOG_WARN("fail to build file column expr", K(ret));
           }
         }
@@ -13757,7 +13762,9 @@ int ObDMLResolver::resolve_function_table_column_item(const TableItem &table_ite
   OX (col_expr->set_column_id(column_id));
   OX (col_expr->set_column_name(column_name));
   OX (col_expr->set_table_item_info(table_item));
-  if (OB_SUCC(ret) && ob_is_enumset_tc(col_expr->get_data_type())) {
+  if (OB_SUCC(ret)
+      && ob_is_enumset_tc(col_expr->get_data_type())
+      && T_FUN_SYS_RESULT_SCAN != table_item.function_table_expr_->get_expr_type()) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("not support enum set in table function", K(ret));
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "enum set in table function");
@@ -14792,12 +14799,200 @@ int ObDMLResolver::resolve_function_table_column_item(const TableItem &table_ite
   if (OB_SUCC(ret)) {
     if (table_item.function_table_expr_->get_result_type().is_ext()) {
       ret = resolve_function_table_column_item_udf(table_item, col_items);
+    } else if (T_FUN_SYS_RESULT_SCAN == table_item.function_table_expr_->get_expr_type()) {
+      ret = resolve_function_table_column_item_result_scan(table_item, col_items);
     } else if (T_FUN_SYS_ARROW_STREAM == table_item.function_table_expr_->get_expr_type()) {
       ret = resolve_function_table_column_item_arrow_stream(table_item, col_items);
     } else if (T_FUN_SYS_ARROW_STREAMS == table_item.function_table_expr_->get_expr_type()) {
       ret = resolve_function_table_column_item_arrow_streams(table_item, col_items);
     } else {
       ret = resolve_function_table_column_item_sys_func(table_item, col_items);
+    }
+  }
+  return ret;
+}
+
+int ObDMLResolver::resolve_function_table_column_item_result_scan(
+    const TableItem &table_item,
+    ObIArray<ColumnItem> &col_items)
+{
+  int ret = OB_SUCCESS;
+  ObRawExpr *table_expr = nullptr;
+  ObDMLStmt *stmt = get_stmt();
+  ObString query_id;
+  int64_t requested_chunk_no = OB_INVALID_INDEX_INT64;
+  ObResultScanTableDesc result_table;
+  ObSEArray<sql::ObResultScanColDesc, 8> col_descs;
+  ObSqlSchemaGuard *sql_schema_guard = nullptr;
+  const ObTableSchema *result_table_schema = nullptr;
+
+  CK (OB_NOT_NULL(stmt));
+  CK (OB_NOT_NULL(stmt->get_query_ctx()));
+  CK (OB_LIKELY(table_item.is_function_table()));
+  CK (OB_NOT_NULL(table_expr = table_item.function_table_expr_));
+  CK (OB_NOT_NULL(params_.schema_checker_));
+  CK (OB_NOT_NULL(params_.expr_factory_));
+  CK (OB_NOT_NULL(params_.session_info_));
+  CK (OB_NOT_NULL(params_.allocator_));
+  if (OB_SUCC(ret)) {
+    // Mark RESULT_SCAN before preprocessing so ordinary queries skip its
+    // table-list scan. Keep the marker after the physical-table rewrite for
+    // plan-cache matching.
+    stmt->get_query_ctx()->set_has_result_scan_table(true);
+    sql_schema_guard = params_.schema_checker_->get_sql_schema_guard();
+    CK (OB_NOT_NULL(sql_schema_guard));
+  }
+  if (OB_SUCC(ret) && OB_INVALID_ID != table_item.ref_id_) {
+    bool found_resolved_column = false;
+    for (int64_t i = 0; OB_SUCC(ret) && i < stmt->get_column_size(); ++i) {
+      ColumnItem *column_item = stmt->get_column_item(i);
+      CK (OB_NOT_NULL(column_item));
+      if (OB_SUCC(ret) && OB_NOT_NULL(column_item)
+          && column_item->table_id_ == table_item.table_id_) {
+        OZ (col_items.push_back(*column_item));
+        found_resolved_column = true;
+      }
+    }
+    if (OB_SUCC(ret) && found_resolved_column) {
+      // RESULT_SCAN was already resolved for this TableItem.  Reuse its
+      // statement-local columns instead of checking the job and parsing
+      // metadata.json again.
+      return ret;
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(ObExprResultScan::extract_query_id_and_chunk_no(
+                         table_expr, query_id, requested_chunk_no))) {
+    LOG_WARN("failed to extract result_scan arguments", KR(ret));
+  }
+  if (OB_SUCC(ret) && OB_FAIL(ObResultScanCatalog::get_result_table(
+          query_id,
+          params_.session_info_,
+          sql_schema_guard,
+          *params_.allocator_,
+          result_table,
+          col_descs,
+          table_item.catalog_table_metadata_,
+          requested_chunk_no))) {
+    LOG_WARN("failed to resolve result_scan catalog", KR(ret), K(query_id));
+  }
+  if (OB_SUCC(ret)) {
+    // TableItem is logically completed by column resolution.  Keep the
+    // statement-local physical/mock schema identity so transform and codegen
+    // consume the exact schema registered above without re-entering Result
+    // Catalog (and without re-reading metadata.json).
+    const_cast<TableItem &>(table_item).ref_id_ = result_table.table_id_;
+    if (OB_NOT_NULL(result_table.catalog_table_metadata_)) {
+      const_cast<TableItem &>(table_item).catalog_table_metadata_ =
+          result_table.catalog_table_metadata_;
+    }
+  }
+  if (OB_SUCC(ret) && OB_NOT_NULL(result_table.catalog_table_metadata_)
+      && OB_FAIL(params_.schema_checker_->get_table_schema(
+             params_.session_info_->get_effective_tenant_id(),
+             table_item.ref_id_,
+             result_table_schema))) {
+    LOG_WARN("failed to get Result Catalog table schema", KR(ret), K(table_item));
+  } else if (OB_SUCC(ret) && OB_NOT_NULL(result_table.catalog_table_metadata_)
+             && OB_ISNULL(result_table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("Result Catalog table schema is null", KR(ret), K(table_item));
+  }
+
+  for (int64_t i = 0; OB_SUCC(ret) && i < col_descs.count(); ++i) {
+    const sql::ObResultScanColDesc &desc = col_descs.at(i);
+    ColumnItem *col_item = nullptr;
+    if (NULL != (col_item = stmt->get_column_item(table_item.table_id_, desc.col_name))) {
+      // already resolved
+    } else {
+      ObObjMeta meta;
+      meta.set_type(desc.ob_type);
+      meta.set_collation_type(desc.cs_type);
+      meta.set_collation_level(common::CS_LEVEL_IMPLICIT);
+      if (OB_FAIL(resolve_function_table_column_item(
+              table_item,
+              meta,
+              desc.accuracy,
+              desc.col_name,
+              desc.column_id,
+              col_item))) {
+        LOG_WARN("failed to resolve result_scan column", KR(ret), K(i));
+      } else if ((desc.ob_type == common::ObCollectionSQLType
+                  || ob_is_enumset_tc(desc.ob_type))
+                 && desc.subschema_id != UINT_MAX16
+                 && OB_NOT_NULL(col_item) && OB_NOT_NULL(col_item->expr_)) {
+        col_item->expr_->set_subschema_id(desc.subschema_id);
+        if (ob_is_enumset_tc(desc.ob_type)) {
+          col_item->expr_->mark_sql_enum_set_with_subschema();
+        }
+      }
+    }
+    if (OB_SUCC(ret) && OB_NOT_NULL(result_table_schema)) {
+      const ObColumnSchemaV2 *column_schema = nullptr;
+      ObRawExpr *file_column_expr = nullptr;
+      ObString refined_column_name;
+      ObString data_access_path;
+      uint64_t file_column_idx = OB_INVALID_ID;
+      if (OB_ISNULL(col_item) || OB_ISNULL(col_item->expr_)
+          || !col_item->expr_->is_column_ref_expr()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid Result Catalog output column expression",
+                 KR(ret), K(i), KP(col_item));
+      } else if (OB_ISNULL(column_schema =
+                                result_table_schema->get_column_schema(desc.column_id))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("Result Catalog output column is absent from its schema",
+                 KR(ret), K(i), K(desc), K(table_item));
+      } else if (column_schema->get_column_id() < OB_APP_MIN_COLUMN_ID) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid Result Catalog output column id",
+                 KR(ret), K(i), KPC(column_schema));
+      } else if (OB_NOT_NULL(col_item->expr_->get_dependant_expr())) {
+        // A repeated function-table resolution reuses the already bound
+        // statement-local physical source expression.
+      } else if (FALSE_IT(file_column_idx = column_schema->get_column_id()
+                                             - OB_APP_MIN_COLUMN_ID + 1)) {
+      } else if (OB_FAIL(ObResolverUtils::build_refined_external_column_expr_name(
+                             *params_.allocator_,
+                             params_.session_info_,
+                             nullptr /* get_path_expr */,
+                             ColumnIndexType::POSITION,
+                             file_column_idx,
+                             refined_column_name,
+                             data_access_path))) {
+        LOG_WARN("failed to build Result Catalog physical column name",
+                 KR(ret), K(i), K(file_column_idx));
+      } else if (OB_FAIL(ObResolverUtils::build_file_column_expr_for_parquet(
+                             *params_.expr_factory_,
+                             *params_.session_info_,
+                             table_item.table_id_,
+                             table_item.table_name_,
+                             desc.col_name,
+                             nullptr /* cast_expr */,
+                             column_schema,
+                             ColumnIndexType::POSITION,
+                             file_column_idx,
+                             data_access_path,
+                             refined_column_name,
+                             true /* preserve_ob_type */,
+                             file_column_expr))) {
+        LOG_WARN("failed to build Result Catalog physical file column",
+                 KR(ret), K(i), K(file_column_idx), K(desc));
+      } else if (OB_FAIL(file_column_expr->add_relation_id(
+                             stmt->get_table_bit_index(table_item.table_id_)))) {
+        LOG_WARN("failed to relate Result Catalog physical file column",
+                 KR(ret), K(i), K(file_column_idx), K(table_item));
+      } else {
+        // This is deliberately not T_FUN_COLUMN_CONV.  The Result Parquet
+        // reader decodes its private Arrow representation directly into the
+        // published OB type; the dependency only binds that logical column to
+        // its physical Parquet field and lets the existing reader skip a
+        // second generic conversion.
+        col_item->expr_->set_dependant_expr(file_column_expr);
+      }
+    }
+    if (OB_SUCC(ret)) {
+      CK (OB_NOT_NULL(col_item));
+      OZ (col_items.push_back(*col_item));
     }
   }
   return ret;

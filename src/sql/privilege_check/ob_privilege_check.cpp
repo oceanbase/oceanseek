@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX SQL_SESSION
 #include "sql/privilege_check/ob_privilege_check.h"
+#include "observer/dbms_scheduler/ob_dbms_sched_job_utils.h"
 
 #include "sql/resolver/ddl/ob_create_table_stmt.h"
 #include "sql/resolver/ddl/ob_create_mlog_stmt.h"
@@ -52,6 +53,7 @@
 #include "sql/optimizer/ob_optimizer_util.h"
 #include "sql/resolver/cmd/ob_event_stmt.h"
 #include "sql/resolver/cmd/ob_location_utils_stmt.h"
+#include "sql/session/ob_sql_session_info.h"
 
 namespace oceanbase {
 using namespace share;
@@ -4120,6 +4122,32 @@ int adjust_session_priv(ObSchemaGetterGuard &schema_guard,
   return ret;
 }
 
+static bool is_matching_async_result_outfile(const ObSqlCtx &ctx,
+                                             const dbms_scheduler::ObDBMSSchedJobInfo *job_info)
+{
+  bool is_match = false;
+  if (OB_NOT_NULL(ctx.cur_stmt_)
+      && stmt::T_SELECT == ctx.cur_stmt_->get_stmt_type()
+      && OB_NOT_NULL(ctx.session_info_)
+      && ctx.session_info_->is_async_result_parquet()
+      && OB_NOT_NULL(job_info)
+      && job_info->is_async_query_job()) {
+    const ObSelectStmt *select_stmt = static_cast<const ObSelectStmt *>(ctx.cur_stmt_);
+    const ObSelectIntoItem *into_item = select_stmt->get_select_into();
+    if (select_stmt->is_select_into_outfile()
+        && OB_NOT_NULL(into_item)
+        && into_item->async_result_) {
+      // The resolver sets async_result_ only after validating the exact reserved URI.
+      // The parsed outfile name can still be an UNKNOWN parameter here.
+      is_match = OB_INVALID_ID != job_info->get_job_id()
+          && job_info->get_tenant_id() == ctx.session_info_->get_effective_tenant_id()
+          && into_item->async_result_tenant_id_ == job_info->get_tenant_id()
+          && into_item->async_result_job_id_ == job_info->get_job_id();
+    }
+  }
+  return is_match;
+}
+
 int ObPrivilegeCheck::check_privilege(
     const ObSqlCtx &ctx,
     const ObStmtNeedPrivs &stmt_need_priv)
@@ -4129,11 +4157,50 @@ int ObPrivilegeCheck::check_privilege(
     //do not check privilege
   } else {
     ObSessionPrivInfo session_priv;
+    ObArenaAllocator async_query_priv_allocator("AsyncQueryPriv");
+    ObStmtNeedPrivs async_query_need_privs(async_query_priv_allocator);
+    const ObStmtNeedPrivs *need_privs_to_check = &stmt_need_priv;
     if (OB_ISNULL(ctx.session_info_) || OB_ISNULL(ctx.schema_guard_)) {
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("Session is NULL");
     } else {
-      if (OB_FAIL(ctx.session_info_->get_session_priv_info(session_priv))) {
+      const dbms_scheduler::ObDBMSSchedJobInfo *job_info = ctx.session_info_->get_job_info();
+      const bool is_async_select_query =
+          ctx.disable_privilege_check_ == PRIV_CHECK_FLAG_ASYNC_SELECT_QUERY;
+      const bool is_async_query_outfile = is_matching_async_result_outfile(ctx, job_info);
+      if ((OB_NOT_NULL(job_info) && job_info->is_async_query_job())
+          || is_async_select_query) {
+        if (OB_FAIL(async_query_need_privs.need_privs_.init(stmt_need_priv.need_privs_.count()))) {
+          LOG_WARN("failed to initialize async query privilege list", KR(ret));
+        }
+        for (int64_t i = 0; OB_SUCC(ret) && i < stmt_need_priv.need_privs_.count(); ++i) {
+          const ObNeedPriv &need_priv = stmt_need_priv.need_privs_.at(i);
+          const bool is_async_query_result_target_priv =
+              OB_PRIV_TABLE_LEVEL == need_priv.priv_level_
+              && (OB_PRIV_CREATE | OB_PRIV_INSERT) == need_priv.priv_set_
+              && OB_NOT_NULL(job_info)
+              && job_info->is_async_query_result_target(need_priv.db_, need_priv.table_);
+          const bool is_async_select_query_target_priv =
+              is_async_select_query
+              && OB_PRIV_TABLE_LEVEL == need_priv.priv_level_
+              && OB_PRIV_INSERT == need_priv.priv_set_;
+          const bool is_async_query_outfile_priv =
+              is_async_query_outfile
+              && OB_PRIV_USER_LEVEL == need_priv.priv_level_
+              && OB_PRIV_FILE == need_priv.priv_set_;
+          if (!is_async_query_result_target_priv
+              && !is_async_select_query_target_priv
+              && !is_async_query_outfile_priv
+              && OB_FAIL(async_query_need_privs.need_privs_.push_back(need_priv))) {
+            LOG_WARN("failed to copy async query privilege", KR(ret), K(need_priv));
+          }
+        }
+        if (OB_SUCC(ret)) {
+          need_privs_to_check = &async_query_need_privs;
+        }
+      }
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(ctx.session_info_->get_session_priv_info(session_priv))) {
         LOG_WARN("fail to get session priv info", K(ret));
       } else if (ctx.session_info_->get_user_id() != ctx.session_info_->get_priv_user_id()
           && OB_FAIL(adjust_session_priv(*ctx.schema_guard_, session_priv))) {
@@ -4143,7 +4210,7 @@ int ObPrivilegeCheck::check_privilege(
         LOG_WARN("Session priv is invalid", "tenant_id", session_priv.tenant_id_,
                  "user_id", session_priv.user_id_, K(ret));
       } else if (OB_FAIL(const_cast<ObSchemaGetterGuard *>(ctx.schema_guard_)->check_priv(
-               session_priv, ctx.session_info_->get_enable_role_array(), stmt_need_priv))) {
+               session_priv, ctx.session_info_->get_enable_role_array(), *need_privs_to_check))) {
         LOG_WARN("No privilege", K(session_priv),
                  "disable check", ctx.disable_privilege_check_, K(ret));
       } else {

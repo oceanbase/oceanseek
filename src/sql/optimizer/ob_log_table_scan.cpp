@@ -8,6 +8,7 @@
 #include "sql/optimizer/ob_log_join.h"
 #include "share/vector_index/ob_vector_index_util.h"
 #include "share/domain_id/ob_domain_id.h"
+#include "share/catalog/ob_catalog_properties.h"
 #include "share/external_table/ob_external_table_utils.h"
 #include "plugin/legacy/interface/ob_plugin_external_intf.h"
 #include "sql/optimizer/ob_lake_table_partition_info.h"
@@ -1191,6 +1192,12 @@ int ObLogTableScan::extract_pushdown_filters(ObIArray<ObRawExpr*> &nonpushdown_f
         LOG_WARN("get unexpected null", K(ret));
       } else if (OB_FAIL(ObSQLUtils::get_external_table_type(table_schema, external_table_type))) {
           LOG_WARN("failed to get external table type", K(ret));
+      } else if (share::is_result_catalog_table(table_schema->get_lake_table_format())) {
+        // Result Catalog Parquet values use a private Arrow-to-OB codec.  A
+        // predicate on logical OB values cannot be evaluated on those stored
+        // values until the codec is applied, so keep every filter above the scan.
+        scan_pushdown_filters.reset();
+        need_dup_filter = true;
       } else if (ObExternalFileFormat::JAVA_PLUGIN_FORMAT == external_table_type) {
         ObArray<ObString> tmp_external_filters;
         if (OB_ISNULL(external_pushdown_filters)) {

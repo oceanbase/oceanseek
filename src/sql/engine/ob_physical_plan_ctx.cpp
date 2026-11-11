@@ -115,6 +115,7 @@ ObPhysicalPlanCtx::ObPhysicalPlanCtx(common::ObIAllocator &allocator)
       check_pdml_affected_rows_(false),
       enable_adaptive_pc_(false)
 {
+  async_result_files_.set_attr(ObMemAttr(MTL_ID(), "ResultFiles"));
 }
 
 ObPhysicalPlanCtx::~ObPhysicalPlanCtx()
@@ -1758,6 +1759,21 @@ int ObPhysicalPlanCtx::set_iceberg_data_files(const common::ObIArray<iceberg::Ob
     } else {
       OZ(data_file->assign(data_files.at(i)));
       OZ(iceberg_data_files_.push_back(data_file));
+    }
+  }
+  return ret;
+}
+
+int ObPhysicalPlanCtx::add_async_result_files(
+    const common::ObIArray<ObAsyncResultFileDesc> &files)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < files.count(); ++i) {
+    if (OB_UNLIKELY(!files.at(i).is_valid())) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid async result file", K(ret), K(i));
+    } else if (OB_FAIL(async_result_files_.push_back(files.at(i)))) {
+      LOG_WARN("failed to add async result file", K(ret), K(i));
     }
   }
   return ret;

@@ -509,7 +509,8 @@ int ObGranuleIteratorOp::try_fetch_task(
         }
       }
     } else {
-      const bool from_share_pool = !MY_SPEC.affinitize_ && !MY_SPEC.access_all_;
+      const bool from_share_pool = !MY_SPEC.affinitize_ && !MY_SPEC.access_all_
+                                   && GIT_RESULT_ORDERED != splitter_type_;
       uint64_t fetched_task_cnt = round_robin && from_share_pool ?
                                    rescan_tasks_info_.get_rescan_task_count() :
                                    0;
@@ -797,6 +798,15 @@ int ObGranuleIteratorOp::inner_open()
         // 因为 partition wise的情况下，获得GI task array是直接通过 `pw_dml_tsc_ids_` 数组类实现的
         tsc_op_id_ = real_child->get_spec().id_;
         real_child_ = real_child;
+        if (GIT_RANDOM == splitter_type_
+            && (PHY_TABLE_SCAN == real_child_->get_spec().type_
+                || IS_SAMPLE_SCAN(real_child_->get_spec().type_))) {
+          const ObTableScanSpec &scan_spec =
+              static_cast<const ObTableScanSpec &>(real_child_->get_spec());
+          if (scan_spec.result_writer_ordered_) {
+            splitter_type_ = GIT_RESULT_ORDERED;
+          }
+        }
       }
     }
   }

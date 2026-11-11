@@ -12,6 +12,7 @@
 #include "lib/mysqlclient/ob_isql_client.h"
 #include "lib/container/ob_iarray.h"
 #include "lib/number/ob_number_v2.h"
+#include "lib/string/ob_sql_string.h"
 
 
 #define DATA_VERSION_SUPPORT_JOB_CLASS(data_version) (data_version >= DATA_VERSION_4_3_2_0)
@@ -33,6 +34,7 @@ namespace common
 {
 
 class ObMySQLProxy;
+class ObMySQLTransaction;
 class ObString;
 class ObIAllocator;
 class ObString;
@@ -54,12 +56,51 @@ namespace share
 namespace schema
 {
 class ObSchemaGetterGuard;
+class ObSysVariableSchema;
 class ObUserInfo;
 }
 }
 
 namespace dbms_scheduler
 {
+enum class ObAsyncQueryResultStore
+{
+  NATIVE,
+  EXTERNAL
+};
+
+class ObAsyncQueryJobConfig
+{
+public:
+  ObAsyncQueryJobConfig()
+      : hint_line_(),
+        result_store_(ObAsyncQueryResultStore::NATIVE)
+  {}
+
+  void reset()
+  {
+    hint_line_.reset();
+    result_store_ = ObAsyncQueryResultStore::NATIVE;
+  }
+
+  int deserialize(const common::ObString &job_config,
+                  common::ObIAllocator &allocator);
+  int serialize(common::ObIAllocator &allocator,
+                common::ObString &job_config) const;
+
+  const common::ObString &get_hint_line() const { return hint_line_; }
+  ObAsyncQueryResultStore get_result_store() const { return result_store_; }
+  void set_hint_line(const common::ObString &hint_line) { hint_line_ = hint_line; }
+  void set_result_store(const ObAsyncQueryResultStore result_store)
+  {
+    result_store_ = result_store;
+  }
+
+private:
+  common::ObString hint_line_;
+  ObAsyncQueryResultStore result_store_;
+};
+
 enum class ObDBMSSchedFuncType : uint64_t
 {
   USER_JOB = 0,
@@ -199,10 +240,10 @@ public:
             && !exec_env_.empty();
   }
 
-  uint64_t get_tenant_id() { return tenant_id_; }
+  uint64_t get_tenant_id() const { return tenant_id_; }
   uint64_t get_user_id() { return user_id_; }
   uint64_t get_database_id() { return database_id_; }
-  uint64_t get_job_id() { return job_; }
+  uint64_t get_job_id() const { return job_; }
   uint64_t get_job_id_with_tenant() { return common::combine_two_ids(tenant_id_, job_); }
   int64_t  get_this_date() { return this_date_; }
   int64_t  get_next_date() { return next_date_; }
@@ -243,6 +284,19 @@ public:
   bool is_mview_job() const { return ObDBMSSchedFuncType::MVIEW_JOB == get_func_type(); }
   bool is_mysql_event_job() const { return ObDBMSSchedFuncType::MYSQL_EVENT_JOB == get_func_type(); }
   bool is_olap_async_job() const { return ObDBMSSchedFuncType::OLAP_ASYNC_JOB == get_func_type(); }
+  bool is_async_query_job() const { return ObDBMSSchedFuncType::ASYNC_QUERY_JOB == get_func_type(); }
+  bool is_async_result_cleanup_job() const
+  {
+    return ObDBMSSchedFuncType::ASYNC_RESULT_CLEANUP_JOB == get_func_type();
+  }
+  bool is_olap_async_job_family() const { return is_olap_async_job() || is_async_query_job(); }
+  int build_async_query_result_table_name(common::ObSqlString &table_name) const;
+  bool is_async_query_result_target(const common::ObString &database_name,
+                                    const common::ObString &table_name) const;
+  static common::ObString get_async_query_result_catalog_name()
+  { return common::ObString::make_string(common::OB_INTERNAL_CATALOG_NAME); }
+  static common::ObString get_async_query_result_database_name()
+  { return common::ObString::make_string(common::OB_ASYNC_QUERY_RESULT_DATABASE_NAME); }
   bool is_stats_maintenance_job() const { return ObDBMSSchedFuncType::STAT_MAINTENANCE_JOB == get_func_type(); }
   bool is_trigger_part_balance_job() const { return ObDBMSSchedFuncType::NODE_BALANCE_JOB == get_func_type(); }
   bool is_dynamic_partition_job() const {return ObDBMSSchedFuncType::DYNAMIC_PARTITION_MANAGE_JOB == get_func_type(); }
@@ -430,6 +484,19 @@ public:
 
   //TO DO DELETE 连雨
   static int generate_job_id(int64_t tenant_id, int64_t &max_job_id);
+  // The tenant data-version gate alone does not imply that the all-version
+  // post-action has installed the async result database and cleanup job.
+  static int check_async_query_result_ready(
+      const uint64_t tenant_id,
+      share::schema::ObSchemaGetterGuard &schema_guard,
+      common::ObISQLClient &sql_client);
+  // Idempotently creates the scheduler job that reaps expired async-query
+  // results.  It is shared by tenant creation and the upgrade post-action so
+  // existing tenants receive the same job as newly created tenants.
+  static int ensure_async_result_cleanup_job(
+      const share::schema::ObSysVariableSchema &sys_variable,
+      const uint64_t tenant_id,
+      common::ObMySQLTransaction &trans);
   /**
    * @brief  创建一个 job
    * @param [in] sql_client

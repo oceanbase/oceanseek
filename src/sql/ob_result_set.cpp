@@ -18,6 +18,8 @@
 #include "src/sql/ob_sql_ccl_rule_manager.h"
 #include "sql/table_format/iceberg/ob_iceberg_table_metadata.h"
 #include "sql/table_format/iceberg/write/ob_snapshot_producer.h"
+#include "sql/result_catalog/ob_async_result_metadata.h"
+#include "sql/engine/basic/ob_select_into_op.h"
 
 using namespace oceanbase::sql;
 using namespace oceanbase::common;
@@ -25,6 +27,45 @@ using namespace oceanbase::share;
 using namespace oceanbase::share::schema;
 using namespace oceanbase::storage;
 using namespace oceanbase::transaction;
+
+namespace
+{
+
+int find_async_result_select_into_spec(ObPhysicalPlan &physical_plan,
+                                       const ObSelectIntoSpec *&async_result_spec)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<const ObOpSpec *, 16> all_specs;
+  async_result_spec = NULL;
+  if (OB_ISNULL(physical_plan.get_root_op_spec())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("physical plan root spec is null", K(ret));
+  } else if (OB_FAIL(physical_plan.get_all_spec_op(
+                         all_specs, *physical_plan.get_root_op_spec()))) {
+    LOG_WARN("failed to enumerate physical plan specs", K(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < all_specs.count(); ++i) {
+    const ObOpSpec *spec = all_specs.at(i);
+    if (OB_ISNULL(spec)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("physical plan contains null spec", K(ret), K(i));
+    } else if (PHY_SELECT_INTO == spec->type_) {
+      const ObSelectIntoSpec *select_into_spec =
+          static_cast<const ObSelectIntoSpec *>(spec);
+      if (select_into_spec->async_result_target_.enabled_) {
+        if (OB_NOT_NULL(async_result_spec)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("multiple async result sinks in one physical plan", K(ret));
+        } else {
+          async_result_spec = select_into_spec;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+} // namespace
 
 ObResultSet::~ObResultSet()
 {
@@ -978,6 +1019,7 @@ OB_INLINE int ObResultSet::do_close_plan(int errcode, ObExecContext &ctx,
     // 通知该plan的所有task删掉对应的中间结果
     int close_ret = OB_SUCCESS;
     ObPhysicalPlanCtx *plan_ctx = NULL;
+    const ObSelectIntoSpec *async_result_spec = NULL;
     if (OB_ISNULL(plan_ctx = get_exec_context().get_physical_plan_ctx())) {
       close_ret = OB_ERR_UNEXPECTED;
       LOG_WARN("physical plan ctx is null");
@@ -1016,18 +1058,32 @@ OB_INLINE int ObResultSet::do_close_plan(int errcode, ObExecContext &ctx,
       }
     }
 
-    if (plan_ctx->get_lake_table_metadata() != NULL
-        && plan_ctx->get_iceberg_data_files().count() > 0
+    if (my_session_.is_async_result_parquet()) {
+      const int find_async_result_ret =
+          find_async_result_select_into_spec(*physical_plan_, async_result_spec);
+      if (OB_SUCCESS != find_async_result_ret) {
+        if (OB_SUCC(ret)) {
+          ret = find_async_result_ret;
+        }
+        LOG_WARN("failed to find async result sink", K(ret), K(find_async_result_ret));
+      }
+    }
+
+    if (OB_ISNULL(async_result_spec)
         && OB_SUCCESS == close_ret
-        && (OB_SUCCESS == errcode || OB_ITER_END == errcode)) {
-      const iceberg::ObIcebergTableMetadata& iceberg_table_metadata =
-        *static_cast<const iceberg::ObIcebergTableMetadata*>(plan_ctx->get_lake_table_metadata());
-      ObArenaAllocator tmp_allocator;
-      iceberg::ObSnapshotProducer snapshot_producer(iceberg_table_metadata,
-                                                    tmp_allocator,
-                                                    plan_ctx->get_iceberg_data_files());
-      OZ(snapshot_producer.init());
-      OZ(snapshot_producer.commit());
+        && (OB_SUCCESS == errcode || OB_ITER_END == errcode)
+        && OB_SUCC(ret)) {
+      if (plan_ctx->get_lake_table_metadata() != NULL
+          && plan_ctx->get_iceberg_data_files().count() > 0) {
+        const iceberg::ObIcebergTableMetadata& iceberg_table_metadata =
+          *static_cast<const iceberg::ObIcebergTableMetadata*>(plan_ctx->get_lake_table_metadata());
+        ObArenaAllocator tmp_allocator;
+        iceberg::ObSnapshotProducer snapshot_producer(iceberg_table_metadata,
+                                                      tmp_allocator,
+                                                      plan_ctx->get_iceberg_data_files());
+        OZ(snapshot_producer.init());
+        OZ(snapshot_producer.commit());
+      }
     }
 //    // 必须要在executor_.execute_plan运行之后再调用exec_result_的一系列函数。
 //    if (OB_FAIL(exec_result_.close(ctx))) {
@@ -1058,6 +1114,28 @@ OB_INLINE int ObResultSet::do_close_plan(int errcode, ObExecContext &ctx,
     if (OB_SUCC(ret)) {
       if (OB_FAIL(deal_feedback_info(physical_plan_, rollback, ctx))) {
         LOG_WARN("fail to deal feedback info", K(ret));
+      }
+    }
+    if (OB_NOT_NULL(async_result_spec)) {
+      const bool statement_succeeded =
+          OB_SUCC(ret)
+          && OB_SUCCESS == close_ret
+          && (OB_SUCCESS == errcode || OB_ITER_END == errcode);
+      if (statement_succeeded) {
+        const int publish_ret = ObAsyncResultMetadataPublisher::publish(
+            ctx, *async_result_spec, plan_ctx->get_async_result_files());
+        if (OB_SUCCESS != publish_ret) {
+          ret = publish_ret;
+          LOG_WARN("failed to publish async result metadata", K(ret));
+        }
+      }
+      if (!statement_succeeded || OB_SUCCESS != ret) {
+        const int cleanup_ret =
+            ObAsyncResultMetadataPublisher::cleanup(*async_result_spec);
+        if (OB_SUCCESS != cleanup_ret) {
+          LOG_WARN("failed to clean unsuccessful async result",
+                   K(cleanup_ret), K(ret), K(close_ret), K(errcode));
+        }
       }
     }
   } else {

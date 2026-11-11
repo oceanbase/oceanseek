@@ -917,6 +917,7 @@ public:
     uint64_t column_idx,
     const common::ObString &data_access_path,
     const common::ObString &refined_column_name,
+    bool preserve_ob_type,
     ObRawExpr *&expr);
   //only used for DDL resolver, resolve a PSEUDO column expr for validation and printer not for execution
   static int resolve_external_table_column_def(ObRawExprFactory &expr_factory,

@@ -182,6 +182,7 @@ ObSQLSessionInfo::ObSQLSessionInfo(const uint64_t tenant_id) :
       client_non_standard_(false),
       is_session_sync_support_(false),
       job_info_(nullptr),
+      async_result_parquet_(false),
       failover_mode_(false),
       service_name_(),
       executing_sql_stat_record_(),
@@ -414,6 +415,7 @@ void ObSQLSessionInfo::reset(bool skip_sys_var)
   need_send_feedback_proxy_info_ = false;
   is_lock_session_ = false;
   job_info_ = nullptr;
+  async_result_parquet_ = false;
   need_send_feedback_proxy_info_ = false;
   is_lock_session_ = false;
   failover_mode_ = false;

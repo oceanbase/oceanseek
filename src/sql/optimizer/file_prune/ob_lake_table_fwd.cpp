@@ -206,6 +206,8 @@ int ObOptHiveFile::assign(const ObIOptLakeTableFile &other)
       file_size_ = hive_file.file_size_;
       modification_time_ = hive_file.modification_time_;
       part_id_ = hive_file.part_id_;
+      first_lineno_ = hive_file.first_lineno_;
+      last_lineno_ = hive_file.last_lineno_;
     }
   }
   return ret;
@@ -218,6 +220,8 @@ void ObOptHiveFile::reset()
   file_size_ = 0;
   modification_time_ = 0;
   part_id_ = OB_INVALID_PARTITION_ID;
+  first_lineno_ = 1;
+  last_lineno_ = INT64_MAX;
 }
 
 int ObOptPluginFile::assign(const ObIOptLakeTableFile &other)
@@ -395,6 +399,8 @@ int ObHiveScanTask::init_with_opt_lake_table_file(ObIAllocator &allocator,
       file_size_ = opt_hive_file.file_size_;
       modification_time_ = opt_hive_file.modification_time_;
       part_id_ = opt_hive_file.part_id_;
+      first_lineno_ = opt_hive_file.first_lineno_;
+      last_lineno_ = opt_hive_file.last_lineno_;
     }
   }
   return ret;

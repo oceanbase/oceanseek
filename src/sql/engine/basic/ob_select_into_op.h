@@ -28,6 +28,7 @@
 #include <parquet/api/writer.h>
 #include "sql/engine/basic/ob_select_into_basic.h"
 #include "sql/engine/basic/ob_external_file_writer.h"
+#include "sql/result_catalog/ob_async_result_arrow_codec.h"
 #include "sql/resolver/dml/ob_select_stmt.h"
 #include "sql/engine/table/ob_odps_table_utils.h"
 #include "lib/number/ob_number_v2.h"
@@ -63,7 +64,9 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObSelectIntoOpInput);
 };
 
-// Serialization placeholder for async result targets.
+// Physical-plan input for the server-owned Result Catalog write target.
+// The published result is represented separately by ObResultCatalogTableMetadata
+// when RESULT_SCAN builds its read-side relation.
 struct ObAsyncResultTargetInfo
 {
   explicit ObAsyncResultTargetInfo(common::ObIAllocator &alloc)
@@ -197,6 +200,8 @@ public:
       need_commit_(true),
       arrow_alloc_(),
       parquet_writer_schema_(nullptr),
+      async_result_arrow_write_plan_(),
+      async_result_arrow_schema_(nullptr),
       orc_schema_(nullptr),
       array_helpers_(),
       export_csv_header_(false)
@@ -379,7 +384,12 @@ private:
   int get_parquet_physical_type(parquet::Type::type &physical_type, const ObObjType &obj_type);
   int calc_parquet_decimal_length(int precision);
   int setup_parquet_schema();
+  int setup_async_result_arrow_schema();
+  bool is_async_result_parquet_sink() const;
+  int get_async_result_writer_identity(int64_t &sqc_id, int64_t &task_id);
+  int resolve_async_result_internal_uri();
   int into_outfile_batch_parquet(const ObBatchRows &brs_, ObExternalFileWriter *data_writer);
+  int into_async_result_batch_parquet(const ObBatchRows &brs_, ObExternalFileWriter *data_writer);
   int check_parquet_file_size(ObParquetFileWriter &data_writer);
   int build_parquet_cell(parquet::RowGroupWriter* rg_writer,
                          const ObDatumMeta &datum_meta,
@@ -475,6 +485,9 @@ private:
   ObString basic_url_; // url without partition expr
   common::ObObjectStorageInfo *access_info_;
   share::ObExternalTableStorageInfo backup_info_;
+  // Owns the cluster-data-store access object when async_result_ resolves the
+  // reserved internal:// sink. Credentials are never populated from SQL text.
+  share::ObBackupDest async_result_storage_dest_;
   share::ObHDFSStorageInfo hdfs_info_;
   IntoFileLocation file_location_;
   int64_t write_offset_;
@@ -515,6 +528,8 @@ private:
   // Handle parquet variables
   ObArrowMemPool arrow_alloc_;
   std::shared_ptr<parquet::schema::GroupNode> parquet_writer_schema_;
+  ObAsyncResultArrowWritePlan async_result_arrow_write_plan_;
+  std::shared_ptr<arrow::Schema> async_result_arrow_schema_;
   static const int64_t SHARED_BUFFER_SIZE = 2LL * 1024 * 1024;
   static const int64_t MAX_OSS_FILE_SIZE = 5LL * 1024 * 1024 * 1024;
   static const int32_t ODPS_DATE_MIN_VAL = -719162; // '0001-1-1'

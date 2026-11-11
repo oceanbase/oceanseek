@@ -2205,6 +2205,8 @@ public:
   int sql_sess_record_sql_stat_start_value(ObExecutingSqlStatRecord& executing_sqlstat);
   dbms_scheduler::ObDBMSSchedJobInfo *get_job_info() const { return job_info_; }
   void set_job_info(dbms_scheduler::ObDBMSSchedJobInfo *job_info) { job_info_ = job_info; }
+  bool is_async_result_parquet() const { return async_result_parquet_; }
+  void set_async_result_parquet(const bool value) { async_result_parquet_ = value; }
   void *get_external_resource_schema_cache() { return external_resource_schema_cache_; }
   void set_external_resource_schema_cache(void *cache) { external_resource_schema_cache_ = cache; }
   void set_retry_wait_event_begin_time();
@@ -2254,6 +2256,9 @@ private:
   bool is_session_sync_support_; // session_sync_support flag.
   share::schema::ObUserLoginInfo login_info_;
   dbms_scheduler::ObDBMSSchedJobInfo *job_info_; // dbms_scheduler related.
+  // Trusted, statement-scoped marker set only by the async-query scheduler.
+  // It routes the generated SELECT INTO through the private result sink.
+  bool async_result_parquet_;
   bool failover_mode_;
   ObServiceNameString service_name_;
   common::ObString audit_filter_name_;

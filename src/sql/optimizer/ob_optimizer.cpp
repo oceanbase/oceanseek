@@ -858,6 +858,8 @@ int ObOptimizer::extract_opt_ctx_basic_flags(const ObDMLStmt &stmt, ObSQLSession
   bool exists_partition_wise_plan_enabled_hint = false;
   omt::ObTenantConfigGuard tenant_config(TENANT_CONF(session.get_effective_tenant_id()));
   bool rowsets_enabled = true;
+  const int64_t async_result_parquet_row_group_rows =
+      session.get_async_result_parquet_row_group_rows();
   ctx_.set_is_online_ddl(session.get_ddl_info().is_ddl());  // set is online ddl first, is used by other extract operations
   bool das_keep_order_enabled = tenant_config.is_valid() && tenant_config->_enable_das_keep_order;
   bool hash_join_enabled = tenant_config.is_valid() && tenant_config->_hash_join_enabled;
@@ -869,6 +871,7 @@ int ObOptimizer::extract_opt_ctx_basic_flags(const ObDMLStmt &stmt, ObSQLSession
   bool is_partial_group_by_pushdown_enabled = true;
   bool is_partial_limit_pushdown_enabled = true;
   bool is_partial_distinct_pushdown_enabled = true;
+  bool is_result_scan_ordered_read_enabled = false;
   int64_t pushdown_storage_level = tenant_config.is_valid() ? tenant_config->_pushdown_storage_level : INT64_MAX;
   bool enable_use_batch_nlj = false;
   bool better_inlist_costing = false;
@@ -914,6 +917,8 @@ int ObOptimizer::extract_opt_ctx_basic_flags(const ObDMLStmt &stmt, ObSQLSession
     LOG_WARN("fail to check pushdown partial limit enabled", K(ret));
   } else if (OB_FAIL(opt_params.get_bool_opt_param(ObOptParamHint::ENABLE_PARTIAL_DISTINCT_PUSHDOWN, is_partial_distinct_pushdown_enabled))) {
     LOG_WARN("fail to check pushdown partial distinct enabled", K(ret));
+  } else if (OB_FAIL(opt_params.get_bool_opt_param(ObOptParamHint::ENABLE_RESULT_SCAN_ORDERED_READ, is_result_scan_ordered_read_enabled))) {
+    LOG_WARN("failed to check Result scan ordered read enabled", K(ret));
   } else if (OB_FAIL(opt_params.get_integer_opt_param(ObOptParamHint::PUSHDOWN_STORAGE_LEVEL, pushdown_storage_level))) {
     LOG_WARN("failed to get pushdown storage level opt param", K(ret));
   } else if (OB_FAIL(stmt.check_has_cursor_expression(has_cursor_expr))) {
@@ -1002,7 +1007,9 @@ int ObOptimizer::extract_opt_ctx_basic_flags(const ObDMLStmt &stmt, ObSQLSession
     ctx_.set_enable_partial_distinct_pushdown(ctx_.get_query_ctx()->check_opt_compat_version(COMPAT_VERSION_4_4_1)
                                               && is_partial_distinct_pushdown_enabled
                                               && aggr_pushdown_allowed);
+    ctx_.set_enable_result_scan_ordered_read(is_result_scan_ordered_read_enabled);
     ctx_.set_rowsets_enabled(rowsets_enabled);
+    ctx_.set_async_result_parquet_row_group_rows(async_result_parquet_row_group_rows);
     ctx_.set_enable_storage_groupby_pushdown(ObPushdownFilterUtils::is_group_by_pushdown_enabled(pushdown_storage_level) && rowsets_enabled);
     ctx_.set_enable_storage_aggr_pushdown(ObPushdownFilterUtils::is_aggregate_pushdown_enabled(pushdown_storage_level));
     ctx_.set_enable_rich_vector_format(rowsets_enabled && session.use_rich_format());

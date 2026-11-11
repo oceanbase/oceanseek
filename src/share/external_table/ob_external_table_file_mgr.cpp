@@ -640,6 +640,36 @@ int ObExternalTableFileManager::get_mocked_external_table_files(
   }
 
   if (OB_FAIL(ret)) {
+  } else if (share::is_result_catalog_table(das_ctdef.lake_table_format_)) {
+    // Result Catalog's immutable metadata.json is the authoritative manifest.
+    // Each partition_info is one exact data file copied from that manifest by
+    // codegen.  Never list the result root: doing so could expose partial,
+    // stale, or unrelated objects and would make publication non-atomic.
+    for (int64_t i = 0; OB_SUCC(ret) && i < das_ctdef.partition_infos_.count(); ++i) {
+      const share::ObExternalTablePartInfo &part_info = das_ctdef.partition_infos_.at(i);
+      ObExternalFileInfo file;
+      if (part_info.partition_spec_.empty()) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("empty file path in result catalog manifest", K(ret), K(i), K(part_info));
+      } else {
+        file.file_id_ = i + 1;
+        file.part_id_ = part_info.part_id_;
+        file.file_url_ = part_info.partition_spec_;
+        // The current manifest does not carry object-store modification time
+        // or content digest.  The task builder resolves basic file information
+        // for this exact path before opening it; no directory listing is used.
+        file.file_size_ = OB_INVALID_SIZE;
+        file.modify_time_ = OB_INVALID_TIMESTAMP;
+        if (OB_FAIL(external_files.push_back(file))) {
+          LOG_WARN("failed to append result catalog file", K(ret), K(i), K(part_info));
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      LOG_TRACE("materialized Result Catalog external files",
+               K(tenant_id), "manifest_file_count", das_ctdef.partition_infos_.count(),
+               "external_file_count", external_files.count());
+    }
   } else if (share::is_hive_lake_table(das_ctdef.lake_table_format_)) {
     // HMS format does not need regexp_vars.
     bool is_local_file_on_disk

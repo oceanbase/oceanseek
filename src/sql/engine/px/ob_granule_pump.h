@@ -198,7 +198,8 @@ public:
   int get_next_gi_task_pos(int64_t &pos);
   int get_next_gi_task(ObGranuleTaskInfo &info);
   int assign(const ObGITaskSet &other);
-  int set_pw_affi_partition_order(bool asc, bool force_reverse);
+  int set_pw_affi_partition_order(bool asc, bool force_reverse,
+                                  bool preserve_group_order = false);
   int set_block_order(bool asc);
   int construct_taskset(const common::ObIArray<ObDASTabletLoc*> &taskset_tablets,
                         const common::ObIArray<ObNewRange> &taskset_ranges,
@@ -388,7 +389,8 @@ public:
                     ObGITaskSet::ObGIRandomType random_type,
                     bool partition_granule = true);
   int adjust_task_order(bool asc, ObGITaskArray &taskset_array, int64_t tsc_op_id,
-                        const ObIArray<std::pair<int64_t, bool>> &locations_order);
+                        const ObIArray<std::pair<int64_t, bool>> &locations_order,
+                        bool preserve_group_order = false);
 };
 
 //A task will be send to many DFO and we use many threads to execute the DFO.
@@ -407,6 +409,7 @@ public:
   parallelism_(-1),
   tablet_size_(common::OB_DEFAULT_TABLET_SIZE),
   partition_wise_join_(false),
+  has_ordered_result_scan_(false),
   gi_task_array_map_(),
   pump_args_(),
   need_partition_pruning_(false),
@@ -467,6 +470,7 @@ public:
   common::ObIArray<ObGranulePumpArgs> &get_pump_args() { return pump_args_; }
   void set_parallelism(int64_t parallelism) { parallelism_ = parallelism; }
   int64_t get_parallelism() const { return parallelism_; }
+  bool has_ordered_result_scan() const { return has_ordered_result_scan_; }
 
   inline void set_need_partition_pruning(bool flag) { need_partition_pruning_ = flag; };
   inline bool need_partition_pruning() { return need_partition_pruning_; }
@@ -528,6 +532,7 @@ private:
   int64_t parallelism_;
   int64_t tablet_size_;
   bool partition_wise_join_;
+  bool has_ordered_result_scan_;
   GITaskArrayMap gi_task_array_map_;
   common::ObArray<ObGranulePumpArgs> pump_args_;
   bool need_partition_pruning_;

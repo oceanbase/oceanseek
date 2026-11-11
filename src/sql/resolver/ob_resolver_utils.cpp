@@ -11,6 +11,9 @@
 #include "sql/resolver/ob_resolver_utils.h"
 #include "sql/engine/expr/ob_expr_vector.h"
 #include "sql/engine/expr/ob_expr_arrow_stream.h"
+#include "sql/engine/expr/ob_expr_result_scan.h"
+#include "sql/result_catalog/ob_async_result_metadata.h"
+#include "sql/result_catalog/ob_result_scan_catalog.h"
 #ifdef OB_BUILD_OBSERVER_FLIGHT_SQL
 #include "observer/flight_sql/ob_arrow_stream_catalog.h"
 #endif
@@ -150,6 +153,69 @@ int ObResolverUtils::get_all_function_table_column_names(const TableItem &table_
         }
 
         OZ (column_names.push_back(name));
+      }
+    }
+  } else if (T_FUN_SYS_RESULT_SCAN == table_expr->get_expr_type()) {
+    ObSEArray<sql::ObResultScanColDesc, 8> col_descs;
+    ObString query_id;
+    int64_t requested_chunk_no = OB_INVALID_INDEX_INT64;
+    ObResultScanTableDesc result_table;
+    const ObTableSchema *table_schema = nullptr;
+    bool got_catalog_column_names = false;
+    if (OB_NOT_NULL(table_item.catalog_table_metadata_)
+        && share::is_result_catalog_table(table_item.catalog_table_metadata_->get_format_type())) {
+      const ObResultCatalogTableMetadata *result_metadata =
+          static_cast<const ObResultCatalogTableMetadata *>(table_item.catalog_table_metadata_);
+      const ObResultTableMetadata &metadata = result_metadata->get_result_table_metadata();
+      for (int64_t i = 0; OB_SUCC(ret) && i < metadata.get_columns().count(); ++i) {
+        OZ(column_names.push_back(metadata.get_columns().at(i).name_));
+      }
+      got_catalog_column_names = true;
+    } else if (OB_INVALID_ID != table_item.ref_id_) {
+      CK (OB_NOT_NULL(params.schema_checker_));
+      if (OB_SUCC(ret) && OB_FAIL(params.schema_checker_->get_table_schema(
+              params.session_info_->get_effective_tenant_id(),
+              table_item.ref_id_,
+              table_schema))) {
+        LOG_WARN("failed to get registered result_scan schema", KR(ret),
+                 "table_id", table_item.ref_id_);
+      } else if (OB_SUCC(ret) && OB_ISNULL(table_schema)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("registered result_scan schema is null", KR(ret),
+                 "table_id", table_item.ref_id_);
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < table_schema->get_column_count(); ++i) {
+        const ObColumnSchemaV2 *column_schema = table_schema->get_column_schema_by_idx(i);
+        if (OB_ISNULL(column_schema)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("null column in registered result_scan schema", KR(ret), K(i));
+        } else if (!column_schema->is_hidden()) {
+          OZ (column_names.push_back(column_schema->get_column_name_str()));
+        }
+      }
+    } else if (OB_FAIL(ObExprResultScan::extract_query_id_and_chunk_no(
+                   table_expr, query_id, requested_chunk_no))) {
+      LOG_WARN("failed to extract result_scan arguments for column check", KR(ret));
+    } else if (OB_FAIL(ObResultScanCatalog::get_result_table(
+                   query_id,
+                   params.session_info_,
+                   nullptr,
+                   *params.allocator_,
+                   result_table,
+                   col_descs,
+                   nullptr /* cached_metadata */,
+                   requested_chunk_no))) {
+      LOG_WARN("failed to get result_scan columns for column check", KR(ret), K(query_id));
+    } else if (OB_NOT_NULL(result_table.catalog_table_metadata_)) {
+      // RESULT_SCAN's catalog metadata is statement-local. Keep the parsed
+      // manifest on the TableItem so full column resolution builds the mock
+      // schema from the same immutable object rather than parsing JSON again.
+      const_cast<TableItem &>(table_item).catalog_table_metadata_ =
+          result_table.catalog_table_metadata_;
+    }
+    if (OB_INVALID_ID == table_item.ref_id_ && !got_catalog_column_names) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < col_descs.count(); ++i) {
+        OZ (column_names.push_back(col_descs.at(i).col_name));
       }
     }
 #ifndef OB_BUILD_OBSERVER_FLIGHT_SQL
@@ -3874,7 +3940,8 @@ bool ObResolverUtils::is_expr_can_be_used_in_table_function(const ObRawExpr &exp
   } else if (T_FUN_SYS_GENERATOR == expr.get_expr_type()) {
     // for generator(N) stream function
     bret = true;
-  } else if (T_FUN_SYS_ARROW_STREAM == expr.get_expr_type()
+  } else if (T_FUN_SYS_RESULT_SCAN == expr.get_expr_type()
+             || T_FUN_SYS_ARROW_STREAM == expr.get_expr_type()
              || T_FUN_SYS_ARROW_STREAMS == expr.get_expr_type()) {
     // for Flight SQL arrow_stream / arrow_streams table functions
     bret = true;
@@ -5404,6 +5471,7 @@ int ObResolverUtils::build_file_column_expr_for_parquet(
     uint64_t column_idx,
     const ObString &data_access_path,
     const ObString &refined_column_name,
+    bool preserve_ob_type,
     ObRawExpr *&expr)
 {
   int ret = OB_SUCCESS;
@@ -5425,7 +5493,24 @@ int ObResolverUtils::build_file_column_expr_for_parquet(
       ObExprTypeCtx type_ctx; // 用于将session等全局变量传入calc_result_type
       type_ctx.set_raw_expr(expr);
       ObSQLUtils::init_type_ctx(&session_info, type_ctx);
-      if (OB_NOT_NULL(cast_expr)) {
+      if (preserve_ob_type && OB_NOT_NULL(generated_column)) {
+        // RESULT files use a private lossless Arrow codec.  The file-column
+        // expression must therefore retain the published OB type verbatim;
+        // ordinary Parquet's UTF8/cast normalization would change the codec
+        // semantics (notably binary-collation strings and RAW).
+        ObColumnRefRawExpr *column_expr = nullptr;
+        if (OB_FAIL(ObRawExprUtils::build_column_expr(
+                expr_factory, *generated_column, &session_info, column_expr))) {
+          LOG_WARN("failed to build result catalog column expr", K(ret));
+        } else {
+          file_column_expr->set_accuracy(column_expr->get_accuracy());
+          file_column_expr->set_data_type(column_expr->get_data_type());
+          file_column_expr->set_collation_type(column_expr->get_collation_type());
+          file_column_expr->set_collation_level(column_expr->get_collation_level());
+          file_column_expr->set_subschema_id(column_expr->get_subschema_id());
+          file_column_expr->set_length(column_expr->get_result_type().get_length());
+        }
+      } else if (OB_NOT_NULL(cast_expr)) {
         bool enable_decimalint = false;
         ObRawExprResType dst_type;
         ObConstRawExpr *const_cast_type_expr = static_cast<ObConstRawExpr *>(cast_expr->get_param_expr(1));

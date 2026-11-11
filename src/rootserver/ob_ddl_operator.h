@@ -516,6 +516,12 @@ public:
       const share::schema::ObTenantSchema &tenant_schema,
       const share::schema::ObSysVariableSchema &sys_variable,
       common::ObMySQLTransaction &trans);
+  // Backfill the private async-query result database for an existing user tenant.
+  // The database is normally created by init_tenant_schemas() during tenant creation.
+  virtual int ensure_async_query_result_database(
+      const share::schema::ObTenantSchema &tenant_schema,
+      const share::schema::ObSysVariableSchema &sys_variable,
+      common::ObMySQLTransaction &trans);
   virtual int rename_table(const share::schema::ObTableSchema &table_schema,
                            const common::ObString &new_table_name,
                            const uint64_t new_db_id,
@@ -1058,7 +1064,9 @@ private:
                                    const uint64_t pure_db_id,
                                    const common::ObString &db_comment,
                                    common::ObMySQLTransaction &trans,
-                                   const bool is_oracle_mode = false);
+                                   const bool is_oracle_mode = false,
+                                   const common::ObCharsetType charset_type = common::CHARSET_INVALID,
+                                   const common::ObCollationType collation_type = common::CS_TYPE_INVALID);
   virtual int init_tenant_databases(const share::schema::ObTenantSchema &tenant_schema,
                                     const share::schema::ObSysVariableSchema &sys_variable,
                                     common::ObMySQLTransaction &trans);

@@ -14,6 +14,7 @@
 #include "sql/engine/basic/ob_pushdown_filter.h"
 #include "sql/engine/table/ob_parquet_table_row_iter.h"
 #include "sql/engine/table/ob_parquet_min_max_iter.h"
+#include "sql/result_catalog/ob_async_result_parquet_table_row_iter.h"
 #ifdef OB_BUILD_CPP_ODPS
 #include "sql/engine/table/ob_odps_table_row_iter.h"
 #endif
@@ -630,7 +631,13 @@ int ObExternalTableAccessService::table_scan(
           }
           break;
         case ObExternalFileFormat::PARQUET_FORMAT:
-          if (is_ext_min_max_agg_scan(scan_param)) {
+          if (share::is_result_catalog_table(param.lake_table_format_)) {
+            if (OB_ISNULL(row_iter = OB_NEWx(ObAsyncResultParquetTableRowIterator,
+                                             (scan_param.allocator_)))) {
+              ret = OB_ALLOCATE_MEMORY_FAILED;
+              LOG_WARN("alloc memory failed", K(ret));
+            }
+          } else if (is_ext_min_max_agg_scan(scan_param)) {
             if (OB_ISNULL(row_iter = OB_NEWx(ObParquetMinMaxIter, (scan_param.allocator_)))) {
               ret = OB_ALLOCATE_MEMORY_FAILED;
               LOG_WARN("alloc memory failed", K(ret));

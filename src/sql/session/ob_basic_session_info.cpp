@@ -1549,6 +1549,8 @@ int ObBasicSessionInfo::load_default_configs_in_pc()
 {
   int ret = OB_SUCCESS;
   inf_pc_configs_.pushdown_storage_level_ = ObConfigInfoInPC::DEFAULT_PUSHDOWN_STORAGE_LEVEL;
+  inf_pc_configs_.async_result_parquet_row_group_rows_ =
+      ObConfigInfoInPC::DEFAULT_ASYNC_RESULT_PARQUET_ROW_GROUP_ROWS;
   inf_pc_configs_.enable_hyperscan_regexp_engine_ = false;
   inf_pc_configs_.enable_re2_regexp_engine_ = false;
   inf_pc_configs_.min_cluster_version_ = GET_MIN_CLUSTER_VERSION();
@@ -8332,6 +8334,11 @@ bool ObBasicSessionInfo::get_extend_sql_plan_monitor_metrics() const
 bool ObBasicSessionInfo::get_rowsets_enabled() const
 {
   return inf_pc_configs_.rowsets_enabled_;
+}
+
+int64_t ObBasicSessionInfo::get_async_result_parquet_row_group_rows() const
+{
+  return inf_pc_configs_.async_result_parquet_row_group_rows_;
 }
 
 int64_t ObBasicSessionInfo::get_hybrid_search_primary_get_ratio_default() const

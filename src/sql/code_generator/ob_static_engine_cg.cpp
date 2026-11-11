@@ -44,6 +44,7 @@
 #include "sql/optimizer/ob_log_optimizer_stats_gathering.h"
 #include "sql/optimizer/ob_direct_load_optimizer_ctx.h"
 #include "sql/optimizer/ob_log_expand.h"
+#include "sql/result_catalog/ob_async_result_metadata.h"
 #include "sql/engine/ob_operator_factory.h"
 #include "sql/engine/basic/ob_limit_op.h"
 #include "sql/engine/basic/ob_limit_vec_op.h"
@@ -6529,6 +6530,23 @@ int ObStaticEngineCG::generate_normal_tsc(ObLogTableScan &op, ObTableScanSpec &s
     spec.is_external_table_ = true;
     spec.lake_table_format_ = op.get_lake_table_type();
   }
+  if (OB_SUCC(ret) && share::is_result_catalog_table(spec.lake_table_format_)) {
+    const ObDMLStmt *stmt = op.get_plan()->get_stmt();
+    const TableItem *table_item = OB_NOT_NULL(stmt)
+        ? stmt->get_table_item_by_id(op.get_table_id()) : nullptr;
+    if (OB_ISNULL(table_item) || OB_ISNULL(table_item->catalog_table_metadata_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("Result scan has no statement-local manifest", K(ret), K(op.get_table_id()));
+    } else {
+      const ObResultCatalogTableMetadata *result_metadata =
+          static_cast<const ObResultCatalogTableMetadata *>(
+              table_item->catalog_table_metadata_);
+      spec.result_writer_ordered_ = opt_ctx_->enable_result_scan_ordered_read()
+          && result_metadata->get_result_table_metadata().has_writer_file_ordering();
+      spec.result_worker_order_claimed_ = spec.result_writer_ordered_
+          && op.get_is_local_order() && !op.get_op_ordering().empty();
+    }
+  }
 
   if (OB_SUCC(ret) && opt_ctx_->is_insert_stmt_in_online_ddl()) {
     const TableItem *insert_table_item = opt_ctx_->get_root_stmt()->get_table_item(0);
@@ -9979,6 +9997,45 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
       spec.plan_->need_drive_dml_query_ = true;
     }
   }
+  if (OB_SUCC(ret)) {
+    spec.async_result_target_.enabled_ = op.is_async_result();
+    spec.async_result_target_.tenant_id_ = op.get_async_result_tenant_id();
+    spec.async_result_target_.job_id_ = op.get_async_result_job_id();
+    if (spec.async_result_target_.enabled_
+        && OB_UNLIKELY(OB_INVALID_TENANT_ID == spec.async_result_target_.tenant_id_
+                       || OB_INVALID_ID == spec.async_result_target_.job_id_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid async result identity in logical plan", KR(ret),
+               K(spec.async_result_target_.tenant_id_), K(spec.async_result_target_.job_id_));
+    }
+  }
+  if (OB_SUCC(ret) && spec.async_result_target_.enabled_) {
+    const int64_t row_group_rows =
+        log_plan->get_optimizer_context().get_async_result_parquet_row_group_rows();
+    if (OB_UNLIKELY(row_group_rows <= 0)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid async result parquet row-group row count in optimizer context",
+               KR(ret), K(row_group_rows));
+    } else {
+      spec.async_result_target_.parquet_row_group_rows_ = row_group_rows;
+    }
+    if (OB_SUCC(ret)
+        && OB_UNLIKELY(op.get_input_ordering_column_idxs().count()
+                       != op.get_input_ordering_directions().count())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("mismatched async result input ordering", K(ret),
+               "column_count", op.get_input_ordering_column_idxs().count(),
+               "direction_count", op.get_input_ordering_directions().count());
+    } else if (OB_SUCC(ret)
+               && OB_FAIL(spec.async_result_target_.input_ordering_column_idxs_.assign(
+                   op.get_input_ordering_column_idxs()))) {
+      LOG_WARN("failed to lower async result ordering columns", K(ret));
+    } else if (OB_SUCC(ret)
+               && OB_FAIL(spec.async_result_target_.input_ordering_directions_.assign(
+                   op.get_input_ordering_directions()))) {
+      LOG_WARN("failed to lower async result ordering directions", K(ret));
+    }
+  }
   if (OB_SUCC(ret) && lake_table_metadata != NULL) {
     spec.lake_table_format_ = lake_table_metadata->get_format_type();
     if (OB_FAIL(plan_ctx->set_lake_table_metadata(lake_table_metadata))) {
@@ -10030,7 +10087,10 @@ int ObStaticEngineCG::generate_spec(ObLogFunctionTable &op, ObFunctionTableSpec 
         OZ (spec.column_exprs_.push_back(rt_expr));
       }
     }
-    if (OB_SUCC(ret) && op.get_server_list().count() > 0) {
+    if (OB_SUCC(ret)
+        && (T_FUN_SYS_ARROW_STREAM == value_raw_expr->get_expr_type()
+            || T_FUN_SYS_ARROW_STREAMS == value_raw_expr->get_expr_type())
+        && op.get_server_list().count() > 0) {
       OZ(spec.server_list_.init(op.get_server_list().count()));
       for (int64_t i = 0; OB_SUCC(ret) && i < op.get_server_list().count(); ++i) {
         OZ(spec.server_list_.push_back(op.get_server_list().at(i)));

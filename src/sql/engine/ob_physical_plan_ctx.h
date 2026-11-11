@@ -20,6 +20,7 @@
 #include "lib/enumset/ob_enum_set_meta.h"
 #include "sql/engine/ob_subschema_ctx.h"
 #include "sql/engine/expr/ob_expr_util.h"
+#include "sql/result_catalog/ob_async_result_file.h"
 
 namespace oceanbase
 {
@@ -131,6 +132,7 @@ public:
     // with another allocator should call destroy here.
     subschema_ctx_.destroy();
     all_local_session_vars_.destroy();
+    async_result_files_.reset();
   }
   inline void set_tenant_id(uint64_t tenant_id) { tenant_id_ = tenant_id; }
   inline void set_show_seed(bool show_seed) { is_show_seed_ = show_seed; }
@@ -601,6 +603,11 @@ public:
     return iceberg_data_files_;
   }
   int set_iceberg_data_files(const common::ObIArray<iceberg::ObSerializableDataFile>& data_files);
+  const common::ObIArray<ObAsyncResultFileDesc> &get_async_result_files() const
+  {
+    return async_result_files_;
+  }
+  int add_async_result_files(const common::ObIArray<ObAsyncResultFileDesc> &files);
   inline const share::ObILakeTableMetadata* get_lake_table_metadata() const
   {
     return lake_table_metadata_;
@@ -763,6 +770,7 @@ private:
 
   // for iceberg table dml
   ObArray<iceberg::DataFile*> iceberg_data_files_;
+  common::ObArray<ObAsyncResultFileDesc> async_result_files_;
   const share::ObILakeTableMetadata* lake_table_metadata_;
 };
 

@@ -33,6 +33,8 @@ arbitration_timeout
 archive_lag_target
 async_inverted_index_iter_cache_max_size
 async_ps_cursor_max_count
+async_result_chunk_rows
+async_result_retention_time
 audit_log_buffer_size
 audit_log_compression
 audit_log_enable
@@ -107,6 +109,7 @@ direct_load_allow_fallback
 disk_io_thread_count
 document_ai_file_max_size
 dtl_buffer_size
+dtl_compress_func
 dump_data_dictionary_to_log_interval
 enable_adaptive_plan_cache
 enable_agent_db_background_task
@@ -162,6 +165,7 @@ external_table_io_hole_size
 external_table_io_range_size
 ext_plugin_config
 flight_sql_port
+flight_sql_tls_enabled
 freeze_trigger_percentage
 function_round_dialect
 fuse_row_cache_priority
@@ -602,6 +606,7 @@ _force_malloc_for_absent_tenant
 _force_skip_encoding_partition_id
 _force_subquery_unnest
 _force_unstreaming_cursor
+_fork_database_prepare_thread_score
 _fork_history_expiration_time
 _fork_table_max_concurrent_tasks
 _fuse_row_cache_activate_threshold
@@ -617,6 +622,7 @@ _hnsw_max_scan_vectors
 _hot_macro_cache_gc_idle_time
 _hot_macro_cache_gc_interval
 _hot_macro_cache_mark_interval
+_hybrid_search_primary_get_ratio_default
 _hybrid_search_topk_dynamic_pruning_level
 _ignore_system_memory_over_limit_error
 _index_merge_threshold_for_multivalue
@@ -768,6 +774,7 @@ _server_standby_fetch_log_bandwidth_limit
 _session_context_size
 _session_temp_table_clean_interval
 _shared_advance_checkpoint_interval
+_shared_checkpoint_backpressure_threshold
 _shared_gc_file_expiration_time
 _shared_gc_interval
 _shared_gc_retention_time

@@ -940,7 +940,8 @@ bool ObOptParamHint::is_param_val_valid(const OptParamType param_type, const ObO
     case ENABLE_MERGE_INTO:
     case PRESERVE_ORDER_FOR_GROUPBY:
     case ENABLE_HYBRID_SEARCH_PARALLEL_EXECUTION:
-    case ENABLE_LAKE_TABLE_PARALLEL_RESOLVING: {
+    case ENABLE_LAKE_TABLE_PARALLEL_RESOLVING:
+    case ENABLE_RESULT_SCAN_ORDERED_READ: {
       is_valid = val.is_varchar() && (0 == val.get_varchar().case_compare("true")
                                       || 0 == val.get_varchar().case_compare("false"));
       break;

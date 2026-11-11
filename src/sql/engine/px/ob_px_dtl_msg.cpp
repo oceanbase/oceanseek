@@ -102,3 +102,12 @@ int ObPxFinishSqcResultMsg::set_sqc_iceberg_data_files(const ObSqcCtx &sqc_ctx)
   }
   return ret;
 }
+
+int ObPxFinishSqcResultMsg::set_sqc_async_result_files(const ObSqcCtx &sqc_ctx)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(sqc_async_result_files_.assign(sqc_ctx.async_result_files_))) {
+    LOG_WARN("failed to copy SQC async result files", K(ret));
+  }
+  return ret;
+}

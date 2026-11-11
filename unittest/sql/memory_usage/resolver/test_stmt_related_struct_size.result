@@ -1,6 +1,6 @@
 | class | sizeof(class) |
 | --- | --- |
-| TableItem | 592 |
+| TableItem | 600 |
 | ObJtColBaseInfo | 144 |
 | ObJsonTableDef | 144 |
 | ObUnpivotItem | 128 |
@@ -12,7 +12,7 @@
 | PartExprItem | 32 |
 | CheckConstraintItem | 96 |
 | SelectItem | 1568 |
-| ObSelectIntoItem | 224 |
+| ObSelectIntoItem | 248 |
 | ObGroupbyExpr | 40 |
 | ObRollupItem | 40 |
 | ObCubeItem | 40 |

@@ -22,6 +22,8 @@
 #include "sql/hybrid_search/ob_hybrid_search_dsl_resolver.h"
 #include "sql/rewrite/ob_expand_aggregate_utils.h"
 #include "share/external_table/ob_external_table_utils.h"
+#include "observer/dbms_scheduler/ob_dbms_sched_job_utils.h"
+#include "sql/result_catalog/ob_async_result_metadata.h"
 
 #include "sql/executor/ob_memory_tracker.h"
 namespace oceanbase
@@ -6171,6 +6173,78 @@ int ObSelectResolver::resolve_into_outfile_without_format(const ParseNode *node,
   return ret;
 }
 
+int ObSelectResolver::resolve_async_result_target(ObSelectIntoItem &into_item)
+{
+  int ret = OB_SUCCESS;
+  ObSQLSessionInfo *session = params_.session_info_;
+  dbms_scheduler::ObDBMSSchedJobInfo *job_info = NULL;
+  ObExternalFileFormat external_format;
+  ObString target;
+  const ObString internal_uri = ObAsyncResultStorageUtils::get_internal_uri();
+  const ObObj *target_obj = &into_item.outfile_name_;
+  bool targets_internal_uri = false;
+  if (OB_ISNULL(session)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("session is null when resolving select into target", KR(ret));
+  } else if (into_item.outfile_name_.is_unknown()) {
+    const int64_t param_idx = into_item.outfile_name_.get_unknown();
+    if (OB_ISNULL(params_.param_list_) || OB_UNLIKELY(param_idx < 0
+        || param_idx >= params_.param_list_->count())) {
+      if (session->is_async_result_parquet()) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("async result outfile parameter is unavailable", KR(ret), K(param_idx));
+      }
+    } else {
+      target_obj = &params_.param_list_->at(param_idx);
+    }
+  }
+  if (OB_SUCC(ret) && OB_NOT_NULL(session)) {
+    if (target_obj->is_varchar_or_char()) {
+      target = target_obj->get_string().trim();
+      targets_internal_uri = target.prefix_match(internal_uri);
+    } else if (session->is_async_result_parquet()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("select into outfile target is not a string", KR(ret), KPC(target_obj));
+    }
+  }
+  if (OB_FAIL(ret) || (!targets_internal_uri && !session->is_async_result_parquet())) {
+  } else if (!session->is_async_result_parquet()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("internal async result uri is reserved for async query jobs", KR(ret), K(target));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "internal async result URI");
+  } else if (target != internal_uri) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("async result job does not use the reserved internal uri", KR(ret), K(target));
+  } else if (OB_ISNULL(job_info = session->get_job_info())
+             || OB_UNLIKELY(!job_info->is_async_query_job())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("async result session has no async query job identity", KR(ret), KP(job_info));
+  } else if (OB_UNLIKELY(job_info->get_tenant_id() != session->get_effective_tenant_id()
+                         || OB_INVALID_ID == job_info->get_job_id())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid async query job identity", KR(ret),
+             "job_tenant_id", job_info->get_tenant_id(),
+             "session_tenant_id", session->get_effective_tenant_id(),
+             "job_id", job_info->get_job_id());
+  } else if (into_item.external_properties_.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("async result target has no external file format", KR(ret));
+  } else if (OB_FAIL(external_format.load_from_string(
+                         into_item.external_properties_, *allocator_))) {
+    LOG_WARN("failed to load async result external file format", KR(ret));
+  } else if (ObExternalFileFormat::PARQUET_FORMAT != external_format.format_type_) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("async result internal uri requires parquet format", KR(ret),
+             K(external_format.format_type_));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "internal async result URI without PARQUET format");
+  } else {
+    into_item.async_result_ = true;
+    into_item.async_result_tenant_id_ = job_info->get_tenant_id();
+    into_item.async_result_job_id_ = job_info->get_job_id();
+  }
+  return ret;
+}
+
 int ObSelectResolver::resolve_into_clause(const ParseNode *node)
 {
   int ret = OB_SUCCESS;
@@ -6222,6 +6296,8 @@ int ObSelectResolver::resolve_into_clause(const ParseNode *node)
           ret = OB_NOT_SUPPORTED;
           LOG_WARN("not support to use file partition option when single is true", K(ret));
           LOG_USER_ERROR(OB_NOT_SUPPORTED, "use file partition option when single is true");
+        } else if (OB_SUCC(ret) && OB_FAIL(resolve_async_result_target(*into_item))) {
+          LOG_WARN("failed to resolve async result target", KR(ret));
         }
       } else if (T_INTO_DUMPFILE  == node->type_) { // into dumpfile
         if (is_in_set_query()) {

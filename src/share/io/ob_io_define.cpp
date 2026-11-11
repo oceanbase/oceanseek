@@ -855,6 +855,20 @@ bool ObIOResult::is_valid() const
       : nullptr != buf_);
 }
 
+int64_t ObIOResult::timeout_ts() const
+{
+  int64_t timeout_ts = 0;
+  if (time_log_.begin_ts_ > 0) {
+    const int64_t begin_ts = time_log_.begin_ts_;
+    // A no-timeout reader may pass a duration that reaches INT64_MAX.
+    // Saturate the absolute deadline instead of wrapping it around.
+    timeout_ts = timeout_us_ >= INT64_MAX - begin_ts
+                     ? INT64_MAX
+                     : begin_ts + timeout_us_;
+  }
+  return timeout_ts;
+}
+
 int ObIOResult::basic_init()
 {
   int ret = OB_SUCCESS;
@@ -1446,7 +1460,7 @@ ObIOGroupKey ObIORequest::get_group_key() const
 
 int64_t ObIORequest::timeout_ts() const
 {
-  return nullptr == io_result_ ? 0 : io_result_->time_log_.begin_ts_ > 0 ? io_result_->time_log_.begin_ts_ + io_result_->timeout_us_ : 0;
+  return nullptr == io_result_ ? 0 : io_result_->timeout_ts();
 }
 
 uint64_t ObIORequest::get_sys_module_id() const
@@ -1917,8 +1931,7 @@ int64_t ObIORequest::get_remained_io_timeout_us()
 {
   int64_t cur_remained_timeout_us = 0;
   if (OB_NOT_NULL(io_result_)) {
-    cur_remained_timeout_us = io_result_->timeout_us_ 
-                            - (ObTimeUtility::current_time() - io_result_->time_log_.begin_ts_);
+    cur_remained_timeout_us = io_result_->timeout_ts() - ObTimeUtility::current_time();
   }
   return MAX(0, cur_remained_timeout_us);
 }
@@ -2162,7 +2175,7 @@ int ObIOHandle::check_is_finished(bool &is_finished)
 void ObIOHandle::get_remained_io_timeout_ms(int64_t &real_wait_timeout_ms) const
 {
   const int64_t timeout_ms = ((result_->time_log_.begin_ts_ > 0
-                               ? result_->time_log_.begin_ts_ + result_->timeout_us_ - ObTimeUtility::current_time()
+                               ? result_->timeout_ts() - ObTimeUtility::current_time()
                                : 0) / 1000L);
   real_wait_timeout_ms = (result_->is_limit_net_bandwidth_req_
                           ? timeout_ms

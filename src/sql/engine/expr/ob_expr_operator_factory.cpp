@@ -198,6 +198,7 @@
 #include "sql/engine/expr/ob_expr_random.h"
 #include "sql/engine/expr/ob_expr_generator_func.h"
 #include "sql/engine/expr/ob_expr_arrow_stream.h"
+#include "sql/engine/expr/ob_expr_result_scan.h"
 #include "sql/engine/expr/ob_expr_zipf.h"
 #include "sql/engine/expr/ob_expr_normal.h"
 #include "sql/engine/expr/ob_expr_uniform.h"
@@ -1187,6 +1188,7 @@ void ObExprOperatorFactory::register_expr_operators()
     REG_OP(ObExprGeneratorFunc, SHORT_CIRCUIT_EVALUATION);
     REG_OP(ObExprArrowStream, EAGER_EVALUATION);
     REG_OP(ObExprArrowStreams, EAGER_EVALUATION);
+    REG_OP(ObExprResultScan, EAGER_EVALUATION);
     REG_OP(ObExprZipf, EAGER_EVALUATION);
     REG_OP(ObExprNormal, EAGER_EVALUATION);
     REG_OP(ObExprUniform, SHORT_CIRCUIT_EVALUATION);

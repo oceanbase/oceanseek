@@ -3299,6 +3299,15 @@ DEF_CAP(external_table_csv_max_buffer_size, OB_TENANT_PARAMETER, "1G", "[0B,)",
 DEF_BOOL(_enable_external_table_parquet_page_cache, OB_TENANT_PARAMETER, "True",
          "enable external table parquet page cache",
          ObParameterAttr(Section::OBSERVER, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
+DEF_INT(async_result_chunk_rows, OB_TENANT_PARAMETER, "1048576", "[1,)",
+        "Approximate number of rows per async query result chunk. "
+        "A chunk may contain fewer rows. Range: [1, INT64_MAX], default: 1048576 rows.",
+        ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
+DEF_TIME(async_result_retention_time, OB_TENANT_PARAMETER, "1d", "[1s,365d]",
+         "How long completed async-query results remain readable before RESULT_SCAN reports "
+         "them expired and the daily cleanup job may remove their physical result data. "
+         "Range: [1s, 365d], default: 1d.",
+         ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 
 DEF_INT(_orc_filter_pushdown_level, OB_TENANT_PARAMETER, "4", "[0, 4]",
         "This parameter controls the filter pushdown level for ORC external tables, "

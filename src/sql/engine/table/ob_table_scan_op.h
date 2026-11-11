@@ -487,7 +487,9 @@ public:
       uint64_t is_spiv_ddl_                     : 1;
       uint64_t ft_doc_token_need_sort_          : 1;
       uint64_t external_table_file_size_load_balance_ : 1;
-      uint64_t reserved_                        : 45;
+      uint64_t result_writer_ordered_           : 1; // private Result manifest has writer streams
+      uint64_t result_worker_order_claimed_     : 1; // optimizer relies on one stream per worker
+      uint64_t reserved_                        : 43;
     };
   };
   int64_t tenant_id_col_idx_;

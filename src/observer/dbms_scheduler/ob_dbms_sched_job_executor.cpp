@@ -18,6 +18,8 @@
 
 #include "observer/ob_inner_sql_connection_pool.h"
 #include "sql/executor/ob_executor_rpc_processor.h"
+#include "sql/result_catalog/ob_async_result_metadata.h"
+#include "sql/result_catalog/ob_result_scan_catalog.h"
 #include "sql/session/ob_sql_session_info.h"
 #include "sql/ob_sql.h"
 
@@ -32,6 +34,42 @@ using namespace sql;
 
 namespace dbms_scheduler
 {
+
+namespace
+{
+int build_async_query_parquet_sql(ObDBMSSchedJobInfo &job_info,
+                                  const ObString &hint_line,
+                                  ObSqlString &sql)
+{
+  int ret = OB_SUCCESS;
+  ObString select_sql = job_info.get_what().trim();
+  const ObString internal_uri = ObAsyncResultStorageUtils::get_internal_uri();
+  while (!select_sql.empty() && ';' == select_sql[select_sql.length() - 1]) {
+    select_sql.assign_ptr(select_sql.ptr(), select_sql.length() - 1);
+    select_sql = select_sql.trim();
+  }
+  // Keep the submitted SQL untouched. HINT belongs to the server-generated
+  // terminal INTO OUTFILE clause, which also works when select_sql starts WITH.
+  if (select_sql.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("empty async query SQL for parquet result store", K(ret), K(job_info));
+  } else if (OB_FAIL(sql.append_fmt(
+                 "%.*s\nINTO OUTFILE "
+                 "'%.*s' "
+                 "FORMAT = (TYPE = 'PARQUET', COMPRESSION = 'UNCOMPRESSED') "
+                 "SINGLE = FALSE",
+                 select_sql.length(), select_sql.ptr(),
+                 internal_uri.length(), internal_uri.ptr()))) {
+    LOG_WARN("failed to build async query parquet SQL", K(ret), K(job_info));
+  } else if (!hint_line.empty()
+             && OB_FAIL(sql.append_fmt(" HINT /*+ %.*s */",
+                                       hint_line.length(), hint_line.ptr()))) {
+    LOG_WARN("failed to append async query parquet hint", K(ret), K(job_info));
+  }
+  return ret;
+}
+
+} // namespace
 
 int ObDBMSSchedJobExecutor::init(
   common::ObMySQLProxy *sql_proxy, ObMultiVersionSchemaService *schema_service)
@@ -124,7 +162,7 @@ int ObDBMSSchedJobExecutor::init_session(
       trx_timeout_obj.set_int(TRX_TIMEOUT_US);
       OZ (session.update_sys_variable(SYS_VAR_OB_QUERY_TIMEOUT, query_timeout_obj));
       OZ (session.update_sys_variable(SYS_VAR_OB_TRX_TIMEOUT, trx_timeout_obj));
-    } else if (job_info.is_olap_async_job()) {
+    } else if (job_info.is_olap_async_job_family()) {
       const int64_t QUERY_TIMEOUT_US = ((job_info.get_max_run_duration() - OLAP_ASYNC_JOB_DEVIATION_SECOND) * 1000000L);
       const int64_t TRX_TIMEOUT_US = ((job_info.get_max_run_duration() - OLAP_ASYNC_JOB_DEVIATION_SECOND) * 1000000L);
       ObObj query_timeout_obj;
@@ -263,14 +301,25 @@ int ObDBMSSchedJobExecutor::run_dbms_sched_job(
   ObInnerSQLConnection *conn = NULL;
   ObSQLSessionInfo *session_info = NULL;
   ObFreeSessionCtx free_session_ctx;
+  ObArenaAllocator job_config_allocator("AsyncJobCfg");
+  bool use_async_result_external = false;
   int64_t affected_rows = 0;
   CK (OB_LIKELY(inited_));
   CK (OB_NOT_NULL(sql_proxy_));
   CK (sql_proxy_->is_inited());
   CK (job_info.valid());
   CK ((job_info.get_what().length() != 0) || (job_info.get_program_name().length() != 0));
+  if (OB_SUCC(ret) && job_info.is_async_query_job()) {
+    ObSchemaGetterGuard schema_guard;
+    CK (OB_NOT_NULL(schema_service_));
+    OZ (schema_service_->get_tenant_schema_guard(tenant_id, schema_guard));
+    OZ (ObDBMSSchedJobUtils::check_async_query_result_ready(
+        tenant_id, schema_guard, *sql_proxy_));
+  }
   if (OB_FAIL(ret)) {
     // do nothing
+  } else if (job_info.is_async_result_cleanup_job()) {
+    OZ (ObResultScanCatalog::cleanup_expired_results(tenant_id, *sql_proxy_));
   } else if (OB_FAIL(ObDBMSSchedJobExecutor::create_session(tenant_id, free_session_ctx, session_info))) {
     LOG_WARN("failed to create session", KR(ret), K(tenant_id));
   } else {
@@ -278,7 +327,40 @@ int ObDBMSSchedJobExecutor::run_dbms_sched_job(
       if (job_info.is_oracle_tenant_) {
         OZ (what.append_fmt("BEGIN %.*s; END;",
             job_info.get_what().length(), job_info.get_what().ptr()));
-      } else if (job_info.is_olap_async_job()){
+      } else if (job_info.is_async_query_job()) {
+        ObSqlString result_table_name;
+        ObAsyncQueryJobConfig async_query_config;
+        const ObString result_catalog_name =
+            ObDBMSSchedJobInfo::get_async_query_result_catalog_name();
+        const ObString result_database_name =
+            ObDBMSSchedJobInfo::get_async_query_result_database_name();
+        OZ (async_query_config.deserialize(
+            job_info.get_job_config(), job_config_allocator));
+        use_async_result_external =
+            ObAsyncQueryResultStore::EXTERNAL == async_query_config.get_result_store();
+        if (OB_SUCC(ret) && use_async_result_external) {
+          OZ (build_async_query_parquet_sql(
+              job_info, async_query_config.get_hint_line(), what));
+        } else if (OB_SUCC(ret)) {
+          OZ (job_info.build_async_query_result_table_name(result_table_name));
+        }
+        if (OB_SUCC(ret) && !use_async_result_external
+            && async_query_config.get_hint_line().empty()) {
+          OZ (what.append_fmt("CREATE TABLE `%.*s`.`%.*s`.`%.*s` AS %.*s",
+              result_catalog_name.length(), result_catalog_name.ptr(),
+              result_database_name.length(), result_database_name.ptr(),
+              result_table_name.length(), result_table_name.ptr(),
+              job_info.get_what().length(), job_info.get_what().ptr()));
+        } else if (OB_SUCC(ret) && !use_async_result_external) {
+          OZ (what.append_fmt("CREATE /*+ %.*s */ TABLE `%.*s`.`%.*s`.`%.*s` AS %.*s",
+              async_query_config.get_hint_line().length(),
+              async_query_config.get_hint_line().ptr(),
+              result_catalog_name.length(), result_catalog_name.ptr(),
+              result_database_name.length(), result_database_name.ptr(),
+              result_table_name.length(), result_table_name.ptr(),
+              job_info.get_what().length(), job_info.get_what().ptr()));
+        }
+      } else if (job_info.is_olap_async_job_family()) {
         OZ (what.append_fmt("%.*s",
             job_info.get_what().length(), job_info.get_what().ptr()));        
       } else if (job_info.is_mysql_event_job()) { //mysql event
@@ -386,8 +468,14 @@ int ObDBMSSchedJobExecutor::run_dbms_sched_job(
       int64_t current_time = ObTimeUtility::current_time();
       ObWorkerSessionGuard worker_session_guard(session_info);
       OZ (ObDBMSSchedJobExecutor::init_env(job_info, *session_info));
+      if (OB_SUCC(ret) && job_info.is_async_query_job()) {
+        ObObj no_plan_cache;
+        no_plan_cache.set_int(0);
+        OZ (session_info->update_sys_variable(SYS_VAR_OB_ENABLE_PLAN_CACHE, no_plan_cache));
+      }
       CK (OB_NOT_NULL(pool = static_cast<ObInnerSQLConnectionPool *>(sql_proxy_->get_pool())));
       OX (session_info->set_job_info(&job_info));
+      OX (session_info->set_async_result_parquet(use_async_result_external));
       OX (session_info->set_current_trace_id(ObCurTraceId::get_trace_id()));
       OX (session_info->set_session_active(what.string(), current_time, current_time, obmysql::COM_QUERY));
       EVENT_INC(ACTIVE_SESSIONS);
@@ -414,6 +502,7 @@ int ObDBMSSchedJobExecutor::run_dbms_sched_job(
       } else {
         OZ (conn->execute_write(tenant_id, what.string().ptr(), affected_rows));
       }
+      session_info->set_async_result_parquet(false);
       if (OB_NOT_NULL(conn) && OB_NOT_NULL(session_info) && !is_ora_sys_user(session_info->get_user_id()) && !is_root_user(session_info->get_user_id())) {
         conn->set_check_priv(false);
       }

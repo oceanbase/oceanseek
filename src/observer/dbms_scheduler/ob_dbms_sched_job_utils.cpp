@@ -14,6 +14,11 @@
 #include "observer/dbms_scheduler/ob_dbms_sched_job_rpc_proxy.h"
 #include "storage/mview/ob_mview_sched_job_utils.h"
 #include "observer/dbms_scheduler/ob_dbms_sched_time_utils.h"
+#include "lib/allocator/page_arena.h"
+#include "lib/json_type/ob_json_tree.h"
+#include "lib/mysqlclient/ob_mysql_transaction.h"
+#include "lib/json/ob_json.h"
+#include "sql/session/ob_basic_session_info.h"
 
 namespace oceanbase
 {
@@ -27,6 +32,189 @@ using namespace sql;
 namespace dbms_scheduler
 {
 ObDBMSSchedFuncSet ObDBMSSchedFuncSet::instance_;
+
+namespace
+{
+
+static const int64_t ASYNC_QUERY_JOB_CONFIG_VERSION = 1;
+static const char *const ASYNC_RESULT_CLEANUP_JOB_NAME = "__ob_async_result_cleanup";
+static const char *const ASYNC_RESULT_CLEANUP_JOB_ACTION = "ASYNC_RESULT_CLEANUP";
+static const char *const ASYNC_RESULT_CLEANUP_REPEAT_INTERVAL = "FREQ=DAILY;INTERVAL=1";
+static const int64_t ASYNC_RESULT_CLEANUP_MAX_RUN_DURATION_SEC = 6 * 60 * 60;
+
+bool is_safe_async_query_hint_line(const ObString &hint_line)
+{
+  bool is_safe = true;
+  for (int64_t i = 0; is_safe && i < hint_line.length(); ++i) {
+    is_safe = '\0' != hint_line[i]
+        && !(i + 1 < hint_line.length()
+             && (('/' == hint_line[i] && '*' == hint_line[i + 1])
+                 || ('*' == hint_line[i] && '/' == hint_line[i + 1])));
+  }
+  return is_safe;
+}
+
+} // namespace
+
+int ObAsyncQueryJobConfig::deserialize(
+    const ObString &job_config,
+    ObIAllocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  ObArenaAllocator parser_allocator("AsyncJobCfg");
+  reset();
+  if (job_config.empty()) {
+    // Empty is the backward-compatible default: native result store with no
+    // result-store execution hint.
+  } else {
+    json::Parser parser;
+    json::Value *root = NULL;
+    int64_t version = -1;
+    bool has_version = false;
+    bool has_hint_line = false;
+    bool has_result_store = false;
+    ObString parsed_hint_line;
+    if (OB_FAIL(parser.init(&parser_allocator))) {
+      LOG_WARN("failed to initialize async query job config parser", K(ret));
+    } else if (OB_FAIL(parser.parse(job_config.ptr(), job_config.length(), root))) {
+      LOG_WARN("failed to parse async query job config", K(ret), K(job_config));
+    } else if (OB_ISNULL(root) || json::JT_OBJECT != root->get_type()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("async query job config is not a json object", K(ret), K(job_config));
+    } else {
+      DLIST_FOREACH_X(it, root->get_object(), OB_SUCC(ret)) {
+        if (0 == it->name_.case_compare("version")) {
+          if (has_version || json::JT_NUMBER != it->value_->get_type()) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_WARN("invalid async query job config version", K(ret), K(has_version));
+          } else {
+            has_version = true;
+            version = it->value_->get_number();
+          }
+        } else if (0 == it->name_.case_compare("hint_line")) {
+          if (has_hint_line || json::JT_STRING != it->value_->get_type()) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_WARN("invalid async query job config hint_line", K(ret), K(has_hint_line));
+          } else {
+            has_hint_line = true;
+            parsed_hint_line = it->value_->get_string();
+          }
+        } else if (0 == it->name_.case_compare("result_store")) {
+          if (has_result_store || json::JT_STRING != it->value_->get_type()) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_WARN("invalid async query job config result_store",
+                     K(ret), K(has_result_store));
+          } else {
+            const ObString store = it->value_->get_string();
+            has_result_store = true;
+            if (0 == store.case_compare("NATIVE")) {
+              result_store_ = ObAsyncQueryResultStore::NATIVE;
+            } else if (0 == store.case_compare("EXTERNAL")) {
+              result_store_ = ObAsyncQueryResultStore::EXTERNAL;
+            } else {
+              ret = OB_INVALID_ARGUMENT;
+              LOG_WARN("invalid async query result store", K(ret), K(store));
+            }
+          }
+        } else {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_WARN("unknown async query job config option", K(ret), K(it->name_));
+        }
+      }
+      if (OB_SUCC(ret) && (!has_version || ASYNC_QUERY_JOB_CONFIG_VERSION != version)) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("unsupported async query job config version", K(ret), K(has_version), K(version));
+      } else if (OB_SUCC(ret) && !is_safe_async_query_hint_line(parsed_hint_line)) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("unsafe async query job config hint_line", K(ret));
+      } else if (OB_SUCC(ret) && !parsed_hint_line.empty()
+                 && OB_FAIL(ob_write_string(allocator, parsed_hint_line, hint_line_))) {
+        LOG_WARN("failed to copy async query hint line", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObAsyncQueryJobConfig::serialize(
+    ObIAllocator &allocator,
+    ObString &job_config) const
+{
+  int ret = OB_SUCCESS;
+  const char *result_store_name = NULL;
+  job_config.reset();
+  if (ObAsyncQueryResultStore::NATIVE == result_store_) {
+    result_store_name = "NATIVE";
+  } else if (ObAsyncQueryResultStore::EXTERNAL == result_store_) {
+    result_store_name = "EXTERNAL";
+  } else {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid async query result store", K(ret), K(result_store_));
+  }
+
+  if (OB_SUCC(ret)) {
+    ObJsonObject *root = OB_NEWx(ObJsonObject, &allocator, &allocator);
+    ObJsonInt *version = OB_NEWx(
+        ObJsonInt, &allocator, ASYNC_QUERY_JOB_CONFIG_VERSION);
+    ObJsonString *store = OB_NEWx(
+        ObJsonString, &allocator, ObString::make_string(result_store_name));
+    ObJsonString *hint = OB_NEWx(ObJsonString, &allocator, hint_line_);
+    if (OB_ISNULL(root) || OB_ISNULL(version)
+        || OB_ISNULL(store) || OB_ISNULL(hint)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate async query job config json",
+               K(ret), KP(root), KP(version), KP(store), KP(hint));
+    } else if (OB_FAIL(root->object_add(ObString::make_string("version"), version))) {
+      LOG_WARN("failed to add async query job config version", K(ret));
+    } else if (OB_FAIL(root->object_add(ObString::make_string("result_store"), store))) {
+      LOG_WARN("failed to add async query job result store", K(ret));
+    } else if (OB_FAIL(root->object_add(ObString::make_string("hint_line"), hint))) {
+      LOG_WARN("failed to add async query job hint line", K(ret));
+    } else {
+      ObJsonBuffer buffer(&allocator);
+      if (OB_FAIL(root->print(buffer, false))) {
+        LOG_WARN("failed to serialize async query job config", K(ret));
+      } else if (OB_UNLIKELY(
+                     buffer.string().length() > OB_MAX_JOB_INFO_JOB_CONFIG_LENGTH)) {
+        ret = OB_SIZE_OVERFLOW;
+        LOG_USER_ERROR(OB_SIZE_OVERFLOW);
+        LOG_WARN("async query job config is too long", K(ret),
+                 "length", buffer.string().length(),
+                 K(OB_MAX_JOB_INFO_JOB_CONFIG_LENGTH));
+      } else if (OB_FAIL(ob_write_string(
+                     allocator, buffer.string(), job_config, true))) {
+        LOG_WARN("failed to save async query job config", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDBMSSchedJobInfo::build_async_query_result_table_name(ObSqlString &table_name) const
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!is_async_query_job())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("not an async query job", KR(ret), K(func_type_), K(job_));
+  } else if (OB_FAIL(table_name.assign_fmt("__ob_aqr_t%016lx_u%016lx_j%016lx",
+                                           static_cast<unsigned long>(tenant_id_),
+                                           static_cast<unsigned long>(user_id_),
+                                           static_cast<unsigned long>(job_)))) {
+    LOG_WARN("failed to build async query result table name", KR(ret),
+             K(tenant_id_), K(user_id_), K(job_));
+  }
+  return ret;
+}
+
+bool ObDBMSSchedJobInfo::is_async_query_result_target(const ObString &database_name,
+                                                      const ObString &table_name) const
+{
+  ObSqlString expected_table_name;
+  return is_async_query_job()
+      && 0 == database_name.case_compare(get_async_query_result_database_name())
+      && OB_SUCCESS == build_async_query_result_table_name(expected_table_name)
+      && 0 == table_name.case_compare(expected_table_name.string());
+}
 
 int ObDBMSSchedJobUtils::check_is_valid_name(const ObString &name) 
 {
@@ -371,6 +559,151 @@ int ObDBMSSchedJobUtils::generate_job_id(int64_t tenant_id, int64_t &max_job_id)
   return ret;
 }
 
+int ObDBMSSchedJobUtils::check_async_query_result_ready(
+    const uint64_t tenant_id,
+    ObSchemaGetterGuard &schema_guard,
+    ObISQLClient &sql_client)
+{
+  int ret = OB_SUCCESS;
+  uint64_t data_version = 0;
+  const ObDatabaseSchema *database_schema = NULL;
+  const ObSysVariableSchema *sys_variable_schema = NULL;
+  bool is_oracle_mode = false;
+  bool upgrade_pending = false;
+  ObArenaAllocator allocator("AsyncResReady");
+  ObDBMSSchedJobInfo cleanup_job_info;
+  if (OB_UNLIKELY(!is_user_tenant(tenant_id))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("async query requires a user tenant", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id, data_version))) {
+    LOG_WARN("failed to get tenant data version for async query", KR(ret), K(tenant_id));
+  } else if (data_version < DATA_VERSION_4_6_2_1) {
+    ret = OB_NOT_SUPPORTED;
+    upgrade_pending = true;
+    LOG_WARN("async query tenant data version is not ready", KR(ret), K(tenant_id), KDV(data_version));
+  } else if (OB_FAIL(schema_guard.get_database_schema(
+                 tenant_id, ObString(OB_ASYNC_QUERY_RESULT_DATABASE_NAME), database_schema))) {
+    LOG_WARN("failed to get async result database schema", KR(ret), K(tenant_id));
+  } else if (OB_ISNULL(database_schema)) {
+    ret = OB_NOT_SUPPORTED;
+    upgrade_pending = true;
+    LOG_WARN("async result database is not ready", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(schema_guard.get_sys_variable_schema(tenant_id, sys_variable_schema))) {
+    LOG_WARN("failed to get tenant system variables", KR(ret), K(tenant_id));
+  } else if (OB_ISNULL(sys_variable_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("tenant system variables are null", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(sys_variable_schema->get_oracle_mode(is_oracle_mode))) {
+    LOG_WARN("failed to get tenant compatibility mode", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(get_dbms_sched_job_info(sql_client,
+                                              tenant_id,
+                                              is_oracle_mode,
+                                              ObString(ASYNC_RESULT_CLEANUP_JOB_NAME),
+                                              allocator,
+                                              cleanup_job_info))) {
+    if (OB_ENTRY_NOT_EXIST == ret) {
+      ret = OB_NOT_SUPPORTED;
+      upgrade_pending = true;
+      LOG_WARN("async result cleanup job is not ready", KR(ret), K(tenant_id));
+    } else {
+      LOG_WARN("failed to get async result cleanup job", KR(ret), K(tenant_id));
+    }
+  } else if (OB_UNLIKELY(!cleanup_job_info.is_async_result_cleanup_job())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("async result cleanup job has unexpected type", KR(ret), K(tenant_id));
+  }
+  if (upgrade_pending) {
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "SUBMIT JOB SELECT before tenant async result upgrade completes");
+  }
+  return ret;
+}
+
+int ObDBMSSchedJobUtils::ensure_async_result_cleanup_job(
+    const share::schema::ObSysVariableSchema &sys_variable,
+    const uint64_t tenant_id,
+    common::ObMySQLTransaction &trans)
+{
+  int ret = OB_SUCCESS;
+  bool is_oracle_mode = false;
+  bool job_exists = false;
+  ObArenaAllocator allocator("AsyncResClean");
+  ObDBMSSchedJobInfo existing_job_info;
+  if (OB_UNLIKELY(!is_user_tenant(tenant_id))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("async result cleanup must be a user-tenant job", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(sys_variable.get_oracle_mode(is_oracle_mode))) {
+    LOG_WARN("failed to get tenant compatibility mode", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(get_dbms_sched_job_info(trans,
+                                               tenant_id,
+                                               is_oracle_mode,
+                                               ObString(ASYNC_RESULT_CLEANUP_JOB_NAME),
+                                               allocator,
+                                               existing_job_info))) {
+    if (OB_ENTRY_NOT_EXIST == ret) {
+      ret = OB_SUCCESS;
+    } else {
+      LOG_WARN("failed to look up async result cleanup job", KR(ret), K(tenant_id));
+    }
+  } else if (OB_UNLIKELY(!existing_job_info.is_async_result_cleanup_job())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("async result cleanup job name conflicts with another scheduler job",
+             KR(ret), K(tenant_id), K(existing_job_info));
+  } else {
+    job_exists = true;
+    LOG_TRACE("async result cleanup job already exists", K(tenant_id), K(existing_job_info));
+  }
+
+  if (OB_SUCC(ret) && !job_exists) {
+    char exec_env_buf[OB_MAX_PROC_ENV_LENGTH] = {0};
+    int64_t exec_env_pos = 0;
+    int64_t job_id = OB_INVALID_ID;
+    if (OB_FAIL(sql::ObExecEnv::gen_exec_env(
+            sys_variable, exec_env_buf, OB_MAX_PROC_ENV_LENGTH, exec_env_pos))) {
+      LOG_WARN("failed to generate async result cleanup execution environment", KR(ret), K(tenant_id));
+    } else if (OB_FAIL(generate_job_id(tenant_id, job_id))) {
+      LOG_WARN("failed to generate async result cleanup job id", KR(ret), K(tenant_id));
+    } else {
+      HEAP_VAR(ObDBMSSchedJobInfo, job_info) {
+        job_info.tenant_id_ = tenant_id;
+        job_info.job_ = job_id;
+        job_info.job_name_ = ObString(ASYNC_RESULT_CLEANUP_JOB_NAME);
+        // The executor dispatches this shadow function type directly; the
+        // non-empty action is only the scheduler's persisted job contract.
+        job_info.job_action_ = ObString(ASYNC_RESULT_CLEANUP_JOB_ACTION);
+        job_info.lowner_ = is_oracle_mode ? ObString("SYS") : ObString("root@%");
+        job_info.powner_ = is_oracle_mode ? ObString("SYS") : ObString("root@%");
+        job_info.cowner_ = is_oracle_mode ? ObString("SYS") : ObString(OB_SYS_DATABASE_NAME);
+        job_info.job_style_ = ObString("REGULAR");
+        job_info.job_type_ = ObString("PLSQL_BLOCK");
+        job_info.job_class_ = ObString("DEFAULT_JOB_CLASS");
+        job_info.start_date_ = ObTimeUtility::current_time();
+        job_info.end_date_ = ObDBMSSchedJobInfo::DEFAULT_MAX_END_DATE;
+        job_info.repeat_interval_ = ObString(ASYNC_RESULT_CLEANUP_REPEAT_INTERVAL);
+        job_info.enabled_ = true;
+        job_info.auto_drop_ = false;
+        job_info.max_run_duration_ = ASYNC_RESULT_CLEANUP_MAX_RUN_DURATION_SEC;
+        job_info.exec_env_ = ObString(exec_env_pos, exec_env_buf);
+        job_info.comments_ = ObString("daily cleanup for expired async query results");
+        job_info.func_type_ = ObDBMSSchedFuncType::ASYNC_RESULT_CLEANUP_JOB;
+
+        if (OB_FAIL(create_dbms_sched_job(trans, tenant_id, job_id, job_info))) {
+          if (OB_ERR_PRIMARY_KEY_DUPLICATE == ret) {
+            ret = OB_SUCCESS;
+            LOG_TRACE("async result cleanup job already exists", K(job_info));
+          } else {
+            LOG_WARN("failed to create async result cleanup job", KR(ret), K(job_info));
+          }
+        } else {
+          LOG_DEBUG("created async result cleanup job", K(job_info));
+        }
+      } else {
+        LOG_WARN("failed to allocate async result cleanup job", KR(ret), K(tenant_id));
+      }
+    }
+  }
+  return ret;
+}
+
 int ObDBMSSchedJobUtils::stop_dbms_sched_job(
     common::ObISQLClient &sql_client,
     const ObDBMSSchedJobInfo &job_info,
@@ -526,6 +859,12 @@ int ObDBMSSchedJobUtils::create_dbms_sched_job(
   //check program job
   } else if (0 == job_info.job_type_.case_compare("STORED_PROCEDURE") && OB_FAIL(check_is_valid_name(job_info.program_name_))) {
     ret = OB_INVALID_ARGUMENT;
+  // async query is an immediate, one-shot job
+  } else if (job_info.is_async_query_job()
+             && (!job_info.is_once_job()
+                 || job_info.start_date_ > ObTimeUtility::current_time())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("async query must be submitted as an immediate one-shot job", K(ret), K(job_info));
   //check repeat_interval
   } else if (!job_info.repeat_interval_.empty() && !job_info.is_mview_job() && OB_FAIL(check_is_valid_repeat_interval(tenant_id, job_info.repeat_interval_))) {
     ret = OB_INVALID_ARGUMENT;

@@ -3087,10 +3087,12 @@ struct MergeKeyInfoHelper
                                      const uint64_t ref_table_id);
 
     int create_lake_table_access_paths(const uint64_t table_id,
-                                                const uint64_t ref_table_id,
-                                                PathHelper &helper,
-                                                ObIArray<AccessPath *> &access_paths,
-                                                ObIndexInfoCache &index_info_cache);
+                                       const uint64_t ref_table_id,
+                                       PathHelper &helper,
+                                       ObIArray<AccessPath *> &access_paths,
+                                       ObIndexInfoCache &index_info_cache);
+    int set_result_scan_access_path_ordering(const uint64_t table_id,
+                                             AccessPath *access_path);
     int fill_lake_table_index_info_entry(const uint64_t table_id,
                                          const uint64_t base_table_id,
                                          ObIndexInfoCache &index_info_cache,

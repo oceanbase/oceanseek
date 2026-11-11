@@ -31,6 +31,8 @@ public:
   inline void set_job_database(const common::ObString &job_database) {  job_database_ = job_database; }
   inline void set_job_action(const common::ObString &job_action) {  job_action_ = job_action; }
   inline void set_exec_env(const common::ObString &exec_env) {  exec_env_ = exec_env; }
+  inline void set_job_config(const common::ObString &job_config) { job_config_ = job_config; }
+  inline void set_async_query(const bool is_async_query) { is_async_query_ = is_async_query; }
   inline uint64_t get_tenant_id() const { return tenant_id_; }
   inline uint64_t get_database_id() const { return database_id_; }
   inline uint64_t get_user_id() const { return user_id_; }
@@ -40,7 +42,9 @@ public:
   inline const common::ObString &get_job_definer() const { return job_definer_; }
   inline const common::ObString &get_job_action() const { return job_action_; }
   inline const common::ObString &get_exec_env() const { return exec_env_; }
+  inline const common::ObString &get_job_config() const { return job_config_; }
   inline const common::ObString &get_job_database() const { return job_database_; }
+  inline bool is_async_query() const { return is_async_query_; }
   DECLARE_VIRTUAL_TO_STRING;
 private:
   // data members
@@ -54,6 +58,8 @@ private:
   common::ObString job_database_;
   common::ObString job_action_;
   common::ObString exec_env_;
+  common::ObString job_config_;
+  bool is_async_query_;
 
 private:
   DISALLOW_COPY_AND_ASSIGN(ObOLAPAsyncSubmitJobStmt);

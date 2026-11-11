@@ -25,6 +25,7 @@
 #include "sql/dtl/ob_dtl_msg_type.h"
 #include "sql/engine/px/datahub/components/ob_dh_opt_stats_gather.h"
 #include "sql/engine/px/datahub/components/ob_dh_join_filter_count_row.h"
+#include "sql/result_catalog/ob_async_result_file.h"
 
 namespace oceanbase
 {
@@ -132,6 +133,8 @@ public:
   ObIArray<ObTabletDirectLoadMgrHandle>* lob_direct_load_mgr_handles_;
   common::ObArray<iceberg::DataFile*> iceberg_data_files_;
   common::ObSpinLock iceberg_data_file_lock_;
+  common::ObArray<ObAsyncResultFileDesc> async_result_files_;
+  common::ObSpinLock async_result_file_lock_;
   common::ObArenaAllocator async_index_query_allocator_;
   common::ObSEArray<ObSqcAsyncIndexQueryCtxEntry *, 1> async_index_query_ctxs_;
 private:

@@ -502,26 +502,34 @@ int ObPXServerAddrUtil::assign_lake_table_files_to_sqc(const DASTabletLocList &l
   return ret;
 }
 
-int ObPXServerAddrUtil::find_function_table_server_list(const ObOpSpec &op,
-                                                         ObIArray<ObAddr> &server_list)
+int ObPXServerAddrUtil::find_arrow_stream_server_list(const ObOpSpec &op,
+                                                       ObIArray<ObAddr> &server_list)
 {
   int ret = OB_SUCCESS;
   if (op.get_type() == PHY_FUNCTION_TABLE) {
     const ObFunctionTableSpec &ft = static_cast<const ObFunctionTableSpec &>(op);
-    for (int64_t i = 0; OB_SUCC(ret) && i < ft.server_list_.count(); ++i) {
-      OZ(server_list.push_back(ft.server_list_.at(i)));
+    if (OB_NOT_NULL(ft.value_expr_)
+        && (T_FUN_SYS_ARROW_STREAM == ft.value_expr_->type_
+            || T_FUN_SYS_ARROW_STREAMS == ft.value_expr_->type_)) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < ft.server_list_.count(); ++i) {
+        OZ(server_list.push_back(ft.server_list_.at(i)));
+      }
     }
   } else if (op.get_type() == PHY_SYS_FUNCTION_TABLE_VEC) {
     const ObSysFunctionTableVecSpec &ft = static_cast<const ObSysFunctionTableVecSpec &>(op);
-    for (int64_t i = 0; OB_SUCC(ret) && i < ft.server_list_.count(); ++i) {
-      OZ(server_list.push_back(ft.server_list_.at(i)));
+    if (OB_NOT_NULL(ft.value_expr_)
+        && (T_FUN_SYS_ARROW_STREAM == ft.value_expr_->type_
+            || T_FUN_SYS_ARROW_STREAMS == ft.value_expr_->type_)) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < ft.server_list_.count(); ++i) {
+        OZ(server_list.push_back(ft.server_list_.at(i)));
+      }
     }
   }
   if (OB_SUCC(ret) && server_list.empty() && !IS_RECEIVE(op.get_type())) {
     for (int32_t i = 0; OB_SUCC(ret) && server_list.empty() && i < op.get_child_num(); ++i) {
       const ObOpSpec *child = op.get_child(i);
       if (OB_NOT_NULL(child)) {
-        OZ(ObPXServerAddrUtil::find_function_table_server_list(*child, server_list));
+        OZ(ObPXServerAddrUtil::find_arrow_stream_server_list(*child, server_list));
       }
     }
   }
@@ -704,12 +712,12 @@ int ObPXServerAddrUtil::alloc_by_data_distribution_inner(
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("the count of insert ops is not right", K(ret), K(dml_ops.count()));
   } else {
-    // Check for function table with server_list first — applies to any DFO
-    // (INSERT with arrow_streams, UPDATE with arrow_streams, etc.)
-    ObSEArray<ObAddr, 4> ft_server_list;
-    if (OB_FAIL(find_function_table_server_list(*root_op, ft_server_list))) {
-      LOG_WARN("failed to find function table server list", K(ret), K(dfo));
-    } else if (ft_server_list.count() > 0) {
+    // Arrow streams must execute on the observers that own their input streams.
+    // Other function tables follow the regular scan/DML data distribution path.
+    ObSEArray<ObAddr, 4> arrow_stream_server_list;
+    if (OB_FAIL(find_arrow_stream_server_list(*root_op, arrow_stream_server_list))) {
+      LOG_WARN("failed to find arrow stream server list", K(ret), K(dfo));
+    } else if (arrow_stream_server_list.count() > 0) {
       if (OB_FAIL(generate_dh_map_info(dfo))) {
         LOG_WARN("fail to generate dh map info", K(ret));
       } else {
@@ -717,12 +725,12 @@ int ObPXServerAddrUtil::alloc_by_data_distribution_inner(
         if (parallel <= 0) { parallel = 1; }
         ObIArray<ObPxSqcMeta> &sqcs = dfo.get_sqcs();
         ObTMArray<double> sqc_part_count;
-        OZ(sqc_part_count.prepare_allocate(ft_server_list.count()));
-        for (int64_t i = 0; OB_SUCC(ret) && i < ft_server_list.count(); ++i) {
+        OZ(sqc_part_count.prepare_allocate(arrow_stream_server_list.count()));
+        for (int64_t i = 0; OB_SUCC(ret) && i < arrow_stream_server_list.count(); ++i) {
           SMART_VAR(ObPxSqcMeta, sqc) {
             sqc.set_dfo_id(dfo.get_dfo_id());
             sqc.set_sqc_id(i);
-            sqc.set_exec_addr(ft_server_list.at(i));
+            sqc.set_exec_addr(arrow_stream_server_list.at(i));
             sqc.set_qc_addr(GCTX.self_addr());
             sqc.set_execution_id(dfo.get_execution_id());
             sqc.set_px_sequence_id(dfo.get_px_sequence_id());
@@ -752,7 +760,7 @@ int ObPXServerAddrUtil::alloc_by_data_distribution_inner(
           }
           for (int64_t i = 0; OB_SUCC(ret) && i < sqc_max_task_count.count(); ++i) {
             sqcs.at(i).set_total_task_count(total_task_count);
-            sqcs.at(i).set_total_part_count(ft_server_list.count());
+            sqcs.at(i).set_total_part_count(arrow_stream_server_list.count());
           }
         }
       }
@@ -1000,6 +1008,9 @@ int ObPXServerAddrUtil::build_dfo_sqc(ObExecContext &ctx,
   bool is_opt_stat_valid = false;
   //for pkey, we send tablets row info to sqc to help decide the affinity rule
   bool send_px_tablets_info_to_sqc = false;
+  const bool result_worker_order_claimed = scan_ops.count() == 1
+      && OB_NOT_NULL(scan_ops.at(0))
+      && scan_ops.at(0)->result_worker_order_claimed_;
   int64_t parallel = dfo.get_assigned_worker_count();
   if (0 >= parallel) {
     parallel = 1;
@@ -1086,11 +1097,27 @@ int ObPXServerAddrUtil::build_dfo_sqc(ObExecContext &ctx,
         LOG_WARN("Unexpected sqcs count and sqc max task count", K(ret), K(sqcs.count()), K(sqc_max_task_count.count()));
       }
     }
+    if (OB_SUCC(ret) && result_worker_order_claimed
+        && (is_opt_stat_valid || parallel < total_part_cnt)) {
+      ret = OB_ERR_INSUFFICIENT_PX_WORKER;
+      LOG_WARN("ordered Result scan cannot reserve one reader per writer",
+               K(ret), K(parallel), K(total_part_cnt), K(is_opt_stat_valid));
+    }
     int64_t total_task_count = 0;
     for (int64_t i = 0; OB_SUCC(ret) && i < sqc_max_task_count.count(); ++i) {
-      sqcs.at(i).set_min_task_count(1);
-      sqcs.at(i).set_max_task_count(sqc_max_task_count.at(i));
-      total_task_count += sqc_max_task_count.at(i);
+      const int64_t min_task_count = result_worker_order_claimed
+          ? static_cast<int64_t>(sqc_part_count.at(i)) : 1;
+      if (result_worker_order_claimed
+          && OB_UNLIKELY(min_task_count <= 0
+                         || sqc_max_task_count.at(i) < min_task_count)) {
+        ret = OB_ERR_INSUFFICIENT_PX_WORKER;
+        LOG_WARN("ordered Result SQC has fewer readers than writer streams",
+                 K(ret), K(i), K(min_task_count), K(sqc_max_task_count.at(i)));
+      } else {
+        sqcs.at(i).set_min_task_count(min_task_count);
+        sqcs.at(i).set_max_task_count(sqc_max_task_count.at(i));
+        total_task_count += sqc_max_task_count.at(i);
+      }
     }
     for (int64_t i = 0; OB_SUCC(ret) && i < sqc_max_task_count.count(); ++i) {
       sqcs.at(i).set_total_task_count(total_task_count);
@@ -5240,4 +5267,3 @@ int ObPXServerAddrUtil::assign_extra_lake_table_files_to_sqc(ObExecContext &exec
   }
   return ret;
 }
-

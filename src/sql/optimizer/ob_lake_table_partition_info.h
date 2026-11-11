@@ -104,7 +104,8 @@ public:
                                      const uint64_t ref_table_id,
                                      int64_t lake_table_snapshot_id,
                                      const ObIArray<ObRawExpr*> &filter_exprs,
-                                     int64_t estimated_parallel);
+                                     int64_t estimated_parallel,
+                                     bool enable_result_scan_ordered_read);
 
   // 为保留文件选择执行节点；bucket 表复用预先生成的稠密分区 ID。
   int select_location_for_iceberg(ObExecContext *exec_ctx,
@@ -117,6 +118,10 @@ public:
                                       share::ObExternalTablePartInfoArray &partition_infos);
 
   int select_location_for_hive(ObExecContext *exec_ctx, ObIArray<ObHiveFileDesc> &file_descs);
+  // Keep one ordered Result writer's files on one scan location, in manifest
+  // order. Unordered Result files use select_location_for_hive().
+  int select_location_for_ordered_result(ObExecContext *exec_ctx,
+                                         ObIArray<ObHiveFileDesc> &file_descs);
   /// Pure placement for ODPS: one candidate tablet loc per alive server, then
   /// each scan unit (produced by ObODPSFilePruner::plan_files) is hung on
   /// the loc of its assigned slot. The units live in the pruner's allocator

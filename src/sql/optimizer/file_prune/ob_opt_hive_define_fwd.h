@@ -18,13 +18,23 @@ namespace sql
 
 struct ObHiveFileDesc
 {
-  ObHiveFileDesc() : part_id_(OB_INVALID_PARTITION_ID), file_size_(0), modify_ts_(0)
+  ObHiveFileDesc()
+    : part_id_(OB_INVALID_PARTITION_ID),
+      file_size_(0),
+      modify_ts_(0),
+      first_lineno_(1),
+      last_lineno_(INT64_MAX)
   {
   }
-  TO_STRING_KV(K(part_id_), K(file_size_), K(modify_ts_), K(file_path_));
+  TO_STRING_KV(K(part_id_), K(file_size_), K(modify_ts_), K(first_lineno_), K(last_lineno_),
+               K(file_path_));
   int64_t part_id_;
   int64_t file_size_;
   int64_t modify_ts_;
+  // Parquet uses the inherited line-number range as a one-based row-group
+  // range. The default retains the ordinary whole-file Hive scan behavior.
+  int64_t first_lineno_;
+  int64_t last_lineno_;
   common::ObString file_path_;
 };
 

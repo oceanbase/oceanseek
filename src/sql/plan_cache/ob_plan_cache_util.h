@@ -1202,10 +1202,12 @@ class ObConfigInfoInPC
 {
 public:
   static const int DEFAULT_PUSHDOWN_STORAGE_LEVEL = 4;
+  static const int64_t DEFAULT_ASYNC_RESULT_PARQUET_ROW_GROUP_ROWS = 1024L * 1024;
 
   ObConfigInfoInPC()
   : pushdown_storage_level_(DEFAULT_PUSHDOWN_STORAGE_LEVEL),
     rowsets_enabled_(false),
+    async_result_parquet_row_group_rows_(DEFAULT_ASYNC_RESULT_PARQUET_ROW_GROUP_ROWS),
     enable_px_batch_rescan_(true),
     bloom_filter_enabled_(true),
     enable_newsort_(true),
@@ -1271,6 +1273,7 @@ public:
   //
   int pushdown_storage_level_;
   bool rowsets_enabled_;
+  int64_t async_result_parquet_row_group_rows_;
   bool enable_px_batch_rescan_;
   bool enable_px_ordered_coord_;
   bool bloom_filter_enabled_;

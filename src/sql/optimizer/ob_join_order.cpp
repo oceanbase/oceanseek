@@ -21,6 +21,8 @@
 #include "share/catalog/ob_catalog_properties.h"
 #include "share/catalog/odps/ob_odps_catalog.h"
 #include "sql/optimizer/ob_lake_table_partition_info.h"
+#include "sql/result_catalog/ob_async_result_metadata.h"
+#include "sql/result_catalog/ob_result_scan_catalog.h"
 #include "share/stat/ob_lake_table_stat.h"
 #include "share/external_table/ob_external_table_file_mgr.h"
 #include "share/location_cache/ob_location_service.h"
@@ -15125,20 +15127,21 @@ int ObJoinOrder::get_distributed_join_method(Path &left_path,
                              DIST_ALL_NONE);
     OPT_TRACE("[FlightSQL] Arrow FunctionTable on right side can not use NONE distribution");
   }
-  // Distributed function tables (e.g. arrow_streams with server_cnt>1) require
+  // Distributed Arrow streams require
   // each PX worker to land on a distinct node to read its local ingest stream.
   // Slave-mapping distributions and BC2HOST co-locate workers, so forbid them.
   {
-    bool has_dist_ft = (left_path.is_function_table_path() && left_path.server_cnt_ > 1)
-                    || (right_path.is_function_table_path() && right_path.server_cnt_ > 1);
-    if (has_dist_ft) {
+    const bool has_distributed_arrow_stream =
+        (is_one_shot_arrow_stream_path(&left_path) && left_path.server_cnt_ > 1)
+        || (is_one_shot_arrow_stream_path(&right_path) && right_path.server_cnt_ > 1);
+    if (has_distributed_arrow_stream) {
       distributed_methods &= ~DIST_BC2HOST_NONE;
       distributed_methods &= ~DIST_HASH_HASH_LOCAL;
       distributed_methods &= ~DIST_PARTITION_HASH_LOCAL;
       distributed_methods &= ~DIST_HASH_LOCAL_PARTITION;
       distributed_methods &= ~DIST_BROADCAST_HASH_LOCAL;
       distributed_methods &= ~DIST_HASH_LOCAL_BROADCAST;
-      OPT_TRACE("[FlightSQL] distributed function table: disabling BC2HOST and slave mapping");
+      OPT_TRACE("[FlightSQL] distributed Arrow stream: disabling BC2HOST and slave mapping");
     }
   }
   if (NESTED_LOOP_JOIN == join_algo || is_naaj) {
@@ -24871,6 +24874,13 @@ int ObJoinOrder::generate_lake_table_paths(PathHelper &helper)
     LOG_WARN("failed to estimate_size", K(ret));
   } else if (OB_FAIL(compute_parallel_and_server_info_for_base_paths(access_paths))) {
     LOG_WARN("failed to compute", K(ret));
+  } else if (share::is_result_catalog_table(table_meta_info_.lake_table_format_)
+             && (access_paths.count() != 1 || OB_ISNULL(access_paths.at(0)))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected Result Catalog access path count", K(ret), K(access_paths.count()));
+  } else if (share::is_result_catalog_table(table_meta_info_.lake_table_format_)
+             && OB_FAIL(set_result_scan_access_path_ordering(table_id, access_paths.at(0)))) {
+    LOG_WARN("failed to set Result Catalog access path ordering", K(ret), K(table_id));
   } else if (OB_FAIL(compute_sharding_info_for_lake_paths(access_paths))) {
     LOG_WARN("failed to calc sharding info", K(ret));
   } else if (OB_FAIL(compute_cost_and_prune_access_path(helper, access_paths))) {
@@ -24981,7 +24991,8 @@ int ObJoinOrder::compute_lake_table_location_and_meta(const uint64_t table_id,
                                                                            ref_table_id,
                                                                            lake_table_snapshot_id,
                                                                            uncorrelated_filters,
-                                                                           estimated_parallel))) {
+                                                                           estimated_parallel,
+                                                                           OPT_CTX.enable_result_scan_ordered_read()))) {
     LOG_WARN("failed to prune file and select location");
   } else {
     table_partition_info = lake_table_partition_info;
@@ -25050,6 +25061,15 @@ int ObJoinOrder::compute_lake_table_meta_info(const uint64_t table_id,
         LOG_WARN("failed to get plugin table stat", K(ret));
       } else {
         table_meta_info_.table_row_count_ = table_stat.total_row_count_;
+      }
+    } else if (share::is_result_catalog_table(table_meta_info_.lake_table_format_)) {
+      const TableItem *result_table_item = get_plan()->get_stmt()->get_table_item_by_id(table_id);
+      const share::ObILakeTableMetadata *catalog_metadata =
+          OB_NOT_NULL(result_table_item) ? result_table_item->catalog_table_metadata_ : nullptr;
+      if (OB_FAIL(ObResultScanCatalog::get_result_row_count(
+              catalog_metadata, table_meta_info_.table_row_count_))) {
+        LOG_WARN("failed to get Result Catalog cardinality", KR(ret), K(table_id),
+                 K(ref_table_id), KP(catalog_metadata));
       }
     } else {
       if (OB_FAIL(ObLakeTablePartitionInfo::get_table_stat(*allocator_,
@@ -25185,6 +25205,102 @@ int ObJoinOrder::create_lake_table_access_paths(const uint64_t table_id,
     LOG_WARN("failed to create one lake table access path", K(ref_table_id));
   } else if(OB_FAIL(access_paths.push_back(lake_table_access_path))) {
     LOG_WARN("failed to push back access path", K(ret));
+  }
+  return ret;
+}
+
+int ObJoinOrder::set_result_scan_access_path_ordering(const uint64_t table_id,
+                                                      AccessPath *access_path)
+{
+  int ret = OB_SUCCESS;
+  const ObDMLStmt *stmt = NULL;
+  const TableItem *table_item = NULL;
+  const share::ObILakeTableMetadata *catalog_metadata = NULL;
+  const ObResultCatalogTableMetadata *result_metadata = NULL;
+  if (OB_ISNULL(access_path)
+      || OB_ISNULL(get_plan())
+      || OB_ISNULL(stmt = get_plan()->get_stmt())
+      || OB_ISNULL(table_item = stmt->get_table_item_by_id(table_id))
+      || OB_ISNULL(catalog_metadata = table_item->catalog_table_metadata_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null Result Catalog access path context",
+             K(ret), K(table_id), KP(access_path), KP(stmt), KP(table_item), KP(catalog_metadata));
+  } else if (OB_UNLIKELY(!share::is_result_catalog_table(catalog_metadata->get_format_type()))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("unexpected metadata type for Result Catalog access path",
+             K(ret), K(table_id), "format_type", catalog_metadata->get_format_type());
+  } else {
+    const bool enable_ordered_read = OPT_CTX.enable_result_scan_ordered_read();
+    result_metadata = static_cast<const ObResultCatalogTableMetadata *>(catalog_metadata);
+    const ObResultTableMetadata &manifest = result_metadata->get_result_table_metadata();
+    const ObIArray<ObResultColumnMetadata> &columns = manifest.get_columns();
+    const ObIArray<ObResultOrderingFieldMetadata> &ordering_fields =
+        manifest.get_ordering_fields();
+    const int64_t selected_writer_count = OB_ISNULL(access_path->table_partition_info_)
+        ? 0
+        : access_path->table_partition_info_->get_phy_tbl_location_info()
+              .get_phy_part_loc_info_list().count();
+    // A selected location is one writer stream. PX admission will require at
+    // least that many workers on each SQC, and the Result GI assigns each
+    // stream to a distinct worker. Other GI modes keep their own ordering
+    // rules and cannot consume this access-path claim.
+    const bool can_claim_worker_order = enable_ordered_read
+        && manifest.has_writer_file_ordering()
+        && stmt->is_single_table_stmt()
+        && !access_path->is_inner_path_
+        && !access_path->use_das_
+        && selected_writer_count > 0
+        && access_path->parallel_ >= selected_writer_count;
+    access_path->ordering_.reset();
+    access_path->is_local_order_ = false;
+    access_path->set_interesting_order_info(OrderingFlag::NOT_MATCH);
+    bool ordering_prefix_available = can_claim_worker_order;
+    for (int64_t i = 0; OB_SUCC(ret) && ordering_prefix_available
+                        && i < ordering_fields.count(); ++i) {
+      const ObResultOrderingFieldMetadata &ordering_field = ordering_fields.at(i);
+      const ObResultColumnMetadata *column = NULL;
+      ObColumnRefRawExpr *column_expr = NULL;
+      for (int64_t j = 0; OB_ISNULL(column) && j < columns.count(); ++j) {
+        if (ordering_field.field_id_ == columns.at(j).field_id_) {
+          column = &columns.at(j);
+        }
+      }
+      if (OB_ISNULL(column)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("Result Catalog ordering field is absent from schema",
+                 K(ret), K(table_id), K(i), K(ordering_field));
+      } else if (OB_ISNULL(column_expr = stmt->get_column_expr_by_id(
+                     table_id,
+                     OB_APP_MIN_COLUMN_ID + static_cast<uint64_t>(column->ordinal_)))) {
+        // A pruned ordering column ends the prefix available to this query.
+        ordering_prefix_available = false;
+      } else {
+        const ObOrderDirection direction =
+            ordering_field.ascending_
+                ? (ordering_field.nulls_first_ ? NULLS_FIRST_ASC : NULLS_LAST_ASC)
+                : (ordering_field.nulls_first_ ? NULLS_FIRST_DESC : NULLS_LAST_DESC);
+        if (OB_FAIL(access_path->ordering_.push_back(OrderItem(column_expr, direction)))) {
+          LOG_WARN("failed to append Result Catalog access path ordering",
+                   K(ret), K(table_id), K(i), KPC(column_expr), K(direction));
+        }
+      }
+    }
+    if (OB_SUCC(ret) && !access_path->ordering_.empty()) {
+      access_path->is_local_order_ = true;
+      int64_t interesting_order_info = OrderingFlag::NOT_MATCH;
+      if (OB_FAIL(check_all_interesting_order(access_path->ordering_,
+                                              stmt,
+                                              interesting_order_info))) {
+        LOG_WARN("failed to check Result Catalog interesting ordering",
+                 K(ret), K(table_id), K(access_path->ordering_));
+      } else {
+        access_path->set_interesting_order_info(interesting_order_info);
+      }
+    }
+    LOG_TRACE("set Result Catalog worker-local ordering",
+              K(table_id), K(selected_writer_count), K(access_path->parallel_),
+              K(enable_ordered_read), K(can_claim_worker_order), K(access_path->is_local_order_),
+              "path_ordering", access_path->ordering_);
   }
   return ret;
 }

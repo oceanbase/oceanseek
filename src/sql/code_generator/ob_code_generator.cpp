@@ -7,6 +7,7 @@
 
 #include "sql/code_generator/ob_code_generator.h"
 #include "sql/code_generator/ob_static_engine_cg.h"
+#include "sql/resolver/dml/ob_select_stmt.h"
 
 namespace oceanbase
 {
@@ -92,6 +93,13 @@ int ObCodeGenerator::detect_batch_size(
   ObBasicSessionInfo *session =
       log_plan.get_optimizer_context().get_session_info();
   ObExecContext *exec_ctx = log_plan.get_optimizer_context().get_exec_ctx();
+  bool is_async_result = false;
+  if (OB_NOT_NULL(log_plan.get_stmt())
+      && stmt::T_SELECT == log_plan.get_stmt()->get_stmt_type()) {
+    const ObSelectIntoItem *select_into_item =
+        static_cast<const ObSelectStmt *>(log_plan.get_stmt())->get_select_into();
+    is_async_result = OB_NOT_NULL(select_into_item) && select_into_item->async_result_;
+  }
   CK(NULL != exec_ctx && NULL != exec_ctx->get_physical_plan_ctx());
   bool has_registered_vec_op = false;
   if (OB_ISNULL(log_plan.get_plan_root())) {
@@ -129,7 +137,13 @@ int ObCodeGenerator::detect_batch_size(
     } else if (GET_MIN_CLUSTER_VERSION() >= CLUSTER_VERSION_4_3_3_0 && !vectorize) {
       // set max_batch_size = 1
       // if all physical operator is not registered as vec op, disable vectorization
-      if (rowsets_enabled && has_registered_vec_op) {
+      // Result Catalog Parquet has one private vector-to-Arrow codec.  Keep its
+      // SELECT INTO sink on the batch interface even when the input plan is in
+      // row mode; row-only children are adapted to a one-row batch by
+      // ObOperator::get_next_batch_with_onlyone_row().
+      if (has_registered_vec_op
+          && (rowsets_enabled
+              || is_async_result)) {
         batch_size = 1;
       } else {
         batch_size = 0;

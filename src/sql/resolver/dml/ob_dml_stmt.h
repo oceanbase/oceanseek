@@ -28,6 +28,10 @@
 
 namespace oceanbase
 {
+namespace share
+{
+class ObILakeTableMetadata;
+}
 namespace sql
 {
 class ObStmtResolver;
@@ -256,6 +260,7 @@ struct TableItem
     kv_value_col_id_ = common::OB_INVALID_ID;
     logical_table_aux_type_ = share::LT_AUX_MAX_TYPE;
     ext_table_def_ = NULL;
+    catalog_table_metadata_ = nullptr;
   }
 
   virtual TO_STRING_KV(N_TID, table_id_,
@@ -278,8 +283,8 @@ struct TableItem
                KPC_(function_table_expr),
                K_(flashback_query_type), KPC_(flashback_query_expr), K_(table_type),
                K_(exec_params), KPC_(sample_info), K_(mview_id), K_(need_expand_rt_mv),
-               KPC_(ext_table_def), K_(catalog_name), K_(is_mv_proctime_table),
-               K_(is_partition_tier_selection_empty));
+               KPC_(ext_table_def), KP_(catalog_table_metadata), K_(catalog_name),
+               K_(is_mv_proctime_table), K_(is_partition_tier_selection_empty));
 
   enum TableType
   {
@@ -445,6 +450,9 @@ struct TableItem
   // external table
   common::ObString catalog_name_;
   ObExtTableDef *ext_table_def_;
+  // Statement-local catalog metadata. It is non-owning; ObSqlSchemaGuard or
+  // the resolver owns the concrete lake metadata object.
+  const share::ObILakeTableMetadata *catalog_table_metadata_;
   // sample scan infos
   SampleInfo *sample_info_;
   // transpose table

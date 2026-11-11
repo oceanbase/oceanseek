@@ -119,7 +119,10 @@ struct ObSelectIntoItem
         escaped_cht_(),
         file_partition_expr_(NULL),
         buffer_size_(DEFAULT_BUFFER_SIZE),
-        external_properties_()
+        external_properties_(),
+        async_result_(false),
+        async_result_tenant_id_(common::OB_INVALID_TENANT_ID),
+        async_result_job_id_(common::OB_INVALID_ID)
   {
     field_str_.set_varchar(DEFAULT_FIELD_TERM_STR);
     field_str_.set_collation_type(ObCharset::get_system_collation());
@@ -147,6 +150,9 @@ struct ObSelectIntoItem
     file_partition_expr_ = other.file_partition_expr_;
     buffer_size_ = other.buffer_size_;
     external_properties_ = other.external_properties_;
+    async_result_ = other.async_result_;
+    async_result_tenant_id_ = other.async_result_tenant_id_;
+    async_result_job_id_ = other.async_result_job_id_;
     return user_vars_.assign(other.user_vars_);
   }
   int deep_copy(ObIAllocator &allocator,
@@ -164,7 +170,10 @@ struct ObSelectIntoItem
                K_(cs_type),
                N_EXPR, file_partition_expr_,
                K_(buffer_size),
-               K_(external_properties));
+               K_(external_properties),
+               K_(async_result),
+               K_(async_result_tenant_id),
+               K_(async_result_job_id));
   ObItemType into_type_;
   common::ObObj outfile_name_;
   common::ObObj field_str_; // field terminated str
@@ -180,6 +189,11 @@ struct ObSelectIntoItem
   sql::ObRawExpr* file_partition_expr_;
   int64_t buffer_size_;
   common::ObString external_properties_;
+  // Set only after the resolver binds the private Result Store target to the
+  // trusted scheduler job identity.
+  bool async_result_;
+  uint64_t async_result_tenant_id_;
+  uint64_t async_result_job_id_;
 
   static const char* const DEFAULT_FIELD_TERM_STR;
   static const char* const DEFAULT_LINE_TERM_STR;

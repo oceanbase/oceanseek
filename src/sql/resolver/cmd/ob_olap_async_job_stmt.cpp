@@ -12,12 +12,14 @@ using namespace oceanbase::common;
 using namespace oceanbase::sql;
 
 ObOLAPAsyncSubmitJobStmt::ObOLAPAsyncSubmitJobStmt(ObIAllocator *name_pool)
-    : ObCMDStmt(name_pool, stmt::T_OLAP_ASYNC_JOB_SUBMIT)
+    : ObCMDStmt(name_pool, stmt::T_OLAP_ASYNC_JOB_SUBMIT),
+      is_async_query_(false)
 {
 }
 
 ObOLAPAsyncSubmitJobStmt::ObOLAPAsyncSubmitJobStmt()
-    : ObCMDStmt(NULL, stmt::T_OLAP_ASYNC_JOB_SUBMIT)
+    : ObCMDStmt(NULL, stmt::T_OLAP_ASYNC_JOB_SUBMIT),
+      is_async_query_(false)
 {
 }
 

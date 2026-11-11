@@ -7,6 +7,8 @@
 
 #include "ob_granule_pump.h"
 #include "ob_external_table_granule_handler.h"
+#include "share/catalog/ob_external_catalog.h"
+#include "sql/result_catalog/ob_async_result_granule_splitter.h"
 #include "sql/engine/px/ob_px_sqc_handler.h"
 
 namespace oceanbase
@@ -148,7 +150,8 @@ int ObGITaskSet::assign(const ObGITaskSet &other)
   return ret;
 }
 
-int ObGITaskSet::set_pw_affi_partition_order(bool asc, bool force_reverse)
+int ObGITaskSet::set_pw_affi_partition_order(
+    bool asc, bool force_reverse, bool preserve_group_order)
 {
   int ret = OB_SUCCESS;
   if (gi_task_set_.count() <= 1) {
@@ -163,19 +166,46 @@ int ObGITaskSet::set_pw_affi_partition_order(bool asc, bool force_reverse)
 
     // do nothing
   } else {
-    // first we do a defensive check. if data already sorted as expected, we just skip reverse
-    if (!force_reverse &&
-        ((asc && (gi_task_set_.at(0).tablet_loc_->tablet_id_ <= gi_task_set_.at(1).tablet_loc_->tablet_id_))
-         || (!asc && (gi_task_set_.at(0).tablet_loc_->tablet_id_ > gi_task_set_.at(1).tablet_loc_->tablet_id_)))) {
+    // For Result files, several entries can be one writer task. Compare the
+    // first two task groups and reverse groups without reversing their files.
+    int64_t second_group_pos = 1;
+    if (preserve_group_order) {
+      while (second_group_pos < gi_task_set_.count()
+             && gi_task_set_.at(second_group_pos).idx_ == gi_task_set_.at(0).idx_) {
+        ++second_group_pos;
+      }
+    }
+    const bool already_ordered = second_group_pos == gi_task_set_.count()
+        || (asc && gi_task_set_.at(0).tablet_loc_->tablet_id_
+                   <= gi_task_set_.at(second_group_pos).tablet_loc_->tablet_id_)
+        || (!asc && gi_task_set_.at(0).tablet_loc_->tablet_id_
+                    > gi_task_set_.at(second_group_pos).tablet_loc_->tablet_id_);
+    if (!force_reverse && already_ordered) {
       // no need to reverse this taskset
     } else {
       common::ObArray<ObGITaskInfo> reverse_task_info;
       if (OB_FAIL(reverse_task_info.reserve(gi_task_set_.count()))) {
         LOG_WARN("fail reserve memory for array", K(ret));
       }
-      for (int64_t i = gi_task_set_.count() - 1; OB_SUCC(ret) && i >=0; --i) {
-        if (OB_FAIL(reverse_task_info.push_back(gi_task_set_.at(i)))) {
-          LOG_WARN("failed to push back task info", K(ret));
+      if (preserve_group_order) {
+        for (int64_t end = gi_task_set_.count(); OB_SUCC(ret) && end > 0;) {
+          int64_t begin = end - 1;
+          while (begin > 0 && gi_task_set_.at(begin - 1).idx_
+                              == gi_task_set_.at(end - 1).idx_) {
+            --begin;
+          }
+          for (int64_t i = begin; OB_SUCC(ret) && i < end; ++i) {
+            if (OB_FAIL(reverse_task_info.push_back(gi_task_set_.at(i)))) {
+              LOG_WARN("failed to preserve Result file sequence while reversing task groups", K(ret));
+            }
+          }
+          end = begin;
+        }
+      } else {
+        for (int64_t i = gi_task_set_.count() - 1; OB_SUCC(ret) && i >=0; --i) {
+          if (OB_FAIL(reverse_task_info.push_back(gi_task_set_.at(i)))) {
+            LOG_WARN("failed to push back task info", K(ret));
+          }
         }
       }
       if (OB_SUCC(ret)) {
@@ -377,6 +407,7 @@ int ObGranulePump::fetch_granule_task(const ObGITaskSet *&res_task_set,
   } else {
     switch(splitter_type) {
     case GIT_AFFINITY:
+    case GIT_RESULT_ORDERED:
     case GIT_ACCESS_ALL:
     case GIT_FULL_PARTITION_WISE:
     case GIT_PARTITION_WISE_WITH_AFFINITY:
@@ -669,6 +700,25 @@ int ObGranulePump::add_new_gi_task(ObGranulePumpArgs &args, bool check_task_exis
   partition_wise_join_ = ObGranuleUtil::pwj_gi(args.gi_attri_flag_);
   ObTableModifySpec *modify_op = args.op_info_.get_modify_op();
   ObIArray<const ObTableScanSpec *> &scan_ops = args.op_info_.get_scan_ops();
+  bool contains_result_catalog_scan = false;
+  bool ordered_result_single_scan = false;
+  for (int64_t i = 0; i < scan_ops.count() && !contains_result_catalog_scan; ++i) {
+    const ObTableScanSpec *scan_op = scan_ops.at(i);
+    contains_result_catalog_scan = OB_NOT_NULL(scan_op)
+        && share::is_result_catalog_table(
+            scan_op->tsc_ctdef_.scan_ctdef_.lake_table_format_);
+  }
+  for (int64_t i = 0; i < scan_ops.count(); ++i) {
+    if (OB_NOT_NULL(scan_ops.at(i)) && scan_ops.at(i)->result_writer_ordered_) {
+      has_ordered_result_scan_ = true;
+    }
+  }
+  ordered_result_single_scan = scan_ops.count() == 1
+      && OB_NOT_NULL(scan_ops.at(0))
+      && scan_ops.at(0)->result_writer_ordered_
+      && !ObGranuleUtil::affinitize(args.gi_attri_flag_)
+      && !ObGranuleUtil::pwj_gi(args.gi_attri_flag_)
+      && !ObGranuleUtil::access_all(args.gi_attri_flag_);
   LOG_DEBUG("init granule", K(args));
   LOG_DEBUG("gi pump add_new_gi_task", K(modify_op), K(this), K(scan_ops), K(gi_task_array_map_),
            K(gi_task_array_map_.count()), K(args.tablet_arrays_));
@@ -679,13 +729,26 @@ int ObGranulePump::add_new_gi_task(ObGranulePumpArgs &args, bool check_task_exis
     bool can_randomize = false;
     if (OB_FAIL(check_can_randomize(args, can_randomize))) {
       LOG_WARN("check can randomize failed", K(ret));
-    } else if (can_randomize) {
+    } else if (can_randomize && !contains_result_catalog_scan) {
       random_type = ObGITaskSet::GI_RANDOM_RANGE;
       LOG_TRACE("split random task/range for online ddl and pdml");
     }
   }
+  for (int64_t i = 0; OB_SUCC(ret) && !ordered_result_single_scan
+                      && i < scan_ops.count(); ++i) {
+    if (OB_NOT_NULL(scan_ops.at(i)) && scan_ops.at(i)->result_worker_order_claimed_) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("ordered Result access path requires a single scan GI",
+               K(ret), K(args.gi_attri_flag_), K(scan_ops.count()));
+    }
+  }
 
   if (OB_FAIL(ret)) {
+  } else if (ordered_result_single_scan) {
+    ObAsyncResultGranuleSplitter splitter;
+    if (OB_FAIL(splitter.split_granule(args, gi_task_array_map_, check_task_exist))) {
+      LOG_WARN("failed to assign ordered Result writer streams", K(ret));
+    }
   } else if (ObGranuleUtil::access_all(args.gi_attri_flag_)) {
     ObAccessAllGranuleSplitter splitter;
     if (OB_FAIL(splitter.split_granule(args,
@@ -957,6 +1020,7 @@ int ObGranulePump::check_can_randomize(ObGranulePumpArgs &args, bool &can_random
 void ObGranulePump::destroy()
 {
   gi_task_array_map_.reset();
+  has_ordered_result_scan_ = false;
   // no pump_version added rescan no sample scan
   for (int64_t i = 0; i < external_task_runners_.count(); ++i) {
     OB_DELETEx(GITaskGenRunner, &external_task_runners_.at(i)->get_exec_ctx().get_allocator(), external_task_runners_.at(i));
@@ -1317,6 +1381,10 @@ int ObRandomGranuleSplitter::split_granule(ObGranulePumpArgs &args,
     } else {
       uint64_t scan_key_id = tsc->get_scan_key_id();
       uint64_t op_id = tsc->get_id();
+      const bool is_result_catalog = share::is_result_catalog_table(
+          tsc->tsc_ctdef_.scan_ctdef_.lake_table_format_);
+      const ObGITaskSet::ObGIRandomType scan_random_type = is_result_catalog
+          ? ObGITaskSet::GI_RANDOM_NONE : random_type;
       ObGITaskSet total_task_set;
       ObGITaskArray &taskset_array = gi_task_array_result.at(idx + task_idx).taskset_array_;
       taskset_array.reuse();
@@ -1328,10 +1396,10 @@ int ObRandomGranuleSplitter::split_granule(ObGranulePumpArgs &args,
                                 tablet_arrays.at(idx),
                                 partition_granule,
                                 total_task_set,
-                                random_type))) {
+                                scan_random_type))) {
         LOG_WARN("failed to init granule iter pump", K(ret), K(idx), K(tablet_arrays));
       } else if (OB_FAIL(total_task_set.set_block_order(
-            ObGranuleUtil::desc_order(args.gi_attri_flag_)))) {
+            !is_result_catalog && ObGranuleUtil::desc_order(args.gi_attri_flag_)))) {
         LOG_WARN("fail set block order", K(ret));
       } else if (OB_FAIL(taskset_array.push_back(total_task_set))) {
         LOG_WARN("failed to push back task set", K(ret));
@@ -1902,7 +1970,8 @@ int ObPWAffinitizeGranuleSplitter::split_granule(ObGranulePumpArgs &args,
         taskset_array))) {
       LOG_WARN("failed to split task affinity", K(ret));
     } else if (OB_FAIL(adjust_task_order(asc_gi_task_order, taskset_array,
-                                         op_id, args.locations_order_))) {
+                                         op_id, args.locations_order_,
+                                         tsc->result_writer_ordered_))) {
       LOG_WARN("failed to adjust task order", K(ret));
     } else {
       gi_task_array_result.at(idx + task_idx).tsc_op_id_ = op_id;
@@ -1915,7 +1984,8 @@ int ObPWAffinitizeGranuleSplitter::split_granule(ObGranulePumpArgs &args,
 
 int ObPWAffinitizeGranuleSplitter::adjust_task_order(bool asc, ObGITaskArray &taskset_array,
                                           int64_t tsc_op_id,
-                                          const ObIArray<std::pair<int64_t, bool>> &locations_order)
+                                          const ObIArray<std::pair<int64_t, bool>> &locations_order,
+                                          bool preserve_group_order)
 {
   // In same pw affi task group, worker has there own task order,
   // we must adjust task order to get right join result, just see issue/22963231.
@@ -1941,7 +2011,8 @@ int ObPWAffinitizeGranuleSplitter::adjust_task_order(bool asc, ObGITaskArray &ta
     // no need reverse
   } else {
     for (int64_t i = 0; i < taskset_array.count() && OB_SUCC(ret); ++i) {
-      if (OB_FAIL(taskset_array.at(i).set_pw_affi_partition_order(asc, force_reverse))) {
+      if (OB_FAIL(taskset_array.at(i).set_pw_affi_partition_order(
+              asc, force_reverse, preserve_group_order))) {
           LOG_WARN("failed to set partition order", K(ret));
       }
     }

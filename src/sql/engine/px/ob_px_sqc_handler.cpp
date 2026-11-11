@@ -569,9 +569,14 @@ int ObPxSqcHandler::thread_count_auto_scaling(int64_t &reserved_px_thread_count)
   int64_t range_cnt = 0;
   int64_t origin_thread_cnt = reserved_px_thread_count;
   int64_t thread_cnt_after_scaling_by_load = 0;
+  const bool ordered_result_tasks_preassigned = OB_NOT_NULL(sub_coord_)
+      && sub_coord_->get_sqc_ctx().gi_pump_.has_ordered_result_scan();
   if (OB_ISNULL(sub_coord_) || OB_ISNULL(sqc_init_args_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("subcoord is null", K(ret));
+  } else if (ordered_result_tasks_preassigned) {
+    // GI already assigned each Result writer stream using the admitted worker
+    // IDs. Shrinking this SQC now would leave tasks on workers never started.
   } else if (sqc_init_args_->sqc_.is_direct_load_stream_source()) {
     // 固定 Stream queue 不能进入 DOP 或外部任务兜底路径。
   } else if (OB_FAIL(dop_scaling_by_load(reserved_px_thread_count))) {

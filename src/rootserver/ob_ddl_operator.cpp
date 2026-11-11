@@ -44,6 +44,9 @@
 #endif
 #include "share/compaction/ob_schedule_daily_maintenance_window.h"
 #include "share/inner_table/user_table/ob_user_table_schema.h"
+#include "observer/dbms_scheduler/ob_dbms_sched_job_utils.h"
+#include "sql/engine/ob_exec_context.h"
+#include "sql/result_catalog/ob_async_result_metadata.h"
 
 namespace oceanbase
 {
@@ -6685,6 +6688,9 @@ int ObDDLOperator::init_tenant_schemas(
     LOG_WARN("insert default tablegroup failed", K(tenant_id), K(ret));
   } else if (OB_FAIL(init_tenant_databases(tenant_schema, sys_variable, trans))) {
     LOG_WARN("insert default databases failed,", K(tenant_id), K(ret));
+  } else if (is_user_tenant(tenant_id)
+             && OB_FAIL(ObAsyncResultStorageUtils::ensure_result_root_marker())) {
+    LOG_WARN("failed to create async result object-store root marker", K(tenant_id), K(ret));
   } else if (OB_FAIL(init_tenant_optimizer_stats_info(sys_variable, tenant_id, trans))) {
     LOG_WARN("failed to init tenant optimizer stats info", K(tenant_id), K(ret));
   } else if (OB_FAIL(init_tenant_scheduled_job(sys_variable, tenant_id, trans))) {
@@ -6779,11 +6785,17 @@ int ObDDLOperator::init_tenant_database(const ObTenantSchema &tenant_schema,
                                         const uint64_t pure_db_id,
                                         const ObString &db_comment,
                                         ObMySQLTransaction &trans,
-                                        const bool is_oracle_mode)
+                                        const bool is_oracle_mode,
+                                        const ObCharsetType charset_type,
+                                        const ObCollationType collation_type)
 {
   int ret = OB_SUCCESS;
   int64_t start = ObTimeUtility::current_time();
   const uint64_t tenant_id = tenant_schema.get_tenant_id();
+  const ObCharsetType effective_charset_type = CHARSET_INVALID == charset_type
+      ? tenant_schema.get_charset_type() : charset_type;
+  const ObCollationType effective_collation_type = CS_TYPE_INVALID == collation_type
+      ? tenant_schema.get_collation_type() : collation_type;
   int64_t new_schema_version = OB_INVALID_VERSION;
   if (db_name.empty() || OB_INVALID_ID == pure_db_id || db_comment.empty()) {
     ret = OB_INVALID_ARGUMENT;
@@ -6806,8 +6818,8 @@ int ObDDLOperator::init_tenant_database(const ObTenantSchema &tenant_schema,
     if (OB_ISNULL(schema_service)) {
       ret = OB_ERR_SYS;
       RS_LOG(ERROR, "schema_service must not null");
-    } else if (OB_FAIL(ObSchema::set_charset_and_collation_options(tenant_schema.get_charset_type(),
-                                                                   tenant_schema.get_collation_type(),
+    } else if (OB_FAIL(ObSchema::set_charset_and_collation_options(effective_charset_type,
+                                                                   effective_collation_type,
                                                                    db_schema))) {
       RS_LOG(WARN, "set charset and collation options failed", K(ret));
     } else if (OB_FAIL(schema_service->get_database_sql_service().insert_database(db_schema, trans))) {
@@ -6854,6 +6866,61 @@ int ObDDLOperator::init_tenant_database(const ObTenantSchema &tenant_schema,
            "tenant_id", tenant_schema.get_tenant_id(),
            "database_name", db_name,
            "cost", ObTimeUtility::current_time() - start);
+  return ret;
+}
+
+int ObDDLOperator::ensure_async_query_result_database(
+    const ObTenantSchema &tenant_schema,
+    const ObSysVariableSchema &sys_variable,
+    ObMySQLTransaction &trans)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t tenant_id = tenant_schema.get_tenant_id();
+  const ObString database_name(OB_ASYNC_QUERY_RESULT_DATABASE_NAME);
+  const ObDatabaseSchema *database_schema = NULL;
+  const ObSysVarSchema *collation_var = NULL;
+  ObObj collation_obj;
+  ObArenaAllocator allocator;
+  ObSchemaGetterGuard schema_guard;
+  bool is_oracle_mode = false;
+  if (!is_user_tenant(tenant_id)) {
+    ret = OB_INVALID_ARGUMENT;
+    RS_LOG(WARN, "async query result database only applies to user tenants", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(sys_variable.get_oracle_mode(is_oracle_mode))) {
+    RS_LOG(WARN, "failed to get tenant compatibility mode", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(schema_service_.get_tenant_schema_guard(tenant_id, schema_guard))) {
+    RS_LOG(WARN, "failed to get tenant schema guard", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(schema_guard.get_database_schema(tenant_id, database_name, database_schema))) {
+    RS_LOG(WARN, "failed to get async query result database schema", KR(ret), K(tenant_id));
+  } else if (OB_NOT_NULL(database_schema)) {
+    RS_LOG(INFO, "async query result database already exists", K(tenant_id), K(database_name));
+  } else {
+    ObCollationType tenant_collation_type = CS_TYPE_INVALID;
+    ObCharsetType tenant_charset_type = CHARSET_INVALID;
+    if (OB_FAIL(sys_variable.get_sysvar_schema(SYS_VAR_COLLATION_SERVER, collation_var))) {
+      RS_LOG(WARN, "failed to get tenant collation_server", KR(ret), K(tenant_id));
+    } else if (OB_ISNULL(collation_var)) {
+      ret = OB_ERR_UNEXPECTED;
+      RS_LOG(WARN, "tenant collation_server is null", KR(ret), K(tenant_id));
+    } else if (OB_FAIL(collation_var->get_value(&allocator, NULL, collation_obj))) {
+      RS_LOG(WARN, "failed to get tenant collation_server value", KR(ret), K(tenant_id));
+    } else {
+      tenant_collation_type = static_cast<ObCollationType>(collation_obj.get_int());
+      tenant_charset_type = ObCharset::charset_type_by_coll(tenant_collation_type);
+      if (OB_FAIL(init_tenant_database(tenant_schema,
+                                      database_name,
+                                      OB_ASYNC_QUERY_RESULT_DATABASE_ID,
+                                      "private async query result database",
+                                      trans,
+                                      is_oracle_mode,
+                                      tenant_charset_type,
+                                      tenant_collation_type))) {
+        RS_LOG(WARN, "failed to create async query result database", KR(ret), K(tenant_id));
+      } else {
+        RS_LOG(INFO, "created async query result database", K(tenant_id), K(database_name));
+      }
+    }
+  }
   return ret;
 }
 
@@ -6906,6 +6973,15 @@ int ObDDLOperator::init_tenant_databases(const ObTenantSchema &tenant_schema,
     }
     if (OB_FAIL(ret)) {
       // do nothing
+    } else if (is_user_tenant(tenant_id)
+               && OB_FAIL(init_tenant_database(
+                   tenant_schema,
+                   ObString(OB_ASYNC_QUERY_RESULT_DATABASE_NAME),
+                   OB_ASYNC_QUERY_RESULT_DATABASE_ID,
+                   "private async query result database",
+                   trans,
+                   is_oracle_mode))) {
+      RS_LOG(WARN, "insert async query result database failed", K(ret), K(tenant_id));
     } else if (is_oracle_mode || is_sys) {
       if (OB_FAIL(init_tenant_database(tenant_schema, ora_sys_schema,
           OB_ORA_SYS_DATABASE_ID, "oracle sys schema", trans, is_oracle_mode))) {
@@ -12372,6 +12448,9 @@ int ObDDLOperator::init_tenant_scheduled_job(
                      tenant_id,
                      trans))) {
     LOG_WARN("create scheduled daily maintenance window job failed", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(dbms_scheduler::ObDBMSSchedJobUtils::ensure_async_result_cleanup_job(
+                 sys_variable, tenant_id, trans))) {
+    LOG_WARN("create async result cleanup job failed", KR(ret), K(tenant_id));
   }
   return ret;
 }

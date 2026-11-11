@@ -75,6 +75,11 @@ private:
                              const int64_t current_level,
                              const ObDMLStmt &stmt,
                              bool &need_trans) override;
+
+  int transform_result_scan_tables(ObDMLStmt *stmt, bool &trans_happened);
+  int transform_result_scan_table(ObDMLStmt &stmt,
+                                  TableItem &table_item,
+                                  bool &trans_happened);
 // used for transform in expr to or exprs
 
   /*

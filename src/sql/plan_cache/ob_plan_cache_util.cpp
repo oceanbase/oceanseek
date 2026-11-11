@@ -514,6 +514,8 @@ int ObConfigInfoInPC::load_influence_plan_config()
   if (tenant_config.is_valid()) {
     pushdown_storage_level_ = tenant_config->_pushdown_storage_level;
     rowsets_enabled_ = tenant_config->_rowsets_enabled;
+    async_result_parquet_row_group_rows_ =
+        tenant_config->async_result_chunk_rows.get_value();
     enable_px_batch_rescan_ = tenant_config->_enable_px_batch_rescan;
     bloom_filter_enabled_ = tenant_config->_bloom_filter_enabled;
     px_join_skew_handling_ = tenant_config->_px_join_skew_handling;
@@ -564,6 +566,10 @@ int ObConfigInfoInPC::serialize_configs(char *buf, int buf_len, int64_t &pos)
   } else if (OB_FAIL(databuff_printf(buf, buf_len, pos,
                               "%d,", rowsets_enabled_))) {
     SQL_PC_LOG(WARN, "failed to databuff_printf", K(ret), K(rowsets_enabled_));
+  } else if (OB_FAIL(databuff_printf(buf, buf_len, pos,
+                              "%ld,", async_result_parquet_row_group_rows_))) {
+    SQL_PC_LOG(WARN, "failed to databuff_printf", K(ret),
+               K(async_result_parquet_row_group_rows_));
   } else if (OB_FAIL(databuff_printf(buf, buf_len, pos,
                               "%d,", enable_px_batch_rescan_))) {
     SQL_PC_LOG(WARN, "failed to databuff_printf", K(ret), K(enable_px_batch_rescan_));

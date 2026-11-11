@@ -300,6 +300,7 @@ int TableItem::deep_copy(ObIRawExprCopier &expr_copier,
   ref_query_ = other.ref_query_;
   //external table
   catalog_name_ = other.catalog_name_;
+  catalog_table_metadata_ = other.catalog_table_metadata_;
   is_logical_table_ = other.is_logical_table_;
   is_partition_tier_selection_empty_ = other.is_partition_tier_selection_empty_;
   physical_data_table_id_ = other.physical_data_table_id_;
