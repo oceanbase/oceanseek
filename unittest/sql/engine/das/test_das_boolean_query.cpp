@@ -384,6 +384,41 @@ private:
   int return_error_;
 };
 
+// Models the Primary ROR enumeration contract without storage dependencies.
+class ProbeSensitiveScanRtDef : public ObDASScalarScanRtDef
+{
+public:
+  int compute_cost(ObDASSearchCtx &, ObDASSearchCost &cost) override
+  {
+    cost = ObDASSearchCost(100);
+    return OB_SUCCESS;
+  }
+
+  int generate_op(ObDASSearchCost, ObDASSearchCtx &ctx, ObIDASSearchOp *&op) override
+  {
+    MockSearchOp *mock = get_allow_probe()
+        ? OB_NEWx(MockProbeSearchOp, &ctx.get_allocator(), ctx,
+                  std::vector<uint64_t>({2, 4, 8}), 0.0)
+        : OB_NEWx(MockSearchOp, &ctx.get_allocator(), ctx,
+                  std::vector<uint64_t>({2, 4, 8}));
+    int ret = OB_SUCCESS;
+    if (nullptr == mock) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      MockSearchOpParam param;
+      if (OB_FAIL(mock->init(param))) {
+      } else {
+        if (get_allow_probe()) {
+          mock->set_next_rowid_error(OB_NOT_SUPPORTED);
+          mock->set_advance_to_error(OB_NOT_SUPPORTED);
+        }
+        op = mock;
+      }
+    }
+    return ret;
+  }
+};
+
 class MockScalarScanRtDef : public ObDASScalarScanRtDef
 {
 public:
@@ -3781,6 +3816,87 @@ TEST_F(ObDASBooleanQueryTest, estimate_filter_cost_discards_partial_estimates)
         filter_clauses, setup.search_ctx_, filter_cost));
     EXPECT_FALSE(filter_cost.is_valid());
     EXPECT_EQ(0, setup.search_ctx_.get_filter_bitmap_provider_count());
+  }
+}
+
+TEST_F(ObDASBooleanQueryTest, prepare_bmm_input_clears_previous_group_probe)
+{
+  SearchCtxSetup setup(allocator_);
+  setup.search_ctx_.table_row_count_ = ObDASSearchCost(100);
+  ObDASScalarCtDef scalar_ctdef(allocator_);
+  ObDASScalarRtDef scalar;
+  ObDASScalarScanCtDef primary_ctdef(allocator_);
+  ProbeSensitiveScanRtDef primary;
+  primary_ctdef.is_primary_table_scan_ = true;
+  primary.ctdef_ = &primary_ctdef;
+  ObDASBaseCtDef *ct_children[] = {&primary_ctdef};
+  ObDASBaseRtDef *rt_children[] = {&primary};
+  scalar_ctdef.children_ = ct_children;
+  scalar_ctdef.children_cnt_ = 1;
+  scalar_ctdef.set_has_main_scan(true);
+  scalar.ctdef_ = &scalar_ctdef;
+  scalar.children_ = rt_children;
+  scalar.children_cnt_ = 1;
+
+  MockSearchCtDef driver_ctdef(allocator_);
+  MockSearchRtDef driver(1, {1, 2, 3, 4, 8, 9});
+  driver.ctdef_ = &driver_ctdef;
+  ObIDASSearchRtDef *required[] = {&driver, &scalar};
+  ObBooleanSubClause<ObIDASSearchRtDef> filters(required, ARRAYSIZEOF(required));
+  ObBooleanSubClause<ObIDASSearchRtDef> empty;
+  // Re-enter a conjunction after each BMM generation, as happens across Groups.
+  for (int round = 0; round < 3; ++round) {
+    ObIDASSearchOp *conjunction = nullptr;
+    ASSERT_EQ(OB_SUCCESS, rtdef_.req(empty, filters, ObDASSearchCost(1),
+                                   false, setup.search_ctx_, conjunction));
+    EXPECT_TRUE(scalar.get_allow_probe());
+    EXPECT_TRUE(primary.get_allow_probe());
+    EXPECT_FALSE(driver.get_allow_probe());
+    ASSERT_NE(nullptr, conjunction);
+    ASSERT_EQ(OB_SUCCESS, conjunction->open());
+    ObDASRowID intersection_id;
+    double intersection_score = 0;
+    ASSERT_EQ(OB_SUCCESS, conjunction->next_rowid(intersection_id, intersection_score));
+    EXPECT_EQ(2, intersection_id.get_uint64());
+    ObDASRowID intersection_target;
+    intersection_target.set_uint64(3);
+    ASSERT_EQ(OB_SUCCESS, conjunction->advance_to(
+        intersection_target, intersection_id, intersection_score));
+    EXPECT_EQ(4, intersection_id.get_uint64());
+    ASSERT_EQ(OB_SUCCESS, conjunction->next_rowid(intersection_id, intersection_score));
+    EXPECT_EQ(8, intersection_id.get_uint64());
+    EXPECT_EQ(OB_ITER_END, conjunction->next_rowid(intersection_id, intersection_score));
+    ASSERT_EQ(OB_SUCCESS, conjunction->close());
+
+    // Cover both the scalar build-options branch and the ordinary single-input
+    // branch. The scalar uses the real main-table fallback generation path.
+    for (int wrapped = 0; wrapped < 2; ++wrapped) {
+      scalar.set_allow_probe(true);
+      primary.set_allow_probe(true);
+      ObIDASSearchRtDef *single[] = {wrapped ? static_cast<ObIDASSearchRtDef *>(&scalar)
+                                           : static_cast<ObIDASSearchRtDef *>(&primary)};
+      ObBooleanSubClause<ObIDASSearchRtDef> input(single, 1);
+      ObIDASSearchOp *op = nullptr;
+      ObDASSearchCost cost;
+      ASSERT_EQ(OB_SUCCESS, rtdef_.prepare_bmm_input(input, ObDASSearchCost(1),
+          setup.search_ctx_, op, cost, false, bmm_options_, has_bmm_options_));
+      EXPECT_EQ(0 != wrapped, has_bmm_options_);
+      EXPECT_FALSE(primary.get_allow_probe());
+      ASSERT_NE(nullptr, op);
+      ASSERT_EQ(OB_SUCCESS, op->open());
+      ObDASRowID id;
+      double score = 0;
+      ASSERT_EQ(OB_SUCCESS, op->next_rowid(id, score));
+      EXPECT_EQ(2, id.get_uint64());
+      ObDASRowID target;
+      target.set_uint64(4);
+      ASSERT_EQ(OB_SUCCESS, op->advance_to(target, id, score));
+      EXPECT_EQ(4, id.get_uint64());
+      ASSERT_EQ(OB_SUCCESS, op->next_rowid(id, score));
+      EXPECT_EQ(8, id.get_uint64());
+      EXPECT_EQ(OB_ITER_END, op->next_rowid(id, score));
+      ASSERT_EQ(OB_SUCCESS, op->close());
+    }
   }
 }
 

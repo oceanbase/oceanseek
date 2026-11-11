@@ -2035,6 +2035,10 @@ int ObDASBooleanQueryRtDef::prepare_bmm_input(
     } else if (OB_ISNULL(single_clause)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected null single filter clause", K(ret));
+    } else {
+      // RtDefs are reused across Groups. A former conjunction follower may
+      // allow primary probe, but a single BMM input must enumerate its matches.
+      single_clause->set_allow_probe(false);
     }
   }
   if (OB_SUCC(ret) && OB_NOT_NULL(single_clause)
