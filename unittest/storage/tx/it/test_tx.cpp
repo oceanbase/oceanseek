@@ -4,8 +4,12 @@
  */
 
 #include <gtest/gtest.h>
+#include <atomic>
+#include <thread>
+#include <vector>
 #define private public
 #define protected public
+#include "common/ob_timeout_ctx.h"
 #define USING_LOG_PREFIX TRANS
 #include "tx_node.h"
 #include "../mock_utils/async_util.h"
@@ -223,7 +227,7 @@ TEST_F(ObTestTx, rollback_savepoint_with_msg_lost)
   ObTxDescGuard guard = n1->get_tx_guard();
   ObTxDesc &tx = guard.get_tx_desc();
   ObTxParam tx_param;
-  tx_param.timeout_us_ = 1000000;
+  tx_param.timeout_us_ = 10 * 1000 * 1000;
   tx_param.access_mode_ = ObTxAccessMode::RW;
   tx_param.isolation_ = ObTxIsolationLevel::RC;
   tx_param.cluster_id_ = 100;
@@ -286,6 +290,440 @@ TEST_F(ObTestTx, rollback_savepoint_timeout)
   ASYNC_WAIT(async_op, 3000 * 1000, wait_ret);
   REPAIR_LINK_FAILURE(n1, n2);
   ROLLBACK_TX(n1, tx);
+}
+
+TEST_F(ObTestTx, interrupted_rollback_bounds_location_lookup_timeout)
+{
+  class TimeoutLocationAdapter : public ObFakeLocationAdapter
+  {
+  public:
+    int nonblock_get_leader(const int64_t cluster_id,
+                           const int64_t tenant_id,
+                           const ObLSID &ls_id,
+                           ObAddr &leader) override
+    {
+      // Observe the context used by inner SQL on the synchronous send path.
+      if (!observed_) {
+        timeout_ts_ = ObTimeoutCtx::get_ctx().get_abs_timeout();
+        lookup_ts_ = ObTimeUtility::current_time();
+        observed_ = true;
+      }
+      return OB_ERR_UNEXPECTED;
+    }
+    int64_t timeout_ts_ = -1;
+    int64_t lookup_ts_ = -1;
+    bool observed_ = false;
+  } location;
+
+  START_TWO_TX_NODE(n1, n2);
+  for (int i = 0; i < 3; ++i) {
+    PREPARE_TX(n1, tx);
+    PREPARE_TX_PARAM(tx_param);
+    tx_param.timeout_us_ = 30 * 1000 * 1000;
+    CREATE_IMPLICIT_SAVEPOINT(n1, tx, tx_param, sp1);
+    ASSERT_EQ(OB_SUCCESS, n2->write(tx, 100, 111));
+    CREATE_IMPLICIT_SAVEPOINT(n1, tx, tx_param, sp2);
+    ASSERT_EQ(OB_SUCCESS, n2->write(tx, 101, 112));
+    ASSERT_EQ(OB_SUCCESS, n1->interrupt(tx, OB_ERR_INTERRUPTED));
+
+    ObTimeoutCtx outer_ctx;
+    // Cover the 1s cap, a statement deadline below the old 200ms minimum,
+    // and a tighter inherited inner-SQL deadline.
+    const int64_t expire_ts = n1->ts_after_us(i == 1 ? 100 * 1000 : 10 * 1000 * 1000);
+    if (i == 2) {
+      ASSERT_EQ(OB_SUCCESS, outer_ctx.set_abs_timeout(n1->ts_after_ms(100)));
+    }
+    const int64_t outer_expire_ts = outer_ctx.get_abs_timeout();
+    location.observed_ = false;
+    ObILocationAdapter *saved_location = n1->fake_rpc_.location_adapter_;
+    n1->fake_rpc_.location_adapter_ = &location;
+    const int ret = n1->rollback_to_implicit_savepoint(tx, sp2, expire_ts, nullptr);
+    n1->fake_rpc_.location_adapter_ = saved_location;
+
+    ASSERT_EQ(OB_ERR_UNEXPECTED, ret);
+    ASSERT_TRUE(location.observed_);
+    ASSERT_GT(location.timeout_ts_, location.lookup_ts_);
+    ASSERT_LE(location.timeout_ts_ - location.lookup_ts_, 1000 * 1000);
+    ASSERT_LE(location.timeout_ts_, expire_ts);
+    if (i == 1) {
+      ASSERT_EQ(expire_ts, location.timeout_ts_);
+    } else if (i == 2) {
+      ASSERT_EQ(outer_expire_ts, location.timeout_ts_);
+    }
+    ASSERT_EQ(outer_expire_ts, ObTimeoutCtx::get_ctx().get_abs_timeout());
+    ASSERT_FALSE(tx.flags_.BLOCK_);
+    ASSERT_FALSE(tx.flags_.INTERRUPTED_);
+    ASSERT_EQ(OB_SUCCESS, n1->rollback_tx(tx));
+    // abort_tx_() posts the participant abort while this adapter is still
+    // installed, so that message is dropped. rollback_tx() will not post it
+    // again once the descriptor is ABORTED. Release the scheduler and make the
+    // participant exit before the next case writes the same rows.
+    ObPartTransCtx *part_ctx = NULL;
+    const ObTransID aborted_tx_id = tx.tx_id_;
+    const int ctx_ret = n2->get_tx_ctx(ObLSID(2), aborted_tx_id, part_ctx);
+    ASSERT_EQ(OB_SUCCESS, guard.release());
+    if (OB_SUCCESS == ctx_ret) {
+      part_ctx->last_ask_scheduler_status_ts_ = 0;
+      ASSERT_EQ(OB_SUCCESS, part_ctx->check_scheduler_status());
+      int wait_cnt = 0;
+      while (!part_ctx->is_exiting_ && wait_cnt++ < 200) {
+        usleep(500);
+      }
+      ASSERT_TRUE(part_ctx->is_exiting_);
+      ASSERT_EQ(OB_SUCCESS, n2->revert_tx_ctx(part_ctx));
+    } else {
+      ASSERT_EQ(OB_TRANS_CTX_NOT_EXIST, ctx_ret);
+    }
+  }
+}
+
+// Inject at the real synchronous send boundary, while tx.lock_ is released.
+class RollbackInterruptLocation : public ObFakeLocationAdapter
+{
+public:
+  int nonblock_get_leader(const int64_t cluster_id, const int64_t tenant_id,
+                         const ObLSID &ls_id, ObAddr &leader) override
+  {
+    on_lookup_();
+    return delegate_->nonblock_get_leader(cluster_id, tenant_id, ls_id, leader);
+  }
+  ObILocationAdapter *delegate_ = nullptr;
+  std::function<void()> on_lookup_;
+};
+
+TEST_F(ObTestTx, interrupted_rollback_fixed_budget)
+{
+  // Entry interrupt; new/repeated interrupts with success; repeated interrupts
+  // with lost RPCs; earlier statement/inherited/transaction deadline; first
+  // interrupt after the fixed window; already expired inherited deadline.
+  START_TWO_TX_NODE(n1, n2);
+  for (int scenario = 0; scenario < 8; ++scenario) {
+    SCOPED_TRACE(scenario);
+    PREPARE_TX(n1, tx);
+    PREPARE_TX_PARAM(tx_param);
+    tx_param.timeout_us_ = 30 * 1000 * 1000;
+    CREATE_IMPLICIT_SAVEPOINT(n1, tx, tx_param, sp1);
+    ASSERT_EQ(OB_SUCCESS, n2->write(tx, 100, 111));
+    CREATE_IMPLICIT_SAVEPOINT(n1, tx, tx_param, sp2);
+    ASSERT_EQ(OB_SUCCESS, n2->write(tx, 101, 112));
+
+    if (scenario != 1 && scenario != 2 && scenario != 6) {
+      ASSERT_EQ(OB_SUCCESS, n1->interrupt(tx, OB_ERR_INTERRUPTED));
+    }
+    if (scenario != 0) {
+      ASSERT_EQ(OB_SUCCESS, bus_.inject_link_failure(n1->addr_, n2->addr_));
+    }
+    const int64_t begin = ObTimeUtility::current_time();
+    const int64_t statement_end = begin + (scenario == 3 ? 100 * 1000 : 10 * 1000 * 1000);
+    ObTimeoutCtx outer_ctx;
+    if (scenario == 4 || scenario == 7) {
+      ASSERT_EQ(OB_SUCCESS, outer_ctx.set_abs_timeout(begin + (scenario == 4 ? 100 * 1000 : -1)));
+    }
+    if (scenario == 5) {
+      tx.expire_ts_ = begin + 100 * 1000;
+    }
+    const int64_t outer_end = outer_ctx.get_abs_timeout();
+    RollbackInterruptLocation location;
+    location.delegate_ = n1->fake_rpc_.location_adapter_;
+    int lookups = 0;
+    int64_t first_timeout = 0;
+    std::atomic<int> kills_started(0);
+    std::atomic<int> kills_done(0);
+    std::vector<std::thread> killers;
+    location.on_lookup_ = [&]() {
+      // Abort cleanup also uses location lookup, but must not inject more KILLs.
+      if (!tx.flags_.BLOCK_) { return; }
+      ++lookups;
+      if (((scenario == 1 || scenario == 2) && lookups <= 2) ||
+          (scenario == 6 && lookups == 1)) {
+        if (scenario == 2) { usleep(200 * 1000); }
+        if (scenario == 6) { usleep(1100 * 1000); }
+        killers.emplace_back([&]() {
+          ++kills_started;
+          EXPECT_EQ(OB_SUCCESS, n1->interrupt(tx, OB_ERR_INTERRUPTED));
+          ++kills_done;
+        });
+        // The first KILL must have published the flag before posting resumes.
+        bool interrupted = false;
+        while (!interrupted) {
+          { ObSpinLockGuard lock(tx.lock_); interrupted = tx.flags_.INTERRUPTED_; }
+          if (!interrupted) { usleep(100); }
+        }
+        while (kills_started.load() < lookups) { usleep(100); }
+        EXPECT_EQ(0, kills_done.load());
+      }
+      if (scenario == 1 && lookups == 3) {
+        EXPECT_EQ(OB_SUCCESS, bus_.repair_link_failure(n1->addr_, n2->addr_));
+      }
+      if ((scenario == 1 || scenario == 2) && lookups >= 2) {
+        const int64_t timeout = ObTimeoutCtx::get_ctx().get_abs_timeout();
+        if (lookups == 2) { first_timeout = timeout; }
+        EXPECT_EQ(first_timeout, timeout); // repeated KILL never renews it
+        EXPECT_LE(timeout, begin + 1100 * 1000);
+      }
+    };
+    n1->fake_rpc_.location_adapter_ = &location;
+    const int ret = n1->rollback_to_implicit_savepoint(tx, sp2, statement_end, nullptr);
+    const int64_t elapsed = ObTimeUtility::current_time() - begin;
+    n1->fake_rpc_.location_adapter_ = location.delegate_;
+    for (auto &killer : killers) { killer.join(); }
+    EXPECT_EQ(kills_started.load(), kills_done.load());
+    if (scenario == 1 || scenario == 2) {
+      EXPECT_EQ(2, kills_started.load());
+      EXPECT_GE(lookups, 3);
+    } else if (scenario == 6) {
+      EXPECT_EQ(1, kills_started.load());
+      EXPECT_EQ(1, lookups);
+    }
+    EXPECT_EQ(outer_end, ObTimeoutCtx::get_ctx().get_abs_timeout());
+    EXPECT_FALSE(tx.flags_.BLOCK_);
+    EXPECT_FALSE(tx.flags_.INTERRUPTED_);
+    if (scenario <= 1) {
+      EXPECT_EQ(OB_SUCCESS, ret);
+      EXPECT_LT(elapsed, 1000 * 1000); // no mandatory wait to the window end
+      EXPECT_TRUE(tx.is_tx_active());
+      int64_t value = 0;
+      EXPECT_EQ(OB_SUCCESS, n2->read(tx, 100, value));
+      EXPECT_EQ(111, value); // the preceding statement survives
+      EXPECT_EQ(OB_SUCCESS, n2->write(tx, 102, 113));
+      EXPECT_EQ(OB_SUCCESS, n1->commit_tx(tx, n1->ts_after_ms(1000)));
+    } else {
+      if (scenario == 2 || scenario == 6) {
+        EXPECT_EQ(OB_ERR_INTERRUPTED, ret);
+        EXPECT_GE(elapsed, 1000 * 1000);
+        EXPECT_LT(elapsed, 1350 * 1000); // no fresh second from a later KILL
+      } else {
+        EXPECT_EQ(scenario == 5 ? OB_TRANS_TIMEOUT : OB_TIMEOUT, ret);
+        EXPECT_LT(elapsed, 200 * 1000); // no legacy minimum-wait extension
+      }
+      if (scenario == 7) { EXPECT_EQ(0, lookups); }
+      EXPECT_EQ(OB_SUCCESS, bus_.repair_link_failure(n1->addr_, n2->addr_));
+      EXPECT_EQ(OB_SUCCESS, n1->rollback_tx(tx));
+      // The abort RPC was lost with the rollback RPCs. Let the participant
+      // discover that its scheduler has gone before destroying the fake nodes.
+      ObPartTransCtx *part_ctx = nullptr;
+      const int ctx_ret = n2->get_tx_ctx(ObLSID(2), tx.tx_id_, part_ctx);
+      EXPECT_EQ(OB_SUCCESS, guard.release());
+      if (OB_SUCCESS == ctx_ret) {
+        part_ctx->last_ask_scheduler_status_ts_ = 0;
+        EXPECT_EQ(OB_SUCCESS, part_ctx->check_scheduler_status());
+        int wait_cnt = 0;
+        while (!part_ctx->is_exiting_ && wait_cnt++ < 200) { usleep(500); }
+        EXPECT_TRUE(part_ctx->is_exiting_);
+        EXPECT_EQ(OB_SUCCESS, n2->revert_tx_ctx(part_ctx));
+      } else {
+        EXPECT_EQ(OB_TRANS_CTX_NOT_EXIST, ctx_ret);
+      }
+    }
+  }
+}
+
+// Hold the message-manager bucket's read lock after insertion. Responses can
+// still take read locks, but cleanup's del() must wait for our lock. Its writer
+// wait bit identifies the post-loop boundary without a production test hook.
+TEST_F(ObTestTx, rollback_success_survives_cleanup_delay)
+{
+  START_TWO_TX_NODE(n1, n2);
+  for (int scenario = 0; scenario < 3; ++scenario) {
+    SCOPED_TRACE(scenario); // statement expiry, late KILL, concurrent abort
+    PREPARE_TX(n1, tx);
+    PREPARE_TX_PARAM(tx_param);
+    tx_param.timeout_us_ = 30 * 1000 * 1000;
+    CREATE_IMPLICIT_SAVEPOINT(n1, tx, tx_param, sp1);
+    ASSERT_EQ(OB_SUCCESS, n2->write(tx, 100, 111));
+    CREATE_IMPLICIT_SAVEPOINT(n1, tx, tx_param, sp2);
+    ASSERT_EQ(OB_SUCCESS, n2->write(tx, 101, 112));
+    const auto saved_state = tx.state_;
+    const int64_t begin = ObTimeUtility::current_time();
+    const int64_t statement_end = begin + (scenario == 0 ? 500 * 1000 : 10 * 1000 * 1000);
+    RollbackInterruptLocation location;
+    location.delegate_ = n1->fake_rpc_.location_adapter_;
+    std::atomic<bool> injected(false);
+    std::atomic<bool> ready(false);
+    std::atomic<bool> kill_done(false);
+    std::thread cleanup;
+    std::thread killer;
+    location.on_lookup_ = [&]() {
+      if (injected.exchange(true)) { return; }
+      const auto msg_id = tx.brpc_mask_set_.get_tx_msg_id();
+      auto &mgr = n1->txs_.rollback_sp_msg_mgr_;
+      auto &bucket_lock = mgr.locks_[msg_id.hash() % (sizeof(mgr.locks_) / sizeof(mgr.locks_[0]))].lock_;
+      cleanup = std::thread([&, msg_id]() {
+        const int lock_ret = bucket_lock.rdlock();
+        EXPECT_EQ(OB_SUCCESS, lock_ret);
+        ready = true;
+        if (OB_SUCCESS != lock_ret) { return; }
+        const int64_t watchdog = ObTimeUtility::current_time() + 5 * 1000 * 1000;
+        while (0 == (ATOMIC_LOAD(&bucket_lock.latch_.lock_) & ObLatch::WAIT_MASK)
+               && ObTimeUtility::current_time() < watchdog) {
+          usleep(100);
+        }
+        const bool deleting = 0 != (ATOMIC_LOAD(&bucket_lock.latch_.lock_) & ObLatch::WAIT_MASK);
+        EXPECT_TRUE(deleting);
+        bool completed = false;
+        {
+          ObSpinLockGuard lock(tx.lock_);
+          completed = tx.brpc_mask_set_.is_all_mask();
+          EXPECT_TRUE(completed);
+          EXPECT_EQ(ObTxDesc::State::ROLLBACK_SAVEPOINT, tx.state_);
+          EXPECT_TRUE(tx.flags_.BLOCK_);
+        }
+        EXPECT_LT(ObTimeUtility::current_time(), statement_end);
+        if (deleting && completed) {
+          if (scenario <= 1) {
+            // KILL is first published after the fixed grace window, but after
+            // rollback success. It must not retroactively fail that rollback.
+            const int64_t release_after = scenario == 0 ? statement_end + 10 * 1000
+                                                       : begin + 1100 * 1000;
+            while (ObTimeUtility::current_time() < release_after) { usleep(1000); }
+            if (scenario == 1) {
+              killer = std::thread([&]() {
+                EXPECT_EQ(OB_SUCCESS, n1->interrupt(tx, OB_ERR_INTERRUPTED));
+                kill_done = true;
+              });
+              bool interrupted = false;
+              while (!interrupted && ObTimeUtility::current_time() < watchdog) {
+                { ObSpinLockGuard lock(tx.lock_); interrupted = tx.flags_.INTERRUPTED_; }
+                if (!interrupted) { usleep(100); }
+              }
+              EXPECT_TRUE(interrupted);
+              EXPECT_FALSE(kill_done.load());
+            }
+          } else {
+            EXPECT_EQ(OB_SUCCESS, n1->abort_tx(tx, ObTxAbortCause::IMPLICIT_ROLLBACK));
+          }
+        }
+        EXPECT_EQ(OB_SUCCESS, bucket_lock.unlock());
+      });
+      while (!ready.load()) { usleep(100); }
+    };
+    n1->fake_rpc_.location_adapter_ = &location;
+    const int ret = n1->rollback_to_implicit_savepoint(tx, sp2, statement_end, nullptr);
+    if (cleanup.joinable()) { cleanup.join(); }
+    if (killer.joinable()) { killer.join(); }
+    n1->fake_rpc_.location_adapter_ = location.delegate_;
+    EXPECT_TRUE(injected.load());
+    EXPECT_FALSE(tx.flags_.BLOCK_);
+    EXPECT_FALSE(tx.flags_.INTERRUPTED_);
+    EXPECT_FALSE(tx.brpc_mask_set_.get_tx_msg_id().is_valid());
+    EXPECT_EQ(0, n1->txs_.rollback_sp_msg_mgr_.count());
+    if (scenario <= 1) {
+      EXPECT_EQ(OB_SUCCESS, ret);
+      EXPECT_EQ(saved_state, tx.state_);
+      if (scenario == 1) { EXPECT_TRUE(kill_done.load()); }
+      if (OB_SUCCESS == ret) {
+        int64_t value = 0;
+        EXPECT_EQ(OB_SUCCESS, n2->read(tx, 100, value));
+        EXPECT_EQ(111, value);
+        EXPECT_EQ(OB_SUCCESS, n2->write(tx, 102, 113));
+        EXPECT_EQ(OB_SUCCESS, n1->commit_tx(tx, n1->ts_after_ms(1000)));
+      } else {
+        EXPECT_EQ(OB_SUCCESS, n1->rollback_tx(tx));
+      }
+    } else {
+      EXPECT_EQ(OB_TRANS_HAS_DECIDED, ret);
+      EXPECT_EQ(ObTxDesc::State::ABORTED, tx.state_);
+      EXPECT_EQ(OB_SUCCESS, n1->rollback_tx(tx));
+    }
+  }
+}
+
+TEST_F(ObTestTx, uninterrupted_rollback_preserves_deadlines)
+{
+  class ObserveLocationTimeout : public ObFakeLocationAdapter
+  {
+  public:
+    int nonblock_get_leader(const int64_t cluster_id, const int64_t tenant_id,
+                           const ObLSID &ls_id, ObAddr &leader) override
+    {
+      ++lookups_;
+      const ObTimeoutCtx &ctx = ObTimeoutCtx::get_ctx();
+      EXPECT_EQ(expected_timeout_, ctx.get_abs_timeout());
+      EXPECT_EQ(expected_timeout_ > 0, ctx.is_timeout_set());
+      EXPECT_EQ(expected_trx_timeout_, ctx.get_trx_timeout_us());
+      return delegate_->nonblock_get_leader(cluster_id, tenant_id, ls_id, leader);
+    }
+    ObILocationAdapter *delegate_ = nullptr;
+    int64_t expected_timeout_ = -1;
+    int64_t expected_trx_timeout_ = -1;
+    int lookups_ = 0;
+  } location;
+  struct TestCase
+  {
+    const char *name_;
+    int64_t statement_timeout_us_;
+    int64_t tx_timeout_us_;
+    int64_t inherited_timeout_us_;
+    int expected_ret_;
+  };
+  const TestCase cases[] = {
+    {"statement, unset context", 50 * 1000, 30 * 1000 * 1000, 0, OB_TIMEOUT},
+    {"statement, longer context", 50 * 1000, 30 * 1000 * 1000, 5 * 1000 * 1000, OB_TIMEOUT},
+    {"statement, shorter context", 50 * 1000, 30 * 1000 * 1000, 10 * 1000, OB_TIMEOUT},
+    {"transaction, longer context", 10 * 1000 * 1000, 50 * 1000, 5 * 1000 * 1000, OB_TRANS_TIMEOUT},
+  };
+
+  START_TWO_TX_NODE(n1, n2);
+  for (const auto &test_case : cases) {
+    SCOPED_TRACE(test_case.name_);
+    PREPARE_TX(n1, tx);
+    PREPARE_TX_PARAM(tx_param);
+    tx_param.timeout_us_ = 30 * 1000 * 1000;
+    CREATE_IMPLICIT_SAVEPOINT(n1, tx, tx_param, sp1);
+    ASSERT_EQ(OB_SUCCESS, n2->write(tx, 100, 111));
+    CREATE_IMPLICIT_SAVEPOINT(n1, tx, tx_param, sp2);
+    ASSERT_EQ(OB_SUCCESS, n2->write(tx, 101, 112));
+    ASSERT_FALSE(tx.flags_.INTERRUPTED_);
+    ASSERT_EQ(OB_SUCCESS, bus_.inject_link_failure(n1->addr_, n2->addr_));
+
+    ObTimeoutCtx outer_ctx;
+    outer_ctx.reset_timeout_us();
+    ASSERT_EQ(OB_SUCCESS, outer_ctx.set_trx_timeout_us(7 * 1000 * 1000));
+    const int64_t begin = ObTimeUtility::current_time();
+    tx.expire_ts_ = begin + test_case.tx_timeout_us_;
+    if (test_case.inherited_timeout_us_ > 0) {
+      ASSERT_EQ(OB_SUCCESS, outer_ctx.set_abs_timeout(begin + test_case.inherited_timeout_us_));
+    }
+    location.expected_timeout_ = outer_ctx.get_abs_timeout();
+    location.expected_trx_timeout_ = outer_ctx.get_trx_timeout_us();
+    location.lookups_ = 0;
+    location.delegate_ = n1->fake_rpc_.location_adapter_;
+    n1->fake_rpc_.location_adapter_ = &location;
+    const int ret = n1->rollback_to_implicit_savepoint(
+        tx, sp2, begin + test_case.statement_timeout_us_, nullptr);
+    const int64_t elapsed = ObTimeUtility::current_time() - begin;
+    n1->fake_rpc_.location_adapter_ = location.delegate_;
+
+    EXPECT_EQ(test_case.expected_ret_, ret);
+    // Neither the 50ms original deadline nor a shorter inherited context
+    // removes the legacy 200ms RPC wait minimum when there is no interrupt.
+    EXPECT_GE(elapsed, 200 * 1000);
+    EXPECT_LT(elapsed, 1000 * 1000);
+    EXPECT_GT(location.lookups_, 0);
+    EXPECT_EQ(&outer_ctx, &ObTimeoutCtx::get_ctx());
+    EXPECT_EQ(location.expected_timeout_, outer_ctx.get_abs_timeout());
+    EXPECT_EQ(location.expected_trx_timeout_, outer_ctx.get_trx_timeout_us());
+    EXPECT_FALSE(tx.flags_.INTERRUPTED_);
+    EXPECT_FALSE(tx.flags_.BLOCK_);
+
+    EXPECT_EQ(OB_SUCCESS, bus_.repair_link_failure(n1->addr_, n2->addr_));
+    EXPECT_EQ(OB_SUCCESS, n1->rollback_tx(tx));
+    // The injected link failure also dropped abort_tx_()'s message. Release
+    // the scheduler so the participant can discover the abort and exit.
+    ObPartTransCtx *part_ctx = nullptr;
+    const int ctx_ret = n2->get_tx_ctx(ObLSID(2), tx.tx_id_, part_ctx);
+    EXPECT_EQ(OB_SUCCESS, guard.release());
+    if (OB_SUCCESS == ctx_ret) {
+      part_ctx->last_ask_scheduler_status_ts_ = 0;
+      EXPECT_EQ(OB_SUCCESS, part_ctx->check_scheduler_status());
+      int wait_cnt = 0;
+      while (!part_ctx->is_exiting_ && wait_cnt++ < 200) { usleep(500); }
+      EXPECT_TRUE(part_ctx->is_exiting_);
+      EXPECT_EQ(OB_SUCCESS, n2->revert_tx_ctx(part_ctx));
+    } else {
+      EXPECT_EQ(OB_TRANS_CTX_NOT_EXIST, ctx_ret);
+    }
+  }
 }
 
 TEST_F(ObTestTx, rollback_savepoint_with_uncertain_participants)

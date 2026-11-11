@@ -383,10 +383,11 @@ int ls_rollback_to_savepoint_(const ObTransID &tx_id,
                               int64_t &output_transfer_epoch,
                               ObIArray<ObTxLSEpochPair> &downstream_parts,
                               int64_t expire_ts = -1);
+class RollbackDeadline;
 int sync_rollback_savepoint__(ObTxDesc &tx,
                               ObTxRollbackSPMsg &msg,
                               RollbackMaskSet &mask_set,
-                              int64_t expire_ts,
+                              RollbackDeadline &deadline,
                               const int64_t max_retry_interval,
                               int &retries);
 int create_local_implicit_savepoint_(ObTxDesc &tx,

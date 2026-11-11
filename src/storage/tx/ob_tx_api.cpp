@@ -5,6 +5,7 @@
 
 #include "ob_trans_service.h"
 #include "ob_trans_part_ctx.h"
+#include "common/ob_timeout_ctx.h"
 #include "src/storage/tx/wrs/ob_i_weak_read_service.h"
 #include "storage/tx/wrs/ob_weak_read_util.h"
 #include "ob_xa_service.h"
@@ -1741,6 +1742,62 @@ int ObTransService::ls_rollback_to_savepoint_(const ObTransID &tx_id,
   return ret;
 }
 
+// One budget for the entire remote rollback, including interrupts first observed
+// during RPC posting/waiting. Repeated interrupts never restart this budget.
+class ObTransService::RollbackDeadline
+{
+public:
+  RollbackDeadline(const int64_t start_ts, const int64_t expire_ts,
+                   const int64_t tx_expire_ts)
+    : grace_end_(start_ts + INTERRUPTED_ROLLBACK_GRACE_US),
+      hard_end_(std::min(std::min(expire_ts, tx_expire_ts),
+                         timeout_ctx_.get_abs_timeout(expire_ts))),
+      // Preserve the ordinary rollback minimum; an interrupt replaces it with
+      // the original hard deadline and fixed grace deadline in check().
+      expire_ts_(std::max(start_ts + MIN_ROLLBACK_WAIT_US, expire_ts)),
+      interrupted_(false)
+  {}
+
+  // Caller holds tx.lock_. Keep the flag until the common cleanup so that a
+  // later checkpoint cannot forget an interrupt or renew its deadline.
+  int check(ObTxDesc &tx)
+  {
+    int ret = OB_SUCCESS;
+    interrupted_ |= tx.flags_.INTERRUPTED_;
+    if (interrupted_) {
+      expire_ts_ = std::min(hard_end_, grace_end_);
+      // Also constrain synchronous inner SQL entered by location lookup.
+      ret = timeout_ctx_.set_abs_timeout(expire_ts_);
+    }
+    const int64_t now = ObTimeUtility::current_time();
+    if (tx.is_terminated()) {
+      ret = OB_TRANS_HAS_DECIDED;
+    } else if (OB_SUCC(ret) && now >= expire_ts_) {
+      ret = interrupted_ && now < hard_end_ ? OB_ERR_INTERRUPTED : OB_TIMEOUT;
+    }
+    return ret;
+  }
+
+  // For checkpoints where the caller has released tx.lock_.
+  int check_with_lock(ObTxDesc &tx)
+  {
+    ObSpinLockGuard guard(tx.lock_);
+    return check(tx);
+  }
+
+  int64_t expire_ts() const { return expire_ts_; }
+  bool interrupted() const { return interrupted_; }
+
+private:
+  static constexpr int64_t INTERRUPTED_ROLLBACK_GRACE_US = 1000 * 1000; // 1s
+  static constexpr int64_t MIN_ROLLBACK_WAIT_US = 200 * 1000; // 200ms
+  ObTimeoutCtx timeout_ctx_;
+  const int64_t grace_end_;
+  const int64_t hard_end_;
+  int64_t expire_ts_;
+  bool interrupted_;
+};
+
 inline int ObTransService::rollback_savepoint_slowpath_(ObTxDesc &tx,
                                                         ObTxRollbackParts &rollback_parts,
                                                         const ObTxSEQ specified_from_scn,
@@ -1799,10 +1856,9 @@ inline int ObTransService::rollback_savepoint_slowpath_(ObTxDesc &tx,
   }
   int64_t start_ts = ObTimeUtility::current_time();
   int retries = 0;
-  if (OB_UNLIKELY(tx.flags_.INTERRUPTED_)) {
-    ret = OB_ERR_INTERRUPTED;
-    tx.clear_interrupt();
-    TRANS_LOG(WARN, "interrupted", K(ret), K(tx));
+  RollbackDeadline deadline(start_ts, expire_ts, tx.get_expire_ts());
+  if (OB_SUCC(ret)) {
+    ret = deadline.check(tx);
   }
   if (OB_SUCC(ret)) {
     // setup state before release lock
@@ -1812,35 +1868,40 @@ inline int ObTransService::rollback_savepoint_slowpath_(ObTxDesc &tx,
     // release lock before blocking
     tx.lock_.unlock();
     ret = sync_rollback_savepoint__(tx, msg, tx.brpc_mask_set_,
-                                    expire_ts, max_retry_intval, retries);
+                                    deadline, max_retry_intval, retries);
     tx.lock_.lock();
-    // restore state
+    // The loop has already confirmed rollback success. Local cleanup or a late
+    // interrupt must not revoke it; only honor a concurrent transaction end.
+    if (OB_SUCC(ret) && tx.is_terminated()) {
+      ret = OB_TRANS_HAS_DECIDED;
+    }
     if (OB_SUCC(ret) && tx.is_tx_active()) {
       tx.state_ = save_state;
     }
-    // mask_set need clear
-    tx.brpc_mask_set_.reset();
-    // check interrupt
-    if (OB_SUCC(ret) && tx.flags_.INTERRUPTED_) {
-      ret = OB_ERR_INTERRUPTED;
-      TRANS_LOG(WARN, "rollback savepoint was interrupted", K(ret));
-    }
-    // clear interrupt flag
-    tx.clear_interrupt();
-    tx.flags_.BLOCK_ = false;
   }
+  // Also clean up when the entry checkpoint rejects an expired deadline.
+  tx.brpc_mask_set_.reset();
+  tx.clear_interrupt();
+  tx.flags_.BLOCK_ = false;
   if (OB_NOT_NULL(tmp_tx_desc)) {
     msg.tx_ptr_ = NULL;
     tmp_tx_desc->~ObTxDesc();
     ob_free(tmp_tx_desc);
   }
   int64_t elapsed_us = ObTimeUtility::current_time() - start_ts;
+  const bool grace_applied = deadline.interrupted();
+  const int64_t rollback_expire_ts = deadline.expire_ts();
+  if (OB_FAIL(ret) && grace_applied) {
+    TRANS_LOG(WARN, "rollback savepoint of interrupted tx failed in grace period",
+              K(ret), K(expire_ts), K(rollback_expire_ts), K(retries), K(tx));
+  }
   TRANS_LOG(INFO, "rollback savepoint slowpath", K(ret),
             K_(tx.tx_id), K(start_ts), K(retries),
-            K(savepoint), K(expire_ts), K(tx), K(rollback_parts.count()));
+            K(savepoint), K(expire_ts), K(rollback_expire_ts), K(grace_applied),
+            K(tx), K(rollback_parts.count()));
   ObTransTraceLog &tlog = tx.get_tlog();
   REC_TRANS_TRACE_EXT(&tlog, rollback_savepoint_slowpath, OB_Y(ret),
-                      OB_ID(savepoint), savepoint.cast_to_int(), OB_Y(expire_ts),
+                      OB_ID(savepoint), savepoint.cast_to_int(), OB_ID(expire_ts), rollback_expire_ts,
                       OB_ID(retry_cnt), retries,
                       OB_ID(time_used), elapsed_us);
   return ret;
@@ -1849,16 +1910,14 @@ inline int ObTransService::rollback_savepoint_slowpath_(ObTxDesc &tx,
 inline int ObTransService::sync_rollback_savepoint__(ObTxDesc &tx,
                                                      ObTxRollbackSPMsg &msg,
                                                      RollbackMaskSet &mask_set,
-                                                     int64_t expire_ts,
+                                                     RollbackDeadline &deadline,
                                                      const int64_t max_retry_intval,
                                                      int &retries)
 {
-  const int64_t MIN_WAIT_TIME = 200 * 1000; // 200 ms
   int ret = OB_SUCCESS;
   int64_t start_ts = ObClockGenerator::getClock();
   retries = 0;
   int64_t min_retry_intval = 10 * 1000; // 10 ms
-  expire_ts = std::max(ObTimeUtility::current_time() + MIN_WAIT_TIME, expire_ts);
   ObCommonID msg_id(msg.request_id_);
   ObRollbackSPMsgGuard *rollback_sp_msg_guard = NULL;
   bool insert_mgr = false;
@@ -1878,11 +1937,11 @@ inline int ObTransService::sync_rollback_savepoint__(ObTxDesc &tx,
     insert_mgr = true;
   }
   while (OB_SUCC(ret)) {
-    int64_t retry_intval = std::min(min_retry_intval * (1 + retries), max_retry_intval);
-    int64_t waittime = std::min(expire_ts - ObTimeUtility::current_time(), retry_intval);
-    if (waittime <=0) {
-      ret = OB_TIMEOUT;
-      TRANS_LOG(WARN, "tx rpc wait result timeout", K(ret), K(expire_ts), K(retries));
+    const int64_t retry_intval = std::min(min_retry_intval * (1 + retries), max_retry_intval);
+    int64_t expire_ts = deadline.expire_ts();
+    int64_t waittime = 0;
+    if (OB_FAIL(deadline.check_with_lock(tx))) {
+      TRANS_LOG(WARN, "rollback deadline reached", K(ret), K(expire_ts), K(retries));
     } else {
       ObTxRollbackParts remain;
       mask_set.get_not_mask(remain);
@@ -1900,9 +1959,16 @@ inline int ObTransService::sync_rollback_savepoint__(ObTxDesc &tx,
           }
         } else { remain_cnt = post_succ_num; }
       }
+      // Posting can block in location lookup. Observe new interrupts and
+      // recompute the remaining budget before either success or another wait.
+      if (OB_SUCC(ret)) {
+        ret = deadline.check_with_lock(tx);
+        expire_ts = deadline.expire_ts();
+        waittime = std::min(retry_intval, expire_ts - ObTimeUtility::current_time());
+      }
       // if post failed, wait awhile and retry
       // if post succ, wait responses
-      if (OB_SUCC(ret) && remain_cnt > 0) {
+      if (OB_SUCC(ret) && remain_cnt > 0 && waittime > 0) {
           // wait result
           int rpc_ret = OB_SUCCESS;
           if (OB_FAIL(tx.rpc_cond_.wait(waittime, rpc_ret))) {
@@ -1935,18 +2001,14 @@ inline int ObTransService::sync_rollback_savepoint__(ObTxDesc &tx,
             }
           }
       }
-      // check request complete
+      if (OB_SUCC(ret)) {
+        ret = deadline.check_with_lock(tx);
+      }
+      // Completion within the budget returns immediately, even after KILL.
       if (OB_SUCC(ret) && mask_set.is_all_mask()) {
         TRANS_LOG(INFO, "all savepoint rollback succeed", K_(tx.tx_id),
                   K(remain_cnt), K(waittime), K(retries));
         break;
-      }
-      // interrupted, fail fastly
-      if (tx.flags_.INTERRUPTED_) {
-        ret = OB_ERR_INTERRUPTED;
-        TRANS_LOG(WARN, "rollback was interrupted", "caused_by", ObTxAbortCauseNames::of(tx.abort_cause_),
-                  "trans_id", tx.tx_id_,
-                  K(remain_cnt), K(waittime), K(retries));
       }
     }
     ++retries;
