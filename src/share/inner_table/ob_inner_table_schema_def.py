@@ -19280,6 +19280,11 @@ def_table_schema(
 # 12634: __all_virtual_catalog_table_priv
 # 12635: __all_virtual_catalog_table_priv_history
 
+# 12636: __all_virtual_local_active_tx
+# 12637: __all_virtual_local_log_stat
+# 12638: __all_virtual_local_log_pool_stat
+# 12639: __all_virtual_local_log_active_item
+
 # 余留位置（此行之前占位）
 # 本区域占位建议：采用真实表名进行占位
 ################################################################################
