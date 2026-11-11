@@ -1668,27 +1668,34 @@ int ObOBJLock::get_lock_op_iter(const ObLockID &lock_id,
     }
   }
   // add a mock lock op for row share lock count.
-  if (OB_SUCC(ret) && 0 != row_share_) {
+  // NOTE: row_share_/row_exclusive_ are maintained by ATOMIC_INC/ATOMIC_DEC from
+  // other threads (the dml row lock is not protected by rwlock_), so read each
+  // counter only once. Checking and using two independent loads could observe 0
+  // in between, and constructing ObTxSEQ with a zero sequence would fail the
+  // assert in ObTxSEQ(int64_t, int16_t) and abort the observer.
+  const int64_t row_share_cnt = ATOMIC_LOAD(&row_share_);
+  if (OB_SUCC(ret) && 0 != row_share_cnt) {
     ObTableLockOp tmp_op;
     tmp_op.lock_id_ = lock_id;
     tmp_op.lock_mode_ = ROW_SHARE;
     tmp_op.op_type_ = IN_TRANS_DML_LOCK;
     tmp_op.lock_op_status_ = LOCK_OP_DOING;
     // we use this one for the count.
-    tmp_op.lock_seq_no_ = ObTxSEQ(row_share_, 0);
+    tmp_op.lock_seq_no_ = ObTxSEQ(row_share_cnt, 0);
     if (OB_FAIL(iter.push(tmp_op))) {
       TABLELOCK_LOG(WARN, "push tmp lock op into iterator failed", K(ret), K(tmp_op));
     }
   }
   // add a mock lock op for row exclusive lock count.
-  if (OB_SUCC(ret) && 0 != row_exclusive_) {
+  const int64_t row_exclusive_cnt = ATOMIC_LOAD(&row_exclusive_);
+  if (OB_SUCC(ret) && 0 != row_exclusive_cnt) {
     ObTableLockOp tmp_op;
     tmp_op.lock_id_ = lock_id;
     tmp_op.lock_mode_ = ROW_EXCLUSIVE;
     tmp_op.op_type_ = IN_TRANS_DML_LOCK;
     tmp_op.lock_op_status_ = LOCK_OP_DOING;
     // we use this one for the count.
-    tmp_op.lock_seq_no_ = ObTxSEQ(row_exclusive_, 0);
+    tmp_op.lock_seq_no_ = ObTxSEQ(row_exclusive_cnt, 0);
     if (OB_FAIL(iter.push(tmp_op))) {
       TABLELOCK_LOG(WARN, "push tmp lock op into iterator failed", K(ret), K(tmp_op));
     }
