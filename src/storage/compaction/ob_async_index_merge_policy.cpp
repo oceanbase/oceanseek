@@ -527,15 +527,22 @@ int ObAsyncIndexMergePolicyHelper::calc_schedule_snapshot_version(
     } else if (OB_UNLIKELY(!index_handle.is_valid() || OB_ISNULL(index_handle.get_obj()))) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("invalid index tablet handle", KR(ret), K(i), K(index_tablet_id));
+    } else if (0 >= index_handle.get_obj()->get_last_major_snapshot_version()) {
+      // TODO(aozeliu.azl): Support async index inc major compaction when a participating tablet has no baseline.
+      ret = OB_NO_NEED_MERGE;
+      LOG_INFO("async index baseline is not ready, skip group merge", KR(ret), K(i), K(index_tablet_ids),
+          KPC(index_handle.get_obj()));
     } else if (OB_FAIL(index_handle.get_obj()->get_latest_async_index_published_version(max_published_version))) {
       LOG_WARN("failed to calc eligible max scn", KR(ret), K(i), K(index_tablet_id));
-    } else if (max_published_version <= 0) {
-      ret = OB_NO_NEED_MERGE;
-      LOG_INFO("tablet max published version is 0, so skip", KR(ret), K(i), K(index_tablet_id), K(max_published_version));
     } else {
-      schedule_snapshot_version = MIN(schedule_snapshot_version, max_published_version);
+      // An installed baseline covers earlier merge targets before the first
+      // publication. Keep this scheduling bound separate from query publication;
+      // otherwise a new index can prevent older indexes from freeing refresh capacity.
+      const int64_t merge_coverage_snapshot = max_published_version > 0
+          ? max_published_version : index_handle.get_obj()->get_last_major_snapshot_version();
+      schedule_snapshot_version = MIN(schedule_snapshot_version, merge_coverage_snapshot);
       LOG_DEBUG("async index merge published version", K(i), K(index_tablet_id),
-          K(max_published_version), K(schedule_snapshot_version));
+          K(max_published_version), K(merge_coverage_snapshot), K(schedule_snapshot_version));
     }
   }
   return ret;

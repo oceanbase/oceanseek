@@ -7,7 +7,7 @@
  * 基础组用例目录（按源码定义顺序；搜索完整用例名可定位实现）
  * 范围：DDL/schema、合并选表/选范围、元数据和 medium info 构造/提交。
  * 真实 DAG 执行、refresh/DML 配合及破坏性 GC 场景放在 integration 文件。
- * 共 38 个测试定义，参数展开后 51 个启用 case。
+ * 共 39 个测试定义，参数展开后 52 个启用 case。
  * 默认 fixture 为 ObAsyncIndexCompactionTest；特殊参数化 fixture 如下：
  *   多索引：ObMultiAsyncIndexCompactionTest，/0、/1、/2 分别为 2、3、5 个全文索引。
  *   分区：ObPartitionAsyncIndexCompactionTest，/0=HASH 4 分区，/1=RANGE 3 分区，
@@ -90,6 +90,8 @@
  *     表驱动检查倒排合并选表：允许缺少前后缀及区间空洞，过滤未提交/后续段，拒绝跨边界和交叉重叠等不可用范围。
  * 38. async_index_merge_selection_allows_range_holes
  *     同时检查全文索引和删除索引：物理 SCN 空洞/空区间、逻辑空洞、缺少前后缀或无增量时仍可选择现有合法输入。
+ * 39. unpublished_delete_baseline_limits_group_merge
+ *     共享删除索引尚未发布时以已安装Major约束组目标，选范围不改变逻辑/查询发布水位。
  */
 #include "test_async_index_compaction_common.h"
 
@@ -1851,6 +1853,138 @@ TEST_F(ObAsyncIndexCompactionTest, get_async_index_tablet_ids)
   ASSERT_EQ(1, index_tablet_ids.count());
   ASSERT_EQ(ctx.fts_index_tablet_ids_.at(0), index_tablet_ids.at(0));
   ASSERT_EQ(ctx.delete_index_tablet_id_, delete_index_tablet_id);
+}
+
+TEST_F(ObAsyncIndexCompactionTest, unpublished_delete_baseline_limits_group_merge)
+{
+  share::ObTenantSwitchGuard tguard;
+  OK(tguard.switch_to(run_ctx_.tenant_id_));
+  exe_prepare_sql();
+
+  const char *table_name = "t_async_fts_unpublished_delete_baseline";
+  create_async_fts_table(table_name);
+  MultiAsyncIndexTabletCtx ctx;
+  resolve_multi_async_index_tablet_ctx(table_name, ctx);
+  ObLSHandle ls_handle;
+  ASSERT_EQ(OB_SUCCESS, get_ls_handle(ctx.ls_id_, ls_handle));
+  const int64_t base = get_mock_major_snapshot(ctx);
+  const int64_t published = calc_schedule_snapshot_version(base);
+  const int64_t delete_baseline = base + DEFAULT_INC_MAJOR_STEP;
+  ASSERT_GT(published, delete_baseline);
+  const ObTabletID &fts_tablet_id = ctx.fts_index_tablet_ids_.at(0);
+  ASSERT_EQ(OB_SUCCESS, add_major_to_tablet(ls_handle, fts_tablet_id, base));
+  ASSERT_EQ(OB_SUCCESS, fill_inc_major_segments(ls_handle, fts_tablet_id,
+      base, DEFAULT_INC_MAJOR_CNT, DEFAULT_INC_MAJOR_STEP, DEFAULT_SEG_SIZE));
+  ASSERT_EQ(OB_SUCCESS, publish_async_index_version(ls_handle, fts_tablet_id, published));
+  ASSERT_EQ(OB_SUCCESS, add_major_to_tablet(ls_handle, ctx.delete_index_tablet_id_,
+      delete_baseline, 0 /*row_count*/, INDEX_TYPE_ASYNC_DELETE_INDEX_LOCAL));
+  ASSERT_EQ(OB_SUCCESS, publish_async_index_version(ls_handle, ctx.delete_index_tablet_id_, 0));
+
+  ObTabletHandle delete_handle;
+  ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, ctx.delete_index_tablet_id_, delete_handle));
+  ASSERT_TRUE(delete_handle.get_obj()->is_async_delete_index());
+  int64_t logical_published = -1;
+  ASSERT_EQ(OB_SUCCESS, delete_handle.get_obj()->get_latest_async_index_published_version(logical_published));
+  ASSERT_EQ(0, logical_published);
+
+  int64_t group_snapshot = 0;
+  ASSERT_EQ(OB_SUCCESS, calc_common_published_snapshot(*ls_handle.get_ls(),
+      ctx.fts_index_tablet_ids_, ctx.delete_index_tablet_id_, group_snapshot));
+  ASSERT_EQ(delete_baseline, group_snapshot);
+  ObTabletHandle data_handle;
+  ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, ctx.data_tablet_id_, data_handle));
+  share::schema::ObAsyncIndexParams params;
+  ObNewVersionRange range;
+  ASSERT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicy::choose_async_index_merge_range(
+      *ls_handle.get_ls(), *data_handle.get_obj(), ctx.fts_index_tablet_ids_,
+      ctx.delete_index_tablet_id_, ObAdaptiveMergePolicy::ASYNC_INDEX_FORCE_MERGE, params, range));
+  ASSERT_EQ(0, range.base_version_);
+  ASSERT_EQ(delete_baseline, range.snapshot_version_);
+
+  share::SCN read_scn;
+  ASSERT_EQ(OB_SUCCESS, read_scn.convert_for_tx(published));
+  ASSERT_EQ(OB_SUCCESS, delete_handle.get_obj()->get_async_index_query_published_version(
+      read_scn, logical_published));
+  ASSERT_EQ(0, logical_published);
+}
+
+TEST_F(ObAsyncIndexCompactionTest, missing_baseline_skips_group_merge)
+{
+  share::ObTenantSwitchGuard tguard;
+  OK(tguard.switch_to(run_ctx_.tenant_id_));
+  exe_prepare_sql();
+
+  const char *table_name = "t_async_fts_missing_baseline";
+  create_async_fts_table_with_index_cnt(table_name, 2);
+  MultiAsyncIndexTabletCtx ctx;
+  resolve_multi_async_index_tablet_ctx(table_name, ctx);
+  ObLSHandle ls_handle;
+  ASSERT_EQ(OB_SUCCESS, get_ls_handle(ctx.ls_id_, ls_handle));
+  const int64_t base = get_mock_major_snapshot(ctx);
+  const int64_t newer_major_snapshot = base + (DEFAULT_INC_MAJOR_CNT + 1) * DEFAULT_INC_MAJOR_STEP;
+  const int64_t published_snapshot = newer_major_snapshot + DEFAULT_INC_MAJOR_CNT * DEFAULT_INC_MAJOR_STEP;
+  ASSERT_EQ(OB_SUCCESS, add_major_to_tablet(ls_handle, ctx.data_tablet_id_, base,
+      DELETE_PERCENT_DATA_ROW_COUNT, INDEX_TYPE_IS_NOT));
+  ASSERT_EQ(OB_SUCCESS, add_major_to_tablet(ls_handle, ctx.delete_index_tablet_id_, base,
+      DELETE_PERCENT_DELETE_ROW_COUNT, INDEX_TYPE_ASYNC_DELETE_INDEX_LOCAL));
+  ObTabletHandle data_handle;
+  ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, ctx.data_tablet_id_, data_handle));
+  for (int64_t i = 0; i < ctx.fts_index_tablet_ids_.count(); ++i) {
+    const ObTabletID &tablet_id = ctx.fts_index_tablet_ids_.at(i);
+    ASSERT_EQ(OB_SUCCESS, add_major_to_tablet(ls_handle, tablet_id, 0 == i ? base : newer_major_snapshot));
+    if (0 == i) {
+      ASSERT_EQ(OB_SUCCESS, fill_inc_major_segments(
+          ls_handle, tablet_id, base, 2 * DEFAULT_INC_MAJOR_CNT + 1, DEFAULT_INC_MAJOR_STEP, DEFAULT_SEG_SIZE));
+    }
+    ASSERT_EQ(OB_SUCCESS, publish_async_index_version(ls_handle, tablet_id, published_snapshot));
+  }
+  ASSERT_EQ(OB_SUCCESS, publish_async_index_version(
+      ls_handle, ctx.delete_index_tablet_id_, published_snapshot));
+
+  share::schema::ObAsyncIndexParams params;
+  params.delete_purge_threshold_ = 20;
+  int64_t delete_percentage = 0;
+  ASSERT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicyHelper::calc_delete_percentage(
+      *ls_handle.get_ls(), *data_handle.get_obj(), ctx.delete_index_tablet_id_, delete_percentage));
+  ASSERT_GE(delete_percentage, params.delete_purge_threshold_);
+  ObNewVersionRange major_range;
+  ASSERT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicy::choose_async_index_merge_range(
+      *ls_handle.get_ls(), *data_handle.get_obj(), ctx.fts_index_tablet_ids_,
+      ctx.delete_index_tablet_id_, ObAdaptiveMergePolicy::NONE, params, major_range));
+  ASSERT_EQ(0, major_range.base_version_);
+
+  // The shared delete index participates in the baseline check as well.
+  ObTabletHandle delete_handle;
+  ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, ctx.delete_index_tablet_id_, delete_handle));
+  const int64_t delete_major_snapshot = delete_handle.get_obj()->get_last_major_snapshot_version();
+  delete_handle.get_obj()->table_store_cache_.last_major_snapshot_version_ = 0;
+  ObNewVersionRange inc_range;
+  const int choose_ret = ObAsyncIndexMergePolicy::choose_async_index_merge_range(
+      *ls_handle.get_ls(), *data_handle.get_obj(), ctx.fts_index_tablet_ids_,
+      ctx.delete_index_tablet_id_, ObAdaptiveMergePolicy::TENANT_MAJOR, params, inc_range);
+  delete_handle.get_obj()->table_store_cache_.last_major_snapshot_version_ = delete_major_snapshot;
+  ASSERT_EQ(OB_NO_NEED_MERGE, choose_ret);
+
+  // A building index without a baseline blocks the entire group.
+  ObTabletHandle index_handle;
+  ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, ctx.fts_index_tablet_ids_.at(0), index_handle));
+  ObTabletMemberWrapper<ObTabletTableStore> wrapper;
+  ASSERT_EQ(OB_SUCCESS, index_handle.get_obj()->fetch_table_store(wrapper));
+  ASSERT_NE(nullptr, wrapper.get_member());
+  const_cast<ObTabletTableStore *>(wrapper.get_member())->major_tables_.reset();
+  index_handle.get_obj()->table_store_cache_.last_major_snapshot_version_ = 0;
+
+  const ObAdaptiveMergePolicy::AdaptiveMergeReason reasons[] = {
+      ObAdaptiveMergePolicy::NONE, ObAdaptiveMergePolicy::TENANT_MAJOR,
+      ObAdaptiveMergePolicy::WINDOW_COMPACTION, ObAdaptiveMergePolicy::USER_REQUEST,
+      ObAdaptiveMergePolicy::ASYNC_INDEX_FORCE_MERGE};
+  for (const auto reason : reasons) {
+    SCOPED_TRACE(static_cast<int>(reason));
+    ObNewVersionRange range;
+    ASSERT_EQ(OB_NO_NEED_MERGE, ObAsyncIndexMergePolicy::choose_async_index_merge_range(
+        *ls_handle.get_ls(), *data_handle.get_obj(), ctx.fts_index_tablet_ids_,
+        ctx.delete_index_tablet_id_, reason, params, range));
+  }
 }
 
 TEST_F(ObAsyncIndexCompactionTest, submit_medium_info_medium_major_no_inc)

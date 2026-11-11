@@ -2055,7 +2055,7 @@ int ObMediumCompactionScheduleFunc::check_progressive_merge(
 #endif
 
 // Get async index tablet ids with the latest data table schema.
-// Recyclebin tables still participate in merge completion checks and must advance.
+// Building and recyclebin indexes still participate; deleting indexes no longer refresh.
 //   - return OB_SUCCESS: Index tablet ids are obtained.
 //   - return other errors: Schema or index lookup failed.
 int ObMediumCompactionScheduleFunc::get_async_index_tablet_ids(
@@ -2120,8 +2120,8 @@ int ObMediumCompactionScheduleFunc::get_async_index_tablet_ids(
       } else if (OB_ISNULL(index_schema)) {
         ret = OB_TABLE_IS_DELETED;
         LOG_WARN("async search data schema is null", KR(ret), K(i), K(index_table_id));
-      } else if (!index_schema->can_read_index()) {
-        LOG_INFO("index table is not available now, skip async index schedule", K(i), K(index_info), KPC(index_schema));
+      } else if (index_schema->is_in_deleting()) {
+        LOG_TRACE("skip deleting async index", K(i), K(index_info), K(index_table_id));
       } else if (OB_FAIL(index_schema->get_part_id_and_tablet_id_by_idx(
           part_idx, subpart_idx, related_part_id, related_first_level_part_id, index_tablet_id))) {
         LOG_WARN("failed to get index tablet id", KR(ret), K(i), K(part_idx), K(subpart_idx), K(index_info));
