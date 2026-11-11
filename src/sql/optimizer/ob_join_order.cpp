@@ -2185,8 +2185,15 @@ int ObJoinOrder::create_one_access_path(const uint64_t table_id,
     ap->est_cost_info_.use_column_store_ = use_column_store;
     ap->force_direction_ = index_info_entry->is_force_direction();
     ap->contain_das_op_ = ap->use_das_;
+    // ROR must be guaranteed by the parameterized range graph, not just by the
+    // current bounds. For example, a >= ? AND a <= ? may cease to be an equality
+    // on a plan-cache hit, so it must keep the non-ROR path even when both values
+    // happen to be equal during compilation.
+    const ObQueryRangeProvider *range_provider = range_info.get_query_range_provider();
     ap->is_ordered_by_pk_ = (ref_id == index_id
-                            || range_info.get_equal_prefix_count() >= range_info.get_index_column_count())
+                            || (OB_NOT_NULL(range_provider)
+                                && range_provider->is_equal_range()
+                                && range_info.get_equal_prefix_count() >= range_info.get_index_column_count()))
                             && 1 >= range_info.get_range_count();
     //set strong_sharding_ ignore dop, update sharding by dop in set_sharding_info_for_base_path()
     ap->strong_sharding_ = index_info_entry->get_sharding_info();
@@ -26229,8 +26236,12 @@ int ObJoinOrder::set_search_index_access_info(AccessPath &ap, const QueryRangeIn
     LOG_WARN("search data index table schema is null", K(ret), K(search_data_index_id));
   } else {
     ap.search_data_index_id_ = search_data_index_id;
-    ap.is_index_term_point_scan_ =
-        range_info.get_equal_prefix_count() >= SEARCH_INDEX_DOC_ID;
+    // A point term scan must remain a point scan after rebinding parameters.
+    // Equal values for independent range bounds do not establish that contract.
+    const ObQueryRangeProvider *range_provider = range_info.get_query_range_provider();
+    ap.is_index_term_point_scan_ = OB_NOT_NULL(range_provider)
+        && range_provider->is_equal_range()
+        && range_info.get_equal_prefix_count() >= SEARCH_INDEX_DOC_ID;
     ap.is_ordered_by_pk_ = ap.is_index_term_point_scan_
         && 1 >= range_info.get_range_count();
   }
