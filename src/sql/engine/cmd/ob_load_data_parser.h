@@ -1376,7 +1376,9 @@ struct ObExternalFileFormat
     /// This is distinct from the Java-side JAVA_PLUGIN_FORMAT.
     CPP_PLUGIN_FORMAT,
     DIRECT_LOAD_STREAM_FORMAT,
-    MAX_FORMAT
+    MAX_FORMAT,
+    // Internal task routing only; not a persisted external table format.
+    CPP_PLUGIN_SDK_FORMAT = MAX_FORMAT + 1
   };
 
   enum Options {
