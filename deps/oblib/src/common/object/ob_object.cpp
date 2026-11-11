@@ -322,7 +322,7 @@ DEF_TO_STRING(ObLobLocatorV2)
     if (!lob_common->in_row_) {
       if (buf_len > pos && size_ >= offset + sizeof(ObLobId)) {
         ObLobId lob_id;
-        if (OB_SUCCESS == lob_id.from_string(ObString(sizeof(ObLobId), ptr_ + offset))) {
+        if (OB_SUCCESS == get_lob_id(lob_id)) {
           J_COMMA();
           J_KV(K(lob_id));
         }
@@ -485,6 +485,30 @@ int ObLobLocatorV2::get_disk_locator(ObString &disc_loc_buff) const
     } else {
       disc_loc_buff.assign_ptr(reinterpret_cast<const char *>(disk_loc), mem_loc->disk_locator_size_);
     }
+  }
+  return ret;
+}
+
+int ObLobLocatorV2::get_lob_id(ObString &lob_id) const
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(size_ < sizeof(ObLobCommon) + sizeof(ObLobId) || !is_outrow_disk_lob_locator())) {
+    ret = OB_INVALID_ARGUMENT;
+    COMMON_LOG(WARN, "invalid outrow disk lob locator", K(ret), KP_(ptr), K_(size));
+  } else {
+    lob_id.assign_ptr(ptr_ + sizeof(ObLobCommon), sizeof(ObLobId));
+  }
+  return ret;
+}
+
+int ObLobLocatorV2::get_lob_id(ObLobId &lob_id) const
+{
+  int ret = OB_SUCCESS;
+  ObString lob_id_string;
+  if (OB_FAIL(get_lob_id(lob_id_string))) {
+    COMMON_LOG(WARN, "failed to get lob id string", K(ret), KP_(ptr), K_(size));
+  } else if (OB_FAIL(lob_id.from_string(lob_id_string))) {
+    COMMON_LOG(WARN, "failed to parse lob id", K(ret), K(lob_id_string.length()));
   }
   return ret;
 }

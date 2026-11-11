@@ -936,9 +936,8 @@ int ObLobDiskLocatorWrapper::init(const char *ptr, const int64_t len)
     if (OB_UNLIKELY(len != DISK_LOB_OUTROW_FULL_SIZE)) {
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("invalid outrow disk locator size", KR(ret), KP(ptr), K(len), K(DISK_LOB_OUTROW_FULL_SIZE));
-    } else if (OB_FAIL(lob_id_.from_string(
-                   ObString(sizeof(ObLobId), lob_common_->buffer_)))) {
-      LOG_WARN("failed to parse lob id from disk locator", KR(ret), KP(ptr), K(len));
+    } else if (OB_FAIL(ObLobLocatorV2(ObString(len, ptr)).get_lob_id(lob_id_))) {
+      LOG_WARN("failed to get lob id from disk locator", KR(ret), KP(ptr), K(len));
     } else {
       ptr_ = ptr;
       len_ = len;

@@ -1065,6 +1065,8 @@ public:
   int get_rowkey(ObString &rowkey_str) const;
   int get_disk_locator(ObLobCommon *&disk_loc) const;
   int get_disk_locator(ObString &disc_loc_buff) const;
+  int get_lob_id(ObString &lob_id) const;
+  int get_lob_id(ObLobId &lob_id) const;
 
   int get_inrow_data(ObString &inrow_data) const;
   // only supported in inrow

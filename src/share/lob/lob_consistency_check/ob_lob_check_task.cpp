@@ -811,8 +811,8 @@ int ObLobCheckTask::scan_main_table()
             if (OB_UNLIKELY(lob_data.length() < sizeof(ObLobCommon) + sizeof(ObLobId))) {
               ret = OB_ERR_UNEXPECTED;
               LOG_WARN("invalid outrow lob data length", K(ret), K(i), K(lob_data.length()));
-            } else if (OB_FAIL(lob_id.from_string(ObString(sizeof(ObLobId), lob_common->buffer_)))) {
-              LOG_WARN("failed to parse lob id", K(ret), K(i));
+            } else if (OB_FAIL(ObLobLocatorV2(lob_data).get_lob_id(lob_id))) {
+              LOG_WARN("failed to get lob id", K(ret), K(i));
             } else if (OB_FAIL(build_range_from_lob_id(lob_id, allocator_, range))) {
               LOG_WARN("fail to build range from lob_id", K(ret), K(lob_id));
             } else if (OB_FAIL(aux_table_iter_->rescan(range))) {

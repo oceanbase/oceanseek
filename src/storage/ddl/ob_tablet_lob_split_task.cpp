@@ -2116,12 +2116,12 @@ int ObMainTabletSSTableLobIterator::get_next_row_and_collect_lobids(
             if (datum.is_nop() || datum.is_null()) {
               // do nothing
             } else {
-              const ObLobCommon &lob_common = datum.get_lob_data();
-              if (!lob_common.in_row_) {
+              const ObLobLocatorV2 lob_locator(datum.get_string());
+              if (!lob_locator.is_inrow()) {
                 ObLobIdItem item;
                 item.tablet_idx_ = idx;
-                if (OB_FAIL(item.id_.from_string(ObString(sizeof(ObLobId), lob_common.buffer_)))) {
-                  LOG_WARN("failed to parse lob id", K(ret), K(lob_idx));
+                if (OB_FAIL(lob_locator.get_lob_id(item.id_))) {
+                  LOG_WARN("failed to get lob id", K(ret), K(lob_idx));
                 } else if (OB_FAIL(submap->add_item(item))) {
                   LOG_WARN("fail to add lob item into extern sortmap", K(ret));
                 } else {
@@ -2145,12 +2145,12 @@ int ObMainTabletSSTableLobIterator::get_next_row_and_collect_lobids(
             if (datum.is_nop() || datum.is_null()) {
               // do nothing
             } else {
-              const ObLobCommon &lob_common = datum.get_lob_data();
-              if (!lob_common.in_row_) {
+              const ObLobLocatorV2 lob_locator(datum.get_string());
+              if (!lob_locator.is_inrow()) {
                 ObLobIdItem item;
                 item.tablet_idx_ = idx;
-                if (OB_FAIL(item.id_.from_string(ObString(sizeof(ObLobId), lob_common.buffer_)))) {
-                  LOG_WARN("failed to parse lob id", K(ret), K(lob_col_idxs.at(i - 1)));
+                if (OB_FAIL(lob_locator.get_lob_id(item.id_))) {
+                  LOG_WARN("failed to get lob id", K(ret), K(lob_col_idxs.at(i - 1)));
                 } else if (OB_FAIL(submap->add_item(item))) {
                   LOG_WARN("fail to add lob item into extern sortmap", K(ret));
                 } else {

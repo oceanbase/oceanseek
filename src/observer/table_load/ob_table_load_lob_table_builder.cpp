@@ -89,13 +89,13 @@ int ObTableLoadLobTableBuilder::append_delete_row(const ObTabletID &tablet_id,
     for (int64_t i = 0; OB_SUCC(ret) && i < lob_column_idxs_->count(); i++) {
       int64_t lob_idx = lob_column_idxs_->at(i);
       ObStorageDatum &datum = datum_row.storage_datums_[lob_idx];
-      const ObLobCommon &lob_common = datum.get_lob_data();
-      if (!lob_common.in_row_) {
-        ObLobId lob_id;
-        if (OB_FAIL(lob_id.from_string(ObString(sizeof(ObLobId), lob_common.buffer_)))) {
-          LOG_WARN("failed to parse lob id", KR(ret));
+      const ObLobLocatorV2 lob_locator(datum.get_string());
+      if (!lob_locator.is_inrow()) {
+        ObString lob_id;
+        if (OB_FAIL(lob_locator.get_lob_id(lob_id))) {
+          LOG_WARN("failed to get lob id", KR(ret));
         } else {
-          datum_row_.storage_datums_[0].set_string(lob_id.get_string());
+          datum_row_.storage_datums_[0].set_string(lob_id);
           if (OB_FAIL(table_builder_.append_row(lob_tablet_id, datum_row_))) {
             LOG_WARN("fail to append row", KR(ret));
           }
