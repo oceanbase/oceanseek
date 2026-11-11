@@ -577,6 +577,7 @@ int ObTabletDDLKvMgr::get_or_create_inc_major_ddl_kv(
     ObDDLKVHandle &kv_handle)
 {
   int ret = OB_SUCCESS;
+  bool need_schedule_merge = false;
   kv_handle.reset();
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
@@ -620,9 +621,18 @@ int ObTabletDDLKvMgr::get_or_create_inc_major_ddl_kv(
                                       table_type))) {
         LOG_WARN("create ddl kv failed", K(ret), K(trans_id), K(seq_no), K(table_type));
       }
+      need_schedule_merge = get_count_nolock() >= MAX_DDL_KV_CNT_TO_DUMP;
     }
     if (lock_tid != 0) {
       unlock(lock_tid);
+    }
+  }
+  // Scheduling reads the KV list, so release the manager lock before scheduling.
+  // Also schedule when the full KV queue makes allocation return OB_EAGAIN.
+  if (need_schedule_merge) {
+    int tmp_ret = OB_SUCCESS;
+    if (OB_TMP_FAIL(ObDDLMergeScheduler::schedule_tablet_ddl_inc_major_merge(ls_id_, tablet_id_))) {
+      LOG_WARN("failed to schedule tablet ddl inc major merge", KR(tmp_ret), K_(ls_id), K_(tablet_id));
     }
   }
   return ret;
@@ -1002,13 +1012,6 @@ int ObTabletDDLKvMgr::handle_ddl_kv_queue_overflow(const ObDDLKVType ddl_kv_type
   int ret = OB_SUCCESS;
   int64_t ddl_kv_count = get_count_nolock();
   if (is_inc_major_ddl_kv(ddl_kv_type)) {
-    // TODO @yuya.yu There is deadlock here. Need to fix it
-    // if (ddl_kv_count >= MAX_DDL_KV_CNT_TO_DUMP) {
-    //   int tmp_ret = OB_SUCCESS;
-    //   if (OB_TMP_FAIL(ObDDLMergeScheduler::schedule_tablet_ddl_inc_major_merge(ls_id_, tablet_id_))) {
-    //     LOG_WARN("failed to schedule tablet ddl inc major merge", KR(tmp_ret), K_(ls_id), K_(tablet_id));
-    //   }
-    // }
     if (ddl_kv_count == MAX_DDL_KV_CNT_IN_STORAGE) {
       ret = OB_EAGAIN;
     }

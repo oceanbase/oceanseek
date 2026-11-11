@@ -11,6 +11,9 @@
 #include "storage/ddl/ob_inc_ddl_merge_task_utils.h"
 #include "storage/ddl/ob_inc_ddl_merge_helper.h"
 #include "storage/ddl/ob_tablet_ddl_kv_mgr.h"
+#include "storage/ddl/ob_ddl_merge_task.h"
+#include "storage/ddl/ob_ddl_merge_schedule.h"
+#include "storage/ddl/ob_ddl_inc_task.h"
 #include "storage/ddl/ob_ss_ddl_util.h"
 #include "storage/compaction_v2/ob_ss_compact_helper.h"
 #include "storage/direct_load/ob_direct_load_ss_update_inc_major_task.h"
@@ -18,6 +21,8 @@
 #include "storage/incremental/ob_inc_sstable_upload_task.h"
 #include "storage/tablet/ob_tablet_ddl_complete_mds_helper.h"
 #include "storage/compaction/ob_tablet_medium_clog_replay_executor.h"
+#include "storage/compaction/ob_tenant_tablet_scheduler.h"
+#include "storage/compaction/ob_schedule_dag_func.h"
 #include "storage/tx_table/ob_tx_table.h"
 #include "storage/tx/ob_tx_log.h"
 #include "logservice/ob_log_handler.h"
@@ -31,6 +36,18 @@
 namespace oceanbase
 {
 OB_MOCK_PALF_KV_FOR_REPLACE_SYS_TENANT
+
+#ifdef ERRSIM
+thread_local int64_t ddl_merge_dag_create_count = 0;
+
+int compaction::ObScheduleDagFunc::schedule_ddl_table_merge_dag(
+    storage::ObDDLTableMergeDagParam &param, const bool is_emergency)
+{
+  // Count synchronous preparation requests while retaining real DAG creation and enqueue deduplication.
+  ++ddl_merge_dag_create_count;
+  return MTL(share::ObTenantDagScheduler *)->create_and_add_dag<storage::ObDDLTableMergeDag>(&param, is_emergency);
+}
+#endif
 }
 
 int64_t lease_epoch = 1;
@@ -367,6 +384,93 @@ protected:
   }
 
   void check_lob_end_retry(const bool empty_lob_piece);
+
+#ifdef ERRSIM
+  int prepare_full_inc_kv_queue(RecEndContext &ctx, const ObTransID &trans_id,
+      ObDDLKvMgrHandle &mgr, ObDDLKVHandle &first, ObDDLTableMergeDag &dag, SCN &end_scn)
+  {
+    int ret = OB_SUCCESS;
+    SCN start_scn;
+    const int64_t snapshot = ctx.local_.get_obj()->get_snapshot_version();
+    const ObTxSEQ seq_no = ObTxSEQ::from_seq(1);
+    // Only fixture construction suppresses scheduling; the tested retries submit real DAGs.
+    NamedEventGuard setup_only;
+    if (OB_FAIL(start_scn.convert_for_tx(SS_DDL_START_SCN_VAL))) {
+    } else if (OB_FAIL(ObDDLIncLoadUtil::record_inc_major_start_info_to_mds(*ctx.schema_,
+        ctx.tablet_id_, ctx.ls_id_, trans_id, DATA_VERSION_4_6_3_0, snapshot, start_scn, ctx.allocator_))) {
+    } else if (OB_FAIL(ctx.local_.get_obj()->get_ddl_kv_mgr(mgr, true))) {
+    } else if (OB_FAIL(ctx.ls_.get_ls()->get_max_decided_scn(end_scn))) {
+    } else if (FALSE_IT(end_scn = SCN::minus(end_scn, 1000))) {
+    } else if (OB_FAIL(mgr.get_obj()->set_max_freeze_scn(end_scn))) {
+    } else if (OB_FAIL(setup_only.init("EN_COMPACTION_DISABLE_INC_MAJOR_SSTABLE", OB_EAGAIN, 100))) {
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < ObTabletDDLKvMgr::MAX_DDL_KV_CNT_IN_STORAGE; ++i) {
+      ObDDLKVHandle kv;
+      end_scn = SCN::plus(end_scn, 1);
+      if (OB_FAIL(mgr.get_obj()->get_or_create_inc_major_ddl_kv(end_scn, start_scn, snapshot,
+          DATA_VERSION_4_6_3_0, trans_id, seq_no, ObITable::INC_MAJOR_DDL_MEM_SSTABLE, kv))) {
+      } else {
+        // Metadata-only KVs isolate queue draining from macro-block I/O.
+        kv.get_obj()->min_scn_ = kv.get_obj()->max_scn_ = end_scn;
+        if (i == 0) {
+          first = kv;
+        }
+        ret = mgr.get_obj()->freeze_ddl_kv(start_scn, snapshot, DATA_VERSION_4_6_3_0,
+            end_scn, ObDDLKVType::DDL_KV_INC_MAJOR, trans_id, seq_no, ObITable::INC_MAJOR_DDL_MEM_SSTABLE);
+      }
+    }
+    if (OB_SUCC(ret)) {
+      ObDDLTableMergeDagParam param;
+      param.direct_load_type_ = DIRECT_LOAD_INCREMENTAL_MAJOR;
+      param.ls_id_ = ctx.ls_id_;
+      param.tablet_id_ = ctx.tablet_id_;
+      param.start_scn_ = first.get_obj()->get_start_scn();
+      param.snapshot_version_ = snapshot;
+      param.data_format_version_ = DATA_VERSION_4_6_3_0;
+      param.trans_id_ = trans_id;
+      param.seq_no_ = seq_no;
+      param.table_type_ = ObITable::INC_MAJOR_DDL_DUMP_SSTABLE;
+      ret = dag.init_by_param(&param);
+    }
+    return ret;
+  }
+
+  template <typename Predicate>
+  bool wait_for_inc_kv_condition(Predicate predicate)
+  {
+    const int64_t deadline = ObTimeUtility::current_time() + 30 * 1000 * 1000;
+    while (!predicate()) {
+      if (ObTimeUtility::current_time() >= deadline) {
+        return false;
+      }
+      ob_usleep(1000);
+    }
+    return true;
+  }
+
+  bool inc_kv_dag_finished(const ObDDLTableMergeDag &dag)
+  {
+    bool exists = true;
+    bool emergency = false;
+    int ret = MTL(ObTenantDagScheduler *)->check_dag_exist(&dag, exists, emergency);
+    return OB_SUCC(ret) && !exists;
+  }
+
+  void check_inc_kv_dump(RecEndContext &ctx, const ObTransID &trans_id, const SCN &end_scn)
+  {
+    ASSERT_EQ(OB_SUCCESS, ctx.ls_.get_ls()->get_tablet(ctx.tablet_id_, ctx.local_));
+    ObTableStoreIterator dumps;
+    ASSERT_EQ(OB_SUCCESS, ctx.local_.get_obj()->get_inc_major_ddl_sstables(
+        dumps, trans_id, ObTxSEQ::from_seq(1)));
+    ASSERT_EQ(1, dumps.count());
+    ObITable *table = nullptr;
+    ASSERT_EQ(OB_SUCCESS, dumps.get_next(table));
+    ASSERT_NE(nullptr, table);
+    EXPECT_EQ(end_scn, table->get_end_scn());
+    EXPECT_EQ(end_scn, ctx.local_.get_obj()->get_ddl_checkpoint_scn());
+  }
+
+#endif
 };
 
 TEST_F(TestDliEndRecCheckpoint, dump_checkpoint_does_not_skip_final_publication)
@@ -1682,6 +1786,126 @@ TEST_F(TestDliEndRecCheckpoint, primary_end_checkpoint_flag_follows_async_index_
     ASSERT_EQ(OB_SUCCESS, exe_sql(sql.ptr()));
   }
 }
+
+#ifdef ERRSIM
+TEST_F(TestDliEndRecCheckpoint, inc_kv_pressure_schedules_on_allocation)
+{
+  share::ObTenantSwitchGuard tenant;
+  ASSERT_EQ(OB_SUCCESS, tenant.switch_to(run_ctx_.tenant_id_));
+  // Prove pressure scheduling works without a periodic MergeLoop, and exclude timer races.
+  auto &timer = MTL(compaction::ObTenantTabletScheduler *)->timer_task_mgr_;
+  ASSERT_EQ(OB_SUCCESS, TG_CANCEL_TASK_R(timer.merge_loop_tg_id_, timer.merge_loop_task_));
+  DEFER(EXPECT_EQ(OB_SUCCESS, TG_SCHEDULE(timer.merge_loop_tg_id_,
+      timer.merge_loop_task_, timer.schedule_interval_, true /*repeat*/)));
+  ASSERT_EQ(OB_SUCCESS, TG_INVOKE(timer.merge_loop_tg_id_, wait_task, timer.merge_loop_task_));
+  RecEndContext ctx;
+  ASSERT_EQ(OB_SUCCESS, prepare("rec_end_kv_pressure", ctx));
+  ObDDLKvMgrHandle mgr;
+  ASSERT_EQ(OB_SUCCESS, ctx.local_.get_obj()->get_ddl_kv_mgr(mgr, true));
+  NamedEventGuard schedule_failure;
+  ASSERT_EQ(OB_SUCCESS, schedule_failure.init("EN_COMPACTION_DISABLE_INC_MAJOR_SSTABLE", OB_EAGAIN, 100));
+  DEFER(mgr.get_obj()->cleanup(); exe_sql("drop table rec_end_kv_pressure"));
+  SCN scn;
+  ASSERT_EQ(OB_SUCCESS, ctx.ls_.get_ls()->get_max_decided_scn(scn));
+  scn = SCN::minus(scn, 1000);
+  ASSERT_EQ(OB_SUCCESS, mgr.get_obj()->set_max_freeze_scn(scn));
+  const int64_t threshold = ObTabletDDLKvMgr::MAX_DDL_KV_CNT_TO_DUMP;
+  for (int64_t i = 0; i < threshold; ++i) {
+    scn = SCN::plus(scn, 1);
+    ObDDLKVHandle kv;
+    ASSERT_EQ(OB_SUCCESS, mgr.get_obj()->get_or_create_inc_major_ddl_kv(
+        scn, SCN::base_scn(), ctx.local_.get_obj()->get_snapshot_version(), DATA_VERSION_4_6_3_0,
+        ObTransID(77401), ObTxSEQ::from_seq(i + 1), ObITable::INC_MAJOR_DDL_MEM_SSTABLE, kv));
+    ASSERT_TRUE(kv.is_valid());
+    EXPECT_EQ(i + 1, mgr.get_obj()->get_count());
+    EXPECT_EQ(i + 1 < threshold ? 0 : 1, schedule_failure.get_trigger_count());
+    // Model a completed REDO; allocation, freezing and scheduling use the real implementations.
+    kv.get_obj()->min_scn_ = kv.get_obj()->max_scn_ = scn;
+    ASSERT_EQ(OB_SUCCESS, mgr.get_obj()->freeze_ddl_kv(SCN::base_scn(),
+        ctx.local_.get_obj()->get_snapshot_version(), DATA_VERSION_4_6_3_0, SCN::min_scn(),
+        ObDDLKVType::DDL_KV_INC_MAJOR, ObTransID(77401), ObTxSEQ::from_seq(i + 1),
+        ObITable::INC_MAJOR_DDL_MEM_SSTABLE));
+    ASSERT_TRUE(kv.get_obj()->is_freezed());
+    EXPECT_EQ(i + 1 < threshold ? 0 : 1, schedule_failure.get_trigger_count());
+  }
+}
+
+TEST_F(TestDliEndRecCheckpoint, inc_kv_full_queue_dump_skips_duplicate_preparation)
+{
+  // Full-queue retries must schedule a real dump without repeating preparation for a live DAG.
+  share::ObTenantSwitchGuard tenant;
+  ASSERT_EQ(OB_SUCCESS, tenant.switch_to(run_ctx_.tenant_id_));
+  auto &timer = MTL(compaction::ObTenantTabletScheduler *)->timer_task_mgr_;
+  ASSERT_EQ(OB_SUCCESS, TG_CANCEL_TASK_R(timer.merge_loop_tg_id_, timer.merge_loop_task_));
+  DEFER(EXPECT_EQ(OB_SUCCESS, TG_SCHEDULE(timer.merge_loop_tg_id_,
+      timer.merge_loop_task_, timer.schedule_interval_, true /*repeat*/)));
+  ASSERT_EQ(OB_SUCCESS, TG_INVOKE(timer.merge_loop_tg_id_, wait_task, timer.merge_loop_task_));
+  RecEndContext ctx;
+  ASSERT_EQ(OB_SUCCESS, prepare("rec_end_kv_pending", ctx));
+  const ObTransID trans_id(77403);
+  ObDDLKvMgrHandle mgr;
+  ObDDLKVHandle first;
+  ObDDLTableMergeDag dag;
+  SCN end_scn;
+  ASSERT_EQ(OB_SUCCESS, prepare_full_inc_kv_queue(ctx, trans_id, mgr, first, dag, end_scn));
+  DEFER({
+    (void)MTL(ObTenantDagScheduler *)->cancel_dag(&dag, true);
+    if (wait_for_inc_kv_condition([&]() { return inc_kv_dag_finished(dag); })) {
+      mgr.get_obj()->cleanup();
+      EXPECT_EQ(OB_SUCCESS, exe_sql("drop table rec_end_kv_pending"));
+    } else {
+      ADD_FAILURE() << "dump DAG did not stop during cleanup";
+    }
+  });
+  first.get_obj()->inc_pending_cnt();
+  bool pending = true;
+  DEFER(if (pending) { first.get_obj()->dec_pending_cnt(); });
+  ASSERT_EQ(OB_EAGAIN, first.get_obj()->wait_pending());
+  const SCN checkpoint_before = ctx.local_.get_obj()->get_ddl_checkpoint_scn();
+  ObDDLKVHandle next;
+  SCN start_scn;
+  ASSERT_EQ(OB_SUCCESS, start_scn.convert_for_tx(SS_DDL_START_SCN_VAL));
+  const int64_t before_create = ddl_merge_dag_create_count;
+  ASSERT_EQ(OB_EAGAIN, mgr.get_obj()->get_or_create_inc_major_ddl_kv(
+      SCN::plus(end_scn, 1), start_scn, ctx.local_.get_obj()->get_snapshot_version(), DATA_VERSION_4_6_3_0,
+      trans_id, ObTxSEQ::from_seq(1), ObITable::INC_MAJOR_DDL_MEM_SSTABLE, next));
+  ASSERT_FALSE(next.is_valid());
+  ASSERT_EQ(before_create + 1, ddl_merge_dag_create_count);
+  // The DAG owns the tablet lock while close_ddl_kvs waits for the held pending count.
+  ASSERT_TRUE(wait_for_inc_kv_condition([&]() {
+    int ret = MTL(ObDDLMergeBucketLock *)->lock(ctx.tablet_id_);
+    if (OB_SUCC(ret)) {
+      EXPECT_EQ(OB_SUCCESS, MTL(ObDDLMergeBucketLock *)->unlock(ctx.tablet_id_));
+    }
+    return OB_EAGAIN == ret;
+  }));
+  const int64_t capacity = ObTabletDDLKvMgr::MAX_DDL_KV_CNT_IN_STORAGE;
+  EXPECT_EQ(capacity, mgr.get_obj()->get_count());
+  EXPECT_FALSE(first.get_obj()->is_closed());
+  ASSERT_EQ(OB_SUCCESS, ctx.ls_.get_ls()->get_tablet(ctx.tablet_id_, ctx.local_));
+  EXPECT_EQ(checkpoint_before, ctx.local_.get_obj()->get_ddl_checkpoint_scn());
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_FALSE(inc_kv_dag_finished(dag));
+    EXPECT_EQ(OB_EAGAIN, ObDDLMergeScheduler::schedule_tablet_ddl_inc_major_merge(ctx.ls_, ctx.local_));
+    EXPECT_EQ(before_create + 1, ddl_merge_dag_create_count);
+  }
+  // Bypassing the early check still returns EAGAIN, but performs preparation before final deduplication.
+  EXPECT_EQ(OB_EAGAIN, compaction::ObScheduleDagFunc::schedule_ddl_table_merge_dag(dag.ddl_param_));
+  EXPECT_EQ(before_create + 2, ddl_merge_dag_create_count);
+  first.get_obj()->dec_pending_cnt();
+  pending = false;
+  ASSERT_TRUE(wait_for_inc_kv_condition([&]() {
+    return mgr.get_obj()->get_count() == 0 && inc_kv_dag_finished(dag);
+  }));
+  check_inc_kv_dump(ctx, trans_id, end_scn);
+  ASSERT_EQ(OB_SUCCESS, mgr.get_obj()->get_or_create_inc_major_ddl_kv(
+      SCN::plus(end_scn, 1), start_scn, ctx.local_.get_obj()->get_snapshot_version(), DATA_VERSION_4_6_3_0,
+      trans_id, ObTxSEQ::from_seq(1), ObITable::INC_MAJOR_DDL_MEM_SSTABLE, next));
+  ASSERT_TRUE(next.is_valid());
+  EXPECT_EQ(end_scn, next.get_obj()->get_start_scn());
+}
+
+#endif
 
 TEST_F(TestDliEndRecCheckpoint, primary_sql_keeps_data_checkpoint_for_main_and_lob)
 {

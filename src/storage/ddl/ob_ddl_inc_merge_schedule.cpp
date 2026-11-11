@@ -575,6 +575,10 @@ int ObDDLMergeScheduler::schedule_tablet_ddl_inc_major_merge_for_ss(
     } else {
       ObDDLKV *ddl_kv = first_ddl_kv_handle.get_obj();
       ObDDLTableMergeDagParam param;
+      ObDDLTableMergeDag dag;
+      ObTenantDagScheduler *dag_scheduler = MTL(ObTenantDagScheduler *);
+      bool dag_exist = false;
+      bool unused_is_emergency = false;
       param.direct_load_type_    = DIRECT_LOAD_INCREMENTAL_MAJOR;
       param.ls_id_               = ls->get_ls_id();
       param.tablet_id_           = tablet_handle.get_obj()->get_tablet_id();
@@ -588,6 +592,17 @@ int ObDDLMergeScheduler::schedule_tablet_ddl_inc_major_merge_for_ss(
       if (OB_FAIL(EN_COMPACTION_DISABLE_INC_MAJOR_SSTABLE)) {
         FLOG_INFO("EN_COMPACTION_DISABLE_INC_MAJOR_SSTABLE: stop creating inc major sstable", K(ret));
         ret = OB_NO_NEED_MERGE;
+      } else if (OB_ISNULL(dag_scheduler)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("tenant dag scheduler is null", KR(ret));
+      } else if (OB_FAIL(dag.init_by_param(&param))) {
+        LOG_WARN("failed to init ddl merge dag", KR(ret), K(param));
+      // Check for an existing DAG early to avoid repeating expensive initialization and task creation.
+      } else if (OB_FAIL(dag_scheduler->check_dag_exist(&dag, dag_exist, unused_is_emergency))) {
+        LOG_WARN("failed to check ddl merge dag exist", KR(ret), K(param));
+      } else if (dag_exist) {
+        // Skip task preparation for an existing DAG; add_dag still handles concurrent submissions.
+        ret = OB_EAGAIN;
       } else if (OB_FAIL(ObScheduleDagFunc::schedule_ddl_table_merge_dag(param))) {
         if (OB_SIZE_OVERFLOW != ret && OB_EAGAIN != ret) {
           LOG_WARN("schedule ddl merge dag failed", K(ret), K(param));
