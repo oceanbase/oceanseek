@@ -10,9 +10,11 @@
 
 #include "lib/string/ob_sql_string.h"
 #include "rootserver/ddl_task/ob_fork_table_task.h"
+#include "rootserver/ob_ddl_service.h"
 #include "rootserver/fork_table/ob_fork_table_helper.h"
 #include "rootserver/fork_table/ob_fork_table_tablet_task_operator.h"
 #include "share/inner_table/ob_inner_table_schema.h"
+#include "share/ob_ddl_sim_point.h"
 
 #define LOG_FILE_PATH "./test_fork_table_task.log"
 
@@ -30,6 +32,11 @@ using namespace oceanbase::rootserver;
 class TestForkTableTask : public ::testing::Test
 {
 public:
+  static void SetUpTestCase()
+  {
+    ASSERT_SUCC(ObDDLSimPointMgr::get_instance().init());
+  }
+
   void SetUp() override {}
   void TearDown() override {}
 
@@ -277,6 +284,7 @@ TEST_F(TestForkTableTask, fork_database_serialize_roundtrip)
   src_task.src_database_id_ = src_db_id;
   src_task.dst_database_id_ = dst_db_id;
   src_task.child_task_total_cnt_ = child_total;
+  src_task.fork_snapshot_version_ = 123456;
 
   const int64_t size = src_task.get_serialize_param_size();
   ASSERT_GT(size, 0);
@@ -300,6 +308,296 @@ TEST_F(TestForkTableTask, fork_database_serialize_roundtrip)
   ASSERT_EQ(static_cast<int64_t>(dst_db_id), dst_task.target_object_id_);
 
   ob_free(buf);
+}
+
+// Keep the old RPC layout independent of the production serializer to verify
+// optional tail-field compatibility. Upgrade admission guards feature semantics.
+struct LegacyForkDatabaseArg : public obrpc::ObDDLArg
+{
+  OB_UNIS_VERSION(1);
+public:
+  uint64_t tenant_id_ = 1002;
+  ObString src_database_name_ = ObString::make_string("source");
+  ObString dst_database_name_ = ObString::make_string("destination");
+  int64_t session_id_ = 0;
+};
+OB_SERIALIZE_MEMBER((LegacyForkDatabaseArg, obrpc::ObDDLArg),
+                    tenant_id_, src_database_name_, dst_database_name_, session_id_);
+
+TEST_F(TestForkTableTask, fork_database_rpc_rolling_upgrade)
+{
+  char buf[4096];
+  LegacyForkDatabaseArg legacy;
+  int64_t pos = 0;
+  ASSERT_SUCC(legacy.serialize(buf, sizeof(buf), pos));
+  obrpc::ObForkDatabaseArg current;
+  int64_t read_pos = 0;
+  ASSERT_SUCC(current.deserialize(buf, pos, read_pos));
+  ASSERT_FALSE(current.schema_only_);
+  ASSERT_EQ(legacy.src_database_name_, current.src_database_name_);
+  ASSERT_EQ(pos, read_pos);
+
+  pos = 0;
+  ASSERT_SUCC(current.serialize(buf, sizeof(buf), pos));
+  ASSERT_EQ(current.get_serialize_size(), pos);
+  read_pos = 0;
+  ASSERT_SUCC(legacy.deserialize(buf, pos, read_pos));
+  ASSERT_EQ(pos, read_pos);
+
+  current.schema_only_ = true;
+  pos = 0;
+  ASSERT_SUCC(current.serialize(buf, sizeof(buf), pos));
+  ASSERT_EQ(current.get_serialize_size(), pos);
+  read_pos = 0;
+  ASSERT_SUCC(legacy.deserialize(buf, pos, read_pos));
+  ASSERT_EQ(pos, read_pos); // Old readers skip the new tail field; upgrade gates block fork.
+  ASSERT_EQ(current.dst_database_name_, legacy.dst_database_name_);
+  obrpc::ObForkDatabaseArg decoded;
+  read_pos = 0;
+  ASSERT_SUCC(decoded.deserialize(buf, pos, read_pos));
+  ASSERT_TRUE(decoded.schema_only_);
+  ASSERT_EQ(current.dst_database_name_, decoded.dst_database_name_);
+  read_pos = 0;
+  ASSERT_NE(OB_SUCCESS, decoded.deserialize(buf, pos - 1, read_pos));
+  read_pos = 0;
+  ASSERT_NE(OB_SUCCESS, decoded.deserialize(buf, 0, read_pos));
+}
+
+// The pre-SCHEMA-ONLY v1 RPC already includes COPY GRANTS as its last field.
+struct LegacyCopyGrantsForkDatabaseArg : public obrpc::ObDDLArg
+{
+  OB_UNIS_VERSION(1);
+public:
+  uint64_t tenant_id_ = 1002;
+  ObString src_database_name_ = ObString::make_string("source");
+  ObString dst_database_name_ = ObString::make_string("destination");
+  int64_t session_id_ = 0;
+  bool copy_grants_ = false;
+};
+OB_SERIALIZE_MEMBER((LegacyCopyGrantsForkDatabaseArg, obrpc::ObDDLArg),
+                    tenant_id_, src_database_name_, dst_database_name_, session_id_, copy_grants_);
+
+TEST_F(TestForkTableTask, fork_database_rpc_copy_grants_schema_only)
+{
+  char buf[4096];
+  LegacyCopyGrantsForkDatabaseArg legacy;
+  legacy.copy_grants_ = true;
+  int64_t pos = 0;
+  ASSERT_SUCC(legacy.serialize(buf, sizeof(buf), pos));
+  obrpc::ObForkDatabaseArg current;
+  int64_t read_pos = 0;
+  ASSERT_SUCC(current.deserialize(buf, pos, read_pos));
+  ASSERT_EQ(pos, read_pos);
+  ASSERT_TRUE(current.copy_grants_);
+  ASSERT_FALSE(current.schema_only_);
+
+  const bool values[] = {false, true};
+  for (const bool copy_grants : values) {
+    for (const bool schema_only : values) {
+      current.copy_grants_ = copy_grants;
+      current.schema_only_ = schema_only;
+      obrpc::ObForkDatabaseArg assigned;
+      assigned.copy_grants_ = !copy_grants;
+      assigned.schema_only_ = !schema_only;
+      ASSERT_SUCC(assigned.assign(current));
+      ASSERT_EQ(copy_grants, assigned.copy_grants_);
+      ASSERT_EQ(schema_only, assigned.schema_only_);
+      pos = 0;
+      ASSERT_SUCC(current.serialize(buf, sizeof(buf), pos));
+      ASSERT_EQ(current.get_serialize_size(), pos);
+
+      // An older COPY GRANTS reader must not mistake the new mode for its flag.
+      legacy.copy_grants_ = !copy_grants;
+      read_pos = 0;
+      ASSERT_SUCC(legacy.deserialize(buf, pos, read_pos));
+      ASSERT_EQ(pos, read_pos);
+      ASSERT_EQ(copy_grants, legacy.copy_grants_);
+
+      obrpc::ObForkDatabaseArg decoded;
+      read_pos = 0;
+      ASSERT_SUCC(decoded.deserialize(buf, pos, read_pos));
+      ASSERT_EQ(pos, read_pos);
+      ASSERT_EQ(copy_grants, decoded.copy_grants_);
+      ASSERT_EQ(schema_only, decoded.schema_only_);
+    }
+  }
+
+  // Requests predating COPY GRANTS retain the constructor defaults for both flags.
+  LegacyForkDatabaseArg oldest;
+  pos = 0;
+  ASSERT_SUCC(oldest.serialize(buf, sizeof(buf), pos));
+  obrpc::ObForkDatabaseArg decoded_oldest;
+  read_pos = 0;
+  ASSERT_SUCC(decoded_oldest.deserialize(buf, pos, read_pos));
+  ASSERT_EQ(pos, read_pos);
+  ASSERT_FALSE(decoded_oldest.copy_grants_);
+  ASSERT_FALSE(decoded_oldest.schema_only_);
+}
+
+TEST_F(TestForkTableTask, fork_database_schema_only_recovery_message)
+{
+  ObForkDatabaseTask task;
+  task.task_version_ = ObForkDatabaseTask::OB_FORK_DATABASE_TASK_VERSION;
+  task.src_database_id_ = 600001;
+  task.dst_database_id_ = 600002;
+  task.schema_only_ = true;
+  task.fork_snapshot_version_ = 0;
+  task.child_task_total_cnt_ = 0;
+  // Independently encode the historical v1 prefix without a mode field.
+  auto serialize_legacy = [&task](char *buf, const int64_t buf_len, int64_t &pos) {
+    int ret = task.ObDDLTask::serialize_params_to_message(buf, buf_len, pos);
+    LST_DO_CODE(OB_UNIS_ENCODE, task.src_database_id_, task.dst_database_id_,
+                task.child_task_total_cnt_, task.fork_snapshot_version_);
+    return ret;
+  };
+  char buf[4096];
+  int64_t pos = 0;
+  ASSERT_SUCC(task.serialize_params_to_message(buf, sizeof(buf), pos));
+  ASSERT_EQ(task.get_serialize_param_size(), pos);
+  char legacy_buf[4096];
+  int64_t legacy_pos = 0;
+  ASSERT_SUCC(serialize_legacy(legacy_buf, sizeof(legacy_buf), legacy_pos));
+  ASSERT_EQ(legacy_pos + serialization::encoded_length(task.schema_only_), pos);
+  ASSERT_EQ(0, MEMCMP(legacy_buf, buf, legacy_pos));
+
+  ObForkDatabaseTask restored;
+  int64_t read_pos = 0;
+  ASSERT_SUCC(restored.deserialize_params_from_message(1002, buf, pos, read_pos));
+  ASSERT_EQ(pos, read_pos);
+  ASSERT_TRUE(restored.schema_only_);
+  ASSERT_EQ(1, restored.task_version_);
+  ASSERT_EQ(0, restored.fork_snapshot_version_);
+  ASSERT_EQ(0, restored.child_task_total_cnt_);
+  ASSERT_EQ(task.dst_database_id_, restored.dst_database_id_);
+
+  // A missing mode never derives true from snapshot zero. Recovery init rejects
+  // this incomplete schema-only record through the snapshot/count consistency checks.
+  read_pos = 0;
+  ASSERT_SUCC(restored.deserialize_params_from_message(1002, legacy_buf, legacy_pos, read_pos));
+  ASSERT_FALSE(restored.schema_only_);
+  ASSERT_EQ(0, restored.fork_snapshot_version_);
+
+  // Newly written data-fork records retain the old prefix and append false.
+  task.schema_only_ = false;
+  task.fork_snapshot_version_ = 123456;
+  task.child_task_total_cnt_ = 4;
+  pos = 0;
+  legacy_pos = 0;
+  ASSERT_SUCC(task.serialize_params_to_message(buf, sizeof(buf), pos));
+  ASSERT_EQ(task.get_serialize_param_size(), pos);
+  ASSERT_SUCC(serialize_legacy(legacy_buf, sizeof(legacy_buf), legacy_pos));
+  ASSERT_EQ(legacy_pos + serialization::encoded_length(task.schema_only_), pos);
+  ASSERT_EQ(0, MEMCMP(legacy_buf, buf, legacy_pos));
+  read_pos = 0;
+  ASSERT_SUCC(restored.deserialize_params_from_message(1002, buf, pos, read_pos));
+  ASSERT_EQ(pos, read_pos);
+  ASSERT_FALSE(restored.schema_only_);
+  ASSERT_EQ(1, restored.task_version_);
+  ASSERT_EQ(123456, restored.fork_snapshot_version_);
+  ASSERT_EQ(4, restored.child_task_total_cnt_);
+
+  // Truncating inside the snapshot encoding must still fail.
+  ASSERT_GT(serialization::encoded_length(task.fork_snapshot_version_), 1);
+  read_pos = 0;
+  ASSERT_NE(OB_SUCCESS, restored.deserialize_params_from_message(1002, legacy_buf, legacy_pos - 1, read_pos));
+
+  // Historical data-fork messages have no mode: reset a reused decoder to false.
+  restored.schema_only_ = true;
+  read_pos = 0;
+  ASSERT_SUCC(restored.deserialize_params_from_message(1002, legacy_buf, legacy_pos, read_pos));
+  ASSERT_EQ(legacy_pos, read_pos);
+  ASSERT_FALSE(restored.schema_only_);
+  ASSERT_EQ(123456, restored.fork_snapshot_version_);
+  ASSERT_EQ(4, restored.child_task_total_cnt_);
+}
+
+// Keep a transaction logically started without a real connection. Capture the
+// SQL side effect so invalid snapshots cannot silently delete or skip data snapshots.
+class ForkSnapshotReleaseTransaction : public ObMySQLTransaction
+{
+public:
+  bool is_started() const override { return started_; }
+  int write(const uint64_t tenant_id, const char *sql, int64_t &affected_rows) override
+  {
+    ++write_count_;
+    write_tenant_id_ = tenant_id;
+    affected_rows = 1;
+    const int ret = sql_.assign(sql);
+    return OB_SUCCESS == ret ? write_ret_ : ret;
+  }
+
+  bool started_ = true;
+  int64_t write_count_ = 0;
+  uint64_t write_tenant_id_ = OB_INVALID_TENANT_ID;
+  int write_ret_ = OB_SUCCESS;
+  ObSqlString sql_;
+};
+
+TEST_F(TestForkTableTask, fork_database_snapshot_release_rejects_invalid_arguments)
+{
+  ObDDLService ddl_service;
+  ForkSnapshotReleaseTransaction trans;
+  ASSERT_EQ(OB_INVALID_ARGUMENT,
+            ddl_service.fork_db_release_snapshot_(1002, 600001, 0, trans));
+  ASSERT_EQ(OB_INVALID_ARGUMENT,
+            ddl_service.fork_db_release_snapshot_(1002, 600001, -1, trans));
+  ASSERT_EQ(0, trans.write_count_);
+  trans.started_ = false;
+  ASSERT_EQ(OB_INVALID_ARGUMENT,
+            ddl_service.fork_db_release_snapshot_(1002, 600001, 123456, trans));
+  ASSERT_EQ(0, trans.write_count_);
+}
+
+TEST_F(TestForkTableTask, fork_database_snapshot_release_sql_and_error)
+{
+  ObDDLService ddl_service;
+  ForkSnapshotReleaseTransaction trans;
+  ASSERT_SUCC(ddl_service.fork_db_release_snapshot_(1002, 600001, 123456, trans));
+  ASSERT_EQ(1, trans.write_count_);
+  ASSERT_EQ(1002, trans.write_tenant_id_);
+  ASSERT_NE(nullptr, STRSTR(trans.sql_.ptr(), "DELETE"));
+  ASSERT_NE(nullptr, STRSTR(trans.sql_.ptr(), "__all_acquired_snapshot"));
+  ASSERT_NE(nullptr, STRSTR(trans.sql_.ptr(), "schema_version = 600001"));
+  ASSERT_NE(nullptr, STRSTR(trans.sql_.ptr(), "tablet_id IN ( 0)"));
+  SCN snapshot_scn;
+  ObSqlString snapshot_filter;
+  ASSERT_SUCC(snapshot_scn.convert_for_tx(123456));
+  ASSERT_SUCC(snapshot_filter.append_fmt("snapshot_scn = %lu",
+                                        snapshot_scn.get_val_for_inner_table_field()));
+  ASSERT_NE(nullptr, STRSTR(trans.sql_.ptr(), snapshot_filter.ptr()));
+
+  trans.write_ret_ = OB_TIMEOUT;
+  ASSERT_EQ(OB_TIMEOUT,
+            ddl_service.fork_db_release_snapshot_(1002, 600001, 123456, trans));
+  ASSERT_EQ(2, trans.write_count_);
+}
+
+TEST_F(TestForkTableTask, fork_database_rejects_invalid_snapshot_mode)
+{
+  // No schema service is initialized: validation must precede schema or SQL access.
+  ObDDLService ddl_service;
+  const int64_t deadline_us = ObTimeUtility::current_time() + 1000000;
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ddl_service.cleanup_incomplete_fork_database(
+      1002, 600002, 600001, 0, false, OB_RS_NOT_MASTER, deadline_us));
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ddl_service.cleanup_incomplete_fork_database(
+      1002, 600002, 600001, 123456, true, OB_RS_NOT_MASTER, deadline_us));
+
+  obrpc::ObForkDatabaseArg arg;
+  share::schema::ObDatabaseSchema dst_db_schema;
+  ObDDLTaskRecord task_record;
+  bool finalizer_committed = false;
+  bool finalizer_state_uncertain = false;
+  arg.tenant_id_ = 1002;
+  task_record.task_id_ = 600001;
+  task_record.snapshot_version_ = 0;
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ddl_service.fork_db_commit_finalizer_(
+      arg, dst_db_schema, task_record, finalizer_committed, finalizer_state_uncertain));
+  arg.schema_only_ = true;
+  task_record.snapshot_version_ = 123456;
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ddl_service.fork_db_commit_finalizer_(
+      arg, dst_db_schema, task_record, finalizer_committed, finalizer_state_uncertain));
+  ASSERT_FALSE(finalizer_committed);
+  ASSERT_FALSE(finalizer_state_uncertain);
 }
 
 // 父任务进度判定：剩余子任务数归零才结束；首个非 SUCCESS 子任务码决定终态。

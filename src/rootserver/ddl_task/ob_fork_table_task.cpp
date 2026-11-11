@@ -950,10 +950,12 @@ ObForkDatabaseTask::ObForkDatabaseTask()
   : ObDDLTask(DDL_FORK_DATABASE),
     src_database_id_(OB_INVALID_ID),
     dst_database_id_(OB_INVALID_ID),
+    fork_snapshot_version_(0),
     child_task_total_cnt_(0),
     child_task_unfinished_cnt_(0),
     last_child_cnt_sync_ts_(0),
     child_tasks_woken_(false),
+    schema_only_(false),
     ddl_service_(nullptr)
 {
 }
@@ -995,14 +997,14 @@ int ObForkDatabaseTask::init(const ObCreateDDLTaskParam &param)
     // PREPARE 是多事务准备阶段的持久化标记。finalizer 在发布目标数据库的同一事务中，
     // 将其修改为 WAIT_CHILD_TASK_FINISH。
     task_status_ = ObDDLTaskStatus::PREPARE;
+    schema_only_ = fork_db_arg->schema_only_;
     task_version_ = OB_FORK_DATABASE_TASK_VERSION;
     data_format_version_ = param.tenant_data_version_;
-    if (OB_UNLIKELY(param.new_snapshot_version_ <= 0)) {
+    const bool invalid_snapshot_version = schema_only_ ? 0 != param.new_snapshot_version_ : param.new_snapshot_version_ <= 0;
+    const bool invalid_total_cnt = schema_only_ ? 0 != param.fork_progress_total_cnt_ : param.fork_progress_total_cnt_ <= 0;
+    if (invalid_snapshot_version || invalid_total_cnt) {
       ret = OB_INVALID_ARGUMENT;
-      LOG_WARN("[ForkTable] invalid fork snapshot version", KR(ret), K(param));
-    } else if (OB_UNLIKELY(param.fork_progress_total_cnt_ <= 0)) {
-      ret = OB_INVALID_ARGUMENT;
-      LOG_WARN("[ForkTable] invalid fork database child task total cnt", KR(ret), K(param));
+      LOG_WARN("[ForkTable] invalid fork params", KR(ret), K(param));
     } else if (FALSE_IT(fork_snapshot_version_ = param.new_snapshot_version_)) {
     } else if (FALSE_IT(snapshot_version_ = fork_snapshot_version_)) {
     } else if (FALSE_IT(child_task_total_cnt_ = param.fork_progress_total_cnt_)) {
@@ -1058,7 +1060,9 @@ int ObForkDatabaseTask::init(const ObDDLTaskRecord &task_record)
       child_task_total_cnt_ = 0;
     }
     if (OB_FAIL(ret)) {
-    } else if (fork_snapshot_version_ <= 0) {
+    } else if (schema_only_
+               ? (0 != fork_snapshot_version_ || 0 != child_task_total_cnt_)
+               : (fork_snapshot_version_ <= 0 || child_task_total_cnt_ <= 0)) {
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("[ForkTable] invalid fork snapshot version after recovery", KR(ret), K(task_record));
     } else if (snapshot_version_ != fork_snapshot_version_) {
@@ -1136,7 +1140,8 @@ int ObForkDatabaseTask::abort_incomplete_prepare_()
   } else {
     const int64_t cleanup_deadline_us = ObTimeUtility::current_time() + GCONF._ob_ddl_timeout;
     if (OB_FAIL(ddl_service_->cleanup_incomplete_fork_database(
-            tenant_id_, dst_database_id_, task_id_, fork_snapshot_version_, OB_RS_NOT_MASTER, cleanup_deadline_us))) {
+            tenant_id_, dst_database_id_, task_id_, fork_snapshot_version_, schema_only_,
+            OB_RS_NOT_MASTER, cleanup_deadline_us))) {
       LOG_WARN("[ForkTable] compensate incomplete prepare failed", KR(ret),
                K(tenant_id_), K(task_id_), K(dst_database_id_), K(fork_snapshot_version_));
       if (OB_STATE_NOT_MATCH == ret) {
@@ -1348,7 +1353,7 @@ int ObForkDatabaseTask::serialize_params_to_message(char *buf, const int64_t buf
     LOG_WARN("[ForkTable] ObDDLTask serialize failed", KR(ret));
   } else {
     LST_DO_CODE(OB_UNIS_ENCODE, src_database_id_, dst_database_id_, child_task_total_cnt_,
-                fork_snapshot_version_);
+                fork_snapshot_version_, schema_only_);
   }
   return ret;
 }
@@ -1365,9 +1370,11 @@ int ObForkDatabaseTask::deserialize_params_from_message(const uint64_t tenant_id
   } else if (OB_FAIL(ObDDLTask::deserialize_params_from_message(tenant_id, buf, data_len, pos))) {
     LOG_WARN("[ForkTable] ObDDLTask deserialize failed", KR(ret));
   } else {
+    schema_only_ = false;
     LST_DO_CODE(OB_UNIS_DECODE, src_database_id_, dst_database_id_, child_task_total_cnt_,
                 fork_snapshot_version_);
     if (OB_SUCC(ret)) {
+      OB_UNIS_DECODE(schema_only_);
       object_id_ = src_database_id_;
       target_object_id_ = dst_database_id_;
     }
@@ -1379,6 +1386,6 @@ int64_t ObForkDatabaseTask::get_serialize_param_size() const
 {
   int64_t len = ObDDLTask::get_serialize_param_size();
   LST_DO_CODE(OB_UNIS_ADD_LEN, src_database_id_, dst_database_id_, child_task_total_cnt_,
-              fork_snapshot_version_);
+              fork_snapshot_version_, schema_only_);
   return len;
 }

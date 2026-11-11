@@ -88,6 +88,8 @@ class ObCommitAlterTablegroupLocalityArg;
 class ObCommitAlterTableLocalityArg;
 class ObDDLSQLTransaction;
 class ObTableGroupHelp;
+class ObTableCreator;
+class ObNewTableTabletAllocator;
 //class ObFreezeInfoManager;
 class ObSnapshotInfoManager;
 struct ObTruncateInfoService;
@@ -735,7 +737,8 @@ int check_table_udt_id_is_exist(share::schema::ObSchemaGetterGuard &schema_guard
   // 此时全部 worker 输出仍然隐藏，因此可以安全重试清理，客户端也可以重新发起原始 FORK DATABASE。
   int cleanup_incomplete_fork_database(const uint64_t tenant_id, const uint64_t dst_database_id,
                                        const int64_t parent_task_id, const int64_t fork_snapshot_version,
-                                       const int worker_ret, const int64_t cleanup_deadline_us);
+                                       const bool schema_only, const int worker_ret,
+                                       const int64_t cleanup_deadline_us);
   // 创建该任务的 RS 请求仍在执行时，周期 DDL 恢复扫描也能看到 PREPARE 记录。
   // 该进程内标记只提供存活提示：RS 切主或重启后标记消失，恢复流程会补偿持久化的隐藏 PREPARE 记录。
   bool is_fork_database_prepare_active(const uint64_t tenant_id, const int64_t parent_task_id) const;
@@ -3004,7 +3007,27 @@ private:
       common::ObArenaAllocator &allocator,
       common::ObIArray<share::schema::ObTableSchema> &dst_table_schemas,
       const int64_t fork_snapshot_version,
-      share::ObForkTablePrepareResult &prepare_result);
+      share::ObForkTablePrepareResult &prepare_result,
+      const bool schema_only);
+
+  int fork_table_persist_schemas_(const uint64_t tenant_id,
+      common::ObIArray<share::schema::ObTableSchema> &dst_table_schemas,
+      const common::ObString &ddl_stmt_str, common::ObMySQLTransaction &trans);
+
+  // 只 fork db 的 schema，不 fork 数据
+  int fork_db_create_empty_table_(const uint64_t tenant_id,
+      common::ObIArray<share::schema::ObTableSchema> &dst_table_schemas,
+      const common::ObString &ddl_stmt_str, share::schema::ObSchemaGetterGuard &schema_guard,
+      common::ObMySQLTransaction &trans);
+
+  int fork_db_create_empty_tablets_(const uint64_t tenant_id, const uint64_t tenant_data_version,
+      const common::ObIArray<share::schema::ObTableSchema> &dst_table_schemas,
+      share::schema::ObSchemaGetterGuard &schema_guard, common::ObMySQLTransaction &trans);
+
+  int fork_db_add_empty_tablet_args_(const uint64_t tenant_data_version,
+      const common::ObIArray<share::schema::ObTableSchema> &dst_table_schemas,
+      const share::schema::ObTablegroupSchema *tablegroup_schema, common::ObMySQLTransaction &trans,
+      ObNewTableTabletAllocator &tablet_allocator, ObTableCreator &table_creator);
 
   // 统计持久化一个预构造 ForkTable Schema 计划时执行的每次 gen_new_schema_version()。
   // range 在预留完整版本块前，还会为 OB_DDL_END_SIGN 边界额外增加一个版本。
@@ -3219,6 +3242,7 @@ private:
                                          common::ObArray<ForkDatabaseCleanupChild> &children);
   int fork_db_cleanup_drop_database_(const uint64_t tenant_id, const uint64_t dst_database_id,
                                      const int64_t parent_task_id, const int64_t fork_snapshot_version,
+                                     const bool schema_only,
                                      const common::ObIArray<ForkDatabaseCleanupChild> &children);
 
   int register_fork_database_prepare_(const uint64_t tenant_id, const int64_t parent_task_id);

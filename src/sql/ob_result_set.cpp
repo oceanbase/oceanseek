@@ -739,7 +739,10 @@ int ObResultSet::set_mysql_info()
 OB_INLINE void ObResultSet::store_affected_rows(ObPhysicalPlanCtx &plan_ctx)
 {
   int64_t affected_row = 0;
-  if (!ObStmt::is_dml_stmt(get_stmt_type())
+  if (stmt::T_MERGE_TABLE == get_stmt_type()) {
+    // MERGE TABLE is a command whose inner INSERT supplies its affected rows.
+    affected_row = get_affected_rows();
+  } else if (!ObStmt::is_dml_stmt(get_stmt_type())
       && (lib::is_oracle_mode() || !is_pl_stmt(get_stmt_type()))) {
     affected_row = 0;
   } else if (stmt::T_SELECT == get_stmt_type()) {

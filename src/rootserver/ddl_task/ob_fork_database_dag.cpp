@@ -25,7 +25,7 @@ namespace rootserver
 {
 
 // ForkDB prepare 是 RS 本地的控制面 DAG。每个 worker 创建一个 range task，
-// 每个 task 使用独立的 DDL 事务执行对应 range。调用方会同步等待 DAG 完成后再执行 finalizer 事务，
+// 每个 task 将对应 range 拆成有界批次，每批使用独立的 DDL 事务。调用方等待 DAG 完成后再执行 finalizer 事务，
 // 因此该上下文只在本进程内使用。
 ObForkDatabaseLocalDagContext::ObForkDatabaseLocalDagContext()
     : result_ret_(OB_SUCCESS), finished_table_count_(0), dag_finished_(false),
@@ -121,7 +121,7 @@ bool ObForkDatabasePrepareDagParam::is_valid() const
 {
   return OB_NOT_NULL(ddl_service_) && OB_NOT_NULL(arg_) && arg_->is_valid() && OB_NOT_NULL(dst_db_schema_)
          && dst_db_schema_->is_valid() && OB_NOT_NULL(src_table_ids_) && !src_table_ids_->empty() && worker_count_ > 0
-         && worker_count_ <= src_table_ids_->count() && fork_snapshot_version_ > 0 && parent_task_id_ > 0
+         && worker_count_ <= src_table_ids_->count() && (arg_->schema_only_ ? 0 == fork_snapshot_version_ : fork_snapshot_version_ > 0) && parent_task_id_ > 0
          && base_tenant_schema_version_ > 0 && base_sys_schema_version_ > 0 && fork_deadline_us_ > 0
          && ctx_handle_.is_valid();
 }
@@ -141,7 +141,7 @@ int ObForkDatabasePrepareRangeTask::init(
 {
   int ret = OB_SUCCESS;
   if (range_begin < 0 || range_end <= range_begin || range_end > src_table_ids.count()
-      || fork_snapshot_version <= 0 || parent_task_id <= 0) {
+      || (arg.schema_only_ ? fork_snapshot_version != 0 : fork_snapshot_version <= 0) || parent_task_id <= 0) {
     ret = OB_INVALID_ARGUMENT;
   } else {
     dag_ = &dag;
@@ -189,11 +189,20 @@ int ObForkDatabasePrepareRangeTask::process()
         }
       }
     }
-    if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(ddl_service_->fork_db_run_parallel_range_(
-                   *arg_, *dst_db_schema_, *src_table_ids_, range_begin_, range_end_,
-                   fork_snapshot_version_, parent_task_id_, *dag_, processed_table_count))) {
-      LOG_WARN("[ForkTable] process fork database range failed", KR(ret));
+    // 调度 range 与事务批大小解耦：保留 worker 并发度，每批独立提交并释放 Schema 计划。
+    // 限制的是源表数量；索引、LOB 等附属 Schema 仍与宿主表在同一批次内处理。
+    const int64_t max_batch_table_count = 512;
+    for (int64_t batch_begin = range_begin_; OB_SUCC(ret) && batch_begin < range_end_;) {
+      const int64_t batch_end = batch_begin + MIN(max_batch_table_count, range_end_ - batch_begin);
+      int64_t batch_table_count = 0;
+      if (OB_FAIL(ddl_service_->fork_db_run_parallel_range_(*arg_, *dst_db_schema_, *src_table_ids_,
+                      batch_begin, batch_end, fork_snapshot_version_, parent_task_id_, *dag_, batch_table_count))) {
+        LOG_WARN("[ForkTable] process fork database batch failed", KR(ret), K(batch_begin), K(batch_end));
+      }
+      processed_table_count += batch_table_count;
+      LOG_INFO("[ForkTable] range batch finished", KR(ret), K(batch_begin), K(batch_end), K(batch_table_count),
+               K_(range_begin), K_(range_end), "parent_task_id", parent_task_id_);
+      batch_begin = batch_end;
     }
     dag_->finish_tables(ret, processed_table_count);
     LOG_INFO("[ForkTable] range task finished", KR(ret), K_(range_begin), K_(range_end), K(processed_table_count),

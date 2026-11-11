@@ -342,6 +342,7 @@
 #include "ob_expr_extract_cert_expired_time.h"
 #include "ob_expr_transaction_id.h"
 #include "ob_expr_inner_row_cmp_val.h"
+#include "ob_expr_merge_table.h"
 #include "ob_expr_last_refresh_scn.h"
 #include "ob_expr_sql_udt_construct.h"
 #include "ob_expr_priv_attribute_access.h"
@@ -1535,6 +1536,9 @@ ObExprRandCanonical::calc_random_expr_canonical,                    /* 890 */
   NULL, // ObExprDslParamValue::eval_value,                            /* 931 */
   ObExprHybridUniqueShardDoc::eval_unique_shard_doc,                  /* 932 */
   ObExprHybridSearchSortValues::eval_sort_values,                     /* 933 */
+  ObExprMergeValueEqual::eval_merge_value_equal,                      /* 934 */
+  ObExprMergeConflictCheck::eval_merge_conflict_check,                /* 935 */
+  ObExprMergeUniqueCheck::eval_merge_unique_check,                    /* 936 */
 };
 static ObExpr::EvalBatchFunc g_expr_eval_batch_functions[] = {
   expr_default_eval_batch_func,                                       /* 0 */

@@ -2097,6 +2097,7 @@ int ObForkDatabaseArg::assign(const ObForkDatabaseArg &other)
     dst_database_name_ = other.dst_database_name_;
     session_id_ = other.session_id_;
     copy_grants_ = other.copy_grants_;
+    schema_only_ = other.schema_only_;
   }
   return ret;
 }
@@ -2116,17 +2117,20 @@ DEF_TO_STRING(ObForkDatabaseArg)
        K_(src_database_name),
        K_(dst_database_name),
        K_(session_id),
-       K_(copy_grants));
+       K_(copy_grants),
+       K_(schema_only));
   J_OBJ_END();
   return pos;
 }
 
+// Preserve the v1 prefix, including COPY GRANTS, and append the optional mode.
 OB_SERIALIZE_MEMBER((ObForkDatabaseArg, ObDDLArg),
                     tenant_id_,
                     src_database_name_,
                     dst_database_name_,
                     session_id_,
-                    copy_grants_);
+                    copy_grants_,
+                    schema_only_);
 
 int ObSetCommentArg::assign(const ObSetCommentArg &other)
 {

@@ -408,6 +408,7 @@
 #include "sql/engine/expr/ob_expr_extract_cert_expired_time.h"
 #include "sql/engine/expr/ob_expr_transaction_id.h"
 #include "sql/engine/expr/ob_expr_inner_row_cmp_val.h"
+#include "sql/engine/expr/ob_expr_merge_table.h"
 #include "sql/engine/expr/ob_expr_last_refresh_scn.h"
 #include "sql/engine/expr/ob_expr_priv_st_makeenvelope.h"
 #include "sql/engine/expr/ob_expr_priv_st_clipbybox2d.h"
@@ -1400,6 +1401,9 @@ void ObExprOperatorFactory::register_expr_operators()
     REG_OP(ObExprDslMultiValueRange, SHORT_CIRCUIT_EVALUATION);
     REG_OP(ObExprHybridUniqueShardDoc, SHORT_CIRCUIT_EVALUATION);
     REG_OP(ObExprHybridSearchSortValues, SHORT_CIRCUIT_EVALUATION);
+    REG_OP(ObExprMergeValueEqual, SHORT_CIRCUIT_EVALUATION);
+    REG_OP(ObExprMergeConflictCheck, SHORT_CIRCUIT_EVALUATION);
+    REG_OP(ObExprMergeUniqueCheck, SHORT_CIRCUIT_EVALUATION);
   }();
 // 注册oracle系统函数
   REG_OP_ORCL(ObExprSysConnectByPath, EAGER_EVALUATION);

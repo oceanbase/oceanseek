@@ -15,6 +15,7 @@
 #include "sql/resolver/prepare/ob_execute_resolver.h"
 #include "sql/resolver/prepare/ob_deallocate_resolver.h"
 #include "sql/resolver/cmd/ob_bootstrap_resolver.h"
+#include "sql/resolver/cmd/ob_merge_table_resolver.h"
 #include "sql/resolver/ddl/ob_create_table_resolver.h"
 #include "sql/resolver/ddl/ob_create_func_resolver.h"
 #include "sql/resolver/ddl/ob_drop_func_resolver.h"
@@ -395,6 +396,10 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
       }
       case T_FORK_DATABASE: {
         REGISTER_STMT_RESOLVER(ForkDatabase);
+        break;
+      }
+      case T_MERGE_TABLE: {
+        REGISTER_STMT_RESOLVER(MergeTable);
         break;
       }
       case T_SELECT: {

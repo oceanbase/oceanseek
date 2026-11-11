@@ -2793,15 +2793,21 @@ int ObRawExprDeduceType::visit(ObSysFunRawExpr &expr)
       }
     }
     if (OB_SUCC(ret) && ob_is_enumset_tc(expr.get_data_type())
-        && (T_FUN_SYS_NULLIF == expr.get_expr_type() || T_FUN_SYS_VALUES == expr.get_expr_type() )) {
-      ObRawExpr *first_param = NULL;
-      if (OB_ISNULL(first_param = expr.get_param_expr(0))
-          || !(ob_is_enumset_tc(first_param->get_data_type()))) {
+        && (T_FUN_SYS_NULLIF == expr.get_expr_type()
+            || T_FUN_SYS_VALUES == expr.get_expr_type()
+            || T_FUN_SYS_MERGE_UNIQUE_CHECK == expr.get_expr_type())) {
+      // Type deduction normalizes ENUM/SET metadata in the parameter copies.
+      // Restore it from the original value expression for identity results.
+      const int64_t value_idx = T_FUN_SYS_MERGE_UNIQUE_CHECK == expr.get_expr_type() ? 1 : 0;
+      ObRawExpr *value_param = NULL;
+      if (OB_UNLIKELY(value_idx >= expr.get_param_count())
+          || OB_ISNULL(value_param = expr.get_param_expr(value_idx))
+          || !ob_is_enumset_tc(value_param->get_data_type())) {
         ret = OB_INVALID_ARGUMENT;
-        LOG_WARN("invalid expr", KPC(first_param), K(expr), K(ret));
-      } else if (first_param->is_enum_set_with_subschema()) {
-        expr.set_subschema_id(first_param->get_subschema_id());
-        expr.mark_enum_set_with_subschema(first_param->get_enum_set_subschema_state());
+        LOG_WARN("invalid expr", KPC(value_param), K(expr), K(ret));
+      } else if (value_param->is_enum_set_with_subschema()) {
+        expr.set_subschema_id(value_param->get_subschema_id());
+        expr.mark_enum_set_with_subschema(value_param->get_enum_set_subschema_state());
       }
     }
     CK(OB_NOT_NULL(my_session_));

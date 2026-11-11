@@ -414,6 +414,7 @@ OB_STMT_TYPE_DEF(T_FORK_DATABASE, get_fork_database_stmt_need_privs, 413, ACTION
 
 OB_STMT_TYPE_DEF_UNKNOWN_AT(T_REFRESH_FULLTEXT_DICT, get_sys_tenant_alter_system_priv, 414)
 OB_STMT_TYPE_DEF_UNKNOWN_AT(T_SYNC_CATALOG, get_sync_catalog_stmt_need_privs, 415)
+OB_STMT_TYPE_DEF_UNKNOWN_AT(T_MERGE_TABLE, get_merge_table_stmt_need_privs, 416)
 OB_STMT_TYPE_DEF_UNKNOWN_AT(T_MAX, err_stmt_type_priv, 500)
 #endif
 

@@ -189,6 +189,7 @@ public:
            stmt_type == stmt::T_REPLACE ||
            stmt_type == stmt::T_DELETE ||
            stmt_type == stmt::T_UPDATE ||
+           stmt_type == stmt::T_MERGE_TABLE ||
            is_ddl_stmt(stmt_type, has_global_variable);
   }
 

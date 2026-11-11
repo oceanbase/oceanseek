@@ -2458,6 +2458,7 @@ stmt::StmtType ObResolverUtils::get_stmt_type_by_item_type(const ObItemType item
       SET_STMT_TYPE(T_CREATE_TABLE_LIKE);
       SET_STMT_TYPE(T_FORK_TABLE);
       SET_STMT_TYPE(T_FORK_DATABASE);
+      SET_STMT_TYPE(T_MERGE_TABLE);
       SET_STMT_TYPE(T_ALTER_TABLE);
       SET_STMT_TYPE(T_OPTIMIZE_TABLE);
       SET_STMT_TYPE(T_OPTIMIZE_TENANT);

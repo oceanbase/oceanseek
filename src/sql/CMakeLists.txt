@@ -378,6 +378,7 @@ ob_set_subtarget(ob_sql engine_cmd
   engine/cmd/ob_load_data_utils.cpp
   engine/cmd/ob_location_executor.cpp
   engine/cmd/ob_location_utils_executor.cpp
+  engine/cmd/ob_merge_table_executor.cpp
   engine/cmd/ob_lock_table_executor.cpp
   engine/cmd/ob_outline_executor.cpp
   engine/cmd/ob_package_executor.cpp
@@ -691,6 +692,7 @@ ob_set_subtarget(ob_sql engine_expr
   engine/expr/ob_expr_transaction_id.cpp
   engine/expr/ob_expr_ora_login_user.cpp
   engine/expr/ob_expr_inner_row_cmp_val.cpp
+  engine/expr/ob_expr_merge_table.cpp
   engine/expr/ob_expr_last_refresh_scn.cpp
   engine/expr/ob_expr_json_utils.cpp
   engine/expr/ob_expr_array.cpp
@@ -1523,6 +1525,7 @@ ob_set_subtarget(ob_sql resolver_cmd
   resolver/cmd/ob_load_data_resolver.cpp
   resolver/cmd/ob_load_data_stmt.cpp
   resolver/cmd/ob_location_utils_resolver.cpp
+  resolver/cmd/ob_merge_table_resolver.cpp
   resolver/cmd/ob_resource_resolver.cpp
   resolver/cmd/ob_routine_load_resolver.cpp
   resolver/cmd/ob_set_names_resolver.cpp

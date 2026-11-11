@@ -37,7 +37,7 @@ static int check_fork_min_data_version(const uint64_t tenant_id)
     min_data_version = DATA_VERSION_4_6_2_0;
   }
 #endif
-  if (OB_SUCC(ret) && min_data_version < DATA_VERSION_4_6_3_0) {
+  if (OB_SUCC(ret) && min_data_version < DATA_VERSION_4_6_3_1) {
     ret = OB_NOT_SUPPORTED;
     SQL_RESV_LOG(WARN, "fork is not supported during upgrade", KR(ret), K(tenant_id), K(min_data_version));
   }
@@ -130,7 +130,7 @@ int ObForkTableResolver::resolve(const ParseNode &parse_tree)
         SQL_RESV_LOG(WARN, "failed to deep copy src table name", K(ret));
       } else {
         fork_table_arg.need_lock_src_table_ = OB_NOT_NULL(read_lock_node);
-        fork_table_arg.copy_grants_ = OB_NOT_NULL(copy_grants_node);
+        fork_table_arg.copy_grants_ = OB_NOT_NULL(copy_grants_node) && 0 != copy_grants_node->value_;
       }
     }
   }
@@ -178,6 +178,8 @@ int ObForkDatabaseResolver::resolve(const ParseNode &parse_tree)
     stmt_ = fork_database_stmt;
     obrpc::ObForkDatabaseArg &fork_database_arg = fork_database_stmt->get_fork_database_arg();
     fork_database_arg.tenant_id_ = session_info_->get_effective_tenant_id();
+    ParseNode *schema_only_node = parse_tree.children_[SCHEMA_ONLY_NODE];
+    fork_database_arg.schema_only_ = OB_NOT_NULL(schema_only_node) && 0 != schema_only_node->value_;
   }
 
   if (OB_SUCC(ret)) {
@@ -228,7 +230,7 @@ int ObForkDatabaseResolver::resolve(const ParseNode &parse_tree)
           } else if (OB_FAIL(deep_copy_str(src_database_name, fork_database_arg.src_database_name_))) {
             SQL_RESV_LOG(WARN, "failed to deep copy src database name", K(ret));
           } else {
-            fork_database_arg.copy_grants_ = OB_NOT_NULL(copy_grants_node);
+            fork_database_arg.copy_grants_ = OB_NOT_NULL(copy_grants_node) && 0 != copy_grants_node->value_;
           }
         }
       }

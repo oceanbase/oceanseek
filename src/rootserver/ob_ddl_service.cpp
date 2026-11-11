@@ -42228,7 +42228,7 @@ int ObDDLService::fork_table_(
     LOG_WARN("[ForkTable] empty prebuilt schema plan", KR(ret), "dst_schema_count", dst_table_schemas.count(),
              "build_info_count", prepare_result.table_build_infos_.count());
   } else if (!use_prebuilt_plan && OB_FAIL(fork_table_build_table_schema_(arg, src_table_schema, dst_db_schema, schema_guard, allocator,
-                                                  dst_table_schemas, fork_snapshot_version, prepare_result))) {
+                                        dst_table_schemas, fork_snapshot_version, prepare_result, false /*schema_only*/))) {
     LOG_WARN("[ForkTable] build dst table schema failed", KR(ret), K(arg));
   } else if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id, prepare_result.data_format_version_))) {
     LOG_WARN("[ForkTable] get min data version failed", KR(ret), K(tenant_id));
@@ -42561,7 +42561,7 @@ int ObDDLService::fork_db_build_range_schema_plans_(
       LOG_WARN("[ForkTable] build table argument for schema plan failed", KR(ret), K(src_table_id), K(table_idx));
     } else if (OB_FAIL(fork_table_build_table_schema_(table_arg, *src_table_schema, dst_db_schema, schema_guard,
                        allocator, table_plan.dst_table_schemas_, fork_snapshot_version,
-                       table_plan.prepare_result_))) {
+                       table_plan.prepare_result_, arg.schema_only_))) {
       LOG_WARN("[ForkTable] build table schema plan failed", KR(ret), K(src_table_id), K(table_idx));
     } else if (OB_FAIL(fork_table_calc_schema_version_count_(table_plan.dst_table_schemas_, schema_guard,
                                                              table_schema_version_count))) {
@@ -42673,7 +42673,7 @@ int ObDDLService::fork_db_run_parallel_range_(const obrpc::ObForkDatabaseArg &ar
   ObDDLSQLTransaction worker_trans(schema_service_, false /*不需要结束标记*/, false /*不启用查询暂存*/, true /*启用 DDL 并行*/);
   bool controller_task_registered = false;
   bool old_batch_generate_schema_version = ob_batch_generate_schema_version();
-  // 一个 range 对应一个 worker 事务；range 之间并行，range 内的表顺序执行并一次提交。
+  // 本 range 是有界事务批次，批内的表顺序执行并一次提交；同一调度 range 内串行处理各批次，调度 range 之间并行。
   // 外层 prepare fence 已持有租户级锁，因此 worker 事务跳过重复获取租户 DDL 锁。
   worker_trans.set_skip_tenant_ddl_lock(true);
   // 开启后，本 range 创建 Schema 时从 Controller 为当前线程预留的版本区间依次取值，
@@ -42684,7 +42684,8 @@ int ObDDLService::fork_db_run_parallel_range_(const obrpc::ObForkDatabaseArg &ar
   // 阶段 1：预构建本 range 的全部目标 Schema，并精确计算和预留本事务需要的 Schema version。
   // Controller 同时登记版本区间和提交次序，避免并发事务的 Schema version 区间交叉。
   if (!arg.is_valid() || !dst_db_schema.is_valid() || range_begin < 0 || range_end <= range_begin
-      || range_end > src_table_ids.count() || fork_snapshot_version <= 0 || parent_task_id <= 0) {
+      || range_end > src_table_ids.count()
+      || (arg.schema_only_ ? fork_snapshot_version != 0 : fork_snapshot_version <= 0) || parent_task_id <= 0) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("[ForkTable] invalid worker range argument", KR(ret), K(range_begin), K(range_end), "table_count",
              src_table_ids.count(), K(fork_snapshot_version), K(parent_task_id));
@@ -42742,11 +42743,7 @@ int ObDDLService::fork_db_run_parallel_range_(const obrpc::ObForkDatabaseArg &ar
     }
   }
   // 阶段 3：range 内复用预构建的 Schema 计划逐表执行，所有表的元数据最终由同一个事务提交。
-  ObDDLTaskRecord table_task_record;
-  obrpc::ObForkTableArg table_arg;
   for (int64_t table_idx = range_begin; OB_SUCC(ret) && table_idx < range_end; ++table_idx) {
-    table_task_record.reset();
-    table_arg.reset();
     const uint64_t src_table_id = src_table_ids.at(table_idx);
     const ObTableSchema *src_table_schema = nullptr;
     ForkDatabaseTableSchemaPlan &table_plan = table_schema_plans.at(table_idx - range_begin);
@@ -42758,14 +42755,25 @@ int ObDDLService::fork_db_run_parallel_range_(const obrpc::ObForkDatabaseArg &ar
     } else if (OB_ISNULL(src_table_schema)) {
       ret = OB_TABLE_NOT_EXIST;
       LOG_WARN("[ForkTable] source table disappeared", KR(ret), K(src_table_id), K(table_idx));
-    } else if (OB_FAIL(build_fork_database_table_arg_(arg, *src_table_schema, table_arg))) {
-      LOG_WARN("[ForkTable] build table argument for range failed", KR(ret), K(src_table_id), K(table_idx));
-    } else if (OB_FAIL(fork_table_(table_arg, *src_table_schema, fork_snapshot_version, dst_db_schema,
-                                  worker_schema_guard, worker_trans, worker_allocator, parent_task_id,
-                                  table_task_record, &table_plan))) {
-      LOG_WARN("[ForkTable] range table fork prepare failed", KR(ret), K(table_idx), K(src_table_id), K(range_begin),
-               K(range_end));
+    } else if (arg.schema_only_) {
+      if (OB_FAIL(fork_db_create_empty_table_(arg.tenant_id_, table_plan.dst_table_schemas_,
+                      arg.ddl_stmt_str_, worker_schema_guard, worker_trans))) {
+        LOG_WARN("[ForkTable] range empty table creation failed", KR(ret), K(table_idx), K(src_table_id),
+                 K(range_begin), K(range_end));
+      }
     } else {
+      obrpc::ObForkTableArg table_arg;
+      ObDDLTaskRecord table_task_record;
+      if (OB_FAIL(build_fork_database_table_arg_(arg, *src_table_schema, table_arg))) {
+        LOG_WARN("[ForkTable] build table argument for range failed", KR(ret), K(src_table_id), K(table_idx));
+      } else if (OB_FAIL(fork_table_(table_arg, *src_table_schema, fork_snapshot_version, dst_db_schema,
+                         worker_schema_guard, worker_trans, worker_allocator, parent_task_id,
+                         table_task_record, &table_plan))) {
+        LOG_WARN("[ForkTable] range table fork prepare failed", KR(ret), K(table_idx), K(src_table_id),
+                 K(range_begin), K(range_end));
+      }
+    }
+    if (OB_SUCC(ret)) {
       ++processed_table_count;
     }
   }
@@ -43161,14 +43169,15 @@ int ObDDLService::fork_table_build_table_schema_(
     ObArenaAllocator &allocator,
     ObIArray<ObTableSchema> &dst_table_schemas,
     const int64_t fork_snapshot_version,
-    share::ObForkTablePrepareResult &prepare_result)
+    share::ObForkTablePrepareResult &prepare_result,
+    const bool schema_only)
 {
   int ret = OB_SUCCESS;
   ObSchemaService *schema_service = nullptr;
 
   dst_table_schemas.reset();
   prepare_result.reset();
-  if (OB_UNLIKELY(!arg.is_valid() || fork_snapshot_version <= 0)) {
+  if (OB_UNLIKELY(!arg.is_valid() || (schema_only ? fork_snapshot_version != 0 : fork_snapshot_version <= 0))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("[ForkTable] invalid argument", KR(ret), K(arg), K(fork_snapshot_version));
   } else if (OB_ISNULL(schema_service = schema_service_->get_schema_service())) {
@@ -43186,8 +43195,8 @@ int ObDDLService::fork_table_build_table_schema_(
   } else if (OB_UNLIKELY(dst_table_schemas.empty())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("[ForkTable] dst table schemas is empty after rebuild", KR(ret), K(arg));
-  } else if (OB_SUCC(ret) && OB_FAIL(fork_table_expand_tablet_pairs_(src_table_schema, dst_table_schemas,
-                        schema_guard, fork_snapshot_version, prepare_result))) {
+  } else if (!schema_only && OB_FAIL(fork_table_expand_tablet_pairs_(src_table_schema, dst_table_schemas,
+                                                              schema_guard, fork_snapshot_version, prepare_result))) {
     LOG_WARN("[ForkTable] expand tablet pairs failed", KR(ret), K(arg));
   }
 
@@ -43393,6 +43402,154 @@ int ObDDLService::fork_table_resolve_dst_schema_versions_(
   return ret;
 }
 
+// Both modes persist the same schema plan and consume the same reserved schema versions.
+int ObDDLService::fork_table_persist_schemas_(const uint64_t tenant_id,
+    ObIArray<ObTableSchema> &dst_table_schemas, const ObString &ddl_stmt_str, ObMySQLTransaction &trans)
+{
+  int ret = OB_SUCCESS;
+  ObDDLOperator ddl_operator(*schema_service_, *sql_proxy_);
+  int64_t last_schema_version = OB_INVALID_VERSION;
+  // 逐表持久化目标 schema：ddl 语句只挂在第一张表上，最后一次 create_table 才触发
+  // 本批次宿主数据表的 schema version 提升（与调用方预留的版本数严格对齐）。
+  for (int64_t i = 0; OB_SUCC(ret) && i < dst_table_schemas.count(); ++i) {
+    ObTableSchema &table_schema = dst_table_schemas.at(i);
+    // 全文索引表先加载并锁住词典表，防止并发的词典构建冲突。
+    if (OB_FAIL(ObFtsIndexBuilderUtil::try_load_and_lock_dictionary_tables(table_schema, trans))) {
+      LOG_WARN("[ForkTable] load and lock dictionary tables failed", KR(ret), K(table_schema));
+    } else if (OB_FAIL(ddl_operator.create_table(table_schema, trans,
+                   0 == i ? &ddl_stmt_str : nullptr, i == dst_table_schemas.count() - 1))) {
+      LOG_WARN("[ForkTable] create destination schema failed", KR(ret), K(table_schema));
+    // 写临时表信息，供 DDL 崩溃恢复/失败回滚时清理，语义与普通 CREATE TABLE 一致。
+    } else if (OB_FAIL(ddl_operator.insert_temp_table_info(trans, table_schema))) {
+      LOG_WARN("[ForkTable] insert temp table info failed", KR(ret), K(table_schema));
+    }
+  }
+  // 所有表建完后取定稿的 schema version，作为这批 tablet 的原始 schema 版本。
+  if (OB_SUCC(ret) && OB_FAIL(get_last_schema_version(last_schema_version))) {
+    LOG_WARN("[ForkTable] get last schema version failed", KR(ret), K(tenant_id));
+  }
+  // 为有 tablet 的表记录创建时的原始 schema version，供 schema 历史 GC / 闪回判断版本可见性。
+  for (int64_t i = 0; OB_SUCC(ret) && i < dst_table_schemas.count(); ++i) {
+    const ObTableSchema &table_schema = dst_table_schemas.at(i);
+    if (table_schema.has_tablet() && OB_FAIL(ddl_operator.insert_ori_schema_version(trans, tenant_id,
+                                                     table_schema.get_table_id(), last_schema_version))) {
+      LOG_WARN("[ForkTable] insert original schema version failed", KR(ret), K(table_schema));
+    }
+  }
+  return ret;
+}
+
+// Create ordinary empty tablets. No source tablet pairing, snapshot, fork MDS or child task is needed.
+int ObDDLService::fork_db_create_empty_table_(const uint64_t tenant_id,
+    ObIArray<ObTableSchema> &dst_table_schemas, const ObString &ddl_stmt_str,
+    ObSchemaGetterGuard &schema_guard, ObMySQLTransaction &trans)
+{
+  int ret = OB_SUCCESS;
+  uint64_t tenant_data_version = 0;
+  if (OB_UNLIKELY(dst_table_schemas.empty() || !trans.is_started())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("[ForkTable] invalid schema-only table plan", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id, tenant_data_version))) {
+    LOG_WARN("[ForkTable] get tenant data version failed", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(fork_table_persist_schemas_(tenant_id, dst_table_schemas, ddl_stmt_str, trans))) {
+    LOG_WARN("[ForkTable] persist empty table schemas failed", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(fork_db_create_empty_tablets_(
+                 tenant_id, tenant_data_version, dst_table_schemas, schema_guard, trans))) {
+    LOG_WARN("[ForkTable] create empty table tablets failed", KR(ret), K(tenant_id));
+  }
+  return ret;
+}
+
+int ObDDLService::fork_db_add_empty_tablet_args_(const uint64_t tenant_data_version,
+    const ObIArray<ObTableSchema> &dst_table_schemas, const ObTablegroupSchema *tablegroup_schema,
+    ObMySQLTransaction &trans, ObNewTableTabletAllocator &tablet_allocator, ObTableCreator &table_creator)
+{
+  int ret = OB_SUCCESS;
+  const ObTableSchema &data_table = dst_table_schemas.at(0);
+  ObArray<const ObTableSchema *> schemas;
+  ObArray<bool> need_create_empty_majors;
+  ObArray<ObLSID> ls_ids;
+  // 数据表及本地存储索引共用 LS 放置；独立存储的全局索引按自身分区单独分配。
+  for (int64_t i = 0; OB_SUCC(ret) && i < dst_table_schemas.count(); ++i) {
+    const ObTableSchema &table_schema = dst_table_schemas.at(i);
+    if (!table_schema.has_tablet()) {
+    } else if (!table_schema.is_global_index_table()) {
+      if (OB_FAIL(schemas.push_back(&table_schema)) || OB_FAIL(need_create_empty_majors.push_back(true))) {
+        LOG_WARN("[ForkTable] collect empty table schema failed", KR(ret), K(table_schema));
+      }
+    } else if (OB_FAIL(tablet_allocator.prepare(trans, table_schema, tablegroup_schema))) {
+      LOG_WARN("[ForkTable] allocate global index tablets failed", KR(ret), K(table_schema));
+    } else if (OB_FAIL(tablet_allocator.get_ls_id_array(ls_ids))) {
+      LOG_WARN("[ForkTable] get global index ls ids failed", KR(ret));
+    } else if (OB_FAIL(table_creator.add_create_tablets_of_table_arg(
+                   table_schema, ls_ids, tenant_data_version, true /*empty major*/))) {
+      LOG_WARN("[ForkTable] add empty global index tablets failed", KR(ret), K(table_schema));
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(tablet_allocator.prepare(trans, data_table, tablegroup_schema))) {
+    LOG_WARN("[ForkTable] allocate empty data tablets failed", KR(ret), K(data_table));
+  } else if (OB_FAIL(tablet_allocator.get_ls_id_array(ls_ids))) {
+    LOG_WARN("[ForkTable] get empty data ls ids failed", KR(ret));
+  } else if (OB_FAIL(table_creator.add_create_tablets_of_tables_arg(
+                 schemas, ls_ids, tenant_data_version, need_create_empty_majors))) {
+    LOG_WARN("[ForkTable] add empty data tablets failed", KR(ret), K(data_table));
+  }
+  return ret;
+}
+
+int ObDDLService::fork_db_create_empty_tablets_(const uint64_t tenant_id,
+    const uint64_t tenant_data_version, const ObIArray<ObTableSchema> &dst_table_schemas,
+    ObSchemaGetterGuard &schema_guard, ObMySQLTransaction &trans)
+{
+  int ret = OB_SUCCESS;
+  SCN frozen_scn;
+  if (OB_FAIL(ObMajorFreezeHelper::get_frozen_scn(tenant_id, frozen_scn, &trans))) {
+    LOG_WARN("[ForkTable] get frozen scn for empty tablets failed", KR(ret), K(tenant_id));
+  } else {
+    const ObTableSchema &data_table = dst_table_schemas.at(0);
+    const ObTablegroupSchema *tablegroup_schema = nullptr;
+    ObTableCreator table_creator(tenant_id, frozen_scn, trans);
+    ObSchemaGetterGuard placement_schema_guard;
+    const bool in_tablegroup = OB_INVALID_ID != data_table.get_tablegroup_id();
+    // The prepare fence prevents concurrent tenant DDL. Tablegroup placement
+    // uses the normal latest guard; source schema plans still use the fixed guard.
+    ObSchemaGetterGuard &allocator_schema_guard = in_tablegroup ? placement_schema_guard : schema_guard;
+    // Match ordinary CREATE TABLE: placement statistics use a separate meta-tenant
+    // connection, while schema/tablet creation stays in the user-tenant DDL transaction.
+    ObNewTableTabletAllocator tablet_allocator(
+        tenant_id, allocator_schema_guard, sql_proxy_, true /*parallel DDL*/, &data_table);
+    if (OB_FAIL(table_creator.init(true /*need tablet count check*/))) {
+      LOG_WARN("[ForkTable] init empty table creator failed", KR(ret));
+    } else if (in_tablegroup
+               && OB_FAIL(schema_service_->get_tenant_schema_guard(tenant_id, placement_schema_guard))) {
+      LOG_WARN("[ForkTable] get tablegroup placement schema guard failed", KR(ret), K(tenant_id));
+    } else if (OB_FAIL(tablet_allocator.init())) {
+      LOG_WARN("[ForkTable] init empty tablet allocator failed", KR(ret));
+    } else if (in_tablegroup) {
+      if (OB_FAIL(schema_guard.get_tablegroup_schema(tenant_id, data_table.get_tablegroup_id(), tablegroup_schema))) {
+        LOG_WARN("[ForkTable] get tablegroup schema failed", KR(ret), K(data_table));
+      } else if (OB_ISNULL(tablegroup_schema)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("[ForkTable] tablegroup schema is null", KR(ret), K(data_table));
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(fork_db_add_empty_tablet_args_(
+                   tenant_data_version, dst_table_schemas, tablegroup_schema, trans, tablet_allocator, table_creator))) {
+      LOG_WARN("[ForkTable] add empty tablet creation arguments failed", KR(ret), K(data_table));
+    } else if (OB_FAIL(table_creator.execute())) {
+      LOG_WARN("[ForkTable] create empty tablets failed", KR(ret), K(data_table));
+    }
+    const int tmp_ret = tablet_allocator.finish(OB_SUCC(ret));
+    if (OB_SUCCESS != tmp_ret && OB_SUCC(ret)) {
+      ret = tmp_ret;
+      LOG_WARN("[ForkTable] finish empty tablet allocation failed", KR(ret));
+    }
+  }
+  return ret;
+}
+
 // (3) 创建目的端 tablet，复用 CREATE_TABLET_NEW_MDS；同时将 dst schema 写入内部表。
 // 直接消费 prepare 阶段产出的完整表级配对，由 ObForkTableInfoBuilder 按分区推导 src tablet id。
 int ObDDLService::fork_table_create_dest_tablet_(
@@ -43434,20 +43591,11 @@ int ObDDLService::fork_table_create_dest_tablet_(
   } else if (OB_FAIL(check_inner_stat())) {
     LOG_WARN("[ForkTable] check inner stat failed", KR(ret));
   } else {
-    ObDDLOperator ddl_operator(*schema_service_, *sql_proxy_);
     const ObTableSchema &data_table_schema = dst_table_schemas.at(0);
     const int64_t table_schema_cnt = dst_table_schemas.count();
 
-    // (1) 将目的端各表 schema 写入内部表（__all_table 等），FTS 字典表需先加锁。
-    for (int64_t i = 0; OB_SUCC(ret) && i < table_schema_cnt; ++i) {
-      ObTableSchema &table_schema = dst_table_schemas.at(i);
-      if (OB_FAIL(ObFtsIndexBuilderUtil::try_load_and_lock_dictionary_tables(table_schema, trans))) {
-        LOG_WARN("[ForkTable] fail to load and lock dictionary tables", KR(ret), K(table_schema));
-      } else if (OB_FAIL(ddl_operator.create_table(table_schema, trans, 0 == i ? &ddl_stmt_str : nullptr, i == table_schema_cnt - 1))) {
-        LOG_WARN("[ForkTable] fail to create dst table schema", KR(ret), K(table_schema));
-      } else if (OB_FAIL(ddl_operator.insert_temp_table_info(trans, table_schema))) {
-        LOG_WARN("[ForkTable] fail to insert temp table info", KR(ret), K(table_schema));
-      }
+    if (OB_FAIL(fork_table_persist_schemas_(tenant_id, dst_table_schemas, ddl_stmt_str, trans))) {
+      LOG_WARN("[ForkTable] persist destination schemas failed", KR(ret), K(tenant_id));
     }
 
     ObArray<const ObTableSchema *> schemas;
@@ -43465,22 +43613,6 @@ int ObDDLService::fork_table_create_dest_tablet_(
         }
       } else if (OB_FAIL(schemas.push_back(&this_table)) || OB_FAIL(need_create_empty_majors.push_back(false))) {
         LOG_WARN("[ForkTable] fail to push back table schema", KR(ret), K(this_table));
-      }
-    }
-
-    int64_t last_schema_version = OB_INVALID_VERSION;
-    if (OB_FAIL(ret)) {
-    } else if (schemas.empty()) {
-    } else if (OB_FAIL(get_last_schema_version(last_schema_version))) {
-      LOG_WARN("[ForkTable] get last schema version failed", KR(ret), K(tenant_id));
-    } else {
-      for (int64_t i = 0; OB_SUCC(ret) && i < table_schema_cnt; ++i) {
-        const ObTableSchema &this_table = dst_table_schemas.at(i);
-        const int64_t table_id = this_table.get_table_id();
-        if (!this_table.has_tablet()) {
-        } else if (OB_FAIL(ddl_operator.insert_ori_schema_version(trans, tenant_id, table_id, last_schema_version))) {
-          LOG_WARN("[ForkTable] insert ori schema version failed", KR(ret), K(tenant_id), K(table_id), K(last_schema_version));
-        }
       }
     }
 
@@ -44174,7 +44306,7 @@ int ObDDLService::fork_database(const obrpc::ObForkDatabaseArg &arg, obrpc::ObDD
     // parent 已提交且 finalizer 明确未提交；DAG 已停止时可安全执行前台补偿。
     if (can_foreground_cleanup) {
       const int tmp_ret = cleanup_incomplete_fork_database(arg.tenant_id_, dst_db_schema.get_database_id(),
-          db_task_record.task_id_, fork_snapshot_version, ret, fork_deadline_us);
+          db_task_record.task_id_, fork_snapshot_version, arg.schema_only_, ret, fork_deadline_us);
       if (OB_SUCCESS != tmp_ret) {
         LOG_WARN("[ForkTable] foreground compensation unfinished; leave for recovery", K(tmp_ret), KR(ret),
                  "parent_task_id", db_task_record.task_id_, K(fork_deadline_us));
@@ -44503,6 +44635,7 @@ int ObDDLService::fork_db_cleanup_drop_database_(
     const uint64_t dst_database_id,
     const int64_t parent_task_id,
     const int64_t fork_snapshot_version,
+    const bool schema_only,
     const ObIArray<ForkDatabaseCleanupChild> &children)
 {
   int ret = OB_SUCCESS;
@@ -44563,9 +44696,9 @@ int ObDDLService::fork_db_cleanup_drop_database_(
   if (OB_SUCC(ret)) {
     affected_rows = 0;
     // acquired snapshot、父任务删除与 prepare fence 解锁同事务提交；事务失败时仍保留
-    // 完整恢复入口、隔离栅栏和快照保护。
-    if (OB_FAIL(fork_db_release_snapshot_(tenant_id, parent_task_id,
-                                          fork_snapshot_version, drop_database_trans))) {
+    // 完整恢复入口、隔离栅栏和快照保护。Schema-only 不申请数据快照，无需释放。
+    if (!schema_only && OB_FAIL(fork_db_release_snapshot_(tenant_id, parent_task_id,
+                                                          fork_snapshot_version, drop_database_trans))) {
       LOG_WARN("[ForkTable] release persistent snapshot in cleanup failed", KR(ret), K(tenant_id),
                K(parent_task_id), K(fork_snapshot_version));
     } else if (OB_FAIL(ObForkDatabaseTaskOperator::delete_parent_task(
@@ -44621,6 +44754,7 @@ int ObDDLService::cleanup_incomplete_fork_database(
     const uint64_t dst_database_id,
     const int64_t parent_task_id,
     const int64_t fork_snapshot_version,
+    const bool schema_only,
     const int worker_ret,
     const int64_t cleanup_deadline_us)
 {
@@ -44639,7 +44773,11 @@ int ObDDLService::cleanup_incomplete_fork_database(
   // 活跃状态 -> FORK_TABLE_CLEANUP_MDS_FINISHED -> FORK_TABLE_CLEANUP_RESOURCES_RELEASED -> 删除记录。
   // worker range 可能已经提交部分 Schema，按内表最新版本刷新本地 schema guard，
   // 保证补偿能看到已持久化的目标表并释放相关资源。
-  if (cleanup_timeout_us <= 0) {
+  if (schema_only ? 0 != fork_snapshot_version : fork_snapshot_version <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("[ForkTable] invalid compensation snapshot mode", KR(ret), K(schema_only), K(fork_snapshot_version),
+             K(tenant_id), K(parent_task_id));
+  } else if (cleanup_timeout_us <= 0) {
     ret = OB_TIMEOUT;
     LOG_WARN("[ForkTable] cleanup deadline expired", KR(ret), K(cleanup_deadline_us), K(cleanup_start_us));
   } else if (OB_FAIL(cleanup_timeout_ctx.set_trx_timeout_us(cleanup_timeout_us))) {
@@ -44676,7 +44814,7 @@ int ObDDLService::cleanup_incomplete_fork_database(
                                                    refreshed_schema_version, schema_guard, children))) {
       LOG_WARN("[ForkTable] cleanup release resources phase failed", KR(ret));
     } else if (OB_FAIL(fork_db_cleanup_drop_database_(tenant_id, dst_database_id, parent_task_id,
-                                                      fork_snapshot_version, children))) {
+                                                      fork_snapshot_version, schema_only, children))) {
       LOG_WARN("[ForkTable] cleanup drop database phase failed", KR(ret));
     }
   }
@@ -44729,6 +44867,7 @@ int ObDDLService::fork_db_commit_parent_(
   int ret = OB_SUCCESS;
   const uint64_t src_database_id = src_db_schema.get_database_id();
   const bool has_source_tables = !src_table_ids.empty();
+  const int64_t child_task_total_cnt = arg.schema_only_ ? 0 : src_table_ids.count();
   share::SCN snapshot_gc_scn;
   ObDDLSQLTransaction parent_trans(schema_service_);
   ObForkPrivilegeCopier privilege_copier(arg.tenant_id_, *schema_service_, schema_guard,
@@ -44748,21 +44887,22 @@ int ObDDLService::fork_db_commit_parent_(
       LOG_WARN("[ForkTable] copy empty database privileges failed", KR(ret), K(arg));
     }
   } else if (has_source_tables) {
-    // parent_trans 在生成 S 前锁住 snapshot_gc_scn，并在同一事务写入持久化 acquired snapshot。
+    // 数据 fork 在生成 S 前锁住 snapshot_gc_scn，并在同一事务写入持久化 acquired snapshot。
+    // Schema-only 保留 PREPARE/fence，但快照为 0，既不取 GTS 也不建立 acquired snapshot。
     // 提交前由行锁保护，提交后由 acquired snapshot 保护，避免长事务 guard 的超时空窗。
-    if (OB_FAIL(lock_user_snapshot_gc_scn_(parent_trans, arg.tenant_id_, snapshot_gc_scn))) {
+    if (!arg.schema_only_ && OB_FAIL(lock_user_snapshot_gc_scn_(parent_trans, arg.tenant_id_, snapshot_gc_scn))) {
       LOG_WARN("[ForkTable] lock snapshot gc scn in parent transaction failed", KR(ret), K(arg),
                K(src_database_id), "dst_database_id", dst_db_schema.get_database_id());
-    } else if (OB_FAIL(fork_table_cal_snapshot_(parent_trans, arg.tenant_id_, snapshot_gc_scn,
+    } else if (!arg.schema_only_ && OB_FAIL(fork_table_cal_snapshot_(parent_trans, arg.tenant_id_, snapshot_gc_scn,
                                                 fork_snapshot_version))) {
       LOG_WARN("[ForkTable] calculate snapshot failed", KR(ret), K(arg), K(snapshot_gc_scn), K(src_database_id),
                "dst_database_id", dst_db_schema.get_database_id());
     } else if (OB_FAIL(fork_db_add_task_(arg, src_db_schema, dst_db_schema.get_database_id(), fork_snapshot_version,
-                                        src_table_ids.count(), allocator, parent_trans, db_task_record))) {
+                                        child_task_total_cnt, allocator, parent_trans, db_task_record))) {
       LOG_WARN("[ForkTable] create parent task failed", KR(ret), K(arg), K(src_database_id),
                "dst_database_id", dst_db_schema.get_database_id(), K(fork_snapshot_version),
                "table_count", src_table_ids.count());
-    } else if (OB_FAIL(fork_db_acquire_snapshot_(arg.tenant_id_, db_task_record.task_id_,
+    } else if (!arg.schema_only_ && OB_FAIL(fork_db_acquire_snapshot_(arg.tenant_id_, db_task_record.task_id_,
                                                  fork_snapshot_version, parent_trans))) {
       LOG_WARN("[ForkTable] acquire persistent fork database snapshot failed", KR(ret), K(arg),
                K(src_database_id), "dst_database_id", dst_db_schema.get_database_id(),
@@ -44863,7 +45003,12 @@ int ObDDLService::fork_db_commit_finalizer_(
   ObDDLSQLTransaction final_trans(schema_service_);
   // PREPARE 阶段已持有 tenant prepare fence，finalizer 复用该隔离语义，不重复获取租户 DDL 锁。
   final_trans.set_skip_tenant_ddl_lock(true);
-  if (OB_FAIL(get_tenant_schema_guard_with_version_in_inner_table(arg.tenant_id_, schema_guard))) {
+  if (OB_UNLIKELY(arg.schema_only_ ? 0 != db_task_record.snapshot_version_
+                                   : db_task_record.snapshot_version_ <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("[ForkTable] invalid finalizer snapshot mode", KR(ret), K(arg.schema_only_),
+             "snapshot_version", db_task_record.snapshot_version_, "parent_task_id", db_task_record.task_id_);
+  } else if (OB_FAIL(get_tenant_schema_guard_with_version_in_inner_table(arg.tenant_id_, schema_guard))) {
     LOG_WARN("[ForkTable] refresh schema before finalizer failed", KR(ret));
   } else if (OB_FAIL(schema_guard.get_schema_version(arg.tenant_id_, refreshed_schema_version))) {
     LOG_WARN("[ForkTable] get finalizer schema version failed", KR(ret));
@@ -44906,8 +45051,9 @@ int ObDDLService::fork_db_commit_finalizer_(
     } else if (OB_FAIL(unlock_fork_database_prepare_fence_(arg.tenant_id_, db_task_record.task_id_, final_trans))) {
       LOG_WARN("[ForkTable] release prepare fence in finalizer failed", KR(ret), "parent_task_id",
                db_task_record.task_id_);
-    } else if (OB_FAIL(fork_db_release_snapshot_(arg.tenant_id_, db_task_record.task_id_,
-                                                 db_task_record.snapshot_version_, final_trans))) {
+    } else if (!arg.schema_only_
+               && OB_FAIL(fork_db_release_snapshot_(arg.tenant_id_, db_task_record.task_id_,
+                                                    db_task_record.snapshot_version_, final_trans))) {
       LOG_WARN("[ForkTable] release persistent snapshot in finalizer failed", KR(ret),
                "parent_task_id", db_task_record.task_id_,
                "snapshot_version", db_task_record.snapshot_version_);
@@ -44950,8 +45096,10 @@ int ObDDLService::fork_db_add_task_(
   task_record.reset();
   const uint64_t src_database_id = src_db_schema.get_database_id();
   const int64_t src_schema_version = src_db_schema.get_schema_version();
-  if (!arg.is_valid() || !trans.is_started() || OB_INVALID_ID == src_database_id || fork_snapshot_version <= 0
-      || OB_INVALID_ID == dst_database_id || src_schema_version <= 0 || child_task_total_cnt <= 0) {
+  if (!arg.is_valid() || !trans.is_started() || OB_INVALID_ID == src_database_id
+      || (arg.schema_only_ ? fork_snapshot_version != 0 : fork_snapshot_version <= 0)
+      || OB_INVALID_ID == dst_database_id || src_schema_version <= 0
+      || (arg.schema_only_ ? child_task_total_cnt != 0 : child_task_total_cnt <= 0)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("[ForkTable] invalid argument", KR(ret), K(arg), "trans_started",
             trans.is_started(), K(src_database_id), K(dst_database_id), K(src_schema_version),

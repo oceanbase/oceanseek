@@ -39,6 +39,7 @@ public:
     DST_DATABASE_NODE = 0,
     SRC_DATABASE_NODE,
     COPY_GRANTS_NODE,
+    SCHEMA_ONLY_NODE,
     MAX_NODE
   };
 public:

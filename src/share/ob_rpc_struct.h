@@ -1446,7 +1446,8 @@ public:
       src_database_name_(),
       dst_database_name_(),
       session_id_(0),
-      copy_grants_(false)
+      copy_grants_(false),
+      schema_only_(false)
   {}
   bool is_valid() const;
   virtual bool is_allow_when_upgrade() const { return true; }
@@ -1458,6 +1459,7 @@ public:
   common::ObString dst_database_name_;
   int64_t session_id_;
   bool copy_grants_;
+  bool schema_only_;
 };
 
 struct ObCreateSynonymArg : ObDDLArg

@@ -224,7 +224,7 @@ NEG_SIGN
 %token /*can not be relation name*/
 _BINARY _UTF8 _UTF8MB4 _UTF8MB3 _GBK _UTF16 _GB18030 _GB18030_2022 _LATIN1 _GB2312 _ASCII _TIS620 _UJIS _EUCKR _EUCJPMS _CP932 _UTF16LE _SJIS _BIG5 _DEC8 _CP850 _HP8 _MACROMAN _SWE7 _HKSCS _HKSCS31 CNNOP
 SELECT_HINT_BEGIN UPDATE_HINT_BEGIN DELETE_HINT_BEGIN INSERT_HINT_BEGIN REPLACE_HINT_BEGIN MERGE_HINT_BEGIN HINT_HINT_BEGIN HINT_END
-LOAD_DATA_HINT_BEGIN CREATE_HINT_BEGIN ALTER_HINT_BEGIN
+LOAD_DATA_HINT_BEGIN MERGE_TABLE_HINT_BEGIN CREATE_HINT_BEGIN ALTER_HINT_BEGIN
 END_P SET_VAR DELIMITER
 
 %token <reserved_keyword>
@@ -303,7 +303,7 @@ END_P SET_VAR DELIMITER
         ESCAPE EVENT EVENTS EVERY EXCHANGE EXCLUDING EXECUTE EXPANSION EXPIRE EXPIRE_INFO EXPORT OUTLINE EXTENDED
         EXTENDED_NOADDR EXTBLOB EXTENT_SIZE EXTRACT EXCEPT EXPIRED ENCODING EMPTY_FIELD_AS_NULL EUCLIDEAN EXTERNAL EXTERNAL_STORAGE_DEST EXPIRE_TIME EXCLUSIVE
 
-        FAILOVER FAST FAULTS FILE_BLOCK_SIZE FIELDS FILEX FINAL_COUNT FIRST FIRST_VALUE FIXED FLUSH FOLLOWER FORMAT
+        FAIL FAILOVER FAST FAULTS FILE_BLOCK_SIZE FIELDS FILEX FINAL_COUNT FIRST FIRST_VALUE FIXED FLUSH FOLLOWER FORMAT
         FOUND FREEZE FREQUENCY FUNCTION FOLLOWING FLASHBACK FULL FRAGMENTATION FREQ_THRESHOLD FROZEN FILE_ID FILTER 
         FIELD_OPTIONALLY_ENCLOSED_BY FIELD_DELIMITER FIELD_ENCLOSED_BY FILE_EXTENSION FULLTEXT_DICT FTS_INDEX_TYPE
 
@@ -339,7 +339,7 @@ END_P SET_VAR DELIMITER
         NOMINVALUE NOMAXVALUE NOORDER NOCYCLE NOCACHE NOCHECK NO_WAIT NULLS NUMBER NVARCHAR NTILE NTH_VALUE NOARCHIVELOG NETWORK NET_BANDWIDTH_WEIGHT NOPARALLEL
         NULL_IF_EXETERNAL
 
-        OAUTH2_SVR_URI OBSOLETE OBJECT OBJECT_NAME_DISPLAY OCCUR OF OFF OFFSET OLD OLD_PASSWORD ONE ONE_SHOT ONLY OPEN OPTIONS ORDINALITY ORIG_DEFAULT OWNER OLD_KEY OVER
+        OAUTH2_SVR_URI OBSOLETE OBJECT OBJECT_NAME_DISPLAY OCCUR OF OFF OFFSET OLD OLD_PASSWORD ONE ONE_SHOT ONLY OPEN OPTIONS ORDINALITY ORIG_DEFAULT OURS OWNER OLD_KEY OVER
         OBCONFIG_URL OJ
         OBJECT_ID
         LOGSERVICE_ACCESS_POINT
@@ -372,7 +372,7 @@ END_P SET_VAR DELIMITER
         SS MI HH DD WK WW MM QQ YY MS NS S N H D M Q
         SRID STANDBY _ST_ASMVT STAT START STARTS STATS_AUTO_RECALC
         STATS_PERSISTENT STATS_SAMPLE_PAGES STATUS STATEMENTS STATISTICS STD STDDEV STDDEV_POP STDDEV_SAMP STDDEVSAMP STOPWORD_TABLE STORAGE_CACHE_POLICY STORAGE_CACHE_POLICY_EXECUTOR STRONG STSTOKEN
-        SYNC SYNCHRONIZATION SYNCHRONOUS STOP STORAGE STORAGE_FORMAT_VERSION STORE STORING STREAM STREAM_ID STRING STRING_AGG STRIPE_SIZE
+        SYNC STRATEGY SYNCHRONIZATION SYNCHRONOUS STOP STORAGE STORAGE_FORMAT_VERSION STORE STORING STREAM STREAM_ID STRING STRING_AGG STRIPE_SIZE
         SUBCLASS_ORIGIN SUBDATE SUBJECT SUBPARTITION SUBPARTITIONS SUBSTR SUBSTRING SUCCESSFUL SUM
         SUPER SUSPEND SWAPS SWITCH SWITCHES SWITCHOVER SYSTEM SYSTEM_USER SYSDATE SYS_COUNT_INROW SESSION_ALIAS
         SIZE SKEWONLY SEQUENCE SLOG STATEMENT_ID SKIP_HEADER PARSE_HEADER IGNORE_LAST_EMPTY_COLUMN 
@@ -381,7 +381,7 @@ END_P SET_VAR DELIMITER
 
         TABLE_CHECKSUM TABLE_MODE TABLE_ID TABLE_NAME TABLEGROUPS TABLES TABLESPACE TABLET TABLET_ID TABLET_MAX_SIZE TASK_ID TIER
         TEMPLATE TEMPORARY TEMPTABLE TENANT TEXT THAN TIME TIMESTAMP TIMESTAMPADD TIMESTAMPDIFF TP_NO
-        TP_NAME TRACE TRADITIONAL TRANSACTION TRIGGERS TRIM TRUNCATE TYPE TYPES TASK TABLET_SIZE
+        THEIRS TP_NAME TRACE TRADITIONAL TRANSACTION TRIGGERS TRIM TRUNCATE TYPE TYPES TASK TABLET_SIZE
         TABLEGROUP_ID TENANT_ID THROTTLE TIME_ZONE_INFO TOP_K_FRE_HIST TIMES TRIM_SPACE TTL
         TRANSFER TUNNEL_ENDPOINT TENANT_STS_CREDENTIAL TABLETS TIME_UNIT TIME_ZONE TOKEN
 
@@ -405,7 +405,7 @@ END_P SET_VAR DELIMITER
 %type <node> sql_stmt stmt_list stmt opt_end_p
 %type <node> select_stmt update_stmt delete_stmt merge_stmt
 %type <node> insert_stmt single_table_insert values_clause dml_table_name
-%type <node> create_table_stmt create_table_like_stmt fork_table_stmt fork_database_stmt opt_fork_read_lock opt_copy_grants opt_table_option_list table_option_list table_option table_option_list_space_seperated create_function_stmt drop_function_stmt parallel_option lob_storage_clause lob_storage_parameter lob_storage_parameters lob_chunk_size
+%type <node> create_table_stmt create_table_like_stmt fork_table_stmt fork_database_stmt merge_table_stmt opt_merge_strategy opt_fork_schema_only opt_fork_read_lock opt_copy_grants opt_table_option_list table_option_list table_option table_option_list_space_seperated create_function_stmt drop_function_stmt parallel_option lob_storage_clause lob_storage_parameter lob_storage_parameters lob_chunk_size
 %type <node> opt_force
 %type <node> index_or_heap
 %type <node> create_sequence_stmt alter_sequence_stmt drop_sequence_stmt opt_sequence_option_list sequence_option_list sequence_option simple_num
@@ -498,7 +498,7 @@ END_P SET_VAR DELIMITER
 %type <node> opt_comment opt_as
 %type <node> column_name relation_name relation_name_list opt_relation_name function_name column_label var_name relation_name_or_string refresh_fulltext_dict_dst row_format_option compression_name merge_engine_types
 %type <node> audit_stmt audit_clause op_audit_tail_clause audit_operation_clause audit_all_shortcut_list audit_all_shortcut auditing_on_clause auditing_by_user_clause audit_user_list audit_user audit_user_with_host_name
-%type <node> opt_hint_list hint_option select_with_opt_hint update_with_opt_hint delete_with_opt_hint merge_with_opt_hint hint_list_with_end global_hint transform_hint optimize_hint
+%type <node> opt_hint_list hint_option select_with_opt_hint update_with_opt_hint delete_with_opt_hint merge_with_opt_hint merge_table_with_opt_hint hint_list_with_end global_hint transform_hint optimize_hint
 %type <node> create_index_stmt index_name sort_column_list sort_column_key opt_index_option_list opt_fulltext_index_option_list index_option fulltext_index_option opt_sort_column_key_length opt_index_using_algorithm index_using_algorithm visibility_option opt_constraint_name constraint_name create_with_opt_hint index_expr alter_with_opt_hint
 %type <node> search_sort_column_list search_sort_column_key opt_search_column_with
 %type <node> search_index_with_opt_list search_index_with_opt
@@ -683,6 +683,7 @@ stmt:
   | create_table_like_stmt  { $$ = $1; check_question_mark($$, result); }
   | fork_table_stmt         { $$ = $1; check_question_mark($$, result); }
   | fork_database_stmt      { $$ = $1; check_question_mark($$, result); }
+  | merge_table_stmt        { $$ = $1; check_question_mark($$, result); }
   | create_database_stmt    { $$ = $1; check_question_mark($$, result); }
   | drop_database_stmt      { $$ = $1; check_question_mark($$, result); }
   | alter_database_stmt     { $$ = $1; check_question_mark($$, result); }
@@ -6066,7 +6067,8 @@ opt_fork_read_lock:
 opt_copy_grants:
 /* 空产生式 */
 {
-  $$ = NULL;
+  malloc_terminal_node($$, result->malloc_pool_, T_BOOL);
+  $$->value_ = 0;
 }
 | COPY GRANTS
 {
@@ -6076,9 +6078,75 @@ opt_copy_grants:
 ;
 
 fork_database_stmt:
-FORK DATABASE database_factor TO database_factor opt_copy_grants
+FORK DATABASE database_factor TO database_factor opt_fork_schema_only opt_copy_grants
 {
-  malloc_non_terminal_node($$, result->malloc_pool_, T_FORK_DATABASE, 3, $5, $3, $6);
+  // Keep COPY GRANTS in its existing AST slot and append SCHEMA ONLY.
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FORK_DATABASE, 4, $5, $3, $7, $6);
+}
+;
+
+opt_fork_schema_only:
+/* EMPTY */
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_BOOL);
+  $$->value_ = 0;
+}
+| SCHEMA ONLY
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_BOOL);
+  $$->value_ = 1;
+}
+;
+
+/*****************************************************************************
+ *
+ *	MERGE TABLE grammar
+ *
+ *****************************************************************************/
+
+merge_table_with_opt_hint:
+MERGE TABLE
+{
+  $$ = NULL;
+}
+| MERGE_TABLE_HINT_BEGIN hint_list_with_end
+{
+  $$ = $2;
+}
+;
+
+merge_table_stmt:
+merge_table_with_opt_hint relation_factor INTO relation_factor opt_merge_strategy
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_MERGE_TABLE, 4, $2, $4, $5, $1);
+  if (NULL != $1) {
+    // Preserve the original prefix
+    dup_string($1, result, @1.first_column, @1.last_column);
+  }
+}
+;
+
+/* value_ is ObMergeTableStrategy: FAIL (default) = 0, THEIRS = 1, OURS = 2 */
+opt_merge_strategy:
+/* EMPTY */
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_INT);
+  $$->value_ = 0;
+}
+| STRATEGY FAIL
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_INT);
+  $$->value_ = 0;
+}
+| STRATEGY THEIRS
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_INT);
+  $$->value_ = 1;
+}
+| STRATEGY OURS
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_INT);
+  $$->value_ = 2;
 }
 ;
 
@@ -29119,6 +29187,7 @@ ACCESS_INFO
 |       EXTERNAL
 |       EXTERNAL_STORAGE_DEST
 |       EXTRACT
+|       FAIL
 |       FAILOVER
 |       FAST
 |       FAULTS
@@ -29415,6 +29484,7 @@ ACCESS_INFO
 |       ORIG_DEFAULT
 |       REMOTE_OSS
 |       OUTLINE
+|       OURS
 |       OWNER
 |       PACK_KEYS
 |       PAGE
@@ -29684,6 +29754,7 @@ ACCESS_INFO
 |       STORAGE
 |       STORAGE_CACHE_POLICY
 |       STORAGE_CACHE_POLICY_EXECUTOR
+|       STRATEGY
 |       STORAGE_FORMAT_VERSION
 |       STORE
 |       STORING
@@ -29750,6 +29821,7 @@ ACCESS_INFO
 |       TP_NO
 |       TRACE
 |       TRANSACTION
+|       THEIRS
 |       TRADITIONAL
 |       TRIGGERS
 |       TRIM
@@ -30409,6 +30481,7 @@ int obsql_mysql_fast_parse(ParseResult *p)
                 INSERT_HINT_BEGIN == token ||
                 REPLACE_HINT_BEGIN == token ||
                 MERGE_HINT_BEGIN == token ||
+                MERGE_TABLE_HINT_BEGIN == token ||
                 LOAD_DATA_HINT_BEGIN == token ||
                 CREATE_HINT_BEGIN == token
                 /* token == INSERT_HINT_BEGIN */) {

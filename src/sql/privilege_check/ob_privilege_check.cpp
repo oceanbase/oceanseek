@@ -54,6 +54,7 @@
 #include "sql/resolver/cmd/ob_event_stmt.h"
 #include "sql/resolver/cmd/ob_location_utils_stmt.h"
 #include "sql/session/ob_sql_session_info.h"
+#include "sql/resolver/cmd/ob_merge_table_stmt.h"
 
 namespace oceanbase {
 using namespace share;
@@ -3926,6 +3927,51 @@ int get_rls_policy_ddl_stmt_need_privs(
       ObNeedPriv need_priv(db_name, table_name, OB_PRIV_TABLE_LEVEL,
                            OB_PRIV_ALTER, rls_stmt->is_sys_table());
       ADD_NEED_PRIV(need_priv);
+    }
+  }
+  return ret;
+}
+
+
+// Collect SELECT on the source table and SELECT, INSERT, and UPDATE on the target for MERGE TABLE.
+int get_merge_table_stmt_need_privs(
+    const ObSessionPrivInfo &session_priv,
+    const ObStmt *basic_stmt,
+    ObIArray<ObNeedPriv> &need_privs)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(basic_stmt)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("basic_stmt should not be NULL", K(ret));
+  } else if (stmt::T_MERGE_TABLE != basic_stmt->get_stmt_type()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected stmt type", K(ret), K(basic_stmt->get_stmt_type()));
+  } else {
+    const ObMergeTableStmt *merge_stmt = static_cast<const ObMergeTableStmt *>(basic_stmt);
+    if (OB_FAIL(ObPrivilegeCheck::can_do_operation_on_db(
+            session_priv, merge_stmt->get_inc_db_name()))) {
+      LOG_WARN("can not do this operation on the source database", K(session_priv), K(ret));
+    } else if (OB_FAIL(ObPrivilegeCheck::can_do_operation_on_db(
+            session_priv, merge_stmt->get_cur_db_name()))) {
+      LOG_WARN("can not do this operation on the target database", K(session_priv), K(ret));
+    } else {
+      ObNeedPriv need_priv;
+      need_priv.priv_level_ = OB_PRIV_TABLE_LEVEL;
+      need_priv.is_sys_table_ = false;
+      need_priv.db_ = merge_stmt->get_inc_db_name();
+      need_priv.table_ = merge_stmt->get_inc_table_name();
+      need_priv.priv_set_ = OB_PRIV_SELECT;
+      ADD_NEED_PRIV(need_priv);
+      if (OB_SUCC(ret)) {
+        need_priv.db_ = merge_stmt->get_cur_db_name();
+        need_priv.table_ = merge_stmt->get_cur_table_name();
+        // Only THEIRS overwrites existing rows; FAIL and OURS just insert.
+        need_priv.priv_set_ = OB_PRIV_SELECT | OB_PRIV_INSERT;
+        if (ObMergeTableStrategy::THEIRS == merge_stmt->get_strategy()) {
+          need_priv.priv_set_ |= OB_PRIV_UPDATE;
+        }
+        ADD_NEED_PRIV(need_priv);
+      }
     }
   }
   return ret;

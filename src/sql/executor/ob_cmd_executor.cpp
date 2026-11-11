@@ -58,6 +58,7 @@
 #include "sql/resolver/tcl/ob_end_trans_stmt.h"
 #include "sql/resolver/tcl/ob_savepoint_stmt.h"
 #include "sql/resolver/cmd/ob_bootstrap_stmt.h"
+#include "sql/resolver/cmd/ob_merge_table_stmt.h"
 #include "sql/resolver/cmd/ob_kill_stmt.h"
 #include "sql/resolver/cmd/ob_empty_query_stmt.h"
 #include "sql/resolver/cmd/ob_resource_stmt.h"
@@ -116,6 +117,7 @@
 #include "sql/engine/cmd/ob_dblink_executor.h"
 #include "sql/engine/cmd/ob_load_data_executor.h"
 #include "sql/engine/cmd/ob_location_utils_executor.h"
+#include "sql/engine/cmd/ob_merge_table_executor.h"
 #include "sql/engine/cmd/ob_sequence_executor.h"
 #include "sql/engine/cmd/ob_role_cmd_executor.h"
 #include "sql/engine/cmd/ob_xa_executor.h"
@@ -470,6 +472,10 @@ int ObCmdExecutor::execute(ObExecContext &ctx, ObICmd &cmd)
       }
       case stmt::T_FORK_DATABASE: {
         DEFINE_EXECUTE_CMD(ObForkDatabaseStmt, ObForkDatabaseExecutor);
+        break;
+      }
+      case stmt::T_MERGE_TABLE: {
+        DEFINE_EXECUTE_CMD(ObMergeTableStmt, ObMergeTableExecutor);
         break;
       }
       case stmt::T_CREATE_TABLE_LIKE: {

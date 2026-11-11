@@ -9,6 +9,8 @@
 #include "share/ob_cluster_version.h"
 #include "share/schema/ob_priv_mgr.h"
 #include "sql/resolver/ddl/ob_fork_table_resolver.h"
+#include "sql/resolver/cmd/ob_merge_table_resolver.h"
+#include "sql/resolver/ob_schema_checker.h"
 #include "sql/session/ob_sql_session_info.h"
 #include "lib/utility/utility.h"
 
@@ -126,7 +128,8 @@ TEST(TestForkCopyGrants, database_protocol)
 // 返回 OB_ALLOCATE_MEMORY_FAILED；低版本的普通 Fork 和 COPY GRANTS 都必须更早返回 OB_NOT_SUPPORTED。
 // 此测试只验证入口闸门，不把“到达后续阶段”误认为完整 SQL 执行成功。
 template <typename Resolver>
-int resolve_version_gate(const ObItemType type, const bool copy_grants, const bool read_lock = false)
+int resolve_version_gate(const ObItemType type, const bool copy_grants,
+                         const bool read_lock = false, const bool schema_only = false)
 {
   ObArenaAllocator allocator;
   sql::ObSQLSessionInfo session;
@@ -140,6 +143,8 @@ int resolve_version_gate(const ObItemType type, const bool copy_grants, const bo
     children[Resolver::COPY_GRANTS_NODE] = copy_grants ? &option : nullptr;
     if (T_FORK_TABLE == type) {
       children[sql::ObForkTableResolver::READ_LOCK_NODE] = read_lock ? &option : nullptr;
+    } else if (T_FORK_DATABASE == type) {
+      children[sql::ObForkDatabaseResolver::SCHEMA_ONLY_NODE] = schema_only ? &option : nullptr;
     }
     ParseNode tree = {};
     tree.type_ = type;
@@ -159,15 +164,20 @@ void check_data_version_gate(const ObItemType type)
     ~ResetMockVersion() { ODV_MGR.set_mock_data_version(0); }
   } reset_mock;
   for (const uint64_t version : {DATA_VERSION_4_6_2_1, DATA_VERSION_4_6_2_2,
-                                DATA_VERSION_4_6_3_0, cal_version(4, 6, 3, 1)}) {
+                                DATA_VERSION_4_6_3_0, DATA_VERSION_4_6_3_1}) {
+    SCOPED_TRACE(version);
     ODV_MGR.set_mock_data_version(version);
-    const int expected = version < DATA_VERSION_4_6_3_0 ? OB_NOT_SUPPORTED : OB_ALLOCATE_MEMORY_FAILED;
+    // 4.6.3.1 introduces SCHEMA ONLY; every Fork form must obey the same upgrade gate.
+    const int expected = version < DATA_VERSION_4_6_3_1 ? OB_NOT_SUPPORTED : OB_ALLOCATE_MEMORY_FAILED;
     // 普通 Fork 与 COPY GRANTS 共用入口门禁，省略子句或使用 READ LOCK 都不能绕过版本检查。
     EXPECT_EQ(expected, resolve_version_gate<Resolver>(type, true));
     EXPECT_EQ(expected, resolve_version_gate<Resolver>(type, false));
     if (T_FORK_TABLE == type) {
       EXPECT_EQ(expected, resolve_version_gate<Resolver>(type, true, true));
       EXPECT_EQ(expected, resolve_version_gate<Resolver>(type, false, true));
+    } else if (T_FORK_DATABASE == type) {
+      EXPECT_EQ(expected, resolve_version_gate<Resolver>(type, true, false, true));
+      EXPECT_EQ(expected, resolve_version_gate<Resolver>(type, false, false, true));
     }
   }
   // 未能取得 data version 时，两种 Fork 都应原样返回错误，不能把“不知道版本”当成允许执行。
@@ -180,6 +190,9 @@ void check_data_version_gate(const ObItemType type)
   if (T_FORK_TABLE == type) {
     EXPECT_EQ(version_ret, resolve_version_gate<Resolver>(type, true, true));
     EXPECT_EQ(version_ret, resolve_version_gate<Resolver>(type, false, true));
+  } else if (T_FORK_DATABASE == type) {
+    EXPECT_EQ(version_ret, resolve_version_gate<Resolver>(type, true, false, true));
+    EXPECT_EQ(version_ret, resolve_version_gate<Resolver>(type, false, false, true));
   }
 }
 
@@ -191,6 +204,50 @@ TEST(TestForkCopyGrants, table_data_version_gate)
 TEST(TestForkCopyGrants, database_data_version_gate)
 {
   check_data_version_gate<sql::ObForkDatabaseResolver>(T_FORK_DATABASE);
+}
+
+// MERGE introduces serialized expressions too: every strategy must pass the
+// tenant data-version gate before allocating a statement or looking up tables.
+TEST(TestForkCopyGrants, merge_table_data_version_gate)
+{
+  lib::CompatModeGuard mode(lib::Worker::CompatMode::MYSQL);
+  struct ResetMockVersion {
+    ~ResetMockVersion() { ODV_MGR.set_mock_data_version(0); }
+  } reset_mock;
+  ObArenaAllocator allocator;
+  sql::ObSQLSessionInfo session;
+  sql::ObSchemaChecker checker;
+  ASSERT_EQ(OB_SUCCESS, session.set_tenant(ObString::make_string("merge_test"), 1002));
+  sql::ObResolverParams params;
+  params.allocator_ = &allocator;
+  params.session_info_ = &session;
+  params.schema_checker_ = &checker;
+  ParseNode strategy = {};
+  ParseNode *children[4] = {nullptr, nullptr, &strategy, nullptr};
+  ParseNode tree = {};
+  tree.type_ = T_MERGE_TABLE;
+  tree.num_child_ = 4;
+  tree.children_ = children;
+  for (const uint64_t version : {DATA_VERSION_4_6_3_0, DATA_VERSION_4_6_3_1}) {
+    SCOPED_TRACE(version);
+    ODV_MGR.set_mock_data_version(version);
+    for (int64_t i = 0; i < 3; ++i) {
+      SCOPED_TRACE(i);
+      strategy.value_ = i;
+      sql::ObMergeTableResolver resolver(params);
+      EXPECT_EQ(version < DATA_VERSION_4_6_3_1 ? OB_NOT_SUPPORTED : OB_ALLOCATE_MEMORY_FAILED,
+                resolver.resolve(tree));
+    }
+  }
+  ODV_MGR.set_mock_data_version(0);
+  uint64_t version = 0;
+  const int version_ret = GET_MIN_DATA_VERSION(1002, version);
+  ASSERT_NE(OB_SUCCESS, version_ret);
+  for (int64_t i = 0; i < 3; ++i) {
+    strategy.value_ = i;
+    sql::ObMergeTableResolver resolver(params);
+    EXPECT_EQ(version_ret, resolver.resolve(tree));
+  }
 }
 
 // 直接验证编码字节，而非只做往返校验，避免 encode/decode 同时出错却互相抵消。

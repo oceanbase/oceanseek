@@ -125,7 +125,8 @@ public:
                        K_(dst_database_id),
                        K_(fork_snapshot_version),
                        K_(child_task_total_cnt),
-                       K_(child_task_unfinished_cnt));
+                       K_(child_task_unfinished_cnt),
+                       K_(schema_only));
 
 private:
   int check_health();
@@ -149,6 +150,7 @@ private:
   int64_t child_task_unfinished_cnt_;
   int64_t last_child_cnt_sync_ts_;
   bool child_tasks_woken_;
+  bool schema_only_; // Persisted as an optional v1 tail field; absent in old data-fork messages.
   ObDDLService *ddl_service_;
 
   DISALLOW_COPY_AND_ASSIGN(ObForkDatabaseTask);
