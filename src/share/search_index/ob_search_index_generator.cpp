@@ -116,6 +116,11 @@ int ObSearchIndexRowGenerator::Generator::init_array_generator(const common::ObC
           MEMCPY(copy, path_buf, path_len);
           array_index_path_.assign_ptr(copy, path_len);
           ObObjMeta elem_meta = basic_elem.get_meta_type();
+          if (elem_meta.is_varchar() || elem_meta.is_text()) {
+            // ObArrayBinary compares bytes, including case, trailing spaces and NULs.
+            // Use the same encoding for index entries and array query values.
+            elem_meta.set_collation_type(CS_TYPE_BINARY);
+          }
           void *elem_generator_ptr = nullptr;
           if (OB_ISNULL(elem_generator_ptr = inner_allocator_.alloc(sizeof(Generator)))) {
             ret = OB_ALLOCATE_MEMORY_FAILED;

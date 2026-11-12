@@ -5122,13 +5122,14 @@ int ObExprRangeConverter::convert_domain_expr_on_search_index(const ObRawExpr *d
   } else if (expr->is_domain_array_expr()) {
     if (T_FUNC_SYS_ARRAY_CONTAINS == expr->get_expr_type()) {
       int64_t value_param_idx = -1;
+      const ObObjType cmp_obj_type = ObCollectionSQLType;
       bool can_extract = true;
       if (ctx_.search_index_range_ctx_->need_constraint() &&
           OB_FAIL(check_str_length_for_search_index_range(const_expr, can_extract))) {
         LOG_WARN("failed to check string length for search index range", K(ret));
       } else if (!can_extract) {
         // string length doesn't match index, skip range extraction
-      } else if (OB_FAIL(get_final_search_index_value_param_idx(*const_expr, nullptr, value_param_idx))) {
+      } else if (OB_FAIL(get_final_search_index_value_param_idx(*const_expr, &cmp_obj_type, value_param_idx))) {
         LOG_WARN("failed to get final search index value param idx", K(ret));
       } else if (OB_FAIL(fill_scalar_search_index_range_node(*column_expr, value_param_idx,
                                                              ObItemType::T_OP_EQ,
