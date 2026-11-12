@@ -2,8 +2,10 @@
  * Copyright (C) 2026 OceanBase
  * SPDX-License-Identifier: Apache-2.0
  */
+#include "deps/oblib/unittest/lib/unittest_diagnostic_info_util.h"
 #include "test_shared_meta_common.h"
 #include "mittest/shared_storage/clean_residual_data.h"
+#include "lib/stat/ob_diagnostic_info_guard.h"
 #define private public
 #define protected public
 #include "storage/ddl/ob_ddl_replay_executor.h"
@@ -399,10 +401,40 @@ TEST_F(TestDliEndRecCheckpoint, dump_checkpoint_does_not_skip_final_publication)
   ASSERT_EQ(OB_SUCCESS, batch_key.init(ctx.tablet_id_, ObTabletID(), ObTabletID(),
       DIRECT_LOAD_INCREMENTAL_MAJOR, ObTransID(77001), ObTxSEQ(1, 0),
       ctx.local_.get_obj()->get_snapshot_version(), DATA_VERSION_4_6_3_0));
-  bool pending = false;
-  ASSERT_EQ(OB_SUCCESS, ctx.ls_.get_ls()->get_inc_sstable_uploader().check_inc_major_ddl_checkpoint_(
-      batch_key, pending));
-  ASSERT_TRUE(pending); // The local dump has not reached Shared yet.
+  // Keep the cached LS watermark independent of background upload scheduling.
+  ObLSIncSSTableUploader checkpoint_uploader(*ctx.ls_.get_ls());
+  (void)checkpoint_uploader.ckpt_scn_on_ss_ls_meta_.atomic_store(SCN::scn_dec(ctx.rec_scn_));
+  checkpoint_uploader.is_online_ = true;
+  checkpoint_uploader.finish_reloading_ = true;
+  // DLI-CACHED-READ-001: observe only this thread inside each readiness call.
+  lib::ObUnitTestEnableDiagnoseGuard enable_diagnose_guard;
+  const bool old_diagnose = lib::ObLibConfig::enable_diagnose_info_;
+  lib::reload_diagnose_info_config(true);
+  DEFER(lib::reload_diagnose_info_config(old_diagnose));
+  ASSERT_TRUE(lib::is_diagnose_info_enabled());
+  ObDiagnosticInfoSlot read_stats;
+  ObStatEventAddStat *read_count = read_stats.get_stats().get(ObStatEventIds::SS_META_READ_COUNT);
+  ASSERT_NE(nullptr, read_count);
+  // Calibrate with a successful Shared read so a disabled counter cannot pass.
+  {
+    ObTenantDiagnosticInfoSummaryGuard read_guard(&read_stats);
+    ASSERT_EQ(OB_SUCCESS, latest(ctx));
+  }
+  ASSERT_GT(read_count->stat_value_, 0);
+  auto check_dump_ready_without_shared_reads = [&](bool &ready) {
+    const int64_t reads_before = read_count->stat_value_;
+    int ret = OB_SUCCESS;
+    {
+      ObTenantDiagnosticInfoSummaryGuard read_guard(&read_stats);
+      ret = checkpoint_uploader.check_inc_major_dump_ready(batch_key, ready);
+    }
+    EXPECT_EQ(0, read_count->stat_value_ - reads_before)
+        << "dump readiness must not synchronously read Shared metadata";
+    return ret;
+  };
+  bool ready = false;
+  ASSERT_EQ(OB_SUCCESS, check_dump_ready_without_shared_reads(ready));
+  ASSERT_FALSE(ready); // The local dump has not reached Shared yet.
   ObArray<ObSSMetaCtrlKeyInfo> keys;
   ASSERT_EQ(OB_SUCCESS, MTL(ObSSMetaService *)->update_tablet_table_store(ctx.ls_id_,
       ctx.tablet_id_, ctx.reorganization_scn_,
@@ -413,9 +445,34 @@ TEST_F(TestDliEndRecCheckpoint, dump_checkpoint_does_not_skip_final_publication)
   ASSERT_EQ(0, count);
   ASSERT_EQ(ctx.rec_scn_, ctx.shared_.get_obj()->get_ddl_checkpoint_scn());
   ASSERT_LT(ctx.shared_.get_obj()->get_ddl_checkpoint_scn(), ctx.end_scn_);
-  ASSERT_EQ(OB_SUCCESS, ctx.ls_.get_ls()->get_inc_sstable_uploader().check_inc_major_ddl_checkpoint_(
-      batch_key, pending));
-  ASSERT_FALSE(pending);
+  ASSERT_EQ(OB_SUCCESS, check_dump_ready_without_shared_reads(ready));
+  ASSERT_FALSE(ready); // Shared DDL progress alone does not advance the cached LS watermark.
+  // Repeated checks must return while the cache stays behind. This measures the
+  // hot local check, not background checkpoint advancement or a production SLA.
+  const int64_t check_count = 100;
+  int64_t max_check_us = 0;
+  const int64_t checks_started = ObTimeUtility::current_monotonic_time();
+  for (int64_t i = 0; i < check_count; ++i) {
+    const int64_t started = ObTimeUtility::current_monotonic_time();
+    ASSERT_EQ(OB_SUCCESS, check_dump_ready_without_shared_reads(ready));
+    const int64_t elapsed_us = ObTimeUtility::current_monotonic_time() - started;
+    max_check_us = MAX(max_check_us, elapsed_us);
+    ASSERT_FALSE(ready);
+  }
+  const int64_t total_check_us = ObTimeUtility::current_monotonic_time() - checks_started;
+  RecordProperty("cached_checkpoint_pending_checks", static_cast<int>(check_count));
+  RecordProperty("cached_checkpoint_checks_total_us", static_cast<int>(total_check_us));
+  RecordProperty("cached_checkpoint_check_max_us", static_cast<int>(max_check_us));
+  // The fixture exits before GTest writes XML, so retain timing in stdout too.
+  fprintf(stdout, "DLI_CACHED_CHECKPOINT_TIMING count=%ld total_us=%ld max_us=%ld\n",
+      check_count, total_check_us, max_check_us);
+  fflush(stdout);
+  (void)checkpoint_uploader.ckpt_scn_on_ss_ls_meta_.atomic_store(ctx.rec_scn_);
+  ASSERT_EQ(OB_SUCCESS, check_dump_ready_without_shared_reads(ready));
+  ASSERT_TRUE(ready);
+  (void)checkpoint_uploader.ckpt_scn_on_ss_ls_meta_.atomic_store(SCN::scn_inc(ctx.rec_scn_));
+  ASSERT_EQ(OB_SUCCESS, check_dump_ready_without_shared_reads(ready));
+  ASSERT_TRUE(ready);
   ObTableStoreIterator installed_dumps;
   ASSERT_EQ(OB_SUCCESS, ctx.shared_.get_obj()->get_inc_major_ddl_sstables(
       installed_dumps, ObTransID(77001), ObTxSEQ(1, 0)));
