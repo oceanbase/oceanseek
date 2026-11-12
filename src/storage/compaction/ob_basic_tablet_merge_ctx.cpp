@@ -20,6 +20,7 @@
 #include "share/truncate_info/ob_truncate_info_util.h"
 #include "storage/compaction/filter/ob_rowscn_filter.h"
 #include "storage/compaction_ttl/ob_mlog_purge_info_helper.h"
+#include "storage/compaction_v2/ob_ss_compact_helper.h"
 
 namespace oceanbase
 {
@@ -908,6 +909,8 @@ int ObBasicTabletMergeCtx::get_ls_and_tablet()
     ret = OB_CANCELED;
     LOG_INFO("ls offline, skip merge", K(ret), "param", get_dag_param());
   } else if (FALSE_IT(static_param_.ls_rebuild_seq_ = ls_handle.get_ls()->get_rebuild_seq())) {
+  } else if (OB_FAIL(ensure_async_index_compaction_inputs_())) {
+    LOG_WARN("failed to ensure async index compaction inputs", K(ret), K(static_param_));
   } else if (get_dag_param().need_swap_tablet_flag_) {
     if (OB_FAIL(swap_tablet())) {
       LOG_WARN("failed to swap tablet", K(ret), K(static_param_));
@@ -918,6 +921,23 @@ int ObBasicTabletMergeCtx::get_ls_and_tablet()
           0/*timeout_us*/,
           storage::ObMDSGetTabletMode::READ_ALL_COMMITED))) {
     LOG_WARN("failed to get tablet", K(ret), K(static_param_));
+  }
+  return ret;
+}
+
+// Temporary async index Link before acquiring the merge tablet.
+int ObBasicTabletMergeCtx::ensure_async_index_compaction_inputs_()
+{
+  int ret = OB_SUCCESS;
+  if (is_major_merge_type(get_merge_type()) || is_inc_major_merge(get_merge_type())) {
+    ObTabletHandle tablet_handle;
+    if (OB_FAIL(get_ls()->get_tablet_svr()->ha_get_tablet(get_tablet_id(), tablet_handle))) {
+      LOG_WARN("failed to get tablet for async index type check", K(ret), K(static_param_));
+    } else if (tablet_handle.get_obj()->is_async_index()
+        && OB_FAIL(share::SSCompactHelper::ensure_async_index_tablet_ready(
+            *get_ls(), get_tablet_id()))) {
+      LOG_WARN("failed to ensure async index tablet", K(ret), K(static_param_));
+    }
   }
   return ret;
 }

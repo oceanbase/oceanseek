@@ -279,6 +279,10 @@ public:
   ObLSWRSHandler *get_ls_wrs_handler() { return &ls_wrs_handler_; }
   rootserver::ObLSRecoveryStatHandler *get_ls_recovery_stat_handler() { return &ls_recovery_stat_handler_; }
   ObLSTabletService *get_tablet_svr() { return &ls_tablet_svr_; }
+  bool is_async_index_leader() const
+  { return ls_async_index_scheduler_.is_leader(); }
+  int64_t get_async_index_leader_epoch() const
+  { return ls_async_index_scheduler_.get_leader_epoch(); }
   share::ObLSID get_ls_id() const { return ls_meta_.ls_id_; }
   bool is_sys_ls() const { return ls_meta_.ls_id_.is_sys_ls(); }
   int get_replica_status(ObReplicaStatus &replica_status);

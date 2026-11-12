@@ -16,6 +16,7 @@
 #include "storage/schema_utils.h"
 #include "storage/test_dml_common.h"
 #include "storage/test_tablet_helper.h"
+#include "storage/compaction_v2/ob_ss_compact_helper.h"
 #include "unittest/storage/slog/simple_ob_storage_redo_module.h"
 
 namespace oceanbase
@@ -1047,6 +1048,76 @@ TEST_F(TestLSTabletService, test_update_empty_shell)
   ret = ls_tablet_service_->do_remove_tablet(ls_id_, tablet_id);
   ASSERT_EQ(OB_SUCCESS, ret);
   const int64_t inner_tablet_count = INNER_TABLET_CNT;
+  valid_tablet_num(inner_tablet_count);
+}
+
+TEST_F(TestLSTabletService, test_async_index_empty_shell_readiness)
+{
+  const int64_t inner_tablet_count = INNER_TABLET_CNT;
+  const ObTabletID tablet_id(10000015);
+  ObTableSchema schema;
+  TestSchemaUtils::prepare_data_schema(schema);
+  schema.set_table_type(USER_INDEX);
+  schema.set_index_type(INDEX_TYPE_ASYNC_DELETE_INDEX_LOCAL);
+  schema.set_index_status(INDEX_STATUS_AVAILABLE);
+  ObLSHandle ls_handle;
+  ASSERT_EQ(OB_SUCCESS, MTL(ObLSService *)->get_ls(
+      ls_id_, ls_handle, ObLSGetMod::STORAGE_MOD));
+  ASSERT_EQ(OB_SUCCESS, TestTabletHelper::create_tablet(
+      ls_handle, tablet_id, schema, allocator_, ObTabletStatus::DELETED));
+
+  ObTabletHandle tablet_handle;
+  ASSERT_EQ(OB_SUCCESS, ls_tablet_service_->get_tablet(
+      tablet_id, tablet_handle, 0, ObMDSGetTabletMode::READ_WITHOUT_CHECK));
+  ASSERT_TRUE(tablet_handle.get_obj()->is_async_index());
+  ObTabletHandle ready_handle;
+  {
+    // This healthy subcase exercises an already-checked leader fast path.
+    ObLSAsyncIndexScheduler &scheduler = ls_handle.get_ls()->ls_async_index_scheduler_;
+    const bool saved_leader = scheduler.is_leader();
+    DEFER(ATOMIC_STORE(&scheduler.is_leader_, saved_leader));
+    ATOMIC_STORE(&scheduler.is_leader_, true);
+    const int64_t epoch = ls_handle.get_ls()->get_async_index_leader_epoch();
+    tablet_handle.get_obj()->get_pointer_handle().get_tablet_pointer()->
+        set_async_index_checked_leader_epoch(epoch);
+    ASSERT_EQ(OB_SUCCESS, share::SSCompactHelper::ensure_async_index_tablet_ready(
+        *ls_handle.get_ls(), tablet_id));
+    ASSERT_EQ(OB_SUCCESS, ls_tablet_service_->get_tablet(
+        tablet_id, ready_handle, 0, ObMDSGetTabletMode::READ_WITHOUT_CHECK));
+    ASSERT_EQ(tablet_handle.get_obj(), ready_handle.get_obj());
+  }
+  ready_handle.reset();
+  tablet_handle.reset();
+
+  ASSERT_EQ(OB_SUCCESS, ls_tablet_service_->update_tablet_to_empty_shell(
+      DATA_CURRENT_VERSION, tablet_id));
+  ASSERT_EQ(OB_SUCCESS, ls_tablet_service_->get_tablet(
+      tablet_id, tablet_handle, 0, ObMDSGetTabletMode::READ_WITHOUT_CHECK));
+  ASSERT_TRUE(tablet_handle.get_obj()->is_empty_shell());
+  ObTabletPointer *pointer = tablet_handle.get_obj()->get_pointer_handle().get_tablet_pointer();
+  pointer->set_async_index_checked_leader_epoch(-1);
+  EXPECT_EQ(OB_TABLET_NOT_EXIST, share::SSCompactHelper::ensure_async_index_tablet_ready(
+      *ls_handle.get_ls(), tablet_id));
+  EXPECT_EQ(-1, pointer->get_async_index_checked_leader_epoch());
+  tablet_handle.reset();
+
+  ASSERT_EQ(OB_SUCCESS, ls_tablet_service_->do_remove_tablet(ls_id_, tablet_id));
+  EXPECT_EQ(OB_TABLET_NOT_EXIST, share::SSCompactHelper::ensure_async_index_tablet_ready(
+      *ls_handle.get_ls(), tablet_id));
+
+  const ObTabletID data_tablet_id(10000016);
+  ObTableSchema data_schema;
+  TestSchemaUtils::prepare_data_schema(data_schema);
+  ASSERT_EQ(OB_SUCCESS, TestTabletHelper::create_tablet(
+      ls_handle, data_tablet_id, data_schema, allocator_));
+  ASSERT_EQ(OB_SUCCESS, ls_tablet_service_->get_tablet(data_tablet_id, tablet_handle));
+  ASSERT_FALSE(tablet_handle.get_obj()->is_async_index());
+  EXPECT_EQ(OB_INVALID_ARGUMENT, share::SSCompactHelper::ensure_async_index_tablet_ready(
+      *ls_handle.get_ls(), data_tablet_id));
+  EXPECT_EQ(-1, tablet_handle.get_obj()->get_pointer_handle().get_tablet_pointer()->
+      get_async_index_checked_leader_epoch());
+  tablet_handle.reset();
+  ASSERT_EQ(OB_SUCCESS, ls_tablet_service_->do_remove_tablet(ls_id_, data_tablet_id));
   valid_tablet_num(inner_tablet_count);
 }
 

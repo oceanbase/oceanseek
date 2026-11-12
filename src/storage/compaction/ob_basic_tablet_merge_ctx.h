@@ -389,6 +389,7 @@ public:
   virtual int64_t to_string(char* buf, const int64_t buf_len) const;
 
 protected:
+  int ensure_async_index_compaction_inputs_();
   int cal_major_merge_param(const bool force_full_merge,
                             ObProgressiveMergeMgr &progressive_mgr);
   int init_parallel_merge_ctx();

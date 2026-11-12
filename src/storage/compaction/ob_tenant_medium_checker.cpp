@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX STORAGE_COMPACTION
 #include "ob_tenant_medium_checker.h"
+#include "lib/allocator/ob_sql_mem_leak_checker.h"
 #include "storage/compaction/ob_medium_compaction_func.h"
 #include "storage/compaction/ob_server_compaction_event_history.h"
 #include "storage/tx_storage/ob_ls_service.h"
@@ -144,8 +145,12 @@ int ObTenantMediumChecker::refresh_ls_status()
           if (OB_HASH_NOT_EXIST != tmp_ret) {
             LOG_WARN("failed to get ls locality", K(tmp_ret), K(ls_id));
           }
-        } else if (OB_TMP_FAIL(ls_info_map_.set_refactored(ls_id, ls_info))) {
-          LOG_WARN("fail to set map", K(ret), K(ls_id));
+        } else {
+          // The cache owns the copied LS info beyond the current SQL request.
+          DISABLE_SQL_MEMLEAK_GUARD;
+          if (OB_TMP_FAIL(ls_info_map_.set_refactored(ls_id, ls_info))) {
+            LOG_WARN("fail to set map", K(ret), K(ls_id));
+          }
         }
       }
     }

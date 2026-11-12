@@ -102,6 +102,38 @@ void TestMetaPointerMap::FakeLs(ObLS &ls)
   ls.ls_meta_.store_format_ = common::ObLSStoreType::OB_LS_STORE_NORMAL;
 }
 
+TEST_F(TestMetaPointerMap, async_index_readiness_is_memory_only_and_survives_washing)
+{
+  ObTabletPointer pointer;
+  ASSERT_EQ(-1, pointer.get_async_index_checked_leader_epoch());
+  ObLSHandle ls_handle;
+  ObMemtableMgrHandle memtable_handle;
+  ObTabletPointer with_handles(ls_handle, memtable_handle);
+  ASSERT_EQ(-1, with_handles.get_async_index_checked_leader_epoch());
+
+  ObTabletAttr attr;
+  attr.iter_attr_.valid_ = true;
+  attr.reorganization_scn_ = SCN::base_scn();
+  ASSERT_EQ(OB_SUCCESS, pointer.set_tablet_attr(attr));
+  pointer.set_async_index_checked_leader_epoch(7);
+  pointer.reset_obj();
+  ASSERT_EQ(7, pointer.get_async_index_checked_leader_epoch());
+  ASSERT_EQ(OB_SUCCESS, pointer.set_tablet_attr(attr));
+  ASSERT_EQ(7, pointer.get_async_index_checked_leader_epoch());
+
+  char *buf = static_cast<char *>(allocator_.alloc(pointer.get_deep_copy_size()));
+  ASSERT_NE(nullptr, buf);
+  ObTabletPointer *copied = nullptr;
+  ASSERT_EQ(OB_SUCCESS, pointer.deep_copy(buf, pointer.get_deep_copy_size(), copied));
+  ASSERT_NE(nullptr, copied);
+  ASSERT_EQ(7, copied->get_async_index_checked_leader_epoch());
+  copied->set_async_index_checked_leader_epoch(8);
+  copied->reset();
+  ASSERT_EQ(-1, copied->get_async_index_checked_leader_epoch());
+  copied->~ObTabletPointer();
+  allocator_.free(buf);
+}
+
 class CalculateSize final
 {
 public:

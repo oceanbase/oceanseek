@@ -7,6 +7,8 @@
 #include "storage/compaction/ob_async_index_merge_ctx.h"
 #include "share/schema/ob_tenant_schema_service.h"
 #include "share/table/ob_table_util.h"
+#include "storage/ls/ob_ls.h"
+#include "storage/compaction_v2/ob_ss_compact_helper.h"
 #include "storage/tablet/ob_tablet_medium_info_reader.h"
 
 namespace oceanbase
@@ -199,6 +201,9 @@ int ObAsyncIndexMergeCtx::check_deletion_bitmap_ready(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid deletion bitmap snapshot arguments", KR(ret),
         K(delete_index_tablet_id), K(async_snapshot));
+  } else if (OB_FAIL(share::SSCompactHelper::ensure_async_index_tablet_ready(
+      ls, delete_index_tablet_id))) {
+    LOG_WARN("failed to ensure deletion tablet readiness", KR(ret), K(delete_index_tablet_id));
   } else if (OB_FAIL(ls.get_tablet(delete_index_tablet_id, tablet_handle))) {
     LOG_WARN("failed to get deletion tablet", KR(ret), K(delete_index_tablet_id));
   } else if (OB_ISNULL(tablet_handle.get_obj())) {

@@ -3,6 +3,9 @@
 #define USING_LOG_PREFIX STORAGE
 #include "ob_ss_compact_helper.h"
 #include "share/compaction/ob_shared_storage_compaction_util.h"
+#include "storage/compaction/ob_medium_compaction_mgr.h"
+#include "storage/ls/ob_ls.h"
+#include "storage/meta_mem/ob_tablet_pointer.h"
 #include "storage/compaction_v2/ob_ss_link_major_task.h"
 #include "storage/compaction_v2/ob_ss_link_inc_major_task.h"
 #include "storage/incremental/ob_shared_meta_service.h"
@@ -11,6 +14,10 @@
 #include "storage/compaction_v2/ob_ss_skip_major_merge_dag.h"
 #include "storage/compaction_v2/ob_ss_link_major_dag.h"
 #include "storage/incremental/ob_inc_sstable_upload_task.h"
+#include "lib/worker.h"
+#ifdef ERRSIM
+#include "lib/utility/ob_tracepoint.h"
+#endif
 
 namespace oceanbase
 {
@@ -40,6 +47,9 @@ int SSCompactHelper::check_is_sswriter(const share::ObLSID &ls_id,
   return check_is_sswriter(ls_id, tablet_id, epoch);
 }
 
+#ifdef ERRSIM
+ERRSIM_POINT_DEF(EN_ASYNC_INDEX_LINK_MAJOR_ERROR);
+#endif
 int SSCompactHelper::link_major(const share::ObLSID &ls_id,
                                 const common::ObTabletID &tablet_id,
                                 const ObMergeType merge_type,
@@ -48,8 +58,22 @@ int SSCompactHelper::link_major(const share::ObLSID &ls_id,
                                 const bool prewarm,
                                 const bool report)
 {
-  ObTabletSSLinkMajorTask task(ls_id, tablet_id, snapshot_version, merge_base_version, merge_type, prewarm, report);
-  return task.process();
+  int ret = OB_SUCCESS;
+#ifdef ERRSIM
+  // Match Major by +tablet_id and IncMajor by -tablet_id for independent failures.
+  const int64_t target = is_inc_major_merge(merge_type)
+      ? -static_cast<int64_t>(tablet_id.id()) : static_cast<int64_t>(tablet_id.id());
+  if (OB_FAIL(EVENT_CALL(EN_ASYNC_INDEX_LINK_MAJOR_ERROR, target))) {
+    LOG_INFO("ERRSIM async index link major failed", KR(ret), K(ls_id), K(tablet_id),
+        K(merge_type));
+  }
+#endif
+  if (OB_SUCC(ret)) {
+    ObTabletSSLinkMajorTask task(ls_id, tablet_id, snapshot_version, merge_base_version,
+        merge_type, prewarm, report);
+    ret = task.process();
+  }
+  return ret;
 }
 
 // create major sstable atomic protocol with gc rely infos
@@ -339,6 +363,135 @@ bool SSCompactHelper::check_ls_dag_need_cancel(const ObIDag &dag, const ObLSID &
   }
   return recognized;
 }
+
+// Temporary leader-switch workaround, kept separate from the query's original flow.
+int SSCompactHelper::ensure_async_index_tablets_ready(
+    storage::ObLS &ls,
+    const common::ObIArray<common::ObTabletID> &index_tablet_ids,
+    const common::ObTabletID &delete_tablet_id)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < index_tablet_ids.count(); ++i) {
+    const common::ObTabletID &tablet_id = index_tablet_ids.at(i);
+    if (OB_FAIL(ensure_async_index_tablet_ready_with_retry(ls, tablet_id))) {
+      LOG_WARN("failed to ensure async index tablet before query", K(ret), K(tablet_id));
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(ensure_async_index_tablet_ready_with_retry(ls, delete_tablet_id))) {
+    LOG_WARN("failed to ensure async delete tablet before query", K(ret), K(delete_tablet_id));
+  }
+  return ret;
+}
+
+int SSCompactHelper::ensure_async_index_tablet_ready_with_retry(
+    storage::ObLS &ls,
+    const common::ObTabletID &tablet_id)
+{
+  int ret = OB_SUCCESS;
+  const int64_t timeout_ts = THIS_WORKER.get_timeout_ts();
+  const int64_t RETRY_INTERVAL_US = 1_ms;
+  if (INT64_MAX == timeout_ts) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("async index query readiness requires a deadline", K(ret), K(tablet_id));
+  } else {
+    for (int64_t retry_count = 0; ; ++retry_count) {
+      if (THIS_WORKER.get_timeout_remain() <= 0) {
+        ret = OB_TIMEOUT;
+        LOG_WARN("async index query readiness timed out", K(ret), K(retry_count),
+            K(tablet_id));
+        break;
+      }
+      ret = ensure_async_index_tablet_ready(ls, tablet_id);
+      if (OB_EAGAIN != ret) {
+        if (OB_SUCCESS != ret) {
+          LOG_WARN("stop retrying async index query readiness", K(ret), K(retry_count),
+              K(tablet_id));
+        }
+        break;
+      }
+      if (REACH_THREAD_TIME_INTERVAL(1_s)) {
+        LOG_INFO("retry async index query readiness", K(ret), K(retry_count), K(tablet_id));
+      }
+      ob_usleep(RETRY_INTERVAL_US);
+    }
+  }
+  return ret;
+}
+
+int SSCompactHelper::ensure_async_index_tablet_ready(
+    storage::ObLS &ls,
+    const common::ObTabletID &tablet_id)
+{
+  int ret = OB_SUCCESS;
+  storage::ObTabletHandle tablet_handle;
+  if (OB_FAIL(ls.get_tablet_svr()->ha_get_tablet(tablet_id, tablet_handle))) {
+    LOG_WARN("failed to get tablet for async index Link", K(ret), K(tablet_id));
+  } else if (!tablet_handle.get_obj()->is_async_index()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("tablet is not an async index", K(ret), K(tablet_id));
+  } else if (tablet_handle.get_obj()->get_tablet_meta().has_transfer_table()) {
+    ret = OB_REPLICA_NOT_READABLE;
+    LOG_WARN("async index tablet is waiting for transfer backfill", K(ret), K(tablet_id));
+  } else {
+    // Pair with switch_to_leader: publish epoch before role, read role before epoch.
+    const bool is_leader = ls.is_async_index_leader();
+    const int64_t epoch = ls.get_async_index_leader_epoch();
+    storage::ObTabletPointer *pointer =
+        tablet_handle.get_obj()->get_pointer_handle().get_tablet_pointer();
+    if (!is_leader || pointer->get_async_index_checked_leader_epoch() != epoch) {
+      if (OB_FAIL(link_async_index_compactions_(*tablet_handle.get_obj()))) {
+        LOG_WARN("failed to ensure async index compactions", K(ret), K(tablet_id));
+      } else {
+        pointer->set_async_index_checked_leader_epoch(epoch);
+        LOG_INFO("async index tablet is ready for checked role epoch", K(tablet_id), K(epoch));
+      }
+    }
+  }
+  return ret;
+}
+
+int SSCompactHelper::link_async_index_compactions_(const storage::ObTablet &tablet)
+{
+  int ret = OB_SUCCESS;
+  ObArenaAllocator allocator(ObMemAttr(MTL_ID(), "AsyncReadReady"));
+  const ObMediumCompactionInfoList *medium_list = nullptr;
+  const ObLSID ls_id = tablet.get_ls_id();
+  const ObTabletID tablet_id = tablet.get_tablet_id();
+  int64_t last_major = tablet.get_last_major_snapshot_version();
+  int64_t last_inc_major = tablet.get_last_inc_major_snapshot_version();
+  if (OB_FAIL(tablet.read_medium_info_list(allocator, medium_list))) {
+    LOG_WARN("failed to read async index medium info", K(ret), K(tablet_id));
+  } else {
+    DLIST_FOREACH_X(info, medium_list->get_list(), OB_SUCC(ret)) {
+      const bool is_inc_major = info->is_inc_major_compaction();
+      int64_t &last_snapshot = is_inc_major ? last_inc_major : last_major;
+      const int64_t snapshot = info->medium_snapshot_;
+      const int64_t base_version = info->merge_base_version_;
+      if (snapshot <= last_snapshot) {
+        continue;
+      }
+      if (OB_FAIL(SSCompactHelper::link_major(ls_id, tablet_id,
+          is_inc_major ? INC_MAJOR_MERGE : MEDIUM_MERGE,
+          snapshot, base_version, false /*prewarm*/, true /*report*/))) {
+        if (OB_ENTRY_NOT_EXIST == ret) {
+          ret = OB_SUCCESS;
+          continue;
+        }
+        LOG_WARN("failed to link pending async index compaction", K(ret),
+            K(ls_id), K(tablet_id), K(snapshot), K(base_version));
+      } else {
+        last_snapshot = snapshot;
+        LOG_INFO("synchronously linked pending async index compaction",
+            K(ls_id), K(tablet_id), K(is_inc_major), K(snapshot), K(base_version));
+      }
+    }
+  }
+  if (OB_NOT_NULL(medium_list)) {
+    medium_list->~ObMediumCompactionInfoList();
+  }
+  return ret;
+}
+
 
 } // namespace compaction
 } // namespace oceanbase

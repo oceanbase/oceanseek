@@ -120,11 +120,15 @@ public:
   bool get_initial_state() const;
   ObTabletResidentInfo get_tablet_resident_info(const ObTabletMapKey &key) const;
   bool is_empty_shell() const { return attr_.is_empty_shell(); }
+  int64_t get_async_index_checked_leader_epoch() const
+  { return ATOMIC_LOAD(&async_index_checked_leader_epoch_); }
+  void set_async_index_checked_leader_epoch(const int64_t epoch)
+  { ATOMIC_STORE(&async_index_checked_leader_epoch_, epoch); }
 
   // do not KPC memtable_mgr, may dead lock
   VIRTUAL_TO_STRING_KV(K_(phy_addr), K_(obj), K_(ls_handle), K_(ddl_kv_mgr_handle), K_(attr),
       K_(protected_memtable_mgr_handle), K_(ddl_info), KP_(old_version_chain), K_(flying),
-      K_(next_meta_version), K_(last_gc_version));
+      K_(next_meta_version), K_(last_gc_version), K_(async_index_checked_leader_epoch));
 private:
   int get_in_memory_obj(ObTabletHandle &guard);
   int get_attr_for_obj(ObTablet *t);
@@ -198,7 +202,9 @@ private:
   ObTabletAttr attr_; // 120B
   int64_t next_meta_version_; // 8B(for SS private tablet)
   int64_t last_gc_version_; // 8B(for SS private block gc)
-  DISALLOW_COPY_AND_ASSIGN(ObTabletPointer); // 408B
+  // Pure memory: survive tablet replacement/washing; LS role changes invalidate the epoch.
+  int64_t async_index_checked_leader_epoch_; // 8B
+  DISALLOW_COPY_AND_ASSIGN(ObTabletPointer);
 };
 
 
