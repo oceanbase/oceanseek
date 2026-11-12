@@ -1442,10 +1442,15 @@ int ObDSLResolver::formalize_exprs()
 int ObDSLResolver::get_col_idx_info(const ObString &col_name, ObColumnIndexInfo *&idx_info)
 {
   int ret = OB_SUCCESS;
+  ObString lower_name;
   idx_info = nullptr;
+  // Column expressions retain the schema spelling, while init_col_idx_map()
+  // stores lowercase keys. Normalize here for all index lookup callers.
   if (!col_idx_map_.created()) {
     // do nothing
-  } else if (OB_FAIL(col_idx_map_.get_refactored(col_name, idx_info))) {
+  } else if (OB_FAIL(ObCharset::tolower(CS_TYPE_UTF8MB4_GENERAL_CI, col_name, lower_name, *allocator_))) {
+    LOG_WARN("fail to lower column name", K(ret), K(col_name));
+  } else if (OB_FAIL(col_idx_map_.get_refactored(lower_name, idx_info))) {
     if (OB_HASH_NOT_EXIST == ret) {
       ret = OB_SUCCESS;
     } else {
@@ -1462,15 +1467,8 @@ int ObDSLResolver::get_dist_algo_type(
 {
   int ret = OB_SUCCESS;
   ObColumnIndexInfo *idx_info = nullptr;
-  ObString col_name;
   is_brute_force = false;
-  // Column expressions retain the schema spelling, while init_col_idx_map()
-  // stores lowercase keys. A case mismatch must not turn indexed KNN into
-  // brute force or change the distance algorithm configured on the index.
-  if (OB_FAIL(ObCharset::tolower(CS_TYPE_UTF8MB4_GENERAL_CI,
-                                field_expr->get_column_name(), col_name, *allocator_))) {
-    LOG_WARN("fail to lower vector column name", K(ret), K(field_expr->get_column_name()));
-  } else if (OB_FAIL(get_col_idx_info(col_name, idx_info))) {
+  if (OB_FAIL(get_col_idx_info(field_expr->get_column_name(), idx_info))) {
     LOG_WARN("fail to get col idx info", K(ret), K(field_expr->get_column_name()));
   } else if (OB_ISNULL(idx_info)) {
     // No vector index on this column, default to cosine distance.
@@ -7352,11 +7350,14 @@ int ObDSLResolver::get_declared_nested_paths_for_column(const ObString &col_name
 {
   int ret = OB_SUCCESS;
   const ObColumnSchemaV2 *col_schema = nullptr;
+  ObString lower_name;
   out.reset();
   if (col_name.empty()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("empty column name in get_declared_nested_paths_for_column", K(ret));
-  } else if (OB_FAIL(col_schema_map_.get_refactored(col_name, col_schema))) {
+  } else if (OB_FAIL(ObCharset::tolower(CS_TYPE_UTF8MB4_GENERAL_CI, col_name, lower_name, *allocator_))) {
+    LOG_WARN("fail to lower column name", K(ret), K(col_name));
+  } else if (OB_FAIL(col_schema_map_.get_refactored(lower_name, col_schema))) {
     if (OB_HASH_NOT_EXIST == ret) {
       ret = OB_INVALID_ARGUMENT;
       LOG_USER_ERROR(OB_INVALID_ARGUMENT, "nested query, column not found");
