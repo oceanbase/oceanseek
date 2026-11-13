@@ -2635,7 +2635,7 @@ int ObTableSqlService::batch_create_table(ObIArray<ObTableSchema> &tables,
       } else {
         // for user table
         // add ddl operation
-        if (OB_FAIL(log_operation_dml(opt, ddl_operation_dml, ddl_id_dml))) {
+        if (OB_FAIL(log_operation_dml(opt, ddl_operation_dml, ddl_id_dml, tenant_id))) {
           LOG_WARN("log operation failed", K(opt), KR(ret));
         }
       }

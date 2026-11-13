@@ -44,7 +44,7 @@ protected:
       const ObSchemaOperation &ddl_operation,
       share::ObDMLSqlSplicer &ddl_operation_dml,
       share::ObDMLSqlSplicer &ddl_id_dml,
-      const int64_t sql_tenant_id = OB_SYS_TENANT_ID);
+      const int64_t sql_tenant_id);
   int gen_ddl_operation_dml(
       const ObSchemaOperation &ddl_operation,
       const uint64_t exec_tenant_id,
