@@ -1910,6 +1910,7 @@ int ObCreateTableArg::assign(const ObCreateTableArg &other)
   OZ(sequence_ddl_arg_.assign(other.sequence_ddl_arg_));
   OZ(dep_infos_.assign(other.dep_infos_));
   OZ(mv_ainfo_.assign(other.mv_ainfo_));
+  OX(auto_grant_creator_privileges_ = other.auto_grant_creator_privileges_);
 
   return ret;
 }
@@ -1930,7 +1931,8 @@ DEF_TO_STRING(ObCreateTableArg)
        K_(error_info),
        K_(is_alter_view),
        K_(sequence_ddl_arg),
-       K_(dep_infos));
+       K_(dep_infos),
+       K_(auto_grant_creator_privileges));
   J_OBJ_END();
   return pos;
 }
@@ -1949,7 +1951,8 @@ OB_SERIALIZE_MEMBER((ObCreateTableArg, ObDDLArg),
                     is_alter_view_,
                     sequence_ddl_arg_,
                     dep_infos_,
-                    mv_ainfo_);
+                    mv_ainfo_,
+                    auto_grant_creator_privileges_);
 
 bool ObCreateTableArg::is_allow_when_upgrade() const
 {
@@ -1997,6 +2000,7 @@ int ObCreateTableLikeArg::assign(const ObCreateTableLikeArg &other)
     create_host_ = other.create_host_;
     session_id_ = other.session_id_;
     define_user_id_ = other.define_user_id_;
+    auto_grant_creator_privileges_ = other.auto_grant_creator_privileges_;
   }
   return ret;
 }
@@ -2015,7 +2019,8 @@ DEF_TO_STRING(ObCreateTableLikeArg)
        K_(create_host),
        K_(sequence_ddl_arg),
        K_(session_id),
-       K_(define_user_id));
+       K_(define_user_id),
+       K_(auto_grant_creator_privileges));
   J_OBJ_END();
   return pos;
 }
@@ -2031,7 +2036,8 @@ OB_SERIALIZE_MEMBER((ObCreateTableLikeArg, ObDDLArg),
                     create_host_,
                     sequence_ddl_arg_,
                     session_id_,
-                    define_user_id_);
+                    define_user_id_,
+                    auto_grant_creator_privileges_);
 
 int ObForkTableArg::assign(const ObForkTableArg &other)
 {
@@ -2047,6 +2053,7 @@ int ObForkTableArg::assign(const ObForkTableArg &other)
     session_id_ = other.session_id_;
     need_lock_src_table_ = other.need_lock_src_table_;
     copy_grants_ = other.copy_grants_;
+    creator_user_id_ = other.creator_user_id_;
   }
   return ret;
 }
@@ -2071,7 +2078,8 @@ DEF_TO_STRING(ObForkTableArg)
        K_(dst_table_name),
        K_(session_id),
        K_(need_lock_src_table),
-       K_(copy_grants));
+       K_(copy_grants),
+       K_(creator_user_id));
   J_OBJ_END();
   return pos;
 }
@@ -2084,7 +2092,8 @@ OB_SERIALIZE_MEMBER((ObForkTableArg, ObDDLArg),
                     dst_table_name_,
                     session_id_,
                     need_lock_src_table_,
-                    copy_grants_);
+                    copy_grants_,
+                    creator_user_id_);
 
 int ObForkDatabaseArg::assign(const ObForkDatabaseArg &other)
 {
@@ -2730,7 +2739,8 @@ OB_DEF_SERIALIZE(ObAlterTableArg)
               part_storage_cache_policy_,
               data_version_,
               enable_hidden_table_partition_pruning_,
-              async_index_offline_refresh_snapshot_);
+              async_index_offline_refresh_snapshot_,
+              auto_grant_creator_privileges_);
 
   return ret;
 }
@@ -2846,8 +2856,10 @@ OB_DEF_DESERIALIZE(ObAlterTableArg)
               data_version_,
               enable_hidden_table_partition_pruning_);
   async_index_offline_refresh_snapshot_ = 0;
+  auto_grant_creator_privileges_ = false;
   if (OB_SUCC(ret) && pos < data_len) {
     OB_UNIS_DECODE(async_index_offline_refresh_snapshot_);
+    OB_UNIS_DECODE(auto_grant_creator_privileges_);
   }
   return ret;
 }
@@ -2909,7 +2921,8 @@ OB_DEF_SERIALIZE_SIZE(ObAlterTableArg)
                 part_storage_cache_policy_,
                 data_version_,
                 enable_hidden_table_partition_pruning_,
-                async_index_offline_refresh_snapshot_);
+                async_index_offline_refresh_snapshot_,
+                auto_grant_creator_privileges_);
   }
 
   if (OB_FAIL(ret)) {

@@ -94,6 +94,8 @@ public:
     ASSERT_EQ(task_id, status.task_id_);
     ASSERT_EQ(INT64_MAX, status.ret_code_);
   }
+
+  static void check_legacy_task_recovery(bool has_snapshot);
 };
 
 // SQL 代理不可用时状态切换会退出；已成功任务的取消不能提前污染最终结果码。
@@ -385,6 +387,7 @@ TEST_F(TestTableRedefinitionTask, offline_refresh_snapshot_survives_task_recover
     ObTableRedefinitionTask src;
     prepare_task(src);
     src.alter_table_arg_.async_index_offline_refresh_snapshot_ = snapshot;
+    src.alter_table_arg_.auto_grant_creator_privileges_ = true;
     src.is_copy_indexes_ = true;
     src.is_copy_triggers_ = false;
     src.is_ignore_errors_ = true;
@@ -404,6 +407,7 @@ TEST_F(TestTableRedefinitionTask, offline_refresh_snapshot_survives_task_recover
     ASSERT_SUCC(recovered.deserialize_params_from_message(src.tenant_id_, buf, size, pos));
     ASSERT_EQ(size, pos);
     ASSERT_EQ(snapshot, recovered.alter_table_arg_.async_index_offline_refresh_snapshot_);
+    ASSERT_TRUE(recovered.alter_table_arg_.auto_grant_creator_privileges_);
     ASSERT_TRUE(recovered.is_copy_indexes_);
     ASSERT_FALSE(recovered.is_copy_triggers_);
     ASSERT_TRUE(recovered.is_ignore_errors_);
@@ -413,16 +417,17 @@ TEST_F(TestTableRedefinitionTask, offline_refresh_snapshot_survives_task_recover
     obrpc::ObAlterTableArg rpc_copy;
     ASSERT_SUCC(ObDDLTask::deep_copy_table_arg(allocator, recovered.alter_table_arg_, rpc_copy));
     ASSERT_EQ(snapshot, rpc_copy.async_index_offline_refresh_snapshot_);
+    ASSERT_TRUE(rpc_copy.auto_grant_creator_privileges_);
   }
 }
 
-// 从完整任务消息中移除新字段，并同步缩短内层 UNIS 长度，模拟真实旧包消息。
-// 保留外层 copy flags/子任务，防止仅截断整个缓冲区导致兼容性测试假通过。
-TEST_F(TestTableRedefinitionTask, legacy_task_without_offline_refresh_snapshot)
+// 两种旧格式都没有授权字段；更早的格式也没有 snapshot。保留外层 flags 和子任务。
+void TestTableRedefinitionTask::check_legacy_task_recovery(const bool has_snapshot)
 {
   ObTableRedefinitionTask src;
   prepare_task(src);
   src.alter_table_arg_.async_index_offline_refresh_snapshot_ = 1791184635690904000L;
+  src.alter_table_arg_.auto_grant_creator_privileges_ = true;
   src.is_copy_indexes_ = true;
   src.is_ignore_errors_ = true;
   src.target_cg_cnt_ = 11;
@@ -432,51 +437,65 @@ TEST_F(TestTableRedefinitionTask, legacy_task_without_offline_refresh_snapshot)
   ObArenaAllocator allocator;
   const int64_t size = src.get_serialize_param_size();
   char *buf = static_cast<char *>(allocator.alloc(size));
-  char *prefix = static_cast<char *>(allocator.alloc(size));
   ASSERT_NE(nullptr, buf);
-  ASSERT_NE(nullptr, prefix);
   int64_t pos = 0;
   ASSERT_SUCC(src.serialize_params_to_message(buf, size, pos));
   ASSERT_EQ(size, pos);
-  int64_t arg_pos = 0;
-  ASSERT_SUCC(src.ObDDLTask::serialize_params_to_message(prefix, size, arg_pos));
+  const int64_t arg_start = src.ObDDLTask::get_serialize_param_size();
+  int64_t arg_pos = arg_start;
   int64_t version = 0;
   ASSERT_SUCC(serialization::decode_vi64(buf, size, arg_pos, &version));
   const int64_t length_pos = arg_pos;
   int64_t payload_length = 0;
   ASSERT_SUCC(serialization::decode_vi64(buf, size, arg_pos, &payload_length));
   const int64_t length_bytes = arg_pos - length_pos;
-  const int64_t field_size = serialization::encoded_length_vi64(
-      src.alter_table_arg_.async_index_offline_refresh_snapshot_);
+  const int64_t snapshot = src.alter_table_arg_.async_index_offline_refresh_snapshot_;
+  const int64_t expected_snapshot = has_snapshot ? snapshot : 0;
+  int64_t removed_size = serialization::encoded_length_bool(
+      src.alter_table_arg_.auto_grant_creator_privileges_);
+  if (!has_snapshot) {
+    removed_size += serialization::encoded_length_vi64(snapshot);
+  }
   const int64_t arg_end = arg_pos + payload_length;
-  ASSERT_GT(payload_length, field_size);
+  ASSERT_GT(payload_length, removed_size);
   ASSERT_LT(arg_end, size);
-  MEMMOVE(buf + arg_end - field_size, buf + arg_end, size - arg_end);
+  MEMMOVE(buf + arg_end - removed_size, buf + arg_end, size - arg_end);
   pos = 0;
   ASSERT_SUCC(serialization::encode_fixed_bytes_i64(
-      buf + length_pos, length_bytes, pos, payload_length - field_size));
-  const int64_t legacy_size = size - field_size;
+      buf + length_pos, length_bytes, pos, payload_length - removed_size));
+  const int64_t legacy_size = size - removed_size;
   ObTableRedefinitionTask recovered;
-  // 目标对象先放非零值，确认旧消息解码主动清零，而非只依赖构造函数。
+  // 预置非默认值，确认恢复时会覆盖旧值。
   recovered.alter_table_arg_.async_index_offline_refresh_snapshot_ = 123;
+  recovered.alter_table_arg_.auto_grant_creator_privileges_ = true;
   pos = 0;
   ASSERT_SUCC(recovered.deserialize_params_from_message(src.tenant_id_, buf, legacy_size, pos));
   ASSERT_EQ(legacy_size, pos);
-  ASSERT_EQ(0, recovered.alter_table_arg_.async_index_offline_refresh_snapshot_);
+  ASSERT_EQ(expected_snapshot, recovered.alter_table_arg_.async_index_offline_refresh_snapshot_);
+  ASSERT_FALSE(recovered.alter_table_arg_.auto_grant_creator_privileges_);
   ASSERT_TRUE(recovered.is_copy_indexes_);
   ASSERT_TRUE(recovered.is_ignore_errors_);
   ASSERT_EQ(11, recovered.target_cg_cnt_);
   assert_recovered_child(recovered, 500001, 7001);
-  // 直接复用参数对象解码旧格式，验证 deserialize_ 自身清零。
+  // 直接复用参数对象，验证反序列化会重置缺失字段。
   obrpc::ObAlterTableArg reused;
   reused.async_index_offline_refresh_snapshot_ = 456;
-  pos = 0;
-  int64_t base_end = 0;
-  ASSERT_SUCC(src.ObDDLTask::serialize_params_to_message(prefix, size, base_end));
-  pos = base_end;
+  reused.auto_grant_creator_privileges_ = true;
+  pos = arg_start;
   ASSERT_SUCC(reused.deserialize(buf, legacy_size, pos));
-  ASSERT_EQ(0, reused.async_index_offline_refresh_snapshot_);
-  ASSERT_EQ(arg_end - field_size, pos);
+  ASSERT_EQ(expected_snapshot, reused.async_index_offline_refresh_snapshot_);
+  ASSERT_FALSE(reused.auto_grant_creator_privileges_);
+  ASSERT_EQ(arg_end - removed_size, pos);
+}
+
+TEST_F(TestTableRedefinitionTask, legacy_task_without_offline_refresh_snapshot)
+{
+  check_legacy_task_recovery(false);
+}
+
+TEST_F(TestTableRedefinitionTask, legacy_task_without_auto_grant_creator_privileges)
+{
+  check_legacy_task_recovery(true);
 }
 
 } // namespace unittest

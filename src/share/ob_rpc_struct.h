@@ -1282,7 +1282,8 @@ public:
       is_alter_view_(false),
       sequence_ddl_arg_(),
       dep_infos_(),
-      mv_ainfo_()
+      mv_ainfo_(),
+      auto_grant_creator_privileges_(false)
   {}
   explicit ObCreateTableArg(common::ObIAllocator *allocator) :
            ObDDLArg(),
@@ -1299,7 +1300,8 @@ public:
            is_alter_view_(false),
            sequence_ddl_arg_(),
            dep_infos_(),
-           mv_ainfo_()
+           mv_ainfo_(),
+           auto_grant_creator_privileges_(false)
   {}
   bool is_valid() const;
   virtual bool is_allow_when_upgrade() const;
@@ -1321,6 +1323,7 @@ public:
   ObSequenceDDLArg sequence_ddl_arg_;
   common::ObSArray<oceanbase::share::schema::ObDependencyInfo> dep_infos_;
   common::ObSArray<ObMVAdditionalInfo> mv_ainfo_;
+  bool auto_grant_creator_privileges_;
 };
 
 struct ObCreateTableRes
@@ -1386,7 +1389,8 @@ public:
       create_host_(),
       sequence_ddl_arg_(),
       session_id_(0),
-      define_user_id_(common::OB_INVALID_ID)
+      define_user_id_(common::OB_INVALID_ID),
+      auto_grant_creator_privileges_(false)
   {}
   bool is_valid() const;
   int assign(const ObCreateTableLikeArg &other);
@@ -1404,6 +1408,7 @@ public:
   ObSequenceDDLArg sequence_ddl_arg_;
   int64_t session_id_;
   uint64_t define_user_id_;
+  bool auto_grant_creator_privileges_;
 };
 
 struct ObForkTableArg : public ObDDLArg
@@ -1419,7 +1424,8 @@ public:
       dst_table_name_(),
       session_id_(0),
       need_lock_src_table_(false),
-      copy_grants_(false)
+      copy_grants_(false),
+      creator_user_id_(common::OB_INVALID_ID)
   {}
   bool is_valid() const;
   virtual bool is_allow_when_upgrade() const { return true; }
@@ -1434,6 +1440,7 @@ public:
   int64_t session_id_;
   bool need_lock_src_table_;
   bool copy_grants_;
+  uint64_t creator_user_id_;
 };
 
 struct ObForkDatabaseArg : public ObDDLArg
@@ -2716,7 +2723,8 @@ public:
       part_storage_cache_policy_(),
       data_version_(0),
       enable_hidden_table_partition_pruning_(false),
-      async_index_offline_refresh_snapshot_(0)
+      async_index_offline_refresh_snapshot_(0),
+      auto_grant_creator_privileges_(false)
   {
   }
   virtual ~ObAlterTableArg()
@@ -2894,6 +2902,8 @@ public:
   uint64_t data_version_;
   bool enable_hidden_table_partition_pruning_;
   int64_t async_index_offline_refresh_snapshot_;
+  // Reserved for the rename that publishes a CTAS table.
+  bool auto_grant_creator_privileges_;
   int serialize_index_args(char *buf, const int64_t data_len, int64_t &pos) const;
   int deserialize_index_args(const char *buf, const int64_t data_len, int64_t &pos);
   int64_t get_index_args_serialize_size() const;
