@@ -181,6 +181,87 @@ TEST_F(TestSearchIndexLifecycleSchema, fts_and_delete_expand_independently_of_st
   ASSERT_EQ(1, targets_.count());
 }
 
+TEST_F(TestSearchIndexLifecycleSchema, async_ivf_expands_to_itself_including_building_indexes)
+{
+  ObTableSchema ivf;
+  init_schema(ivf, 5600, base_.get_table_id(), INDEX_TYPE_ASYNC_IVF_INDEX_LOCAL);
+  ASSERT_NO_FATAL_FAILURE(add_child(base_, ivf));
+  ASSERT_EQ(OB_SUCCESS, catalog_.add(ivf));
+  for (const ObIndexStatus status : {INDEX_STATUS_UNAVAILABLE, INDEX_STATUS_INDEX_ERROR,
+       INDEX_STATUS_UNUSABLE, INDEX_STATUS_AVAILABLE}) {
+    SCOPED_TRACE(status);
+    ivf.set_index_status(status);
+    // Seed the output with Search children to check that IVF replaces it.
+    ASSERT_EQ(OB_SUCCESS, collect());
+    ASSERT_EQ(OB_SUCCESS, ObSearchIndexLifecycleUtil::expand_async_index(base_, ivf, targets_));
+    ASSERT_EQ(1, targets_.count());
+    expect_target(ivf.get_table_id(), INDEX_TYPE_ASYNC_IVF_INDEX_LOCAL, OB_INVALID_ID);
+    EXPECT_FALSE(targets_.at(0).is_delete_);
+    const ObTableSchema *resolved = nullptr;
+    ASSERT_EQ(OB_SUCCESS, ObSearchIndexLifecycleUtil::get_target_schema(
+        guard_, base_, targets_.at(0), resolved));
+    EXPECT_EQ(&ivf, resolved);
+  }
+}
+
+TEST_F(TestSearchIndexLifecycleSchema, async_ivf_preserves_parent_and_tenant_validation)
+{
+  ObTableSchema ivf;
+  init_schema(ivf, 5600, base_.get_table_id(), INDEX_TYPE_ASYNC_IVF_INDEX_LOCAL);
+  for (const bool wrong_tenant : {false, true}) {
+    SCOPED_TRACE(wrong_tenant);
+    ivf.set_tenant_id(wrong_tenant ? base_.get_tenant_id() + 1 : base_.get_tenant_id());
+    ivf.set_data_table_id(wrong_tenant ? base_.get_table_id() : base_.get_table_id() + 1);
+    ASSERT_EQ(OB_SUCCESS, collect());
+    ASSERT_EQ(OB_ERR_UNEXPECTED,
+        ObSearchIndexLifecycleUtil::expand_async_index(base_, ivf, targets_));
+    EXPECT_TRUE(targets_.empty());
+  }
+}
+
+TEST_F(TestSearchIndexLifecycleSchema, physical_search_children_are_not_logical_indexes)
+{
+  for (const ObIndexType type : {INDEX_TYPE_ASYNC_SEARCH_DATA_INDEX_LOCAL,
+       INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_INDEX_LOCAL,
+       INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_PHRASE_INDEX_LOCAL}) {
+    SCOPED_TRACE(type);
+    ObTableSchema physical;
+    init_schema(physical, 5600, base_.get_table_id(), type);
+    ASSERT_EQ(OB_SUCCESS, collect());
+    ASSERT_EQ(OB_INVALID_ARGUMENT,
+        ObSearchIndexLifecycleUtil::expand_async_index(base_, physical, targets_));
+    EXPECT_TRUE(targets_.empty());
+  }
+}
+
+TEST_F(TestSearchIndexLifecycleSchema, deletion_consumers_include_ivf_alongside_search_and_fts)
+{
+  ObTableSchema ivf, fts;
+  init_schema(ivf, 5600, base_.get_table_id(), INDEX_TYPE_ASYNC_IVF_INDEX_LOCAL);
+  init_schema(fts, 5700, base_.get_table_id(), INDEX_TYPE_ASYNC_FTS_INDEX_LOCAL);
+  ASSERT_NO_FATAL_FAILURE(add_child(base_, ivf));
+  ASSERT_NO_FATAL_FAILURE(add_child(base_, fts));
+  ASSERT_EQ(OB_SUCCESS, catalog_.add(ivf));
+  ASSERT_EQ(OB_SUCCESS, catalog_.add(fts));
+  ASSERT_EQ(OB_SUCCESS,
+      ObAsyncIndexRetentionHelper::collect_deletion_consumers_(guard_, base_, targets_));
+  ASSERT_EQ(5, targets_.count()); // Three Search children, IVF and FTS; no Delete.
+  expect_target(data_.get_table_id(), INDEX_TYPE_ASYNC_SEARCH_DATA_INDEX_LOCAL, def_.get_table_id());
+  expect_target(match_.get_table_id(), INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_INDEX_LOCAL, def_.get_table_id());
+  expect_target(phrase_.get_table_id(), INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_PHRASE_INDEX_LOCAL, def_.get_table_id());
+  expect_target(ivf.get_table_id(), INDEX_TYPE_ASYNC_IVF_INDEX_LOCAL, OB_INVALID_ID);
+  expect_target(fts.get_table_id(), INDEX_TYPE_ASYNC_FTS_INDEX_LOCAL, OB_INVALID_ID);
+  for (int64_t i = 0; i < targets_.count(); ++i) {
+    EXPECT_FALSE(targets_.at(i).is_delete_);
+  }
+  // A missing IVF schema must still block GC rather than silently omit it.
+  catalog_.fail_table_id_ = ivf.get_table_id();
+  catalog_.failure_ = OB_SUCCESS;
+  ASSERT_EQ(OB_TABLE_NOT_EXIST,
+      ObAsyncIndexRetentionHelper::collect_deletion_consumers_(guard_, base_, targets_));
+  EXPECT_TRUE(targets_.empty());
+}
+
 TEST_F(TestSearchIndexLifecycleSchema, missing_schema_and_lookup_errors_are_left_to_caller)
 {
   ASSERT_EQ(OB_SUCCESS, collect());

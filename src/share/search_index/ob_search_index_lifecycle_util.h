@@ -37,7 +37,7 @@ struct ObSearchPhysicalChild
 };
 
 // A maintenance target after expanding all selected indexes of a base table.
-// Represents a Search child, an async FTS table, or the shared Delete table;
+// Represents a Search child, an async FTS/IVF table, or the shared Delete table;
 // the logical Search Def itself is never a physical target.
 struct ObAsyncPhysicalTarget
 {
@@ -45,7 +45,7 @@ struct ObAsyncPhysicalTarget
       : table_id_(OB_INVALID_ID), def_table_id_(OB_INVALID_ID),
         index_type_(schema::INDEX_TYPE_IS_NOT), is_delete_(false) {}
   uint64_t table_id_;     // Physical table ID; resolve its tablet per base partition.
-  uint64_t def_table_id_; // Owning Search Def, or OB_INVALID_ID for FTS/Delete.
+  uint64_t def_table_id_; // Owning Search Def, or OB_INVALID_ID for FTS/IVF/Delete.
   schema::ObIndexType index_type_;
   bool is_delete_;        // True only for the shared deletion-record table.
   TO_STRING_KV(K_(table_id), K_(def_table_id), K_(index_type), K_(is_delete));
@@ -65,7 +65,7 @@ public:
       const schema::ObTableSchema &def_schema,
       common::ObIArray<ObSearchPhysicalChild> &children);
 
-  // Expand one logical async index registered on base_schema. FTS/Delete return themselves;
+  // Expand one logical async index registered on base_schema. FTS/IVF/Delete return themselves;
   // Search Def returns its registered children, or OB_SCHEMA_EAGAIN if none are registered.
   // Failure clears targets. Callers own schema lookup errors,
   // status filtering, and whether Delete participates in their operation.

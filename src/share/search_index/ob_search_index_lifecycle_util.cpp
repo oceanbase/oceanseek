@@ -93,6 +93,7 @@ int ObSearchIndexLifecycleUtil::expand_async_index(
   targets.reset();
   if (!is_async_search_def_index(index_schema.get_index_type())
       && !is_async_fts_index(index_schema.get_index_type())
+      && !is_async_ivf_index(index_schema.get_index_type())
       && !is_async_delete_index(index_schema.get_index_type())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("expected logical async index", KR(ret), "table_id", index_schema.get_table_id());
