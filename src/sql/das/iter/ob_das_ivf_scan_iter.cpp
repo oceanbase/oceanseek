@@ -284,26 +284,28 @@ int ObDASIvfBaseScanIter::do_aux_table_scan(bool &first_scan,
   return ret;
 }
 
-// Reset memory context and clean up associated resources
-void ObDASIvfBaseScanIter::reset_memory_context()
+void ObDASIvfBaseScanIter::reset_hgraph_search_context()
 {
-  // Clean up HGraph iterative search context and reset memory context
+  // The search context must be destroyed before its allocator.
   if (OB_NOT_NULL(hgraph_iter_ctx_)) {
     obvectorutil::delete_iter_ctx(hgraph_iter_ctx_);
     hgraph_iter_ctx_ = nullptr;
   }
-  // Clean up HGraph iterative search context and reset memory context before mem_context_ reset
   if (OB_NOT_NULL(hgraph_vsag_alloc_)) {
     hgraph_vsag_alloc_->~ObVsagSearchAlloc();
     hgraph_vsag_alloc_ = nullptr;
   }
+  hgraph_has_next_center_ = true;
+  has_used_hgraph_ = false;
+}
+
+// Reset memory context and clean up associated resources
+void ObDASIvfBaseScanIter::reset_memory_context()
+{
+  reset_hgraph_search_context();
   if (nullptr != mem_context_) {
     mem_context_->reset_remain_one_page();
   }
-
-  // Reset HGraph state for next iteration
-  hgraph_has_next_center_ = true;
-  has_used_hgraph_ = false;
 }
 
 // Unified interface for checking if there are more centers available
@@ -906,26 +908,34 @@ int ObDASIvfBaseScanIter::reset_filter_path()
 {
   int ret = OB_SUCCESS;
   ObPhysicalPlanCtx *plan_ctx = GET_PHY_PLAN_CTX(*exec_ctx_);
-  ObPlanStat* plan_stat = nullptr;
   if (strategy_ == ObVecIdxQueryStrategy::LATENCY_FIRST && vec_idx_try_path_ == ObVecIdxAdaTryPath::VEC_INDEX_ITERATIVE_FILTER) {
     // RT first mode, do nothing
-  } else if (OB_ISNULL(plan_ctx->get_phy_plan())) {
-    // remote scan, phy plan is null, do nothing, just use try path in ctdef
-    LOG_WARN("plan ctx is null", K(ret), KP(plan_ctx));
-  } else if (OB_FALSE_IT(plan_stat = const_cast<ObPlanStat*>(&(plan_ctx->get_phy_plan()->stat_)))) {
-  } else if (vec_idx_try_path_ == ObVecIdxAdaTryPath::VEC_INDEX_PRE_FILTER) {
-    vec_idx_try_path_ = ObVecIdxAdaTryPath::VEC_INDEX_ITERATIVE_FILTER;
-  } else if (vec_idx_try_path_ == ObVecIdxAdaTryPath::VEC_INDEX_ITERATIVE_FILTER) {
-    double iter_selectivity = double(adaptive_ctx_.iter_res_row_cnt_) / double(adaptive_ctx_.iter_filter_row_cnt_);
-    adaptive_ctx_.selectivity_ = iter_selectivity;
-    vec_idx_try_path_ = ObVecIdxAdaTryPath::VEC_INDEX_PRE_FILTER;
-  }
-  if (OB_FAIL(ret) || OB_ISNULL(plan_stat)) {
-  } else if (OB_FAIL(updata_vec_exec_ctx(plan_stat))) {
-    LOG_WARN("failed to updata vec exec ctx", K(ret), K(vec_idx_try_path_));
+  } else if (OB_ISNULL(plan_ctx)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("plan ctx is null", K(ret));
   } else {
-    can_retry_ = false;
-    reuse_cid_ctx();
+    if (vec_idx_try_path_ == ObVecIdxAdaTryPath::VEC_INDEX_PRE_FILTER) {
+      vec_idx_try_path_ = ObVecIdxAdaTryPath::VEC_INDEX_ITERATIVE_FILTER;
+    } else if (vec_idx_try_path_ == ObVecIdxAdaTryPath::VEC_INDEX_ITERATIVE_FILTER) {
+      double iter_selectivity = double(adaptive_ctx_.iter_res_row_cnt_) / double(adaptive_ctx_.iter_filter_row_cnt_);
+      adaptive_ctx_.selectivity_ = iter_selectivity;
+      vec_idx_try_path_ = ObVecIdxAdaTryPath::VEC_INDEX_PRE_FILTER;
+    } else {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected adaptive filter path", K(ret), K(vec_idx_try_path_));
+    }
+    // Remote DAS has no physical plan, but must still switch the runtime path
+    // and discard the previous path's centroid state before retrying.
+    if (OB_SUCC(ret)) {
+      can_retry_ = false;
+      reuse_cid_ctx();
+      if (OB_NOT_NULL(plan_ctx->get_phy_plan())) {
+        ObPlanStat *plan_stat = const_cast<ObPlanStat*>(&(plan_ctx->get_phy_plan()->stat_));
+        if (OB_FAIL(updata_vec_exec_ctx(plan_stat))) {
+          LOG_WARN("failed to updata vec exec ctx", K(ret), K(vec_idx_try_path_));
+        }
+      }
+    }
   }
   return ret;
 }
@@ -2095,6 +2105,9 @@ int ObDASIvfBaseScanIter::do_table_post_filter(bool is_vectorized,
 
 void ObDASIvfBaseScanIter::reuse_cid_ctx()
 {
+  // A path switch discards the previous candidates. Restart HGraph as well,
+  // without resetting other query allocations needed by the new path.
+  reset_hgraph_search_context();
   iterative_filter_ctx_.reuse();
 }
 

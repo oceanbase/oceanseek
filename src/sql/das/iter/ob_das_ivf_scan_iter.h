@@ -513,6 +513,7 @@ protected:
   virtual int inner_init(ObDASIterParam &param) override;
   virtual int inner_reuse() override;
   virtual int inner_release() override;
+  void reset_hgraph_search_context();
   void reset_memory_context(); // Reset memory context and clean up associated resources
   virtual int inner_get_next_row() override;
   virtual int inner_get_next_rows(int64_t &count, int64_t capacity) override;

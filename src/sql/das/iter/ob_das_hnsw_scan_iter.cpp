@@ -1014,11 +1014,9 @@ int ObDASHNSWScanIter::reset_filter_path()
 {
   int ret = OB_SUCCESS;
   ObPhysicalPlanCtx *plan_ctx = GET_PHY_PLAN_CTX(*exec_ctx_);
-  ObPlanStat* plan_stat = nullptr;
-  if (OB_ISNULL(plan_ctx->get_phy_plan())) {
-    // remote scan, phy plan is null, do nothing, just use try path in ctdef
-    LOG_WARN("plan ctx is null", K(ret), KP(plan_ctx));
-  } else if (OB_FALSE_IT(plan_stat = const_cast<ObPlanStat*>(&(plan_ctx->get_phy_plan()->stat_)))) {
+  if (OB_ISNULL(plan_ctx)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("plan ctx is null", K(ret));
   } else if (vec_idx_try_path_ == ObVecIdxAdaTryPath::VEC_INDEX_PRE_FILTER) {
     if (is_ipivf()) {
       vec_idx_try_path_ = ObVecIdxAdaTryPath::VEC_INDEX_POST_FILTER;
@@ -1029,11 +1027,13 @@ int ObDASHNSWScanIter::reset_filter_path()
     double iter_selectivity = double(adaptive_ctx_.iter_res_row_cnt_) / double(adaptive_ctx_.iter_filter_row_cnt_);
     adaptive_ctx_.selectivity_ = iter_selectivity;
     vec_idx_try_path_ = ObVecIdxAdaTryPath::VEC_INDEX_PRE_FILTER;
-  }
-  if (OB_FAIL(ret) || OB_ISNULL(plan_stat)) {
-  } else if (OB_FAIL(updata_vec_exec_ctx(plan_stat))) {
-    LOG_WARN("failed to updata vec exec ctx", K(ret), K(vec_idx_try_path_));
   } else {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected adaptive filter path", K(ret), K(vec_idx_try_path_));
+  }
+  // Remote DAS has no physical plan, but must still switch the runtime path
+  // and discard the previous path's query state before retrying.
+  if (OB_SUCC(ret)) {
     query_cond_.reset();
     go_brute_force_ = false;
     can_retry_ = false;
@@ -1046,6 +1046,12 @@ int ObDASHNSWScanIter::reset_filter_path()
       adaptor_vid_iter_->reset();
       adaptor_vid_iter_->~ObVectorQueryVidIterator();
       adaptor_vid_iter_ = nullptr;
+    }
+    if (OB_NOT_NULL(plan_ctx->get_phy_plan())) {
+      ObPlanStat *plan_stat = const_cast<ObPlanStat*>(&(plan_ctx->get_phy_plan()->stat_));
+      if (OB_FAIL(updata_vec_exec_ctx(plan_stat))) {
+        LOG_WARN("failed to updata vec exec ctx", K(ret), K(vec_idx_try_path_));
+      }
     }
   }
   return ret;
