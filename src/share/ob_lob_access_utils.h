@@ -246,6 +246,7 @@ public:
 
   bool is_init() { return is_init_; };
 
+  OB_INLINE int64_t get_result_len() const { return pos_; }
   OB_INLINE void get_result_buffer(ObString &buf_str) { buf_str.assign(buffer_, pos_); }
   static int ob_convert_obj_temporay_lob(ObObj &obj, ObIAllocator &allocator);
   static int calc_inrow_templob_len(uint32 inrow_data_len, int64_t &templob_len);

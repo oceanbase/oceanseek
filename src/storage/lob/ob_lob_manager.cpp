@@ -8,7 +8,9 @@
 
 #include "lib/allocator/page_arena.h"
 #include "lib/ob_errno.h"
+#include "lib/time/ob_time_utility.h"
 #include "lib/utility/ob_macro_utils.h"
+#include "lib/worker.h"
 #include "share/backup/ob_backup_io_adapter.h"
 #include "storage/lob/access/ob_lob_iterator.h"
 #include "storage/lob/common/ob_lob_context.h"
@@ -925,6 +927,7 @@ int ObLobManager::get_external_lob_byte_length_(
   } else {
     share::ObBackupStorageInfo access_info;
     common::ObIODFileStat statbuf(ObExternalIoAdapter::get_tenant_id());
+    int64_t remaining_us;
     if (OB_ISNULL(read_ctx.access_ctx_)) {
       ret = OB_NOT_SUPPORTED;
       LOG_USER_ERROR(OB_NOT_SUPPORTED, "reading external LOB without SQL access context");
@@ -933,8 +936,16 @@ int ObLobManager::get_external_lob_byte_length_(
     } else if (OB_FAIL(read_ctx.access_ctx_->get_external_access_info(info.url_, access_info))) {
       LOG_WARN("failed to resolve external lob LOCATION", KR(ret),
                K(read_ctx.tablet_id_), "url_length", info.url_.length());
-    } else if (OB_FAIL(ObExternalIoAdapter::get_file_stat(info.url_, &access_info, statbuf))) {
-      LOG_WARN("failed to HEAD external lob", KR(ret), K(read_ctx.tablet_id_), K(read_ctx.timeout_));
+    } else if (OB_FAIL(THIS_WORKER.check_status())) {
+      LOG_WARN("external LOB interrupted before HEAD", KR(ret), K(read_ctx.tablet_id_));
+    } else if (FALSE_IT(remaining_us = read_ctx.timeout_
+                                       - common::ObTimeUtility::current_time_us())) {
+    } else if (OB_UNLIKELY(remaining_us <= 0)) {
+      ret = OB_TIMEOUT;
+      LOG_WARN("external LOB HEAD timed out", KR(ret), K(read_ctx.tablet_id_), K(read_ctx.timeout_));
+    } else if (OB_FAIL(ObExternalIoAdapter::get_file_stat(info.url_, &access_info,
+                       statbuf, static_cast<uint64_t>(remaining_us)))) {
+      LOG_WARN("external LOB HEAD failed", KR(ret), K(read_ctx.tablet_id_), K(remaining_us));
     } else if (OB_UNLIKELY(statbuf.size_ < 0)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("invalid external object length", KR(ret), K(statbuf.size_), K(read_ctx.tablet_id_));

@@ -222,7 +222,8 @@ int ObExprSubstr::calc_result_typeN(ObExprResType &type,
     const int32_t mbmaxlen = 4;
     if (ObTextType == types_array[0].get_type()
         || ObMediumTextType == types_array[0].get_type()
-        || ObLongTextType == types_array[0].get_type()) {
+        || ObLongTextType == types_array[0].get_type()
+        || ObExtendBLobType == types_array[0].get_type()) {
       type.set_type(ObLongTextType);
       type.set_length(OB_MAX_LONGTEXT_LENGTH / mbmaxlen);
     } else if (ObTinyTextType == types_array[0].get_type()) {
@@ -638,6 +639,8 @@ static int eval_substr_text(const ObCollationType &cs_type,
           ret = (input_iter.get_inner_ret() != OB_SUCCESS) ? 
                   input_iter.get_inner_ret() : OB_INVALID_DATA;
           LOG_WARN("iter state invalid", K(ret), K(state), K(input_iter)); 
+        } else if (OB_FAIL(ObDatum::check_length(output_result.get_result_len()))) {
+          LOG_WARN("invalid SUBSTR result length", KR(ret), K(output_result.get_result_len()));
         } else {
           output_result.set_result();
         }
