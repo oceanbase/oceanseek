@@ -33,6 +33,8 @@ namespace observer
 {
 
 struct ObFlightSqlSession;
+class ObFlightSqlRequestCancellation;
+class ObFlightSqlQueryRetry;
 
 // reader 运行过程中要保留的 session、SQL 执行信息。
 struct ObFlightReaderCtx
@@ -48,6 +50,9 @@ struct ObFlightReaderCtx
   int64_t     request_time{0};
   uint64_t    resource_group_id{0};
   int64_t     timeout_ts{INT64_MAX};
+  // Retired by ObFlightBatchReader before it releases the native query lock.
+  std::shared_ptr<ObFlightSqlRequestCancellation> cancellation;
+  std::shared_ptr<ObFlightSqlQueryRetry> retry;
 };
 
 // SQL session state follows the streamed query, rather than the gRPC thread
@@ -83,14 +88,19 @@ public:
   ~ObFlightBatchReader() override;
 
   std::shared_ptr<arrow::Schema> schema() const override { return schema_; }
+  const ObFlightReaderCtx &get_context() const { return ctx_; }
   arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch> *out) override;
   arrow::Status Close() override;
+  arrow::Status prefetch_first_batch();
 
   // DoGetStatement 在 try_lock_query 成功后调用，用于转移 query_lock 所有权。
   void set_query_locked() { query_locked_ = true; }
 
 private:
   int close_result();
+  bool retry_first_fetch(int &error);
+  void reset_execution();
+  void init_root_operator();
   int read_next_vectorized(std::shared_ptr<arrow::RecordBatch> *out);
   int read_next_rows(std::shared_ptr<arrow::RecordBatch> *out);
 
@@ -112,6 +122,9 @@ private:
   uint64_t tenant_id_;
   bool iter_end_;
   bool is_vectorized_;
+  bool has_fetched_row_{false};
+  bool has_prefetched_batch_{false};
+  std::shared_ptr<arrow::RecordBatch> prefetched_batch_;
 
   // 流式读取在 DoGetStatement 返回后仍会继续，因此 open_query() 创建的这些对象
   // 需要作为 reader 成员一直保留到析构。result_set_ 负责持有查询执行状态，

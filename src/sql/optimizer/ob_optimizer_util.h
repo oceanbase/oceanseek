@@ -441,6 +441,17 @@ public:
 
   static int contains_group_by(const ObLogicalOperator *root, bool & contains);
 
+  // Placement checks stop at exchanges; rescan checks inspect the whole tree.
+  static int contains_arrow_stream(const ObLogicalOperator *root,
+                                   bool &contains,
+                                   const bool distributed_only = false,
+                                   const bool current_dfo_only = false);
+
+  static int contains_arrow_stream(const Path *path,
+                                   bool &contains,
+                                   const bool distributed_only = false,
+                                   const bool current_dfo_only = false);
+
   static int contains_lob_type(const common::ObIArray<ObRawExpr *> &expr, bool & contains);
 
   static bool find_expr(common::ObIArray<ExprProducer> *ctx, const ObRawExpr &expr, ExprProducer *&producer);

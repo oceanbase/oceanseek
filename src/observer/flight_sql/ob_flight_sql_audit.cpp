@@ -63,6 +63,7 @@ void mirror_flight_sql_audit_record_to_gv_sql_audit(
 
   std::string tenant_holder;
   std::string user_holder;
+  std::string proxy_user_holder;
   std::string db_holder;
   common::ObString tstr = session.get_tenant_name();
   if (!tstr.empty()) {
@@ -75,6 +76,10 @@ void mirror_flight_sql_audit_record_to_gv_sql_audit(
     if (!ustr.empty()) {
       user_holder.assign(ustr.ptr(), static_cast<size_t>(ustr.length()));
     }
+  }
+  const common::ObString proxy_user = session.get_proxy_user_name();
+  if (!proxy_user.empty()) {
+    proxy_user_holder.assign(proxy_user.ptr(), static_cast<size_t>(proxy_user.length()));
   }
   if ('\0' != rec.schema_name[0]) {
     db_holder.assign(rec.schema_name);
@@ -137,6 +142,7 @@ void mirror_flight_sql_audit_record_to_gv_sql_audit(
   ar.proxy_session_id_ = session.get_proxy_sessid();
   ar.execution_id_ = session.get_current_execution_id();
   ar.user_id_ = session.get_user_id();
+  ar.proxy_user_id_ = session.get_proxy_user_id();
   ar.db_id_ = session.get_database_id();
   ar.server_addr_ = GCTX.self_addr();
   if (rec.peer_ip[0] != '\0' && rec.peer_port > 0) {
@@ -180,6 +186,10 @@ void mirror_flight_sql_audit_record_to_gv_sql_audit(
   if (!user_holder.empty()) {
     ar.user_name_ = user_holder.data();
     ar.user_name_len_ = static_cast<int64_t>(user_holder.length());
+  }
+  if (!proxy_user_holder.empty()) {
+    ar.proxy_user_name_ = proxy_user_holder.data();
+    ar.proxy_user_name_len_ = static_cast<int64_t>(proxy_user_holder.length());
   }
   if (!db_holder.empty()) {
     ar.db_name_ = db_holder.data();

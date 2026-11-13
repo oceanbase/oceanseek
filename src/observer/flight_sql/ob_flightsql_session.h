@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -63,7 +64,10 @@ struct ObFlightSqlSession
   std::string session_id;       // UUID, used as Bearer token
   uint64_t tenant_id{0};
   std::string tenant_name;
-  std::string user_name;
+  std::string user_name;        // effective SQL user returned by authentication
+  // Requested proxy target, empty for direct login. Identity is fixed at
+  // authentication; neither session options nor later RPC headers can change it.
+  const std::string proxied_user_name;
 
   ::oceanbase::sql::ObSQLSessionInfo *ob_session{nullptr};
   ::oceanbase::sql::ObFreeSessionCtx free_ctx;
@@ -90,12 +94,23 @@ struct ObFlightSqlSession
   // V1 ingest state: session-scoped Arrow stream registry and monotonic stream ID counter.
   ObArrowStreamRegistry stream_registry;
   std::atomic<uint64_t> next_stream_id_{1};
+  // At most one V1 stream may be registered in a Flight session. A nonzero
+  // value covers both a schema-only user registration and the transient entry
+  // created by the generated-SQL DoPut path. Protected by mutex.
+  uint64_t active_v1_stream_id_{0};
   bool closing_{false};  // protected by mutex; fences DoPut admission after CloseSession
+  // Fences new Flight SQL admission while CancelQuery delivers a native kill
+  // without holding mutex across the potentially blocking OceanBase call.
+  bool cancel_query_active_{false};  // protected by mutex
   bool doput_cancel_pending_{false};  // cancellation before request publication
   bool doput_active_{false};  // protected by mutex; only one DoPut per Flight session
   // Published only for the admitted DoPut, and retired before its query guard
   // is released. Protected by mutex; CancelQuery retains a shared handle.
   std::shared_ptr<ObFlightSqlRequestCancellation> active_doput_cancellation;
+  // Published atomically with DoGet query-lock admission and transferred to
+  // ObFlightBatchReader. CloseSession cancels the transport before waiting for
+  // disconnect_session() to acquire the native query lock. Protected by mutex.
+  std::shared_ptr<ObFlightSqlRequestCancellation> active_doget_cancellation;
 
   // Prepared DML state is separate from the general session mutex because
   // prepare/execute can compile or run SQL while holding this lock.  The
@@ -107,8 +122,9 @@ struct ObFlightSqlSession
   // V2/V3 ingest: last in-flight ingest_id for auto-abort on session death.
   std::string last_ingest_id;
 
-  explicit ObFlightSqlSession(uint64_t owner_tenant_id)
-      : tenant_id(owner_tenant_id)
+  explicit ObFlightSqlSession(uint64_t owner_tenant_id,
+                             const std::string &proxy_target = "")
+      : tenant_id(owner_tenant_id), proxied_user_name(proxy_target)
   {
   }
   ~ObFlightSqlSession();
@@ -137,7 +153,9 @@ struct ObSessionQueryGuard
                                const bool already_locked = false)
       : session_(session)
   {
-    if (OB_NOT_NULL(session_.ob_session)) {
+    std::lock_guard<std::mutex> guard(session_.mutex);
+    if (!session_.closing_ && !session_.cancel_query_active_
+        && OB_NOT_NULL(session_.ob_session)) {
       acquired_ = already_locked
           || (OB_SUCCESS == session_.ob_session->try_lock_query());
       owns_lock_ = acquired_ && !already_locked;
@@ -166,7 +184,8 @@ struct ObSessionDoPutGuard
   explicit ObSessionDoPutGuard(ObFlightSqlSession &session) : session_(session)
   {
     std::lock_guard<std::mutex> guard(session_.mutex);
-    if (!session_.closing_ && !session_.doput_active_) {
+    if (!session_.closing_ && !session_.cancel_query_active_
+        && !session_.doput_active_) {
       session_.doput_active_ = true;
       session_.doput_cancel_pending_ = false;
       acquired_ = true;
@@ -221,6 +240,7 @@ public:
                                            const std::string &tenant_name,
                                            const std::string &user_name,
                                            const std::string &password,
+                                           const std::string &proxied_user_name,
                                            bool is_oracle_mode,
                                            const std::string &peer_ip = "",
                                            int32_t peer_port = 0,
@@ -244,8 +264,13 @@ public:
                               uint64_t stream_id,
                               ObArrowStreamEntryPtr &entry);
 
-  // Explicitly remove a session (CloseSession path). Frees ObSQLSessionInfo.
+  // Non-blocking removal for failed authentication and exceptional cleanup.
+  // Active holders defer ObSQLSessionInfo destruction to the wrapper dtor.
   void remove(const std::string &session_id);
+  // Atomically fence the bearer, cancel and drain active work, then run the
+  // same native disconnect/free sequence used by the MySQL connection path.
+  int close(const std::string &session_id,
+            const std::function<bool()> &is_cancelled);
 
   // Return a point-in-time snapshot of all live sessions (for virtual table).
   std::vector<ObFlightSqlSessionSnapshot> snapshot() const;
@@ -257,12 +282,23 @@ private:
   using SessionMap = std::unordered_map<std::string, std::shared_ptr<ObFlightSqlSession>>;
   using ActiveStreamSessionMap =
       std::unordered_map<uint32_t, std::shared_ptr<ObFlightSqlSession>>;
+  struct CloseState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool done{false};
+    int result{common::OB_SUCCESS};
+  };
+  using ClosingSessionMap =
+      std::unordered_map<std::string, std::shared_ptr<CloseState>>;
 
   bool is_stopped() const;
-  void destroy_session(const std::shared_ptr<ObFlightSqlSession> &session);
+  int destroy_session(const std::shared_ptr<ObFlightSqlSession> &session);
   static std::string generate_session_token(uint64_t tenant_id, uint32_t sid);
 
   SessionMap sessions_;
+  // A second CloseSession that passed authentication before the first request
+  // fenced the bearer waits on the same completion barrier.
+  ClosingSessionMap closing_sessions_;
   ActiveStreamSessionMap active_stream_sessions_;
   mutable std::mutex mutex_;
   std::condition_variable gc_cv_;

@@ -253,7 +253,7 @@ else()
       ${DEP_DIR}/lib64/libabsl_utf8_for_code_point.a)
 endif()
 
-if(NOT OB_BUILD_OPENSOURCE)
+# Arrow Flight SQL is included in both community and business builds.
 file(GLOB _grpc_absl "${DEP_DIR}/lib64/libabsl_*.a")
 list(SORT _grpc_absl)
 set(OBLIB_ARROW_FLIGHT_LINK_LIBS
@@ -273,11 +273,6 @@ set(OBLIB_ARROW_FLIGHT_LINK_LIBS
 set(OB_BUILD_OBSERVER_FLIGHT_SQL ON CACHE INTERNAL "" FORCE)
 add_definitions(-DOB_BUILD_OBSERVER_FLIGHT_SQL)
 message(STATUS "OB_BUILD_OBSERVER_FLIGHT_SQL=ON (static)")
-else()
-set(OBLIB_ARROW_FLIGHT_LINK_LIBS "" CACHE INTERNAL "Arrow Flight SQL link libs" FORCE)
-set(OB_BUILD_OBSERVER_FLIGHT_SQL OFF CACHE INTERNAL "" FORCE)
-message(STATUS "OB_BUILD_OBSERVER_FLIGHT_SQL=OFF (opensource)")
-endif()
 
 if(OB_BUILD_OPENSOURCE)
 set(LGPL_DEPS "-L${DEP_DIR}/lib/mariadb -lmariadb")

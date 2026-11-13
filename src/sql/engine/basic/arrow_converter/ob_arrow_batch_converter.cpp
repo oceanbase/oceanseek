@@ -1,12 +1,13 @@
 /**
- * Copyright (C) 2026 OceanBase
- * 本文件包含机密及专有信息，未经授权不得使用或披露。
+ * Copyright (c) 2026 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #define USING_LOG_PREFIX SQL_ENG
 #include "sql/engine/basic/arrow_converter/ob_arrow_batch_converter.h"
 
 #include "lib/allocator/page_arena.h"
+#include "lib/geo/ob_geo_3d.h"
 #include "lib/json_type/ob_json_bin.h"
 #include "lib/json_type/ob_json_common.h"
 #include "lib/timezone/ob_time_convert.h"
@@ -22,6 +23,7 @@
 #include "sql/engine/expr/ob_datum_cast.h"
 #include "sql/engine/expr/ob_array_expr_utils.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
+#include "sql/engine/ob_exec_context.h"
 
 // 分派表：命中时走向量化转换，miss 时回退到逐行 datum 路径。
 #include "sql/engine/basic/arrow_converter/ob_arrow_conv_register.h"
@@ -39,10 +41,12 @@ bool ObArrowBatchConverter::supports_output_type(const common::ObObjType type)
     case ObNullType:
     case ObTinyIntType:
     case ObSmallIntType:
+    case ObMediumIntType:
     case ObInt32Type:
     case ObIntType:
     case ObUTinyIntType:
     case ObUSmallIntType:
+    case ObUMediumIntType:
     case ObUInt32Type:
     case ObUInt64Type:
     case ObFloatType:
@@ -72,12 +76,145 @@ bool ObArrowBatchConverter::supports_output_type(const common::ObObjType type)
     case ObSetType:
     case ObURowIDType:
     case ObJsonType:
+    case ObGeometryType:
     case ObLobType:
     case ObCollectionSQLType:
       return true;
     default:
       return false;
   }
+}
+
+namespace
+{
+int append_ewkb_header(arrow::BinaryBuilder &builder,
+                       const common::ObGeoWkbByteOrder bo,
+                       const common::ObGeoType type,
+                       const uint32_t srid)
+{
+  using namespace common;
+  uint32_t ewkb_type = static_cast<uint32_t>(type);
+  if (ObGeoTypeUtil::is_3d_geo_type(type)) {
+    ewkb_type = (ewkb_type - ObGeoTypeUtil::WKB_3D_TYPE_OFFSET)
+                | ObGeoTypeUtil::EWKB_Z_FLAG;
+  }
+  if (srid != 0) {
+    ewkb_type |= ObGeoTypeUtil::EWKB_SRID_FLAG;
+  }
+  char header[EWKB_WITH_SRID_LEN];
+  header[0] = static_cast<char>(bo);
+  ObGeoWkbByteOrderUtil::write<uint32_t>(header + WKB_GEO_BO_SIZE, ewkb_type, bo);
+  int32_t header_len = EWKB_COMMON_WKB_HEADER_LEN;
+  if (srid != 0) {
+    ObGeoWkbByteOrderUtil::write<uint32_t>(header + header_len, srid, bo);
+    header_len += WKB_GEO_SRID_SIZE;
+  }
+  return arrow_status_to_ob_ret(builder.ExtendCurrent(
+      reinterpret_cast<const uint8_t *>(header), header_len));
+}
+
+// Rewrite every ISO Z header, including children of multi-geometries and
+// nested collections. Copy coordinate bytes directly from the source view.
+class ObArrowGeometryEWKBVisitor : public common::ObGeo3DVisitor
+{
+public:
+  ObArrowGeometryEWKBVisitor(common::ObGeometry3D &geo,
+                             arrow::BinaryBuilder &builder,
+                             const uint32_t srid)
+      : geo_(geo), builder_(builder), srid_(srid), copied_until_(0)
+  {}
+
+  int visit_header(common::ObGeoWkbByteOrder bo, common::ObGeoType type,
+                   bool /*is_sub_type*/ = false) override
+  {
+    int ret = OB_SUCCESS;
+    // The native visitor has consumed the five-byte WKB header at this point.
+    const int64_t header_pos = static_cast<int64_t>(geo_.get_pos())
+                               - common::EWKB_COMMON_WKB_HEADER_LEN;
+    if (header_pos < copied_until_) {
+      ret = OB_ERR_GIS_INVALID_DATA;
+    } else if (OB_FAIL(extend_source(header_pos))) {
+    } else if (OB_FAIL(append_ewkb_header(
+                   builder_, bo, type, header_pos == 0 ? srid_ : 0))) {
+    } else {
+      copied_until_ = static_cast<int64_t>(geo_.get_pos());
+    }
+    return ret;
+  }
+
+  int finish() { return extend_source(static_cast<int64_t>(geo_.length())); }
+
+private:
+  int extend_source(const int64_t end)
+  {
+    int ret = OB_SUCCESS;
+    if (end < copied_until_ || end > static_cast<int64_t>(geo_.length())) {
+      ret = OB_ERR_GIS_INVALID_DATA;
+    } else {
+      ret = arrow_status_to_ob_ret(builder_.ExtendCurrent(
+          reinterpret_cast<const uint8_t *>(geo_.val() + copied_until_),
+          static_cast<int32_t>(end - copied_until_)));
+    }
+    return ret;
+  }
+
+  common::ObGeometry3D &geo_;
+  arrow::BinaryBuilder &builder_;
+  uint32_t srid_;
+  int64_t copied_until_;
+};
+} // namespace
+
+int ObArrowBatchConverter::append_geometry_to_builder(const common::ObString &raw,
+                                                       arrow::BinaryBuilder &builder,
+                                                       common::ObIAllocator &arena)
+{
+  int ret = OB_SUCCESS;
+  using namespace common;
+  ObString wkb;
+  uint32_t offset = 0;
+  ObGeoWkbHeader header;
+  ObGeometry *geo = nullptr;
+  if (OB_ISNULL(raw.ptr())) {
+    ret = OB_ERR_GIS_INVALID_DATA;
+  } else if (OB_FAIL(ObGeoTypeUtil::get_wkb_from_swkb(raw, wkb, offset))) {
+    LOG_WARN("read geometry storage header failed", K(ret));
+  } else if (wkb.length() < EWKB_COMMON_WKB_HEADER_LEN) {
+    ret = OB_ERR_GIS_INVALID_DATA;
+  } else if (OB_FAIL(ObGeoTypeUtil::get_header_info_from_wkb(raw, header))) {
+    LOG_WARN("read geometry type and SRID failed", K(ret));
+  } else if (OB_FAIL(ObGeoTypeUtil::create_geo_by_wkb(
+                 arena, raw, nullptr, geo, true, false, true))) {
+    LOG_WARN("validate geometry for Arrow output failed", K(ret));
+  } else {
+    // Storage uses XY (longitude/latitude in degrees for geographic SRS),
+    // as documented by ObGeoTypeUtil::geo_to_ewkt(). Keep these bytes intact.
+    const int64_t ewkb_len = static_cast<int64_t>(wkb.length())
+                            + (header.srid_ != 0 ? WKB_GEO_SRID_SIZE : 0);
+    if (ewkb_len > arrow::BinaryBuilder::memory_limit() - builder.value_data_length()) {
+      ret = OB_SIZE_OVERFLOW;
+      LOG_WARN("geometry column exceeds Arrow binary buffer limit", K(ret), K(ewkb_len));
+    } else if (OB_FAIL(arrow_status_to_ob_ret(builder.ReserveData(ewkb_len)))) {
+      LOG_WARN("reserve geometry data failed", K(ret), K(ewkb_len));
+    } else if (OB_FAIL(arrow_status_to_ob_ret(builder.Append("", 0)))) {
+      LOG_WARN("append geometry value failed", K(ret));
+    } else if (ObGeoTypeUtil::is_3d_geo_type(header.type_)) {
+      ObGeometry3D &geo_3d = *static_cast<ObGeometry3D *>(geo);
+      ObArrowGeometryEWKBVisitor visitor(geo_3d, builder, header.srid_);
+      if (OB_FAIL(geo_3d.accept(visitor))) {
+        LOG_WARN("encode 3D geometry as EWKB failed", K(ret));
+      } else if (OB_FAIL(visitor.finish())) {
+        LOG_WARN("append 3D geometry coordinates failed", K(ret));
+      }
+    } else if (OB_FAIL(append_ewkb_header(builder, header.bo_, header.type_, header.srid_))) {
+      LOG_WARN("append EWKB header failed", K(ret));
+    } else if (OB_FAIL(arrow_status_to_ob_ret(builder.ExtendCurrent(
+                   reinterpret_cast<const uint8_t *>(wkb.ptr() + EWKB_COMMON_WKB_HEADER_LEN),
+                   wkb.length() - EWKB_COMMON_WKB_HEADER_LEN)))) {
+      LOG_WARN("append geometry coordinates failed", K(ret));
+    }
+  }
+  return ret;
 }
 
 template <typename CppType, typename Bld>
@@ -936,8 +1073,17 @@ int ObArrowBatchConverter::append_datum_to_builder(const ObExpr &expr,
   int ret = OB_SUCCESS;
   arrow::Status status;
   using namespace common;
-  if (datum.is_null()) {
+  if (OB_ISNULL(builder.type())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("null Arrow builder type", K(ret));
+  } else if (datum.is_null()) {
     ret = arrow_status_to_ob_ret(builder.AppendNull());
+  } else if (OB_ISNULL(datum.ptr_)
+             && (datum.len_ > 0 || expr.is_fixed_length_data_
+                 || ob_is_numeric_type(expr.datum_meta_.type_))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("null result datum payload", K(ret), K(datum.len_),
+             "ob_type", ob_obj_type_str(expr.datum_meta_.type_));
   } else {
     switch (expr.datum_meta_.type_) {
       case ObNullType:
@@ -950,6 +1096,10 @@ int ObArrowBatchConverter::append_datum_to_builder(const ObExpr &expr,
       case ObSmallIntType:
         ret = arrow_status_to_ob_ret(static_cast<arrow::Int16Builder&>(builder).Append(
             static_cast<int16_t>(datum.get_int())));
+        break;
+      case ObMediumIntType:
+        ret = arrow_status_to_ob_ret(static_cast<arrow::Int32Builder&>(builder).Append(
+            datum.get_mediumint()));
         break;
       case ObInt32Type:
         ret = arrow_status_to_ob_ret(static_cast<arrow::Int32Builder&>(builder).Append(
@@ -966,6 +1116,10 @@ int ObArrowBatchConverter::append_datum_to_builder(const ObExpr &expr,
       case ObUSmallIntType:
         ret = arrow_status_to_ob_ret(static_cast<arrow::UInt16Builder&>(builder).Append(
             static_cast<uint16_t>(datum.get_uint())));
+        break;
+      case ObUMediumIntType:
+        ret = arrow_status_to_ob_ret(static_cast<arrow::Int32Builder&>(builder).Append(
+            static_cast<int32_t>(datum.get_umediumint())));
         break;
       case ObUInt32Type:
         ret = arrow_status_to_ob_ret(static_cast<arrow::UInt32Builder&>(builder).Append(
@@ -1059,6 +1213,17 @@ int ObArrowBatchConverter::append_datum_to_builder(const ObExpr &expr,
       case ObJsonType:
         ret = append_json_datum_to_builder(expr, datum, builder, lob_arena);
         break;
+      case ObGeometryType: {
+        common::ObString raw;
+        if (OB_FAIL(ObTextStringHelper::read_real_string_data(
+                lob_arena, datum, expr.datum_meta_, raw))) {
+          LOG_WARN("read geometry payload failed", K(ret));
+        } else {
+          ret = append_geometry_to_builder(
+              raw, static_cast<arrow::BinaryBuilder &>(builder), lob_arena);
+        }
+        break;
+      }
       case ObCollectionSQLType:
         ret = append_collection_datum_to_builder(
             expr, datum, builder, lob_arena, eval_ctx);
@@ -1068,6 +1233,134 @@ int ObArrowBatchConverter::append_datum_to_builder(const ObExpr &expr,
         LOG_WARN("unsupported ob type for arrow conversion", K(ret),
                  "ob_type", common::ob_obj_type_str(expr.datum_meta_.type_));
         break;
+    }
+  }
+  return ret;
+}
+
+static int check_arrow_output_expr_frame(const ObExpr *expr, ObEvalCtx &eval_ctx)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t frame_count = eval_ctx.exec_ctx_.get_frame_cnt();
+  if (OB_ISNULL(expr)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("null result expression", K(ret));
+  } else if (OB_ISNULL(eval_ctx.frames_) || expr->frame_idx_ >= frame_count) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid result expression frame array or index", K(ret),
+             KP(eval_ctx.frames_), K(expr->frame_idx_), K(frame_count));
+  } else if (OB_ISNULL(eval_ctx.frames_[expr->frame_idx_])) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("null result expression frame", K(ret), K(expr->frame_idx_));
+  }
+  return ret;
+}
+
+int ObArrowBatchConverter::eval_batch_expr(
+    const ObExpr *expr, ObEvalCtx &eval_ctx, const ObBatchRows &brs)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(check_arrow_output_expr_frame(expr, eval_ctx))) {
+    LOG_WARN("invalid batch expression frame", K(ret));
+  } else if (brs.size_ < 0 || (brs.size_ > 0 && OB_ISNULL(brs.skip_))
+             || (expr->is_batch_result() && brs.size_ > eval_ctx.max_batch_size_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid result batch size or skip vector", K(ret), K(brs.size_),
+             KP(brs.skip_), K(eval_ctx.max_batch_size_));
+  } else if (brs.size_ > 0) {
+    if (!expr->enable_rich_format()) {
+      ret = expr->eval_batch(eval_ctx, *brs.skip_, brs.size_);
+    } else {
+      // VEC_INVALID is valid before eval_vector() initializes the header.
+      const common::VectorFormat format = expr->get_format(eval_ctx);
+      if (format != common::VEC_INVALID && !common::is_valid_format(format)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid result vector format before evaluation", K(ret), K(format));
+      } else {
+        ret = expr->eval_vector(eval_ctx, brs);
+      }
+    }
+  }
+  return ret;
+}
+
+int ObArrowBatchConverter::eval_row_expr(
+    const ObExpr *expr, ObEvalCtx &eval_ctx, ObDatum *&datum)
+{
+  int ret = OB_SUCCESS;
+  datum = nullptr;
+  if (OB_FAIL(check_arrow_output_expr_frame(expr, eval_ctx))) {
+    LOG_WARN("invalid row expression frame", K(ret));
+  } else if (OB_FAIL(expr->eval(eval_ctx, datum))) {
+    LOG_WARN("result row expression evaluation failed", K(ret));
+  } else if (OB_ISNULL(datum)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("result row expression returned null datum", K(ret));
+  }
+  return ret;
+}
+
+static int get_arrow_output_vector(const ObExpr &expr, ObEvalCtx &eval_ctx,
+                                    const int64_t size, common::ObIVector *&vec)
+{
+  int ret = OB_SUCCESS;
+  vec = nullptr;
+  if (OB_FAIL(check_arrow_output_expr_frame(&expr, eval_ctx))) {
+    LOG_WARN("invalid vector expression frame", K(ret));
+  } else if (!expr.enable_rich_format()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("result expression has no rich vector header", K(ret));
+  } else {
+    const common::VectorFormat format = expr.get_format(eval_ctx);
+    if (!common::is_valid_format(format)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("uninitialized result vector format", K(ret), K(format));
+    } else if (OB_ISNULL(vec = expr.get_vector(eval_ctx))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("null result vector", K(ret), K(format));
+    } else if (size < 0 || (format != common::VEC_UNIFORM_CONST
+               && size > static_cast<const common::ObVectorBase &>(*vec).get_max_row_cnt())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("result batch exceeds vector capacity", K(ret), K(size), K(format));
+    } else {
+      switch (format) {
+        case common::VEC_FIXED: {
+          const auto &v = static_cast<const common::ObFixedLengthBase &>(*vec);
+          if (OB_ISNULL(v.get_nulls()) || OB_ISNULL(v.get_data())) {
+            ret = OB_ERR_UNEXPECTED;
+          }
+          break;
+        }
+        case common::VEC_DISCRETE: {
+          const auto &v = static_cast<const common::ObDiscreteBase &>(*vec);
+          if (OB_ISNULL(v.get_nulls()) || OB_ISNULL(v.get_lens()) || OB_ISNULL(v.get_ptrs())) {
+            ret = OB_ERR_UNEXPECTED;
+          }
+          break;
+        }
+        case common::VEC_CONTINUOUS: {
+          const auto &v = static_cast<const common::ObContinuousBase &>(*vec);
+          if (OB_ISNULL(v.get_nulls()) || OB_ISNULL(v.get_offsets()) || OB_ISNULL(v.get_data())) {
+            ret = OB_ERR_UNEXPECTED;
+          }
+          break;
+        }
+        case common::VEC_UNIFORM:
+        case common::VEC_UNIFORM_CONST: {
+          const auto &v = static_cast<const common::ObUniformBase &>(*vec);
+          if (OB_ISNULL(v.get_datums())) {
+            ret = OB_ERR_UNEXPECTED;
+          }
+          break;
+        }
+        default: {
+          ret = OB_ERR_UNEXPECTED;
+          break;
+        }
+      }
+      if (OB_FAIL(ret)) {
+        LOG_WARN("null result vector buffer", K(ret), K(size), K(format));
+      }
     }
   }
   return ret;
@@ -1083,46 +1376,42 @@ int ObArrowBatchConverter::append_brs_to_builders(
   int ret = OB_SUCCESS;
   const int64_t ncols = output_exprs.count();
   const int64_t nrows = brs.size_;
-  if (OB_UNLIKELY(static_cast<int64_t>(builders.size()) != ncols)) {
+  if (nrows < 0 || (nrows > 0 && OB_ISNULL(brs.skip_))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid result batch", K(ret), K(nrows), KP(brs.skip_));
+  } else if (OB_UNLIKELY(static_cast<int64_t>(builders.size()) != ncols)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("builder count mismatch", K(ret), "builders", builders.size(), K(ncols));
     // The callers construct builders from the result schema and expressions
     // from the physical operator.  They must remain one-to-one.  Do not
     // attempt conversion when that invariant has been broken: Arrow builders
     // use unchecked append paths internally, so continuing can corrupt memory.
-  } else if (OB_SUCC(ret)) {
+  } else if (nrows > 0) {
     for (int64_t col = 0; OB_SUCC(ret) && col < ncols; ++col) {
       ObExpr *expr = output_exprs.at(col);
       common::ObIVector *vec = nullptr;
       if (OB_ISNULL(expr) || OB_ISNULL(builders[col])) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("null expr or builder", K(ret), K(col));
-      } else if (UINT32_MAX == expr->vector_header_off_) {
-        // Legacy batch expressions have datum arrays without vector storage.
-        // Calling eval_vector/get_vector would read an invalid frame offset.
-        ObEvalCtx::BatchInfoScopeGuard batch_guard(eval_ctx);
-        batch_guard.set_batch_size(nrows);
-        batch_guard.set_batch_idx(0);
-        if (OB_FAIL(expr->eval_batch(eval_ctx, *brs.skip_, nrows))) {
-          LOG_WARN("eval_batch failed", K(ret), K(col));
-        } else {
-          const common::ObDatum *datums = expr->locate_batch_datums(eval_ctx);
-          for (int64_t row = 0; OB_SUCC(ret) && row < nrows; ++row) {
-            if (brs.all_rows_active_ || !brs.skip_->at(row)) {
-              batch_guard.set_batch_idx(row);
-              const common::ObDatum &datum = datums[expr->is_batch_result() ? row : 0];
-              if (OB_FAIL(append_datum_to_builder(
-                      *expr, datum, *builders[col], lob_arena, &eval_ctx))) {
-                LOG_WARN("append batch datum failed", K(ret), K(col), K(row));
-              }
-            }
+      } else if (OB_ISNULL(builders[col]->type())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("null Arrow builder type", K(ret), K(col));
+      } else if (OB_FAIL(eval_batch_expr(expr, eval_ctx, brs))) {
+        LOG_WARN("result batch expression evaluation failed", K(ret), K(col));
+      } else if (!expr->enable_rich_format()) {
+        // Legacy batch expressions own ObDatum arrays, not vector headers.
+        for (int64_t i = 0; OB_SUCC(ret) && i < nrows; ++i) {
+          if (!brs.all_rows_active_ && brs.skip_->at(i)) {
+            continue;
+          }
+          if (OB_FAIL(append_datum_to_builder(
+                  *expr, expr->locate_expr_datum(eval_ctx, i),
+                  *builders[col], lob_arena, &eval_ctx))) {
+            LOG_WARN("append legacy batch datum failed", K(ret), K(col), K(i));
           }
         }
-      } else if (OB_FAIL(expr->eval_vector(eval_ctx, brs))) {
-        LOG_WARN("eval_vector failed", K(ret), K(col));
-      } else if (OB_ISNULL(vec = expr->get_vector(eval_ctx))) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("get_vector failed", K(ret), K(col));
+      } else if (OB_FAIL(get_arrow_output_vector(*expr, eval_ctx, nrows, vec))) {
+        LOG_WARN("invalid result vector", K(ret), K(col));
       } else {
         const common::ObObjType ob_t = expr->datum_meta_.type_;
         const arrow::Type::type ar_t = builders[col]->type()->id();
@@ -1133,7 +1422,7 @@ int ObArrowBatchConverter::append_brs_to_builders(
           // 命中静态分发表时走向量化路径。
           if (OB_FAIL(fn(*expr, *vec, *brs.skip_, nrows, brs.all_rows_active_,
                          *builders[col], &lob_arena))) {
-            LOG_WARN("arrow converter fn failed — NOT retrying datum path; check LUT/group invariant",
+            LOG_WARN("Arrow vector conversion failed",
                      K(ret), K(col), K(ob_t), K(ar_t));
           }
         } else {

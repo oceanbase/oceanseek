@@ -1328,6 +1328,7 @@ public:
                                           const bool is_update_set,
                                           const int64_t dist_methods,
                                           ObIArray<CandidatePlan> &subquery_plans,
+                                          bool &rejected_rescan,
                                           const ObIArray<ObAliasRefRawExpr *> *project_refs = NULL);
 
   int inner_candi_allocate_massive_subplan_filter(ObIArray<ObSEArray<CandidatePlan,4>> &best_list,
@@ -1342,6 +1343,7 @@ public:
                                                   const bool is_update_set,
                                                   const int64_t dist_methods,
                                                   ObIArray<CandidatePlan> &subquery_plans,
+                                                  bool &rejected_rescan,
                                                   const ObIArray<ObAliasRefRawExpr *> *project_refs = NULL);
 
   int prepare_subplan_candidate_list(ObIArray<ObLogPlan*> &subplans,
@@ -1382,6 +1384,7 @@ public:
                                  const ObIArray<ObRawExpr*> &filters,
                                  const bool is_update_set,
                                  const bool for_cursor_expr,
+                                 bool &rejected_rescan,
                                  const ObIArray<ObAliasRefRawExpr *> *project_refs = NULL);
 
   int check_contains_recursive_cte(ObIArray<ObLogicalOperator*> &child_ops,

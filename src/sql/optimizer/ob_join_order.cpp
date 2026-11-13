@@ -8,7 +8,6 @@
 #include "sql/code_generator/ob_enable_rich_format_flags.h"
 #include "sql/optimizer/ob_skyline_prunning.h"
 #include "sql/optimizer/ob_log_table_scan.h"
-#include "sql/optimizer/ob_log_function_table.h"
 #include "sql/rewrite/ob_transform_utils.h"
 #include "sql/optimizer/ob_access_path_estimation.h"
 #include "share/stat/ob_opt_stat_manager.h"
@@ -12987,6 +12986,10 @@ int ObJoinOrder::generate_function_table_paths()
 #ifdef OB_BUILD_OBSERVER_FLIGHT_SQL
       ObRawExpr *arrow_expr = table_item->function_table_expr_;
       ObOptimizerContext &opt_ctx = get_plan()->get_optimizer_context();
+      if (OB_FAIL(observer::ObArrowStreamCatalog::get_estimated_row_count(
+              arrow_expr, output_rows_))) {
+        LOG_WARN("failed to estimate Arrow stream row count", K(ret));
+      }
       EnableOpRichFormat rich_format(
           opt_ctx.get_query_ctx()->get_global_hint().disable_op_rich_format_hint_.get_op_flags(),
           opt_ctx.get_session_info()->use_rich_format());
@@ -14895,81 +14898,6 @@ int ObJoinOrder::compute_nlj_dop_by_auto_dop(Path *left_path,
   return ret;
 }
 
-// Arrow streams are owned by the Flight SQL DoPut RPC and can be consumed only
-// once.  They may drive an NLJ, but must never be the NLJ inner input because
-// that side is rescanned for each driver row. For placement checks, inspect only
-// the current DFO: an exchange already separates its producer's server list.
-static int check_contain_one_shot_arrow_stream(const ::oceanbase::sql::ObLogicalOperator *op,
-                                              const bool current_dfo_only,
-                                              bool &contain)
-{
-  int ret = OB_SUCCESS;
-  contain = false;
-  if (OB_ISNULL(op)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected null operator", K(ret));
-  } else if (current_dfo_only && log_op_def::LOG_EXCHANGE == op->get_type()) {
-    // The Arrow reader below this exchange belongs to another DFO.
-  } else if (log_op_def::LOG_FUNCTION_TABLE == op->get_type()) {
-    const ObRawExpr *value_expr =
-        static_cast<const ::oceanbase::sql::ObLogFunctionTable *>(op)->get_value_expr();
-    contain = OB_NOT_NULL(value_expr)
-        && (T_FUN_SYS_ARROW_STREAM == value_expr->get_expr_type()
-            || T_FUN_SYS_ARROW_STREAMS == value_expr->get_expr_type());
-  } else {
-    for (int64_t i = 0; OB_SUCC(ret) && !contain && i < op->get_num_of_child(); ++i) {
-      if (OB_FAIL(SMART_CALL(check_contain_one_shot_arrow_stream(
-              op->get_child(i), current_dfo_only, contain)))) {
-        LOG_WARN("failed to check child operator for one-shot Arrow stream", K(ret));
-      }
-    }
-  }
-  return ret;
-}
-
-static int check_contain_one_shot_arrow_stream(const ::oceanbase::sql::Path *path,
-                                              const bool current_dfo_only,
-                                              bool &contain)
-{
-  int ret = OB_SUCCESS;
-  contain = false;
-  if (OB_ISNULL(path)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected null path", K(ret));
-  } else if (path->is_function_table_path()) {
-    const ::oceanbase::sql::FunctionTablePath *function_table_path =
-        static_cast<const ::oceanbase::sql::FunctionTablePath *>(path);
-    const ObRawExpr *value_expr = function_table_path->value_expr_;
-    contain = OB_NOT_NULL(value_expr)
-        && (T_FUN_SYS_ARROW_STREAM == value_expr->get_expr_type()
-            || T_FUN_SYS_ARROW_STREAMS == value_expr->get_expr_type());
-  } else if (path->is_subquery_path()) {
-    const ::oceanbase::sql::SubQueryPath *subquery_path =
-        static_cast<const ::oceanbase::sql::SubQueryPath *>(path);
-    if (OB_FAIL(SMART_CALL(check_contain_one_shot_arrow_stream(
-            subquery_path->root_, current_dfo_only, contain)))) {
-      LOG_WARN("failed to check subquery for one-shot Arrow stream", K(ret));
-    }
-  } else if (path->is_join_path()) {
-    const ::oceanbase::sql::JoinPath *join_path =
-        static_cast<const ::oceanbase::sql::JoinPath *>(path);
-    if (!current_dfo_only || !join_path->is_left_need_exchange()) {
-      if (OB_FAIL(SMART_CALL(check_contain_one_shot_arrow_stream(
-              join_path->left_path_, current_dfo_only, contain)))) {
-        LOG_WARN("failed to check left join path for one-shot Arrow stream", K(ret));
-      }
-    }
-    if (OB_SUCC(ret) && !contain
-        && (!current_dfo_only || !join_path->is_right_need_exchange())) {
-      if (OB_FAIL(SMART_CALL(check_contain_one_shot_arrow_stream(
-              join_path->right_path_, current_dfo_only, contain)))) {
-        LOG_WARN("failed to check right join path for one-shot Arrow stream", K(ret));
-      }
-    }
-  }
-  return ret;
-}
-
 int ObJoinOrder::generate_inner_nl_paths(const EqualSets &equal_sets,
                                          const ObIArray<Path*> &left_paths,
                                          Path *right_path,
@@ -14982,20 +14910,17 @@ int ObJoinOrder::generate_inner_nl_paths(const EqualSets &equal_sets,
                                          const bool has_equal_cond)
 {
   int ret = OB_SUCCESS;
+  bool has_arrow_stream = false;
   int64_t dist_method = 0;
   int64_t join_parallel = ObGlobalHint::UNSET_PARALLEL;
-  bool right_contain_arrow_stream = false;
   OPT_TRACE_TITLE("GENERATE INNER NL PATHS");
   if (OB_UNLIKELY(left_paths.empty()) || OB_ISNULL(left_paths.at(0)) || OB_ISNULL(right_path)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected error", K(left_paths.count()), K(right_path), K(ret));
-  } else if (OB_FAIL(check_contain_one_shot_arrow_stream(
-                 right_path, false /* current_dfo_only */, right_contain_arrow_stream))) {
-    LOG_WARN("failed to check inner NLJ input for one-shot Arrow stream", K(ret));
-  } else if (right_contain_arrow_stream) {
-    // An inner-path NLJ rescans its right child with a new set of parameters.
-    // Do not build one over a one-shot Arrow input.
-    OPT_TRACE("skip inner NLJ for one-shot Arrow FunctionTable");
+  } else if (OB_FAIL(ObOptimizerUtil::contains_arrow_stream(right_path, has_arrow_stream))) {
+    LOG_WARN("failed to check for Arrow stream in right path", K(ret));
+  } else if (has_arrow_stream) {
+    OPT_TRACE("skip inner NLJ because the right path contains an Arrow stream");
   } else if (OB_FAIL(compute_nlj_dop_by_auto_dop(left_paths.at(0),
                                                 right_path,
                                                 path_info.join_type_,
@@ -15066,25 +14991,20 @@ int ObJoinOrder::generate_normal_nl_paths(const EqualSets &equal_sets,
                                           const bool has_equal_cond)
 {
   int ret = OB_SUCCESS;
+  bool has_arrow_stream = false;
   Path *left_path = NULL;
   ObJoinOrder *left_tree = NULL;
   int64_t dist_method = 0;
   int64_t join_parallel = ObGlobalHint::UNSET_PARALLEL;
-  bool right_contain_arrow_stream = false;
   if (OB_UNLIKELY(left_paths.empty()) || OB_ISNULL(left_paths.at(0)) ||
       OB_ISNULL(left_tree = left_paths.at(0)->parent_) ||
       OB_ISNULL(right_path) || OB_ISNULL(right_path->get_sharding())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected error", K(left_paths.count()), K(right_path), K(ret));
-  } else if (OB_FAIL(check_contain_one_shot_arrow_stream(
-                 right_path, false /* current_dfo_only */, right_contain_arrow_stream))) {
-    LOG_WARN("failed to check normal NLJ input for one-shot Arrow stream", K(ret));
-  } else if (right_contain_arrow_stream) {
-    // A normal NLJ also rescans its right child for each left row.  Do not
-    // auto-materialize the Flight SQL input: that would turn streaming ingest
-    // into full buffering.  Leave this invalid NLJ orientation ungenerated so
-    // normal hint fallback can select another valid join method.
-    OPT_TRACE("skip normal NLJ for one-shot Arrow FunctionTable");
+  } else if (OB_FAIL(ObOptimizerUtil::contains_arrow_stream(right_path, has_arrow_stream))) {
+    LOG_WARN("failed to check for Arrow stream in right path", K(ret));
+  } else if (has_arrow_stream) {
+    OPT_TRACE("skip normal NLJ because the right path contains an Arrow stream");
   } else if (OB_FAIL(compute_nlj_dop_by_auto_dop(left_paths.at(0),
                                                  right_path,
                                                  path_info.join_type_,
@@ -15200,8 +15120,6 @@ int ObJoinOrder::get_distributed_join_method(Path &left_path,
   bool is_partition_wise = false;
   bool is_ext_partition_wise = false;
   bool right_is_base_table = false;
-  bool left_contain_arrow_stream = false;
-  bool right_contain_arrow_stream = false;
   ObSEArray<ObRawExpr*, 8> target_part_keys;
   ObShardingInfo *left_sharding = NULL;
   ObShardingInfo *right_sharding = NULL;
@@ -15221,20 +15139,27 @@ int ObJoinOrder::get_distributed_join_method(Path &left_path,
   // child.  NONE ALL is safe on the left, however: it inherits the left
   // server_list_ and lets the Arrow input drive an NLJ against an ALL/DAS
   // inner table.
-  if (OB_FAIL(check_contain_one_shot_arrow_stream(
-          &left_path, true /* current_dfo_only */, left_contain_arrow_stream))) {
-    LOG_WARN("failed to check left join input for one-shot Arrow stream", K(ret));
-  } else if (OB_FAIL(check_contain_one_shot_arrow_stream(
-                 &right_path, true /* current_dfo_only */, right_contain_arrow_stream))) {
-    LOG_WARN("failed to check right join input for one-shot Arrow stream", K(ret));
+  // TODO: reject BC2HOST when its input contains an Arrow source in the same
+  // DFO, while allowing BC2HOST after the Arrow data has crossed a lower
+  // reshuffle boundary. Join reordering runs before LOG_EXCHANGE allocation,
+  // so this requires a path-level check of child distribution methods.
+  bool has_left_arrow_stream = false;
+  bool has_right_arrow_stream = false;
+  if (OB_FAIL(ObOptimizerUtil::contains_arrow_stream(&left_path, has_left_arrow_stream,
+                                                   false /* distributed_only */,
+                                                   true /* current_dfo_only */))
+      || OB_FAIL(ObOptimizerUtil::contains_arrow_stream(&right_path, has_right_arrow_stream,
+                                                       false /* distributed_only */,
+                                                       true /* current_dfo_only */))) {
+    LOG_WARN("failed to check for Arrow stream in join paths", K(ret));
   }
-  if (OB_SUCC(ret) && left_contain_arrow_stream) {
+  if (OB_SUCC(ret) && has_left_arrow_stream) {
     distributed_methods &= ~(DIST_NONE_HASH |
                              DIST_NONE_BROADCAST |
                              DIST_NONE_PARTITION);
     OPT_TRACE("[FlightSQL] Arrow FunctionTable on left side can not use unsafe NONE distribution");
   }
-  if (OB_SUCC(ret) && right_contain_arrow_stream) {
+  if (OB_SUCC(ret) && has_right_arrow_stream) {
     distributed_methods &= ~(DIST_HASH_NONE |
                              DIST_BROADCAST_NONE |
                              DIST_BC2HOST_NONE |
@@ -15246,10 +15171,17 @@ int ObJoinOrder::get_distributed_join_method(Path &left_path,
   // each PX worker to land on a distinct node to read its local ingest stream.
   // Slave-mapping distributions and BC2HOST co-locate workers, so forbid them.
   {
-    const bool has_distributed_arrow_stream =
-        (left_contain_arrow_stream && left_path.server_cnt_ > 1)
-        || (right_contain_arrow_stream && right_path.server_cnt_ > 1);
-    if (has_distributed_arrow_stream) {
+    bool has_dist_ft = false;
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(ObOptimizerUtil::contains_arrow_stream(&left_path, has_dist_ft,
+                                                            true /* distributed_only */,
+                                                            true /* current_dfo_only */))
+               || (!has_dist_ft
+                   && OB_FAIL(ObOptimizerUtil::contains_arrow_stream(&right_path, has_dist_ft,
+                                                                    true /* distributed_only */,
+                                                                    true /* current_dfo_only */)))) {
+      LOG_WARN("failed to check for distributed Arrow stream in join paths", K(ret));
+    } else if (has_dist_ft) {
       distributed_methods &= ~DIST_BC2HOST_NONE;
       distributed_methods &= ~DIST_HASH_HASH_LOCAL;
       distributed_methods &= ~DIST_PARTITION_HASH_LOCAL;
@@ -19256,6 +19188,7 @@ int ObJoinOrder::create_and_add_nl_path(const Path *left_path,
                                         int64_t join_parallel)
 {
   int ret = OB_SUCCESS;
+  bool has_arrow_stream = false;
   JoinPath *join_path = NULL;
   ObSEArray<ObRawExpr*, 4> normal_filters;
   ObSEArray<ObRawExpr*, 4> subquery_filters;
@@ -19264,6 +19197,10 @@ int ObJoinOrder::create_and_add_nl_path(const Path *left_path,
       OB_ISNULL(left_path->parent_) || OB_ISNULL(right_path->parent_)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("get unexpected null", K(left_path), K(right_path), K(get_plan()), K(ret));
+  } else if (OB_FAIL(ObOptimizerUtil::contains_arrow_stream(right_path, has_arrow_stream))) {
+    LOG_WARN("failed to check for Arrow stream in right path", K(ret));
+  } else if (has_arrow_stream) {
+    OPT_TRACE("skip NLJ because the right path contains an Arrow stream");
   } else if (IS_NOT_INNER_JOIN(join_type) &&
              OB_FAIL(ObOptimizerUtil::classify_subquery_exprs(where_conditions,
                                                               subquery_filters,

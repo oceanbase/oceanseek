@@ -51,6 +51,10 @@ public:
                                     common::ObIAllocator &alloc,
                                     common::ObIArray<sql::ObArrowStreamColDesc> &col_descs);
 
+  // Get the optimizer's estimated row count for an Arrow function table.
+  static int get_estimated_row_count(const sql::ObRawExpr *func_expr,
+                                     double &row_count);
+
   // Get the sharding for an arrow_stream/arrow_streams function table scan path.
   // V1 (arrow_stream): returns opt_ctx.get_local_sharding().
   // arrow_streams returns local sharding only when its sole listed observer is

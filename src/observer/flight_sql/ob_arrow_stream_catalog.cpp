@@ -33,6 +33,26 @@ using namespace common;
 namespace observer
 {
 
+int ObArrowStreamCatalog::get_estimated_row_count(const sql::ObRawExpr *func_expr,
+                                                   double &row_count)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(func_expr)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("[FlightSQL] Arrow function expression is null", K(ret));
+  } else if (T_FUN_SYS_ARROW_STREAM == func_expr->get_expr_type()) {
+    // V1 streams normally supply bulk ingest input.
+    row_count = 1000000.0;
+  } else if (T_FUN_SYS_ARROW_STREAMS == func_expr->get_expr_type()) {
+    // Keep the existing estimate for V2/V3 streams.
+    row_count = 199.0;
+  } else {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("[FlightSQL] unexpected Arrow function expression", K(ret), KPC(func_expr));
+  }
+  return ret;
+}
+
 static bool is_arrow_collection_field(const arrow::Field &arrow_field)
 {
   const arrow::Type::type type_id = arrow_field.type()->id();
@@ -151,7 +171,11 @@ int ObArrowStreamCatalog::get_columns(uint64_t stream_id,
   int ret = OB_SUCCESS;
   void *session_registry = OB_NOT_NULL(session)
       ? session->get_flight_sql_stream_registry() : nullptr;
-  if (OB_ISNULL(session_registry)) {
+  if (OB_ISNULL(session)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("[FlightSQL] SQL session is null", K(ret), K(stream_id));
+    return ret;
+  } else if (OB_ISNULL(session_registry)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("[FlightSQL] no active stream registry", K(ret), K(stream_id));
     return ret;
@@ -165,39 +189,42 @@ int ObArrowStreamCatalog::get_columns(uint64_t stream_id,
     return ret;
   }
 
-  // ── Acquire OB schema at resolve time ──────────────────────────────────────
+  // Generated V1 SQL validates Arrow fields against its target table. A
+  // schema-only registration belongs to user-provided SQL and has no single
+  // target table, so its function-table schema comes directly from Arrow.
   const uint64_t tenant_id = session->get_effective_tenant_id();
   share::schema::ObSchemaGetterGuard guard;
-  if (OB_ISNULL(GCTX.schema_service_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("[FlightSQL] schema service unavailable", K(ret));
-    return ret;
-  }
-  if (OB_FAIL(GCTX.schema_service_->get_tenant_schema_guard(tenant_id, guard))) {
-    LOG_WARN("[FlightSQL] get_tenant_schema_guard failed", K(ret), K(tenant_id));
-    return ret;
-  }
-
-  uint64_t db_id = common::OB_INVALID_ID;
-  const ObString ob_db(static_cast<int32_t>(entry->db_name.size()),
-                       entry->db_name.c_str());
-  if (OB_FAIL(guard.get_database_id(tenant_id, ob_db, db_id))
-      || OB_INVALID_ID == db_id) {
-    ret = OB_SUCC(ret) ? OB_ERR_UNEXPECTED : ret;
-    LOG_WARN("[FlightSQL] database not found in schema guard", K(ret),
-             "db_name", entry->db_name.c_str());
-    return ret;
-  }
-
   const share::schema::ObTableSchema *table_schema = nullptr;
-  const ObString ob_tbl(static_cast<int32_t>(entry->table_name.size()),
-                        entry->table_name.c_str());
-  if (OB_FAIL(guard.get_table_schema(tenant_id, db_id, ob_tbl, false, table_schema))
-      || OB_ISNULL(table_schema)) {
-    ret = OB_SUCC(ret) ? OB_TABLE_NOT_EXIST : ret;
-    LOG_WARN("[FlightSQL] table not found in schema guard", K(ret),
-             "table_name", entry->table_name.c_str());
-    return ret;
+  if (!entry->schema_only) {
+    if (OB_ISNULL(GCTX.schema_service_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("[FlightSQL] schema service unavailable", K(ret));
+      return ret;
+    } else if (OB_FAIL(GCTX.schema_service_->get_tenant_schema_guard(tenant_id, guard))) {
+      LOG_WARN("[FlightSQL] get_tenant_schema_guard failed", K(ret), K(tenant_id));
+      return ret;
+    }
+
+    uint64_t db_id = common::OB_INVALID_ID;
+    const ObString ob_db(static_cast<int32_t>(entry->db_name.size()),
+                         entry->db_name.c_str());
+    if (OB_FAIL(guard.get_database_id(tenant_id, ob_db, db_id))
+        || OB_INVALID_ID == db_id) {
+      ret = OB_SUCC(ret) ? OB_ERR_UNEXPECTED : ret;
+      LOG_WARN("[FlightSQL] database not found in schema guard", K(ret),
+               "db_name", entry->db_name.c_str());
+      return ret;
+    }
+
+    const ObString ob_tbl(static_cast<int32_t>(entry->table_name.size()),
+                          entry->table_name.c_str());
+    if (OB_FAIL(guard.get_table_schema(tenant_id, db_id, ob_tbl, false, table_schema))
+        || OB_ISNULL(table_schema)) {
+      ret = OB_SUCC(ret) ? OB_TABLE_NOT_EXIST : ret;
+      LOG_WARN("[FlightSQL] table not found in schema guard", K(ret),
+               "table_name", entry->table_name.c_str());
+      return ret;
+    }
   }
 
   // ── Map each Arrow field → OB column, populate desc ────────────────────────
@@ -223,10 +250,12 @@ int ObArrowStreamCatalog::get_columns(uint64_t stream_id,
     const arrow::Field &arrow_field = *arrow_field_ptr;
     const ObString ob_col_name(static_cast<int32_t>(arrow_field.name().size()),
                                arrow_field.name().c_str());
-    const share::schema::ObColumnSchemaV2 *ob_col =
-        table_schema->get_column_schema(ob_col_name);
+    const share::schema::ObColumnSchemaV2 *ob_col = entry->schema_only
+        ? nullptr : table_schema->get_column_schema(ob_col_name);
     share::schema::ObColumnSchemaV2 source_column;
-    if (OB_ISNULL(ob_col) && entry->is_merge_source) {
+    if (entry->schema_only) {
+      // No target-column validation is meaningful for arbitrary user SQL.
+    } else if (OB_ISNULL(ob_col) && entry->is_merge_source) {
       if (OB_FAIL(build_merge_source_column(arrow_field, *session, source_column))) {
         LOG_WARN("[FlightSQL] failed to map source-only MERGE field", K(ret), K(i));
         break;
@@ -267,7 +296,7 @@ int ObArrowStreamCatalog::get_columns(uint64_t stream_id,
       break;
     }
 
-    const ObString raw_name = entry->is_merge_source
+    const ObString raw_name = entry->schema_only || entry->is_merge_source
         ? ob_col_name : ob_col->get_column_name_str();
     char *buf = static_cast<char *>(alloc.alloc(raw_name.length()));
     if (OB_ISNULL(buf)) {

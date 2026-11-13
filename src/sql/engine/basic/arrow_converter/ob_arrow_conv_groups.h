@@ -1,6 +1,6 @@
 /**
- * Copyright (C) 2026 OceanBase
- * 本文件包含机密及专有信息，未经授权不得使用或披露。
+ * Copyright (c) 2026 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #ifndef OCEANBASE_SQL_ENGINE_BASIC_OB_ARROW_CONV_GROUPS_H_
@@ -10,6 +10,7 @@
 #include <arrow/api.h>
 #include "sql/engine/basic/arrow_converter/ob_arrow_conv_traits.h"
 #include "sql/engine/basic/arrow_converter/ob_arrow_conv_impl.h"
+#include "sql/engine/basic/arrow_converter/ob_arrow_batch_converter.h"
 #include "sql/engine/basic/arrow_converter/ob_arrow_utils.h"
 #include "sql/engine/expr/ob_expr.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
@@ -213,6 +214,42 @@ struct JsonGroup
           ret = arrow_status_to_ob_ret(status);
           LOG_WARN("append json failed", K(ret), "st", status.ToString().c_str(), K(i));
         }
+      }
+      return ret;
+    }
+  };
+};
+
+template <common::ObObjType OT, arrow::Type::type AT>
+struct GeometryGroup
+{
+  using Builder = typename ObArrowConvTraits<OT, AT>::Builder;
+
+  template <typename VEC>
+  struct ConvFn
+  {
+    VEC &vec_;
+    Builder &builder_;
+    common::ObIAllocator *arena_;
+    ObDatumMeta datum_meta_;
+
+    ConvFn(const ObExpr &expr, VEC &vec, Builder &builder, common::ObIAllocator *arena)
+        : vec_(vec), builder_(builder), arena_(arena), datum_meta_(expr.datum_meta_)
+    {}
+
+    OB_INLINE int operator()(const ObExpr & /*expr*/, int64_t i)
+    {
+      int ret = OB_SUCCESS;
+      common::ObString raw;
+      if (OB_ISNULL(arena_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("null geometry arena", K(ret), K(i));
+      } else if (OB_FAIL(ObTextStringHelper::read_real_string_data(
+                     *arena_, &vec_, datum_meta_, raw, i))) {
+        LOG_WARN("read geometry payload failed", K(ret), K(i));
+      } else if (OB_FAIL(ObArrowBatchConverter::append_geometry_to_builder(
+                     raw, builder_, *arena_))) {
+        LOG_WARN("append geometry to Arrow failed", K(ret), K(i));
       }
       return ret;
     }

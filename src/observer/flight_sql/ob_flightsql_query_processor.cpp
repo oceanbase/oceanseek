@@ -1,6 +1,6 @@
 /**
  * Copyright (c) 2024 OceanBase
- * 本文件包含机密及专有信息，未经授权不得使用或披露。
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #define USING_LOG_PREFIX SERVER
@@ -13,11 +13,14 @@
 #include "lib/oblog/ob_log.h"
 #include "lib/time/ob_time_utility.h"
 #include "lib/timezone/ob_time_convert.h"
+#include "lib/utility/ob_defer.h"
 #include "lib/wide_integer/ob_wide_integer.h"
 #include "lib/wide_integer/ob_wide_integer_str_funcs.h"
 #include "lib/worker.h"
 #include "observer/ob_req_time_service.h"
+#include "observer/flight_sql/ob_flight_worker.h"
 #include "observer/flight_sql/ob_flightsql_param_converter.h"
+#include "observer/flight_sql/ob_flightsql_query_retry.h"
 #include "sql/engine/expr/ob_datum_cast.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
 #include "lib/profile/ob_trace_id.h"
@@ -37,6 +40,7 @@
 #include "sql/engine/ob_physical_plan.h"
 #include "sql/engine/ob_subschema_ctx.h"
 #include "sql/engine/basic/arrow_converter/ob_arrow_batch_converter.h"
+#include "sql/engine/basic/arrow_converter/ob_arrow_utils.h"
 #include "sql/resolver/ob_stmt.h"
 #include "lib/stat/ob_diagnose_info.h"
 #include "lib/string/ob_string.h"
@@ -260,18 +264,26 @@ struct ObFlightSqlPreparedStateScope {
   ObFlightSqlPreparedStateScope(ObFlightSqlSession &flight_session,
                                 const common::ObString &display_sql,
                                 const obmysql::ObMySQLCmd command)
-      : session_(flight_session.ob_session),
+      : flight_session_(&flight_session),
+        session_(flight_session.ob_session),
         idle_tag_("/* flightsql */")
   {
     if (OB_NOT_NULL(session_)) {
-      session_->set_mysql_cmd(command);
-      (void)session_->set_session_state(sql::QUERY_ACTIVE);
-      (void)session_->store_query_string(display_sql);
+      std::lock_guard<std::mutex> guard(flight_session_->mutex);
+      if (!flight_session_->closing_) {
+        session_->set_mysql_cmd(command);
+        (void)session_->set_session_state(sql::QUERY_ACTIVE);
+        (void)session_->store_query_string(display_sql);
+      }
     }
   }
   ~ObFlightSqlPreparedStateScope()
   {
-    if (OB_NOT_NULL(session_)) {
+    if (OB_NOT_NULL(session_) && OB_NOT_NULL(flight_session_)) {
+      std::lock_guard<std::mutex> guard(flight_session_->mutex);
+      if (flight_session_->closing_) {
+        return;
+      }
       session_->set_session_sleep();
       (void)session_->store_query_string(common::ObString(
           static_cast<int32_t>(idle_tag_.size()), idle_tag_.c_str()));
@@ -279,6 +291,7 @@ struct ObFlightSqlPreparedStateScope {
   }
 
 private:
+  ObFlightSqlSession *flight_session_;
   sql::ObSQLSessionInfo *session_;
   std::string idle_tag_;
   ObFlightSqlPreparedStateScope(const ObFlightSqlPreparedStateScope &) = delete;
@@ -406,7 +419,7 @@ static void flight_sql_log_append_null_from_status_(
 }
 
 template <typename ArrowDecimalType, typename ArrowBuilderType>
-static void flight_sql_append_scaled_decimal_int_to_arrow_(
+static int flight_sql_append_scaled_decimal_int_to_arrow_(
     ArrowBuilderType *builder,
     const common::ObDecimalInt *decint,
     const int32_t int_bytes,
@@ -414,6 +427,12 @@ static void flight_sql_append_scaled_decimal_int_to_arrow_(
     const int64_t col_idx,
     const char *col_name)
 {
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(builder) || OB_ISNULL(decint)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("[FlightSQL] null decimal builder or payload", K(ret), K(col_idx));
+    return ret;
+  }
   const int32_t arrow_bytes = static_cast<int32_t>(ArrowDecimalType::kByteWidth);
   common::ObDecimalIntBuilder extended;
   extended.from(decint, int_bytes);
@@ -423,11 +442,15 @@ static void flight_sql_append_scaled_decimal_int_to_arrow_(
     flight_sql_log_append_null_("decimal_int_bytes_exceeds_arrow_width", obj, builder, col_idx,
                                 col_name, nullptr, -1, -1, -1,
                                 "scaled decimal int is wider than Arrow decimal type");
-    (void)builder->AppendNull();
-    return;
+    return sql::arrow_status_to_ob_ret(builder->AppendNull());
   }
   const int32_t final_bytes = extended.get_int_bytes();
   const uint8_t *buffer = reinterpret_cast<const uint8_t *>(extended.get_decimal_int());
+  if (OB_ISNULL(buffer) || final_bytes < 0 || final_bytes > arrow_bytes) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("[FlightSQL] invalid decimal buffer or width", K(ret), K(final_bytes), K(arrow_bytes));
+    return ret;
+  }
   uint8_t buf[ArrowDecimalType::kByteWidth] = {0};
   for (int32_t i = 0; i < final_bytes; ++i) {
     buf[arrow_bytes - 1 - i] = buffer[i];
@@ -437,32 +460,37 @@ static void flight_sql_append_scaled_decimal_int_to_arrow_(
   if (!dec_res.ok()) {
     flight_sql_log_append_null_from_status_("decimal_from_big_endian_failed", obj, builder,
                                             col_idx, col_name, dec_res.status());
-    (void)builder->AppendNull();
-    return;
+    return sql::arrow_status_to_ob_ret(builder->AppendNull());
   }
   const arrow::Status append_st = builder->Append(dec_res.ValueOrDie());
+  ret = sql::arrow_status_to_ob_ret(append_st);
   if (!append_st.ok()) {
-    flight_sql_log_append_null_from_status_("decimal_append_failed", obj, builder, col_idx,
-                                            col_name, append_st);
-    (void)builder->AppendNull();
+    LOG_WARN("[FlightSQL] append decimal output failed", K(ret), K(col_idx),
+             "status", append_st.ToString().c_str());
   }
+  return ret;
 }
 
-static void flight_sql_append_ob_decimal_to_builder_(
+static int flight_sql_append_ob_decimal_to_builder_(
     arrow::ArrayBuilder *builder,
     const common::ObObj &obj,
     const int64_t col_idx,
     const char *col_name)
 {
   using namespace common;
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(builder) || OB_ISNULL(builder->type())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("[FlightSQL] null decimal builder or type", K(ret), K(col_idx));
+    return ret;
+  }
   int32_t tgt_prec = -1;
   int32_t tgt_scale = -1;
   int arrow_type_id = -1;
   flight_sql_get_arrow_decimal_meta_(builder, tgt_prec, tgt_scale, arrow_type_id);
   if (tgt_prec <= 0 || tgt_scale < 0) {
     flight_sql_log_append_null_("decimal_arrow_meta_invalid", obj, builder, col_idx, col_name);
-    (void)builder->AppendNull();
-    return;
+    return sql::arrow_status_to_ob_ret(builder->AppendNull());
   }
 
   ObDecimalIntBuilder work;
@@ -470,7 +498,6 @@ static void flight_sql_append_ob_decimal_to_builder_(
   const ObDecimalInt *src_decint = nullptr;
   int32_t src_int_bytes = 0;
   ObScale src_scale = 0;
-  int ret = OB_SUCCESS;
 
   if (ObNumberType == obj.get_type() || ObUNumberType == obj.get_type()) {
     const number::ObNumber &nmb = obj.get_number();
@@ -486,8 +513,7 @@ static void flight_sql_append_ob_decimal_to_builder_(
       flight_sql_log_append_null_("ob_number_to_decimal_int_failed", obj, builder, col_idx,
                                   col_name, nullptr, -1, -1, static_cast<int32_t>(src_scale),
                                   "wide::from_number failed");
-      (void)builder->AppendNull();
-      return;
+      return sql::arrow_status_to_ob_ret(builder->AppendNull());
     }
     src_decint = tmp_decint;
     src_int_bytes = tmp_int_bytes;
@@ -497,13 +523,11 @@ static void flight_sql_append_ob_decimal_to_builder_(
     src_scale = obj.get_scale();
     if (OB_ISNULL(src_decint)) {
       flight_sql_log_append_null_("decimal_int_ptr_null", obj, builder, col_idx, col_name);
-      (void)builder->AppendNull();
-      return;
+      return sql::arrow_status_to_ob_ret(builder->AppendNull());
     }
   } else {
     flight_sql_log_append_null_("not_decimal_ob_type", obj, builder, col_idx, col_name);
-    (void)builder->AppendNull();
-    return;
+    return sql::arrow_status_to_ob_ret(builder->AppendNull());
   }
 
   const ObPrecision out_prec = static_cast<ObPrecision>(tgt_prec);
@@ -520,26 +544,26 @@ static void flight_sql_append_ob_decimal_to_builder_(
                                   col_name, nullptr, out_prec, out_scale,
                                   static_cast<int32_t>(src_scale),
                                   "ObDatumCast::common_scale_decimalint failed");
-      (void)builder->AppendNull();
-      return;
+      return sql::arrow_status_to_ob_ret(builder->AppendNull());
     }
     out_decint = scaled.get_decimal_int();
     out_bytes = scaled.get_int_bytes();
   }
 
   if (arrow_type_id == static_cast<int>(arrow::Type::DECIMAL128)) {
-    flight_sql_append_scaled_decimal_int_to_arrow_<arrow::Decimal128, arrow::Decimal128Builder>(
+    ret = flight_sql_append_scaled_decimal_int_to_arrow_<arrow::Decimal128, arrow::Decimal128Builder>(
         static_cast<arrow::Decimal128Builder *>(builder), out_decint, out_bytes, obj, col_idx,
         col_name);
   } else if (arrow_type_id == static_cast<int>(arrow::Type::DECIMAL256)) {
-    flight_sql_append_scaled_decimal_int_to_arrow_<arrow::Decimal256, arrow::Decimal256Builder>(
+    ret = flight_sql_append_scaled_decimal_int_to_arrow_<arrow::Decimal256, arrow::Decimal256Builder>(
         static_cast<arrow::Decimal256Builder *>(builder), out_decint, out_bytes, obj, col_idx,
         col_name);
   } else {
     flight_sql_log_append_null_("unexpected_arrow_decimal_builder_type", obj, builder, col_idx,
                                 col_name);
-    (void)builder->AppendNull();
+    ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
   }
+  return ret;
 }
 } // namespace
 
@@ -547,7 +571,7 @@ static void flight_sql_append_ob_decimal_to_builder_(
 // OB → Arrow cell serialisation
 // ============================================================
 
-static void append_obj_to_builder_(arrow::ArrayBuilder *builder,
+static int append_obj_to_builder_(arrow::ArrayBuilder *builder,
                                    const common::ObObj &obj,
                                    const int64_t tenant_id,
                                    const int64_t col_idx = -1,
@@ -555,99 +579,111 @@ static void append_obj_to_builder_(arrow::ArrayBuilder *builder,
 {
   int ret = OB_SUCCESS;
   using namespace common;
+  if (OB_ISNULL(builder) || OB_ISNULL(builder->type())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("[FlightSQL] null result builder or type", K(ret), K(col_idx));
+    return ret;
+  }
   if (obj.is_null()) {
     LOG_DEBUG("[FlightSQL] append_obj_to_builder_: SQL null cell",
              "col_idx", col_idx,
              "col_name", (OB_NOT_NULL(col_name) ? col_name : "(unknown)"),
              "ob_type", static_cast<int>(obj.get_type()));
-    (void)builder->AppendNull();
-    return;
+    return sql::arrow_status_to_ob_ret(builder->AppendNull());
   }
   switch (obj.get_type()) {
     case ObTinyIntType:
-      (void)static_cast<arrow::Int8Builder *>(builder)->Append(
-          static_cast<int8_t>(obj.get_tinyint()));
+      ret = sql::arrow_status_to_ob_ret(static_cast<arrow::Int8Builder *>(builder)->Append(
+          static_cast<int8_t>(obj.get_tinyint())));
       break;
     case ObSmallIntType:
-      (void)static_cast<arrow::Int16Builder *>(builder)->Append(
-          static_cast<int16_t>(obj.get_smallint()));
+      ret = sql::arrow_status_to_ob_ret(static_cast<arrow::Int16Builder *>(builder)->Append(
+          static_cast<int16_t>(obj.get_smallint())));
+      break;
+    case ObMediumIntType:
+      ret = sql::arrow_status_to_ob_ret(static_cast<arrow::Int32Builder *>(builder)->Append(
+          static_cast<int32_t>(obj.get_mediumint())));
       break;
     case ObInt32Type:
-      (void)static_cast<arrow::Int32Builder *>(builder)->Append(
-          static_cast<int32_t>(obj.get_int32()));
+      ret = sql::arrow_status_to_ob_ret(static_cast<arrow::Int32Builder *>(builder)->Append(
+          static_cast<int32_t>(obj.get_int32())));
       break;
     case ObIntType:
-      (void)static_cast<arrow::Int64Builder *>(builder)->Append(
-          static_cast<int64_t>(obj.get_int()));
+      ret = sql::arrow_status_to_ob_ret(static_cast<arrow::Int64Builder *>(builder)->Append(
+          static_cast<int64_t>(obj.get_int())));
       break;
     case ObUTinyIntType:
-      (void)static_cast<arrow::UInt8Builder *>(builder)->Append(
-          static_cast<uint8_t>(obj.get_utinyint()));
+      ret = sql::arrow_status_to_ob_ret(static_cast<arrow::UInt8Builder *>(builder)->Append(
+          static_cast<uint8_t>(obj.get_utinyint())));
       break;
     case ObUSmallIntType:
-      (void)static_cast<arrow::UInt16Builder *>(builder)->Append(
-          static_cast<uint16_t>(obj.get_usmallint()));
+      ret = sql::arrow_status_to_ob_ret(static_cast<arrow::UInt16Builder *>(builder)->Append(
+          static_cast<uint16_t>(obj.get_usmallint())));
+      break;
+    case ObUMediumIntType:
+      ret = sql::arrow_status_to_ob_ret(static_cast<arrow::Int32Builder *>(builder)->Append(
+          static_cast<int32_t>(obj.get_umediumint())));
       break;
     case ObUInt32Type:
-      (void)static_cast<arrow::UInt32Builder *>(builder)->Append(
-          static_cast<uint32_t>(obj.get_uint32()));
+      ret = sql::arrow_status_to_ob_ret(static_cast<arrow::UInt32Builder *>(builder)->Append(
+          static_cast<uint32_t>(obj.get_uint32())));
       break;
     case ObUInt64Type:
-      (void)static_cast<arrow::UInt64Builder *>(builder)->Append(
-          static_cast<uint64_t>(obj.get_uint64()));
+      ret = sql::arrow_status_to_ob_ret(static_cast<arrow::UInt64Builder *>(builder)->Append(
+          static_cast<uint64_t>(obj.get_uint64())));
       break;
     case ObFloatType:
     case ObUFloatType:
-      (void)static_cast<arrow::FloatBuilder *>(builder)->Append(obj.get_float());
+      ret = sql::arrow_status_to_ob_ret(static_cast<arrow::FloatBuilder *>(builder)->Append(obj.get_float()));
       break;
     case ObDoubleType:
     case ObUDoubleType:
-      (void)static_cast<arrow::DoubleBuilder *>(builder)->Append(obj.get_double());
+      ret = sql::arrow_status_to_ob_ret(static_cast<arrow::DoubleBuilder *>(builder)->Append(obj.get_double()));
       break;
     case ObNumberType:
     case ObUNumberType:
     case ObDecimalIntType:
-      flight_sql_append_ob_decimal_to_builder_(builder, obj, col_idx, col_name);
+      ret = flight_sql_append_ob_decimal_to_builder_(builder, obj, col_idx, col_name);
       break;
     case ObDateTimeType:
     case ObTimestampType:
-      (void)static_cast<arrow::TimestampBuilder *>(builder)->Append(obj.get_datetime());
+      ret = sql::arrow_status_to_ob_ret(static_cast<arrow::TimestampBuilder *>(builder)->Append(obj.get_datetime()));
       break;
     case ObMySQLDateTimeType: {
       const common::ObMySQLDateTime mdt = obj.get_mysql_datetime();
       int64_t dt_value = 0;
       if (OB_SUCCESS != common::ObTimeConverter::mdatetime_to_datetime(mdt, dt_value, 0)) {
-        (void)builder->AppendNull();
+        ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
       } else {
-        (void)static_cast<arrow::TimestampBuilder *>(builder)->Append(dt_value);
+        ret = sql::arrow_status_to_ob_ret(static_cast<arrow::TimestampBuilder *>(builder)->Append(dt_value));
       }
       break;
     }
     case ObDateType:
-      (void)static_cast<arrow::Date32Builder *>(builder)->Append(
-          static_cast<int32_t>(obj.get_date()));
+      ret = sql::arrow_status_to_ob_ret(static_cast<arrow::Date32Builder *>(builder)->Append(
+          static_cast<int32_t>(obj.get_date())));
       break;
     case ObMySQLDateType: {
       const common::ObMySQLDate md = obj.get_mysql_date();
       int32_t d_value = 0;
       if (OB_SUCCESS != common::ObTimeConverter::mdate_to_date(md, d_value, 0)) {
-        (void)builder->AppendNull();
+        ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
       } else {
-        (void)static_cast<arrow::Date32Builder *>(builder)->Append(d_value);
+        ret = sql::arrow_status_to_ob_ret(static_cast<arrow::Date32Builder *>(builder)->Append(d_value));
       }
       break;
     }
     case ObTimeType:
-      (void)static_cast<arrow::DurationBuilder *>(builder)->Append(obj.get_time());
+      ret = sql::arrow_status_to_ob_ret(static_cast<arrow::DurationBuilder *>(builder)->Append(obj.get_time()));
       break;
     case ObYearType: {
       const uint8_t raw = obj.get_year();
-      (void)static_cast<arrow::Int16Builder *>(builder)->Append(
-          static_cast<int16_t>(raw == 0 ? 0 : 1900 + raw));
+      ret = sql::arrow_status_to_ob_ret(static_cast<arrow::Int16Builder *>(builder)->Append(
+          static_cast<int16_t>(raw == 0 ? 0 : 1900 + raw)));
       break;
     }
     case ObBitType:
-      (void)static_cast<arrow::UInt64Builder *>(builder)->Append(obj.get_bit());
+      ret = sql::arrow_status_to_ob_ret(static_cast<arrow::UInt64Builder *>(builder)->Append(obj.get_bit()));
       break;
     case ObVarcharType:
     case ObCharType:
@@ -663,6 +699,10 @@ static void append_obj_to_builder_(arrow::ArrayBuilder *builder,
       ObString s;
       if (obj.is_lob_storage() && obj.get_string_len() != 0) {
         const ObLobCommon *lob = obj.get_lob_value();
+        if (OB_ISNULL(lob)) {
+          ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
+          break;
+        }
         if (!lob->is_mem_loc_ && lob->in_row_) {
           // inrow disk LOB: skip header with pointer arithmetic, zero allocation
           const int64_t byte_sz = lob->get_byte_size(obj.get_string_len());
@@ -670,21 +710,21 @@ static void append_obj_to_builder_(arrow::ArrayBuilder *builder,
             LOG_WARN("[FlightSQL] inrow LOB byte_size out of int32 range, returning NULL",
                      "byte_sz", byte_sz, "col_idx", col_idx,
                      "col_name", (OB_NOT_NULL(col_name) ? col_name : "(unknown)"));
-            (void)builder->AppendNull();
+            ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
             break;
           }
           s.assign_ptr(lob->get_inrow_data_ptr(), static_cast<int32_t>(byte_sz));
         } else {
           // outrow or mem LOB: materialize via allocator
           if (OB_SUCCESS != sql::ObTextStringHelper::read_real_string_data(&arena, obj, s)) {
-            (void)builder->AppendNull();
+            ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
             break;
           }
           if (OB_UNLIKELY(s.length() < 0)) {
             LOG_WARN("[FlightSQL] text LOB length overflowed int32 after read, returning NULL",
                      "length", s.length(), "col_idx", col_idx,
                      "col_name", (OB_NOT_NULL(col_name) ? col_name : "(unknown)"));
-            (void)builder->AppendNull();
+            ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
             break;
           }
         }
@@ -693,15 +733,26 @@ static void append_obj_to_builder_(arrow::ArrayBuilder *builder,
       }
       if (builder->type()->id() == arrow::Type::LARGE_BINARY) {
         if (OB_NOT_NULL(s.ptr())) {
-          (void)static_cast<arrow::LargeBinaryBuilder *>(builder)->Append(
+          ret = sql::arrow_status_to_ob_ret(static_cast<arrow::LargeBinaryBuilder *>(builder)->Append(
               reinterpret_cast<const uint8_t *>(s.ptr()),
-              static_cast<int64_t>(s.length()));
+              static_cast<int64_t>(s.length())));
         } else {
-          (void)builder->AppendNull();
+          ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
         }
       } else {
-        (void)static_cast<arrow::StringBuilder *>(builder)->Append(
-            s.ptr(), static_cast<int32_t>(s.length()));
+        ret = sql::arrow_status_to_ob_ret(static_cast<arrow::StringBuilder *>(builder)->Append(
+            s.ptr(), static_cast<int32_t>(s.length())));
+      }
+      break;
+    }
+    case ObGeometryType: {
+      common::ObArenaAllocator arena("FlightSQL", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id);
+      ObString raw;
+      if (OB_FAIL(sql::ObTextStringHelper::read_real_string_data(&arena, obj, raw))) {
+        LOG_WARN("[FlightSQL] read geometry payload failed", K(ret), K(col_idx));
+      } else if (OB_FAIL(sql::ObArrowBatchConverter::append_geometry_to_builder(
+                     raw, *static_cast<arrow::BinaryBuilder *>(builder), arena))) {
+        LOG_WARN("[FlightSQL] append geometry output failed", K(ret), K(col_idx));
       }
       break;
     }
@@ -716,7 +767,7 @@ static void append_obj_to_builder_(arrow::ArrayBuilder *builder,
       if (obj.is_lob_storage() && obj.get_string_len() != 0) {
         const ObLobCommon *lob = obj.get_lob_value();
         if (OB_ISNULL(lob)) {
-          (void)builder->AppendNull();
+          ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
           break;
         }
         if (!lob->is_mem_loc_ && lob->in_row_) {
@@ -725,20 +776,20 @@ static void append_obj_to_builder_(arrow::ArrayBuilder *builder,
             LOG_WARN("[FlightSQL] JSON inrow LOB byte_size out of int32 range, returning NULL",
                      "byte_sz", byte_sz, "col_idx", col_idx,
                      "col_name", (OB_NOT_NULL(col_name) ? col_name : "(unknown)"));
-            (void)builder->AppendNull();
+            ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
             break;
           }
           raw.assign_ptr(lob->get_inrow_data_ptr(), static_cast<int32_t>(byte_sz));
         } else {
           if (OB_SUCCESS != sql::ObTextStringHelper::read_real_string_data(&arena, obj, raw)) {
-            (void)builder->AppendNull();
+            ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
             break;
           }
           if (OB_UNLIKELY(raw.length() < 0)) {
             LOG_WARN("[FlightSQL] JSON LOB length overflowed int32 after read, returning NULL",
                      "length", raw.length(), "col_idx", col_idx,
                      "col_name", (OB_NOT_NULL(col_name) ? col_name : "(unknown)"));
-            (void)builder->AppendNull();
+            ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
             break;
           }
         }
@@ -746,7 +797,7 @@ static void append_obj_to_builder_(arrow::ArrayBuilder *builder,
         raw = obj.get_string();
       }
       if (OB_ISNULL(raw.ptr()) || raw.length() == 0) {
-        (void)builder->AppendNull();
+        ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
         break;
       }
       common::ObJsonBin j_bin(raw.ptr(), raw.length(), &arena);
@@ -755,17 +806,17 @@ static void append_obj_to_builder_(arrow::ArrayBuilder *builder,
       if (OB_SUCCESS != j_bin.reset_iter()
           || OB_SUCCESS != j_bin.print(jbuf, /*is_quoted=*/true, raw.length())
           || jbuf.empty()) {
-        (void)builder->AppendNull();
+        ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
       } else {
         const int64_t jbuf_len = static_cast<int64_t>(jbuf.length());
         if (OB_UNLIKELY(jbuf_len < 0 || jbuf_len > INT32_MAX)) {
           LOG_WARN("[FlightSQL] serialized JSON length out of int32 range, returning NULL",
                    "jbuf_len", jbuf_len, "col_idx", col_idx,
                    "col_name", (OB_NOT_NULL(col_name) ? col_name : "(unknown)"));
-          (void)builder->AppendNull();
+          ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
         } else {
-          (void)static_cast<arrow::StringBuilder *>(builder)->Append(
-              jbuf.ptr(), static_cast<int32_t>(jbuf_len));
+          ret = sql::arrow_status_to_ob_ret(static_cast<arrow::StringBuilder *>(builder)->Append(
+              jbuf.ptr(), static_cast<int32_t>(jbuf_len)));
         }
       }
       break;
@@ -776,7 +827,7 @@ static void append_obj_to_builder_(arrow::ArrayBuilder *builder,
       if (obj.is_lob_storage() && obj.get_string_len() != 0) {
         const ObLobCommon *lob = obj.get_lob_value();
         if (OB_ISNULL(lob)) {
-          (void)builder->AppendNull();
+          ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
           break;
         }
         if (!lob->is_mem_loc_ && lob->in_row_) {
@@ -785,20 +836,20 @@ static void append_obj_to_builder_(arrow::ArrayBuilder *builder,
             LOG_WARN("[FlightSQL] LOB inrow byte_size out of int32 range, returning NULL",
                      "byte_sz", byte_sz, "col_idx", col_idx,
                      "col_name", (OB_NOT_NULL(col_name) ? col_name : "(unknown)"));
-            (void)builder->AppendNull();
+            ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
             break;
           }
           s.assign_ptr(lob->get_inrow_data_ptr(), static_cast<int32_t>(byte_sz));
         } else {
           if (OB_SUCCESS != sql::ObTextStringHelper::read_real_string_data(&arena, obj, s)) {
-            (void)builder->AppendNull();
+            ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
             break;
           }
           if (OB_UNLIKELY(s.length() < 0)) {
             LOG_WARN("[FlightSQL] LOB length overflowed int32 after read, returning NULL",
                      "length", s.length(), "col_idx", col_idx,
                      "col_name", (OB_NOT_NULL(col_name) ? col_name : "(unknown)"));
-            (void)builder->AppendNull();
+            ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
             break;
           }
         }
@@ -806,11 +857,11 @@ static void append_obj_to_builder_(arrow::ArrayBuilder *builder,
         s = obj.get_string();
       }
       if (OB_NOT_NULL(s.ptr())) {
-        (void)static_cast<arrow::LargeBinaryBuilder *>(builder)->Append(
+        ret = sql::arrow_status_to_ob_ret(static_cast<arrow::LargeBinaryBuilder *>(builder)->Append(
             reinterpret_cast<const uint8_t *>(s.ptr()),
-            static_cast<int64_t>(s.length()));
+            static_cast<int64_t>(s.length())));
       } else {
-        (void)builder->AppendNull();
+        ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
       }
       break;
     }
@@ -824,7 +875,7 @@ static void append_obj_to_builder_(arrow::ArrayBuilder *builder,
       if (obj.is_lob_storage() && obj.get_string_len() != 0) {
         const ObLobCommon *lob = obj.get_lob_value();
         if (OB_ISNULL(lob)) {
-          (void)builder->AppendNull();
+          ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
           break;
         }
         if (!lob->is_mem_loc_ && lob->in_row_) {
@@ -833,20 +884,20 @@ static void append_obj_to_builder_(arrow::ArrayBuilder *builder,
             LOG_WARN("[FlightSQL] collection inrow LOB byte_size out of int32 range, returning NULL",
                      "byte_sz", byte_sz, "col_idx", col_idx,
                      "col_name", (OB_NOT_NULL(col_name) ? col_name : "(unknown)"));
-            (void)builder->AppendNull();
+            ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
             break;
           }
           raw.assign_ptr(lob->get_inrow_data_ptr(), static_cast<int32_t>(byte_sz));
         } else {
           if (OB_SUCCESS != sql::ObTextStringHelper::read_real_string_data(&arena, obj, raw)) {
-            (void)builder->AppendNull();
+            ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
             break;
           }
           if (OB_UNLIKELY(raw.length() < 0)) {
             LOG_WARN("[FlightSQL] collection LOB length overflowed int32 after read, returning NULL",
                      "length", raw.length(), "col_idx", col_idx,
                      "col_name", (OB_NOT_NULL(col_name) ? col_name : "(unknown)"));
-            (void)builder->AppendNull();
+            ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
             break;
           }
         }
@@ -854,7 +905,7 @@ static void append_obj_to_builder_(arrow::ArrayBuilder *builder,
         raw = obj.get_string();
       }
       if (OB_ISNULL(raw.ptr())) {
-        (void)builder->AppendNull();
+        ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
         break;
       }
       // VECTOR (FIXED_SIZE_LIST): binary is raw packed elements, no header.
@@ -863,44 +914,63 @@ static void append_obj_to_builder_(arrow::ArrayBuilder *builder,
       //   nulls[i] == 1 means element i is NULL.
 #define FLIGHT_SQL_APPEND_FIXED_LIST_(CppType, ArrowBuilder, ArrowTypeId)                     \
       } else if (elem_tid == arrow::Type::ArrowTypeId) {                                       \
-        if (raw.length() >= static_cast<int64_t>(dim * static_cast<int32_t>(sizeof(CppType)))) { \
-          (void)list_bld->Append();                                                             \
+        if (raw.length() >= static_cast<int64_t>(dim) * static_cast<int64_t>(sizeof(CppType))) { \
           auto *eb = static_cast<arrow::ArrowBuilder *>(list_bld->value_builder());            \
-          const CppType *vals = reinterpret_cast<const CppType *>(raw.ptr());                  \
-          for (int32_t i = 0; i < dim; i++) { (void)eb->Append(vals[i]); }                    \
-        } else { (void)builder->AppendNull(); }
+          if (OB_ISNULL(eb)) {                                                                \
+            ret = OB_ERR_UNEXPECTED;                                                         \
+          } else {                                                                           \
+            ret = sql::arrow_status_to_ob_ret(list_bld->Append());                            \
+            const CppType *vals = reinterpret_cast<const CppType *>(raw.ptr());               \
+            for (int32_t i = 0; OB_SUCC(ret) && i < dim; i++) {                               \
+              ret = sql::arrow_status_to_ob_ret(eb->Append(vals[i]));                         \
+            }                                                                                \
+          }                                                                                  \
+        } else { ret = sql::arrow_status_to_ob_ret(builder->AppendNull()); }
 #define FLIGHT_SQL_APPEND_VAR_LIST_(CppType, ArrowBuilder, ArrowTypeId)                        \
       } else if (elem_tid == arrow::Type::ArrowTypeId) {                                       \
         if (raw.length() < static_cast<int64_t>(sizeof(uint32_t))) {                          \
-          (void)builder->AppendNull();                                                          \
+          ret = sql::arrow_status_to_ob_ret(builder->AppendNull());                                                          \
         } else {                                                                                \
           const uint32_t arr_cnt = *reinterpret_cast<const uint32_t *>(raw.ptr());            \
           const char *body = raw.ptr() + sizeof(uint32_t);                                     \
           const int64_t body_len = raw.length() - static_cast<int64_t>(sizeof(uint32_t));     \
           const int64_t need = static_cast<int64_t>(arr_cnt) * (1 + static_cast<int64_t>(sizeof(CppType))); \
           if (body_len < need) {                                                                \
-            (void)builder->AppendNull();                                                        \
+            ret = sql::arrow_status_to_ob_ret(builder->AppendNull());                                                        \
           } else {                                                                              \
-            (void)list_bld->Append();                                                           \
             auto *eb = static_cast<arrow::ArrowBuilder *>(list_bld->value_builder());         \
-            const uint8_t *nulls = reinterpret_cast<const uint8_t *>(body);                   \
-            const CppType *vals = reinterpret_cast<const CppType *>(body + arr_cnt);          \
-            for (uint32_t i = 0; i < arr_cnt; i++) {                                          \
-              if (nulls[i]) { (void)eb->AppendNull(); }                                        \
-              else { (void)eb->Append(vals[i]); }                                              \
+            if (OB_ISNULL(eb)) {                                                              \
+              ret = OB_ERR_UNEXPECTED;                                                       \
+            } else {                                                                         \
+              ret = sql::arrow_status_to_ob_ret(list_bld->Append());                          \
+              const uint8_t *nulls = reinterpret_cast<const uint8_t *>(body);                 \
+              const CppType *vals = reinterpret_cast<const CppType *>(body + arr_cnt);        \
+              for (uint32_t i = 0; OB_SUCC(ret) && i < arr_cnt; i++) {                         \
+                ret = sql::arrow_status_to_ob_ret(                                            \
+                    nulls[i] ? eb->AppendNull() : eb->Append(vals[i]));                       \
+              }                                                                              \
             }                                                                                   \
           }                                                                                     \
         }
       // Arrow 20: ListBuilder::type() creates a new shared_ptr on every call.
       // Hold it alive for the full if/else chain so raw pointers don't dangle.
       const ArrowDataTypePtr type_sptr = builder->type();
+      if (OB_ISNULL(type_sptr)) {
+        ret = OB_ERR_UNEXPECTED;
+        break;
+      }
       const arrow::Type::type tid = type_sptr->id();
       if (tid == arrow::Type::FIXED_SIZE_LIST) {
         auto *list_bld = static_cast<arrow::FixedSizeListBuilder *>(builder);
         const auto *list_type =
             static_cast<const arrow::FixedSizeListType *>(type_sptr.get());
         const int32_t dim = list_type->list_size();
-        const arrow::Type::type elem_tid = list_type->value_type()->id();
+        const ArrowDataTypePtr elem_type = list_type->value_type();
+        if (dim < 0 || OB_ISNULL(elem_type)) {
+          ret = OB_ERR_UNEXPECTED;
+          break;
+        }
+        const arrow::Type::type elem_tid = elem_type->id();
         if (false) { // anchor for the macro chain
         FLIGHT_SQL_APPEND_FIXED_LIST_(float,    FloatBuilder,   FLOAT)
         FLIGHT_SQL_APPEND_FIXED_LIST_(double,   DoubleBuilder,  DOUBLE)
@@ -914,12 +984,17 @@ static void append_obj_to_builder_(arrow::ArrayBuilder *builder,
         FLIGHT_SQL_APPEND_FIXED_LIST_(uint64_t, UInt64Builder,  UINT64)
         } else {
           flight_sql_log_append_null_("unsupported_fixed_list_elem", obj, builder, col_idx, col_name);
-          (void)builder->AppendNull();
+          ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
         }
       } else if (tid == arrow::Type::LIST) {
         auto *list_bld = static_cast<arrow::ListBuilder *>(builder);
         const auto *list_type = static_cast<const arrow::ListType *>(type_sptr.get());
-        const arrow::Type::type elem_tid = list_type->value_type()->id();
+        const ArrowDataTypePtr elem_type = list_type->value_type();
+        if (OB_ISNULL(elem_type)) {
+          ret = OB_ERR_UNEXPECTED;
+          break;
+        }
+        const arrow::Type::type elem_tid = elem_type->id();
         if (false) { // anchor for the macro chain
         FLIGHT_SQL_APPEND_VAR_LIST_(float,    FloatBuilder,   FLOAT)
         FLIGHT_SQL_APPEND_VAR_LIST_(double,   DoubleBuilder,  DOUBLE)
@@ -933,12 +1008,12 @@ static void append_obj_to_builder_(arrow::ArrayBuilder *builder,
         FLIGHT_SQL_APPEND_VAR_LIST_(uint64_t, UInt64Builder,  UINT64)
         } else {
           flight_sql_log_append_null_("unsupported_list_elem", obj, builder, col_idx, col_name);
-          (void)builder->AppendNull();
+          ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
         }
       } else {
-        (void)static_cast<arrow::LargeBinaryBuilder *>(builder)->Append(
+        ret = sql::arrow_status_to_ob_ret(static_cast<arrow::LargeBinaryBuilder *>(builder)->Append(
             reinterpret_cast<const uint8_t *>(raw.ptr()),
-            static_cast<int64_t>(raw.length()));
+            static_cast<int64_t>(raw.length())));
       }
 #undef FLIGHT_SQL_APPEND_FIXED_LIST_
 #undef FLIGHT_SQL_APPEND_VAR_LIST_
@@ -946,9 +1021,10 @@ static void append_obj_to_builder_(arrow::ArrayBuilder *builder,
     }
     default:
       flight_sql_log_append_null_("unsupported_ob_type", obj, builder, col_idx, col_name);
-      (void)builder->AppendNull();
+      ret = sql::arrow_status_to_ob_ret(builder->AppendNull());
       break;
   }
+  return ret;
 }
 
 // ============================================================
@@ -1345,6 +1421,94 @@ int64_t ObFlightSqlQueryProcessor::start_request_timeout(ObFlightSqlSession &ses
   return timeout_ts;
 }
 
+int ObFlightSqlQueryRetry::init(ObFlightSqlSession &session, const common::ObString &sql)
+{
+  int ret = OB_SUCCESS;
+  int64_t tenant_version = 0;
+  int64_t sys_version = 0;
+  MAKE_TENANT_SWITCH_SCOPE_GUARD(tenant_guard);
+  if (OB_ISNULL(session.ob_session) || OB_ISNULL(GCTX.schema_service_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_FAIL(tenant_guard.switch_to(session.tenant_id))) {
+    LOG_WARN("[FlightSQL] retry: tenant switch failed", K(ret), K(session.tenant_id));
+  } else if (OB_FAIL(GCTX.schema_service_->get_tenant_received_broadcast_version(
+                 session.ob_session->get_effective_tenant_id(), tenant_version))) {
+    LOG_WARN("[FlightSQL] retry: failed to get tenant schema version", K(ret));
+  } else if (OB_FAIL(GCTX.schema_service_->get_tenant_received_broadcast_version(
+                 common::OB_SYS_TENANT_ID, sys_version))) {
+    LOG_WARN("[FlightSQL] retry: failed to get system schema version", K(ret));
+  } else {
+    common::ObCurTraceId::init(GCTX.self_addr());
+    trace_id_ = *common::ObCurTraceId::get_trace_id();
+    if (OB_FAIL(session.ob_session->check_and_init_retry_info(trace_id_, sql))) {
+      LOG_WARN("[FlightSQL] retry: failed to initialize session retry info", K(ret));
+    } else {
+      retry_ctrl_.set_tenant_global_schema_version(tenant_version);
+      retry_ctrl_.set_sys_global_schema_version(sys_version);
+      session.ob_session->set_session_in_retry(sql::SESS_NOT_IN_RETRY);
+      timeout_ts_ = ObFlightSqlQueryProcessor::start_request_timeout(session);
+      initialized_ = true;
+    }
+  }
+  return ret;
+}
+
+void ObFlightSqlQueryRetry::begin_attempt(ObFlightSqlSession &session)
+{
+  retry_ctrl_.clear_state_before_each_retry(session.ob_session->get_retry_info_for_update());
+}
+
+int ObFlightSqlQueryRetry::set_schema_versions(
+    ObFlightSqlSession &session,
+    share::schema::ObSchemaGetterGuard &schema_guard,
+    sql::ObSqlCtx &sql_ctx)
+{
+  int ret = OB_SUCCESS;
+  int64_t tenant_version = 0;
+  int64_t sys_version = 0;
+  if (OB_FAIL(schema_guard.get_schema_version(
+          session.ob_session->get_effective_tenant_id(), tenant_version))) {
+    LOG_WARN("[FlightSQL] retry: failed to get local tenant schema version", K(ret));
+  } else if (OB_FAIL(schema_guard.get_schema_version(common::OB_SYS_TENANT_ID, sys_version))) {
+    LOG_WARN("[FlightSQL] retry: failed to get local system schema version", K(ret));
+  } else {
+    retry_ctrl_.set_tenant_local_schema_version(tenant_version);
+    retry_ctrl_.set_sys_local_schema_version(sys_version);
+    sql_ctx.retry_times_ = retry_ctrl_.get_retry_times();
+  }
+  return ret;
+}
+
+void ObFlightSqlQueryRetry::check_retry(
+    sql::ObSqlCtx &sql_ctx, sql::ObResultSet &result, int &client_ret)
+{
+  const int error = client_ret;
+  if (sql::stmt::T_SELECT == result.get_stmt_type()
+      && (OB_SCHEMA_EAGAIN == error || OB_ERR_WAIT_REMOTE_SCHEMA_REFRESH == error)) {
+    // Flight RPCs cannot be put back on the MySQL request queue. Use the same
+    // schema policy, but keep local retries within the original deadline.
+    retry_ctrl_.test_and_save_retry_state(GCTX, sql_ctx, result, error, client_ret,
+                                         true /* force_local_retry */);
+    if (need_retry()) {
+      result.set_will_retry();
+    }
+  }
+}
+
+void ObFlightSqlQueryRetry::update_session(ObFlightSqlSession &session)
+{
+  session.ob_session->set_session_in_retry(retry_ctrl_.need_retry());
+}
+
+void ObFlightSqlQueryRetry::finish(ObFlightSqlSession &session)
+{
+  if (initialized_ && OB_NOT_NULL(session.ob_session)) {
+    session.ob_session->check_and_reset_retry_info(trace_id_, false /* packet_retry */);
+    session.ob_session->set_session_in_retry(sql::SESS_NOT_IN_RETRY);
+    initialized_ = false;
+  }
+}
+
 // ============================================================
 // Arrow type mapping
 // ============================================================
@@ -1357,10 +1521,14 @@ std::shared_ptr<arrow::DataType> ObFlightSqlQueryProcessor::ob_type_to_arrow(
     case ObNullType:       return arrow::null();
     case ObTinyIntType:    return arrow::int8();
     case ObSmallIntType:   return arrow::int16();
+    // Both MEDIUMINT ranges fit Spark IntegerType.  Use signed Arrow int32 so
+    // Spark can consume the IntVector directly without unsigned widening.
+    case ObMediumIntType:  return arrow::int32();
     case ObInt32Type:      return arrow::int32();
     case ObIntType:        return arrow::int64();
     case ObUTinyIntType:   return arrow::uint8();
     case ObUSmallIntType:  return arrow::uint16();
+    case ObUMediumIntType: return arrow::int32();
     case ObUInt32Type:     return arrow::uint32();
     case ObUInt64Type:     return arrow::uint64();
     case ObFloatType:
@@ -1392,6 +1560,7 @@ std::shared_ptr<arrow::DataType> ObFlightSqlQueryProcessor::ob_type_to_arrow(
     case ObSetType:        return arrow::utf8();
     case ObLobType:        return arrow::large_binary();
     case ObJsonType:       return arrow::utf8();
+    case ObGeometryType:   return arrow::binary();
     case ObURowIDType:     return arrow::utf8();
     default:               return arrow::utf8();
   }
@@ -1546,6 +1715,13 @@ std::shared_ptr<arrow::Schema> ObFlightSqlQueryProcessor::build_schema(
       }
     }
 
+    if (ob_tp == common::ObGeometryType) {
+      meta_keys.push_back("ob_encoding");
+      meta_values.push_back("ewkb");
+      meta_keys.push_back("ob_geometry_axis_order");
+      meta_values.push_back("xy");
+    }
+
     // ENUM/SET: look up the backing column schema once to get the member list.
     // OB reports both ENUM and SET as ObCharType in ObField, so we can't detect
     // them from ob_tp alone — a schema lookup on the original table column is the
@@ -1622,6 +1798,34 @@ int ObFlightSqlQueryProcessor::prepare(ObFlightSqlSession &session,
                                        const PrepareMode mode,
                                        const bool query_already_locked)
 {
+  if (PrepareMode::STATEMENT_QUERY != mode || OB_ISNULL(session.ob_session)) {
+    return prepare_once(session, sql, mode, query_already_locked, nullptr);
+  }
+
+  ObFlightWorkerGuard worker_guard;
+  ObSessionQueryGuard query_guard(session, query_already_locked);
+  if (!query_guard.acquired()) {
+    return OB_EAGAIN;
+  }
+  ObFlightSqlQueryRetry retry;
+  DEFER(retry.finish(session));
+  int ret = retry.init(session, sql);
+  if (OB_SUCC(ret)) {
+    do {
+      retry.begin_attempt(session);
+      ret = prepare_once(session, sql, mode, true /* query_already_locked */, &retry);
+      retry.update_session(session);
+    } while (OB_SUCCESS != ret && retry.need_retry());
+  }
+  return ret;
+}
+
+int ObFlightSqlQueryProcessor::prepare_once(ObFlightSqlSession &session,
+                                            const common::ObString &sql,
+                                            const PrepareMode mode,
+                                            const bool query_already_locked,
+                                            ObFlightSqlQueryRetry *retry)
+{
   int ret = OB_SUCCESS;
   arrow_schema_.reset();
   trace_id_str_.clear();
@@ -1652,7 +1856,11 @@ int ObFlightSqlQueryProcessor::prepare(ObFlightSqlSession &session,
     return ret;
   }
 
-  common::ObCurTraceId::init(GCTX.self_addr());
+  if (OB_NOT_NULL(retry)) {
+    common::ObCurTraceId::set(retry->trace_id());
+  } else {
+    common::ObCurTraceId::init(GCTX.self_addr());
+  }
   trace_id_str_ = common::ObCurTraceId::get_trace_id_str();
 
   MAKE_TENANT_SWITCH_SCOPE_GUARD(tenant_guard);
@@ -1661,10 +1869,13 @@ int ObFlightSqlQueryProcessor::prepare(ObFlightSqlSession &session,
              K(ret), "tenant_id", (int64_t)session.tenant_id);
     return ret;
   }
-  const int64_t timeout_ts = start_request_timeout(session);
+  const int64_t timeout_ts = OB_NOT_NULL(retry)
+      ? retry->timeout_ts() : start_request_timeout(session);
   lib::WorkerTimeoutGuard timeout_guard(timeout_ts);
   ObFlightSqlExecutionScope execution_scope(session);
   if (OB_FAIL(execution_scope.refresh_session_state())) {
+    return ret;
+  } else if (OB_NOT_NULL(retry) && OB_FAIL(THIS_WORKER.check_status())) {
     return ret;
   }
 
@@ -1680,6 +1891,9 @@ int ObFlightSqlQueryProcessor::prepare(ObFlightSqlSession &session,
   sql_ctx.disable_privilege_check_ = PRIV_CHECK_FLAG_NORMAL;
   sql_ctx.is_flight_sql_           = true;
   sql_ctx.enable_sql_resource_manage_ = true;
+  if (OB_NOT_NULL(retry) && OB_FAIL(retry->set_schema_versions(session, schema_guard, sql_ctx))) {
+    return ret;
+  }
 
   lib::ContextParam ctx_param;
   ctx_param.set_mem_attr(session.tenant_id, "FlightSQL")
@@ -1706,6 +1920,9 @@ int ObFlightSqlQueryProcessor::prepare(ObFlightSqlSession &session,
       LOG_WARN("[FlightSQL] QueryProcessor::prepare: stmt_query failed",
                K(ret), "ob_trace_id", ObCurTraceId::get_trace_id_str(),
                "sql", sql.ptr());
+      if (OB_NOT_NULL(retry)) {
+        retry->check_retry(sql_ctx, *result_set, ret);
+      }
       return ret;
     }
     const stmt::StmtType stmt_type = result_set->get_stmt_type();
@@ -1953,6 +2170,7 @@ int ObFlightSqlQueryProcessor::execute_prepared_update(
     const ObFlightSqlRequestCancellation *cancellation)
 {
   int ret = OB_SUCCESS;
+  UNUSED(audit_request_name);
   failed_column = -1;
   arrow_schema_.reset();
   batches_.clear();
@@ -2349,7 +2567,33 @@ int ObFlightSqlQueryProcessor::open_query(ObFlightSqlSession &session,
                                           ObFlightSqlQueryPtr<common::ObArenaAllocator> &out_arena,
                                           ObFlightSqlQueryPtr<share::schema::ObSchemaGetterGuard> &out_schema_guard,
                                           ObFlightSqlQueryPtr<sql::ObSqlCtx> &out_sql_ctx,
-                                          ObFlightSqlQueryPtr<sql::ObResultSet> &out_result_set)
+                                          ObFlightSqlQueryPtr<sql::ObResultSet> &out_result_set,
+                                          ObFlightSqlQueryRetry &retry,
+                                          const ObFlightSqlRequestCancellation *cancellation)
+{
+  int ret = OB_SUCCESS;
+  do {
+    retry.begin_attempt(session);
+    if (OB_NOT_NULL(cancellation) && cancellation->is_cancelled()) {
+      ret = OB_CANCELED;
+    } else {
+      ret = open_query_once(session, sql, out_mem_ctx, out_arena, out_schema_guard,
+                            out_sql_ctx, out_result_set, retry);
+    }
+    retry.update_session(session);
+  } while (OB_SUCCESS != ret && retry.need_retry());
+  return ret;
+}
+
+int ObFlightSqlQueryProcessor::open_query_once(
+    ObFlightSqlSession &session,
+    const common::ObString &sql,
+    lib::MemoryContext &out_mem_ctx,
+    ObFlightSqlQueryPtr<common::ObArenaAllocator> &out_arena,
+    ObFlightSqlQueryPtr<share::schema::ObSchemaGetterGuard> &out_schema_guard,
+    ObFlightSqlQueryPtr<sql::ObSqlCtx> &out_sql_ctx,
+    ObFlightSqlQueryPtr<sql::ObResultSet> &out_result_set,
+    ObFlightSqlQueryRetry &retry)
 {
   int ret = OB_SUCCESS;
   resource_group_id_ = 0;
@@ -2376,7 +2620,7 @@ int ObFlightSqlQueryProcessor::open_query(ObFlightSqlSession &session,
   is_hit_plan_cache_ = false;
   plan_type_ = sql::OB_PHY_PLAN_UNINITIALIZED;
   stmt_type_ = sql::stmt::T_NONE;
-  common::ObCurTraceId::init(GCTX.self_addr());
+  common::ObCurTraceId::set(retry.trace_id());
   trace_id_str_ = common::ObCurTraceId::get_trace_id_str();
 
   MAKE_TENANT_SWITCH_SCOPE_GUARD(tenant_guard);
@@ -2385,10 +2629,11 @@ int ObFlightSqlQueryProcessor::open_query(ObFlightSqlSession &session,
              K(ret), "tenant_id", (int64_t)session.tenant_id);
     return ret;
   }
-  const int64_t timeout_ts = start_request_timeout(session);
-  lib::WorkerTimeoutGuard timeout_guard(timeout_ts);
+  lib::WorkerTimeoutGuard timeout_guard(retry.timeout_ts());
   ObFlightSqlExecutionScope execution_scope(session);
   if (OB_FAIL(execution_scope.refresh_session_state())) {
+    return ret;
+  } else if (OB_FAIL(THIS_WORKER.check_status())) {
     return ret;
   }
 
@@ -2417,6 +2662,9 @@ int ObFlightSqlQueryProcessor::open_query(ObFlightSqlSession &session,
   sql_ctx->disable_privilege_check_ = PRIV_CHECK_FLAG_NORMAL;
   sql_ctx->is_flight_sql_           = true;
   sql_ctx->enable_sql_resource_manage_ = true;
+  if (OB_FAIL(retry.set_schema_versions(session, *schema_guard, *sql_ctx))) {
+    return ret;
+  }
 
   ObFlightSqlQueryPtr<common::ObArenaAllocator> arena_alloc(
       OB_NEW(common::ObArenaAllocator, query_mem_attr,
@@ -2497,6 +2745,10 @@ int ObFlightSqlQueryProcessor::open_query(ObFlightSqlSession &session,
         const int open_err = ret;
         LOG_WARN("[FlightSQL] open_query: open failed", K(open_err));
       }
+      const sql::ObPhysicalPlanCtx *plan_ctx = result_set->get_exec_context().get_physical_plan_ctx();
+      if (OB_NOT_NULL(plan_ctx)) {
+        retry.set_plan_timeout(plan_ctx->get_timeout_timestamp());
+      }
     }
     if (OB_SUCC(ret)) {
       LOG_TRACE("[FlightSQL] open_query: OK",
@@ -2508,21 +2760,25 @@ int ObFlightSqlQueryProcessor::open_query(ObFlightSqlSession &session,
   resource_group_id_ = THIS_WORKER.get_group_id();
   timeout_ts_ = THIS_WORKER.get_timeout_ts();
   if (OB_FAIL(ret)) {
-    if (open_attempted) {
-      // open() can start a statement before it fails.  close() must still
-      // release that state, while the original error remains the client result.
-      result_set->set_errcode(ret);
-      const int open_ret = ret;
-      {
-        int ret = OB_SUCCESS;  // WITH_CONTEXT requires a successful local status.
-        WITH_CONTEXT(mem_ctx) {
-          const int close_ret = result_set->close();
-          if (OB_SUCCESS != close_ret && close_ret != open_ret) {
-            LOG_WARN("[FlightSQL] open_query: cleanup after failed open failed",
-                     K(close_ret), K(open_ret), "ob_trace_id", trace_id_str_.c_str());
-          }
+    const int attempt_error = ret;
+    int client_ret = ret;
+    // WITH_CONTEXT only enters when ret is OB_SUCCESS.
+    ret = OB_SUCCESS;
+    WITH_CONTEXT(mem_ctx) {
+      retry.check_retry(*sql_ctx, *result_set, client_ret);
+      if (open_attempted) {
+        // Decide retry before closing, as MySQL does. close(ret) can cancel a
+        // retry if transaction cleanup reports an unrecoverable error.
+        result_set->set_errcode(attempt_error);
+        const int close_ret = result_set->close(client_ret);
+        if (OB_SUCCESS != close_ret && close_ret != attempt_error) {
+          LOG_WARN("[FlightSQL] open_query: cleanup after failed open failed",
+                   K(close_ret), K(attempt_error), "ob_trace_id", trace_id_str_.c_str());
         }
       }
+    }
+    if (OB_SUCC(ret)) {
+      ret = client_ret;
     }
     result_set.reset();
     sql_ctx.reset();
@@ -2552,9 +2808,11 @@ int ObFlightSqlQueryProcessor::execute(ObFlightSqlSession &session,
                                        const common::ObString &sql,
                                        const char *audit_request_name,
                                        const bool query_already_locked,
-                                       const ObFlightSqlRequestCancellation *cancellation)
+                                       const ObFlightSqlRequestCancellation *cancellation,
+                                       const ResultMode result_mode)
 {
   int ret = OB_SUCCESS;
+  UNUSED(audit_request_name);
   arrow_schema_.reset();
   batches_.clear();
   trace_id_str_.clear();
@@ -2627,21 +2885,35 @@ int ObFlightSqlQueryProcessor::execute(ObFlightSqlSession &session,
   // A RAII guard restores SLEEP + session tag on every exit path, including
   // early returns inside CREATE_WITH_TEMP_CONTEXT below.
   const std::string flight_session_tag_ = "/* flightsql */";
-  session.ob_session->set_mysql_cmd(obmysql::COM_QUERY);
-  (void)session.ob_session->set_session_state(sql::QUERY_ACTIVE);
-  (void)session.ob_session->store_query_string(sql);
+  {
+    std::lock_guard<std::mutex> guard(session.mutex);
+    if (session.closing_) {
+      return OB_CANCELED;
+    }
+    session.ob_session->set_mysql_cmd(obmysql::COM_QUERY);
+    (void)session.ob_session->set_session_state(sql::QUERY_ACTIVE);
+    (void)session.ob_session->store_query_string(sql);
+  }
   struct FlightExecStateGuard_ {
+    ObFlightSqlSession *flight_;
     sql::ObSQLSessionInfo *s_;
     const std::string     &tag_;
-    FlightExecStateGuard_(sql::ObSQLSessionInfo *s, const std::string &t) : s_(s), tag_(t) {}
+    FlightExecStateGuard_(ObFlightSqlSession *flight,
+                          sql::ObSQLSessionInfo *s,
+                          const std::string &t)
+        : flight_(flight), s_(s), tag_(t) {}
     ~FlightExecStateGuard_() {
-      if (OB_NOT_NULL(s_)) {
+      if (OB_NOT_NULL(flight_) && OB_NOT_NULL(s_)) {
+        std::lock_guard<std::mutex> guard(flight_->mutex);
+        if (flight_->closing_) {
+          return;
+        }
         s_->set_session_sleep();
         (void)s_->store_query_string(common::ObString(
             static_cast<int32_t>(tag_.size()), tag_.c_str()));
       }
     }
-  } flight_exec_state_guard_(session.ob_session, flight_session_tag_);
+  } flight_exec_state_guard_(&session, session.ob_session, flight_session_tag_);
 
   if (OB_NOT_NULL(cancellation) && cancellation->is_cancelled()) {
     return OB_CANCELED;
@@ -2719,7 +2991,8 @@ int ObFlightSqlQueryProcessor::execute(ObFlightSqlSession &session,
   LOG_TRACE("[FlightSQL] QueryProcessor::execute: stmt_query OK (plan only, not executed yet)",
            "ob_trace_id", ObCurTraceId::get_trace_id_str(), "sql", sql.ptr());
 
-  if (OB_FAIL(flight_sql_validate_result_types_(
+  if (ResultMode::MATERIALIZE == result_mode
+      && OB_FAIL(flight_sql_validate_result_types_(
           result_set->get_field_columns(), result_set->get_physical_plan(),
           trace_id_str_, error_detail_))) {
     flight_sql_finalize_statement_audit_like_mpquery_(
@@ -2728,9 +3001,11 @@ int ObFlightSqlQueryProcessor::execute(ObFlightSqlSession &session,
     return ret;
   }
 
-  arrow_schema_ = build_schema(result_set->get_field_columns(),
-                               &result_set->get_exec_context(),
-                               &schema_guard, session.tenant_id);
+  if (ResultMode::MATERIALIZE == result_mode) {
+    arrow_schema_ = build_schema(result_set->get_field_columns(),
+                                 &result_set->get_exec_context(),
+                                 &schema_guard, session.tenant_id);
+  }
 
   // Capture fields available immediately after plan resolution.
   if (sql_ctx.sql_id_[0] != '\0') {
@@ -2767,6 +3042,34 @@ int ObFlightSqlQueryProcessor::execute(ObFlightSqlSession &session,
       // drivers: only result sets that advertise rows may be fetched.
       LOG_TRACE("[FlightSQL] QueryProcessor::execute: non-row result, skip row fetch",
                "ob_trace_id", ObCurTraceId::get_trace_id_str(), "sql", sql.ptr());
+    } else if (ResultMode::DISCARD == result_mode) {
+      const common::ObNewRow *row = nullptr;
+      int iter_ret = OB_SUCCESS;
+      int64_t total_rows_drained = 0;
+      while (OB_SUCCESS == (iter_ret = result_set->get_next_row(row))) {
+        if (OB_ISNULL(row)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("[FlightSQL] QueryProcessor::execute: get_next_row returned null row",
+                   K(ret), "ob_trace_id", ObCurTraceId::get_trace_id_str(),
+                   "sql", sql.ptr(), K(total_rows_drained));
+          break;
+        }
+        ++total_rows_drained;
+      }
+      if (OB_SUCC(ret) && OB_ITER_END != iter_ret) {
+        ret = iter_ret;
+        LOG_WARN("[FlightSQL] QueryProcessor::execute: drain result rows failed",
+                 K(ret), "ob_trace_id", ObCurTraceId::get_trace_id_str(),
+                 "sql", sql.ptr(), K(total_rows_drained));
+      } else if (OB_SUCC(ret)) {
+        LOG_TRACE("[FlightSQL] QueryProcessor::execute: result rows drained",
+                  "ob_trace_id", ObCurTraceId::get_trace_id_str(),
+                  "sql", sql.ptr(), K(total_rows_drained));
+      }
+    } else if (OB_ISNULL(arrow_schema_) || session.arrow_batch_size <= 0) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("[FlightSQL] invalid result schema or Arrow batch size", K(ret),
+               "batch_size", session.arrow_batch_size);
     } else {
       // Build one Arrow ArrayBuilder per column.
       const int64_t ncols      = arrow_schema_->num_fields();
@@ -2774,12 +3077,24 @@ int ObFlightSqlQueryProcessor::execute(ObFlightSqlSession &session,
       std::vector<std::unique_ptr<arrow::ArrayBuilder>> builders(ncols);
       bool builders_ok = true;
       for (int64_t c = 0; c < ncols && builders_ok; c++) {
+        const std::shared_ptr<arrow::Field> &field = arrow_schema_->field(static_cast<int>(c));
         std::unique_ptr<arrow::ArrayBuilder> builder;
+        if (OB_ISNULL(field) || OB_ISNULL(field->type())) {
+          ret = OB_ERR_UNEXPECTED;
+          builders_ok = false;
+          LOG_WARN("[FlightSQL] null result field or type", K(ret), "col", c);
+          break;
+        }
         const arrow::Status bld_status = arrow::MakeBuilder(
-            &arrow_mem_pool_, arrow_schema_->field(c)->type(), &builder);
+            &arrow_mem_pool_, field->type(), &builder);
         if (!bld_status.ok()) {
+          ret = sql::arrow_status_to_ob_ret(bld_status);
           LOG_WARN("[FlightSQL] QueryProcessor::execute: MakeBuilder failed",
-                   "col", (int64_t)c, "st", bld_status.ToString().c_str());
+                   K(ret), "col", c, "st", bld_status.ToString().c_str());
+          builders_ok = false;
+        } else if (OB_ISNULL(builder)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("[FlightSQL] MakeBuilder returned null builder", K(ret), "col", c);
           builders_ok = false;
         } else {
           builders[c] = std::move(builder);
@@ -2801,6 +3116,32 @@ int ObFlightSqlQueryProcessor::execute(ObFlightSqlSession &session,
         // If get_next_row returns e.g. OB_TIMEOUT, we must surface ret != OB_SUCCESS;
         // otherwise DoGetStatement streams partial batches as a successful query.
         int fetch_err_ret = OB_SUCCESS;
+        const auto finish_batch = [&]() -> int {
+          int finish_ret = OB_SUCCESS;
+          std::vector<std::shared_ptr<arrow::Array>> arrays(ncols);
+          for (int64_t c = 0; OB_SUCC(finish_ret) && c < ncols; c++) {
+            if (OB_ISNULL(builders[c])) {
+              finish_ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("[FlightSQL] null result builder while finishing batch", K(finish_ret), K(c));
+            } else {
+              const arrow::Status finish_status = builders[c]->Finish(&arrays[c]);
+              finish_ret = sql::arrow_status_to_ob_ret(finish_status);
+              if (OB_SUCCESS != finish_ret) {
+                LOG_WARN("[FlightSQL] finish result array failed", K(finish_ret), K(c),
+                         "status", finish_status.ToString().c_str());
+              } else if (OB_ISNULL(arrays[c]) || arrays[c]->length() != row_count) {
+                finish_ret = OB_ERR_UNEXPECTED;
+                LOG_WARN("[FlightSQL] invalid result array length", K(finish_ret), K(c), K(row_count));
+              }
+            }
+          }
+          if (OB_SUCC(finish_ret)) {
+            batches_.push_back(arrow::RecordBatch::Make(arrow_schema_, row_count, std::move(arrays)));
+            total_rows_fetched += row_count;
+            row_count = 0;
+          }
+          return finish_ret;
+        };
 
         while (true) {
           const int iter_ret = result_set->get_next_row(row);
@@ -2821,39 +3162,39 @@ int ObFlightSqlQueryProcessor::execute(ObFlightSqlSession &session,
           }
 
           const int64_t cell_count = row->get_count();
-          for (int64_t c = 0; c < ncols; c++) {
+          for (int64_t c = 0; OB_SUCCESS == fetch_err_ret && c < ncols; c++) {
             const char *col_name = arrow_schema_->field(static_cast<int>(c))->name().c_str();
-            if (c < cell_count) {
-              append_obj_to_builder_(builders[c].get(), row->get_cell(c),
-                                     static_cast<int64_t>(session.tenant_id), c, col_name);
+            if (OB_ISNULL(builders[c])) {
+              fetch_err_ret = OB_ERR_UNEXPECTED;
+            } else if (c < cell_count) {
+              fetch_err_ret = append_obj_to_builder_(
+                  builders[c].get(), row->get_cell(c),
+                  static_cast<int64_t>(session.tenant_id), c, col_name);
             } else {
               LOG_DEBUG("[FlightSQL] append_obj_to_builder_: missing row cell, emit null",
                        "col_idx", c, "col_name", col_name,
                        "cell_count", cell_count, "ncols", ncols);
-              (void)builders[c]->AppendNull();
+              fetch_err_ret = sql::arrow_status_to_ob_ret(builders[c]->AppendNull());
             }
+          }
+          if (OB_SUCCESS != fetch_err_ret) {
+            LOG_WARN("[FlightSQL] convert result row failed", K(fetch_err_ret),
+                     "rows_fetched_so_far", total_rows_fetched + row_count);
+            break;
           }
           row_count++;
 
           if (row_count >= batch_rows) {
-            std::vector<std::shared_ptr<arrow::Array>> arrays(ncols);
-            for (int64_t c = 0; c < ncols; c++) {
-              (void)builders[c]->Finish().Value(&arrays[c]);
+            fetch_err_ret = finish_batch();
+            if (OB_SUCCESS != fetch_err_ret) {
+              break;
             }
-            batches_.push_back(arrow::RecordBatch::Make(arrow_schema_, row_count, std::move(arrays)));
-            total_rows_fetched += row_count;
-            row_count = 0;
           }
         }
 
         // Flush remaining rows.
-        if (row_count > 0) {
-          std::vector<std::shared_ptr<arrow::Array>> arrays(ncols);
-          for (int64_t c = 0; c < ncols; c++) {
-            (void)builders[c]->Finish().Value(&arrays[c]);
-          }
-          batches_.push_back(arrow::RecordBatch::Make(arrow_schema_, row_count, std::move(arrays)));
-          total_rows_fetched += row_count;
+        if (OB_SUCCESS == fetch_err_ret && row_count > 0) {
+          fetch_err_ret = finish_batch();
         }
         if (OB_SUCCESS != fetch_err_ret) {
           ret = fetch_err_ret;

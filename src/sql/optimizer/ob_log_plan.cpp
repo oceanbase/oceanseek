@@ -53,6 +53,9 @@
 #include "sql/optimizer/ob_log_rescan.h"
 #include "sql/optimizer/ob_join_order_enum_idp.h"
 #include "sql/optimizer/ob_join_order_enum_permutation.h"
+#ifdef OB_BUILD_OBSERVER_FLIGHT_SQL
+#include "observer/flight_sql/ob_arrow_stream_catalog.h"
+#endif
 
 #include "sql/optimizer/optimizer_plan_rewriter/ob_groupby_pushdown_rule.h"
 #include "sql/optimizer/optimizer_plan_rewriter/ob_distinct_pushdown_rule.h"
@@ -8573,6 +8576,7 @@ int ObLogPlan::inner_candi_allocate_subplan_filter(ObIArray<ObLogPlan*> &subplan
   ObSEArray<ObSEArray<CandidatePlan, 4>, 8> best_dist_subplan_list;
   ObSEArray<CandidatePlan, 4> subquery_plans;
   const bool has_onetime = !onetime_idxs.is_empty();
+  bool rejected_rescan = false;
   int64_t dist_methods = DIST_INVALID_METHOD;
   if (OB_FAIL(prepare_subplan_candidate_list(subplans, params, best_subplan_list,
                                              best_dist_subplan_list))) {
@@ -8596,6 +8600,7 @@ int ObLogPlan::inner_candi_allocate_subplan_filter(ObIArray<ObLogPlan*> &subplan
                                                           is_update_set,
                                                           dist_methods,
                                                           subquery_plans,
+                                                          rejected_rescan,
                                                           project_refs))) {
     LOG_WARN("failed to allocate subplan filter", K(ret), K(subquery_plans.count()));
   } else if (!subquery_plans.empty()) {
@@ -8621,6 +8626,7 @@ int ObLogPlan::inner_candi_allocate_subplan_filter(ObIArray<ObLogPlan*> &subplan
                                                           is_update_set,
                                                           dist_methods,
                                                           subquery_plans,
+                                                          rejected_rescan,
                                                           project_refs))) {
     LOG_WARN("failed to allocate subplan filter", K(ret), K(subquery_plans.count()));
   } else {
@@ -8630,6 +8636,12 @@ int ObLogPlan::inner_candi_allocate_subplan_filter(ObIArray<ObLogPlan*> &subplan
 
   if (OB_FAIL(ret)) {
     /*do nothing*/
+  } else if (subquery_plans.empty() && rejected_rescan) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                   "rescan of a one-shot source in a subquery "
+                   "(try apply hint or rewriting the SQL) is");
+    LOG_WARN("no valid subquery plan because the source does not support rescan", K(ret));
   } else if (OB_FAIL(prune_and_keep_best_plans(subquery_plans))) {
     LOG_WARN("failed to prune and keep best plans", K(ret));
   } else { /*do nothing*/ }
@@ -8778,6 +8790,7 @@ int ObLogPlan::inner_candi_allocate_subplan_filter(ObIArray<ObSEArray<CandidateP
                                                    const bool is_update_set,
                                                    const int64_t dist_methods,
                                                    ObIArray<CandidatePlan> &subquery_plans,
+                                                   bool &rejected_rescan,
                                                    const ObIArray<ObAliasRefRawExpr *> *project_refs)
 {
   int ret = OB_SUCCESS;
@@ -8794,6 +8807,7 @@ int ObLogPlan::inner_candi_allocate_subplan_filter(ObIArray<ObSEArray<CandidateP
                                                             is_update_set,
                                                             dist_methods,
                                                             subquery_plans,
+                                                            rejected_rescan,
                                                             project_refs))) {
       LOG_WARN("failed to candi allocate massive subplan filter", K(ret));
     }
@@ -8846,6 +8860,7 @@ int ObLogPlan::inner_candi_allocate_subplan_filter(ObIArray<ObSEArray<CandidateP
                                                     filters,
                                                     is_update_set,
                                                     for_cursor_expr,
+                                                    rejected_rescan,
                                                     project_refs))) {
               LOG_WARN("failed to create subplan filter plan", K(ret));
             } else if (NULL != curr_candidate_plan.plan_tree_
@@ -8885,6 +8900,7 @@ int ObLogPlan::inner_candi_allocate_massive_subplan_filter(ObIArray<ObSEArray<Ca
                                                             const bool is_update_set,
                                                             const int64_t dist_methods,
                                                             ObIArray<CandidatePlan> &subquery_plans,
+                                                            bool &rejected_rescan,
                                                             const ObIArray<ObAliasRefRawExpr *> *project_refs)
 {
   int ret = OB_SUCCESS;
@@ -8983,6 +8999,7 @@ int ObLogPlan::inner_candi_allocate_massive_subplan_filter(ObIArray<ObSEArray<Ca
                                                       filters,
                                                       is_update_set,
                                                       for_cursor_expr,
+                                                      rejected_rescan,
                                                       project_refs))) {
           LOG_WARN("failed to create subplan filter plan", K(ret));
         } else if (NULL != curr_candidate_plan.plan_tree_
@@ -9231,15 +9248,42 @@ int ObLogPlan::create_subplan_filter_plan(ObLogicalOperator *&top,
                                           const ObIArray<ObRawExpr*> &filters,
                                           const bool is_update_set,
                                           const bool for_cursor_expr,
+                                          bool &rejected_rescan,
                                           const ObIArray<ObAliasRefRawExpr *> *project_refs)
 {
   int ret = OB_SUCCESS;
   ObExchangeInfo exch_info;
   int64_t cur_dist_methods = dist_methods;
   DistAlgo dist_algo = DIST_INVALID_METHOD;
+  bool has_unsupported_rescan_child = false;
   if (OB_ISNULL(top)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected null", K(ret));
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && !has_unsupported_rescan_child
+                        && i < subquery_ops.count(); ++i) {
+      const int64_t child_idx = i + 1;
+      const ObLogicalOperator *subquery_op = subquery_ops.at(i);
+      if (OB_ISNULL(subquery_op)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("get unexpected null subquery op", K(ret), K(i));
+        break;
+      } else if (!onetime_idxs.has_member(child_idx)
+                 && !initplan_idxs.has_member(child_idx)
+                 && OB_FAIL(ObOptimizerUtil::contains_arrow_stream(
+                     subquery_op, has_unsupported_rescan_child))) {
+        LOG_WARN("failed to check for Arrow stream in subquery operator", K(ret), K(i));
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (has_unsupported_rescan_child) {
+    // Ordinary SPF right children are restarted for each driving row.  Do not
+    // form a candidate around a one-shot subtree.  Onetime and initplan
+    // children are evaluated once and remain valid here.
+    OPT_TRACE("skip subplan filter because a rescan child does not support rescan");
+    rejected_rescan = true;
+    top = NULL;
   } else if (OB_FAIL(get_subplan_filter_distributed_method(top,
                                                            subquery_ops,
                                                            params,
@@ -11813,6 +11857,180 @@ int ObLogPlan::generate_dblink_raw_plan()
   return ret;
 }
 
+namespace
+{
+
+bool is_arrow_stream_expr(const ObRawExpr *expr)
+{
+  return OB_NOT_NULL(expr)
+      && (T_FUN_SYS_ARROW_STREAM == expr->get_expr_type()
+          || T_FUN_SYS_ARROW_STREAMS == expr->get_expr_type());
+}
+
+bool same_server_set(const common::ObIArray<common::ObAddr> &left,
+                     const common::ObIArray<common::ObAddr> &right)
+{
+  bool same = left.count() == right.count();
+  for (int64_t i = 0; same && i < left.count(); ++i) {
+    bool found = false;
+    for (int64_t j = 0; !found && j < right.count(); ++j) {
+      found = left.at(i) == right.at(j);
+    }
+    same = found;
+  }
+  return same;
+}
+
+struct ObArrowStreamPlanContext : public RewriterContext
+{
+  explicit ObArrowStreamPlanContext(const bool under_rescan = false)
+      : under_rescan_(under_rescan)
+  {}
+
+  bool under_rescan_;
+};
+
+class ObArrowStreamPlanVisitor final
+    : public SimplePlanVisitor<RewriterResult, RewriterContext>
+{
+public:
+  ObArrowStreamPlanVisitor()
+      : arrow_stream_count_(0)
+  {}
+
+  int visit_node(ObLogicalOperator *op,
+                 RewriterContext *context,
+                 RewriterResult *&result) override
+  {
+    int ret = OB_SUCCESS;
+    ObArrowStreamPlanContext *plan_context =
+        static_cast<ObArrowStreamPlanContext *>(context);
+    if (OB_ISNULL(op) || OB_ISNULL(plan_context)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null logical operator or plan context",
+               K(ret), KP(op), KP(plan_context));
+    } else if (LOG_FUNCTION_TABLE == op->get_type()) {
+      ObLogFunctionTable *function_table = static_cast<ObLogFunctionTable *>(op);
+      const ObRawExpr *value_expr = function_table->get_value_expr();
+      if (is_arrow_stream_expr(value_expr)) {
+        ++arrow_stream_count_;
+        if (arrow_stream_count_ > 1) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                         "more than one arrow_stream or arrow_streams source in one SQL statement");
+          LOG_WARN("multiple Arrow stream sources in finalized plan", K(ret),
+                   K(arrow_stream_count_));
+        } else if (plan_context->under_rescan_) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                         "arrow_stream and arrow_streams on a rescan side");
+          LOG_WARN("Arrow stream source is below a rescan edge", K(ret));
+        } else if (OB_FAIL(check_source_location(*function_table, *value_expr))) {
+          LOG_WARN("Arrow stream source location check failed", K(ret));
+        }
+      }
+    }
+
+    for (int64_t i = 0; OB_SUCC(ret) && i < op->get_num_of_child(); ++i) {
+      ObLogicalOperator *child = op->get_child(i);
+      if (OB_ISNULL(child)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected null child", K(ret), K(i));
+      } else {
+        ObArrowStreamPlanContext child_context(
+            plan_context->under_rescan_ || is_rescan_edge(*op, i));
+        ret = visit_child_with(child, &child_context, result);
+        if (OB_FAIL(ret)) {
+          LOG_WARN("failed to visit child for Arrow stream plan check", K(ret), K(i));
+        }
+      }
+    }
+    return ret;
+  }
+
+private:
+  bool is_rescan_edge(ObLogicalOperator &parent, const int64_t child_idx) const
+  {
+    bool is_rescan = LOG_RESCAN == parent.get_type();
+    if (!is_rescan && LOG_JOIN == parent.get_type()
+        && ObLogicalOperator::second_child == child_idx) {
+      ObLogJoin &join = static_cast<ObLogJoin &>(parent);
+      const JoinPath *join_path = join.get_join_path();
+      is_rescan = NESTED_LOOP_JOIN == join.get_join_algo()
+          && (OB_ISNULL(join_path) || !join_path->need_mat_);
+    } else if (!is_rescan && LOG_SET == parent.get_type()
+               && ObLogicalOperator::second_child == child_idx) {
+      ObLogSet &set = static_cast<ObLogSet &>(parent);
+      is_rescan = set.is_recursive_union();
+    } else if (!is_rescan && LOG_SUBPLAN_FILTER == parent.get_type()
+               && child_idx > ObLogicalOperator::first_child) {
+      ObLogSubPlanFilter &subplan_filter = static_cast<ObLogSubPlanFilter &>(parent);
+      is_rescan = !subplan_filter.get_onetime_idxs().has_member(child_idx)
+          && !subplan_filter.get_initplan_idxs().has_member(child_idx);
+    }
+    return is_rescan;
+  }
+
+  int check_source_location(const ObLogFunctionTable &function_table,
+                            const ObRawExpr &value_expr) const
+  {
+    int ret = OB_SUCCESS;
+#ifdef OB_BUILD_OBSERVER_FLIGHT_SQL
+    common::ObSEArray<common::ObAddr, 4> expected_servers;
+    if (T_FUN_SYS_ARROW_STREAMS == value_expr.get_expr_type()
+        && OB_FAIL(observer::ObArrowStreamCatalog::get_locations_for_arrow_streams(
+                       &value_expr, expected_servers))) {
+      LOG_WARN("failed to get Arrow stream source locations", K(ret));
+    } else if (expected_servers.empty()) {
+      if (OB_ISNULL(function_table.get_plan())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("function table has no logical plan", K(ret));
+      } else if (OB_FAIL(expected_servers.push_back(
+                     function_table.get_plan()->get_optimizer_context()
+                         .get_local_server_addr()))) {
+        LOG_WARN("failed to add local Arrow stream source", K(ret));
+      }
+    }
+    if (OB_SUCC(ret)
+        && !same_server_set(function_table.get_server_list(), expected_servers)) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                     "arrow_stream source execution outside its owning observer");
+      LOG_WARN("Arrow stream source is assigned to unexpected servers", K(ret),
+               "actual_servers", function_table.get_server_list(),
+               K(expected_servers));
+    }
+#else
+    UNUSED(function_table);
+    UNUSED(value_expr);
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "arrow_stream requires Flight SQL support");
+#endif
+    return ret;
+  }
+
+private:
+  int64_t arrow_stream_count_;
+};
+
+int check_arrow_stream_plan(ObLogicalOperator *root)
+{
+  int ret = OB_SUCCESS;
+  ObArrowStreamPlanContext context;
+  RewriterResult result;
+  RewriterResult *result_ptr = &result;
+  ObArrowStreamPlanVisitor visitor;
+  if (OB_ISNULL(root)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid null plan root", K(ret));
+  } else if (OB_FAIL(visitor.visit(root, &context, result_ptr))) {
+    LOG_WARN("final Arrow stream plan sanity check failed", K(ret));
+  }
+  return ret;
+}
+
+} // namespace
+
 int ObLogPlan::do_post_traverse_processing()
 {
   int ret = OB_SUCCESS;
@@ -11826,6 +12044,8 @@ int ObLogPlan::do_post_traverse_processing()
     LOG_WARN("fail calc plan resource", K(ret));
   } else if (OB_FAIL(add_explain_note())) {
     LOG_WARN("fail to add plan node", K(ret));
+  } else if (OB_FAIL(check_arrow_stream_plan(root))) {
+    LOG_WARN("failed final Arrow stream plan sanity check", K(ret));
   } else { /*do nothing*/ }
   return ret;
 }

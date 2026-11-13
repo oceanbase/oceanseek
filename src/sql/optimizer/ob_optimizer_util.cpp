@@ -7,6 +7,8 @@
 #include "ob_optimizer_util.h"
 #include "sql/engine/expr/ob_expr_version.h"
 #include "sql/rewrite/ob_transform_utils.h"
+#include "sql/optimizer/ob_join_order.h"
+#include "sql/optimizer/ob_log_function_table.h"
 #include "sql/optimizer/ob_log_table_scan.h"
 #include "share/ob_order_perserving_encoder.h"
 #include "sql/rewrite/ob_predicate_deduce.h"
@@ -2063,6 +2065,96 @@ int ObOptimizerUtil::contains_group_by(const ObLogicalOperator *root, bool & con
       LOG_WARN("failed to cast select stmt", K(ret));
   } else {
     contains = select_stmt->get_aggr_item_size() > 0;
+  }
+  return ret;
+}
+
+int ObOptimizerUtil::contains_arrow_stream(const ObLogicalOperator *root,
+                                           bool &contains,
+                                           const bool distributed_only,
+                                           const bool current_dfo_only)
+{
+  int ret = OB_SUCCESS;
+  contains = false;
+  if (OB_ISNULL(root)) {
+  } else if (current_dfo_only && log_op_def::LOG_EXCHANGE == root->get_type()) {
+    // The Arrow reader below this exchange belongs to another DFO.
+  } else {
+    switch (root->get_type()) {
+      case log_op_def::LOG_FUNCTION_TABLE: {
+        const ObLogFunctionTable *function_table =
+            static_cast<const ObLogFunctionTable *>(root);
+        const ObRawExpr *value_expr = function_table->get_value_expr();
+        contains = OB_NOT_NULL(value_expr)
+            && (T_FUN_SYS_ARROW_STREAM == value_expr->get_expr_type()
+                || T_FUN_SYS_ARROW_STREAMS == value_expr->get_expr_type())
+            && (!distributed_only || function_table->get_server_cnt() > 1);
+        break;
+      }
+      default: {
+        for (int64_t i = 0; OB_SUCC(ret) && !contains && i < root->get_num_of_child(); ++i) {
+          if (OB_FAIL(SMART_CALL(contains_arrow_stream(root->get_child(i), contains,
+                                                      distributed_only, current_dfo_only)))) {
+            LOG_WARN("failed to check for Arrow stream in child operator", K(ret), K(i));
+          }
+        }
+        break;
+      }
+    }
+  }
+  return ret;
+}
+
+int ObOptimizerUtil::contains_arrow_stream(const Path *path,
+                                           bool &contains,
+                                           const bool distributed_only,
+                                           const bool current_dfo_only)
+{
+  int ret = OB_SUCCESS;
+  contains = false;
+  if (OB_ISNULL(path)) {
+  } else if (OB_NOT_NULL(path->log_op_)) {
+    if (OB_FAIL(SMART_CALL(contains_arrow_stream(path->log_op_, contains,
+                                                distributed_only, current_dfo_only)))) {
+      LOG_WARN("failed to check for Arrow stream in path operator", K(ret));
+    }
+  } else if (OB_NOT_NULL(path->parent_)) {
+    switch (path->parent_->get_type()) {
+      case FUNCTION_TABLE_ACCESS: {
+        const FunctionTablePath *function_table =
+            static_cast<const FunctionTablePath *>(path);
+        const ObRawExpr *value_expr = function_table->value_expr_;
+        contains = OB_NOT_NULL(value_expr)
+            && (T_FUN_SYS_ARROW_STREAM == value_expr->get_expr_type()
+                || T_FUN_SYS_ARROW_STREAMS == value_expr->get_expr_type())
+            && (!distributed_only || function_table->server_cnt_ > 1);
+        break;
+      }
+      case JOIN: {
+        const JoinPath *join_path = static_cast<const JoinPath *>(path);
+        if ((!current_dfo_only || !join_path->is_left_need_exchange())
+            && OB_FAIL(SMART_CALL(contains_arrow_stream(join_path->left_path_, contains,
+                                                        distributed_only, current_dfo_only)))) {
+          LOG_WARN("failed to check for Arrow stream in left path", K(ret));
+        } else if (!contains && (!current_dfo_only || !join_path->is_right_need_exchange())
+                   && OB_FAIL(SMART_CALL(contains_arrow_stream(join_path->right_path_, contains,
+                                                               distributed_only, current_dfo_only)))) {
+          LOG_WARN("failed to check for Arrow stream in right path", K(ret));
+        }
+        break;
+      }
+      case SUBQUERY: {
+        const SubQueryPath *subquery_path = static_cast<const SubQueryPath *>(path);
+        if (OB_FAIL(SMART_CALL(contains_arrow_stream(subquery_path->root_, contains,
+                                                    distributed_only, current_dfo_only)))) {
+          LOG_WARN("failed to check for Arrow stream in subquery path", K(ret));
+        }
+        break;
+      }
+      default: {
+        break;
+      }
+    }
   }
   return ret;
 }

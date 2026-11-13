@@ -47,7 +47,8 @@ int ObArrowStreamRegistry::register_schema(
     std::shared_ptr<arrow::Schema> schema,
     const ObFlightSqlColumnMapping &mapping,
     std::string db_name,
-    std::string table_name)
+    std::string table_name,
+    bool schema_only)
 {
   int ret = OB_SUCCESS;
   ObArrowStreamEntryPtr entry(
@@ -66,6 +67,7 @@ int ObArrowStreamRegistry::register_schema(
       entry->arrow_schema = std::move(schema);
       entry->db_name      = std::move(db_name);
       entry->table_name   = std::move(table_name);
+      entry->schema_only  = schema_only;
       lib::ObMutexGuard guard(mutex_);
       if (OB_FAIL(ensure_entries_created_(tenant_id))) {
         LOG_WARN("failed to initialize Flight SQL stream registry map", K(ret), K(stream_id));

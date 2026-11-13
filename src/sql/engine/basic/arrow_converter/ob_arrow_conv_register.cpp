@@ -1,6 +1,6 @@
 /**
- * Copyright (C) 2026 OceanBase
- * 本文件包含机密及专有信息，未经授权不得使用或披露。
+ * Copyright (c) 2026 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #define USING_LOG_PREFIX SQL_ENG
@@ -28,10 +28,12 @@ static void init_arrow_conv_table()
 {
   REG_CONV(ObTinyIntType,   INT8,   NumericGroup);
   REG_CONV(ObSmallIntType,  INT16,  NumericGroup);
+  REG_CONV(ObMediumIntType, INT32,  NumericGroup);
   REG_CONV(ObInt32Type,     INT32,  NumericGroup);
   REG_CONV(ObIntType,       INT64,  NumericGroup);
   REG_CONV(ObUTinyIntType,  UINT8,  NumericGroup);
   REG_CONV(ObUSmallIntType, UINT16, NumericGroup);
+  REG_CONV(ObUMediumIntType, INT32, NumericGroup);
   REG_CONV(ObUInt32Type,    UINT32, NumericGroup);
   REG_CONV(ObUInt64Type,    UINT64, NumericGroup);
   REG_CONV(ObFloatType,     FLOAT,  NumericGroup);
@@ -68,6 +70,7 @@ static void init_arrow_conv_table()
   REG_CONV(ObLobType,  LARGE_BINARY, StrGroup);
 
   REG_CONV(ObJsonType, STRING, JsonGroup);
+  REG_CONV(ObGeometryType, BINARY, GeometryGroup);
 
 #define REG_DECIMAL_DUAL(OB_TYPE)              \
   REG_CONV(OB_TYPE, DECIMAL128, DecimalGroup); \

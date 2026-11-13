@@ -6,15 +6,33 @@
 #define USING_LOG_PREFIX SERVER
 
 #include "observer/flight_sql/ob_flightsql_ingest_registry.h"
+#include <algorithm>
 #include "lib/alloc/alloc_struct.h"
 #include "lib/ob_define.h"
 #include "lib/oblog/ob_log.h"
 #include "lib/time/ob_time_utility.h"
+#include "lib/worker.h"
 #include "share/ob_errno.h"
 #include "sql/session/ob_sql_session_info.h"
 
 namespace oceanbase {
 namespace observer {
+
+namespace
+{
+int flight_sql_ingest_wait_status()
+{
+  int ret = THIS_WORKER.check_status();
+  // gRPC threads can use a base Worker whose check_status() does not inspect
+  // the attached SQL session. Tenant workers check both the session and PX
+  // interrupts; preserve those checks and cover the gRPC case as well.
+  sql::ObSQLSessionInfo *session = THIS_WORKER.get_session();
+  if (OB_SUCC(ret) && OB_NOT_NULL(session)) {
+    (void)session->is_terminate(ret);
+  }
+  return ret;
+}
+} // namespace
 
 ObFlightSqlIngestRegistry &ObFlightSqlIngestRegistry::instance()
 {
@@ -210,9 +228,12 @@ int ObFlightSqlIngestRegistry::wait_for_stream(
     const std::string &ingest_id,
     int64_t timeout_us)
 {
-  int ret = OB_SUCCESS;
+  int ret = flight_sql_ingest_wait_status();
   const std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now()
       + std::chrono::microseconds(timeout_us);
+  const std::chrono::milliseconds status_interval(100);
+
+  if (OB_FAIL(ret)) { return ret; }
 
   // Phase 1: wait for entry to exist.
   std::shared_ptr<ObFlightSqlIngestEntry> entry;
@@ -220,13 +241,20 @@ int ObFlightSqlIngestRegistry::wait_for_stream(
     std::unique_lock<std::mutex> lg(mu_);
     std::unordered_map<std::string, std::shared_ptr<ObFlightSqlIngestEntry>>::iterator it =
         entries_.find(ingest_id);
-    while (it == entries_.end()) {
-      if (std::cv_status::timeout == entry_cv_.wait_until(lg, deadline)) {
-        break;
-      }
+    while (it == entries_.end() && OB_SUCC(ret)) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) { break; }
+      (void)entry_cv_.wait_until(lg, std::min(deadline, now + status_interval));
+      // Check cancellation without the registry lock. The map may change
+      // while unlocked, so find the entry again after reacquiring it.
+      lg.unlock();
+      ret = flight_sql_ingest_wait_status();
+      lg.lock();
       it = entries_.find(ingest_id);
     }
-    if (it == entries_.end()) {
+    if (OB_FAIL(ret)) {
+      return ret;
+    } else if (it == entries_.end()) {
       ret = OB_TIMEOUT;
       LOG_WARN("[FlightSQL] wait_for_stream: entry never appeared", K(ret),
                "ingest_id", ingest_id.c_str());
@@ -238,12 +266,17 @@ int ObFlightSqlIngestRegistry::wait_for_stream(
   // Phase 2: wait for all slots to be registered.
   {
     std::unique_lock<std::mutex> lk(entry->mu);
-    while (!entry->all_ready && !entry->aborted) {
-      if (std::cv_status::timeout == entry->ready_cv.wait_until(lk, deadline)) {
-        break;
-      }
+    while (!entry->all_ready && !entry->aborted && OB_SUCC(ret)) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) { break; }
+      (void)entry->ready_cv.wait_until(lk, std::min(deadline, now + status_interval));
+      lk.unlock();
+      ret = flight_sql_ingest_wait_status();
+      lk.lock();
     }
-    if (!entry->all_ready && !entry->aborted) {
+    if (OB_FAIL(ret)) {
+      // Preserve the native query, session, or PX interruption error.
+    } else if (!entry->all_ready && !entry->aborted) {
       ret = OB_TIMEOUT;
       LOG_WARN("[FlightSQL] wait_for_stream: slots never ready", K(ret),
                "ingest_id", ingest_id.c_str());
@@ -340,7 +373,9 @@ void ObFlightSqlIngestRegistry::remove(const std::string &ingest_id)
   LOG_TRACE("[FlightSQL] ingest entry removed", "ingest_id", ingest_id.c_str());
 }
 
-int ObFlightSqlIngestRegistry::abort(const std::string &ingest_id)
+int ObFlightSqlIngestRegistry::abort(
+    uint64_t tenant_id,
+    const std::string &ingest_id)
 {
   int ret = OB_SUCCESS;
   std::shared_ptr<ObFlightSqlIngestEntry> entry;
@@ -349,6 +384,13 @@ int ObFlightSqlIngestRegistry::abort(const std::string &ingest_id)
     std::unordered_map<std::string, std::shared_ptr<ObFlightSqlIngestEntry>>::iterator it =
         entries_.find(ingest_id);
     if (it == entries_.end()) { return OB_ENTRY_NOT_EXIST; }
+    if (tenant_id != it->second->tenant_id) {
+      ret = OB_ERR_NO_PRIVILEGE;
+      LOG_WARN("[FlightSQL] abort: tenant does not own ingest entry",
+               K(ret), K(tenant_id), "owner_tenant_id", it->second->tenant_id,
+               "ingest_id", ingest_id.c_str());
+      return ret;
+    }
     entry = it->second;
   }
   {

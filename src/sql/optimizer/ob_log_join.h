@@ -171,6 +171,7 @@ namespace sql
     void set_can_use_batch_nlj(bool can_use) { can_use_batch_nlj_ = can_use; }
     void set_join_path(JoinPath *path) { join_path_ = path; }
     JoinPath *get_join_path() { return join_path_; }
+    const JoinPath *get_join_path() const { return join_path_; }
     bool is_my_exec_expr(const ObRawExpr *expr);
     virtual int get_plan_item_info(PlanText &plan_text, 
                                 ObSqlPlanItem &plan_item) override;

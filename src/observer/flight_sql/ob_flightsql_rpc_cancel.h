@@ -142,7 +142,9 @@ private:
         grpc::experimental::ServerRpcInfo *info) override
     {
       try {
-        if (std::string(info->method()) == "/arrow.flight.protocol.FlightService/DoPut") {
+        const std::string method(info->method());
+        if (method == "/arrow.flight.protocol.FlightService/DoPut"
+            || method == "/arrow.flight.protocol.FlightService/DoGet") {
           return new Interceptor(state_, info->server_context());
         }
       } catch (...) {}

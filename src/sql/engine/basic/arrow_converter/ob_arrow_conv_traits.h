@@ -1,6 +1,6 @@
 /**
- * Copyright (C) 2026 OceanBase
- * 本文件包含机密及专有信息，未经授权不得使用或披露。
+ * Copyright (c) 2026 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
  *
  * 编译期 traits，只描述 (ObObjType, ArrowType) 到 payload 类型和 Builder 类型的映射。
  * 具体转换行为放在各 Group functor。
@@ -44,13 +44,16 @@ struct ObArrowConvTraits
     using Builder = arrow::BUILDER;                                 \
   }
 
-// Numeric：定宽直读，必要时做 static_cast。
+// Numeric：OB integer datums/vectors use 64-bit slots; cast to the advertised
+// Arrow width while appending.
 OB_ARROW_TRAITS_DIRECT(ObTinyIntType,   INT8,   int64_t,  int8_t,   Int8Builder);
 OB_ARROW_TRAITS_DIRECT(ObSmallIntType,  INT16,  int64_t,  int16_t,  Int16Builder);
+OB_ARROW_TRAITS_DIRECT(ObMediumIntType, INT32,  int64_t,  int32_t,  Int32Builder);
 OB_ARROW_TRAITS_DIRECT(ObInt32Type,     INT32,  int64_t,  int32_t,  Int32Builder);
 OB_ARROW_TRAITS_DIRECT(ObIntType,       INT64,  int64_t,  int64_t,  Int64Builder);
 OB_ARROW_TRAITS_DIRECT(ObUTinyIntType,  UINT8,  uint64_t, uint8_t,  UInt8Builder);
 OB_ARROW_TRAITS_DIRECT(ObUSmallIntType, UINT16, uint64_t, uint16_t, UInt16Builder);
+OB_ARROW_TRAITS_DIRECT(ObUMediumIntType, INT32, uint64_t, int32_t,  Int32Builder);
 OB_ARROW_TRAITS_DIRECT(ObUInt32Type,    UINT32, uint64_t, uint32_t, UInt32Builder);
 OB_ARROW_TRAITS_DIRECT(ObUInt64Type,    UINT64, uint64_t, uint64_t, UInt64Builder);
 OB_ARROW_TRAITS_DIRECT(ObFloatType,     FLOAT,  float,    float,    FloatBuilder);
@@ -101,6 +104,9 @@ OB_ARROW_TRAITS_CUSTOM(ObLobType,        LARGE_BINARY, LargeBinaryBuilder);
 
 // Json：恒 STRING。
 OB_ARROW_TRAITS_CUSTOM(ObJsonType,       STRING,       StringBuilder);
+
+// GEOMETRY: public EWKB bytes, including per-value SRID and Z flags.
+OB_ARROW_TRAITS_CUSTOM(ObGeometryType,   BINARY,       BinaryBuilder);
 
 // Null：恒 NA。
 OB_ARROW_TRAITS_CUSTOM(ObNullType,       NA,           NullBuilder);

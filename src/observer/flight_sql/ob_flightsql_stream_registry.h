@@ -120,7 +120,7 @@ struct ObArrowStreamEntry
   // ob_schema/kind/convert_batch populated lazily by get_columns() at resolve time.
   ObFlightSqlColumnMapping            column_mapping;
 
-  // Arrow schema from DoPut.
+  // Arrow schema from registration or DoPut.
   std::shared_ptr<arrow::Schema>      arrow_schema;
 
   // Table identity — used by get_columns() to look up OB schema at resolve time.
@@ -130,6 +130,10 @@ struct ObArrowStreamEntry
   // V1 MERGE source fields need not have target column names. The catalog
   // derives scalar types for those fields from the Arrow schema.
   bool                                is_merge_source{false};
+
+  // User-provided V1 SQL is not tied to one generated target table. Resolve
+  // all function-table column names and types directly from arrow_schema.
+  bool                                schema_only{false};
 
   // Cursor state used by the row-mode ObFunctionTableOp (single-threaded).
   // ObSysFunctionTableVecOp uses per-worker local cursors instead and never
@@ -173,14 +177,16 @@ public:
   ObArrowStreamRegistry();
   ~ObArrowStreamRegistry();
 
-  // Register a stream entry at DoPut time (schema + table identity, no OB schema lookup).
+  // Register a stream entry (schema plus optional generated-SQL target table
+  // identity; no OB schema lookup occurs here).
   // Returns OB_SUCCESS or OB_ALLOCATE_MEMORY_FAILED.
   int register_schema(uint64_t tenant_id,
                       uint64_t stream_id,
                       std::shared_ptr<arrow::Schema> schema,
                       const ObFlightSqlColumnMapping &mapping,
                       std::string db_name,
-                      std::string table_name);
+                      std::string table_name,
+                      bool schema_only = false);
 
   // Attach the Arrow reader at DoPut time.
   // Returns OB_ERR_UNEXPECTED if stream_id not found.

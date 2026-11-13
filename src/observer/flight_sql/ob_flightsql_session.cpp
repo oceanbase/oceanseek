@@ -16,6 +16,7 @@
 #include "lib/random/ob_random.h"
 #include "lib/trace/ob_trace.h"
 #include "lib/time/ob_time_utility.h"
+#include "lib/utility/ob_defer.h"
 #include "share/config/ob_server_config.h"
 #include "share/ob_server_struct.h"
 #include "share/schema/ob_schema_getter_guard.h"
@@ -188,11 +189,13 @@ ObFlightSqlSession::~ObFlightSqlSession()
       ingest_id_to_abort = last_ingest_id;
     }
     if (!ingest_id_to_abort.empty()) {
-      (void)observer::ObFlightSqlIngestRegistry::instance().abort(ingest_id_to_abort);
       (void)observer::ObFlightSqlIngestRegistry::instance().abort(
-          ingest_id_to_abort + ":stream");
+          tenant_id, ingest_id_to_abort);
+      (void)observer::ObFlightSqlIngestRegistry::instance().abort(
+          tenant_id, ingest_id_to_abort + ":stream");
       LOG_TRACE("[FlightSQL] ~ObFlightSqlSession: auto-aborted pending ingest",
-                "session_id", session_id.c_str(),
+                "tenant_id", tenant_id,
+                "sessid", free_ctx.sessid_,
                 "ingest_id", ingest_id_to_abort.c_str());
     }
   }
@@ -214,7 +217,7 @@ ObFlightSqlSession::~ObFlightSqlSession()
   GCTX.session_mgr_->mark_sessid_unused(free_ctx.sessid_);
   ob_session = nullptr;
   LOG_TRACE("[FlightSQL] ~ObFlightSqlSession: ob_session freed (deferred cleanup)",
-            "session_id", session_id.c_str());
+            "tenant_id", tenant_id, "sessid", free_ctx.sessid_);
 }
 
 // ============================================================
@@ -253,6 +256,7 @@ std::shared_ptr<ObFlightSqlSession> ObFlightSqlSessionManager::create(
     const std::string &tenant_name,
     const std::string &user_name,
     const std::string &password,
+    const std::string &proxied_user_name,
     const bool is_oracle_mode,
     const std::string &peer_ip,
     const int32_t peer_port,
@@ -266,7 +270,7 @@ std::shared_ptr<ObFlightSqlSession> ObFlightSqlSessionManager::create(
   const int64_t now = ObTimeUtility::current_time();
   std::shared_ptr<ObFlightSqlSession> session(
       OB_NEW(ObFlightSqlSession,
-             common::ObMemAttr(tenant_id, "FlightSQLSess"), tenant_id),
+             common::ObMemAttr(tenant_id, "FlightSQLSess"), tenant_id, proxied_user_name),
       ObFlightSqlSessionDeleter());
   if (OB_ISNULL(session)) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -312,12 +316,12 @@ std::shared_ptr<ObFlightSqlSession> ObFlightSqlSessionManager::create(
           if (OB_ISNULL(ses->ob_session)) {
             is_dead = true;
             LOG_TRACE("[FlightSQL] evict scan: ob_session is null",
-                     "session_id", ses->session_id.c_str(),
+                     "tenant_id", ses->tenant_id,
                      "ob_sessid", ses->free_ctx.sessid_);
           } else if (ses->ob_session->is_zombie()) {
             is_dead = true;
             LOG_WARN("[FlightSQL] evict scan: ob_session is zombie (via cached ptr)",
-                     "session_id", ses->session_id.c_str(),
+                     "tenant_id", ses->tenant_id,
                      "ob_sessid", ses->free_ctx.sessid_,
                      "state", (int)ses->ob_session->get_session_state());
           } else if (OB_NOT_NULL(GCTX.session_mgr_)) {
@@ -328,7 +332,7 @@ std::shared_ptr<ObFlightSqlSession> ObFlightSqlSessionManager::create(
             if (OB_ENTRY_NOT_EXIST == check_ret) {
               is_dead = true;
               LOG_WARN("[FlightSQL] evict scan: ob_session not in session_mgr",
-                       "session_id", ses->session_id.c_str(),
+                       "tenant_id", ses->tenant_id,
                        "ob_sessid", ses->free_ctx.sessid_);
             } else if (OB_SUCCESS == check_ret && OB_NOT_NULL(tmp)) {
               const bool mark_killed = tmp->is_mark_killed();
@@ -339,7 +343,7 @@ std::shared_ptr<ObFlightSqlSession> ObFlightSqlSessionManager::create(
               if (mark_killed || zombie_via_mgr) {
                 is_dead = true;
                 LOG_WARN("[FlightSQL] evict scan: ob_session is mark-killed/zombie (via mgr)",
-                         "session_id", ses->session_id.c_str(),
+                         "tenant_id", ses->tenant_id,
                          "ob_sessid", ses->free_ctx.sessid_,
                          "mark_killed", mark_killed,
                          "zombie_via_mgr", zombie_via_mgr,
@@ -347,13 +351,13 @@ std::shared_ptr<ObFlightSqlSession> ObFlightSqlSessionManager::create(
                          "state_via_ptr", state_via_ptr);
               } else {
                 LOG_TRACE("[FlightSQL] evict scan: ob_session alive",
-                          "session_id", ses->session_id.c_str(),
+                          "tenant_id", ses->tenant_id,
                           "ob_sessid", ses->free_ctx.sessid_,
                           "state_via_mgr", state_via_mgr);
               }
             } else {
               LOG_WARN("[FlightSQL] evict scan: get_session returned unexpected",
-                       "session_id", ses->session_id.c_str(),
+                       "tenant_id", ses->tenant_id,
                        "ob_sessid", ses->free_ctx.sessid_,
                        K(check_ret));
             }
@@ -460,6 +464,8 @@ std::shared_ptr<ObFlightSqlSession> ObFlightSqlSessionManager::create(
         ObUserLoginInfo login_info;
         login_info.tenant_name_ = ObString(tenant_name.size(), tenant_name.c_str());
         login_info.user_name_ = ObString(user_name.size(), user_name.c_str());
+        login_info.proxied_user_name_ =
+            ObString(proxied_user_name.size(), proxied_user_name.c_str());
         login_info.client_ip_ = ObString(peer_ip.size(), peer_ip.c_str());
         login_info.passwd_ = ObString(password.size(), password.c_str());
         login_info.is_passwd_plaintext_ = true;
@@ -482,19 +488,30 @@ std::shared_ptr<ObFlightSqlSession> ObFlightSqlSessionManager::create(
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("[FlightSQL] check_user_access returned null user", K(ret), K(tenant_id),
                    "user", user_name.c_str());
-        } else if (expected_user_id != user_info->get_user_id()) {
+        } else if (expected_user_id != (proxied_user_name.empty()
+                                           ? session_priv.user_id_
+                                           : session_priv.proxy_user_id_)) {
           // Fail closed if overlapping host entries use different plugins and
           // the shared checker selects a different account than the one whose
-          // wire-format authentication data Flight SQL prepared.
+          // wire-format authentication data Flight SQL prepared. With a proxy
+          // target, user_info is the effective user, so compare the original
+          // authenticated account rather than the target account.
           ret = OB_PASSWORD_WRONG;
           LOG_WARN("[FlightSQL] authenticated account differs from plugin-selected account",
                    K(ret), K(tenant_id), K(expected_user_id),
-                   "authenticated_user_id", user_info->get_user_id());
+                   "authenticated_user_id", proxied_user_name.empty()
+                                                ? session_priv.user_id_
+                                                : session_priv.proxy_user_id_);
         } else if (OB_FAIL(session->ob_session->set_user(
                        session_priv.user_name_,
                        session_priv.host_name_,
                        session_priv.user_id_))) {
           LOG_WARN("[FlightSQL] set_user failed", K(ret));
+        } else if (OB_FAIL(session->ob_session->set_proxy_user(
+                       session_priv.proxy_user_name_,
+                       session_priv.proxy_host_name_,
+                       session_priv.proxy_user_id_))) {
+          LOG_WARN("[FlightSQL] set_proxy_user failed", K(ret));
         } else if (OB_FAIL(session->ob_session->set_enable_role_array(enable_role_id_array))) {
           LOG_WARN("[FlightSQL] set_enable_role_array failed", K(ret));
         } else {
@@ -502,9 +519,13 @@ std::shared_ptr<ObFlightSqlSession> ObFlightSqlSessionManager::create(
           session->ob_session->set_db_priv_set(session_priv.db_priv_set_);
           session->ob_session->set_priv_user_id(session_priv.user_id_);
           session->ob_session->set_current_trace_id(ObCurTraceId::get_trace_id());
+          // Flight audit records and session snapshots must use the same
+          // effective user name as the native SQL session's user ID.
+          session->user_name.assign(session_priv.user_name_.ptr(),
+                                    static_cast<size_t>(session_priv.user_name_.length()));
           LOG_TRACE("[FlightSQL] Session created",
-                   "session_id", session->session_id.c_str(),
-                   K(tenant_id), "user", user_name.c_str());
+                   K(tenant_id), "sessid", session->free_ctx.sessid_,
+                   "user", user_name.c_str());
         }
         MEMSET(native_response, 0, sizeof(native_response));
         MEMSET(native_scramble, 0, sizeof(native_scramble));
@@ -591,7 +612,8 @@ std::shared_ptr<ObFlightSqlSession> ObFlightSqlSessionManager::get_live(const st
 
   if (is_dead) {
     LOG_WARN("[FlightSQL] ob_session is dead or not found, removing flight session",
-             "session_id", session_id.c_str(),
+             "tenant_id", session->tenant_id,
+             "sessid", session->free_ctx.sessid_,
              "ob_session_null", OB_ISNULL(ob_session));
     remove(session_id);
     return nullptr;
@@ -695,6 +717,209 @@ void ObFlightSqlSessionManager::remove(const std::string &session_id)
   destroy_session(session);
 }
 
+int ObFlightSqlSessionManager::close(
+    const std::string &session_id,
+    const std::function<bool()> &is_cancelled)
+{
+  int ret = OB_SUCCESS;
+  std::shared_ptr<ObFlightSqlSession> session;
+  std::shared_ptr<CloseState> close_state;
+  bool owns_close = false;
+  std::shared_ptr<ObFlightSqlRequestCancellation> doput_cancellation;
+  std::shared_ptr<ObFlightSqlRequestCancellation> doget_cancellation;
+  {
+    // Fence and map removal are one admission boundary. A concurrent get()
+    // either completes before this block and is caught by the closing guards,
+    // or observes that the bearer is absent.
+    lib::ObMallocHookAttrGuard malloc_guard(
+        common::ObMemAttr(common::OB_SERVER_TENANT_ID, "FlightSQLSMgr"),
+        false /* use_500 */);
+    std::lock_guard<std::mutex> guard(mutex_);
+    SessionMap::iterator it = sessions_.find(session_id);
+    if (it == sessions_.end()) {
+      ClosingSessionMap::iterator closing_it = closing_sessions_.find(session_id);
+      if (closing_it == closing_sessions_.end()) {
+        // Authentication may have succeeded just before another close or GC
+        // removed this bearer.  Its cleanup result is unknown here, so do not
+        // acknowledge a successful close.
+        return OB_ENTRY_NOT_EXIST;
+      }
+      close_state = closing_it->second;
+    } else {
+      session = it->second;
+      if (OB_ISNULL(session)) { return OB_ERR_UNEXPECTED; }
+      {
+        std::lock_guard<std::mutex> session_guard(session->mutex);
+        close_state = std::make_shared<CloseState>();
+        if (!closing_sessions_.emplace(session_id, close_state).second) {
+          return OB_ERR_UNEXPECTED;
+        }
+        owns_close = true;
+        session->closing_ = true;
+        if (session->doput_active_) {
+          // Covers the interval after DoPut admission and before its native
+          // cancellation handle is published.
+          session->doput_cancel_pending_ = true;
+        }
+        doput_cancellation = session->active_doput_cancellation;
+        doget_cancellation = session->active_doget_cancellation;
+      }
+      sessions_.erase(it);
+    }
+  }
+
+  if (!owns_close) {
+    std::unique_lock<std::mutex> close_guard(close_state->mutex);
+    while (!close_state->done) {
+      if (is_cancelled()) {
+        return OB_CANCELED;
+      }
+      (void)close_state->cv.wait_for(
+          close_guard, std::chrono::milliseconds(100));
+    }
+    return close_state->result;
+  }
+
+  // If an exception escapes after the fence, wake concurrent close callers
+  // with an error instead of leaving them on a completion barrier forever.
+  bool close_published = false;
+  DEFER(
+    if (!close_published) {
+      {
+        std::lock_guard<std::mutex> close_guard(close_state->mutex);
+        close_state->result = OB_ERR_UNEXPECTED;
+        close_state->done = true;
+      }
+      close_state->cv.notify_all();
+      std::lock_guard<std::mutex> guard(mutex_);
+      ClosingSessionMap::iterator it = closing_sessions_.find(session_id);
+      if (it != closing_sessions_.end() && it->second == close_state) {
+        closing_sessions_.erase(it);
+      }
+    }
+  );
+
+  // A data RPC may be blocked on input or output while it owns the native
+  // query lock. Cancel its transport before waiting in disconnect.
+  const auto cancel_request = [](
+      const std::shared_ptr<ObFlightSqlRequestCancellation> &cancellation,
+      const char *request_name) {
+    if (cancellation) {
+      try {
+        (void)cancellation->cancel([] {});
+      } catch (const std::exception &e) {
+        int ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("[FlightSQL] CloseSession: request cancellation failed",
+                 K(ret), K(request_name), "what", e.what());
+      } catch (...) {
+        int ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("[FlightSQL] CloseSession: request cancellation failed",
+                 K(ret), K(request_name));
+      }
+    }
+  };
+  cancel_request(doput_cancellation, "DoPut");
+  cancel_request(doget_cancellation, "DoGet");
+
+  // The wrapper destructor already aborts pending ingest. Do that before
+  // native disconnect as well, so an execute_ingest waiting for local slots
+  // can release the native query lock which disconnect needs to acquire.
+  std::string ingest_id_to_abort;
+  {
+    std::lock_guard<std::mutex> session_guard(session->mutex);
+    ingest_id_to_abort = session->last_ingest_id;
+  }
+  if (!ingest_id_to_abort.empty()) {
+    MAKE_TENANT_SWITCH_SCOPE_GUARD(tenant_guard);
+    const int tenant_ret = tenant_guard.switch_to(session->tenant_id);
+    if (OB_SUCCESS != tenant_ret) {
+      LOG_WARN("[FlightSQL] CloseSession: failed to switch tenant for ingest abort",
+               K(tenant_ret), "tenant_id", session->tenant_id);
+      ret = tenant_ret;
+    } else {
+      (void)ObFlightSqlIngestRegistry::instance().abort(
+          session->tenant_id, ingest_id_to_abort);
+      (void)ObFlightSqlIngestRegistry::instance().abort(
+          session->tenant_id, ingest_id_to_abort + ":stream");
+    }
+  }
+
+  // Mirror the native MySQL disconnect contract. Flight only supplies the
+  // bearer fence and transport cancellation; OceanBase owns query draining
+  // and transaction cleanup.
+  if (OB_NOT_NULL(session->ob_session) && OB_NOT_NULL(GCTX.session_mgr_)) {
+    MAKE_TENANT_SWITCH_SCOPE_GUARD(tenant_guard);
+    int native_ret = tenant_guard.switch_to(session->tenant_id);
+    if (OB_SUCCESS != native_ret) {
+      LOG_WARN("[FlightSQL] CloseSession: failed to switch tenant",
+               K(native_ret), "tenant_id", session->tenant_id);
+      if (OB_SUCC(ret)) { ret = native_ret; }
+    } else {
+      sql::ObSQLSessionInfo *sql_session = nullptr;
+      sql::ObSessionGetterGuard native_guard(
+          *GCTX.session_mgr_, session->free_ctx.sessid_);
+      native_ret = native_guard.get_session(sql_session);
+      if (OB_ENTRY_NOT_EXIST == native_ret) {
+        native_ret = OB_SUCCESS;
+      } else if (OB_SUCCESS != native_ret || OB_ISNULL(sql_session)) {
+        if (OB_SUCCESS == native_ret) { native_ret = OB_ERR_UNEXPECTED; }
+        LOG_WARN("[FlightSQL] CloseSession: native session lookup failed",
+                 K(native_ret), "sessid", session->free_ctx.sessid_);
+      } else {
+        // Wake SQL and lock waits, then establish disconnect_session()'s
+        // documented precondition before it waits for the query lock.
+        const int interrupt_ret = GCTX.session_mgr_->kill_query(*sql_session);
+        if (OB_SUCCESS != interrupt_ret) {
+          LOG_WARN("[FlightSQL] CloseSession: native query interruption failed",
+                   K(interrupt_ret), "sessid", session->free_ctx.sessid_);
+        }
+        sql_session->set_session_state(sql::SESSION_KILLED);
+        sql_session->set_mark_killed(true);
+        const int disconnect_ret =
+            GCTX.session_mgr_->disconnect_session(*sql_session);
+        if (OB_SUCCESS != disconnect_ret) {
+          LOG_WARN("[FlightSQL] CloseSession: native disconnect failed",
+                   K(disconnect_ret), "sessid", session->free_ctx.sessid_);
+          if (OB_SUCCESS == native_ret) { native_ret = disconnect_ret; }
+        }
+      }
+      if (OB_SUCC(ret) && OB_SUCCESS != native_ret) { ret = native_ret; }
+    }
+  } else if (OB_NOT_NULL(session->ob_session)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("[FlightSQL] CloseSession: native session manager is null", K(ret));
+  }
+
+  // Existing Flight holders cannot admit more SQL after the fence. Wait for
+  // their cancellation/error paths to release borrowed raw session state, then
+  // reuse the established tenant-aware native free sequence unchanged.
+  while (session.use_count() > 1) {
+    ob_usleep(1000);
+  }
+  const int destroy_ret = destroy_session(session);
+  if (OB_SUCC(ret) && OB_SUCCESS != destroy_ret) {
+    ret = destroy_ret;
+  }
+  // Run the Flight wrapper destructor (including ingest abort cleanup) before
+  // publishing completion to this or any concurrent CloseSession caller.
+  session.reset();
+  {
+    std::lock_guard<std::mutex> close_guard(close_state->mutex);
+    close_state->result = ret;
+    close_state->done = true;
+  }
+  close_state->cv.notify_all();
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    ClosingSessionMap::iterator it = closing_sessions_.find(session_id);
+    if (it != closing_sessions_.end() && it->second == close_state) {
+      closing_sessions_.erase(it);
+    }
+  }
+  close_published = true;
+  return ret;
+}
+
 std::vector<ObFlightSqlSessionSnapshot> ObFlightSqlSessionManager::snapshot() const
 {
   std::vector<ObFlightSqlSessionSnapshot> result;
@@ -741,10 +966,11 @@ std::vector<ObFlightSqlSessionSnapshot> ObFlightSqlSessionManager::snapshot() co
   return result;
 }
 
-void ObFlightSqlSessionManager::destroy_session(const std::shared_ptr<ObFlightSqlSession> &session)
+int ObFlightSqlSessionManager::destroy_session(
+    const std::shared_ptr<ObFlightSqlSession> &session)
 {
-  if (OB_ISNULL(session)) { return; }
   int ret = OB_SUCCESS;
+  if (OB_ISNULL(session)) { return ret; }
   // If use_count > 1 another thread (e.g. DoGetStatement running execute()) currently
   // holds a strong reference and has an active raw ob_session* inside ObResultSet.
   // Freeing ob_session now causes a use-after-free in check_status/is_terminate.
@@ -752,9 +978,10 @@ void ObFlightSqlSessionManager::destroy_session(const std::shared_ptr<ObFlightSq
   // ~ObFlightSqlSession() will run the teardown when the last reference drops.
   if (session.use_count() > 1) {
     LOG_WARN("[FlightSQL] destroy_session: deferred to destructor (session in use)",
-             "session_id", session->session_id.c_str(),
+             "tenant_id", session->tenant_id,
+             "sessid", session->free_ctx.sessid_,
              "use_count", session.use_count());
-    return;
+    return ret;
   }
   if (OB_NOT_NULL(session->ob_session) && OB_NOT_NULL(GCTX.session_mgr_)) {
     // Switch to the session's real tenant so that revert_session / free_session
@@ -770,11 +997,26 @@ void ObFlightSqlSessionManager::destroy_session(const std::shared_ptr<ObFlightSq
     }
     session->ob_session->set_session_sleep();
     GCTX.session_mgr_->revert_session(session->ob_session);
-    GCTX.session_mgr_->free_session(session->free_ctx);
-    GCTX.session_mgr_->mark_sessid_unused(session->free_ctx.sessid_);
+    int tmp_ret = GCTX.session_mgr_->free_session(session->free_ctx);
+    if (OB_SUCCESS != tmp_ret) {
+      LOG_WARN("[FlightSQL] destroy: failed to free native session",
+               K(tmp_ret), "tenant_id", session->tenant_id,
+               "sessid", session->free_ctx.sessid_);
+      if (OB_SUCC(ret)) { ret = tmp_ret; }
+    }
+    tmp_ret = GCTX.session_mgr_->mark_sessid_unused(session->free_ctx.sessid_);
+    if (OB_SUCCESS != tmp_ret) {
+      LOG_WARN("[FlightSQL] destroy: failed to release native session id",
+               K(tmp_ret), "tenant_id", session->tenant_id,
+               "sessid", session->free_ctx.sessid_);
+      if (OB_SUCC(ret)) { ret = tmp_ret; }
+    }
     session->ob_session = nullptr;
-    LOG_TRACE("[FlightSQL] Session destroyed", "session_id", session->session_id.c_str());
+    LOG_TRACE("[FlightSQL] Session destroyed",
+              "tenant_id", session->tenant_id,
+              "sessid", session->free_ctx.sessid_);
   }
+  return ret;
 }
 
 void ObFlightSqlSessionManager::run1()
@@ -826,7 +1068,8 @@ void ObFlightSqlSessionManager::run1()
       }
       for (const auto &s : expired) {
         LOG_TRACE("[FlightSQL] GC evicting session",
-                 "session_id", s->session_id.c_str(),
+                 "tenant_id", s->tenant_id,
+                 "sessid", s->free_ctx.sessid_,
                  "ob_dead", OB_NOT_NULL(s->ob_session) && s->ob_session->is_zombie());
         destroy_session(s);
       }

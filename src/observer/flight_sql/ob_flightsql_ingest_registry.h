@@ -130,8 +130,8 @@ public:
   int wait_stream_exhausted(const std::shared_ptr<ObFlightSqlIngestEntry> &entry,
                             int64_t timeout_us);
 
-  // Abort: mark aborted and wake everyone.
-  int abort(const std::string &ingest_id);
+  // Abort an entry owned by tenant_id: mark aborted and wake everyone.
+  int abort(uint64_t tenant_id, const std::string &ingest_id);
 
   // Get entry for catalog / VecOp lookup (non-blocking).  Returns nullptr if not found.
   std::shared_ptr<ObFlightSqlIngestEntry> get(const common::ObString &ingest_id);

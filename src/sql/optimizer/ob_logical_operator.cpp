@@ -5029,6 +5029,7 @@ int ObLogicalOperator::is_top_rescan_allowed(bool &allowed)
   int ret = OB_SUCCESS;
   ObLogPlan *plan = NULL;
   bool is_deterministic = false;
+  bool has_arrow_stream = false;
   const ObDMLStmt *stmt = NULL;
   ObSQLSessionInfo *session_info = NULL;
   ObLogicalOperator *root = NULL;
@@ -5061,6 +5062,10 @@ int ObLogicalOperator::is_top_rescan_allowed(bool &allowed)
   } else if (OB_ISNULL(root = plan->get_plan_root())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected null", K(ret));
+  } else if (OB_FAIL(ObOptimizerUtil::contains_arrow_stream(root, has_arrow_stream))) {
+    LOG_WARN("failed to check for Arrow stream", K(ret));
+  } else if (has_arrow_stream) {
+    allowed = false;
   } else if (log_op_def::LOG_RESCAN == root->get_type()
              || (NULL != root->get_parent() && log_op_def::LOG_RESCAN == root->get_parent()->get_type())
              || log_op_def::LOG_TEMP_TABLE_TRANSFORMATION == root->get_type()
