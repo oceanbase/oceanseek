@@ -3579,9 +3579,11 @@ int ObDASHNSWScanIter::post_query_vid_with_filter(
       }
       INC_METRIC_VAL(common::ObMetricId::VEC_ITER_FILTER_LOOP_CNT, 1);
       if (OB_FAIL(ret)) {
-      } else if (tmp_adaptor_vid_iter_->get_total() < query_cond_.query_limit_
+      } else if (tmp_adaptor_vid_iter_->get_total() == 0
       || (iter_scan_total_num > hnsw_max_iter_scan_nums && hnsw_max_iter_scan_nums > 0)) {
-        // res is already less than limit, no need to find again
+        // 这里统计的是本轮后过滤前的候选数。按 segment 缩减预算后，
+        // 候选数小于 query_limit_ 不代表搜索耗尽，不能据此提前结束迭代。
+        // 本轮无候选或累计扫描量超限时停止；结果已足够的情况在下方单独处理。
         query_cond_.query_limit_ = 0;
         LOG_TRACE("iteractive filter log:", K(iter_scan_total_num), K(hnsw_max_iter_scan_nums), K(query_cond_.query_limit_), K(tmp_adaptor_vid_iter_->get_total()), K(query_cond_.query_limit_), K(total_before_add), K(adaptor_vid_iter_->get_total()));
       } else if (is_ipivf()) {
@@ -3994,6 +3996,8 @@ int ObDASHNSWScanIter::set_vector_query_condition(ObVectorQueryConditions &query
     query_cond.rel_count_ = vec_aux_ctdef_->relevance_col_cnt_;
     query_cond.rel_map_ptr_ = &rel_map_;
     query_cond.is_post_with_filter_ = is_iter_filter();
+    query_cond.original_query_limit_ = limit_param_.limit_ + limit_param_.offset_;
+    query_cond.filter_selectivity_ = adaptive_ctx_.selectivity_;
     query_cond.distance_threshold_ = distance_threshold_;
     query_cond.ob_sparse_drop_ratio_search_ = search_param_.ob_sparse_drop_ratio_search_;
     if (vec_aux_ctdef_->vec_query_param_.is_set_last_distance_ && OB_NOT_NULL(distance_calc_)) {

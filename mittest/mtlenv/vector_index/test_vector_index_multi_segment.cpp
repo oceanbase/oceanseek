@@ -2868,7 +2868,7 @@ TEST_F(TestVectorIndexMultiSegment, size_weighted_ef_search_and_bypass)
   {
     ~SwitchGuard()
     {
-      EventTable::set_event("ERRSIM_VEC_ENABLE_SIZE_WEIGHTED_EF", EventItem());
+      EventTable::set_event("ERRSIM_VEC_DISABLE_SIZE_WEIGHTED_EF", EventItem());
       EventTable::set_event("ERRSIM_VEC_ENABLE_SEGMENT_EF_REDUCTION", EventItem());
     }
   } switch_guard;
@@ -2911,6 +2911,8 @@ TEST_F(TestVectorIndexMultiSegment, size_weighted_ef_search_and_bypass)
   ObVectorQueryConditions condition;
   condition.ef_search_ = 300;
   condition.query_limit_ = 100;
+  condition.original_query_limit_ = 100;
+  condition.filter_selectivity_ = 1.0;
   ObVectorIndexSegQueryHandler handler;
   handler.tenant_id_ = MTL_ID();
   handler.ctx_ = &ctx;
@@ -2921,14 +2923,21 @@ TEST_F(TestVectorIndexMultiSegment, size_weighted_ef_search_and_bypass)
   handler.segment_querier_ = ctx.segments_.at(0);
   ObVsagQueryResult baseline;
   ASSERT_EQ(OB_SUCCESS, handler.knn_search(baseline, 2));
-  EXPECT_EQ(0, handler.total_vector_count_); // Default switch is off.
+  EXPECT_EQ(20002, handler.total_vector_count_); // Size weighting is enabled by default.
   ASSERT_EQ(100, baseline.total_);
   EXPECT_EQ(1, baseline.vids_[0]);
 
-  ASSERT_EQ(OB_SUCCESS, EventTable::set_event("ERRSIM_VEC_ENABLE_SIZE_WEIGHTED_EF", enabled));
-  handler.total_vector_count_ = -1; // Start another search round.
   int64_t actual_ef = -1;
   int64_t actual_topk = -1;
+  ASSERT_EQ(OB_SUCCESS, EventTable::set_event("ERRSIM_VEC_DISABLE_SIZE_WEIGHTED_EF", enabled));
+  handler.total_vector_count_ = -1; // Start another search round.
+  calc_segment_ef_params(handler, ctx.segments_, 2, 10001, actual_ef, actual_topk);
+  EXPECT_EQ(0, handler.total_vector_count_);
+  EXPECT_EQ(300, actual_ef);
+  EXPECT_EQ(100, actual_topk);
+
+  ASSERT_EQ(OB_SUCCESS, EventTable::set_event("ERRSIM_VEC_DISABLE_SIZE_WEIGHTED_EF", EventItem()));
+  handler.total_vector_count_ = -1;
   for (int i = 0; i < 2; ++i) {
     calc_segment_ef_params(handler, ctx.segments_, 2, 10001, actual_ef, actual_topk);
     EXPECT_EQ(288, actual_ef);
@@ -2975,6 +2984,65 @@ TEST_F(TestVectorIndexMultiSegment, size_weighted_ef_search_and_bypass)
     EXPECT_EQ(100, actual_topk);
   }
 
+  // Both pre-filter and post-filter allocate candidates, with the SQL limit as a floor.
+  condition.query_limit_ = 300;
+  const int64_t expected_limits[] = {300, 113, 300, 100};
+  for (const bool post_filter : {false, true}) {
+    condition.is_post_with_filter_ = post_filter;
+    for (int i = 0; i < 4; ++i) {
+      calc_segment_ef_params(handler, ctx.segments_, 2, vector_counts[i], actual_ef, actual_topk);
+      EXPECT_EQ(expected_limits[i], actual_topk);
+      EXPECT_EQ(actual_topk, actual_ef);
+    }
+  }
+  condition.query_limit_ = 20; // A continuation round can request fewer than the SQL limit.
+  calc_segment_ef_params(handler, ctx.segments_, 2, 1000, actual_ef, actual_topk);
+  EXPECT_EQ(100, actual_topk);
+  EXPECT_EQ(100, actual_ef);
+  condition.is_post_with_filter_ = false;
+
+  condition.query_limit_ = 300;
+  for (const double selectivity : {-1.0, 0.0, 0.1, 0.10000001, 0.1499, 0.15, 1.1}) {
+    condition.filter_selectivity_ = selectivity;
+    handler.total_vector_count_ = -1;
+    calc_segment_ef_params(handler, ctx.segments_, 2, 10001, actual_ef, actual_topk);
+    EXPECT_EQ(0, handler.total_vector_count_);
+    EXPECT_EQ(300, actual_topk);
+    EXPECT_EQ(300, actual_ef);
+  }
+  // A new round must still bypass weighting when the current selectivity is 0.15.
+  condition.filter_selectivity_ = 0.15;
+  condition.query_limit_ = 500;
+  handler.total_vector_count_ = -1;
+  calc_segment_ef_params(handler, ctx.segments_, 2, 10001, actual_ef, actual_topk);
+  EXPECT_EQ(0, handler.total_vector_count_);
+  EXPECT_EQ(500, actual_topk);
+  EXPECT_EQ(500, actual_ef);
+  condition.query_limit_ = 300;
+  condition.filter_selectivity_ = 0.1501;
+  handler.total_vector_count_ = -1;
+  calc_segment_ef_params(handler, ctx.segments_, 2, 10001, actual_ef, actual_topk);
+  EXPECT_EQ(288, actual_topk);
+  EXPECT_EQ(288, actual_ef);
+  // Hybrid callers leave selectivity unknown; both filter paths bypass size weighting.
+  condition.original_query_limit_ = 0;
+  condition.filter_selectivity_ = -1.0;
+  handler.total_vector_count_ = -1;
+  calc_segment_ef_params(handler, ctx.segments_, 2, 10001, actual_ef, actual_topk);
+  EXPECT_EQ(0, handler.total_vector_count_);
+  EXPECT_EQ(300, actual_topk);
+  EXPECT_EQ(300, actual_ef);
+  condition.is_post_with_filter_ = true;
+  handler.total_vector_count_ = -1;
+  calc_segment_ef_params(handler, ctx.segments_, 2, 10001, actual_ef, actual_topk);
+  EXPECT_EQ(0, handler.total_vector_count_);
+  EXPECT_EQ(300, actual_topk);
+  EXPECT_EQ(300, actual_ef);
+  condition.is_post_with_filter_ = false;
+  condition.original_query_limit_ = 100;
+  condition.filter_selectivity_ = 1.0;
+  condition.query_limit_ = 100;
+
   ASSERT_EQ(OB_SUCCESS, EventTable::set_event("ERRSIM_VEC_ENABLE_SEGMENT_EF_REDUCTION", enabled));
   handler.total_vector_count_ = -1;
   calc_segment_ef_params(handler, ctx.segments_, 2, 10001, actual_ef, actual_topk);
@@ -2983,7 +3051,10 @@ TEST_F(TestVectorIndexMultiSegment, size_weighted_ef_search_and_bypass)
   ObVsagQueryResult legacy;
   ASSERT_EQ(OB_SUCCESS, handler.knn_search(legacy, 2));
   EXPECT_EQ(0, handler.total_vector_count_);
-  EXPECT_EQ(125, legacy.total_); // Both switches enabled: preserve the old policy.
+  EXPECT_EQ(125, legacy.total_); // The legacy switch overrides default size weighting.
+  calc_segment_ef_params(handler, ctx.segments_, 10, 10001, actual_ef, actual_topk);
+  EXPECT_EQ(100, actual_topk);
+  EXPECT_EQ(100, actual_ef);
   ASSERT_EQ(OB_SUCCESS, EventTable::set_event("ERRSIM_VEC_ENABLE_SEGMENT_EF_REDUCTION", EventItem()));
 
   // Exercise the existing adaptor loop and merge with the new calculation.
@@ -3018,6 +3089,117 @@ TEST_F(TestVectorIndexMultiSegment, size_weighted_ef_search_and_bypass)
   EXPECT_EQ(250, condition.query_limit_);
   EXPECT_EQ(300, condition.ef_search_);
   round_iter->~ObVectorQueryVidIterator();
+
+  // A physically nonempty base can contribute no candidates after deletion
+  // filtering. A full reduced quota in the other base must permit continuation.
+  for (const bool weighted : {false, true}) {
+    ASSERT_EQ(OB_SUCCESS, EventTable::set_event("ERRSIM_VEC_DISABLE_SIZE_WEIGHTED_EF",
+        weighted ? EventItem() : enabled));
+    ObVectorQueryAdaptorResultContext deleted_ctx(MTL_ID(), ObLSID(1), 0, &alloc, &alloc);
+    ASSERT_EQ(OB_SUCCESS, deleted_ctx.init_bitmaps());
+    for (int64_t vid = 10002; vid <= 20002; ++vid) {
+      roaring::api::roaring64_bitmap_add(deleted_ctx.bitmaps_->delete_bitmap_, vid);
+    }
+    condition.query_limit_ = 300;
+    ObVectorQueryVidIterator initial(0, 0, 0, nullptr);
+    ObVectorQueryVidIterator *current = &initial;
+    ASSERT_EQ(OB_SUCCESS, adaptor_->vsag_query_vids(&deleted_ctx, &condition, 8, query, current));
+    ASSERT_EQ(weighted ? 288 : 300, current->get_total());
+    for (int64_t i = 0; i < current->get_total(); ++i) { EXPECT_LE(current->get_vids()[i], 10001); }
+
+    ASSERT_EQ(OB_SUCCESS, adaptor_->query_next_result(&deleted_ctx, &condition, current));
+    ASSERT_NE(nullptr, current);
+    ASSERT_EQ(weighted ? 288 : 300, current->get_total());
+    current->~ObVectorQueryVidIterator();
+
+    // Preserve the cache-only last-search path and cover an empty result round.
+    condition.is_last_search_ = true;
+    condition.distance_threshold_ = -1.0F;
+    ASSERT_EQ(OB_SUCCESS, adaptor_->query_next_result(&deleted_ctx, &condition, current));
+    ASSERT_NE(nullptr, current);
+    EXPECT_EQ(0, current->get_total());
+    EXPECT_TRUE(condition.is_last_search_);
+    EXPECT_EQ(300, condition.query_limit_);
+    EXPECT_EQ(300, condition.ef_search_);
+    current->~ObVectorQueryVidIterator();
+    condition.is_last_search_ = false;
+    condition.distance_threshold_ = FLT_MAX;
+  }
+
+  // A partial nonempty result is distinct from an empty result round.
+  ObVectorQueryAdaptorResultContext exhausted_ctx(MTL_ID(), ObLSID(1), 0, &alloc, &alloc);
+  ASSERT_EQ(OB_SUCCESS, exhausted_ctx.init_bitmaps());
+  for (int64_t vid = 11; vid <= 20002; ++vid) {
+    roaring::api::roaring64_bitmap_add(exhausted_ctx.bitmaps_->delete_bitmap_, vid);
+  }
+  ObVectorQueryVidIterator exhausted(0, 0, 0, nullptr);
+  ObVectorQueryVidIterator *exhausted_ptr = &exhausted;
+  ASSERT_EQ(OB_SUCCESS, adaptor_->vsag_query_vids(&exhausted_ctx, &condition, 8, query, exhausted_ptr));
+  EXPECT_EQ(10, exhausted.get_total());
+}
+
+TEST_F(TestVectorIndexMultiSegment, bq_size_weighted_candidates_follow_ef)
+{
+  init_adaptor("HNSW_BQ");
+  ObVectorIndexSegmentHandle handle;
+  ASSERT_EQ(OB_SUCCESS, adaptor_->create_snap_segment(VIAT_HNSW_BQ, handle));
+  ASSERT_EQ(VIAT_HNSW_BQ, handle->get_index_type());
+  ObArenaAllocator alloc("TestBqSegEf");
+  ObVectorQueryAdaptorResultContext ctx(MTL_ID(), ObLSID(1), 0, &alloc, &alloc);
+  ASSERT_EQ(OB_SUCCESS, ctx.add_segment_querier(handle, false, false, nullptr, false));
+  ObVectorQueryConditions condition;
+  condition.query_limit_ = 300;
+  condition.ef_search_ = 600;
+  condition.original_query_limit_ = 100;
+  condition.filter_selectivity_ = 1.0;
+  ObVectorIndexSegQueryHandler handler;
+  handler.query_cond_ = &condition;
+  handler.segment_querier_ = ctx.segments_.at(0);
+  // Exercise per-segment allocation after the round's size sampling has completed.
+  handler.total_vector_count_ = 100000;
+  int64_t actual_ef = 0;
+  int64_t actual_topk = 0;
+  for (const bool post_filter : {false, true}) {
+    condition.is_post_with_filter_ = post_filter;
+    calc_segment_ef_params(handler, ctx.segments_, 2, 10000, actual_ef, actual_topk);
+    EXPECT_EQ(177, actual_ef);
+    EXPECT_EQ(177, actual_topk); // Preserve ef instead of reducing it to the old topk of 113.
+    calc_segment_ef_params(handler, ctx.segments_, 2, 90000, actual_ef, actual_topk);
+    EXPECT_EQ(600, actual_ef);
+    EXPECT_EQ(600, actual_topk); // BQ candidates can exceed the shared query_limit.
+    calc_segment_ef_params(handler, ctx.segments_, 2, 1000, actual_ef, actual_topk);
+    EXPECT_EQ(100, actual_ef);
+    EXPECT_EQ(100, actual_topk); // Both remain equal after the SQL lower-bound protection.
+  }
+
+  // A round that bypasses weighting must keep ef and topk independent.
+  handler.total_vector_count_ = 0;
+  calc_segment_ef_params(handler, ctx.segments_, 2, 10000, actual_ef, actual_topk);
+  EXPECT_EQ(600, actual_ef);
+  EXPECT_EQ(300, actual_topk);
+  condition.original_query_limit_ = 0;
+  condition.query_limit_ = 100;
+  condition.ef_search_ = 64;
+  calc_segment_ef_params(handler, ctx.segments_, 2, 10000, actual_ef, actual_topk);
+  EXPECT_EQ(64, actual_ef);
+  EXPECT_EQ(100, actual_topk);
+
+  struct SwitchGuard
+  {
+    ~SwitchGuard()
+    {
+      EventTable::set_event("ERRSIM_VEC_ENABLE_SEGMENT_EF_REDUCTION", EventItem());
+    }
+  } switch_guard;
+  EventItem enabled;
+  enabled.error_code_ = OB_ERR_UNEXPECTED;
+  enabled.trigger_freq_ = 1;
+  ASSERT_EQ(OB_SUCCESS, EventTable::set_event("ERRSIM_VEC_ENABLE_SEGMENT_EF_REDUCTION", enabled));
+  condition.original_query_limit_ = 100;
+  condition.ef_search_ = 600;
+  calc_segment_ef_params(handler, ctx.segments_, 2, 10000, actual_ef, actual_topk);
+  EXPECT_EQ(300, actual_ef);
+  EXPECT_EQ(125, actual_topk);
 }
 
 } // namespace share

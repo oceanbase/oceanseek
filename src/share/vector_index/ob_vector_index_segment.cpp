@@ -20,7 +20,7 @@
 
 ERRSIM_POINT_DEF(ERRSIM_VEC_ENABLE_SEARCH_TIMEOUT_MS, "When set, add timeout_ms to VSAG search param to limit search time.");
 ERRSIM_POINT_DEF(ERRSIM_VEC_ENABLE_SEGMENT_EF_REDUCTION, "When set, reduce ef_search proportionally across segments to improve QPS in multi-segment searches.");
-ERRSIM_POINT_DEF(ERRSIM_VEC_ENABLE_SIZE_WEIGHTED_EF, "When set, allocate ef_search by HNSW segment size for supported scan paths, retaining query_limit. Disabled when segment ef reduction is enabled.");
+ERRSIM_POINT_DEF(ERRSIM_VEC_DISABLE_SIZE_WEIGHTED_EF, "When set, disable size-weighted ef_search and query_limit allocation. Enabled by default for eligible queries.");
 
 namespace oceanbase
 {
@@ -37,16 +37,21 @@ int64_t ObVecIdxSnapshotData::instacnce_cnt_ = 0;
 int64_t ObVecIdxFrozenData::instacnce_cnt_ = 0;
 
 // Compute per-segment search parameters without changing the shared query conditions.
-// Size-weighted policy (ERRSIM_VEC_ENABLE_SIZE_WEIGHTED_EF):
-//   Q   = query_limit_ (internal candidate count, not necessarily SQL LIMIT)
+// Size-weighted policy (enabled by default; ERRSIM_VEC_DISABLE_SIZE_WEIGHTED_EF disables it):
+//   L   = original_query_limit_ (SQL LIMIT + OFFSET)
+//   Q   = max(query_limit_, L)
 //   E   = max(requested ef_search, Q)
 //   N_i = vector_count of the current segment; N = sum of all segment counts
 //   p_i = min(1, N_i / N)
 //   K   = EF_EXPAND_FACTOR
-//   B_i = floor(max(1, E * p_i + K * sqrt(E * p_i * (1 - p_i))))
-//   ef_i = max(Q, min(E, B_i)); topk_i = Q
+//   B_i(x) = floor(max(1, x * p_i + K * sqrt(x * p_i * (1 - p_i))))
+//   topk_i = max(L, min(Q, B_i(Q))) for all filter paths
+//   ef_i = max(topk_i, min(E, B_i(E)))
+//   BQ segments then use topk_i = ef_i to retain candidates for reranking.
+// Require filter selectivity in (0.15, 1]. Hybrid search does not supply this
+// estimate and keeps the default -1, so it does not use size weighting.
 // The square-root term adds headroom to the size-proportional budget. Clamping to
-// [Q, E] keeps ef at least the requested candidate count and at most the original
+// [topk_i, E] keeps ef at least the segment candidate count and at most the original
 // effective budget; it does not guarantee recall. Existing VSAG caps still apply.
 // Cache N once per round before the first actual search. Require at least two
 // nonempty HNSW-family segments; invalid counts or overflow disable this policy
@@ -65,12 +70,16 @@ void calc_segment_ef_params(ObVectorIndexSegQueryHandler &handler,
   // Scale the extra EF budget above the size-proportional allocation.
   constexpr double EF_EXPAND_FACTOR = 16.0;
   const ObVectorQueryConditions *query_cond = handler.query_cond_;
+  const int64_t min_query_limit = MAX(0L, query_cond->original_query_limit_);
+  const int64_t query_limit = MAX(min_query_limit, static_cast<int64_t>(query_cond->query_limit_));
   int64_t &total_vector_count = handler.total_vector_count_;
   if (total_vector_count < 0) {
     total_vector_count = 0;
     if (!handler.is_sparse_vector_
         && segments.count() > 1
-        && ERRSIM_VEC_ENABLE_SIZE_WEIGHTED_EF != OB_SUCCESS
+        && query_cond->filter_selectivity_ > 0.15
+        && query_cond->filter_selectivity_ <= 1.0
+        && ERRSIM_VEC_DISABLE_SIZE_WEIGHTED_EF == OB_SUCCESS
         && ERRSIM_VEC_ENABLE_SEGMENT_EF_REDUCTION == OB_SUCCESS) {
       int ret = OB_SUCCESS;
       int64_t total = 0;
@@ -100,16 +109,22 @@ void calc_segment_ef_params(ObVectorIndexSegQueryHandler &handler,
     }
   }
   if (total_vector_count > 0) {
-    const int64_t ef = MAX(query_cond->ef_search_, static_cast<int64_t>(query_cond->query_limit_));
+    const int64_t ef = MAX(query_cond->ef_search_, query_limit);
     // An active segment may grow after the total was sampled.
     const double p = MIN(1.0, static_cast<double>(vector_count) / static_cast<double>(total_vector_count));
     const double mean = ef * p;
-    const double budget = std::floor(MAX(1.0,
+    const int64_t budget = static_cast<int64_t>(MAX(1.0,
         mean + EF_EXPAND_FACTOR * std::sqrt(mean * (1.0 - p))));
-    actual_query_limit = query_cond->query_limit_;
-    // Clamp before converting: double(INT64_MAX) rounds up to 2^63.
-    actual_ef_search = budget >= static_cast<double>(ef)
-        ? ef : MAX(actual_query_limit, static_cast<int64_t>(budget));
+    const double limit_mean = query_limit * p;
+    const int64_t limit_budget = static_cast<int64_t>(MAX(1.0,
+        limit_mean + EF_EXPAND_FACTOR * std::sqrt(limit_mean * (1.0 - p))));
+    actual_query_limit = MIN(query_limit, limit_budget);
+    actual_ef_search = MAX(actual_query_limit, MIN(ef, budget));
+    if (OB_NOT_NULL(handler.segment_querier_)
+        && handler.segment_querier_->handle_.is_valid()
+        && VIAT_HNSW_BQ == handler.segment_querier_->handle_->get_index_type()) {
+      actual_query_limit = actual_ef_search;
+    }
   } else {
     const int eff_seg = (segment_cnt > 1 && ERRSIM_VEC_ENABLE_SEGMENT_EF_REDUCTION != OB_SUCCESS)
                         ? segment_cnt : 1;
@@ -124,6 +139,10 @@ void calc_segment_ef_params(ObVectorIndexSegQueryHandler &handler,
       actual_ef_search = query_cond->ef_search_;
       actual_query_limit = query_cond->query_limit_;
     }
+  }
+  if (query_cond->query_limit_ > 0 && min_query_limit > 0) {
+    actual_query_limit = MAX(actual_query_limit, min_query_limit);
+    actual_ef_search = MAX(actual_ef_search, actual_query_limit);
   }
 }
 
@@ -2848,6 +2867,7 @@ int ObVectorIndexSegQueryHandler::knn_search(ObVsagQueryResult &result, int segm
     LOG_TRACE("multi-segment knn_search ef_search adjust",
       K(segment_cnt), K(query_cond_->ef_search_), K(actual_ef_search),
       K(query_cond_->query_limit_), K(actual_query_limit), K(vec_cnt),
+      K(query_cond_->original_query_limit_), K(query_cond_->filter_selectivity_),
       K_(total_vector_count), "size_weighted_ef", total_vector_count_ > 0,
       KP(segment_querier_->handle_.get()),
       K(timeout_ms), K(selectivity_));

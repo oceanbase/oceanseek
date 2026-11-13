@@ -507,6 +507,8 @@ class ObVectorQueryConditions : public ObVecQueryCondBase {
 public:
   ObVectorQueryConditions()
     : ObVecQueryCondBase(),
+      original_query_limit_(0),
+      filter_selectivity_(-1.0),
       only_complete_data_(false),
       ef_search_(0),
       row_iter_(nullptr),
@@ -519,6 +521,8 @@ public:
   bool is_inited() override { return query_vector_.length() > 0 && ef_search_ > 0; }
   void reset() override {
     ObVecQueryCondBase::reset();
+    original_query_limit_ = 0;
+    filter_selectivity_ = -1.0;
     ef_search_ = 0;
     is_last_search_ = false;
     ob_sparse_drop_ratio_search_ = 0;
@@ -526,8 +530,10 @@ public:
     only_complete_data_ = false;
     last_distance_ = -FLT_MAX;
   }
-  TO_STRING_KV(K_(query_limit), K_(query_order), K_(ef_search), K_(query_vector), K_(query_scn), K_(ob_sparse_drop_ratio_search), K_(n_candidate), K_(last_distance));
+  TO_STRING_KV(K_(query_limit), K_(original_query_limit), K_(filter_selectivity), K_(query_order), K_(ef_search), K_(query_vector), K_(query_scn), K_(ob_sparse_drop_ratio_search), K_(n_candidate), K_(last_distance));
 
+  int64_t original_query_limit_; // LIMIT + OFFSET before reorder or iterative expansion.
+  double filter_selectivity_; // Filter pass rate; -1 means unknown.
   bool only_complete_data_; // true when search brute force
   int64_t ef_search_;
   common::ObNewRowIterator *row_iter_; // index_snapshot_data_table iter
