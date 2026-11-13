@@ -94,6 +94,8 @@ enum ObMaxIdType
   OB_MAX_USED_SHARED_USER_FAIL_GC_TASK_ID_TYPE,
   OB_MAX_USED_SHARED_USER_FAIL_GC_MACRO_ID_TASK_ID_TYPE,
   OB_MAX_USED_SHARED_USER_LS_META_GC_TASK_ID_TYPE,
+  // Reserve the persistent Warehouse ID category without enabling its allocator on master.
+  OB_MAX_USED_WAREHOUSE_ID_TYPE,
   OB_MAX_ID_TYPE,
 };
 

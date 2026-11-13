@@ -9701,6 +9701,9 @@ all_catalog_table_priv_def = dict(
 def_table_schema(**all_catalog_table_priv_def)
 def_table_schema(**gen_history_table_def(618, all_catalog_table_priv_def))
 
+# 619: __all_warehouse
+# 620: __all_database_warehouse
+# Their derived LOB table IDs are 50619/50620 and 60619/60620.
 # 余留位置（此行之前占位）
 # 本区域占位建议：采用真实表名进行占位
 ################################################################################
@@ -85403,6 +85406,9 @@ def_sys_index_table(
   index_type = 'INDEX_TYPE_NORMAL_LOCAL',
   keywords = all_def_keywords['__all_catalog_table_privilege'])
 
+# 101137: __idx_619_idx_warehouse_name
+# 101138: __idx_620_idx_data_warehouse_id
+# 101139: __idx_620_idx_default_warehouse_id
 # 余留位置（此行之前占位）
 # 索引表占位建议：基于基表（数据表）表名来占位，其他方式包括：索引名（index_name）、索引表表名
 ################################################################################

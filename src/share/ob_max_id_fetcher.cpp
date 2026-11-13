@@ -94,7 +94,8 @@ const char *ObMaxIdFetcher::max_id_name_info_[OB_MAX_ID_TYPE][2] = {
   { "ob_max_used_shared_user_fail_gc_task_id", "max used shared user fail gc task id"},
   { "ob_max_used_shared_user_fail_gc_macro_id_task_id",
     "max used shared user fail gc macro id task id"},
-  { "ob_max_used_shared_user_ls_meta_gc_task_id", "max used shared user ls meta gc task id"}};
+  { "ob_max_used_shared_user_ls_meta_gc_task_id", "max used shared user ls meta gc task id"},
+  { "ob_max_used_warehouse_id", "max used local warehouse id"}};
 
 ObMaxIdFetcher::ObMaxIdFetcherMutexWrapper ObMaxIdFetcher::mutex_bucket_[MAX_TENANT_MUTEX_BUCKET_CNT];
 

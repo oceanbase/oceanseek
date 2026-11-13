@@ -3126,6 +3126,19 @@ T_FUN_SYS_SEARCH_INDEX_INNER_PATH = 1943,
   T_SEARCH_INDEX_OPTION_LIST = 5012,
   T_HYBRID_SEARCH_TABLET = 5013, // The main table's tablet ID, used for hybrid search to build __shard_doc.
   T_MERGE_TABLE = 5014,
+  // Warehouse parser node IDs; definitions are added by the feature branch.
+  // T_CREATE_WAREHOUSE = 5015,
+  // T_ALTER_WAREHOUSE = 5016,
+  // T_DROP_WAREHOUSE = 5017,
+  // T_SHOW_WAREHOUSES = 5018,
+  // T_SHOW_CREATE_WAREHOUSE = 5019,
+  // T_WAREHOUSE_OPTION_LIST = 5020,
+  // T_WAREHOUSE_TYPE = 5021,
+  // T_WAREHOUSE_POOL_LIST = 5022,
+  // T_WAREHOUSE_ADD_POOL = 5023,
+  // T_WAREHOUSE_RENAME = 5024,
+  // T_WAREHOUSE_REMOVE_POOL = 5025,
+  // T_ALTER_DATABASE_WAREHOUSE = 5026,
 
   T_MAX //Attention: add a new type before T_MAX
 } ObItemType;
