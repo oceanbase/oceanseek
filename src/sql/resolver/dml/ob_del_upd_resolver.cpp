@@ -713,6 +713,7 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
         } else if (OB_FAIL(check_need_assignment(assigns.at(i).assignments_,
                                                  table_item->table_id_,
                                                  table_schema->get_table_id(),
+                                                 *table_schema,
                                                  trigger_exist,
                                                  *column_schema,
                                                  need_assigned))) {
@@ -923,9 +924,59 @@ int ObDelUpdResolver::add_assignment(common::ObIArray<ObTableAssignment> &assign
   return ret;
 }
 
+int ObDelUpdResolver::check_async_only_fts_hidden_column(
+    const ObTableSchema &table_schema,
+    const ObColumnSchemaV2 &column,
+    bool &is_async_only)
+{
+  int ret = OB_SUCCESS;
+  is_async_only = false;
+  bool has_async_fts = false;
+  bool has_sync_index = false;
+  ObSchemaGetterGuard *schema_guard = nullptr;
+  if (!column.is_virtual_generated_column()
+      || !(column.is_word_segment_column()
+           || column.is_word_count_column()
+           || column.is_doc_length_column()
+           || column.is_pos_list_column())) {
+  } else if (OB_ISNULL(schema_checker_) || OB_ISNULL(session_info_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null resolver context", K(ret), KP(schema_checker_), KP(session_info_));
+  } else if (OB_ISNULL(schema_guard = schema_checker_->get_schema_guard())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("schema guard is null", K(ret));
+  } else {
+    const ObIArray<ObAuxTableMetaInfo> &index_infos = table_schema.get_simple_index_infos();
+    const uint64_t tenant_id = session_info_->get_effective_tenant_id();
+    for (int64_t i = 0; OB_SUCC(ret) && i < index_infos.count(); ++i) {
+      const ObAuxTableMetaInfo &index_info = index_infos.at(i);
+      const ObTableSchema *index_schema = nullptr;
+      if (OB_FAIL(schema_guard->get_table_schema(tenant_id, index_info.table_id_, index_schema))) {
+        LOG_WARN("failed to get index schema", K(ret), K(index_info.table_id_));
+      } else if (OB_ISNULL(index_schema)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("index schema should not be null", K(ret), K(index_info.table_id_));
+      } else if (OB_NOT_NULL(index_schema->get_column_schema(column.get_column_id()))) {
+        if (index_schema->is_async_index()) {
+          if (index_schema->is_async_fts_index()) {
+            has_async_fts = true;
+          }
+        } else {
+          has_sync_index = true;
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      is_async_only = has_async_fts && !has_sync_index;
+    }
+  }
+  return ret;
+}
+
 int ObDelUpdResolver::check_need_assignment(const common::ObIArray<ObAssignment> &assigns,
                                             uint64_t table_id,
                                             uint64_t ref_table_id,
+                                            const ObTableSchema &table_schema,
                                             bool before_update_row_trigger_exist,
                                             const ObColumnSchemaV2 &column,
                                             bool &need_assign)
@@ -941,9 +992,16 @@ int ObDelUpdResolver::check_need_assignment(const common::ObIArray<ObAssignment>
     // 兼容oracle,这里的列不级联更新
     // do nothing
   } else if (column.is_udt_hidden_column()) {
-     // do nothing, will handle in udt transform
+    // do nothing, will handle in udt transform
   } else if (column.is_generated_column()) {
-    if (OB_FAIL(ObResolverUtils::check_whether_assigned(stmt, assigns, table_id, column.get_column_id(), exist))) {
+    bool is_async_only = false;
+    const bool need_filter_async_hidden = !session_info_->get_ddl_info().is_ddl()
+        && !session_info_->get_ddl_info().is_async_index_refresh();
+    if (need_filter_async_hidden
+        && OB_FAIL(check_async_only_fts_hidden_column(table_schema, column, is_async_only))) {
+      LOG_WARN("failed to check async only fts hidden column", K(ret), K(column));
+    } else if (need_filter_async_hidden && is_async_only) {
+    } else if (OB_FAIL(ObResolverUtils::check_whether_assigned(stmt, assigns, table_id, column.get_column_id(), exist))) {
       LOG_WARN("check column whether assigned failed", K(ret));
     } else if (!exist) {
       ObArray<uint64_t> cascaded_columns;
@@ -2062,6 +2120,8 @@ int ObDelUpdResolver::add_all_columns_to_stmt(const TableItem &table_item,
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected null", K(table_schema), K(ret));
   } else {
+    const bool need_filter_async_hidden = !params_.session_info_->get_ddl_info().is_ddl()
+        && !params_.session_info_->get_ddl_info().is_async_index_refresh();
     ObTableSchema::const_column_iterator iter = table_schema->column_begin();
     ObTableSchema::const_column_iterator end = table_schema->column_end();
     for (; OB_SUCC(ret) && iter != end; ++iter) {
@@ -2071,8 +2131,17 @@ int ObDelUpdResolver::add_all_columns_to_stmt(const TableItem &table_item,
         LOG_WARN("invalid column schema", K(column));
       } else if (schema::EXTERNAL_TABLE == base_table_item.table_type_
                  && ObExternalTableUtils::is_skipped_insert_column(*column)) {
-      } else if (OB_FAIL(add_column_to_stmt(table_item, *column, column_exprs))) {
-        LOG_WARN("add column item to stmt failed", K(ret));
+      } else {
+        bool is_async_only = false;
+        if (need_filter_async_hidden
+            && OB_FAIL(check_async_only_fts_hidden_column(*table_schema, *column, is_async_only))) {
+          LOG_WARN("failed to check async only fts hidden column", K(ret), KPC(column));
+        } else if (need_filter_async_hidden && is_async_only) {
+          // Skip async-only fulltext hidden generated columns in the primary DML
+          // column list. Refresh SQL reads them from the data table instead.
+        } else if (OB_FAIL(add_column_to_stmt(table_item, *column, column_exprs))) {
+          LOG_WARN("add column item to stmt failed", K(ret));
+        }
       }
     } //end for
   }

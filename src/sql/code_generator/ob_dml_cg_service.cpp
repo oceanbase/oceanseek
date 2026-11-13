@@ -4165,13 +4165,22 @@ int ObDmlCgService::convert_normal_triggers(ObLogDelUpd &log_op,
             LOG_WARN("unexpected status: column schema is null", K(ret), K(i));
           } else {
             is_hidden = column_schema->is_hidden();
-            is_gen_col = column_schema->is_generated_column();
-            is_gen_col_dep = column_schema->has_generated_column_deps();
-            is_update = has_exist_in_array(updated_column_ids, column_schema->get_column_id());
-            if (!has_exist_in_array(column_ids, column_schema->get_column_id(), &col_idx)) {
-              ret = OB_ERR_UNEXPECTED;
-              LOG_WARN("Can't found column idx", K(i), K(column_ids),
-                K(column_schema->get_column_id()), K(ret));
+            // Hidden columns are skipped by the is_hidden continue below, so the
+            // primary DML column list may legitimately not contain them: hidden
+            // generated columns only consumed by async indexes are pruned from the
+            // plan. Locate the column position only for visible columns, otherwise
+            // a pruned hidden column raises OB_ERR_UNEXPECTED in
+            // convert_normal_triggers and breaks DML compilation on tables with
+            // triggers.
+            if (!is_hidden) {
+              is_gen_col = column_schema->is_generated_column();
+              is_gen_col_dep = column_schema->has_generated_column_deps();
+              is_update = has_exist_in_array(updated_column_ids, column_schema->get_column_id());
+              if (!has_exist_in_array(column_ids, column_schema->get_column_id(), &col_idx)) {
+                ret = OB_ERR_UNEXPECTED;
+                LOG_WARN("Can't found column idx", K(i), K(column_ids),
+                  K(column_schema->get_column_id()), K(ret));
+              }
             }
             ++cs_iter;
           }

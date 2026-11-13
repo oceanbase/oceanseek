@@ -77,6 +77,7 @@ protected:
   int check_need_assignment(const common::ObIArray<ObAssignment> &assigns,
                             uint64_t table_id,
                             uint64_t ref_table_id,
+                            const share::schema::ObTableSchema &table_schema,
                             bool before_update_row_trigger_exist,
                             const share::schema::ObColumnSchemaV2 &column,
                             bool &need_assign);
@@ -319,6 +320,10 @@ protected:
   int check_value_row_all_simple_const(const ObIArray<ObRawExpr*> &value_row, bool &all_const);
 
 private:
+  int check_async_only_fts_hidden_column(const share::schema::ObTableSchema &table_schema,
+                                         const share::schema::ObColumnSchemaV2 &column,
+                                         bool &is_async_only);
+
   common::hash::ObPlacementHashSet<uint64_t, 4229> insert_column_ids_;
   bool is_column_specify_;
   bool is_oracle_tmp_table_; //是否创建oracle的临时表
