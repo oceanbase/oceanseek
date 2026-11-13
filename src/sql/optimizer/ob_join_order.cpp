@@ -2199,6 +2199,7 @@ int ObJoinOrder::create_one_access_path(const uint64_t table_id,
     ap->is_ordered_by_pk_ = (ref_id == index_id
                             || (OB_NOT_NULL(range_provider)
                                 && range_provider->is_equal_range()
+                                && range_provider->is_standard_range()
                                 && range_info.get_equal_prefix_count() >= range_info.get_index_column_count()))
                             && 1 >= range_info.get_range_count();
     //set strong_sharding_ ignore dop, update sharding by dop in set_sharding_info_for_base_path()
@@ -26331,6 +26332,7 @@ int ObJoinOrder::set_search_index_access_info(AccessPath &ap, const QueryRangeIn
         && range_provider->is_equal_range()
         && range_info.get_equal_prefix_count() >= SEARCH_INDEX_DOC_ID;
     ap.is_ordered_by_pk_ = ap.is_index_term_point_scan_
+        && range_provider->is_standard_range()
         && 1 >= range_info.get_range_count();
   }
   return ret;

@@ -819,9 +819,9 @@ int ObAccessPathEstimation::process_storage_estimation(ObOptimizerContext &ctx,
       if (OB_FAIL(ret)) {
       } else if (OB_FAIL(tmp_part_info.assign(*table_part_info))) {
         LOG_WARN("failed to assign table part info", K(ret));
-      } else if (!ap->is_global_index_ && ap->ref_table_id_ != ap->index_id_ &&
+      } else if (!ap->is_global_index_ && ap->ref_table_id_ != ap->get_real_index_table_id() &&
                 OB_FAIL(tmp_part_info.replace_final_location_key(*ctx.get_exec_ctx(),
-                                                                 ap->index_id_,
+                                                                 ap->get_real_index_table_id(),
                                                                  true))) {
         LOG_WARN("failed to replace final location key", K(ret));
       } else if (OB_FAIL(calc_range_partition_helper.init(ap->get_table_id(),
@@ -937,7 +937,7 @@ int ObAccessPathEstimation::add_storage_estimation_task(ObOptimizerContext &ctx,
     LOG_WARN("access path is invalid", K(ret), K(ap), K(table_meta));
   } else if (OB_FAIL(choose_storage_estimation_partitions(partition_limit,
                                                           ctx.get_schema_guard(),
-                                                          ap.index_id_,
+                                                          ap.get_real_index_table_id(),
                                                           index_partitions,
                                                           chosen_partitions))) {
     LOG_WARN("failed to choose partitions", K(ret));
@@ -1042,7 +1042,7 @@ int ObAccessPathEstimation::add_storage_estimation_task_by_ranges(ObOptimizerCon
       if (!valid_partitions_for_range.empty()) {
         if (OB_FAIL(choose_storage_estimation_partitions(partition_limit,
                                                         ctx.get_schema_guard(),
-                                                        ap.index_id_,
+                                                        ap.get_real_index_table_id(),
                                                         valid_partitions_for_range,
                                                         chosen_partitions))) {
           LOG_WARN("failed to choose partitions", K(ret));
@@ -1053,7 +1053,7 @@ int ObAccessPathEstimation::add_storage_estimation_task_by_ranges(ObOptimizerCon
         // no valid partitions, choose random partitions from all partitions
         if (OB_FAIL(choose_storage_estimation_partitions(partition_limit,
                                                         ctx.get_schema_guard(),
-                                                        ap.index_id_,
+                                                        ap.get_real_index_table_id(),
                                                         index_partitions,
                                                         chosen_partitions))) {
           LOG_WARN("failed to choose partitions", K(ret));
@@ -1781,7 +1781,8 @@ int ObAccessPathEstimation::add_index_info(ObOptimizerContext &ctx,
   } else if (OB_FAIL(get_key_ranges(ctx, allocator, part.tablet_id_, ap, scan_ranges))) {
     LOG_WARN("failed to get key ranges", K(ret));
   } else {
-    index_est_arg->index_id_ = ap.index_id_;
+    // Search index ranges belong to the data table, not the definition table.
+    index_est_arg->index_id_ = ap.get_real_index_table_id();
     index_est_arg->scan_flag_.index_back_ = ap.est_cost_info_.index_meta_info_.is_index_back_;
     index_est_arg->range_columns_count_ = ap.est_cost_info_.range_columns_.count();
     index_est_arg->tablet_id_ = part.tablet_id_;
@@ -1792,7 +1793,7 @@ int ObAccessPathEstimation::add_index_info(ObOptimizerContext &ctx,
   // FIXME, move following codes
   if (OB_SUCC(ret)) {
     for (int64_t i = 0; ap.is_global_index_ && i < scan_ranges.count(); ++i) {
-      scan_ranges.at(i).table_id_ = ap.index_id_;
+      scan_ranges.at(i).table_id_ = ap.get_real_index_table_id();
     }
     if (FAILEDx(construct_scan_range_batch(allocator, scan_ranges, index_est_arg->batch_))) {
       LOG_WARN("failed to construct scan range batch", K(ret));
@@ -2455,7 +2456,7 @@ int ObAccessPathEstimation::get_key_ranges(ObOptimizerContext &ctx,
   } else {/*do nothing*/}
   if (OB_SUCC(ret)) {
     if (OB_FAIL(convert_physical_rowid_ranges(ctx, allocator, tablet_id,
-                                              ap.index_id_, new_ranges))) {
+                                              ap.get_real_index_table_id(), new_ranges))) {
       LOG_WARN("failed to convert physical rowid ranges", K(ret));
     } else {
       LOG_TRACE("Succeed to get key ranges", K(new_ranges));
