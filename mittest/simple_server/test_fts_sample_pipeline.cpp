@@ -669,5 +669,84 @@ TEST_F(TestFtsSamplePipeline, test_fts_sample_pipeline_operators_init)
   STORAGE_LOG(INFO,   "FTS sample pipeline operators init test passed");
 }
 
+TEST_F(TestFtsSamplePipeline, test_convert_null_and_empty_datums_to_vectors)
+{
+  share::ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(tenant_id_));
+
+  tablet_id_ = 2000005;
+  const int64_t rowkey_count = 2;
+  const int64_t col_count = 2;
+  const ObObjType col_types[col_count] = {ObIntType, ObVarcharType};
+  ASSERT_EQ(OB_SUCCESS, initialize_args_and_env(col_types, col_count, rowkey_count));
+  ddl_dag_.fts_word_doc_ddl_table_schema_.table_item_.rowkey_column_num_ = rowkey_count;
+  for (int64_t i = 0; i < ddl_dag_.ddl_table_schema_.column_items_.count(); ++i) {
+    ASSERT_EQ(OB_SUCCESS,
+              ddl_dag_.fts_word_doc_ddl_table_schema_.column_items_.push_back(
+                  ddl_dag_.ddl_table_schema_.column_items_.at(i)));
+  }
+  fts_sample_pipeline_.set_dag(ddl_dag_);
+  ASSERT_EQ(OB_SUCCESS, fts_sample_pipeline_.init(tablet_id_));
+
+  sql::ObPxTabletRange::DatumKey null_key;
+  sql::ObPxTabletRange::DatumKey empty_key;
+  sql::ObPxTabletRange::DatumKey value_key;
+  const int64_t null_doc_id_value = 1;
+  const int64_t empty_doc_id_value = 2;
+  const int64_t value_doc_id_value = 3;
+  ObDatum null_doc_id(reinterpret_cast<const char *>(&null_doc_id_value), sizeof(null_doc_id_value), false);
+  ObDatum empty_doc_id(reinterpret_cast<const char *>(&empty_doc_id_value), sizeof(empty_doc_id_value), false);
+  ObDatum value_doc_id(reinterpret_cast<const char *>(&value_doc_id_value), sizeof(value_doc_id_value), false);
+  ObDatum null_word;
+  ObDatum empty_word;
+  ObDatum value_word;
+  null_word.set_null();
+  empty_word.set_string("", 0);
+  value_word.set_string("oceanbase", 9);
+  ASSERT_EQ(OB_SUCCESS, null_key.push_back(null_doc_id));
+  ASSERT_EQ(OB_SUCCESS, null_key.push_back(null_word));
+  ASSERT_EQ(OB_SUCCESS, empty_key.push_back(empty_doc_id));
+  ASSERT_EQ(OB_SUCCESS, empty_key.push_back(empty_word));
+  ASSERT_EQ(OB_SUCCESS, value_key.push_back(value_doc_id));
+  ASSERT_EQ(OB_SUCCESS, value_key.push_back(value_word));
+
+  ObFixedArray<ObIVector *, ObIAllocator> vectors;
+  ObSEArray<const sql::ObPxTabletRange::DatumKey *, 1> null_key_refs;
+  ASSERT_EQ(OB_SUCCESS, null_key_refs.push_back(&null_key));
+  EXPECT_EQ(OB_SUCCESS,
+            fts_sample_pipeline_.final_sample_op_.convert_keys_to_vectors(
+                null_key_refs, false /*is_inverted*/, null_key_refs.count(), vectors, allocator_));
+
+  ObSEArray<const sql::ObPxTabletRange::DatumKey *, 1> empty_key_refs;
+  ASSERT_EQ(OB_SUCCESS, empty_key_refs.push_back(&empty_key));
+  EXPECT_EQ(OB_SUCCESS,
+            fts_sample_pipeline_.final_sample_op_.convert_keys_to_vectors(
+                empty_key_refs, false /*is_inverted*/, empty_key_refs.count(), vectors, allocator_));
+
+  ObSEArray<const sql::ObPxTabletRange::DatumKey *, 3> key_refs;
+  ASSERT_EQ(OB_SUCCESS, key_refs.push_back(&null_key));
+  ASSERT_EQ(OB_SUCCESS, key_refs.push_back(&empty_key));
+  ASSERT_EQ(OB_SUCCESS, key_refs.push_back(&value_key));
+
+  ASSERT_EQ(OB_SUCCESS,
+            fts_sample_pipeline_.final_sample_op_.convert_keys_to_vectors(
+                key_refs, false /*is_inverted*/, key_refs.count(), vectors, allocator_));
+  ASSERT_EQ(col_count, vectors.count());
+
+  ObDatum actual;
+  ASSERT_EQ(OB_SUCCESS, ObDirectLoadVectorUtils::to_datum(vectors.at(0), 0, actual));
+  ASSERT_FALSE(actual.is_null());
+  ASSERT_EQ(null_doc_id.get_int(), actual.get_int());
+  ASSERT_EQ(OB_SUCCESS, ObDirectLoadVectorUtils::to_datum(vectors.at(1), 0, actual));
+  ASSERT_TRUE(actual.is_null());
+  ASSERT_EQ(OB_SUCCESS, ObDirectLoadVectorUtils::to_datum(vectors.at(1), 1, actual));
+  ASSERT_FALSE(actual.is_null());
+  ASSERT_EQ(0, actual.len_);
+  ASSERT_NE(nullptr, actual.ptr_);
+  ASSERT_EQ(OB_SUCCESS, ObDirectLoadVectorUtils::to_datum(vectors.at(1), 2, actual));
+  ASSERT_FALSE(actual.is_null());
+  ASSERT_EQ(value_word.get_string(), actual.get_string());
+}
+
 } // namespace unittest
 } // namespace oceanbase
