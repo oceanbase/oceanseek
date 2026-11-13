@@ -78,8 +78,10 @@ int ObFTDictCacheLoaderBase::build_ranges_from_table(const ObFTDictDesc &desc,
         // need more build
       } else if (OB_ITER_END != ret) {
         LOG_WARN("Failed to init iterator", K(ret), K(desc));
-      } else {
-        ret = OB_SUCCESS;  // Empty table
+      } else if (nullptr == partial_ranges) {
+        if (OB_FAIL(update_first_range_cache(desc, nullptr, snapshot_version, 0, range_container))) {
+          LOG_WARN("Failed to publish empty dictionary", K(ret), K(desc));
+        }
       }
     } else if (OB_FAIL(build_ranges(desc, iter_table, range_container, snapshot_version, partial_ranges))) {
       LOG_WARN("Failed to build ranges", K(ret), K(desc));
@@ -184,7 +186,8 @@ int ObFTDictCacheLoaderBase::try_load_cache(const ObFTDictDesc &desc,
 
   if (OB_FAIL(ret)) {
     range_container.reset();
-  } else if (range_container.get_handles().size() != range_count) {
+  } else if (range_container.get_handles().size() != (0 == range_count ? 1 : range_count)) {
+    // An empty dictionary retains one metadata handle, but has no data ranges.
     ret = OB_ENTRY_NOT_EXIST;
   }
 
@@ -251,7 +254,18 @@ int ObFTDictCacheLoaderBase::update_first_range_cache(const ObFTDictDesc &desc,
   int ret = OB_SUCCESS;
   ObFTCacheRangeHandle *first_handle = nullptr;
 
-  if (OB_FAIL(get_first_range_handle(range_container, first_handle))) {
+  ObFTDAT empty_dat;
+  if (0 == range_count) {
+    // Range 0 retains the snapshot and marks an empty dictionary.
+    range_container.reset();
+    empty_dat.mem_block_size_ = sizeof(ObFTDAT);
+    dat_block = &empty_dat;
+    ret = range_container.fetch_info_for_dict(first_handle);
+  } else {
+    ret = get_first_range_handle(range_container, first_handle);
+  }
+
+  if (OB_FAIL(ret)) {
     LOG_WARN("Failed to get first range handle", K(ret));
   } else if (OB_FAIL(ObFTCacheDict::put_and_fetch_cache_entry(
              desc.table_id_, tenant_id_, 0/*range_id = 0*/,
@@ -393,6 +407,11 @@ int ObFTDictCacheLoaderBase::build_ranges(const ObFTDictDesc &desc,
   ObFTDAT *pending_dat_buff = nullptr;
   ObArenaAllocator tmp_alloc(lib::ObMemAttr(tenant_id_, "PendingDatBuff"));
 
+  // A full build replaces any ranges retained from an earlier cache load.
+  if (nullptr == partial_ranges) {
+    range_container.reset();
+  }
+
   while (OB_SUCC(ret) && build_next_range) {
     // When current range_id reaches end of a partial segment, jump to next segment start
     if (partial_range_count > 0 && cur_range_idx + 1 < partial_range_count) {
@@ -402,11 +421,13 @@ int ObFTDictCacheLoaderBase::build_ranges(const ObFTDictDesc &desc,
       }
     }
     
+    const int64_t old_range_count = range_container.get_handles().size();
     if (OB_FAIL(build_one_range(
             desc, range_id, iter, range_container,
             build_next_range, tmp_alloc, pending_dat_buff))) {
       LOG_WARN("Fail to build range", K(ret), K(range_id), K(desc));
-    } else {
+    } else if (range_container.get_handles().size() > old_range_count) {
+      // A successful empty build does not consume a data range id.
       range_id++;
     }
   }
@@ -422,9 +443,7 @@ int ObFTDictCacheLoaderBase::build_ranges(const ObFTDictDesc &desc,
     LOG_WARN("Range count is not consistent", K(ret), K(partial_range_count),
              K(total_range_count), K(range_id), K(expected_end_id), K(desc));
   } else if (partial_range_count <= 0) {
-    if (0 == total_range_count) {
-      // empty table, nothing to do
-    } else if (OB_ISNULL(pending_dat_buff)) {
+    if (total_range_count > 0 && OB_ISNULL(pending_dat_buff)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("Failed to get first data buffer", K(ret));
     } else if (OB_FAIL(update_first_range_cache(desc, pending_dat_buff, snapshot_version, total_range_count, range_container))) {
@@ -505,6 +524,8 @@ int ObFTDictCacheLoaderBase::build_one_range(const ObFTDictDesc &desc,
   ObFTCacheRangeHandle *info = nullptr;
 
   if (OB_FAIL(ret)) {
+  } else if (0 == trie.node_num()) {
+    // No valid words: succeed without generating a DAT range.
   } else if (OB_FAIL(builder.init(trie))) {
     LOG_WARN("Failed to build dat", K(ret));
   } else if (OB_FAIL(builder.build_from_trie(trie))) {
@@ -724,9 +745,10 @@ int ObFTDictCacheLoaderExec::do_partial_build(const ObFTDictDesc &desc,
     // skip
   } else if (FALSE_IT(snapshot_version = missing_ranges.at(0).snapshot_version_)) {
   } else if (OB_FAIL(build_ranges_from_table(desc, snapshot_version, range_container, &missing_ranges))) {
-    if (OB_SNAPSHOT_DISCARDED != ret) {
+    if (OB_SNAPSHOT_DISCARDED != ret && OB_ITER_END != ret) {
       LOG_WARN("Failed to build partial ranges", K(ret), K(desc));
     } else {
+      // An expired snapshot or an empty result cannot restore the missing ranges.
       is_need_full_build = true;
       ret = OB_SUCCESS;
     }
