@@ -258,8 +258,6 @@ public:
 
   static int delete_tmp_files(const common::ObString &uri, const common::ObObjectStorageInfo *storage_info);
 
-  static uint64_t get_tenant_id();
-
   static int basic_init_read_info(common::ObIODevice &device_handle,
                                   common::ObIOFd &fd,
                                   char *buf,

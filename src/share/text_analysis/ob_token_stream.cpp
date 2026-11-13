@@ -39,7 +39,7 @@ int ObTextTokenizer::open(const ObDatum &document, const ObCharsetInfo *cs)
   } else if (OB_ISNULL(cs)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("Charset info is nullptr", K(ret), K(cs));
-  } else if (OB_UNLIKELY(document.is_outline())) {
+  } else if (OB_UNLIKELY(document.is_outline_lob())) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("out row document not supported for tokenizer yet", K(ret), K(document));
   } else {

@@ -583,9 +583,10 @@ int ObLobWriteIter::open_external_(
     LOG_WARN("invalid external lob target collation", KR(ret), K_(coll_type), K(lob_id_));
   } else if (OB_FAIL(source_ctx.read_ctx_->src_loc_.get_external_lob_info(external_info))) {
     LOG_WARN("failed to get external lob descriptor", KR(ret), K(source_ctx));
-  } else if (OB_FAIL(ObLobMetaUtil::serialize_external_lob_block_id(*result_allocator_,
-             target_ctx.lob_meta_tablet_id_.id(), target_ctx.external_lob_seq_id_,
-             summary.lob_block_id_))) {
+  } else if (OB_FAIL(ObExternalLobMacroIdPrefix::serialize(*result_allocator_,
+                                                           target_ctx.lob_meta_tablet_id_.id(),
+                                                           target_ctx.external_lob_macro_seq_id_,
+                                                           summary.lob_block_id_))) {
     LOG_WARN("failed to encode target external lob identity", KR(ret), K(target_ctx));
   } else if (OB_FAIL(ObLobSeqId::get_summary_seq_id(seq_id))) {
     LOG_WARN("failed to build external lob summary sequence", KR(ret), K(lob_id_));

@@ -241,7 +241,7 @@ TEST_F(TestLobChunkSpliter, external_lob_meta_extra_info_round_trip)
   ASSERT_EQ(0, decoded.external_lob_info_.etag_.compare(etag));
 }
 
-TEST_F(TestLobChunkSpliter, external_lob_meta_round_trip_without_identity)
+TEST_F(TestLobChunkSpliter, external_lob_meta_summary_json_round_trip)
 {
   ObArenaAllocator allocator;
   ObExternalBlobInfo external_lob_info;
@@ -257,18 +257,27 @@ TEST_F(TestLobChunkSpliter, external_lob_meta_round_trip_without_identity)
   ObString serialized;
   ASSERT_EQ(OB_SUCCESS, source.serialize(allocator, serialized));
   const std::string json(serialized.ptr(), serialized.length());
-  ASSERT_EQ(std::string::npos, json.find("\"is_external_lob\""));
   ASSERT_NE(std::string::npos, json.find("\"EXTERNAL_REFERENCE\""));
-  ASSERT_EQ(std::string::npos, json.find("\"external_lob_location_id\""));
-  ASSERT_EQ(std::string::npos, json.find("\"external_lob_tablet_id\""));
-  ASSERT_EQ(std::string::npos, json.find("\"external_lob_seq_id\""));
+  ASSERT_NE(std::string::npos, json.find("\"external_lob_url\""));
+  ASSERT_NE(std::string::npos, json.find("\"external_lob_etag\""));
+  ASSERT_NE(std::string::npos, json.find("\"external_lob_offset\""));
+  ASSERT_NE(std::string::npos, json.find("\"external_lob_length\""));
+  ASSERT_NE(std::string::npos, json.find("\"external_lob_has_length\""));
+  ASSERT_NE(std::string::npos, json.find("\"external_lob_kind\""));
 
   ObLobMetaExtraInfo decoded;
   ASSERT_EQ(OB_SUCCESS, decoded.deserialize(external_info_allocator_, serialized));
   ASSERT_TRUE(decoded.is_valid());
   ASSERT_TRUE(decoded.is_external_lob());
   ASSERT_TRUE(decoded.lob_chunk_type_.external_reference());
-  ASSERT_EQ(1, decoded.external_lob_info_.length_);
+  ASSERT_EQ(source.extra_info_type_, decoded.extra_info_type_);
+  ASSERT_EQ(source.chunk_count_, decoded.chunk_count_);
+  ASSERT_EQ(0, decoded.external_lob_info_.url_.compare(external_lob_info.url_));
+  ASSERT_EQ(external_lob_info.offset_, decoded.external_lob_info_.offset_);
+  ASSERT_EQ(external_lob_info.length_, decoded.external_lob_info_.length_);
+  ASSERT_EQ(external_lob_info.has_length_, decoded.external_lob_info_.has_length_);
+  ASSERT_EQ(0, decoded.external_lob_info_.etag_.compare(external_lob_info.etag_));
+  ASSERT_EQ(external_lob_info.kind_, decoded.external_lob_info_.kind_);
 }
 
 TEST_F(TestLobChunkSpliter, external_lob_meta_etag_compatibility_and_bounds)
@@ -456,40 +465,40 @@ TEST_F(TestLobChunkSpliter, external_lob_meta_rejects_zero_length)
   ASSERT_EQ(OB_INVALID_ARGUMENT, decoded.deserialize(external_info_allocator_, serialized));
 }
 
-TEST_F(TestLobChunkSpliter, external_lob_id_round_trip_and_invalid_values)
+TEST_F(TestLobChunkSpliter, external_lob_macro_id_prefix_round_trip_and_invalid_values)
 {
   ObArenaAllocator allocator;
   const uint64_t valid_ids[][2] = {
       {2002, 3003}, {UINT64_MAX, static_cast<uint64_t>(INT64_MAX)}};
   ObString serialized;
   for (const auto &id : valid_ids) {
-    ASSERT_EQ(OB_SUCCESS, ObLobMetaUtil::serialize_external_lob_block_id(
+    ASSERT_EQ(OB_SUCCESS, ObExternalLobMacroIdPrefix::serialize(
         allocator, id[0], id[1], serialized));
     ASSERT_EQ(17, serialized.length());
-    uint64_t tablet_id = 0;
-    uint64_t external_lob_seq_id = 0;
-    ASSERT_EQ(OB_SUCCESS, ObLobMetaUtil::deserialize_external_lob_block_id(
-        serialized, tablet_id, external_lob_seq_id));
-    ASSERT_EQ(id[0], tablet_id);
-    ASSERT_EQ(id[1], external_lob_seq_id);
+    uint64_t decoded_lob_meta_tablet_id = 0;
+    uint64_t external_lob_macro_seq_id = 0;
+    ASSERT_EQ(OB_SUCCESS, ObExternalLobMacroIdPrefix::deserialize(
+        serialized, decoded_lob_meta_tablet_id, external_lob_macro_seq_id));
+    ASSERT_EQ(id[0], decoded_lob_meta_tablet_id);
+    ASSERT_EQ(id[1], external_lob_macro_seq_id);
   }
   const uint64_t invalid_ids[][2] = {
       {0, 1}, {2002, 0}, {2002, static_cast<uint64_t>(INT64_MAX) + 1}};
   for (const auto &id : invalid_ids) {
     ASSERT_EQ(OB_INVALID_ARGUMENT,
-              ObLobMetaUtil::serialize_external_lob_block_id(
+              ObExternalLobMacroIdPrefix::serialize(
                   allocator, id[0], id[1], serialized));
   }
 }
 
-TEST_F(TestLobChunkSpliter, external_lob_id_rejects_malformed_data_atomically)
+TEST_F(TestLobChunkSpliter, external_lob_macro_id_prefix_rejects_malformed_data_atomically)
 {
   ObArenaAllocator allocator;
-  uint64_t tablet_id = 2002;
-  uint64_t external_lob_seq_id = 3003;
+  uint64_t lob_meta_tablet_id = 2002;
+  uint64_t external_lob_macro_seq_id = 3003;
   ObString serialized;
-  ASSERT_EQ(OB_SUCCESS, ObLobMetaUtil::serialize_external_lob_block_id(
-      allocator, tablet_id, external_lob_seq_id, serialized));
+  ASSERT_EQ(OB_SUCCESS, ObExternalLobMacroIdPrefix::serialize(
+      allocator, lob_meta_tablet_id, external_lob_macro_seq_id, serialized));
   ASSERT_EQ(17, serialized.length());
   const std::string valid(serialized.ptr(), serialized.length());
   std::string bad_version(valid);
@@ -506,11 +515,11 @@ TEST_F(TestLobChunkSpliter, external_lob_id_rejects_malformed_data_atomically)
   // Reject truncation, trailing bytes, and invalid identities; preserve the existing identity.
   for (const std::string &data : invalid_data) {
     ASSERT_EQ(OB_INVALID_ARGUMENT,
-              ObLobMetaUtil::deserialize_external_lob_block_id(
-                  ObString(data.length(), data.data()), tablet_id,
-                  external_lob_seq_id));
-    ASSERT_EQ(2002, tablet_id);
-    ASSERT_EQ(3003, external_lob_seq_id);
+              ObExternalLobMacroIdPrefix::deserialize(
+                  ObString(data.length(), data.data()), lob_meta_tablet_id,
+                  external_lob_macro_seq_id));
+    ASSERT_EQ(2002, lob_meta_tablet_id);
+    ASSERT_EQ(3003, external_lob_macro_seq_id);
   }
 }
 
@@ -536,10 +545,10 @@ TEST_F(TestLobChunkSpliter, external_lob_summary_block_id_survives_row_copy)
   summary.char_len_ = 1;
   ASSERT_EQ(OB_SUCCESS,
             extra_info.serialize(allocator, summary.lob_extra_info_));
-  const uint64_t tablet_id = 2002;
-  const uint64_t external_lob_seq_id = 3003;
-  ASSERT_EQ(OB_SUCCESS, ObLobMetaUtil::serialize_external_lob_block_id(
-      allocator, tablet_id, external_lob_seq_id, summary.lob_block_id_));
+  const uint64_t lob_meta_tablet_id = 2002;
+  const uint64_t external_lob_macro_seq_id = 3003;
+  ASSERT_EQ(OB_SUCCESS, ObExternalLobMacroIdPrefix::serialize(
+      allocator, lob_meta_tablet_id, external_lob_macro_seq_id, summary.lob_block_id_));
 
   blocksstable::ObDatumRow row;
   ASSERT_EQ(OB_SUCCESS, row.init(ObLobMetaInfo::COLUMN_CNT));
@@ -556,12 +565,12 @@ TEST_F(TestLobChunkSpliter, external_lob_summary_block_id_survives_row_copy)
   // Overwriting the source row buffer preserves the deep copy's identity and reference descriptor.
   MEMSET(summary.lob_block_id_.ptr(), 0, summary.lob_block_id_.length());
   MEMSET(summary.lob_extra_info_.ptr(), 'x', summary.lob_extra_info_.length());
-  uint64_t decoded_tablet_id = 0;
-  uint64_t decoded_external_lob_seq_id = 0;
-  ASSERT_EQ(OB_SUCCESS, ObLobMetaUtil::deserialize_external_lob_block_id(
-      copied.lob_block_id_, decoded_tablet_id, decoded_external_lob_seq_id));
-  ASSERT_EQ(2002, decoded_tablet_id);
-  ASSERT_EQ(3003, decoded_external_lob_seq_id);
+  uint64_t decoded_lob_meta_tablet_id = 0;
+  uint64_t decoded_external_lob_macro_seq_id = 0;
+  ASSERT_EQ(OB_SUCCESS, ObExternalLobMacroIdPrefix::deserialize(copied.lob_block_id_,
+            decoded_lob_meta_tablet_id, decoded_external_lob_macro_seq_id));
+  ASSERT_EQ(2002, decoded_lob_meta_tablet_id);
+  ASSERT_EQ(3003, decoded_external_lob_macro_seq_id);
   ObLobMetaExtraInfo decoded_info;
   ASSERT_EQ(OB_SUCCESS, decoded_info.deserialize(external_info_allocator_, copied.lob_extra_info_));
   ASSERT_TRUE(decoded_info.is_external_lob());
@@ -1076,7 +1085,7 @@ TEST_F(TestLobChunkSpliter, lob_write_iter_emits_piece_then_meta)
   ASSERT_TRUE(write_iter.is_finished());
 
   ASSERT_EQ(OB_SUCCESS, write_iter.get_pending_locator(pending_locator));
-  ASSERT_TRUE(pending_locator.is_outline_disk_lob_locator());
+  ASSERT_TRUE(pending_locator.is_outline_lob_disk_locator());
   ObString disk_locator;
   ASSERT_EQ(OB_SUCCESS, pending_locator.get_disk_locator(disk_locator));
   ObLobDiskLocatorWrapper locator_wrapper;
@@ -1318,7 +1327,7 @@ TEST_F(TestLobChunkSpliter, lob_write_iter_reset_clears_finished_state)
 
   ObLobLocatorV2 pending_locator;
   ASSERT_EQ(OB_SUCCESS, write_iter.get_pending_locator(pending_locator));
-  ASSERT_TRUE(pending_locator.is_outline_disk_lob_locator());
+  ASSERT_TRUE(pending_locator.is_outline_lob_disk_locator());
 
   write_iter.reset();
   ASSERT_FALSE(write_iter.is_finished());

@@ -195,11 +195,11 @@ static const int8_t EXTERNAL_LOB_ID_VERSION = 1;
 static const int64_t EXTERNAL_LOB_ID_SIZE = 17;
 
 static bool is_valid_external_lob_id(
-    const uint64_t tablet_id, const uint64_t external_lob_seq_id)
+    const uint64_t tablet_id, const uint64_t external_lob_macro_seq_id)
 {
   return common::ObTabletID(tablet_id).is_valid()
-      && 0 != external_lob_seq_id
-      && static_cast<uint64_t>(INT64_MAX) >= external_lob_seq_id;
+      && 0 != external_lob_macro_seq_id
+      && static_cast<uint64_t>(INT64_MAX) >= external_lob_macro_seq_id;
 }
 
 int ObLobMetaUtil::get_lob_meta_macro_id(
@@ -245,32 +245,32 @@ int ObLobMetaUtil::get_lob_meta_macro_id(
   return ret;
 }
 
-int ObLobMetaUtil::serialize_external_lob_block_id(
+int ObExternalLobMacroIdPrefix::serialize(
     ObIAllocator &allocator,
-    const uint64_t tablet_id,
-    const uint64_t external_lob_seq_id,
+    const uint64_t lob_meta_tablet_id,
+    const uint64_t external_lob_macro_seq_id,
     ObString &str)
 {
   int ret = OB_SUCCESS;
   char *buf = nullptr;
   int64_t pos = 0;
   str.reset();
-  if (OB_UNLIKELY(!is_valid_external_lob_id(tablet_id, external_lob_seq_id))) {
+  if (OB_UNLIKELY(!is_valid_external_lob_id(lob_meta_tablet_id, external_lob_macro_seq_id))) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid external lob identity", KR(ret), K(tablet_id), K(external_lob_seq_id));
+    LOG_WARN("invalid external lob identity", KR(ret), K(lob_meta_tablet_id), K(external_lob_macro_seq_id));
   } else if (OB_ISNULL(buf = static_cast<char *>(allocator.alloc(EXTERNAL_LOB_ID_SIZE)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
-    LOG_WARN("failed to allocate external lob identity", KR(ret), K(tablet_id),
-             K(external_lob_seq_id), K(EXTERNAL_LOB_ID_SIZE));
+    LOG_WARN("failed to allocate external lob identity", KR(ret), K(lob_meta_tablet_id),
+             K(external_lob_macro_seq_id), K(EXTERNAL_LOB_ID_SIZE));
   } else if (OB_FAIL(common::serialization::encode_i8(buf, EXTERNAL_LOB_ID_SIZE,
                                                       pos, EXTERNAL_LOB_ID_VERSION))) {
     LOG_WARN("failed to encode external lob identity version", KR(ret), K(pos), K(EXTERNAL_LOB_ID_SIZE));
   } else if (OB_FAIL(common::serialization::encode_i64(buf, EXTERNAL_LOB_ID_SIZE, pos,
-                                                       static_cast<int64_t>(tablet_id)))) {
-    LOG_WARN("failed to encode external lob tablet id", KR(ret), K(tablet_id), K(pos));
+                                                       static_cast<int64_t>(lob_meta_tablet_id)))) {
+    LOG_WARN("failed to encode external lob tablet id", KR(ret), K(lob_meta_tablet_id), K(pos));
   } else if (OB_FAIL(common::serialization::encode_i64(buf, EXTERNAL_LOB_ID_SIZE, pos,
-                                                    static_cast<int64_t>(external_lob_seq_id)))) {
-    LOG_WARN("failed to encode external lob sequence id", KR(ret), K(external_lob_seq_id), K(pos));
+                                       static_cast<int64_t>(external_lob_macro_seq_id)))) {
+    LOG_WARN("failed to encode external lob sequence id", KR(ret), K(external_lob_macro_seq_id), K(pos));
   } else {
     str.assign_ptr(buf, static_cast<int32_t>(pos));
   }
@@ -280,10 +280,10 @@ int ObLobMetaUtil::serialize_external_lob_block_id(
   return ret;
 }
 
-int ObLobMetaUtil::deserialize_external_lob_block_id(
+int ObExternalLobMacroIdPrefix::deserialize(
     const ObString &str,
-    uint64_t &tablet_id,
-    uint64_t &external_lob_seq_id)
+    uint64_t &lob_meta_tablet_id,
+    uint64_t &external_lob_macro_seq_id)
 {
   int ret = OB_SUCCESS;
   int64_t pos = 0;
@@ -309,8 +309,8 @@ int ObLobMetaUtil::deserialize_external_lob_block_id(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid decoded external lob identity", KR(ret), K(decoded_tablet_id), K(decoded_seq_id));
   } else {
-    tablet_id = static_cast<uint64_t>(decoded_tablet_id);
-    external_lob_seq_id = static_cast<uint64_t>(decoded_seq_id);
+    lob_meta_tablet_id = static_cast<uint64_t>(decoded_tablet_id);
+    external_lob_macro_seq_id = static_cast<uint64_t>(decoded_seq_id);
   }
   return ret;
 }

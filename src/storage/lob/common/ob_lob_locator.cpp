@@ -80,7 +80,7 @@ int ObMemLobLocatorBuilder::init(
   } else if (OB_UNLIKELY(!input_wrapper_.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid input wrapper", KR(ret), K(input_wrapper_));
-  } else if (input_wrapper_.is_outline() && need_data) {
+  } else if (input_wrapper_.is_outline_lob() && need_data) {
     need_payload_ = true;
   }
 
@@ -130,7 +130,7 @@ int ObMemLobLocatorBuilder::set_extern_info(
   // 若 input 是 outline，则优先取 lob id 中的 column_idx_
   // 这里是临时的解决方案，Column Store 读路径中的 columns_index 会硬编码为 0，导致读路径失效
   if (OB_FAIL(ret)) {
-  } else if (input_wrapper_.is_outline()) {
+  } else if (input_wrapper_.is_outline_lob()) {
     // Temporary External has no input Disk locator; only persisted outline references have a LobId.
     ObLobId lob_id;
     if (OB_FAIL(input_wrapper_.get_lob_id(lob_id))) {

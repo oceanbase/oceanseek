@@ -194,7 +194,7 @@ struct ObLobTargetWriteCtx
   ObLobTargetWriteCtx()
     : locator_allocator_(nullptr), result_allocator_(nullptr),
       coll_type_(CS_TYPE_INVALID), lob_col_idx_(OB_INVALID_INDEX_INT64),
-      lob_id_(), seq_no_(), lob_meta_tablet_id_(), external_lob_seq_id_(0)
+      lob_id_(), seq_no_(), lob_meta_tablet_id_(), external_lob_macro_seq_id_(0)
   {}
   bool is_valid() const
   {
@@ -208,7 +208,7 @@ struct ObLobTargetWriteCtx
   }
   TO_STRING_KV(KP_(locator_allocator), KP_(result_allocator), K_(coll_type),
                K_(lob_col_idx), K_(lob_id), K_(seq_no), K_(lob_meta_tablet_id),
-               K_(external_lob_seq_id));
+               K_(external_lob_macro_seq_id));
 
   // locator 的生命周期必须覆盖目标主表 datum。
   ObIAllocator *locator_allocator_;
@@ -220,7 +220,7 @@ struct ObLobTargetWriteCtx
   transaction::ObTxSEQ seq_no_;
   common::ObTabletID lob_meta_tablet_id_;
   // External sequences consume a separate value from the target LOB ID cache.
-  uint64_t external_lob_seq_id_;
+  uint64_t external_lob_macro_seq_id_;
 };
 
 // 一个 ObLobWriteIter 只处理一个目标 out-row LOB。

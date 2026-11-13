@@ -632,7 +632,7 @@ TEST_F(TestSSMarkSweepMacroIDIterator, meta_summary_and_external_blob_are_not_ou
   ASSERT_EQ(OB_SUCCESS, info.serialize(allocator_, encoded_info));
   ObString external_id;
   ASSERT_EQ(OB_SUCCESS,
-      ObLobMetaUtil::serialize_external_lob_block_id(allocator_, 200001, 10, external_id));
+      ObExternalLobMacroIdPrefix::serialize(allocator_, 200001, 10, external_id));
   row.storage_datums_[0].set_string(encoded_info);
   row.storage_datums_[1].set_string(external_id);
   ASSERT_EQ(OB_SUCCESS, ObLobMetaUtil::get_lob_meta_macro_id(row, allocator_, id));

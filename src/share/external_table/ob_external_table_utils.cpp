@@ -2078,7 +2078,7 @@ int ObExternalFileInfoCollector::collect_file_stat(const common::ObString &url,
                                                  int64_t &file_size, int64_t &modify_time)
 {
   int ret = OB_SUCCESS;
-  ObIODFileStat statbuf(ObExternalIoAdapter::get_tenant_id());
+  ObIODFileStat statbuf(common::get_storage_io_tenant_id());
   file_size = -1;
   modify_time = -1;
   if (OB_FAIL(ObExternalIoAdapter::get_file_stat(url, storage_info_, statbuf))) {

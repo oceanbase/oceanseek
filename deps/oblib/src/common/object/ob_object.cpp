@@ -714,7 +714,8 @@ int ObLobLocatorV2::get_disk_locator(ObString &disc_loc_buff) const
 int ObLobLocatorV2::get_lob_id(ObString &lob_id) const
 {
   int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(size_ < sizeof(ObLobCommon) + sizeof(ObLobId) || !is_outline_disk_lob_locator())) {
+  if (OB_UNLIKELY(size_ < sizeof(ObLobCommon) + sizeof(ObLobId)
+                  || !is_outline_lob_disk_locator())) {
     ret = OB_INVALID_ARGUMENT;
     COMMON_LOG(WARN, "invalid outrow disk lob locator", K(ret), KP_(ptr), K_(size));
   } else {

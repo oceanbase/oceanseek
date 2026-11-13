@@ -12,6 +12,7 @@
 #include "lib/utility/ob_macro_utils.h"
 #include "lib/worker.h"
 #include "share/backup/ob_backup_io_adapter.h"
+#include "share/ob_device_manager.h"
 #include "storage/lob/access/ob_lob_iterator.h"
 #include "storage/lob/common/ob_lob_context.h"
 #include "storage/lob/common/ob_lob_util.h"
@@ -632,7 +633,7 @@ int ObLobManager::insert_before(ObLobInsertContext &ctx, bool &outrow)
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "outrow lob in index table");
     LOG_WARN("outrow lob in index table is not supported", KR(ret), K(ctx));
-  } else if (OB_FAIL(prepare_outline_locator_(ctx, ObLobId()))) {
+  } else if (OB_FAIL(prepare_outline_lob_locator_(ctx, ObLobId()))) {
     LOG_WARN("failed to prepare outrow locator", KR(ret), K(ctx));
   } else {
     outrow = true;
@@ -666,7 +667,7 @@ int ObLobManager::update_before(ObLobUpdateContext &ctx, bool &outrow)
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "outrow lob in index table");
     LOG_WARN("outrow lob in index table is not supported", KR(ret), K(ctx));
-  } else if (OB_FAIL(prepare_outline_locator_(ctx, ctx.lob_id_))) {
+  } else if (OB_FAIL(prepare_outline_lob_locator_(ctx, ctx.lob_id_))) {
     // ctx.lob_id_ valid: outrow->outrow, reuse old lob id;
     // ctx.lob_id_ invalid: null/inrow->outrow, alloc new lob id.
     LOG_WARN("failed to prepare outrow locator", KR(ret), K(ctx));
@@ -684,7 +685,7 @@ int ObLobManager::append_before(ObLobAppendContext &ctx, bool &outrow)
   ObString old_data;
 
   uint64_t old_byte_len = 0;
-  const bool old_is_outrow = ctx.old_loc_.is_outline_disk_lob_locator();
+  const bool old_is_outrow = ctx.old_loc_.is_outline_lob_disk_locator();
   ObLobReadContext read_ctx;
   ObLobMetaExtraInfo extra_info;
   ObLobDiskLocatorBuilder loc_builder;
@@ -769,7 +770,7 @@ int ObLobManager::append_before(ObLobAppendContext &ctx, bool &outrow)
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "outrow LOB_WRITEAPPEND in index table");
     LOG_WARN("outrow lob append in index table is not supported", KR(ret), K(ctx));
-  } else if (OB_FAIL(prepare_outline_locator_(ctx, ctx.lob_id_))) {
+  } else if (OB_FAIL(prepare_outline_lob_locator_(ctx, ctx.lob_id_))) {
     LOG_WARN("failed to prepare append destination locator", KR(ret), K(ctx));
   } else {
     outrow = true;
@@ -818,7 +819,7 @@ int ObLobManager::get_byte_length(ObLobLocatorV2 &loc, uint64_t &byte_len)
   int ret = OB_SUCCESS;
   int64_t len = 0;
   ObExternalBlobInfo external_info;
-  if (OB_UNLIKELY(!loc.is_valid() || loc.is_outline_disk_lob_locator())) {
+  if (OB_UNLIKELY(!loc.is_valid() || loc.is_outline_lob_disk_locator())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid locator", KR(ret), K(loc));
   } else if (loc.has_inrow_data()) {
@@ -926,7 +927,7 @@ int ObLobManager::get_external_lob_byte_length_(
     byte_len = info.length_;
   } else {
     share::ObBackupStorageInfo access_info;
-    common::ObIODFileStat statbuf(ObExternalIoAdapter::get_tenant_id());
+    common::ObIODFileStat statbuf(common::get_storage_io_tenant_id());
     int64_t remaining_us;
     if (OB_ISNULL(read_ctx.access_ctx_)) {
       ret = OB_NOT_SUPPORTED;
@@ -1002,7 +1003,9 @@ int ObLobManager::get_meta_summary_extra_info(
   return ret;
 }
 
-int ObLobManager::prepare_outline_locator_(ObLobInsertContext &insert_ctx, const ObLobId &reuse_lob_id)
+int ObLobManager::prepare_outline_lob_locator_(
+    ObLobInsertContext &insert_ctx,
+    const ObLobId &reuse_lob_id)
 {
   int ret = OB_SUCCESS;
   ObLobDiskLocatorBuilder loc_builder;

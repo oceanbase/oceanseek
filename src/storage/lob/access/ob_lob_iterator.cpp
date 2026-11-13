@@ -513,18 +513,23 @@ int ObLobAppendSourceIter::get_next_chunk_impl_(ObLobChunk &chunk, const int64_t
 
 /*************ObExternalLobMacroIterator*****************/
 
-int ObExternalLobMacroIterator::init(uint64_t tablet_id,uint64_t seq_id,
-                                     uint64_t offset, uint64_t length)
+int ObExternalLobMacroIterator::init(
+    uint64_t lob_meta_tablet_id,
+    uint64_t external_lob_macro_seq_id,
+    uint64_t offset,
+    uint64_t length)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(is_inited_)) {
     ret = OB_INIT_TWICE;
-    LOG_WARN("external lob piece iterator is initialized twice", KR(ret), K(tablet_id_), K(seq_id_));
-  } else if (OB_UNLIKELY(!common::ObTabletID(tablet_id).is_valid()
-                         || 0 == seq_id || seq_id > INT64_MAX
+    LOG_WARN("external lob piece iterator is initialized twice", KR(ret), K(lob_meta_tablet_id_),
+             K(external_lob_macro_seq_id_));
+  } else if (OB_UNLIKELY(!common::ObTabletID(lob_meta_tablet_id).is_valid()
+                         || 0 == external_lob_macro_seq_id || external_lob_macro_seq_id > INT64_MAX
                          || offset > INT64_MAX || length > INT64_MAX - offset)) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid external lob range or identity", KR(ret), K(tablet_id), K(seq_id), K(offset), K(length));
+    LOG_WARN("invalid external lob range or identity", KR(ret), K(lob_meta_tablet_id),
+             K(external_lob_macro_seq_id), K(offset), K(length));
   } else if (length > 0) {
     const uint64_t num_pieces = (offset + length - 1) / PIECE_SIZE - offset / PIECE_SIZE + 1;
     if (OB_UNLIKELY(num_pieces > MAX_PIECE_COUNT)) {
@@ -533,8 +538,8 @@ int ObExternalLobMacroIterator::init(uint64_t tablet_id,uint64_t seq_id,
     }
   }
   if (OB_SUCC(ret)) {
-    tablet_id_ = tablet_id;
-    seq_id_ = seq_id;
+    lob_meta_tablet_id_ = lob_meta_tablet_id;
+    external_lob_macro_seq_id_ = external_lob_macro_seq_id;
     next_offset_ = offset;
     end_offset_ = offset + length;
     is_inited_ = true;
@@ -557,8 +562,8 @@ int ObExternalLobMacroIterator::get_next(blocksstable::MacroBlockId &macro_id)
                           blocksstable::ObStorageObjectType::SHARED_EXTERNAL_LOB_DATA_MACRO);
     macro_id.set_storage_object_type(type);
     macro_id.set_location(blocksstable::ObMacroBlockIdLocation::OBJECT_STORAGE);
-    macro_id.set_second_id(tablet_id_);
-    macro_id.set_third_id(seq_id_);
+    macro_id.set_second_id(lob_meta_tablet_id_);
+    macro_id.set_third_id(external_lob_macro_seq_id_);
     macro_id.set_fourth_id(next_offset_);
     macro_id.set_fifth_id(size);
     next_offset_ += size;
@@ -568,8 +573,8 @@ int ObExternalLobMacroIterator::get_next(blocksstable::MacroBlockId &macro_id)
 
 void ObExternalLobMacroIterator::reset()
 {
-  tablet_id_ = 0;
-  seq_id_ = 0;
+  lob_meta_tablet_id_ = 0;
+  external_lob_macro_seq_id_ = 0;
   next_offset_ = 0;
   end_offset_ = 0;
   is_inited_ = false;
@@ -585,17 +590,19 @@ ObExternalLobQueryIter::ObExternalLobQueryIter()
 
 int ObExternalLobQueryIter::open(const ObLobReadContext &read_ctx,
                                  const common::ObExternalBlobInfo &external_info,
-                                 uint64_t tablet_id,
-                                 uint64_t seq_id,
+                                 uint64_t lob_meta_tablet_id,
+                                 uint64_t external_lob_macro_seq_id,
                                  const common::ObObjectStorageInfo &access_info)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(is_inited_)) {
     ret = OB_INIT_TWICE;
-    LOG_WARN("external lob query iterator is initialized twice", KR(ret), K(tablet_id), K(seq_id));
+    LOG_WARN("external lob query iterator is initialized twice", KR(ret),
+             K(lob_meta_tablet_id), K(external_lob_macro_seq_id));
   } else if (OB_UNLIKELY(UINT64_MAX == read_ctx.byte_size_)) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("external lob length must be resolved before opening iterator", KR(ret), K(tablet_id), K(seq_id));
+    LOG_WARN("external lob length must be resolved before opening iterator", KR(ret),
+             K(lob_meta_tablet_id), K(external_lob_macro_seq_id));
   } else if (OB_UNLIKELY(!external_info.is_valid()
              || common::ObExternalBlobKind::REFERENCE != external_info.kind_
              || read_ctx.is_char() || read_ctx.scan_backward_)) {
@@ -603,11 +610,12 @@ int ObExternalLobQueryIter::open(const ObLobReadContext &read_ctx,
     LOG_WARN("invalid external lob read", KR(ret), K(external_info.kind_),
              "is_char", read_ctx.is_char(), K(read_ctx.scan_backward_));
   } else if (OB_FAIL(access_info_.assign(access_info))) {
-    LOG_WARN("failed to copy external lob access info", KR(ret), K(tablet_id), K(seq_id));
+    LOG_WARN("failed to copy external lob access info", KR(ret),
+             K(lob_meta_tablet_id), K(external_lob_macro_seq_id));
   } else if (OB_FAIL(external_info_.deep_copy(allocator_, external_info))) {
     LOG_WARN("failed to copy external lob read info", KR(ret));
-  } else if (OB_FAIL(piece_iter_.init(tablet_id, seq_id, external_info_.offset_,
-                                      read_ctx.byte_size_))) {
+  } else if (OB_FAIL(piece_iter_.init(lob_meta_tablet_id, external_lob_macro_seq_id,
+                                     external_info_.offset_, read_ctx.byte_size_))) {
     LOG_WARN("failed to initialize external lob pieces", KR(ret));
   } else {
     const uint64_t length = read_ctx.byte_size_;

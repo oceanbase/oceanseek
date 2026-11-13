@@ -127,8 +127,8 @@ int ObLobQueryIterHandler::set_as_external_lob_iter_(ObLobQueryIter *&result)
   ObLobMetaInfo summary;
   ObExternalBlobInfo read_info;
   ObLobManager *lob_mgr = MTL(ObLobManager *);
-  uint64_t tablet_id = 0;
-  uint64_t external_lob_seq_id = 0;
+  uint64_t lob_meta_tablet_id = 0;
+  uint64_t external_lob_macro_seq_id = 0;
   share::ObBackupStorageInfo access_info;
   ObExternalLobQueryIter *external_iter = nullptr;
   if (OB_ISNULL(lob_mgr)) {
@@ -150,18 +150,18 @@ int ObLobQueryIterHandler::set_as_external_lob_iter_(ObLobQueryIter *&result)
                                                                      access_info))) {
     LOG_WARN("failed to resolve external lob access info", KR(ret), K(read_ctx_.tablet_id_),
              "url_length", read_info.url_.length());
-  } else if (OB_FAIL(ObLobMetaUtil::deserialize_external_lob_block_id(summary.lob_block_id_,
-                                                                      tablet_id,
-                                                                      external_lob_seq_id))) {
+  } else if (OB_FAIL(ObExternalLobMacroIdPrefix::deserialize(summary.lob_block_id_,
+                                                             lob_meta_tablet_id,
+                                                             external_lob_macro_seq_id))) {
     LOG_WARN("failed to deserialize external lob identity", KR(ret));
   } else if (OB_ISNULL(external_iter = OB_NEW(ObExternalLobQueryIter,
                                               ObMemAttr(MTL_ID(),"ExternalLobIter")))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
-    LOG_WARN("failed to allocate external lob query iterator", KR(ret), K(tablet_id), K(external_lob_seq_id),
-             "alloc_size", sizeof(ObExternalLobQueryIter));
-  } else if (OB_FAIL(external_iter->open(read_ctx_, read_info, tablet_id,
-                                         external_lob_seq_id, access_info))) {
-    LOG_WARN("failed to open external lob iterator", KR(ret), K(tablet_id), K(external_lob_seq_id));
+    LOG_WARN("failed to allocate external lob query iterator", KR(ret), K(lob_meta_tablet_id),
+             K(external_lob_macro_seq_id), "alloc_size", sizeof(ObExternalLobQueryIter));
+  } else if (OB_FAIL(external_iter->open(read_ctx_, read_info, lob_meta_tablet_id,
+                                         external_lob_macro_seq_id, access_info))) {
+    LOG_WARN("failed to open external lob iterator", KR(ret), K(lob_meta_tablet_id), K(external_lob_macro_seq_id));
   } else {
     // Transfer ownership to the caller only after open succeeds; free it here on failure.
     result = external_iter;
@@ -590,7 +590,7 @@ int ObLobInserter::get_source_lob_extra_info_(ObLobMetaExtraInfo &extra_info)
   extra_info.reset();
   if (0 == source.size_) {
     // Empty LOBs have no source summary.
-  } else if (OB_UNLIKELY(!source.is_valid() || source.is_outline_disk_lob_locator())) {
+  } else if (OB_UNLIKELY(!source.is_valid() || source.is_outline_lob_disk_locator())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid source lob locator", KR(ret), K(source.size_), K(ctx_->tablet_id_));
   } else if (source.has_inrow_data()) {
@@ -650,7 +650,7 @@ int ObLobInserter::write_external_lob_meta_summary_(
   // seq_id is only used to write summary, so it is always 0 and the buffer is large enough.
   char seq_id_buf[ObLobSeqId::LOB_SEQ_ID_MIN_LEN];
   ObString seq_id(sizeof(seq_id_buf), seq_id_buf);
-  uint64_t external_lob_seq_id = 0;
+  uint64_t external_lob_macro_seq_id = 0;
 
   ObArenaAllocator &allocator = ctx_->own_allocator_;
   // summary stores logical length (declared for External); binary chars equal bytes.
@@ -667,14 +667,14 @@ int ObLobInserter::write_external_lob_meta_summary_(
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "writing External LOB before cluster version 4.6.3.1");
   } else if (OB_FAIL(lob_extra_info.set_external_lob_info(allocator, external_info))) {
     LOG_WARN("failed to set external lob summary", KR(ret), K(lob_id));
-  } else if (OB_FAIL(ObLobUtil::fetch_tablet_inc_id(*ctx_, external_lob_seq_id))) {
+  } else if (OB_FAIL(ObLobUtil::fetch_tablet_inc_id(*ctx_, external_lob_macro_seq_id))) {
     LOG_WARN("failed to allocate external lob sequence", KR(ret), K(ctx_->lob_meta_tablet_id_), K(lob_id));
-  } else if (OB_FAIL(ObLobMetaUtil::serialize_external_lob_block_id(allocator,
-                                                              ctx_->lob_meta_tablet_id_.id(),
-                                                              external_lob_seq_id,
-                                                              summary.lob_block_id_))) {
+  } else if (OB_FAIL(ObExternalLobMacroIdPrefix::serialize(allocator,
+                                                           ctx_->lob_meta_tablet_id_.id(),
+                                                           external_lob_macro_seq_id,
+                                                           summary.lob_block_id_))) {
     LOG_WARN("failed to serialize external lob identity", KR(ret),
-             K(ctx_->lob_meta_tablet_id_), K(external_lob_seq_id), K(lob_id));
+             K(ctx_->lob_meta_tablet_id_), K(external_lob_macro_seq_id), K(lob_id));
   } else if (OB_FAIL(ObLobSeqId::get_seq_id(0, seq_id))) {
     LOG_WARN("failed to build seq_id 0", KR(ret), K(lob_id), K(ctx_->tablet_id_));
   } else {
@@ -684,10 +684,10 @@ int ObLobInserter::write_external_lob_meta_summary_(
     lob_extra_info.extra_info_type_ = ObLobMetaExtraInfo::LOB_META_SUMMARY;
     lob_extra_info.last_write_type_ = ObLobLastWriteType::INSERT;
     if (OB_FAIL(lob_extra_info.serialize(allocator, summary.lob_extra_info_))) {
-      LOG_WARN("failed to serialize external lob extra info", KR(ret), K(lob_id), K(external_lob_seq_id));
+      LOG_WARN("failed to serialize external lob extra info", KR(ret), K(lob_id), K(external_lob_macro_seq_id));
     } else if (OB_FAIL(meta_mgr_->insert(*ctx_, summary))) {
       LOG_WARN("failed to write external lob summary row", KR(ret), K(lob_id), K(ctx_->tablet_id_),
-                                                           K(external_lob_seq_id));
+                                                           K(external_lob_macro_seq_id));
     }
   }
   return ret;

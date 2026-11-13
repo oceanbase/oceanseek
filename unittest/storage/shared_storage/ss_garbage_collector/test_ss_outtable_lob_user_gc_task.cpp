@@ -1069,7 +1069,7 @@ TEST_F(TestSSOuttableLobUserGCTask, meta_scan_skips_non_outtable_rows)
   ASSERT_EQ(OB_SUCCESS, extra_info.serialize(allocator, encoded_info));
   ObString external_id;
   ASSERT_EQ(OB_SUCCESS,
-      ObLobMetaUtil::serialize_external_lob_block_id(allocator, 200001, 10, external_id));
+      ObExternalLobMacroIdPrefix::serialize(allocator, 200001, 10, external_id));
   ASSERT_EQ(17, external_id.length());
   row.storage_datums_[0].set_string(encoded_info);
   row.storage_datums_[1].set_string(external_id);
@@ -1129,7 +1129,7 @@ TEST_F(TestSSOuttableLobUserGCTask, meta_scan_rejects_missing_or_invalid_outtabl
 
   ObString external_id;
   ASSERT_EQ(OB_SUCCESS,
-      ObLobMetaUtil::serialize_external_lob_block_id(allocator, 200001, 10, external_id));
+      ObExternalLobMacroIdPrefix::serialize(allocator, 200001, 10, external_id));
   row.storage_datums_[1].set_string(external_id);
   ASSERT_NE(OB_SUCCESS, ObLobMetaUtil::get_lob_meta_macro_id(row, allocator, macro_id));
   row.storage_datums_[0].set_null();

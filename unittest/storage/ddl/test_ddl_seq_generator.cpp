@@ -394,8 +394,8 @@ TEST_F(TestExternalLobSequence, replay_preserves_external_summary_row_bytes)
     ASSERT_SUCC(writer.lob_id_cache_.next_value(auto_inc_id));
     target_ctx.lob_id_.assign(target_ctx.lob_col_idx_, writer.lob_meta_tablet_id_.id(), auto_inc_id);
     target_ctx.lob_meta_tablet_id_ = writer.lob_meta_tablet_id_;
-    ASSERT_SUCC(writer.lob_id_cache_.next_value(target_ctx.external_lob_seq_id_));
-    ASSERT_NE(auto_inc_id, target_ctx.external_lob_seq_id_);
+    ASSERT_SUCC(writer.lob_id_cache_.next_value(target_ctx.external_lob_macro_seq_id_));
+    ASSERT_NE(auto_inc_id, target_ctx.external_lob_macro_seq_id_);
 
     ObLobWriteIter write_iter;
     ObLobWriteResult result;
@@ -404,13 +404,14 @@ TEST_F(TestExternalLobSequence, replay_preserves_external_summary_row_bytes)
     ASSERT_TRUE(result.is_meta_summary());
     ASSERT_EQ(target_ctx.lob_id_, result.meta_info_.lob_id_);
     ASSERT_EQ(info.length_, result.meta_info_.byte_len_);
-    uint64_t tablet_id = 0;
-    uint64_t seq_id = 0;
-    ASSERT_SUCC(ObLobMetaUtil::deserialize_external_lob_block_id(
-        result.meta_info_.lob_block_id_, tablet_id, seq_id));
-    ASSERT_EQ(writer.lob_meta_tablet_id_.id(), tablet_id);
-    ASSERT_NE(writer.tablet_id_.id(), tablet_id);
-    ASSERT_EQ(target_ctx.external_lob_seq_id_, seq_id);
+    uint64_t decoded_lob_meta_tablet_id = 0;
+    uint64_t decoded_external_lob_macro_seq_id = 0;
+    ASSERT_SUCC(ObExternalLobMacroIdPrefix::deserialize(
+        result.meta_info_.lob_block_id_, decoded_lob_meta_tablet_id,
+        decoded_external_lob_macro_seq_id));
+    ASSERT_EQ(writer.lob_meta_tablet_id_.id(), decoded_lob_meta_tablet_id);
+    ASSERT_NE(writer.tablet_id_.id(), decoded_lob_meta_tablet_id);
+    ASSERT_EQ(target_ctx.external_lob_macro_seq_id_, decoded_external_lob_macro_seq_id);
 
     blocksstable::ObDatumRow row;
     ASSERT_SUCC(row.init(ObLobMetaInfo::COLUMN_CNT));

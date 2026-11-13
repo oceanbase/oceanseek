@@ -87,13 +87,13 @@ TEST_F(TestExtFileSystem, ordinary_storage_guard_keeps_current_tenant_selection)
   const uint64_t saved_storage_tenant = ObObjectStorageTenantGuard::get_tenant_id();
   {
     ObObjectStorageTenantGuard ordinary_guard(caller_tenant_.id(), 123000);
-    EXPECT_EQ(owner_tenant_.id(), ObBackupIoAdapter::get_tenant_id());
+    EXPECT_EQ(owner_tenant_.id(), common::get_storage_io_tenant_id());
     EXPECT_EQ(OB_INVALID_TENANT_ID, ObStorageAccessTenantGuard::get_target_tenant_id());
     // 对应备份检查的 MTL=0、普通 guard=系统租户场景，仍使用租户 500 的 IO 管理器。
     ObTenantEnv::set_tenant(nullptr);
     DEFER(ObTenantEnv::set_tenant(&owner_tenant_));
     ObObjectStorageTenantGuard sys_guard(OB_SYS_TENANT_ID, 123000);
-    EXPECT_EQ(OB_SERVER_TENANT_ID, ObBackupIoAdapter::get_tenant_id());
+    EXPECT_EQ(OB_SERVER_TENANT_ID, common::get_storage_io_tenant_id());
   }
   EXPECT_EQ(saved_storage_tenant, ObObjectStorageTenantGuard::get_tenant_id());
 }
@@ -105,25 +105,25 @@ TEST_F(TestExtFileSystem, explicit_storage_tenant_restores_nested_scopes)
     ExtStorageTenantGuard owner_guard(owner_tenant_.id());
     const int64_t owner_timeout = ObObjectStorageTenantGuard::get_timeout_us();
     ObTenantSwitchGuard caller_guard(&caller_tenant_);
-    EXPECT_EQ(owner_tenant_.id(), ObBackupIoAdapter::get_tenant_id());
+    EXPECT_EQ(owner_tenant_.id(), common::get_storage_io_tenant_id());
     {
       ExtStorageTenantGuard inner_guard(caller_tenant_.id());
-      EXPECT_EQ(caller_tenant_.id(), ObBackupIoAdapter::get_tenant_id());
+      EXPECT_EQ(caller_tenant_.id(), common::get_storage_io_tenant_id());
     }
-    EXPECT_EQ(owner_tenant_.id(), ObBackupIoAdapter::get_tenant_id());
+    EXPECT_EQ(owner_tenant_.id(), common::get_storage_io_tenant_id());
     {
       // 带资源组的普通 guard 也不能清除外层显式指定。
       ObObjectStorageTenantGuard io_guard(caller_tenant_.id(), 456000,
           USER_RESOURCE_OTHER_GROUP_ID);
-      EXPECT_EQ(owner_tenant_.id(), ObBackupIoAdapter::get_tenant_id());
+      EXPECT_EQ(owner_tenant_.id(), common::get_storage_io_tenant_id());
     }
     EXPECT_EQ(owner_tenant_.id(), ObObjectStorageTenantGuard::get_tenant_id());
     EXPECT_EQ(owner_timeout, ObObjectStorageTenantGuard::get_timeout_us());
     {
       ExtStorageTenantGuard server_guard(OB_SERVER_TENANT_ID);
-      EXPECT_EQ(OB_SERVER_TENANT_ID, ObBackupIoAdapter::get_tenant_id());
+      EXPECT_EQ(OB_SERVER_TENANT_ID, common::get_storage_io_tenant_id());
     }
-    EXPECT_EQ(owner_tenant_.id(), ObBackupIoAdapter::get_tenant_id());
+    EXPECT_EQ(owner_tenant_.id(), common::get_storage_io_tenant_id());
     std::thread other_thread([]() {
       EXPECT_EQ(OB_INVALID_TENANT_ID, ObStorageAccessTenantGuard::get_target_tenant_id());
     });

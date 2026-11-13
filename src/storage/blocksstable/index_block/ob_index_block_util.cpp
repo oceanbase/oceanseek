@@ -151,7 +151,7 @@ int get_prefix_for_text_tc_datum(
     char *prefix_datum_buf)
 {
   int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(orig_datum.is_outline()
+  if (OB_UNLIKELY(orig_datum.is_outline_lob()
                   || !ob_is_text_tc(obj_type))
                   || OB_ISNULL(prefix_datum_buf)) {
     ret = OB_ERR_UNEXPECTED;

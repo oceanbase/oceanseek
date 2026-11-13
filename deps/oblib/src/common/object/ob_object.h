@@ -1104,7 +1104,7 @@ public:
   }
 
   // Outline includes internal outrow and external LOBs.
-  OB_INLINE bool is_outline_disk_lob_locator() const
+  OB_INLINE bool is_outline_lob_disk_locator() const
   {
     ObLobCommon *loc = reinterpret_cast<ObLobCommon *>(ptr_);
     return (loc != nullptr) && (size_ >= sizeof(ObLobCommon)) &&

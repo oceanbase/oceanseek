@@ -147,6 +147,18 @@ public:
   ObString lob_block_id_;  // null when in-table (phase1 always null)
 };
 
+class ObExternalLobMacroIdPrefix
+{
+public:
+  // Store identity only in External summary; the caller's allocator manages the encoding buffer.
+  static int serialize(ObIAllocator &allocator,
+                       const uint64_t lob_meta_tablet_id,
+                       const uint64_t external_lob_macro_seq_id,
+                       ObString &str);
+  static int deserialize(const ObString &str,
+                         uint64_t &lob_meta_tablet_id,
+                         uint64_t &external_lob_macro_seq_id);
+};
 
 class ObLobMetaUtil 
 {
@@ -171,14 +183,6 @@ public:
   // Decode a projected [info, lob_block_id] row; non-OutTable rows return an invalid macro ID.
   static int get_lob_meta_macro_id(const blocksstable::ObDatumRow &row,
       common::ObIAllocator &allocator, blocksstable::MacroBlockId &macro_id);
-  // Store identity only in External summary; the caller's allocator manages the encoding buffer.
-  static int serialize_external_lob_block_id(ObIAllocator &allocator,
-                                             const uint64_t tablet_id,
-                                             const uint64_t external_lob_seq_id,
-                                             ObString &str);
-  static int deserialize_external_lob_block_id(const ObString &str,
-                                               uint64_t &tablet_id,
-                                               uint64_t &external_lob_seq_id);
 
   static int transform_from_info_to_row(const ObLobMetaInfo &info, blocksstable::ObDatumRow *row,
     bool with_extra_rowkey);

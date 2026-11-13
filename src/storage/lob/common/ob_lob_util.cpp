@@ -567,13 +567,13 @@ int ObInsertLobColumnHelper::insert_lob_column(ObIAllocator &allocator,
              K(ret), K(source_byte_len), K(lob_storage_param));
   } else {
     uint64_t auto_inc_id = 0;
-    uint64_t external_lob_seq_id = 0;
+    uint64_t external_lob_macro_seq_id = 0;
     ObLobSourceReadCtx source_ctx;
     ObLobTargetWriteCtx target_ctx;
     // 源读取上下文只描述原 locator；目标辅助表身份由 target_ctx 单独承载。
     if (OB_FAIL(lob_id_geneator.next_value(auto_inc_id))) {
       LOG_WARN("allocate target lob id failed", K(ret), K(lob_id_geneator));
-    } else if (is_external && OB_FAIL(lob_id_geneator.next_value(external_lob_seq_id))) {
+    } else if (is_external && OB_FAIL(lob_id_geneator.next_value(external_lob_macro_seq_id))) {
       LOG_WARN("allocate external lob sequence failed", KR(ret), K(lob_meta_tablet_id), K(lob_id_geneator));
     } else if (has_tx_desc
                && OB_FAIL(tx_desc->inc_and_get_tx_seq(
@@ -590,7 +590,7 @@ int ObInsertLobColumnHelper::insert_lob_column(ObIAllocator &allocator,
       target_ctx.lob_col_idx_ = lob_col_idx;
       target_ctx.lob_id_.assign(lob_col_idx, lob_meta_tablet_id.id(), auto_inc_id);
       target_ctx.lob_meta_tablet_id_ = lob_meta_tablet_id;
-      target_ctx.external_lob_seq_id_ = external_lob_seq_id;
+      target_ctx.external_lob_macro_seq_id_ = external_lob_macro_seq_id;
       // 每个目标 out-row LOB 使用独立子序号，不能直接复用 DDL 框架序号。
       target_ctx.seq_no_ = target_lob_seq_no;
       if (OB_FAIL(iter.open(source_ctx, target_ctx))) {

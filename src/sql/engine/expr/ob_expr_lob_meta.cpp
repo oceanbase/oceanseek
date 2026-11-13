@@ -142,7 +142,7 @@ int ObExprLobMeta::eval_lob_meta(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &re
     ObLobLocatorV2 locator(arg->get_string());
     ObExprStrResAlloc allocator(expr, ctx);
     ObString metadata;
-    if (OB_UNLIKELY(!locator.is_valid() || locator.is_outline_disk_lob_locator())) {
+    if (OB_UNLIKELY(!locator.is_valid() || locator.is_outline_lob_disk_locator())) {
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("invalid LOB_META locator", KR(ret), K(locator.size_), K(expr.args_[0]->datum_meta_.type_));
     } else if (OB_UNLIKELY(locator.is_append_delta_lob())) {

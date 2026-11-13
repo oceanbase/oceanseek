@@ -181,8 +181,8 @@ struct ObLobDmlTask
     return valid;
   }
 
-  bool need_insert_outrow() const { return dest_loc_.is_outline_disk_lob_locator(); }
-  bool need_delete_old_outrow() const { return old_loc_.is_outline_disk_lob_locator(); }
+  bool need_insert_outrow() const { return dest_loc_.is_outline_lob_disk_locator(); }
+  bool need_delete_old_outrow() const { return old_loc_.is_outline_lob_disk_locator(); }
 
   int from_ctx(const ObLobInsertContext &ctx, const int16_t row_idx, const int16_t col_idx);
   int from_ctx(const ObLobUpdateContext &ctx, const int16_t row_idx, const int16_t col_idx);

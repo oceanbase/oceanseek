@@ -176,7 +176,7 @@ int ObLobReadContext::build_for_dml(
     LOG_WARN("column is not lob storage", KR(ret), K(col_idx), KPC(column));
   } else if (FALSE_IT(datum.get_lob_locatorv2(disk_locator))) {
   } else if (OB_UNLIKELY(!disk_locator.is_valid()
-      || !disk_locator.is_outline_disk_lob_locator())) {
+      || !disk_locator.is_outline_lob_disk_locator())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("datum is not a valid outline disk lob locator", KR(ret),
         K(col_idx), K(datum), K(disk_locator));

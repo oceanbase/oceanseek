@@ -129,7 +129,7 @@ private:
   int get_external_lob_byte_length_(const ObLobReadContext &read_ctx, uint64_t &byte_len);
   // @brief build outrow dest locator. reuse_lob_id valid: reuse it (outrow->outrow update);
   //  invalid: alloc a new lob id (insert or null/inrow->outrow update).
-  int prepare_outline_locator_(ObLobInsertContext &insert_ctx, const ObLobId &reuse_lob_id);
+  int prepare_outline_lob_locator_(ObLobInsertContext &insert_ctx, const ObLobId &reuse_lob_id);
   int prepare_lob_id_(ObLobInsertContext &insert_ctx,
                       ObLobDiskLocatorBuilder &locator_builder, 
                       const ObLobId &reuse_lob_id);

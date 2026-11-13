@@ -12,14 +12,14 @@ using namespace common;
 using namespace storage;
 using namespace blocksstable;
 
-// Helper to check outline status for both ObObj and ObStorageDatum in template code.
-// ObStorageDatum uses is_outline(); ObObj uses is_outrow_lob().
-static OB_INLINE bool cell_is_outline(const ObStorageDatum &datum)
+// Helper to check outline LOB status for ObObj and ObStorageDatum in template code.
+// ObStorageDatum uses is_outline_lob(); ObObj uses is_outrow_lob().
+static OB_INLINE bool cell_is_outline_lob(const ObStorageDatum &datum)
 {
-  return datum.is_outline();
+  return datum.is_outline_lob();
 }
 
-static OB_INLINE bool cell_is_outline(const ObObj &obj)
+static OB_INLINE bool cell_is_outline_lob(const ObObj &obj)
 {
   return obj.is_outrow_lob();
 }
@@ -1480,7 +1480,7 @@ int ObRowWriterV0::append_sparse_cell_array(
       } else if (cells[i].is_null()) {
         special_vals_[column_index_count_] = ObRowHeader::VAL_NULL;
       } else {
-        special_vals_[column_index_count_] = cell_is_outline(cells[i]) ? ObRowHeader::VAL_OUTROW
+        special_vals_[column_index_count_] = cell_is_outline_lob(cells[i]) ? ObRowHeader::VAL_OUTROW
                                                                        : ObRowHeader::VAL_NORMAL;
         if (OB_FAIL(append_column(cells[i]))) {
           if (OB_BUF_NOT_ENOUGH != ret) {
@@ -1529,7 +1529,7 @@ int ObRowWriterV0::append_flat_cell_array(
       } else if (cells[i].is_null()) {
         special_vals_[column_index_count_] = ObRowHeader::VAL_NULL;
       } else {
-        special_vals_[column_index_count_] = cell_is_outline(cells[i]) ? ObRowHeader::VAL_OUTROW
+        special_vals_[column_index_count_] = cell_is_outline_lob(cells[i]) ? ObRowHeader::VAL_OUTROW
                                                                        : ObRowHeader::VAL_NORMAL;
         if (OB_FAIL(append_column(cells[i]))) {
           if (OB_BUF_NOT_ENOUGH != ret) {

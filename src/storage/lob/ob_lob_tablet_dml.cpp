@@ -200,7 +200,7 @@ int ObLobTabletDmlHelper::update_before(
 
     // Step 3: 若 old_loc_ 是 outrow，或者 dest_loc_ 是 outrow，则创建 ObLobDmlTask 添加到队列中，after 阶段执行
     if (OB_FAIL(ret)) {
-    } else if (upd_ctx.old_loc_.is_outline_disk_lob_locator() || outrow) {
+    } else if (upd_ctx.old_loc_.is_outline_lob_disk_locator() || outrow) {
       ObLobDmlTask task;
       if (OB_FAIL(task.from_ctx(upd_ctx, row_idx, col_idx))) {
         LOG_WARN("failed build update task from update ctx", KR(ret), K(upd_ctx));

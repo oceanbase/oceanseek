@@ -257,7 +257,7 @@ TEST_F(TestLobLocatorBuilder, disk_locator_builder_round_trip)
   ObLobDiskLocatorWrapper wrapper;
   ASSERT_EQ(OB_SUCCESS, wrapper.init(disk_locator.ptr(), disk_locator.length()));
   ASSERT_TRUE(wrapper.is_valid());
-  EXPECT_TRUE(wrapper.is_outline());
+  EXPECT_TRUE(wrapper.is_outline_lob());
   EXPECT_EQ(expected_lob_id, wrapper.get_lob_id());
   ASSERT_NE(nullptr, wrapper.get_lob_id_ptr());
   EXPECT_EQ(expected_lob_id, *wrapper.get_lob_id_ptr());
@@ -319,7 +319,7 @@ TEST_F(TestLobLocatorBuilder, mem_external_predicate_ignores_empty_and_inrow_loc
   EXPECT_FALSE(mem_locator.is_mem_external_lob());
 }
 
-TEST_F(TestLobLocatorBuilder, text_read_rejects_outline_disk_locator)
+TEST_F(TestLobLocatorBuilder, text_read_rejects_outline_lob_disk_locator)
 {
   ObArenaAllocator allocator;
   ObLobLocatorV2 disk_locator_obj;
@@ -651,7 +651,7 @@ TEST_F(TestLobLocatorBuilder, read_context_locator_build_and_rebuild)
   ASSERT_EQ(OB_SUCCESS, read_ctx.src_loc_.get_inrow_data(payload));
   expect_ob_string_eq(payload, "hello", 5);
   ASSERT_EQ(OB_SUCCESS, read_ctx.build(outrow_locator, allocator, 0, UINT64_MAX));
-  EXPECT_TRUE(read_ctx.src_loc_.is_outline_disk_lob_locator());
+  EXPECT_TRUE(read_ctx.src_loc_.is_outline_lob_disk_locator());
   EXPECT_TRUE(read_ctx.src_loc_wrapper_.is_valid());
   ASSERT_TRUE(external_locator.is_external_temp_lob());
   ASSERT_EQ(OB_SUCCESS, read_ctx.build(external_locator, allocator, 0, UINT64_MAX));
@@ -659,7 +659,7 @@ TEST_F(TestLobLocatorBuilder, read_context_locator_build_and_rebuild)
   EXPECT_FALSE(read_ctx.src_loc_wrapper_.is_valid());
   EXPECT_TRUE(read_ctx.src_loc_.is_mem_external_lob());
   ASSERT_EQ(OB_SUCCESS, read_ctx.build(outrow_locator, allocator, 0, UINT64_MAX));
-  EXPECT_TRUE(read_ctx.src_loc_.is_outline_disk_lob_locator());
+  EXPECT_TRUE(read_ctx.src_loc_.is_outline_lob_disk_locator());
   EXPECT_TRUE(read_ctx.src_loc_wrapper_.is_valid());
   EXPECT_FALSE(read_ctx.src_loc_.is_mem_external_lob());
 
@@ -710,7 +710,7 @@ TEST_F(TestLobLocatorBuilder, read_context_locator_assign_and_failure)
   ASSERT_EQ(OB_SUCCESS, make_outrow_disk_locator(allocator, outrow_locator, outrow_data));
   ASSERT_EQ(OB_SUCCESS, source.build(outrow_locator, allocator, 0, UINT64_MAX));
   ASSERT_EQ(OB_SUCCESS, copied.assign(source));
-  EXPECT_TRUE(copied.src_loc_.is_outline_disk_lob_locator());
+  EXPECT_TRUE(copied.src_loc_.is_outline_lob_disk_locator());
   EXPECT_TRUE(copied.src_loc_wrapper_.is_valid());
 
   // Truncate source so assign cannot rebuild Disk wrapper; the target must discard its old input.

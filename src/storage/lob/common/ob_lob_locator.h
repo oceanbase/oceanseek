@@ -30,12 +30,13 @@ public:
 
   bool is_valid() const;
   bool is_inrow() const { return nullptr != lob_common_ && lob_common_->in_row_; }
-  bool is_outline() const { return nullptr != lob_common_ && !lob_common_->in_row_; }
+  bool is_outline_lob() const { return nullptr != lob_common_ && !lob_common_->in_row_; }
 
   const ObLobCommon *get_lob_common() const { return lob_common_; }
-  ObLobId get_lob_id() const { return (nullptr != ptr_ && is_outline()) ? lob_id_ : ObLobId(); }
+  ObLobId get_lob_id() const { return (nullptr != ptr_ && is_outline_lob()) ? lob_id_ : ObLobId(); }
   int get_lob_id(ObLobId &lob_id) const;
-  const ObLobId *get_lob_id_ptr() const { return (nullptr != ptr_ && is_outline()) ? &lob_id_ : nullptr; }
+  const ObLobId *get_lob_id_ptr() const
+  { return (nullptr != ptr_ && is_outline_lob()) ? &lob_id_ : nullptr; }
   const char *get_inrow_data_ptr() const { return inrow_data_; }
   int64_t get_inrow_data_len() const { return inrow_data_len_; }
 

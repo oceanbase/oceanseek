@@ -236,15 +236,15 @@ public:
   inline bool is_max() const { return is_ext() && extend_obj_->is_max_value(); }
   inline bool is_nop() const { return is_ext() && extend_obj_->is_nop_value(); }
   inline bool is_null_or_nop() const { return is_null() || is_nop(); }
-  OB_INLINE bool is_outline_fast() const {
+  OB_INLINE bool is_outline_lob_fast() const {
     const ObLobCommon *lob_common = reinterpret_cast<const ObLobCommon *>(ptr_);
     return !lob_common->in_row_;
   }
-  bool is_outline() const {
+  bool is_outline_lob() const {
     if (flag_ != FlagType::LOB || ptr_ == nullptr || len_ < sizeof(ObLobCommon)) {
       return false;
     }
-    return is_outline_fast();
+    return is_outline_lob_fast();
   }
   inline int8_t get_int8() const { return  *(reinterpret_cast<const int8_t*> (int_)); }
   inline int8_t get_tinyint() const { return *(reinterpret_cast<const int8_t*> (int_)); }

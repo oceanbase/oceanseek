@@ -716,7 +716,7 @@ int ObExprColumnConv::column_convert(const ObExpr &expr,
           if (OB_UNLIKELY(!input_lob.is_valid())) {
             ret = OB_INVALID_ARGUMENT;
             LOG_WARN("invalid input lob locator", KR(ret), K(in_type), K(out_type));
-          } else if (OB_UNLIKELY(input_lob.is_outline_disk_lob_locator())) {
+          } else if (OB_UNLIKELY(input_lob.is_outline_lob_disk_locator())) {
             ret = OB_ERR_UNEXPECTED;
             LOG_USER_ERROR(OB_ERR_UNEXPECTED, "column conversion from a bare outline disk LOB locator");
             LOG_WARN("bare outline disk lob locator is not supported", KR(ret), K(in_type), K(out_type));
@@ -893,7 +893,7 @@ int ObExprColumnConv::column_convert_batch(const ObExpr &expr,
             if (OB_UNLIKELY(!input_lob.is_valid())) {
               ret = OB_INVALID_ARGUMENT;
               LOG_WARN("invalid input lob locator", KR(ret), K(in_type), K(out_type));
-            } else if (OB_UNLIKELY(input_lob.is_outline_disk_lob_locator())) {
+            } else if (OB_UNLIKELY(input_lob.is_outline_lob_disk_locator())) {
               ret = OB_ERR_UNEXPECTED;
               LOG_USER_ERROR(OB_ERR_UNEXPECTED, "column conversion from a bare outline disk LOB locator");
               LOG_WARN("bare outline disk lob locator is not supported", KR(ret), K(in_type), K(out_type));

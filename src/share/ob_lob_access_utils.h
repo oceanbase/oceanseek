@@ -106,7 +106,7 @@ public:
   static const uint32_t DEAFULT_LOB_PREFIX_CHAR_LEN = 1000;
   static const uint32_t MAX_CHAR_MULTIPLIER = 4;
   ObTextStringIter(ObObjType type, ObCollationType cs_type, const ObString &datum_str) :
-    type_(type), cs_type_(cs_type), is_init_(false), is_lob_(false), is_outline_(false),
+    type_(type), cs_type_(cs_type), is_init_(false), is_lob_(false), is_outline_lob_(false),
     state_(TEXTSTRING_ITER_INVALID), datum_str_(datum_str),
     ctx_(nullptr), err_ret_(OB_SUCCESS), tmp_alloc_(nullptr)
   {
@@ -115,14 +115,14 @@ public:
 
   ObTextStringIter(const ObObj &obj) :
     type_(obj.get_type()), cs_type_(obj.get_collation_type()), is_init_(false), is_lob_(false),
-    is_outline_(false), state_(TEXTSTRING_ITER_INVALID),
+    is_outline_lob_(false), state_(TEXTSTRING_ITER_INVALID),
     datum_str_(obj.get_string()), ctx_(nullptr), err_ret_(OB_SUCCESS), tmp_alloc_(nullptr)
   {
     cs_type_ = ob_is_json(obj.get_type()) ? CS_TYPE_BINARY : cs_type_;
   }
   ~ObTextStringIter();
 
-  TO_STRING_KV(K_(type), K_(cs_type), K_(is_init), K_(is_lob), K_(is_outline),
+  TO_STRING_KV(K_(type), K_(cs_type), K_(is_init), K_(is_lob), K_(is_outline_lob),
     K_(state), K(datum_str_), KP_(ctx), K_(err_ret));
 
   int init(uint32_t buffer_len,
@@ -156,7 +156,7 @@ public:
   uint32_t get_accessed_len();
   uint32_t get_accessed_byte_len();
   int get_inner_ret() { return err_ret_; }
-  bool is_outline_lob() { return is_outline_; };
+  bool is_outline_lob() { return is_outline_lob_; };
   int get_byte_len(int64_t &byte_len);
   int get_char_len(int64_t &char_length);
   uint32_t get_iter_count();
@@ -183,7 +183,7 @@ private:
   int reserve_byte_data();
   OB_INLINE bool is_valid_for_config(ObTextStringIterState valid_state = TEXTSTRING_ITER_INIT)
   {
-    return (is_init_ && is_outline_
+    return (is_init_ && is_outline_lob_
             && state_ == valid_state && OB_NOT_NULL(ctx_));
   }
 private:
@@ -191,7 +191,7 @@ private:
   ObCollationType cs_type_;
   uint32_t is_init_ : 1;
   uint32_t is_lob_ : 1;
-  uint32_t is_outline_ : 1;
+  uint32_t is_outline_lob_ : 1;
   uint32_t reserved : 29;
   ObTextStringIterState state_;
   const ObString datum_str_;

@@ -331,7 +331,7 @@ int MutatorRow::parse_outrow_lob_column_(
   storage::ObLobDiskLocatorWrapper locator;
   if (OB_FAIL(locator.init(reinterpret_cast<const char *>(&lob_common), lob_locator_len))) {
     LOG_ERROR("init disk lob locator failed", KR(ret), K(column_id), K(lob_locator_len), K(lob_common));
-  } else if (OB_UNLIKELY(!locator.is_outline())) {
+  } else if (OB_UNLIKELY(!locator.is_outline_lob())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_ERROR("lob locator is not outrow", KR(ret), K(column_id), K(locator));
   } else if (is_parse_new_col) {

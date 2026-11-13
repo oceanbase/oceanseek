@@ -196,13 +196,14 @@ public:
   static constexpr uint64_t MAX_PIECE_COUNT = 64UL * 1024;
 
   ObExternalLobMacroIterator() { reset(); }
-  int init(uint64_t tablet_id, uint64_t seq_id, uint64_t offset, uint64_t length);
+  int init(uint64_t lob_meta_tablet_id,
+      uint64_t external_lob_macro_seq_id, uint64_t offset, uint64_t length);
   int get_next(blocksstable::MacroBlockId &macro_id);
   void reset();
 
 private:
-  uint64_t tablet_id_;
-  uint64_t seq_id_;
+  uint64_t lob_meta_tablet_id_;
+  uint64_t external_lob_macro_seq_id_;
   uint64_t next_offset_;
   uint64_t end_offset_;
   bool is_inited_;
@@ -216,8 +217,8 @@ public:
   virtual ~ObExternalLobQueryIter() { reset(); }
   int open(const ObLobReadContext &read_ctx,
            const common::ObExternalBlobInfo &external_info,
-           uint64_t tablet_id,
-           uint64_t seq_id,
+           uint64_t lob_meta_tablet_id,
+           uint64_t external_lob_macro_seq_id,
            const common::ObObjectStorageInfo &access_info);
   virtual int get_next_row(common::ObString &buffer) override;
   virtual void reset() override;
