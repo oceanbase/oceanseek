@@ -347,10 +347,10 @@ int ObIndexBuilder::drop_index(const ObDropIndexArg &const_arg, obrpc::ObDropInd
         }
       }
       LOG_WARN("cannot delete index with foreign key dependency", K(ret));
-    } else if (!arg.is_inner_ && index_table_schema->is_unavailable_index()) {
-      ret = OB_NOT_SUPPORTED;
-      LOG_WARN("not support to drop a building index", K(ret), K(arg.is_inner_), KPC(index_table_schema));
-      LOG_USER_ERROR(OB_NOT_SUPPORTED, "dropping a building index is");
+    } else if (!arg.is_inner_ && OB_FAIL(ddl_service_.check_index_status_for_drop(*index_table_schema))) {
+      if (OB_EAGAIN != ret) {
+        LOG_WARN("failed to check index status before drop", K(ret), KPC(index_table_schema));
+      }
     } else if (arg.is_inner_
                && arg.is_add_to_scheduler_
                && index_table_schema->is_async_delete_index()
@@ -1875,6 +1875,17 @@ int ObIndexBuilder::submit_drop_search_index_task_(
                                                           owner_id,
                                                           trans))) {
     LOG_WARN("failed to lock online ddl lock", K(ret));
+  }
+  if (OB_SUCC(ret) && nullptr != param.def_index_schema_
+      && INDEX_STATUS_AVAILABLE == param.def_index_schema_->get_index_status()) {
+    // Publish logical unavailability with the parent task, before any auxiliary cleanup can run.
+    ObDDLOperator ddl_operator(ddl_service_.get_schema_service(), ddl_service_.get_sql_proxy());
+    const bool in_offline_ddl_white_list = arg.is_hidden_ || data_schema.get_in_offline_ddl_white_list();
+    if (OB_FAIL(ddl_operator.update_index_status(index_schema.get_tenant_id(),
+            param.def_index_schema_->get_data_table_id(), param.def_index_schema_->get_table_id(),
+            INDEX_STATUS_UNAVAILABLE, in_offline_ddl_white_list, trans, nullptr))) {
+      LOG_WARN("fail to make dropping search index unavailable", KR(ret), KPC(param.def_index_schema_));
+    }
   }
   return ret;
 }

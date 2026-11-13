@@ -2257,6 +2257,7 @@ public:
                                        common::ObString &schema_name,
                                        common::ObString &object_name);
 
+  int check_index_status_for_drop(const share::schema::ObTableSchema &index_schema);
   int check_domain_or_user_async_index_conflict(const uint64_t tenant_id, const uint64_t table_id);
   int check_index_mode_conflict(const share::schema::ObTableSchema &data_table_schema,
                                 const share::schema::ObIndexType new_index_type);

@@ -8599,10 +8599,10 @@ int ObDDLService::alter_table_index(obrpc::ObAlterTableArg &alter_table_arg,
                 }
               }
               LOG_WARN("cannot delete index with foreign key dependency", K(ret));
-            } else if (!drop_index_arg->is_inner_ && index_table_schema->is_unavailable_index()) {
-              ret = OB_NOT_SUPPORTED;
-              LOG_WARN("not support to drop a building index", K(ret), K(drop_index_arg->is_inner_), KPC(index_table_schema));
-              LOG_USER_ERROR(OB_NOT_SUPPORTED, "dropping a building index is");
+            } else if (!drop_index_arg->is_inner_ && OB_FAIL(check_index_status_for_drop(*index_table_schema))) {
+              if (OB_EAGAIN != ret) {
+                LOG_WARN("failed to check index status before drop", K(ret), KPC(index_table_schema));
+              }
             } else if (drop_index_arg->is_add_to_scheduler_ && !drop_index_arg->is_oracle_tmp_table_v2_index_table_) {
               if (OB_FAIL(drop_index_to_scheduler_(trans, schema_guard, alter_table_arg.allocator_, origin_table_schema,
                                                    nullptr /*inc_tablet_ids*/, nullptr /*del_tablet_ids*/, drop_index_arg,
@@ -41588,6 +41588,38 @@ int ObDDLService::check_alter_lob_inrow_threshold(
     }
     LOG_TRACE("alter lob inrow threahold", K(ret), K(is_origin_table_has_lob_column), K(ddl_type),
         "old_value", alter_table_schema.get_lob_inrow_threshold(), "new_value", orig_table_schema->get_lob_inrow_threshold());
+  }
+  return ret;
+}
+
+int ObDDLService::check_index_status_for_drop(const ObTableSchema &index_schema)
+{
+  int ret = OB_SUCCESS;
+  if (index_schema.is_unavailable_index()) {
+    if (index_schema.is_search_def_index()) {
+      ObArenaAllocator allocator(lib::ObMemAttr(index_schema.get_tenant_id(), "DdlTaskRecord"));
+      ObArray<ObDDLTaskRecord> task_records;
+      if (OB_FAIL(ObDDLTaskRecordOperator::get_ddl_task_record_by_table_id(
+          index_schema.get_tenant_id(), index_schema.get_data_table_id(), get_sql_proxy(), allocator, task_records))) {
+        LOG_WARN("failed to get search index ddl tasks", K(ret), K(index_schema));
+      } else {
+        for (int64_t i = 0; OB_SUCC(ret) && i < task_records.count(); ++i) {
+          const ObDDLTaskRecord &task_record = task_records.at(i);
+          // A Search DROP commits UNAVAILABLE before auxiliary cleanup starts.
+          if (index_schema.get_table_id() == task_record.target_object_id_
+              && (ObDDLType::DDL_DROP_SEARCH_INDEX == task_record.ddl_type_
+                  || ObDDLType::DDL_DROP_ASYNC_SEARCH_INDEX == task_record.ddl_type_)) {
+            ret = OB_EAGAIN;
+            LOG_INFO("search index drop is in progress", K(ret), K(task_record));
+          }
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("not support to drop a building index", K(ret), K(index_schema));
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "dropping a building index is");
+    }
   }
   return ret;
 }
