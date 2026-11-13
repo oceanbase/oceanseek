@@ -1,13 +1,13 @@
-Name: oceanbase.ai-ce
+Name: oceanseek
 Version: %{VERSION}
 Release: %{RELEASE}
-Summary: oceanbase.ai-ce
+Summary: oceanseek
 Group: Applications/Databases
 License: Apache-2.0
 Url: https://open.oceanbase.com/
 Vendor: OceanBase Inc.
 Prefix: /home/admin/oceanbase
-Requires: curl, jq, oceanbase.ai-ce-libs = %{version}
+Requires: curl, jq, oceanseek-libs = %{version}
 BuildRequires: wget, rpm, cpio, make, glibc-devel, glibc-headers, binutils, m4, python3, python2, libtool, libaio
 Autoreq: 0
 %systemd_requires
@@ -15,7 +15,7 @@ Autoreq: 0
 %define __os_install_post %{nil}
 %define _prefix /home/admin/oceanbase
 %description
-OceanBase is a distributed relational database
+OceanSeek is a distributed relational database
 %global __requires_exclude ^(/bin/bash|/usr/bin/.*)$
 %define _unpackaged_files_terminate_build 0
 %global _missing_build_ids_terminate_build 0
@@ -30,58 +30,58 @@ OceanBase is a distributed relational database
 %global debug_package %{nil}
 
 %package debuginfo
-Summary: Debug information for OceanBase
+Summary: Debug information for OceanSeek
 Group: Development/Debug
 %description debuginfo
-This package provides debug information for package oceanbase.ai-ce.
+This package provides debug information for package oceanseek.
 Debug information is useful when developing applications that use this
 package or when debugging this package.
 
 %package libs
-Summary: Libraries for OceanBase
+Summary: Libraries for OceanSeek
 Group: System Environment/Libraries
 %description libs
-This package contains libraries for OceanBase.
+This package contains libraries for OceanSeek.
 
 %package libs-debuginfo
-Summary: Debug information for OceanBase Libs
+Summary: Debug information for OceanSeek Libs
 Group: Development/Debug
 %description libs-debuginfo
-This package provides debug information for package oceanbase.ai-ce-libs.
+This package provides debug information for package oceanseek-libs.
 Debug information is useful when developing applications that use this
 package or when debugging this package.
 
 %package sql-parser
-Summary: Sql Parser Libraries for OceanBase
+Summary: Sql Parser Libraries for OceanSeek
 Group: System Environment/Libraries
 %description sql-parser
-This package contains sql pareser libraries for OceanBase.
+This package contains sql pareser libraries for OceanSeek.
 
 %package table
-Summary: Table Api Libraries for OceanBase
+Summary: Table Api Libraries for OceanSeek
 Group: System Environment/Libraries
 %description table
-This package contains table api libraries for OceanBase.
+This package contains table api libraries for OceanSeek.
 
 %package table-debuginfo
-Summary: Debug information for OceanBase Table
+Summary: Debug information for OceanSeek Table
 Group: Development/Debug
 %description table-debuginfo
-This package provides debug information for package oceanbase.ai-ce-table.
+This package provides debug information for package oceanseek-table.
 Debug information is useful when developing applications that use this
 package or when debugging this package.
 
 %package utils
-Summary: Tools for OceanBase
+Summary: Tools for OceanSeek
 Group: Development/Tools
 %description utils
-This package contains tools for OceanBase.
+This package contains tools for OceanSeek.
 
 %package utils-debuginfo
-Summary: Debug information for OceanBase Utils
+Summary: Debug information for OceanSeek Utils
 Group: Development/Debug
 %description utils-debuginfo
-This package provides debug information for package oceanbase.ai-ce-utils.
+This package provides debug information for package oceanseek-utils.
 Debug information is useful when developing applications that use this
 package or when debugging this package.
 
