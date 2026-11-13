@@ -1326,9 +1326,9 @@ int ObDDLTask::switch_status(const ObDDLTaskStatus new_status, const bool enable
       }
       LOG_WARN("select for update failed", K(ret), K(task_id_));
     } else if (table_task_status == FAIL && old_status != table_task_status) {
-      // task failed marked by user
+      // Preserve a persisted failure; a FAIL record without an error retains cancellation semantics.
       real_new_status = FAIL;
-      ret_code_ = OB_CANCELED;
+      ret_code_ = OB_SUCCESS != ret_code ? ret_code : OB_CANCELED;
     } else if (old_status != table_task_status) {
       // refresh status, ret_code and snapshot_version
       real_new_status = static_cast<ObDDLTaskStatus>(table_task_status);
@@ -1338,11 +1338,15 @@ int ObDDLTask::switch_status(const ObDDLTaskStatus new_status, const bool enable
     } else if (old_status == real_new_status) {
       // do nothing
     } else {
+      const bool persist_fts_strategy = DDL_CREATE_FTS_INDEX == task_type_
+          && PREPARE == old_status && GENERATE_ROWKEY_DOC_SCHEMA == real_new_status;
       if (OB_DDL_TASK_ENABLE_TRACING && enable_flt) {
         ddl_tracing_.end_status_span();
-        if (OB_SUCC(ret)) {
-          ret = update_task_record_status_and_msg(trans, real_new_status);
-        }
+      }
+      // Strategy and status must share the record lock and transaction even
+      // when tracing is disabled. A stale PREPARE instance only refreshes above.
+      if (persist_fts_strategy || (OB_DDL_TASK_ENABLE_TRACING && enable_flt)) {
+        ret = update_task_record_status_and_msg(trans, real_new_status);
       } else if (OB_FAIL(ObDDLTaskRecordOperator::update_task_status(
               trans, dst_tenant_id_, task_id_, static_cast<int64_t>(real_new_status)))) {
         LOG_WARN("update task status failed", K(ret), K(task_id_), K(real_new_status));

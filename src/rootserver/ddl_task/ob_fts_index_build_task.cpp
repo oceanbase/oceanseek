@@ -75,7 +75,9 @@ ObFtsIndexBuildTask::ObFtsIndexBuildTask()
     rowkey_doc_schema_version_(0),
     refresh_done_(false),
     async_index_publish_refresh_target_(),
-    existing_async_index_table_ids_()
+    existing_async_index_table_ids_(),
+    status_transition_pending_(false),
+    strategy_reload_required_(false)
 {
 }
 
@@ -187,9 +189,8 @@ int ObFtsIndexBuildTask::init(
     data_format_version_ = tenant_data_version;
     is_retryable_ddl_ = is_retryable_ddl;
     task_status_ = static_cast<ObDDLTaskStatus>(task_status);
+    create_index_arg_.is_partition_local_ddl_ = false;
     if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(check_is_partition_local_ddl(create_index_arg_.is_partition_local_ddl_))) {
-      LOG_WARN("fail to check is partition local ddl", K(ret), K(tenant_id_), K(object_id_));
     } else if (OB_FAIL(init_ddl_task_monitor_info(index_schema->get_table_id()))) {
       LOG_WARN("init ddl task monitor info failed", K(ret));
     } else if (OB_FAIL(ObDDLUtil::get_no_logging_param(tenant_id_, is_no_logging_))) {
@@ -264,8 +265,25 @@ int ObFtsIndexBuildTask::process()
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", K(ret));
+  } else if (status_transition_pending_ && need_retry()) {
+    if (!ObDDLServiceLauncher::is_ddl_service_started()) {
+      need_retry_ = false;
+    } else {
+      // Reconcile the previous decision without counting its error again.
+      // ret_code_ retains a decided failure; the locked record takes precedence
+      // if the transition was already committed.
+      const ObDDLTaskStatus reconcile_status = ObDDLTaskStatus::SUCCESS != task_status_
+          && OB_SUCCESS != ret_code_ ? ObDDLTaskStatus::FAIL : task_status_;
+      if (OB_FAIL(switch_status(reconcile_status, false, OB_SUCCESS))) {
+        LOG_WARN("fail to reconcile fts status transition", K(ret), K(task_id_));
+      } else {
+        status_transition_pending_ = false;
+      }
+    }
   } else if (OB_FAIL(check_health())) {
     LOG_WARN("check health failed", K(ret));
+  } else if (strategy_reload_required_ && OB_FAIL(retry_refresh_task_context())) {
+    LOG_WARN("fail to refresh fulltext task context", K(ret), K(task_id_));
   } else if (!is_domain_index(index_type) && !is_search_index(index_type)
       && !share::schema::is_async_fts_index(index_type)) {
     ret = OB_ERR_UNEXPECTED;
@@ -750,6 +768,16 @@ int ObFtsIndexBuildTask::prepare()
       LOG_INFO("[ASYNC_INDEX] prepare done", K(ret), K(object_id_), K(target_object_id_),
           K(existing_async_index_table_ids_));
     }
+  } else if (is_fts_task()) {
+    // Strategy selection may access storage. Run it only after the child and its
+    // parent relationship are committed, outside the parent creation transaction.
+    bool is_partition_local_ddl = false;
+    if (OB_FAIL(check_is_partition_local_ddl(is_partition_local_ddl))) {
+      LOG_WARN("fail to choose fulltext index build strategy", K(ret), K(task_id_));
+    } else {
+      create_index_arg_.is_partition_local_ddl_ = is_partition_local_ddl;
+      state_finished = true;
+    }
   } else {
     state_finished = true;
   }
@@ -776,8 +804,13 @@ int ObFtsIndexBuildTask::prepare()
       LOG_WARN("failed to get next status", K(ret), K(next_status));
     }
     
-    (void)switch_status(next_status, true, ret);
-    ret = OB_SUCCESS;
+    const int switch_ret = switch_status(next_status, true, ret);
+    if (is_fts_task() && OB_SUCCESS != switch_ret && need_retry()) {
+      status_transition_pending_ = true;
+      ret = switch_ret;
+    } else {
+      ret = OB_SUCCESS;
+    }
   }
   return ret;
 }
@@ -2574,76 +2607,86 @@ int ObFtsIndexBuildTask::refresh_task_context(const share::ObDDLTaskStatus statu
     ret = OB_NOT_INIT;
     LOG_WARN("the obj is not initialized", K(ret));
   } else {
-    SMART_VAR(ObFtsIndexBuildTask, task) {
-      switch (status)
-      {
-        case ObDDLTaskStatus::PREPARE:
-        case ObDDLTaskStatus::GENERATE_ROWKEY_DOC_SCHEMA: {
-          break;
+    bool need_depend_map = false;
+    bool need_all_aux_ids = false;
+    bool need_domain_aux_ids = false;
+    const bool need_strategy = is_fts_task()
+        && (ObDDLTaskStatus::SUCCESS != status || status != task_status_)
+        && (ObDDLTaskStatus::PREPARE != status || strategy_reload_required_);
+    if (need_strategy) {
+      strategy_reload_required_ = true;
+    }
+    switch (status) {
+      case ObDDLTaskStatus::PREPARE:
+      case ObDDLTaskStatus::GENERATE_ROWKEY_DOC_SCHEMA:
+      case ObDDLTaskStatus::LOAD_DICTIONARY:
+      case ObDDLTaskStatus::GENERATE_DOC_AUX_SCHEMA:
+      case ObDDLTaskStatus::GENERATE_DOC_ROWKEY_SCHEMA:
+      case ObDDLTaskStatus::GENERATE_DOC_WORD_SCHEMA_FOR_FTS:
+      case ObDDLTaskStatus::GENERATE_DOMAIN_INDEX_SCHEMA:
+      case ObDDLTaskStatus::TRIGGER_ASYNC_INDEX_REFRESH: {
+        break;
+      }
+      case ObDDLTaskStatus::SUCCESS: {
+        // Success cleanup does not use the build strategy. A failed transaction
+        // may still call us with SUCCESS as its intended status.
+        if (is_fts_task() && status == task_status_) {
+          strategy_reload_required_ = false;
         }
-        case ObDDLTaskStatus::WAIT_ROWKEY_DOC_TABLE_COMPLEMENT: {
-          if (OB_FAIL(ObDDLUtil::load_ddl_task(tenant_id_, task_id_, allocator_, task))) {
-            LOG_WARN("fail to get fulltext task objection", K(ret));
-          } else if (OB_FAIL(refresh_task_depend_map_context(task))) {
-            LOG_WARN("fail to refresh subtask execution status", K(ret), K(task));
-          }
-          break;
-        }
-        case ObDDLTaskStatus::LOAD_DICTIONARY: 
-        case ObDDLTaskStatus::GENERATE_DOC_AUX_SCHEMA:
-        case ObDDLTaskStatus::GENERATE_DOC_ROWKEY_SCHEMA:
-        case ObDDLTaskStatus::GENERATE_DOC_WORD_SCHEMA_FOR_FTS:
-        case ObDDLTaskStatus::GENERATE_DOMAIN_INDEX_SCHEMA: {
-          break;
-        }
-        case ObDDLTaskStatus::WAIT_AUX_TABLE_COMPLEMENT:
-        case ObDDLTaskStatus::WAIT_DOC_ROWKEY_TABLE_COMPLEMENT:
-        case ObDDLTaskStatus::WAIT_DOC_WORD_TABLE_COMPLEMENT_FOR_FTS:
-        case ObDDLTaskStatus::WAIT_DOMAIN_INDEX_TABLE_COMPLEMENT: {
-          if (OB_FAIL(ObDDLUtil::load_ddl_task(tenant_id_, task_id_, allocator_, task))) {
-            LOG_WARN("fail to get fulltext task objection", K(ret));
-          } else if (OB_FAIL(refresh_task_depend_map_context(task))) {
-            LOG_WARN("fail to refresh subtask execution status", K(ret), K(task));
-          }
-          break;
-        }
-        case ObDDLTaskStatus::TRIGGER_ASYNC_INDEX_REFRESH: {
-          break;
-        }
-        case ObDDLTaskStatus::TAKE_EFFECT: {
-          if (is_fts_task() && 
-              (OB_INVALID_ID == domain_index_aux_table_id_ || 
-              OB_INVALID_ID == fts_doc_word_aux_table_id_)) {
-            if (OB_FAIL(ObDDLUtil::load_ddl_task(tenant_id_, task_id_, allocator_, task))) {
-              LOG_WARN("fail to get fulltext task objection", K(ret));
-            } else {
-              domain_index_aux_table_id_ = task.get_domain_index_aux_table_id();
-              fts_doc_word_aux_table_id_ = task.get_fts_doc_word_aux_table_id();
-            }
-          }
-          break;
-        }
-        case ObDDLTaskStatus::FAIL: {
-          if (OB_FAIL(ObDDLUtil::load_ddl_task(tenant_id_, task_id_, allocator_, task))) {
-            LOG_WARN("fail to get fulltext task objection", K(ret));
-          } else if (OB_FAIL(refresh_task_depend_map_context(task))) {
-            LOG_WARN("fail to refresh subtask execution status", K(ret), K(task));
-          } else {
+        break;
+      }
+      case ObDDLTaskStatus::WAIT_ROWKEY_DOC_TABLE_COMPLEMENT:
+      case ObDDLTaskStatus::WAIT_AUX_TABLE_COMPLEMENT:
+      case ObDDLTaskStatus::WAIT_DOC_ROWKEY_TABLE_COMPLEMENT:
+      case ObDDLTaskStatus::WAIT_DOC_WORD_TABLE_COMPLEMENT_FOR_FTS:
+      case ObDDLTaskStatus::WAIT_DOMAIN_INDEX_TABLE_COMPLEMENT: {
+        need_depend_map = true;
+        break;
+      }
+      case ObDDLTaskStatus::TAKE_EFFECT: {
+        need_domain_aux_ids = is_fts_task()
+            && (OB_INVALID_ID == domain_index_aux_table_id_ || OB_INVALID_ID == fts_doc_word_aux_table_id_);
+        break;
+      }
+      case ObDDLTaskStatus::FAIL: {
+        need_depend_map = true;
+        need_all_aux_ids = true;
+        break;
+      }
+      default: {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("error unexpected task status", K(ret), K(status));
+      }
+    }
+    if (OB_SUCC(ret) && (need_depend_map || need_all_aux_ids || need_domain_aux_ids || need_strategy)) {
+      // Use one record for dependencies, table IDs and strategy. Its buffers
+      // outlive the temporary task, but are released after every attempt.
+      common::ObArenaAllocator attempt_allocator(
+          "FtsTaskLoad", OB_MALLOC_NORMAL_BLOCK_SIZE);
+      SMART_VAR(ObFtsIndexBuildTask, task) {
+        if (OB_FAIL(ObDDLUtil::load_ddl_task(tenant_id_, task_id_, attempt_allocator, task))) {
+          LOG_WARN("fail to load persisted fts task context", K(ret), K(task_id_), K(status));
+        } else if (need_depend_map && OB_FAIL(refresh_task_depend_map_context(task))) {
+          LOG_WARN("fail to refresh subtask execution status", K(ret), K(task));
+        } else {
+          if (need_all_aux_ids) {
             rowkey_doc_aux_table_id_ = task.get_rowkey_doc_aux_table_id();
             doc_rowkey_aux_table_id_ = task.get_doc_rowkey_aux_table_id();
+          }
+          if (need_all_aux_ids || need_domain_aux_ids) {
             domain_index_aux_table_id_ = task.get_domain_index_aux_table_id();
             fts_doc_word_aux_table_id_ = task.get_fts_doc_word_aux_table_id();
             search_text_match_aux_table_id_ = task.get_search_text_match_aux_table_id();
             search_text_match_phrase_aux_table_id_ = task.get_search_text_match_phrase_aux_table_id();
           }
-          break;
-        }
-        case ObDDLTaskStatus::SUCCESS: {
-          break;
-        }
-        default: {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("error unexpected task status", K(ret), K(status));
+          if (need_strategy) {
+            create_index_arg_.is_partition_local_ddl_ = task.create_index_arg_.is_partition_local_ddl_;
+            // A failed transaction may still call us with its intended status.
+            // Only release the guard for the actual local status.
+            if (status == task_status_) {
+              strategy_reload_required_ = false;
+            }
+          }
         }
       }
     }
@@ -2681,7 +2724,7 @@ int ObFtsIndexBuildTask::refresh_task_depend_map_context(const ObFtsIndexBuildTa
   return ret;
 }
 
-// it can only be executed at the end of the init function
+// Select the build strategy in PREPARE, after task creation and before auxiliary tasks.
 int ObFtsIndexBuildTask::check_is_partition_local_ddl(bool &is_partition_local_ddl)
 {
   int ret = OB_SUCCESS;
@@ -2721,7 +2764,10 @@ int ObFtsIndexBuildTask::check_is_partition_local_ddl(bool &is_partition_local_d
       }
     }
     if (OB_SUCC(ret) && is_partition_local_ddl) {
-      // auto-select based on data volume
+      // Statistics only select a build strategy; do not let slow statistics
+      // indefinitely block preparation when the ordinary build path is available.
+      ObTimeoutCtx timeout_ctx;
+      const int64_t timeout_us = 120L * 1000L * 1000L;
       int64_t total_tablet_data_row_cnt = 0;
       common::ObArray<ObLSID> ls_ids;
       common::ObArray<ObTabletID> data_table_tablets;
@@ -2729,7 +2775,9 @@ int ObFtsIndexBuildTask::check_is_partition_local_ddl(bool &is_partition_local_d
       share::ObLocationService *location_service = nullptr;
       int64_t rpc_timeout = ObDDLUtil::get_default_ddl_rpc_timeout();
       const int64_t retry_interval_us = 200 * 1000; // 200ms
-      if (OB_ISNULL(location_service = GCTX.location_service_)) {
+      if (OB_FAIL(timeout_ctx.set_timeout(timeout_us))) {
+        LOG_WARN("fail to set fulltext statistics timeout", K(ret), K(timeout_us));
+      } else if (OB_ISNULL(location_service = GCTX.location_service_)) {
         ret = OB_ERR_SYS;
         LOG_WARN("location_cache is null", K(ret), KP(location_service));
       } else if (OB_FAIL(ObDDLUtil::get_tablets(tenant_id_, object_id_, data_table_tablets))) {
@@ -2745,10 +2793,18 @@ int ObFtsIndexBuildTask::check_is_partition_local_ddl(bool &is_partition_local_d
       } else {
         for (int64_t i = 0; OB_SUCC(ret) && i < data_table_tablets.count(); ++i) {
           int64_t tablet_data_row_cnt = 0;
-          if (OB_FAIL(location_service->get_leader_with_retry_until_timeout(GCONF.cluster_id, tenant_id_,
+          const int64_t remaining_timeout_us = timeout_ctx.get_timeout();
+          if (remaining_timeout_us <= 0) {
+            ret = OB_TIMEOUT;
+          } else if (OB_FAIL(location_service->get_leader_with_retry_until_timeout(GCONF.cluster_id, tenant_id_,
                                                                             ls_ids.at(i), leader_addr,
-                                                                            rpc_timeout, retry_interval_us))) {
-            LOG_WARN("fail to get ls locaiton leader", K(ret), K(tenant_id_), K(ls_ids.at(i)));
+                                                                            min(timeout_ctx.get_abs_timeout(), ObTimeUtility::current_time() + rpc_timeout),
+                                                                            retry_interval_us))) {
+            LOG_WARN("fail to get ls location leader", K(ret), K(tenant_id_), K(ls_ids.at(i)));
+            // Leader lookup retains the location renew error when its retry deadline is reached.
+            if (share::is_location_service_renew_error(ret)) {
+              ret = OB_TIMEOUT;
+            }
           } else if (OB_FAIL(ObDDLUtil::get_tablet_data_row_cnt(tenant_id_, data_table_tablets.at(i),
                                                                 ls_ids.at(i), data_format_version_,
                                                                 leader_addr, tablet_data_row_cnt))) {
@@ -2765,6 +2821,12 @@ int ObFtsIndexBuildTask::check_is_partition_local_ddl(bool &is_partition_local_d
             is_partition_local_ddl = false;
           }
         }
+      }
+      if (OB_TIMEOUT == ret) {
+        LOG_WARN("fulltext statistics timed out, use ordinary build strategy",
+                 K(ret), K(task_id_), K(tenant_id_), K(object_id_));
+        is_partition_local_ddl = false;
+        ret = OB_SUCCESS;
       }
     }
   }
@@ -3298,6 +3360,26 @@ int ObFtsIndexBuildTask::update_task_message(common::ObISQLClient &proxy)
     msg.assign(buf, serialize_param_size);
     if (OB_FAIL(ObDDLTaskRecordOperator::update_message(proxy, tenant_id_, task_id_, msg))) {
       LOG_WARN("failed to update message", KR(ret));
+    }
+  }
+  return ret;
+}
+
+int ObFtsIndexBuildTask::retry_refresh_task_context()
+{
+  int ret = refresh_task_context(task_status_);
+  if (OB_FAIL(ret)) {
+    const int refresh_ret = ret;
+    // Keep state transitions outside refresh_task_context(), which itself is a
+    // switch_status() callback, to avoid recursive failure handling.
+    const int switch_ret = switch_status(ObDDLTaskStatus::FAIL, false, refresh_ret);
+    if (OB_SUCCESS != switch_ret) {
+      // Reconcile the decision before another context load or build step.
+      // switch_status() has already classified and latched the original error.
+      if (need_retry()) {
+        status_transition_pending_ = true;
+      }
+      LOG_WARN("fail to handle fts context restore error", K(switch_ret), K(refresh_ret), K(task_id_));
     }
   }
   return ret;

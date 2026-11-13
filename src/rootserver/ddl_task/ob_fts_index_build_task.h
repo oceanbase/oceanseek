@@ -93,7 +93,9 @@ public:
       K(rowkey_doc_schema_version_),
       K(refresh_done_),
       K_(async_index_publish_refresh_target),
-      K(existing_async_index_table_ids_));
+      K(existing_async_index_table_ids_),
+      K(status_transition_pending_),
+      K(strategy_reload_required_));
 
 public:
   void set_rowkey_doc_aux_table_id(const uint64_t id) { rowkey_doc_aux_table_id_ = id; }
@@ -125,6 +127,7 @@ public:
   int update_task_message(common::ObISQLClient &proxy);
 
 private:
+  int retry_refresh_task_context();
   bool is_fts_task() const { return task_type_ == share::DDL_CREATE_FTS_INDEX; }
   bool is_multivalue_task() const { return task_type_ == share::DDL_CREATE_MULTIVALUE_INDEX; }
   bool is_spiv_task() const { return task_type_ == share::DDL_CREATE_VEC_SPIV_INDEX; }
@@ -280,6 +283,10 @@ private:
   // 异步索引发布 SCN，供跨轮重试复用；状态切换后清理，不序列化。
   share::ObAsyncIndexDDLRefreshTarget async_index_publish_refresh_target_;
   common::ObSEArray<uint64_t, 4> existing_async_index_table_ids_; // collected in prepare()
+  // Runtime-only guards; the task message remains unchanged on disk.
+  // Shared by PREPARE and context reload state transitions.
+  bool status_transition_pending_;
+  bool strategy_reload_required_;
 };
 
 } // end namespace rootserver
