@@ -100,6 +100,7 @@ private:
   int append_tablet_meta_scn_(
       const storage::ObSSGCTablet &cur_gc_tablet,
       const storage::ObSSGCTabletStudyInfo &study_info,
+      const storage::ObSSGCTabletType table_type,
       common::ObIArray<storage::ObSSGCTabletStudyResult> &tablet_meta_scn_list);
   int check_allow_tablet_version_gc_(const storage::ObTabletHandle &tablet_handle,
                                      bool &allow_tablet_version_gc);

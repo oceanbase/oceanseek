@@ -1444,7 +1444,7 @@ protected:
     ObSSMarkSweepDagParam param;
     const ObSSGCTabletWithMetaScn scan_input(
         ObSSGCTablet(share::ObLSID(1), ObTabletID(200001), share::SCN::base_scn()),
-        share::SCN::base_scn());
+        share::SCN::base_scn(), ObSSGCTabletType::UNKNOWN);
     if (OB_FAIL(dag.basic_init(allocator))) {
     } else if (OB_FAIL(param.init(OB_SYS_TENANT_ID, 1, MEM_LIMIT, BUF_SIZE, 1))) {
     } else {

@@ -21,6 +21,7 @@
 #include "storage/ss_garbage_collector/ob_ss_lob_gc_scan_util.h"
 #include "storage/tablet/ob_tablet.h"
 #define private public
+#include "storage/ss_garbage_collector/ob_ss_mark_sweep_gc_rpc.h"
 #include "storage/ss_garbage_collector/dag/ob_ss_mark_sweep_dag.h"
 #include "storage/ss_garbage_collector/user_data_gc_dag_task/ob_ss_outtable_gc_task.h"
 #include "storage/ss_garbage_collector/user_data_gc_dag_task/ob_ss_lob_meta_gc_scan_task.h"
@@ -170,7 +171,8 @@ protected:
       param.snapshot_meta_scn_ = SCN::base_scn();
       param.safe_meta_scn_ = SCN::base_scn();
       ret = param.tablet_with_meta_scn_arr_.push_back(ObSSGCTabletWithMetaScn(
-          ObSSGCTablet(ObLSID(1), ObTabletID(200001), SCN::base_scn()), SCN::base_scn()));
+          ObSSGCTablet(ObLSID(1), ObTabletID(200001), SCN::base_scn()), SCN::base_scn(),
+          ObSSGCTabletType::UNKNOWN));
     }
     return ret;
   }
@@ -181,7 +183,8 @@ protected:
     ctx.lob_meta_scan_inputs_.reuse();
     for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
       ret = ctx.lob_meta_scan_inputs_.push_back(ObSSGCTabletWithMetaScn(
-          ObSSGCTablet(ObLSID(1), ObTabletID(200001 + i), SCN::base_scn()), SCN::base_scn()));
+          ObSSGCTablet(ObLSID(1), ObTabletID(200001 + i), SCN::base_scn()), SCN::base_scn(),
+          ObSSGCTabletType::UNKNOWN));
     }
     return ret;
   }
@@ -192,7 +195,8 @@ protected:
     ctx.lob_ctrl_scan_inputs_.reuse();
     for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
       ret = ctx.lob_ctrl_scan_inputs_.push_back(ObSSGCTabletWithMetaScn(
-          ObSSGCTablet(ObLSID(1), ObTabletID(400001 + i), SCN::base_scn()), SCN::base_scn()));
+          ObSSGCTablet(ObLSID(1), ObTabletID(400001 + i), SCN::base_scn()), SCN::base_scn(),
+          ObSSGCTabletType::UNKNOWN));
     }
     return ret;
   }
@@ -304,8 +308,13 @@ TEST_F(TestSSOuttableLobUserGCTask, lob_checkpoint_uses_study_and_shared_version
   const CheckpointCase cases[] = {
       {1, 1, 200, 1, 200},       // Initial checkpoints must not pin a cold tablet.
       {1, 1, 200, 100, 1},       // Shared data is behind the local original checkpoint.
-      {150, 150, 200, 100, 100}, // The local original checkpoint still limits GC.
+      {150, 150, 200, 100, 200}, // The shared baseline lies inside the cold interval.
+      {150, 150, 200, 1, 200},   // An asymmetric replica may keep its original checkpoint at 1.
+      {100, 100, 200, 100, 200}, // The original equality case must still advance.
       {100, 150, 200, 100, 100}, // Shared checkpoints changed within the kept versions.
+      {150, 175, 200, 100, 100}, // Keep the frozen first/latest checkpoint consistency guard.
+      {200, 200, 200, 100, 100}, // This promotion only applies below the effective checkpoint.
+      {250, 250, 200, 100, 100}, // Do not extend the cold interval beyond Study's boundary.
       {150, 150, 100, 100, 100}, // Equal original and effective checkpoints are warm.
       {100, 100, 80, 100, 80},   // A lower effective checkpoint remains a constraint.
       {100, 100, 0, 100, 0},     // A MIN Study result must prevent user GC.
@@ -327,8 +336,8 @@ TEST_F(TestSSOuttableLobUserGCTask, lob_checkpoint_uses_study_and_shared_version
     ObTablet latest;
     ASSERT_EQ(OB_SUCCESS, init_complete_tablet(first, first_checkpoint));
     ASSERT_EQ(OB_SUCCESS, init_complete_tablet(latest, latest_checkpoint));
-    const ObSSGCTabletWithMetaScn input(
-        gc_tablet, SCN::base_scn(), effective_checkpoint, original_checkpoint);
+    const ObSSGCTabletWithMetaScn input(gc_tablet, SCN::base_scn(), ObSSGCTabletType::UNKNOWN,
+        effective_checkpoint, original_checkpoint);
     SCN checkpoint;
     ASSERT_EQ(OB_SUCCESS, calc_checkpoint_with_latest(input, first, latest, checkpoint));
     ASSERT_EQ(expected_checkpoint, checkpoint);
@@ -342,9 +351,8 @@ TEST_F(TestSSOuttableLobUserGCTask, lob_checkpoint_single_kept_version_can_advan
   ASSERT_EQ(OB_SUCCESS, init_complete_tablet(tablet, SCN::base_scn()));
   SCN effective_checkpoint;
   ASSERT_EQ(OB_SUCCESS, effective_checkpoint.convert_for_tx(200));
-  const ObSSGCTabletWithMetaScn input(
-      ObSSGCTablet(ObLSID(1), ObTabletID(200001), SCN::base_scn()),
-      SCN::base_scn(), effective_checkpoint, SCN::base_scn());
+  const ObSSGCTabletWithMetaScn input(ObSSGCTablet(ObLSID(1), ObTabletID(200001), SCN::base_scn()),
+      SCN::base_scn(), ObSSGCTabletType::UNKNOWN, effective_checkpoint, SCN::base_scn());
   SCN checkpoint;
   ObArenaAllocator allocator;
   ObSEArray<SCN, 1> kept_meta_scns;
@@ -354,6 +362,79 @@ TEST_F(TestSSOuttableLobUserGCTask, lob_checkpoint_single_kept_version_can_advan
   ASSERT_EQ(effective_checkpoint, checkpoint);
 }
 
+TEST_F(TestSSOuttableLobUserGCTask, lob_checkpoint_advances_after_asymmetric_replica_study)
+{
+  struct ReplicaCase
+  {
+    int64_t first_original_;
+    int64_t second_original_;
+    int64_t ls_checkpoint_;
+    int64_t shared_checkpoint_;
+    bool first_has_memtable_;
+    int64_t expected_;
+  };
+  const ReplicaCase cases[] = {
+      // Round 11: both replicas are cold, but only z1 flushed an empty MemTable.
+      {1794298319882385000, 1, 1794300556646226000, 1794298319882385000,
+          false, 1794300556646226000},
+      // The replica supplying orig_min is cold; the other replica still limits effective_min.
+      {175, 100, 200, 150, true, 175},
+  };
+  const ObSSGCTablet gc_tablet(ObLSID(1), ObTabletID(200001), SCN::base_scn());
+  obrpc::ObSSMarkSweepGCStudyP processor;
+  ObSSOuttableGCTask task;
+  for (int64_t i = 0; i < ARRAYSIZEOF(cases); ++i) {
+    SCOPED_TRACE(i);
+    SCN originals[2];
+    SCN ls_checkpoint;
+    SCN shared_checkpoint;
+    SCN expected_checkpoint;
+    ASSERT_EQ(OB_SUCCESS, originals[0].convert_for_tx(cases[i].first_original_));
+    ASSERT_EQ(OB_SUCCESS, originals[1].convert_for_tx(cases[i].second_original_));
+    ASSERT_EQ(OB_SUCCESS, ls_checkpoint.convert_for_tx(cases[i].ls_checkpoint_));
+    ASSERT_EQ(OB_SUCCESS, shared_checkpoint.convert_for_tx(cases[i].shared_checkpoint_));
+    ASSERT_EQ(OB_SUCCESS, expected_checkpoint.convert_for_tx(cases[i].expected_));
+    for (int order = 0; order < 2; ++order) {
+      SCOPED_TRACE(order);
+      ObSSGCTabletStudyResultArray server_result;
+      ObSSGCTabletStudyResultArray final_result;
+      hash::ObHashMap<ObSSGCTablet, int64_t> tablet_index_map;
+      ASSERT_EQ(OB_SUCCESS, tablet_index_map.create(8, ObMemAttr(OB_SYS_TENANT_ID, "SSGCStudyUT")));
+      for (int j = 0; j < 2; ++j) {
+        const int replica = (order + j) % 2;
+        const bool has_memtable = 0 == replica && cases[i].first_has_memtable_;
+        ObSSGCTabletStudyInfo info(SCN::max_scn(), 10, originals[replica], 20);
+        ASSERT_EQ(!has_memtable, processor.update_cold_lob_rely_info_(
+            true, 1, has_memtable, ls_checkpoint, info));
+        ASSERT_EQ(originals[replica], info.orig_clog_checkpoint_scn_);
+        server_result.reuse();
+        ASSERT_EQ(OB_SUCCESS, server_result.push_back(
+            ObSSGCTabletStudyResult(gc_tablet, info, ObSSGCTabletType::LOB_META)));
+        ASSERT_EQ(OB_SUCCESS, ObSSGCStudyUtil::merge_server_meta_scn_infos_(
+            server_result, tablet_index_map, final_result));
+      }
+      ASSERT_EQ(1, final_result.count());
+      const ObSSGCTabletStudyInfo &info = final_result.at(0).study_info_;
+      ASSERT_TRUE(info.is_cold());
+      ASSERT_EQ(originals[1], info.orig_clog_checkpoint_scn_);
+      ASSERT_EQ(expected_checkpoint, info.clog_checkpoint_scn_);
+      const ObSSGCTabletWithMetaScn input(gc_tablet, SCN::base_scn(), ObSSGCTabletType::LOB_META,
+          info.clog_checkpoint_scn_, info.orig_clog_checkpoint_scn_);
+      ObTablet tablet;
+      ASSERT_EQ(OB_SUCCESS, init_complete_tablet(tablet, shared_checkpoint));
+      ObArenaAllocator allocator;
+      ObSEArray<SCN, 1> kept_meta_scns;
+      ASSERT_EQ(OB_SUCCESS, kept_meta_scns.push_back(SCN::base_scn()));
+      SCN checkpoint;
+      ASSERT_EQ(OB_SUCCESS,
+          task.calc_lob_gc_checkpoint_scn_(input, tablet, kept_meta_scns, allocator, checkpoint));
+      EXPECT_EQ(expected_checkpoint, checkpoint);
+      ASSERT_EQ(OB_SUCCESS, calc_checkpoint_with_latest(input, tablet, tablet, checkpoint));
+      EXPECT_EQ(expected_checkpoint, checkpoint);
+    }
+  }
+}
+
 TEST_F(TestSSOuttableLobUserGCTask, lob_checkpoint_loads_latest_only_for_promotion)
 {
   ObSSOuttableGCTask task;
@@ -361,9 +442,8 @@ TEST_F(TestSSOuttableLobUserGCTask, lob_checkpoint_loads_latest_only_for_promoti
   ASSERT_EQ(OB_SUCCESS, init_complete_tablet(tablet, SCN::base_scn()));
   SCN effective_checkpoint;
   ASSERT_EQ(OB_SUCCESS, effective_checkpoint.convert_for_tx(200));
-  ObSSGCTabletWithMetaScn input(
-      ObSSGCTablet(ObLSID(1), ObTabletID(200001), SCN::base_scn()),
-      SCN::base_scn(), effective_checkpoint, SCN::base_scn());
+  ObSSGCTabletWithMetaScn input(ObSSGCTablet(ObLSID(1), ObTabletID(200001), SCN::base_scn()),
+      SCN::base_scn(), ObSSGCTabletType::UNKNOWN, effective_checkpoint, SCN::base_scn());
   ObSEArray<SCN, 2> kept_meta_scns;
   ObArenaAllocator allocator;
   SCN checkpoint;
@@ -413,8 +493,8 @@ TEST_F(TestSSOuttableLobUserGCTask, lob_checkpoint_missing_study_keeps_shared_bo
   ObTablet latest;
   ASSERT_EQ(OB_SUCCESS, init_complete_tablet(first, SCN::base_scn()));
   ASSERT_EQ(OB_SUCCESS, init_complete_tablet(latest, SCN::base_scn()));
-  const ObSSGCTabletWithMetaScn input(
-      ObSSGCTablet(ObLSID(1), ObTabletID(200001), SCN::base_scn()), SCN::base_scn());
+  const ObSSGCTabletWithMetaScn input(ObSSGCTablet(ObLSID(1), ObTabletID(200001), SCN::base_scn()),
+      SCN::base_scn(), ObSSGCTabletType::UNKNOWN);
   ASSERT_TRUE(input.clog_checkpoint_scn_.is_max());
   ASSERT_TRUE(input.orig_clog_checkpoint_scn_.is_max());
   SCN checkpoint;
@@ -425,18 +505,19 @@ TEST_F(TestSSOuttableLobUserGCTask, lob_checkpoint_missing_study_keeps_shared_bo
 TEST_F(TestSSOuttableLobUserGCTask, lob_checkpoint_incomplete_first_blocks_user_gc)
 {
   SCN original_checkpoint;
+  SCN shared_checkpoint;
   SCN effective_checkpoint;
   ASSERT_EQ(OB_SUCCESS, original_checkpoint.convert_for_tx(100));
+  ASSERT_EQ(OB_SUCCESS, shared_checkpoint.convert_for_tx(150));
   ASSERT_EQ(OB_SUCCESS, effective_checkpoint.convert_for_tx(200));
-  const ObSSGCTabletWithMetaScn input(
-      ObSSGCTablet(ObLSID(1), ObTabletID(200001), SCN::base_scn()),
-      SCN::base_scn(), effective_checkpoint, original_checkpoint);
+  const ObSSGCTabletWithMetaScn input(ObSSGCTablet(ObLSID(1), ObTabletID(200001), SCN::base_scn()),
+      SCN::base_scn(), ObSSGCTabletType::UNKNOWN, effective_checkpoint, original_checkpoint);
   for (int mode = 0; mode < 3; ++mode) {
     SCOPED_TRACE(mode);
     ObTablet first;
     ObTablet latest;
-    ASSERT_EQ(OB_SUCCESS, init_complete_tablet(first, original_checkpoint));
-    ASSERT_EQ(OB_SUCCESS, init_complete_tablet(latest, original_checkpoint));
+    ASSERT_EQ(OB_SUCCESS, init_complete_tablet(first, shared_checkpoint));
+    ASSERT_EQ(OB_SUCCESS, init_complete_tablet(latest, shared_checkpoint));
     ObTabletMeta &first_meta = const_cast<ObTabletMeta &>(first.get_tablet_meta());
     ObTabletMeta &latest_meta = const_cast<ObTabletMeta &>(latest.get_tablet_meta());
     if (0 == mode) {
@@ -460,18 +541,19 @@ TEST_F(TestSSOuttableLobUserGCTask, lob_checkpoint_incomplete_first_blocks_user_
 TEST_F(TestSSOuttableLobUserGCTask, lob_checkpoint_incomplete_latest_prevents_promotion)
 {
   SCN original_checkpoint;
+  SCN shared_checkpoint;
   SCN effective_checkpoint;
   ASSERT_EQ(OB_SUCCESS, original_checkpoint.convert_for_tx(100));
+  ASSERT_EQ(OB_SUCCESS, shared_checkpoint.convert_for_tx(150));
   ASSERT_EQ(OB_SUCCESS, effective_checkpoint.convert_for_tx(200));
-  const ObSSGCTabletWithMetaScn input(
-      ObSSGCTablet(ObLSID(1), ObTabletID(200001), SCN::base_scn()),
-      SCN::base_scn(), effective_checkpoint, original_checkpoint);
+  const ObSSGCTabletWithMetaScn input(ObSSGCTablet(ObLSID(1), ObTabletID(200001), SCN::base_scn()),
+      SCN::base_scn(), ObSSGCTabletType::UNKNOWN, effective_checkpoint, original_checkpoint);
   for (int mode = 0; mode < 4; ++mode) {
     SCOPED_TRACE(mode);
     ObTablet first;
     ObTablet latest;
-    ASSERT_EQ(OB_SUCCESS, init_complete_tablet(first, original_checkpoint));
-    ASSERT_EQ(OB_SUCCESS, init_complete_tablet(latest, original_checkpoint));
+    ASSERT_EQ(OB_SUCCESS, init_complete_tablet(first, shared_checkpoint));
+    ASSERT_EQ(OB_SUCCESS, init_complete_tablet(latest, shared_checkpoint));
     ObTabletMeta &latest_meta = const_cast<ObTabletMeta &>(latest.get_tablet_meta());
     if (0 == mode) {
       latest_meta.fork_info_.set_fork_snapshot_version(100);
@@ -494,18 +576,20 @@ TEST_F(TestSSOuttableLobUserGCTask, lob_checkpoint_incomplete_latest_prevents_pr
 TEST_F(TestSSOuttableLobUserGCTask, lob_checkpoint_rejects_invalid_boundaries)
 {
   SCN original_checkpoint;
+  SCN shared_checkpoint;
   SCN effective_checkpoint;
   ASSERT_EQ(OB_SUCCESS, original_checkpoint.convert_for_tx(100));
+  ASSERT_EQ(OB_SUCCESS, shared_checkpoint.convert_for_tx(150));
   ASSERT_EQ(OB_SUCCESS, effective_checkpoint.convert_for_tx(200));
   const ObSSGCTablet gc_tablet(ObLSID(1), ObTabletID(200001), SCN::base_scn());
   for (int mode = 0; mode < 5; ++mode) {
     SCOPED_TRACE(mode);
     ObTablet first;
     ObTablet latest;
-    ASSERT_EQ(OB_SUCCESS, init_complete_tablet(first, original_checkpoint));
-    ASSERT_EQ(OB_SUCCESS, init_complete_tablet(latest, original_checkpoint));
-    ObSSGCTabletWithMetaScn input(
-        gc_tablet, SCN::base_scn(), effective_checkpoint, original_checkpoint);
+    ASSERT_EQ(OB_SUCCESS, init_complete_tablet(first, shared_checkpoint));
+    ASSERT_EQ(OB_SUCCESS, init_complete_tablet(latest, shared_checkpoint));
+    ObSSGCTabletWithMetaScn input(gc_tablet, SCN::base_scn(), ObSSGCTabletType::UNKNOWN,
+        effective_checkpoint, original_checkpoint);
     ObTabletMeta &first_meta = const_cast<ObTabletMeta &>(first.get_tablet_meta());
     ObTabletMeta &latest_meta = const_cast<ObTabletMeta &>(latest.get_tablet_meta());
     if (0 == mode) {
@@ -577,9 +661,11 @@ TEST_F(TestSSOuttableLobUserGCTask, empty_scan_input_resets_outputs)
   ObSSGCTabletWithMetaScnArray scan_inputs;
   ObSSGCTabletWithMetaScnArray ctrl_scan_inputs;
   ASSERT_EQ(OB_SUCCESS, ctrl_scan_inputs.push_back(ObSSGCTabletWithMetaScn(
-      ObSSGCTablet(ObLSID(1), ObTabletID(200002), SCN::base_scn()), SCN::base_scn())));
+      ObSSGCTablet(ObLSID(1), ObTabletID(200002), SCN::base_scn()), SCN::base_scn(),
+      ObSSGCTabletType::UNKNOWN)));
   ASSERT_EQ(OB_SUCCESS, scan_inputs.push_back(ObSSGCTabletWithMetaScn(
-      ObSSGCTablet(ObLSID(1), ObTabletID(200001), SCN::base_scn()), SCN::base_scn())));
+      ObSSGCTablet(ObLSID(1), ObTabletID(200001), SCN::base_scn()), SCN::base_scn(),
+      ObSSGCTabletType::UNKNOWN)));
   SCN min_outtable_data_scn;
   ASSERT_EQ(OB_SUCCESS, min_outtable_data_scn.convert_for_tx(100));
   ASSERT_EQ(OB_SUCCESS,
@@ -587,6 +673,31 @@ TEST_F(TestSSOuttableLobUserGCTask, empty_scan_input_resets_outputs)
   ASSERT_TRUE(scan_inputs.empty());
   ASSERT_TRUE(ctrl_scan_inputs.empty());
   ASSERT_TRUE(min_outtable_data_scn.is_max());
+}
+
+TEST_F(TestSSOuttableLobUserGCTask, normal_tablet_skips_shared_metadata)
+{
+  ObSSOuttableGCTask task;
+  ObSSMarkSweepCtx ctx;
+  ctx.tenant_id_ = OB_SYS_TENANT_ID;
+  ObSSGCTabletWithMetaScn input(ObSSGCTablet(ObLSID(1), ObTabletID(200001), SCN::base_scn()),
+      SCN::base_scn(), ObSSGCTabletType::NORMAL);
+  ObSSGCTabletWithMetaScnArray meta_inputs;
+  ObSSGCTabletWithMetaScnArray ctrl_inputs;
+  SCN checkpoint = SCN::max_scn();
+  // No shared metadata service is installed: NORMAL must avoid even enumerating versions.
+  ASSERT_EQ(OB_SUCCESS,
+      task.prepare_lob_tablet_scan_input_(ctx, input, meta_inputs, ctrl_inputs, checkpoint));
+  ASSERT_TRUE(meta_inputs.empty());
+  ASSERT_TRUE(ctrl_inputs.empty());
+  ASSERT_TRUE(checkpoint.is_max());
+  const ObSSGCTabletType scan_types[] = {
+      ObSSGCTabletType::UNKNOWN, ObSSGCTabletType::LOB_META, ObSSGCTabletType::LOB_CTRL};
+  for (const ObSSGCTabletType type : scan_types) {
+    input.table_type_ = type;
+    ASSERT_EQ(OB_ERR_UNEXPECTED,
+        task.prepare_lob_tablet_scan_input_(ctx, input, meta_inputs, ctrl_inputs, checkpoint));
+  }
 }
 
 TEST_F(TestSSOuttableLobUserGCTask, prepare_failure_discards_outputs)
@@ -601,7 +712,8 @@ TEST_F(TestSSOuttableLobUserGCTask, prepare_failure_discards_outputs)
   ObSSGCTabletWithMetaScnArray scan_inputs;
   ObSSGCTabletWithMetaScnArray ctrl_scan_inputs;
   ASSERT_EQ(OB_SUCCESS, ctrl_scan_inputs.push_back(ObSSGCTabletWithMetaScn(
-      ObSSGCTablet(ObLSID(1), ObTabletID(200002), SCN::base_scn()), SCN::base_scn())));
+      ObSSGCTablet(ObLSID(1), ObTabletID(200002), SCN::base_scn()), SCN::base_scn(),
+      ObSSGCTabletType::UNKNOWN)));
   ASSERT_EQ(OB_SUCCESS, scan_inputs.assign(param.tablet_with_meta_scn_arr_));
   SCN min_outtable_data_scn;
   ASSERT_EQ(OB_SUCCESS, min_outtable_data_scn.convert_for_tx(100));
@@ -624,7 +736,8 @@ TEST_F(TestSSOuttableLobUserGCTask, default_max_does_not_skip_preparation)
   task.set_dag(dag);
   ASSERT_TRUE(dag.get_ctx()->min_outtable_data_scn_.is_max());
   ASSERT_EQ(OB_SUCCESS, dag.get_ctx()->lob_ctrl_scan_inputs_.push_back(ObSSGCTabletWithMetaScn(
-      ObSSGCTablet(ObLSID(1), ObTabletID(200002), SCN::base_scn()), SCN::base_scn())));
+      ObSSGCTablet(ObLSID(1), ObTabletID(200002), SCN::base_scn()), SCN::base_scn(),
+      ObSSGCTabletType::UNKNOWN)));
   ASSERT_EQ(OB_ERR_UNEXPECTED, task.process());
   ASSERT_TRUE(dag.get_ctx()->lob_ctrl_scan_inputs_.empty());
   ASSERT_TRUE(dag.get_ctx()->min_outtable_data_scn_.is_max());
@@ -914,7 +1027,8 @@ TEST_F(TestSSOuttableLobUserGCTask, missing_meta_service_is_not_an_empty_keep_se
   ObSSLobMetaGCScanTask task;
   ObMarkSweepSorter sorter;
   const ObSSGCTabletWithMetaScn scan_input(
-      ObSSGCTablet(ObLSID(1), ObTabletID(200001), SCN::base_scn()), SCN::base_scn());
+      ObSSGCTablet(ObLSID(1), ObTabletID(200001), SCN::base_scn()), SCN::base_scn(),
+      ObSSGCTabletType::UNKNOWN);
   ASSERT_EQ(OB_ERR_UNEXPECTED, task.scan_lob_meta_tablet_(scan_input, sorter));
   ASSERT_EQ(OB_INVALID_ARGUMENT, task.scan_lob_meta_tablet_(ObSSGCTabletWithMetaScn(), sorter));
 }
@@ -1590,7 +1704,8 @@ TEST_F(TestSSOuttableLobUserGCTask, ctrl_scan_rejects_invalid_version_and_missin
   ObSSLobCtrlGCScanSorter sorter;
   ASSERT_EQ(OB_INVALID_ARGUMENT, task.scan_lob_ctrl_tablet_(ObSSGCTabletWithMetaScn(), sorter));
   const ObSSGCTabletWithMetaScn scan_input(
-      ObSSGCTablet(ObLSID(1), ObTabletID(400001), SCN::base_scn()), SCN::base_scn());
+      ObSSGCTablet(ObLSID(1), ObTabletID(400001), SCN::base_scn()), SCN::base_scn(),
+      ObSSGCTabletType::UNKNOWN);
   ASSERT_EQ(OB_ERR_UNEXPECTED, task.scan_lob_ctrl_tablet_(scan_input, sorter));
 }
 

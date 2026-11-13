@@ -8,11 +8,26 @@
 #include "storage/ss_garbage_collector/ob_ss_gc_define.h"
 #include "lib/utility/ob_unify_serialize.h"
 #include "share/rc/ob_tenant_base.h"
+#include "storage/ob_storage_schema.h"
 
 namespace oceanbase
 {
 namespace storage
 {
+
+int ObSSGCTabletType::get_ss_gc_tablet_type(
+    const ObStorageSchema &storage_schema, ObSSGCTabletType &table_type)
+{
+  table_type.reset();
+  if (storage_schema.is_aux_lob_meta_table()) {
+    table_type.type_ = LOB_META;
+  } else if (storage_schema.is_aux_outtable_lob_control_table()) {
+    table_type.type_ = LOB_CTRL;
+  } else {
+    table_type.type_ = NORMAL;
+  }
+  return common::OB_SUCCESS;
+}
 
 /****************************** ObSSGCTabletBaseInfo ********************************** */
 bool ObSSGCTabletBaseInfo::operator==(const ObSSGCTabletBaseInfo &other) const
@@ -97,8 +112,7 @@ bool ObSSGCTabletWithDelScn::is_valid() const
 
 /****************************** ObSSGCTabletWithMetaScn *********************************/
 OB_SERIALIZE_MEMBER(ObSSGCTabletWithMetaScn, gc_tablet_, meta_scn_,
-    clog_checkpoint_scn_,
-    orig_clog_checkpoint_scn_);
+    clog_checkpoint_scn_, orig_clog_checkpoint_scn_, table_type_.type_);
 
 bool ObSSGCTabletWithMetaScn::is_valid() const
 {
@@ -110,8 +124,7 @@ bool ObSSGCTabletWithMetaScn::is_valid() const
 // Append fields without changing the wire version to preserve rolling-upgrade compatibility.
 OB_SERIALIZE_MEMBER(ObSSGCTabletStudyResult, gc_tablet_, study_info_.min_dep_meta_scn_,
     study_info_.min_major_snapshot_, study_info_.clog_checkpoint_scn_,
-    study_info_.multi_version_start_,
-    study_info_.orig_clog_checkpoint_scn_);
+    study_info_.multi_version_start_, study_info_.orig_clog_checkpoint_scn_, table_type_.type_);
 
 bool ObSSGCTabletStudyResult::is_valid() const
 {

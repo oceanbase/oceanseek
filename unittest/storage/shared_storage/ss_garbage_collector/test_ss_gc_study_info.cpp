@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 #define private public
 #include "storage/ss_garbage_collector/ob_ss_mark_sweep_gc_rpc.h"
+#include "storage/ss_garbage_collector/task/ob_ss_mark_sweep_gc_gen_task.h"
 #include "storage/meta_mem/ob_tablet_pointer.h"
 #include "storage/tablet/ob_tablet.h"
 #undef private
@@ -139,7 +140,8 @@ TEST_F(TestSSGCStudyInfo, serialize_round_trip)
   ASSERT_EQ(OB_SUCCESS, checkpoint_scn.convert_for_tx(100));
   ObSSGCTabletStudyInfo info(SCN::base_scn(), 10, checkpoint_scn, 20);
   info.orig_clog_checkpoint_scn_ = SCN::base_scn();
-  ObSSGCTabletStudyResult src(ObSSGCTablet(ObLSID(1), ObTabletID(200001), SCN::base_scn()), info);
+  ObSSGCTabletStudyResult src(ObSSGCTablet(ObLSID(1), ObTabletID(200001), SCN::base_scn()),
+      info, ObSSGCTabletType::LOB_META);
   char buf[1024];
   int64_t pos = 0;
   ASSERT_EQ(OB_SUCCESS, src.serialize(buf, sizeof(buf), pos));
@@ -156,6 +158,7 @@ TEST_F(TestSSGCStudyInfo, serialize_round_trip)
   ASSERT_EQ(20, dst.study_info_.multi_version_start_);
   ASSERT_EQ(SCN::base_scn(), dst.study_info_.orig_clog_checkpoint_scn_);
   ASSERT_TRUE(dst.study_info_.is_cold());
+  ASSERT_EQ(ObSSGCTabletType::LOB_META, dst.table_type_.type_);
 }
 
 TEST_F(TestSSGCStudyInfo, deserialize_v1_payload)
@@ -180,6 +183,7 @@ TEST_F(TestSSGCStudyInfo, deserialize_v1_payload)
   ASSERT_EQ(INT64_MAX, new_result.study_info_.multi_version_start_);
   ASSERT_TRUE(new_result.study_info_.orig_clog_checkpoint_scn_.is_max());
   ASSERT_FALSE(new_result.study_info_.is_cold());
+  ASSERT_EQ(ObSSGCTabletType::UNKNOWN, new_result.table_type_.type_);
 }
 
 TEST_F(TestSSGCStudyInfo, v1_deserialize_new_payload)
@@ -187,8 +191,8 @@ TEST_F(TestSSGCStudyInfo, v1_deserialize_new_payload)
   SCN checkpoint_scn;
   ASSERT_EQ(OB_SUCCESS, checkpoint_scn.convert_for_tx(100));
   ObSSGCTabletStudyInfo info(SCN::base_scn(), 10, checkpoint_scn, 20);
-  ObSSGCTabletStudyResult new_result(
-      ObSSGCTablet(ObLSID(1), ObTabletID(200001), SCN::base_scn()), info);
+  ObSSGCTabletStudyResult new_result(ObSSGCTablet(ObLSID(1), ObTabletID(200001), SCN::base_scn()),
+      info, ObSSGCTabletType::UNKNOWN);
   char buf[1024];
   int64_t pos = 0;
   ASSERT_EQ(OB_SUCCESS, new_result.serialize(buf, sizeof(buf), pos));
@@ -260,17 +264,84 @@ TEST_F(TestSSGCStudyInfo, classify_lob_rely_table_type)
 {
   obrpc::ObSSMarkSweepGCStudyP processor;
   ObStorageSchema storage_schema;
+  ObSSGCTabletType table_type;
   storage_schema.table_type_ = share::schema::ObTableType::AUX_LOB_META;
   ASSERT_TRUE(processor.need_collect_lob_rely_info_(storage_schema));
+  ASSERT_EQ(OB_SUCCESS, ObSSGCTabletType::get_ss_gc_tablet_type(storage_schema, table_type));
+  ASSERT_EQ(ObSSGCTabletType::LOB_META, table_type.type_);
 
   storage_schema.table_type_ = share::schema::ObTableType::AUX_OUTTABLE_LOB_CONTROL;
   ASSERT_TRUE(processor.need_collect_lob_rely_info_(storage_schema));
+  ASSERT_EQ(OB_SUCCESS, ObSSGCTabletType::get_ss_gc_tablet_type(storage_schema, table_type));
+  ASSERT_EQ(ObSSGCTabletType::LOB_CTRL, table_type.type_);
 
   storage_schema.table_type_ = share::schema::ObTableType::USER_TABLE;
   ASSERT_FALSE(processor.need_collect_lob_rely_info_(storage_schema));
+  ASSERT_EQ(OB_SUCCESS, ObSSGCTabletType::get_ss_gc_tablet_type(storage_schema, table_type));
+  ASSERT_EQ(ObSSGCTabletType::NORMAL, table_type.type_);
 
   storage_schema.table_type_ = share::schema::ObTableType::AUX_LOB_PIECE;
   ASSERT_FALSE(processor.need_collect_lob_rely_info_(storage_schema));
+  ASSERT_EQ(OB_SUCCESS, ObSSGCTabletType::get_ss_gc_tablet_type(storage_schema, table_type));
+  ASSERT_EQ(ObSSGCTabletType::NORMAL, table_type.type_);
+}
+
+TEST_F(TestSSGCStudyInfo, merge_known_and_unknown_table_types)
+{
+  const ObSSGCTablet gc_tablet(ObLSID(1), ObTabletID(200001), SCN::base_scn());
+  const ObSSGCTabletType types[] = {
+      ObSSGCTabletType::NORMAL, ObSSGCTabletType::LOB_META, ObSSGCTabletType::LOB_CTRL};
+  for (const ObSSGCTabletType type : types) {
+    ObSSGCTabletStudyInfo info;
+    info.set_to_max();
+    ObSSGCTabletStudyResultArray server_result;
+    ObSSGCTabletStudyResultArray final_result;
+    hash::ObHashMap<ObSSGCTablet, int64_t> index_map;
+    ASSERT_EQ(OB_SUCCESS, index_map.create(8, ObMemAttr(OB_SYS_TENANT_ID, "SSGCStudyUT")));
+    // An absent tablet or old server must not hide a type reported by another server.
+    ASSERT_EQ(OB_SUCCESS, server_result.push_back(
+        ObSSGCTabletStudyResult(gc_tablet, info, ObSSGCTabletType::UNKNOWN)));
+    ASSERT_EQ(OB_SUCCESS, ObSSGCStudyUtil::merge_server_meta_scn_infos_(
+        server_result, index_map, final_result));
+    ASSERT_EQ(ObSSGCTabletType::UNKNOWN, final_result.at(0).table_type_.type_);
+    server_result.at(0).table_type_ = type;
+    ASSERT_EQ(OB_SUCCESS, ObSSGCStudyUtil::merge_server_meta_scn_infos_(
+        server_result, index_map, final_result));
+    ASSERT_EQ(type, final_result.at(0).table_type_);
+    server_result.at(0).table_type_ = ObSSGCTabletType::UNKNOWN;
+    ASSERT_EQ(OB_SUCCESS, ObSSGCStudyUtil::merge_server_meta_scn_infos_(
+        server_result, index_map, final_result));
+    ASSERT_EQ(type, final_result.at(0).table_type_);
+    server_result.at(0).table_type_ = type;
+    ASSERT_EQ(OB_SUCCESS, ObSSGCStudyUtil::merge_server_meta_scn_infos_(
+        server_result, index_map, final_result));
+    server_result.at(0).table_type_ = type.is_lob_meta()
+        ? ObSSGCTabletType::NORMAL : ObSSGCTabletType::LOB_META;
+    ASSERT_EQ(OB_ERR_UNEXPECTED, ObSSGCStudyUtil::merge_server_meta_scn_infos_(
+        server_result, index_map, final_result));
+  }
+}
+
+TEST_F(TestSSGCStudyInfo, generated_gc_inputs_preserve_table_type)
+{
+  volatile bool stopped = false;
+  ObSSMarkSweepGCGenTask task(stopped);
+  ObSSGCTabletStudyResultArray results;
+  ObSSGCTabletWithMetaScnArray inputs;
+  ObSSGCTabletStudyInfo info;
+  info.set_to_max();
+  const ObSSGCTabletType types[] = {ObSSGCTabletType::UNKNOWN, ObSSGCTabletType::NORMAL,
+      ObSSGCTabletType::LOB_META, ObSSGCTabletType::LOB_CTRL};
+  for (int64_t i = 0; i < 4; ++i) {
+    ASSERT_EQ(OB_SUCCESS, results.push_back(ObSSGCTabletStudyResult(
+        ObSSGCTablet(ObLSID(1), ObTabletID(200001 + i), SCN::base_scn()), info, types[i])));
+  }
+  ASSERT_EQ(OB_SUCCESS, task.calc_min_meta_scn_(SCN::base_scn(), results, inputs));
+  ASSERT_EQ(4, inputs.count());
+  for (int64_t i = 0; i < inputs.count(); ++i) {
+    EXPECT_EQ(types[i], inputs.at(i).table_type_);
+    EXPECT_EQ(results.at(i).gc_tablet_, inputs.at(i).gc_tablet_);
+  }
 }
 
 TEST_F(TestSSGCStudyInfo, update_cold_lob_rely_info)
@@ -357,7 +428,8 @@ TEST_F(TestSSGCStudyInfo, merge_cold_and_incomplete_results)
   ASSERT_EQ(OB_SUCCESS, second_effective.convert_for_tx(200));
   ObSSGCTabletStudyInfo info(SCN::base_scn(), 10, first_effective, 20);
   info.orig_clog_checkpoint_scn_ = first_raw;
-  ASSERT_EQ(OB_SUCCESS, server_result.push_back(ObSSGCTabletStudyResult(gc_tablet, info)));
+  ASSERT_EQ(OB_SUCCESS, server_result.push_back(
+      ObSSGCTabletStudyResult(gc_tablet, info, ObSSGCTabletType::UNKNOWN)));
   ASSERT_EQ(OB_SUCCESS, ObSSGCStudyUtil::merge_server_meta_scn_infos_(
       server_result, tablet_index_map, final_result));
   ASSERT_TRUE(final_result.at(0).study_info_.is_cold());
@@ -366,7 +438,8 @@ TEST_F(TestSSGCStudyInfo, merge_cold_and_incomplete_results)
   server_result.reuse();
   info.orig_clog_checkpoint_scn_ = second_raw;
   info.clog_checkpoint_scn_ = second_effective;
-  ASSERT_EQ(OB_SUCCESS, server_result.push_back(ObSSGCTabletStudyResult(gc_tablet, info)));
+  ASSERT_EQ(OB_SUCCESS, server_result.push_back(
+      ObSSGCTabletStudyResult(gc_tablet, info, ObSSGCTabletType::UNKNOWN)));
   ASSERT_EQ(OB_SUCCESS, ObSSGCStudyUtil::merge_server_meta_scn_infos_(
       server_result, tablet_index_map, final_result));
   ASSERT_EQ(second_raw, final_result.at(0).study_info_.orig_clog_checkpoint_scn_);
@@ -376,7 +449,8 @@ TEST_F(TestSSGCStudyInfo, merge_cold_and_incomplete_results)
   server_result.reuse();
   info.orig_clog_checkpoint_scn_ = second_effective;
   ASSERT_FALSE(info.is_cold());
-  ASSERT_EQ(OB_SUCCESS, server_result.push_back(ObSSGCTabletStudyResult(gc_tablet, info)));
+  ASSERT_EQ(OB_SUCCESS, server_result.push_back(
+      ObSSGCTabletStudyResult(gc_tablet, info, ObSSGCTabletType::UNKNOWN)));
   ASSERT_EQ(OB_SUCCESS, ObSSGCStudyUtil::merge_server_meta_scn_infos_(
       server_result, tablet_index_map, final_result));
   ASSERT_TRUE(final_result.at(0).study_info_.is_cold());
@@ -385,9 +459,11 @@ TEST_F(TestSSGCStudyInfo, merge_cold_and_incomplete_results)
 
   server_result.reuse();
   info.clog_checkpoint_scn_.set_min();
-  ASSERT_EQ(OB_SUCCESS, server_result.push_back(ObSSGCTabletStudyResult(gc_tablet, info)));
+  ASSERT_EQ(OB_SUCCESS, server_result.push_back(
+      ObSSGCTabletStudyResult(gc_tablet, info, ObSSGCTabletType::UNKNOWN)));
   info.clog_checkpoint_scn_ = second_effective;
-  ASSERT_EQ(OB_SUCCESS, server_result.push_back(ObSSGCTabletStudyResult(gc_tablet, info)));
+  ASSERT_EQ(OB_SUCCESS, server_result.push_back(
+      ObSSGCTabletStudyResult(gc_tablet, info, ObSSGCTabletType::UNKNOWN)));
   ASSERT_EQ(OB_SUCCESS, ObSSGCStudyUtil::merge_server_meta_scn_infos_(
       server_result, tablet_index_map, final_result));
   ASSERT_TRUE(final_result.at(0).study_info_.clog_checkpoint_scn_.is_min());
@@ -494,10 +570,11 @@ TEST_F(TestSSGCStudyInfo, collect_completeness_across_tablet_versions)
 TEST_F(TestSSGCStudyInfo, scan_input_checkpoint_defaults)
 {
   const ObSSGCTablet gc_tablet(ObLSID(1), ObTabletID(200001), SCN::base_scn());
-  ObSSGCTabletWithMetaScn input(gc_tablet, SCN::base_scn());
+  ObSSGCTabletWithMetaScn input(gc_tablet, SCN::base_scn(), ObSSGCTabletType::UNKNOWN);
   ASSERT_TRUE(input.clog_checkpoint_scn_.is_max());
   ASSERT_TRUE(input.orig_clog_checkpoint_scn_.is_max());
   ASSERT_FALSE(input.is_cold());
+  ASSERT_EQ(ObSSGCTabletType::UNKNOWN, input.table_type_.type_);
 }
 
 TEST_F(TestSSGCStudyInfo, scan_input_checkpoint_round_trip)
@@ -507,7 +584,8 @@ TEST_F(TestSSGCStudyInfo, scan_input_checkpoint_round_trip)
   SCN effective;
   ASSERT_EQ(OB_SUCCESS, original.convert_for_tx(100));
   ASSERT_EQ(OB_SUCCESS, effective.convert_for_tx(200));
-  ObSSGCTabletWithMetaScn src(gc_tablet, SCN::base_scn(), effective, original);
+  ObSSGCTabletWithMetaScn src(gc_tablet, SCN::base_scn(), ObSSGCTabletType::LOB_CTRL, effective,
+      original);
   char buf[1024];
   int64_t pos = 0;
   ASSERT_EQ(OB_SUCCESS, src.serialize(buf, sizeof(buf), pos));
@@ -521,6 +599,7 @@ TEST_F(TestSSGCStudyInfo, scan_input_checkpoint_round_trip)
   ASSERT_EQ(effective, dst.clog_checkpoint_scn_);
   ASSERT_EQ(original, dst.orig_clog_checkpoint_scn_);
   ASSERT_TRUE(dst.is_cold());
+  ASSERT_EQ(ObSSGCTabletType::LOB_CTRL, dst.table_type_.type_);
 }
 
 TEST_F(TestSSGCStudyInfo, scan_input_deserialize_previous_payload)
@@ -541,6 +620,7 @@ TEST_F(TestSSGCStudyInfo, scan_input_deserialize_previous_payload)
   ASSERT_TRUE(new_input.clog_checkpoint_scn_.is_max());
   ASSERT_TRUE(new_input.orig_clog_checkpoint_scn_.is_max());
   ASSERT_FALSE(new_input.is_cold());
+  ASSERT_EQ(ObSSGCTabletType::UNKNOWN, new_input.table_type_.type_);
 }
 
 TEST_F(TestSSGCStudyInfo, previous_scan_input_reader_skips_checkpoint_fields)
@@ -550,7 +630,8 @@ TEST_F(TestSSGCStudyInfo, previous_scan_input_reader_skips_checkpoint_fields)
   SCN effective;
   ASSERT_EQ(OB_SUCCESS, original.convert_for_tx(100));
   ASSERT_EQ(OB_SUCCESS, effective.convert_for_tx(200));
-  ObSSGCTabletWithMetaScn new_input(gc_tablet, SCN::base_scn(), effective, original);
+  ObSSGCTabletWithMetaScn new_input(gc_tablet, SCN::base_scn(), ObSSGCTabletType::UNKNOWN,
+      effective, original);
   char buf[1024];
   int64_t pos = 0;
   ASSERT_EQ(OB_SUCCESS, new_input.serialize(buf, sizeof(buf), pos));

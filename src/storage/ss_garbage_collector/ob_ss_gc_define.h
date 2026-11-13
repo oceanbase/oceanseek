@@ -20,6 +20,33 @@ namespace oceanbase
 namespace storage
 {
 
+class ObStorageSchema;
+
+struct ObSSGCTabletType final
+{
+  enum Type : int8_t
+  {
+    UNKNOWN = 0,
+    NORMAL,
+    LOB_META,
+    LOB_CTRL,
+  };
+
+  ObSSGCTabletType(const Type type = UNKNOWN) : type_(type) {}
+  void reset() { type_ = UNKNOWN; }
+  static int get_ss_gc_tablet_type(const ObStorageSchema &storage_schema,
+                                   ObSSGCTabletType &table_type);
+  bool is_unknown() const { return UNKNOWN == type_; }
+  bool is_normal() const { return NORMAL == type_; }
+  bool is_lob_meta() const { return LOB_META == type_; }
+  bool is_lob_ctrl() const { return LOB_CTRL == type_; }
+  bool operator==(const ObSSGCTabletType &other) const { return type_ == other.type_; }
+  bool operator!=(const ObSSGCTabletType &other) const { return !(*this == other); }
+  TO_STRING_KV(K_(type));
+
+  Type type_;
+};
+
 // (tablet_id, reorg_scn) pair collected from ss_meta_ctrl lock-row iteration.
 struct ObSSGCTabletBaseInfo final
 {
@@ -133,21 +160,23 @@ public:
 public:
   ObSSGCTabletWithMetaScn()
     : gc_tablet_(), meta_scn_(), clog_checkpoint_scn_(share::SCN::max_scn()),
-      orig_clog_checkpoint_scn_(share::SCN::max_scn())
+      orig_clog_checkpoint_scn_(share::SCN::max_scn()), table_type_(ObSSGCTabletType::UNKNOWN)
   {}
   ObSSGCTabletWithMetaScn(const ObSSGCTablet &gc_tablet,
                           const share::SCN &meta_scn,
+                          const ObSSGCTabletType table_type,
                           const share::SCN &clog_checkpoint_scn = share::SCN::max_scn(),
                           const share::SCN &orig_clog_checkpoint_scn = share::SCN::max_scn())
     : gc_tablet_(gc_tablet), meta_scn_(meta_scn), clog_checkpoint_scn_(clog_checkpoint_scn),
-      orig_clog_checkpoint_scn_(orig_clog_checkpoint_scn)
+      orig_clog_checkpoint_scn_(orig_clog_checkpoint_scn), table_type_(table_type)
   {}
   ObSSGCTabletWithMetaScn(const share::ObLSID &ls_id,
                          const common::ObTabletID &tablet_id,
                          const share::SCN &transfer_scn,
                          const share::SCN &meta_scn)
     : gc_tablet_(ls_id, tablet_id, transfer_scn), meta_scn_(meta_scn),
-      clog_checkpoint_scn_(share::SCN::max_scn()), orig_clog_checkpoint_scn_(share::SCN::max_scn())
+      clog_checkpoint_scn_(share::SCN::max_scn()), orig_clog_checkpoint_scn_(share::SCN::max_scn()),
+      table_type_(ObSSGCTabletType::UNKNOWN)
   {}
   ~ObSSGCTabletWithMetaScn() {}
   bool is_valid() const;
@@ -162,7 +191,10 @@ public:
   // Frozen Study checkpoints; MAX defaults preserve the shared cutoff for older inputs.
   share::SCN clog_checkpoint_scn_;
   share::SCN orig_clog_checkpoint_scn_;
-  TO_STRING_KV(K_(gc_tablet), K_(meta_scn), K_(clog_checkpoint_scn), K_(orig_clog_checkpoint_scn));
+  // UNKNOWN means Study could not determine the type; load the shared storage schema.
+  ObSSGCTabletType table_type_;
+  TO_STRING_KV(K_(gc_tablet), K_(meta_scn), K_(clog_checkpoint_scn), K_(orig_clog_checkpoint_scn),
+      K_(table_type));
 };
 
 
@@ -242,18 +274,22 @@ public:
   static const int32_t SS_GC_TABLET_STUDY_RESULT_VERSION = 1;
   OB_UNIS_VERSION(SS_GC_TABLET_STUDY_RESULT_VERSION);
 public:
-  ObSSGCTabletStudyResult() : gc_tablet_(), study_info_() {}
+  ObSSGCTabletStudyResult()
+    : gc_tablet_(), study_info_(), table_type_(ObSSGCTabletType::UNKNOWN)
+  {}
   ObSSGCTabletStudyResult(const ObSSGCTablet &gc_tablet,
                           const share::SCN &min_dep_meta_scn,
                           const int64_t min_major_snapshot,
                           const share::SCN &clog_checkpoint_scn,
                           const int64_t multi_version_start)
     : gc_tablet_(gc_tablet),
-      study_info_(min_dep_meta_scn, min_major_snapshot, clog_checkpoint_scn, multi_version_start)
+      study_info_(min_dep_meta_scn, min_major_snapshot, clog_checkpoint_scn, multi_version_start),
+      table_type_(ObSSGCTabletType::UNKNOWN)
   {}
   ObSSGCTabletStudyResult(const ObSSGCTablet &gc_tablet,
-                          const ObSSGCTabletStudyInfo &study_info)
-    : gc_tablet_(gc_tablet), study_info_(study_info)
+                          const ObSSGCTabletStudyInfo &study_info,
+                          const ObSSGCTabletType table_type)
+    : gc_tablet_(gc_tablet), study_info_(study_info), table_type_(table_type)
   {}
   ObSSGCTabletStudyResult(const share::ObLSID &ls_id,
                           const common::ObTabletID &tablet_id,
@@ -263,7 +299,8 @@ public:
                           const share::SCN &clog_checkpoint_scn,
                           const int64_t multi_version_start)
     : gc_tablet_(ls_id, tablet_id, transfer_scn),
-      study_info_(min_dep_meta_scn, min_major_snapshot, clog_checkpoint_scn, multi_version_start)
+      study_info_(min_dep_meta_scn, min_major_snapshot, clog_checkpoint_scn, multi_version_start),
+      table_type_(ObSSGCTabletType::UNKNOWN)
   {}
   ~ObSSGCTabletStudyResult() {}
   bool is_valid() const;
@@ -271,7 +308,9 @@ public:
 public:
   ObSSGCTablet gc_tablet_;
   ObSSGCTabletStudyInfo study_info_;
-  TO_STRING_KV(K_(gc_tablet), K_(study_info));
+  // Unknown for absent tablets and responses from older servers.
+  ObSSGCTabletType table_type_;
+  TO_STRING_KV(K_(gc_tablet), K_(study_info), K_(table_type));
 };
 
 

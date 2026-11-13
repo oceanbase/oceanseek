@@ -101,7 +101,8 @@ int ObSSMarkSweepGCStudyP::study_(
       ObSSGCUtil::report_mark_sweep_set_to_min_event(tablet_list.at(0).gc_tablet_, "LS_IN_MIGRATION");
       for (int64_t i = 0; OB_SUCC(ret) && (i < tablet_cnt); i++) {
         const ObSSGCTablet &cur_gc_tablet = tablet_list.at(i).gc_tablet_;
-        if (OB_FAIL(append_tablet_meta_scn_(cur_gc_tablet, study_info, tablet_meta_scn_list))) {
+        if (OB_FAIL(append_tablet_meta_scn_(
+            cur_gc_tablet, study_info, ObSSGCTabletType::UNKNOWN, tablet_meta_scn_list))) {
           LOG_WARN("fail to append tablet meta scn", KR(ret), K(cur_gc_tablet));
         }
       }
@@ -120,7 +121,8 @@ int ObSSMarkSweepGCStudyP::study_(
           ObSSGCTabletStudyInfo study_info;
           study_info.set_to_min();
           ObSSGCUtil::report_mark_sweep_set_to_min_event(cur_gc_tablet, "LS_CLOG_CHECKPOINT_SCN_BEHIND");
-          if (OB_FAIL(append_tablet_meta_scn_(cur_gc_tablet, study_info, tablet_meta_scn_list))) {
+          if (OB_FAIL(append_tablet_meta_scn_(
+              cur_gc_tablet, study_info, ObSSGCTabletType::UNKNOWN, tablet_meta_scn_list))) {
             LOG_WARN("fail to append tablet meta scn", KR(ret), K(cur_gc_tablet), K(deleted_scn));
           }
         } else if (OB_FAIL(ls.get_tablet(tablet_id, tablet_handle,
@@ -161,7 +163,8 @@ int ObSSMarkSweepGCStudyP::handle_ls_not_exist_(
   // 不能阻止该 LS 随后完成迁入并写入新的 StudyKey。
   // 此处不做无条件删除，避免迟到请求误删新 LS 实例的位点基线。
   study_info.set_to_max();
-  if (OB_FAIL(append_tablet_meta_scn_(cur_gc_tablet, study_info, tablet_meta_scn_list))) {
+  if (OB_FAIL(append_tablet_meta_scn_(
+      cur_gc_tablet, study_info, ObSSGCTabletType::UNKNOWN, tablet_meta_scn_list))) {
     LOG_WARN("fail to append tablet meta scn", KR(ret), K(cur_gc_tablet), K(study_info));
   }
   return ret;
@@ -182,7 +185,8 @@ int ObSSMarkSweepGCStudyP::handle_tablet_not_exist_(
     study_info.set_to_min();
     ObSSGCUtil::report_mark_sweep_set_to_min_event(cur_gc_tablet, "TABLET_NOT_REPLAYED");
   }
-  if (FAILEDx(append_tablet_meta_scn_(cur_gc_tablet, study_info, tablet_meta_scn_list))) {
+  if (FAILEDx(append_tablet_meta_scn_(
+      cur_gc_tablet, study_info, ObSSGCTabletType::UNKNOWN, tablet_meta_scn_list))) {
     LOG_WARN("fail to append tablet meta scn", KR(ret), K(cur_gc_tablet), K(study_info));
   }
   return ret;
@@ -224,6 +228,7 @@ int ObSSMarkSweepGCStudyP::handle_tablet_exist_(
   bool allow_tablet_version_gc = false;
   bool is_normal_study = false;
   ObSSGCTabletStudyInfo study_info;
+  ObSSGCTabletType table_type = ObSSGCTabletType::UNKNOWN;
   if (OB_ISNULL(tablet_handle.get_obj())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("tablet is NULL", KR(ret), K(tablet_handle));
@@ -263,6 +268,11 @@ int ObSSMarkSweepGCStudyP::handle_tablet_exist_(
       LOG_INFO("skip studying empty shell tablet", K(cur_gc_tablet), K(tablet_handle));
     } else if (OB_FAIL(tablet_handle.get_obj()->load_storage_schema(allocator, storage_schema))) {
       LOG_WARN("fail to load storage schema", KR(ret), K(cur_gc_tablet));
+    } else if (OB_ISNULL(storage_schema)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("storage schema is null", KR(ret), K(cur_gc_tablet));
+    } else if (OB_FAIL(ObSSGCTabletType::get_ss_gc_tablet_type(*storage_schema, table_type))) {
+      LOG_WARN("failed to get gc tablet type", KR(ret), K(cur_gc_tablet));
     } else {
       const bool collect_lob_rely_info = need_collect_lob_rely_info_(*storage_schema);
       bool has_memtable = false;
@@ -324,7 +334,8 @@ int ObSSMarkSweepGCStudyP::handle_tablet_exist_(
     }
   }
 
-  if (FAILEDx(append_tablet_meta_scn_(cur_gc_tablet, study_info, tablet_meta_scn_list))) {
+  if (FAILEDx(append_tablet_meta_scn_(
+      cur_gc_tablet, study_info, table_type, tablet_meta_scn_list))) {
     LOG_WARN("fail to append tablet meta scn", KR(ret), K(cur_gc_tablet), K(study_info));
   }
   return ret;
@@ -333,10 +344,11 @@ int ObSSMarkSweepGCStudyP::handle_tablet_exist_(
 int ObSSMarkSweepGCStudyP::append_tablet_meta_scn_(
     const ObSSGCTablet &cur_gc_tablet,
     const ObSSGCTabletStudyInfo &study_info,
+    const ObSSGCTabletType table_type,
     ObIArray<ObSSGCTabletStudyResult> &tablet_meta_scn_list)
 {
   int ret = OB_SUCCESS;
-  ObSSGCTabletStudyResult tablet_meta_scn(cur_gc_tablet, study_info);
+  ObSSGCTabletStudyResult tablet_meta_scn(cur_gc_tablet, study_info, table_type);
   if (OB_FAIL(tablet_meta_scn_list.push_back(tablet_meta_scn))) {
     LOG_WARN("fail to push back tablet meta scn", KR(ret), K(tablet_meta_scn));
   }
@@ -779,6 +791,14 @@ int ObSSGCStudyUtil::merge_server_meta_scn_infos_(
     const int hash_ret = tablet_index_map.get_refactored(cur_info.gc_tablet_, idx);
     if (OB_SUCCESS == hash_ret) {
       ObSSGCTabletStudyResult &final_info = final_tablet_meta_scn_arr.at(idx);
+      if (final_info.table_type_.is_unknown()) {
+        final_info.table_type_ = cur_info.table_type_;
+      } else if (!cur_info.table_type_.is_unknown()
+          && cur_info.table_type_ != final_info.table_type_) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_ERROR("inconsistent tablet table type across study servers", KR(ret),
+            K(cur_info), K(final_info));
+      }
       // take the min of min_dep_meta_scn_ across servers.
       if (cur_info.study_info_.min_dep_meta_scn_.is_min()) {
         final_info.study_info_.min_dep_meta_scn_.set_min();

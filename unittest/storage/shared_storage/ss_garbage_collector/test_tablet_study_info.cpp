@@ -19,6 +19,7 @@
 #include "storage/meta_mem/ob_tenant_meta_mem_mgr.h"
 #include "storage/ss_garbage_collector/ob_ss_gc_service.h"
 #include "storage/ss_garbage_collector/ob_ss_mark_sweep_gc_rpc.h"
+#include "storage/ss_garbage_collector/user_data_gc_dag_task/ob_ss_outtable_gc_task.h"
 #undef private
 #undef protected
 
@@ -342,6 +343,7 @@ protected:
   void expect_max_result(const ObSSGCTabletStudyResultArray &study_results)
   {
     ASSERT_EQ(1, study_results.count());
+    EXPECT_EQ(ObSSGCTabletType::UNKNOWN, study_results.at(0).table_type_.type_);
     EXPECT_TRUE(study_results.at(0).study_info_.min_dep_meta_scn_.is_max());
     EXPECT_EQ(INT64_MAX, study_results.at(0).study_info_.min_major_snapshot_);
     EXPECT_FALSE(study_results.at(0).study_info_.has_finite_rely());
@@ -859,9 +861,52 @@ TEST_F(TestTabletStudyInfo, transfer_table_does_not_cache_until_refresh)
   ASSERT_EQ(1, study_results.count());
   EXPECT_EQ(make_scn(100), study_results.at(0).study_info_.min_dep_meta_scn_);
   EXPECT_EQ(10, study_results.at(0).study_info_.min_major_snapshot_);
+  EXPECT_EQ(ObSSGCTabletType::NORMAL, study_results.at(0).table_type_.type_);
   expect_study_info(gc_tablet, 100, 10);
   EXPECT_EQ(1, get_tablet_study_info_count());
   ASSERT_EQ(OB_SUCCESS, remove_current_tablet(gc_tablet));
+}
+
+TEST_F(TestTabletStudyInfo, outtable_gc_reuses_studied_type_without_storage_schema)
+{
+  ObSSOuttableGCTask task;
+  ObTablet tablet;
+  ObArenaAllocator allocator;
+  const ObSSGCTabletType types[] = {
+      ObSSGCTabletType::NORMAL, ObSSGCTabletType::LOB_META, ObSSGCTabletType::LOB_CTRL};
+  for (const ObSSGCTabletType expected : types) {
+    ObSSGCTabletType type = expected;
+    ASSERT_EQ(OB_SUCCESS, task.get_table_type_(tablet, allocator, type));
+    ASSERT_EQ(expected, type);
+  }
+  ObSSGCTabletType type = ObSSGCTabletType::UNKNOWN;
+  ASSERT_EQ(OB_INVALID_ARGUMENT, task.get_table_type_(tablet, allocator, type));
+  ASSERT_TRUE(type.is_unknown());
+}
+
+TEST_F(TestTabletStudyInfo, outtable_gc_unknown_type_loads_storage_schema)
+{
+  ObSSOuttableGCTask task;
+  ObTablet tablet;
+  ObArenaAllocator allocator;
+  share::schema::ObTableSchema table_schema;
+  ObStorageSchema storage_schema;
+  ASSERT_EQ(OB_SUCCESS, share::ObInnerTableSchema::all_tenant_profile_schema(table_schema));
+  ASSERT_EQ(OB_SUCCESS,
+      storage_schema.init(allocator, table_schema, lib::Worker::CompatMode::MYSQL));
+  tablet.storage_schema_addr_.ptr_ = &storage_schema;
+  DEFER({ tablet.storage_schema_addr_.ptr_ = nullptr; });
+  const share::schema::ObTableType schema_types[] = {
+      share::schema::USER_TABLE, share::schema::AUX_LOB_META,
+      share::schema::AUX_OUTTABLE_LOB_CONTROL};
+  const ObSSGCTabletType expected_types[] = {
+      ObSSGCTabletType::NORMAL, ObSSGCTabletType::LOB_META, ObSSGCTabletType::LOB_CTRL};
+  for (int64_t i = 0; i < 3; ++i) {
+    storage_schema.table_type_ = schema_types[i];
+    ObSSGCTabletType type = ObSSGCTabletType::UNKNOWN;
+    ASSERT_EQ(OB_SUCCESS, task.get_table_type_(tablet, allocator, type));
+    EXPECT_EQ(expected_types[i], type);
+  }
 }
 
 TEST_F(TestTabletStudyInfo, transfer_table_keeps_existing_study_info)

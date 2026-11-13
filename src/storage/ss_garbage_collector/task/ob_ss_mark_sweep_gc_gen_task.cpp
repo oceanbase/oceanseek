@@ -1133,8 +1133,8 @@ int ObSSMarkSweepGCGenTask::calc_min_meta_scn_(
     }
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(tablet_with_meta_scn_arr.push_back(ObSSGCTabletWithMetaScn(
-            study_result.gc_tablet_, meta_scn, study_info.clog_checkpoint_scn_,
-            study_info.orig_clog_checkpoint_scn_)))) {
+            study_result.gc_tablet_, meta_scn, study_result.table_type_,
+            study_info.clog_checkpoint_scn_, study_info.orig_clog_checkpoint_scn_)))) {
       LOG_WARN("fail to push back tablet with meta scn", KR(ret), K_(tenant_id), K(study_result));
     }
   }

@@ -50,6 +50,9 @@ private:
                                      ObSSGCTabletWithMetaScnArray &scan_inputs,
                                      ObSSGCTabletWithMetaScnArray &lob_ctrl_scan_inputs,
                                      share::SCN &min_outtable_data_scn);
+  int get_table_type_(const ObTablet &tablet,
+                      common::ObArenaAllocator &allocator,
+                      ObSSGCTabletType &table_type);
   int calc_lob_gc_checkpoint_scn_(
       const ObSSGCTabletWithMetaScn &tablet_with_meta_scn,
       const ObTablet &first_tablet,

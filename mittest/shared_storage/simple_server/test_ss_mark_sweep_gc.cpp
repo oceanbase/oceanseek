@@ -792,8 +792,8 @@ public:
         for (int64_t n = 0; OB_SUCC(ret) && n < nodes.count(); ++n) {
           results.reuse();
           for (int64_t i = 0; OB_SUCC(ret) && i < batch.count(); ++i) {
-            ret = results.push_back(
-                ObSSGCTabletStudyResult(batch.at(i).gc_tablet_, nodes.at(n).study_info_));
+            ret = results.push_back(ObSSGCTabletStudyResult(
+                batch.at(i).gc_tablet_, nodes.at(n).study_info_, ObSSGCTabletType::UNKNOWN));
           }
           if (OB_SUCC(ret)) {
             ret = diag_info.save_study_result(nodes.at(n).server_, batch, results);
@@ -2908,7 +2908,8 @@ TEST_F(TestSSMarkSweepGC, diagnose_study_raw_result_oom)
   ASSERT_TRUE(server.set_ip_addr("127.0.0.1", 2882));
   study_info.set_to_min();
   ASSERT_EQ(OB_SUCCESS, batch.push_back(ObSSGCTabletWithDelScn(tablet, SCN::min_scn())));
-  ASSERT_EQ(OB_SUCCESS, results.push_back(ObSSGCTabletStudyResult(tablet, study_info)));
+  ASSERT_EQ(OB_SUCCESS, results.push_back(
+      ObSSGCTabletStudyResult(tablet, study_info, ObSSGCTabletType::UNKNOWN)));
   ASSERT_EQ(OB_SUCCESS, allocator.init(TEST_TENANT_ID));
   ASSERT_EQ(OB_ALLOCATE_MEMORY_FAILED, diag_info.save_study_result(server, batch, results));
   EXPECT_EQ(OB_ALLOCATE_MEMORY_FAILED, diag_info.get_first_fail_ret());
@@ -3150,8 +3151,8 @@ TEST_F(TestSSMarkSweepGC, diagnose_study_grouping_and_publish)
         ASSERT_EQ(OB_SUCCESS,
             study_info.min_dep_meta_scn_.convert_for_inner_table_field(raw_value));
         study_info.min_major_snapshot_ = raw_value + 1000000;
-        ASSERT_EQ(OB_SUCCESS,
-            results.push_back(ObSSGCTabletStudyResult(batch.at(t).gc_tablet_, study_info)));
+        ASSERT_EQ(OB_SUCCESS, results.push_back(ObSSGCTabletStudyResult(
+            batch.at(t).gc_tablet_, study_info, ObSSGCTabletType::UNKNOWN)));
       }
       ASSERT_EQ(OB_SUCCESS, diag_info.save_study_result(
           source_nodes.at(n).server_, batch, results));
@@ -3296,7 +3297,8 @@ TEST_F(TestSSMarkSweepGC, diagnose_study_raw_result_lifecycle)
   ASSERT_TRUE(server.set_ip_addr("127.0.0.1", 2882));
   study_info.set_to_min();
   ASSERT_EQ(OB_SUCCESS, batch.push_back(ObSSGCTabletWithDelScn(tablet, SCN::min_scn())));
-  ASSERT_EQ(OB_SUCCESS, results.push_back(ObSSGCTabletStudyResult(tablet, study_info)));
+  ASSERT_EQ(OB_SUCCESS, results.push_back(
+      ObSSGCTabletStudyResult(tablet, study_info, ObSSGCTabletType::UNKNOWN)));
   ASSERT_EQ(OB_SUCCESS, diag_info.save_study_result(server, batch, results));
   ASSERT_EQ(OB_SUCCESS, diag_info.get_first_fail_ret());
   ASSERT_EQ(1, diag_info.get_study_results().count());
@@ -3310,7 +3312,8 @@ TEST_F(TestSSMarkSweepGC, diagnose_study_raw_result_lifecycle)
   batch.reuse();
   results.reuse();
   ASSERT_EQ(OB_SUCCESS, batch.push_back(ObSSGCTabletWithDelScn(tablet, SCN::min_scn())));
-  ASSERT_EQ(OB_SUCCESS, results.push_back(ObSSGCTabletStudyResult(tablet, study_info)));
+  ASSERT_EQ(OB_SUCCESS, results.push_back(
+      ObSSGCTabletStudyResult(tablet, study_info, ObSSGCTabletType::UNKNOWN)));
   ASSERT_EQ(OB_SUCCESS, diag_info.save_study_result(server, batch, results));
   ASSERT_EQ(1, diag_info.get_study_results().count());
   ASSERT_EQ(2, diag_info.get_study_results().at(0)->tablet_results_.count());
@@ -3332,7 +3335,8 @@ TEST_F(TestSSMarkSweepGC, diagnose_study_raw_result_lifecycle)
   ASSERT_EQ(OB_INVALID_DATA, diag_info.save_study_result(server, batch, results));
   ASSERT_EQ(OB_INVALID_DATA, diag_info.get_first_fail_ret());
   ASSERT_EQ(0, diag_info.get_study_results().count());
-  ASSERT_EQ(OB_SUCCESS, results.push_back(ObSSGCTabletStudyResult(tablet, study_info)));
+  ASSERT_EQ(OB_SUCCESS, results.push_back(
+      ObSSGCTabletStudyResult(tablet, study_info, ObSSGCTabletType::UNKNOWN)));
   ASSERT_EQ(OB_SUCCESS, diag_info.save_study_result(server, batch, results));
   ASSERT_EQ(OB_INVALID_DATA, diag_info.get_first_fail_ret());
   ASSERT_EQ(0, diag_info.get_study_results().count());

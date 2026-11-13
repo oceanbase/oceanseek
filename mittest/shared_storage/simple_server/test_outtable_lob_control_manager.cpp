@@ -513,7 +513,8 @@ TEST_F(TestOuttableLobControlManager, gc_delete_batch_rechecks_current_rows_and_
   param.snapshot_meta_scn_ = SCN::base_scn();
   param.safe_meta_scn_ = SCN::base_scn();
   ASSERT_EQ(OB_SUCCESS, param.tablet_with_meta_scn_arr_.push_back(ObSSGCTabletWithMetaScn(
-      ObSSGCTablet(ObLSID(1), ObTabletID(400001), SCN::base_scn()), SCN::base_scn())));
+      ObSSGCTablet(ObLSID(1), ObTabletID(400001), SCN::base_scn()), SCN::base_scn(),
+      ObSSGCTabletType::UNKNOWN)));
   ASSERT_EQ(OB_SUCCESS, dag.init_by_param(&param));
   ObSSMarkSweepCtx &ctx = *dag.get_ctx();
   ctx.min_outtable_data_scn_ = SCN::minus(SCN::max_scn(), 1);

@@ -537,7 +537,8 @@ public:
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("invalid gc tablet", KR(ret), K(gc_tablet));
     } else if (OB_FAIL(ctx.tablet_with_meta_scn_arr_.push_back(
-                   ObSSGCTabletWithMetaScn(gc_tablet, share::SCN::min_scn())))) {
+                   ObSSGCTabletWithMetaScn(gc_tablet, share::SCN::min_scn(),
+                       ObSSGCTabletType::UNKNOWN)))) {
       LOG_WARN("fail to append gc tablet", KR(ret), K(gc_tablet));
     } else if (OB_FAIL(ctx.tablet_kept_meta_scn_map_.create(
                    2, ObMemAttr(ctx.tenant_id_, "TestKeptMap")))) {
@@ -634,7 +635,8 @@ TEST_F(TestSSGCDelAndKeptCalculation, lob_rely_requires_same_tablet_meta_version
 
   ObSSGCTabletStudyResultArray study_results;
   ObSSGCTabletWithMetaScnArray tablet_with_meta_scns;
-  OK(study_results.push_back(ObSSGCTabletStudyResult(gc_tablet, study_info)));
+  OK(study_results.push_back(
+      ObSSGCTabletStudyResult(gc_tablet, study_info, ObSSGCTabletType::UNKNOWN)));
   OK(task.calc_min_meta_scn_(
       version_3, study_results, tablet_with_meta_scns));
   ASSERT_EQ(1, tablet_with_meta_scns.count());
@@ -877,7 +879,7 @@ TEST_F(TestSSGCDelAndKeptCalculation, all_versions_deleted_advances_kept_meta_sc
 
   // studied/safe 均为 big，reserved=big 回落到真实版本 V3，
   // 仅由 real_min_reserved == mark_delete_meta_scn 触发 can_del_all。
-  const ObSSGCTabletWithMetaScn tablet_with_meta_scn(gc_tablet, big);
+  const ObSSGCTabletWithMetaScn tablet_with_meta_scn(gc_tablet, big, ObSSGCTabletType::UNKNOWN);
   ObSSMarkSweepSortTask::ObSSPersistKeptMetaScnItem persist_item;
   {
     ObSSMarkSweepSortTask::ObMarkSweepSorterPair sorter_pair;

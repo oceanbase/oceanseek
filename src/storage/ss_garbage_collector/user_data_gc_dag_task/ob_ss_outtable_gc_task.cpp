@@ -378,8 +378,13 @@ int ObSSOuttableGCTask::calc_lob_gc_checkpoint_scn_(
       || first_tablet.get_tablet_meta().split_info_.is_data_incomplete()) {
     // An incomplete scan baseline must block user GC even when the current Study is complete.
   } else {
-    checkpoint_scn = SCN::min(shared_scn, SCN::min(orig_scn, study_scn));
-    if (tablet_with_meta_scn.is_cold() && shared_scn == orig_scn) {
+    checkpoint_scn = MIN3(shared_scn, orig_scn, study_scn);
+    // If study_scn > orig_scn, the replica supplying orig_scn must have used
+    // cold promotion. Its LS checkpoint was read before its tablet, so there
+    // is no new row data in (orig_scn, study_scn). With asymmetric replica
+    // checkpoints, the shared scan baseline can lie inside this interval.
+    if (tablet_with_meta_scn.is_cold()
+        && orig_scn <= shared_scn && shared_scn < study_scn) {
       ObTabletHandle latest_tablet_handle;
       const ObTablet *latest_tablet = &first_tablet;
       if (kept_meta_scns.count() > 1) {
@@ -406,7 +411,7 @@ int ObSSOuttableGCTask::calc_lob_gc_checkpoint_scn_(
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("invalid latest kept lob checkpoint scn", KR(ret), K(latest_scn),
               K(tablet_with_meta_scn));
-        } else if (latest_scn == orig_scn) {
+        } else if (latest_scn == shared_scn) {
           checkpoint_scn = study_scn;
         }
       }
@@ -426,6 +431,7 @@ int ObSSOuttableGCTask::prepare_lob_tablet_scan_input_(
     SCN &min_outtable_data_scn)
 {
   int ret = OB_SUCCESS;
+  ObSSGCTabletType table_type = tablet_with_meta_scn.table_type_;
   const ObSSGCTablet &gc_tablet = tablet_with_meta_scn.gc_tablet_;
   ObSEArray<SCN, 8> all_meta_scns;
   ObSEArray<SCN, 8> del_meta_scns;
@@ -436,8 +442,9 @@ int ObSSOuttableGCTask::prepare_lob_tablet_scan_input_(
   all_meta_scns.set_attr(mem_attr);
   del_meta_scns.set_attr(mem_attr);
   kept_meta_scns.set_attr(mem_attr);
-  // TODO(muwei.ym): 后续通过迭代 Tablet 的方式优化。
-  if (OB_FAIL(get_all_meta_scns_(gc_tablet, ctx.snapshot_meta_scn_, all_meta_scns))) {
+  if (table_type.is_normal()) {
+    // Study already identified a non-LOB tablet; no shared metadata needs to be read.
+  } else if (OB_FAIL(get_all_meta_scns_(gc_tablet, ctx.snapshot_meta_scn_, all_meta_scns))) {
     LOG_WARN("failed to get tablet meta versions", KR(ret), K(gc_tablet), K(ctx.snapshot_meta_scn_));
   } else if (all_meta_scns.empty()) {
     // 无可读共享版本不能证明没有 LOB 引用，本轮跳过用户 GC，等待后续重新准备。
@@ -464,7 +471,6 @@ int ObSSOuttableGCTask::prepare_lob_tablet_scan_input_(
       ObArenaAllocator allocator(ObMemAttr(ctx.tenant_id_, "SSGCLobTablet"));
       ObTabletHandle tablet_handle;
       ObTablet *tablet = nullptr;
-      ObStorageSchema *storage_schema = nullptr;
       ObSSMetaService *meta_service = MTL(ObSSMetaService *);
       if (OB_ISNULL(meta_service)) {
         ret = OB_ERR_UNEXPECTED;
@@ -477,23 +483,19 @@ int ObSSOuttableGCTask::prepare_lob_tablet_scan_input_(
         LOG_WARN("selected tablet handle is null", KR(ret), K(gc_tablet), K(meta_scn));
       } else if (tablet->is_empty_shell()) {
         // 空壳 Tablet 没有存储 Schema 和可扫描的 LOB 行。
-      } else if (OB_FAIL(tablet->load_storage_schema(allocator, storage_schema))) {
-        LOG_WARN("failed to load selected tablet storage schema", KR(ret), K(gc_tablet), K(meta_scn));
-      } else if (OB_ISNULL(storage_schema)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("selected tablet storage schema is null", KR(ret), K(gc_tablet), K(meta_scn));
-      } else if (storage_schema->is_aux_lob_meta_table()
-          || storage_schema->is_aux_outtable_lob_control_table()) {
+      } else if (OB_FAIL(get_table_type_(*tablet, allocator, table_type))) {
+        LOG_WARN("failed to get selected tablet table type", KR(ret), K(gc_tablet), K(meta_scn));
+      } else if (table_type.is_lob_meta() || table_type.is_lob_ctrl()) {
         SCN clog_checkpoint_scn;
         if (OB_FAIL(calc_lob_gc_checkpoint_scn_(
             tablet_with_meta_scn, *tablet, kept_meta_scns, allocator, clog_checkpoint_scn))) {
           LOG_WARN("failed to calculate lob checkpoint scn", KR(ret), K(gc_tablet), K(meta_scn));
-        } else if (storage_schema->is_aux_lob_meta_table()
-            && OB_FAIL(scan_inputs.push_back(ObSSGCTabletWithMetaScn(gc_tablet, meta_scn)))) {
+        } else if (table_type.is_lob_meta()
+            && OB_FAIL(scan_inputs.push_back(
+                ObSSGCTabletWithMetaScn(gc_tablet, meta_scn, table_type)))) {
           LOG_WARN("failed to append lob meta scan input", KR(ret), K(gc_tablet), K(meta_scn));
-        } else if (storage_schema->is_aux_outtable_lob_control_table()
-            && OB_FAIL(lob_ctrl_scan_inputs.push_back(
-                ObSSGCTabletWithMetaScn(gc_tablet, meta_scn)))) {
+        } else if (table_type.is_lob_ctrl() && OB_FAIL(lob_ctrl_scan_inputs.push_back(
+            ObSSGCTabletWithMetaScn(gc_tablet, meta_scn, table_type)))) {
           LOG_WARN("failed to append lob ctrl scan input", KR(ret), K(gc_tablet), K(meta_scn));
         } else {
           min_outtable_data_scn = SCN::min(min_outtable_data_scn, clog_checkpoint_scn);
@@ -505,8 +507,28 @@ int ObSSOuttableGCTask::prepare_lob_tablet_scan_input_(
           }
         }
       }
-      ObTabletObjLoadHelper::free(allocator, storage_schema);
     }
+  }
+  return ret;
+}
+
+int ObSSOuttableGCTask::get_table_type_(
+    const ObTablet &tablet, ObArenaAllocator &allocator, ObSSGCTabletType &table_type)
+{
+  int ret = OB_SUCCESS;
+  if (table_type.is_unknown()) {
+    // Absent tablets and older Study responses still need the frozen shared storage schema.
+    ObStorageSchema *storage_schema = nullptr;
+    if (OB_FAIL(tablet.load_storage_schema(allocator, storage_schema))) {
+      LOG_WARN("failed to load selected tablet storage schema",
+          KR(ret), K(tablet.get_tablet_meta()));
+    } else if (OB_ISNULL(storage_schema)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("selected tablet storage schema is null", KR(ret), K(tablet.get_tablet_meta()));
+    } else if (OB_FAIL(ObSSGCTabletType::get_ss_gc_tablet_type(*storage_schema, table_type))) {
+      LOG_WARN("failed to get gc tablet type", KR(ret), K(tablet.get_tablet_meta()));
+    }
+    ObTabletObjLoadHelper::free(allocator, storage_schema);
   }
   return ret;
 }

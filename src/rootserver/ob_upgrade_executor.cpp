@@ -990,6 +990,9 @@ int ObUpgradeExecutor::run_upgrade_system_table_job_(
       } else if (OB_TMP_FAIL(upgrade_system_table_(tenant_id))) {
         LOG_WARN("fail to upgrade system table", KR(tmp_ret), K(tenant_id));
         backup_ret = OB_SUCCESS == backup_ret ? tmp_ret : backup_ret;
+      } else if (OB_FAIL(check_schema_sync_(tenant_id))) {
+        LOG_WARN("fail to check schema sync before upgrading builtin user tables",
+                 KR(ret), K(tenant_id));
       } else if (OB_TMP_FAIL(upgrade_builtin_user_tables_(tenant_id))) {
         LOG_WARN("fail to upgrade builtin user tables", KR(tmp_ret), K(tenant_id));
         backup_ret = OB_SUCCESS == backup_ret ? tmp_ret : backup_ret;
