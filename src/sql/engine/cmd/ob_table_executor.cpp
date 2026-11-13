@@ -330,6 +330,9 @@ int ObCreateTableExecutor::prepare_alter_arg(ObCreateTableStmt &stmt,
     LOG_WARN("failed to add member SESSION_ID for alter table schema", K(ret), K(alter_table_arg));
   } else if (OB_FAIL(alter_table_schema->alter_option_bitset_.add_member(obrpc::ObAlterTableArg::TABLE_NAME))) {
     LOG_WARN("failed to add member TABLE_NAME for alter table schema", K(ret), K(alter_table_arg));
+  } else if (alter_table_arg.auto_grant_creator_privileges_) {
+    // AlterTableSchema::assign() does not copy define_user_id_.
+    alter_table_schema->set_define_user_id(table_schema.get_define_user_id());
   }
   LOG_DEBUG("alter table arg preparation complete!", K(*alter_table_schema), K(ret));
   return ret;
@@ -385,6 +388,7 @@ int ObCreateTableExecutor::execute_ctas(ObExecContext &ctx,
     LOG_WARN("failed to prepare create table as select catalog sync operation", KR(ret),
              K(catalog_sync_tenant_id), K(catalog_sync_unified_catalog));
   }
+  const bool auto_grant_creator = stmt.get_create_table_arg().auto_grant_creator_privileges_;
   ObString cur_query;
   int64_t affected_rows = 0;
   ObMySQLProxy *sql_proxy = ctx.get_sql_proxy();
@@ -394,6 +398,7 @@ int ObCreateTableExecutor::execute_ctas(ObExecContext &ctx,
   ObPhysicalPlanCtx *plan_ctx = ctx.get_physical_plan_ctx();
   ObArenaAllocator allocator("CreateTableExec");
   HEAP_VAR(obrpc::ObAlterTableArg, alter_table_arg) {
+    alter_table_arg.auto_grant_creator_privileges_ = auto_grant_creator;
     obrpc::ObDropTableArg drop_table_arg;
     obrpc::ObTableItem table_item;
     ObSqlString ins_sql;
@@ -401,6 +406,8 @@ int ObCreateTableExecutor::execute_ctas(ObExecContext &ctx,
     obrpc::ObCreateTableRes create_table_res;
     obrpc::ObCreateTableArg &create_table_arg = stmt.get_create_table_arg();
     create_table_arg.is_inner_ = my_session->is_inner();
+    // Grant privileges when the temporary table is renamed.
+    create_table_arg.auto_grant_creator_privileges_ = false;
     bool need_clean = true;
     bool is_async_select_query = false;
     CK(OB_NOT_NULL(sql_proxy),
@@ -495,6 +502,8 @@ int ObCreateTableExecutor::execute_ctas(ObExecContext &ctx,
 
         //3, 插入数据
         if (OB_SUCC(ret)) {
+          ObSQLSessionInfo::CtasPrivilegeGuard creator_guard(
+              *my_session, auto_grant_creator ? create_table_res.table_id_ : OB_INVALID_ID);
           bool is_mysql_temp_table = stmt.get_create_table_arg().schema_.is_mysql_tmp_table();
           bool in_trans = my_session->is_in_transaction();
           bool need_set_autocommit = (!is_mysql_temp_table || !in_trans);
@@ -682,6 +691,7 @@ int ObCreateTableExecutor::execute_ctas(ObExecContext &ctx,
     }
     OZ(my_session->store_query_string(cur_query));
   }
+  stmt.get_create_table_arg().auto_grant_creator_privileges_ = auto_grant_creator;
   return ret;
 }
 

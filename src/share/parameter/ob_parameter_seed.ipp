@@ -3715,6 +3715,11 @@ DEF_BOOL(_enable_custom_dict_table, OB_TENANT_PARAMETER, "False",
         "Value: True: turned on; False: turned off.",
         ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 
+DEF_BOOL(_enable_auto_grant_to_table_creator, OB_TENANT_PARAMETER, "False",
+         "Specifies whether to automatically grant table-level SELECT, INSERT, UPDATE, "
+         "and DELETE privileges to the table creator upon successful table creation.",
+         ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
+
 DEF_BOOL(_enable_async_index, OB_TENANT_PARAMETER, "False",
          "Controls whether asynchronous index is supported in the current tenant.",
          ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));

@@ -110,7 +110,8 @@ public:
       const common::ObString &src_database_name,
       const common::ObString &src_table_name,
       const common::ObString &dst_database_name,
-      const common::ObString &dst_table_name);
+      const common::ObString &dst_table_name,
+      const uint64_t creator_user_id = common::OB_INVALID_ID);
 
 private:
   int get_db_priv_user_ids_(common::hash::ObHashSet<uint64_t> &db_priv_user_ids,

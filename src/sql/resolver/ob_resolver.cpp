@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/ob_resolver.h"
+#include "share/schema/ob_table_creator_privilege.h"
 #include "sql/resolver/dml/ob_insert_resolver.h"
 #include "sql/resolver/dml/ob_merge_resolver.h"
 #include "sql/resolver/dml/ob_update_resolver.h"
@@ -208,6 +209,40 @@ int ObResolver::select_stmt_resolver_func(ObResolverParams &params, const ParseN
       LOG_WARN("execute stmt_resolver failed", K(ret), K(parse_tree.type_));
     }
     stmt = stmt_resolver.get_basic_stmt();
+  }
+  return ret;
+}
+
+static int set_table_creator_privileges(ObItemType type, const ObSQLSessionInfo &session,
+                                        obrpc::ObDDLArg &ddl_arg)
+{
+  int ret = OB_SUCCESS;
+  bool *grant_to_creator = nullptr;
+  if (T_CREATE_TABLE == type) {
+    obrpc::ObCreateTableArg &arg = static_cast<obrpc::ObCreateTableArg &>(ddl_arg);
+    if (schema::ObTableCreatorPrivilege::is_supported_table(arg.schema_)) {
+      grant_to_creator = &arg.auto_grant_creator_privileges_;
+    }
+  } else if (T_CREATE_TABLE_LIKE == type) {
+    obrpc::ObCreateTableLikeArg &arg = static_cast<obrpc::ObCreateTableLikeArg &>(ddl_arg);
+    if (schema::USER_TABLE == arg.table_type_) {
+      grant_to_creator = &arg.auto_grant_creator_privileges_;
+    }
+  }
+  if (nullptr != grant_to_creator || T_FORK_TABLE == type) {
+    bool enabled = false;
+    if (OB_FAIL(schema::ObTableCreatorPrivilege::check_enabled(ddl_arg.exec_tenant_id_, enabled))) {
+      LOG_WARN("failed to decide table creator privileges", KR(ret), K(type), K(ddl_arg.exec_tenant_id_));
+    } else if (nullptr != grant_to_creator) {
+      *grant_to_creator = enabled;
+    } else {
+      obrpc::ObForkTableArg &arg = static_cast<obrpc::ObForkTableArg &>(ddl_arg);
+      arg.creator_user_id_ = enabled ? session.get_priv_user_id() : OB_INVALID_ID;
+      if (enabled && OB_INVALID_ID == arg.creator_user_id_) {
+        ret = OB_USER_NOT_EXIST;
+        LOG_WARN("fork table creator is missing", KR(ret), K(ddl_arg.exec_tenant_id_));
+      }
+    }
   }
   return ret;
 }
@@ -1613,7 +1648,9 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
         }
         if (OB_FAIL(ObResolverUtils::set_sync_ddl_id_str(params_.session_info_, ddl_arg.ddl_id_str_))) {
           LOG_WARN("Failed to set_sync_ddl_id_str", K(ret));
-        } else { } // do-nothing
+        } else if (params_.session_info_->is_user_session()) {
+          ret = set_table_creator_privileges(real_parse_tree->type_, *params_.session_info_, ddl_arg);
+        }
       }
     }
   }  // end if

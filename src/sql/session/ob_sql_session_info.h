@@ -1095,6 +1095,21 @@ public:
   transaction::ObTxClass get_trans_type() const { return trans_type_; }
 
   int get_session_priv_info(share::schema::ObSessionPrivInfo &session_priv) const;
+  class CtasPrivilegeGuard
+  {
+  public:
+    CtasPrivilegeGuard(ObSQLSessionInfo &session, const uint64_t table_id)
+      : session_(session), saved_(session.ctas_privilege_table_id_)
+    {
+      session_.ctas_privilege_table_id_ = table_id;
+    }
+    ~CtasPrivilegeGuard() { session_.ctas_privilege_table_id_ = saved_; }
+  private:
+    ObSQLSessionInfo &session_;
+    uint64_t saved_;
+    DISALLOW_COPY_AND_ASSIGN(CtasPrivilegeGuard);
+  };
+  uint64_t get_ctas_privilege_table_id() const { return ctas_privilege_table_id_; }
   void set_found_rows(const int64_t count) { found_rows_ = count; }
   int64_t get_found_rows() const { return found_rows_; }
   void set_affected_rows(const int64_t count) { affected_rows_ = count; }
@@ -1982,6 +1997,7 @@ private:
 
   ObPrivSet user_priv_set_;
   ObPrivSet db_priv_set_;
+  uint64_t ctas_privilege_table_id_;
   int64_t curr_trans_start_time_;
   int64_t curr_trans_last_stmt_time_;
   int64_t sess_create_time_;  //会话创建时间, 目前仅用于临时表的清理判断

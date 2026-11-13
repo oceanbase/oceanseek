@@ -95,6 +95,7 @@ ObSQLSessionInfo::ObSQLSessionInfo(const uint64_t tenant_id) :
       end_trans_cb_(),
       user_priv_set_(),
       db_priv_set_(),
+      ctas_privilege_table_id_(OB_INVALID_ID),
       curr_trans_start_time_(0),
       curr_trans_last_stmt_time_(0),
       sess_create_time_(0),
@@ -293,6 +294,7 @@ void ObSQLSessionInfo::reset(bool skip_sys_var)
     audit_record_.reset();
     user_priv_set_ = 0;
     db_priv_set_ = 0;
+    ctas_privilege_table_id_ = OB_INVALID_ID;
     curr_trans_start_time_ = 0;
     curr_trans_last_stmt_time_ = 0;
     sess_create_time_ = 0;

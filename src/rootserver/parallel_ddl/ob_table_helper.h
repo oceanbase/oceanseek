@@ -7,6 +7,7 @@
 
 #include "rootserver/parallel_ddl/ob_ddl_helper.h"
 #include "lib/hash/ob_hashmap.h"
+#include "share/schema/ob_priv_mgr.h"
 
 namespace oceanbase
 {
@@ -65,6 +66,8 @@ protected:
   int create_audits_();
   int create_tablets_();
   virtual int calc_schema_version_cnt_() override;
+  virtual bool auto_grant_creator_privileges_() const { return false; }
+  int prepare_creator_privileges_();
   int collect_and_sync_host_ids_(
       share::schema::ObSchemaService *schema_service_impl,
       common::ObIArray<uint64_t> &host_ids,
@@ -77,6 +80,8 @@ protected:
   common::ObArray<ObSequenceSchema *> new_sequences_;
   common::ObArray<ObSAuditSchema *> new_audits_;
   common::ObArray<ObMockFKParentTableSchema *> new_mock_fk_parent_tables_;
+  share::schema::ObTablePrivSortKey creator_privilege_key_;
+  bool need_grant_creator_privileges_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObTableHelper);
 };

@@ -83,6 +83,7 @@ ob_set_subtarget(ob_share vector
 
 ob_set_subtarget(ob_share ALONE
   ob_rpc_struct.cpp
+  schema/ob_table_creator_privilege.cpp
   ob_tenant_mgr.cpp
   parameter/ob_parameter_attr.cpp
   schema/ob_schema_service_sql_impl.cpp

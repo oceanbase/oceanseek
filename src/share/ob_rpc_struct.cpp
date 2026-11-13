@@ -1956,7 +1956,7 @@ OB_SERIALIZE_MEMBER((ObCreateTableArg, ObDDLArg),
 
 bool ObCreateTableArg::is_allow_when_upgrade() const
 {
-  bool bret = true;
+  bool bret = !auto_grant_creator_privileges_;
   if (0 != foreign_key_arg_list_.count()
       || 0 != vertical_partition_arg_list_.count()) {
     bret = false;

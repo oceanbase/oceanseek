@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX RS
 
 #include "ob_ddl_service.h"
+#include "share/schema/ob_table_creator_privilege.h"
 #include "share/schema/ob_schema_printer.h"
 #include "share/schema/ob_schema_service_sql_impl.h"
 #include "share/schema/ob_schema_scan_iterator.h"
@@ -17160,6 +17161,35 @@ int ObDDLService::alter_table_in_trans(obrpc::ObAlterTableArg &alter_table_arg,
                                 register_ls_tablets_initial_published_versions(tenant_id, partition_index_published_tablets, trans))) {
             LOG_WARN("failed to register async-index initial published versions for add/truncate partition",
                      KR(ret), K(tenant_id), "table_id", new_table_schema.get_table_id());
+          }
+        }
+        if (OB_SUCC(ret) && alter_table_arg.auto_grant_creator_privileges_) {
+          const common::ObBitSet<> &options = alter_table_schema.alter_option_bitset_;
+          const ObDatabaseSchema *database = nullptr;
+          if (!orig_table_schema->is_user_table() || !orig_table_schema->is_ctas_tmp_table()
+              || orig_table_schema->get_session_id() != alter_table_arg.session_id_
+              || 0 != new_table_schema.get_session_id()
+              || 2 != options.num_members()
+              || !options.has_member(ObAlterTableArg::TABLE_NAME)
+              || !options.has_member(ObAlterTableArg::SESSION_ID)
+              || orig_table_schema->get_define_user_id() != alter_table_schema.get_define_user_id()) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_WARN("creator grant is only valid for CTAS final publication", KR(ret));
+          } else if (OB_FAIL(schema_guard.get_database_schema(tenant_id,
+                                  new_table_schema.get_database_id(), database))) {
+            LOG_WARN("failed to get CTAS destination database", KR(ret));
+          } else if (OB_ISNULL(database)) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (nullptr == schema_guard.get_user_info(tenant_id, orig_table_schema->get_define_user_id())) {
+            ret = OB_USER_NOT_EXIST;
+            LOG_WARN("CTAS creator no longer exists", KR(ret), K(tenant_id));
+          } else {
+            const ObTablePrivSortKey key(tenant_id, orig_table_schema->get_define_user_id(),
+                database->get_database_name_str(), new_table_schema.get_table_name_str());
+            if (OB_FAIL(ddl_operator.grant_table(key, ObTableCreatorPrivilege::PRIVILEGES,
+                    nullptr, trans, ObRawObjPrivArray(), 0, ObObjPrivSortKey()))) {
+              LOG_WARN("failed to grant CTAS final privileges", KR(ret));
+            }
           }
         }
         const bool is_commit = OB_SUCC(ret);
@@ -42176,8 +42206,12 @@ int ObDDLService::fork_table(const obrpc::ObForkTableArg &arg, obrpc::ObDDLRes &
       // 否则 fork 出的目标表可能丢失尚未被异步维护的索引数据。参考 SeekDB
       // ob_fork_table_service.cpp 的 check_has_async_vector_index + ObChangeStreamMgr::wait_refresh_scn。
       ObDDLSQLTransaction trans(schema_service_);
-      ObForkPrivilegeCopier privilege_copier(arg.tenant_id_, *schema_service_, schema_guard, trans, &arg.ddl_stmt_str_);
+      ObForkPrivilegeCopier privilege_copier(arg.tenant_id_, *schema_service_, schema_guard, trans, nullptr);
       int64_t fork_snapshot_version = 0;
+      ObDDLOperator ddl_operator(*schema_service_, *sql_proxy_);
+      const bool grant_to_creator = OB_INVALID_ID != arg.creator_user_id_;
+      const ObTablePrivSortKey creator_key(arg.tenant_id_, arg.creator_user_id_,
+          arg.dst_database_name_, arg.dst_table_name_);
       if (OB_FAIL(trans.start(&get_sql_proxy(), arg.tenant_id_, refreshed_schema_version))) {
         LOG_WARN("start trans failed", KR(ret), "tenant_id", arg.tenant_id_, K(refreshed_schema_version));
       } else if (OB_FAIL(fork_table_check_fork_conflict_(trans, arg.tenant_id_, *src_table_schema))) {
@@ -42194,15 +42228,23 @@ int ObDDLService::fork_table(const obrpc::ObForkTableArg &arg, obrpc::ObDDLRes &
         } else if (OB_FAIL(fork_table_cal_snapshot_(trans, arg.tenant_id_, snapshot_gc_scn, fork_snapshot_version))) {
           LOG_WARN("[ForkTable] failed to cal fork snapshot", KR(ret), "tenant_id", arg.tenant_id_, K(snapshot_gc_scn));
         } else if (FALSE_IT(DEBUG_SYNC(AFTER_FORK_TABLE_CAL_SNAPSHOT_BEFORE_LOCK))) {
+        } else if (grant_to_creator && nullptr == schema_guard.get_user_info(arg.tenant_id_, arg.creator_user_id_)) {
+          ret = OB_USER_NOT_EXIST;
+          LOG_WARN("[ForkTable] creator no longer exists", KR(ret), K(arg));
         } else if (arg.copy_grants_ && OB_FAIL(privilege_copier.copy_table_privileges(
                                                 arg.src_database_name_, arg.src_table_name_,
-                                                arg.dst_database_name_, arg.dst_table_name_))) {
+                                                arg.dst_database_name_, arg.dst_table_name_, arg.creator_user_id_))) {
           LOG_WARN("[ForkTable] failed to copy explicit table privileges", KR(ret), K(arg));
+        } else if (grant_to_creator && !arg.copy_grants_
+                   && OB_FAIL(ddl_operator.grant_table(creator_key, ObTableCreatorPrivilege::PRIVILEGES,
+                        nullptr, trans, ObRawObjPrivArray(), 0, ObObjPrivSortKey()))) {
+          LOG_WARN("[ForkTable] write creator privileges failed", KR(ret), K(arg));
         } else if (OB_FAIL(fork_table_(arg, *src_table_schema, fork_snapshot_version, *dst_db_schema, schema_guard,
                                       trans, allocator, 0 /* parent_task_id */, task_record))) {
           LOG_WARN("[ForkTable] failed to fork table", KR(ret), K(arg), K(fork_snapshot_version));
 #ifdef ERRSIM
-        } else if (arg.copy_grants_ && ERRSIM_FORK_TABLE_COPY_GRANTS_BEFORE_COMMIT) {
+        } else if ((arg.copy_grants_ || grant_to_creator)
+                   && ERRSIM_FORK_TABLE_COPY_GRANTS_BEFORE_COMMIT) {
           // 权限、目标表和任务都已写入但尚未提交；注错验证新增 ACL 和扩权 ACL 能随事务一起还原。
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("[ForkTable] errsim COPY GRANTS transaction failure before commit", KR(ret), K(arg));

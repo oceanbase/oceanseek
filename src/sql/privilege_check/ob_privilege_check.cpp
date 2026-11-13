@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX SQL_SESSION
 #include "sql/privilege_check/ob_privilege_check.h"
 #include "observer/dbms_scheduler/ob_dbms_sched_job_utils.h"
+#include "share/schema/ob_table_creator_privilege.h"
 
 #include "sql/resolver/ddl/ob_create_table_stmt.h"
 #include "sql/resolver/ddl/ob_create_mlog_stmt.h"
@@ -1827,7 +1828,7 @@ int get_create_table_stmt_need_privs(
     } else {
       const ObSelectStmt *select_stmt = stmt->get_sub_select();
       const ObSArray<obrpc::ObCreateForeignKeyArg> &foreign_keys = stmt->get_read_only_foreign_key_arg_list();
-      if (NULL != select_stmt) {
+      if (NULL != select_stmt && !stmt->get_create_table_arg().auto_grant_creator_privileges_) {
         need_priv.priv_set_ = OB_PRIV_CREATE | OB_PRIV_INSERT;
       } else {
         need_priv.priv_set_ = OB_PRIV_CREATE;
@@ -4335,6 +4336,55 @@ int ObPrivilegeCheck::check_ora_privilege(
   return ret;
 }
 
+static int adjust_ctas_target_privileges(const ObSqlCtx &ctx, const ObStmt *stmt,
+                                        ObStmtNeedPrivs &privileges)
+{
+  int ret = OB_SUCCESS;
+  const ObSQLSessionInfo &session = *ctx.session_info_;
+  if (OB_INVALID_ID == session.get_ctas_privilege_table_id() || !stmt->is_insert_stmt()) {
+    // do nothing
+  } else if (OB_ISNULL(stmt->get_query_ctx())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("CTAS statement has no query context", KR(ret));
+  } else {
+    const ObInsertStmt *insert = static_cast<const ObInsertStmt *>(stmt);
+    const TableItem *target = insert->get_table_item_by_id(insert->get_insert_table_info().table_id_);
+    const ObTableSchema *schema = nullptr;
+    if (OB_ISNULL(target)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("INSERT target is missing", KR(ret));
+    } else if (target->ref_id_ == session.get_ctas_privilege_table_id() && !target->is_view_table_) {
+      if (OB_FAIL(ctx.schema_guard_->get_table_schema(session.get_effective_tenant_id(),
+                            session.get_ctas_privilege_table_id(), schema))) {
+        LOG_WARN("failed to read CTAS target schema", KR(ret));
+      } else if (OB_ISNULL(schema)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("CTAS target schema is missing", KR(ret));
+      } else if (schema->is_user_table() && schema->is_ctas_tmp_table()
+                 && schema->get_session_id() == session.get_sessid_for_table()
+                 && schema->get_define_user_id() == session.get_priv_user_id()) {
+        // A cached plan would reuse the reduced privilege list.
+        stmt->get_query_ctx()->get_query_hint_for_update().get_global_hint().merge_plan_cache_hint(OB_USE_PLAN_CACHE_NONE);
+        ObSEArray<ObNeedPriv, 4> remaining;
+        for (int64_t i = 0; OB_SUCC(ret) && i < privileges.need_privs_.count(); ++i) {
+          ObNeedPriv need = privileges.need_privs_.at(i);
+          if (need.priv_level_ == OB_PRIV_TABLE_LEVEL
+              && need.db_ == target->database_name_ && need.table_ == target->table_name_) {
+            need.priv_set_ &= ~ObTableCreatorPrivilege::PRIVILEGES;
+          }
+          if (OB_PRIV_SET_EMPTY != need.priv_set_ && OB_FAIL(remaining.push_back(need))) {
+            LOG_WARN("failed to retain CTAS source privileges", KR(ret));
+          }
+        }
+        if (OB_SUCC(ret) && OB_FAIL(privileges.need_privs_.assign(remaining))) {
+          LOG_WARN("failed to adjust CTAS target privileges", KR(ret));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObPrivilegeCheck::check_privilege(
     const ObSqlCtx &ctx,
     const ObStmt *basic_stmt,
@@ -4379,6 +4429,7 @@ int ObPrivilegeCheck::check_privilege(
                            static_cast<const ObVariableSetStmt*>(basic_stmt)->has_global_variable();
       }
       OZ (check_read_only(ctx, basic_stmt->get_stmt_type(), has_global_variable, stmt_need_privs));
+      OZ (adjust_ctas_target_privileges(ctx, basic_stmt, stmt_need_privs));
       if (OB_SUCC(ret) && OB_FAIL(check_privilege(ctx, stmt_need_privs))) {
         LOG_WARN("privilege check not passed", K(ret));
       }

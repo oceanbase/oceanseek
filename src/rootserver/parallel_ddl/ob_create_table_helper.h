@@ -88,6 +88,8 @@ private:
   int check_and_set_parent_table_id_();
 
   virtual int generate_table_schema_() override;
+  virtual bool auto_grant_creator_privileges_() const override
+  { return arg_.auto_grant_creator_privileges_; }
   virtual int generate_aux_table_schemas_() override;
   virtual int generate_foreign_keys_() override;
   virtual int generate_sequence_object_() override;

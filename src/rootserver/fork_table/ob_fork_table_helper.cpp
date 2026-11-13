@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX RS
 
 #include "rootserver/fork_table/ob_fork_table_helper.h"
+#include "share/schema/ob_table_creator_privilege.h"
 
 #include "lib/mysqlclient/ob_mysql_transaction.h"
 #include "lib/string/ob_sql_string.h"
@@ -377,10 +378,12 @@ int ObForkPrivilegeCopier::copy_table_privileges(
     const ObString &src_database_name,
     const ObString &src_table_name,
     const ObString &dst_database_name,
-    const ObString &dst_table_name)
+    const ObString &dst_table_name,
+    const uint64_t creator_user_id)
 {
   int ret = OB_SUCCESS;
   int64_t copied_count = 0;
+  bool creator_copied = false;
   ObArray<const ObTablePriv *> tenant_table_privs;
   ObNameCaseMode name_case_mode = OB_NAME_CASE_INVALID;
   ObCollationType name_collation = CS_TYPE_INVALID;
@@ -408,13 +411,22 @@ int ObForkPrivilegeCopier::copy_table_privileges(
       } else if (0 != ObCharset::strcmp(name_collation, src_database_name, table_priv->get_database_name_str())
               || 0 != ObCharset::strcmp(name_collation, src_table_name, table_priv->get_table_name_str())) {
       } else if (OB_FAIL(grant_table_privilege_(table_priv->get_user_id(), dst_database_name,
-                     dst_table_name, table_priv->get_priv_set()))) {
+                     dst_table_name, table_priv->get_priv_set()
+                         | (table_priv->get_user_id() == creator_user_id
+                            ? ObTableCreatorPrivilege::PRIVILEGES : OB_PRIV_SET_EMPTY)))) {
         LOG_WARN("[ForkTable] copy table privilege failed", KR(ret), KPC(table_priv),
                  K(src_database_name), K(src_table_name), K(dst_database_name), K(dst_table_name));
       } else {
+        creator_copied |= table_priv->get_user_id() == creator_user_id;
         ++copied_count;
       }
     }
+  }
+  // A second grant using the same schema guard could overwrite the creator's copied privileges.
+  if (OB_SUCC(ret) && OB_INVALID_ID != creator_user_id && !creator_copied
+      && OB_FAIL(grant_table_privilege_(creator_user_id, dst_database_name, dst_table_name,
+                                       ObTableCreatorPrivilege::PRIVILEGES))) {
+    LOG_WARN("[ForkTable] grant creator privileges failed", KR(ret), K(creator_user_id));
   }
   if (OB_SUCC(ret)) {
     LOG_INFO("[ForkTable] copied explicit table privileges", K(tenant_id_), K(src_database_name),

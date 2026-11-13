@@ -1440,7 +1440,7 @@ public:
   int64_t session_id_;
   bool need_lock_src_table_;
   bool copy_grants_;
-  uint64_t creator_user_id_;
+  uint64_t creator_user_id_; // OB_INVALID_ID skips the automatic creator grant.
 };
 
 struct ObForkDatabaseArg : public ObDDLArg
@@ -2902,7 +2902,7 @@ public:
   uint64_t data_version_;
   bool enable_hidden_table_partition_pruning_;
   int64_t async_index_offline_refresh_snapshot_;
-  // Reserved for the rename that publishes a CTAS table.
+  // Used when renaming a CTAS temporary table to its final name.
   bool auto_grant_creator_privileges_;
   int serialize_index_args(char *buf, const int64_t data_len, int64_t &pos) const;
   int deserialize_index_args(const char *buf, const int64_t data_len, int64_t &pos);

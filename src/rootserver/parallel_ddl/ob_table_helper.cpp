@@ -5,6 +5,8 @@
 
 #define USING_LOG_PREFIX RS
 #include "rootserver/parallel_ddl/ob_table_helper.h"
+#include "rootserver/ob_ddl_operator.h"
+#include "share/schema/ob_table_creator_privilege.h"
 #include "rootserver/ob_index_builder.h"
 #include "rootserver/parallel_ddl/ob_index_name_checker.h"
 #include "rootserver/ob_lob_meta_builder.h"
@@ -44,7 +46,9 @@ ObTableHelper::ObTableHelper(
     new_tables_(),
     new_sequences_(),
     new_audits_(),
-    new_mock_fk_parent_tables_()
+    new_mock_fk_parent_tables_(),
+    creator_privilege_key_(),
+    need_grant_creator_privileges_(false)
 {}
 // create audit schema for table/sequence
 
@@ -765,6 +769,8 @@ int ObTableHelper::calc_schema_version_cnt_()
       }
     } // end for
 
+    schema_version_cnt_ += need_grant_creator_privileges_ ? 1 : 0;
+
     // 6. for 1503 boundary ddl operation
     schema_version_cnt_++;
   }
@@ -845,6 +851,14 @@ int ObTableHelper::inner_create_table_(const ObString *ddl_stmt_str,
   } else if (OB_FAIL(create_tablets_())) {
     LOG_WARN("fail create tablets", KR(ret));
   }
+  if (OB_SUCC(ret) && need_grant_creator_privileges_) {
+    ObDDLOperator ddl_operator(*schema_service_, *sql_proxy_);
+    if (OB_FAIL(ddl_operator.grant_table(creator_privilege_key_,
+            ObTableCreatorPrivilege::PRIVILEGES, nullptr, get_trans_(),
+            ObRawObjPrivArray(), 0, ObObjPrivSortKey()))) {
+      LOG_WARN("failed to write creator privileges with CREATE", KR(ret), K_(tenant_id));
+    }
+  }
   return ret;
 }
 
@@ -865,6 +879,43 @@ int ObTableHelper::generate_schemas_()
     LOG_WARN("fail to generate sequence object", KR(ret));
   } else if (OB_FAIL(generate_audit_schema_())) {
     LOG_WARN("fail to generate audit schema", KR(ret));
+  }
+  if (OB_SUCC(ret) && auto_grant_creator_privileges_()
+      && !new_tables_.empty()
+      && ObTableCreatorPrivilege::is_supported_table(new_tables_.at(0))
+      && OB_FAIL(prepare_creator_privileges_())) {
+    LOG_WARN("failed to prepare creator privileges", KR(ret), K_(tenant_id));
+  }
+  return ret;
+}
+
+int ObTableHelper::prepare_creator_privileges_()
+{
+  int ret = OB_SUCCESS;
+  const ObTableSchema &table = new_tables_.at(0);
+  const ObDatabaseSchema *database = nullptr;
+  ObSchemaGetterGuard guard;
+  if (OB_FAIL(schema_guard_wrapper_.get_database_schema(table.get_database_id(), database))) {
+    LOG_WARN("failed to get creator privilege database", KR(ret));
+  } else if (OB_ISNULL(database)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(ddl_service_->get_tenant_schema_guard_with_version_in_inner_table(tenant_id_, guard))) {
+    LOG_WARN("failed to get creator privilege guard", KR(ret));
+  } else if (nullptr == guard.get_user_info(tenant_id_, table.get_define_user_id())) {
+    ret = OB_USER_NOT_EXIST;
+    LOG_WARN("table creator no longer exists", KR(ret), K_(tenant_id), K(table.get_define_user_id()));
+  } else {
+    creator_privilege_key_ = ObTablePrivSortKey(tenant_id_, table.get_define_user_id(),
+        database->get_database_name_str(), table.get_table_name_str());
+    ObPrivSet old_privileges = OB_PRIV_SET_EMPTY;
+    if (OB_FAIL(guard.get_table_priv_set(creator_privilege_key_, old_privileges))) {
+      LOG_WARN("failed to read creator privileges", KR(ret), K_(creator_privilege_key));
+    } else {
+      // The DDL lock blocks GRANT/REVOKE and the name lock blocks a competing CREATE.
+      // The grant will see the same privileges used here to reserve its schema version.
+      need_grant_creator_privileges_ =
+          (old_privileges | ObTableCreatorPrivilege::PRIVILEGES) != old_privileges;
+    }
   }
   return ret;
 }
