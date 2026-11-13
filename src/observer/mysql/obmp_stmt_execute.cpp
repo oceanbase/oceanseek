@@ -2430,7 +2430,6 @@ int ObMPStmtExecute::parse_basic_param_value(ObIAllocator &allocator,
     case MYSQL_TYPE_OB_UROWID:
     case MYSQL_TYPE_ORA_BLOB:
     case MYSQL_TYPE_ORA_CLOB:
-    case MYSQL_TYPE_JSON:
     case MYSQL_TYPE_GEOMETRY: {
       ObString str;
       ObString dst;
@@ -2484,7 +2483,6 @@ int ObMPStmtExecute::parse_basic_param_value(ObIAllocator &allocator,
             || MYSQL_TYPE_VARCHAR == type
             || MYSQL_TYPE_VAR_STRING == type
             || MYSQL_TYPE_ORA_CLOB == type
-            || MYSQL_TYPE_JSON == type
             || MYSQL_TYPE_GEOMETRY == type) {
           int64_t extra_len = 0;
           bool has_inrow_data = false;
@@ -2596,7 +2594,6 @@ int ObMPStmtExecute::parse_basic_param_value(ObIAllocator &allocator,
                     || MYSQL_TYPE_MEDIUM_BLOB == type
                     || MYSQL_TYPE_BLOB == type
                     || MYSQL_TYPE_LONG_BLOB == type
-                    || MYSQL_TYPE_JSON == type
                     || MYSQL_TYPE_GEOMETRY == type) {
             // in ps protocol:
             //    Oracle mode: client driver will call hextoraw()
@@ -2614,8 +2611,6 @@ int ObMPStmtExecute::parse_basic_param_value(ObIAllocator &allocator,
               param.set_lob_value(ObTextType, dst.ptr(), static_cast<int32_t>(dst.length()));
             } else if (MYSQL_TYPE_LONG_BLOB == type) {
               param.set_lob_value(ObLongTextType, dst.ptr(), static_cast<int32_t>(dst.length()));
-            } else if (MYSQL_TYPE_JSON == type) {
-              param.set_json_value(ObJsonType, dst.ptr(), dst.length());
             } else if (MYSQL_TYPE_GEOMETRY == type) {
               param.set_geometry_value(ObGeometryType, dst.ptr(), dst.length());
             }
