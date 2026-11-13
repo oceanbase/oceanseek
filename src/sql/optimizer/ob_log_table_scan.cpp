@@ -2282,6 +2282,26 @@ int ObLogTableScan::replace_gen_column(ObLogPlan *plan, ObRawExpr *part_expr, Ob
   return ret;
 }
 
+static uint64_t hash_index_merge_node(const ObIndexMergeNode *node, uint64_t seed)
+{
+  if (nullptr != node) {
+    seed = do_hash(node->node_type_, seed);
+    if (node->is_hybrid_search_node()) {
+      const ObHybridSearchNodeBase *hybrid_node = static_cast<const ObHybridSearchNodeBase *>(node);
+      if (!hybrid_node->index_name_.empty()) {
+        seed = do_hash(hybrid_node->index_name_, seed);
+      }
+    } else if (nullptr != node->ap_) {
+      seed = do_hash(node->ap_->get_index_table_id(), seed);
+    }
+    seed = do_hash(node->children_.count(), seed);
+    for (int64_t i = 0; i < node->children_.count(); ++i) {
+      seed = hash_index_merge_node(node->children_.at(i), seed);
+    }
+  }
+  return seed;
+}
+
 uint64_t ObLogTableScan::hash(uint64_t seed) const
 {
   uint64_t hash_value = seed;
@@ -2291,6 +2311,12 @@ uint64_t ObLogTableScan::hash(uint64_t seed) const
   }
   hash_value = do_hash(sample_info_.method_, hash_value);
   hash_value = do_hash(use_das_, hash_value);
+  if (use_index_merge()) {
+    // Distinguish the internal scans and merge structure, just as a regular scan
+    // distinguishes its chosen index.
+    const IndexMergePath *path = static_cast<const IndexMergePath *>(access_path_);
+    hash_value = hash_index_merge_node(path->root_, hash_value);
+  }
   LOG_TRACE("TABLE SCAN hash value", K(hash_value), K(table_name_), K(index_name_), K(sample_info_.method_), K(use_das_), K(get_name()));
   hash_value = ObLogicalOperator::hash(hash_value);
   return hash_value;
