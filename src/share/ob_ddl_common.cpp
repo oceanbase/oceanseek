@@ -1252,6 +1252,10 @@ int ObDDLUtil::generate_build_replica_sql(
     ret = OB_TABLE_NOT_EXIST;
     LOG_WARN("fail to get table schema", K(ret), KP(source_table_schema), KP(dest_table_schema), 
       K(tenant_id), K(data_table_id), K(dest_table_id));
+  } else if (dest_table_schema->is_search_def_index()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("search definition index cannot be a data complement destination", K(ret),
+             K(tenant_id), K(data_table_id), K(dest_table_id));
   } else if (dest_table_schema->is_search_aux_index()
     && OB_FAIL(schema_guard.get_table_schema(tenant_id, dest_table_schema->get_data_table_id(),
                                              def_index_schema))) {
@@ -1273,7 +1277,7 @@ int ObDDLUtil::generate_build_replica_sql(
     bool is_shadow_column = false;
     const int64_t real_parallelism = ObDDLUtil::get_real_parallelism(parallelism, false/*is mv refresh*/);
     const bool is_rowkey_doc_aux_table = dest_table_schema->is_rowkey_doc_id();
-    const bool is_search_index = dest_table_schema->is_search_index();
+    const bool is_search_index = dest_table_schema->is_search_aux_index();
     bool enable_async_fts_newsort = dest_table_schema->is_async_fts_index();
     uint64_t doc_id_col_id = OB_INVALID_ID;
     uint64_t ft_id_col_id = OB_INVALID_ID;
