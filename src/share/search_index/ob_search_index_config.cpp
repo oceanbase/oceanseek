@@ -425,7 +425,7 @@ static int validate_modes(const ObIArray<ObSearchIndexModeConfig> &modes, const 
 
 static int print_modes_schema(const ObIArray<ObSearchIndexModeConfig> &modes,
                               const ObString &nested_paths_filter,
-                              char *buf, int64_t buf_len, int64_t &pos)
+                              char *buf, int64_t buf_len, int64_t &pos, ObSQLMode sql_mode)
 {
   int ret = OB_SUCCESS;
   const bool single_value = modes.count() == 1
@@ -441,13 +441,13 @@ static int print_modes_schema(const ObIArray<ObSearchIndexModeConfig> &modes,
     if (OB_FAIL(ret)) {
     } else if (single_value) {
       if (OB_FAIL(ObSearchIndexConfigFilter::print_schema(modes.at(0).filter_, buf, buf_len,
-                                                          pos, true, nested_paths_filter))) {
+                                                          pos, sql_mode, true, nested_paths_filter))) {
         LOG_WARN("failed to print single VALUE search index configuration", K(ret));
       }
     } else {
       if (!nested_paths_filter.empty()) {
         if (OB_FAIL(ObSearchIndexConfigFilter::print_nested_paths(nested_paths_filter,
-                                                                  buf, buf_len, pos))) {
+                                                                  buf, buf_len, pos, sql_mode))) {
           LOG_WARN("failed to print column nested paths", K(ret));
         } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, ", "))) {
           LOG_WARN("failed to print column nested paths separator", K(ret));
@@ -456,7 +456,7 @@ static int print_modes_schema(const ObIArray<ObSearchIndexModeConfig> &modes,
       for (int64_t i = 0; OB_SUCC(ret) && i < modes.count(); ++i) {
         if (i > 0 && OB_FAIL(databuff_printf(buf, buf_len, pos, ", "))) {
           LOG_WARN("failed to print search index mode separator", K(ret), K(i));
-        } else if (OB_FAIL(ObSearchIndexConfigFilter::print_schema(modes.at(i), buf, buf_len, pos))) {
+        } else if (OB_FAIL(ObSearchIndexConfigFilter::print_schema(modes.at(i), buf, buf_len, pos, sql_mode))) {
           LOG_WARN("failed to print search index mode", K(ret), K(i));
         }
       }
@@ -753,7 +753,8 @@ int ObSearchIndexConfig::validate(const ObString &comment)
   return ret;
 }
 
-int ObSearchIndexConfig::print_schema(const ObString &comment, char *buf, int64_t buf_len, int64_t &pos)
+int ObSearchIndexConfig::print_schema(const ObString &comment, char *buf, int64_t buf_len, int64_t &pos,
+                                      ObSQLMode sql_mode)
 {
   int ret = OB_SUCCESS;
   if (comment.empty()) {
@@ -763,7 +764,7 @@ int ObSearchIndexConfig::print_schema(const ObString &comment, char *buf, int64_
     if (OB_FAIL(config.decode(comment))) {
       LOG_WARN("failed to decode legacy search index configuration for printing", K(ret));
     } else if (OB_FAIL(print_modes_schema(config.get_modes(), config.get_nested_paths_filter(),
-                                          buf, buf_len, pos))) {
+                                          buf, buf_len, pos, sql_mode))) {
       LOG_WARN("failed to print legacy search index configuration", K(ret));
     }
   } else {
@@ -771,7 +772,7 @@ int ObSearchIndexConfig::print_schema(const ObString &comment, char *buf, int64_
     ObString nested;
     if (OB_FAIL(decode_versioned(comment, modes, nested))) {
       LOG_WARN("failed to decode search index comment for printing", K(ret));
-    } else if (OB_FAIL(print_modes_schema(modes, nested, buf, buf_len, pos))) {
+    } else if (OB_FAIL(print_modes_schema(modes, nested, buf, buf_len, pos, sql_mode))) {
       LOG_WARN("failed to print search index configuration", K(ret));
     }
   }

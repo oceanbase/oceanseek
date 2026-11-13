@@ -724,7 +724,7 @@ int ObSchemaPrinter::print_single_index_definition(const ObTableSchema *index_sc
               }
             }
             if (OB_SUCC(ret) && is_valid_col) {
-              if (OB_FAIL(print_index_column(table_schema, last_col, *index_schema, false /* not last one */, buf, buf_len, pos))) {
+              if (OB_FAIL(print_index_column(table_schema, last_col, *index_schema, false /* not last one */, buf, buf_len, pos, sql_mode))) {
                 SHARE_SCHEMA_LOG(WARN, "fail to print index column", K(last_col), K(ret));
               }
             }
@@ -744,7 +744,7 @@ int ObSchemaPrinter::print_single_index_definition(const ObTableSchema *index_sc
           }
         }
         if (OB_SUCC(ret)) {
-          if (OB_FAIL(print_index_column(table_schema, last_col, *index_schema, true /* last column */, buf, buf_len, pos))) {
+          if (OB_FAIL(print_index_column(table_schema, last_col, *index_schema, true /* last column */, buf, buf_len, pos, sql_mode))) {
             SHARE_SCHEMA_LOG(WARN, "fail to print column name", K(ret), K(last_col));
           } else { /*do nothing*/ }
         }
@@ -1251,7 +1251,8 @@ int ObSchemaPrinter::print_index_column(const ObTableSchema &table_schema,
                                         bool is_last,
                                         char *buf,
                                         int64_t buf_len,
-                                        int64_t &pos) const
+                                        int64_t &pos,
+                                        ObSQLMode sql_mode) const
 {
   int ret = OB_SUCCESS;
   bool is_oracle_mode = false;
@@ -1318,7 +1319,7 @@ int ObSchemaPrinter::print_index_column(const ObTableSchema &table_schema,
     SHARE_SCHEMA_LOG(WARN, "fail to print column name", K(ret), K(column));
   } else if (is_search_index && OB_NOT_NULL(index_col)
              && OB_FAIL(share::ObSearchIndexConfig::print_schema(
-                 index_col->get_comment_str(), buf, buf_len, pos))) {
+                 index_col->get_comment_str(), buf, buf_len, pos, sql_mode))) {
     SHARE_SCHEMA_LOG(WARN, "fail to print search index column config", K(ret), K(column));
   } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, is_last ? ")" : ", "))) {
     SHARE_SCHEMA_LOG(WARN, "fail to print column name", K(ret), K(column));

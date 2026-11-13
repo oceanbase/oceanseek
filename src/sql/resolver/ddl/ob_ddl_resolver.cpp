@@ -394,7 +394,8 @@ int ObDDLResolver::resolve_search_index_column_comment(
     if (OB_FAIL(GET_MIN_DATA_VERSION(session_info_->get_effective_tenant_id(), tenant_data_version))) {
       LOG_WARN("failed to get tenant data version", K(ret));
     } else if (OB_FAIL(ObSearchIndexConfigResolver::resolve(search_with_node, database_name_,
-            session_info_->get_effective_tenant_id(), tenant_data_version, schema_checker_, col_schema->get_meta_type(), cfg))) {
+            session_info_->get_effective_tenant_id(), tenant_data_version, schema_checker_, col_schema->get_meta_type(),
+            session_info_->get_local_collation_connection(), cfg))) {
       LOG_WARN("failed to resolve search index column config", K(ret), K(column_name));
     } else if (OB_FAIL(ob_write_string(*allocator, cfg.string(), column_comment))) {
       LOG_WARN("failed to copy column config", K(ret), K(cfg.string()));

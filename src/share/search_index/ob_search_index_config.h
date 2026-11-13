@@ -7,6 +7,7 @@
 #define OCEANBASE_SHARE_OB_SEARCH_INDEX_CONFIG_H_
 
 #include "common/object/ob_object.h"
+#include "common/sql_mode/ob_sql_mode.h"
 #include "lib/container/ob_se_array.h"
 #include "lib/string/ob_sql_string.h"
 #include "lib/string/ob_string_holder.h"
@@ -86,7 +87,8 @@ public:
   // Validate a complete v1 comment using borrowed fields, without copying the comment.
   static int validate(const common::ObString &comment);
   // Print v1 fields borrowed from comment; legacy comments retain compatibility normalization.
-  static int print_schema(const common::ObString &comment, char *buf, int64_t buf_len, int64_t &pos);
+  static int print_schema(const common::ObString &comment, char *buf, int64_t buf_len, int64_t &pos,
+                          ObSQLMode sql_mode = SMO_DEFAULT);
   TO_STRING_KV(K_(modes), K_(nested_paths_filter));
 
 private:

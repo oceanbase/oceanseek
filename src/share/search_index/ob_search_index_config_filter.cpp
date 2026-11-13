@@ -20,6 +20,7 @@
 #include "lib/charset/ob_charset.h"
 #include "sql/parser/parse_node.h"
 #include "share/ob_define.h" // OZ macro
+#include "share/rc/ob_tenant_base.h"
 
 namespace oceanbase
 {
@@ -411,12 +412,17 @@ ObJsonNodeType ObSearchIndexConfigFilter::get_json_type(const ObItemType pick_ty
   return json_type;
 }
 
+static int validate_nested_path_item(const ObString &path_str);
+
 int append_search_index_list_items(const ParseNode *node,
                                    ObSqlString &out,
-                                   const bool is_path,
+                                   const ObItemType option_type,
+                                   ObIAllocator &allocator,
+                                   const ObCollationType connection_collation,
                                    common::ObIArray<common::ObString> *collected = nullptr)
 {
   int ret = OB_SUCCESS;
+  const bool is_path = option_type != T_SEARCH_INDEX_INCLUDE_TYPES;
   if (OB_ISNULL(node)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected search index column params", K(ret));
@@ -424,14 +430,40 @@ int append_search_index_list_items(const ParseNode *node,
     if (node->num_child_ != 2 || OB_ISNULL(node->children_)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected search index column params", K(ret));
-    } else if (OB_FAIL(append_search_index_list_items(node->children_[0], out, is_path, collected))) {
+    } else if (OB_FAIL(append_search_index_list_items(
+        node->children_[0], out, option_type, allocator, connection_collation, collected))) {
       LOG_WARN("failed to append search index list items", K(ret));
-    } else if (OB_FAIL(append_search_index_list_items(node->children_[1], out, is_path, collected))) {
+    } else if (OB_FAIL(append_search_index_list_items(
+        node->children_[1], out, option_type, allocator, connection_collation, collected))) {
       LOG_WARN("failed to append search index list items", K(ret));
     }
   } else {
-    if (is_path) {
-      ObString path_str(static_cast<int32_t>(node->str_len_), node->str_value_);
+    ObString path_str(static_cast<int32_t>(node->str_len_), node->str_value_);
+    // Binary input has no declared text encoding; preserve its original bytes.
+    if (is_path && !path_str.empty()
+        && connection_collation != CS_TYPE_BINARY
+        && ObCharset::charset_type_by_coll(connection_collation) != CHARSET_UTF8MB4) {
+      // Convert before parsing and length-prefixing; never replace unconvertible characters.
+      const int64_t buf_len = static_cast<int64_t>(path_str.length()) * 4;
+      char *buf = static_cast<char *>(allocator.alloc(buf_len));
+      uint32_t converted_len = 0;
+      if (OB_ISNULL(buf)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to allocate path buffer", K(ret), K(buf_len));
+      } else if (OB_FAIL(ObCharset::charset_convert(
+          connection_collation, path_str.ptr(), path_str.length(), CS_TYPE_UTF8MB4_BIN,
+          buf, buf_len, converted_len, false /* trim_incomplete_tail */, true /* report_error */))) {
+        LOG_WARN("failed to convert search index path", K(ret), K(connection_collation));
+      } else {
+        path_str.assign_ptr(buf, converted_len);
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (option_type == T_SEARCH_INDEX_NESTED_PATHS) {
+      if (OB_FAIL(validate_nested_path_item(path_str))) {
+        LOG_WARN("failed to validate nested path item", K(ret), K(path_str));
+      }
+    } else if (is_path) {
       ObArenaAllocator tmp_alloc("JsonPathValid");
       void *buf = tmp_alloc.alloc(sizeof(ObJsonPath));
       if (OB_ISNULL(buf)) {
@@ -446,82 +478,68 @@ int append_search_index_list_items(const ParseNode *node,
           LOG_WARN("not supported jsonpath expression", K(ret), K(path_str));
         }
       }
-      if (OB_SUCC(ret) && collected != nullptr) {
-        OZ (collected->push_back(path_str));
-      }
     }
-    OZ (out.append_fmt("%d%.*s", static_cast<int32_t>(node->str_len_), static_cast<int32_t>(node->str_len_), node->str_value_));
+    if (OB_SUCC(ret) && collected != nullptr) {
+      OZ (collected->push_back(path_str));
+    }
+    OZ (out.append_fmt("%d%.*s", path_str.length(), path_str.length(), path_str.ptr()));
   }
   return ret;
 }
 
-// Validates that each path in a NESTED_PATHS list node contains only member nodes
+// Validates that a converted NESTED_PATHS entry contains only member nodes
 // (no wildcards, no array notation) and does not exceed MAX_DEPTH segments.
-static int validate_nested_path_items(const ParseNode *node)
+static int validate_nested_path_item(const ObString &path_str)
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(node)) {
-    // empty list, nothing to validate
-  } else if (node->type_ == T_LINK_NODE) {
-    if (node->num_child_ != 2 || OB_ISNULL(node->children_)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected nested path list node", K(ret));
-    } else if (OB_FAIL(validate_nested_path_items(node->children_[0]))) {
-      LOG_WARN("failed to validate nested path item", K(ret));
-    } else if (OB_FAIL(validate_nested_path_items(node->children_[1]))) {
-      LOG_WARN("failed to validate nested path item", K(ret));
-    }
+  ObArenaAllocator tmp_alloc("JsonPathValid");
+  void *buf = tmp_alloc.alloc(sizeof(ObJsonPath));
+  if (OB_ISNULL(buf)) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to alloc path buf", K(ret));
   } else {
-    ObString path_str(static_cast<int32_t>(node->str_len_), node->str_value_);
-    ObArenaAllocator tmp_alloc("JsonPathValid");
-    void *buf = tmp_alloc.alloc(sizeof(ObJsonPath));
-    if (OB_ISNULL(buf)) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
-      LOG_WARN("failed to alloc path buf", K(ret));
+    ObJsonPath *json_path = new (buf) ObJsonPath(path_str, &tmp_alloc);
+    if (OB_FAIL(json_path->parse_path())) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "NESTED_PATHS path expression");
     } else {
-      ObJsonPath *json_path = new (buf) ObJsonPath(path_str, &tmp_alloc);
-      if (OB_FAIL(json_path->parse_path())) {
-        ret = OB_INVALID_ARGUMENT;
-        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "NESTED_PATHS path expression");
-      } else {
-        int64_t depth = 0;
-        for (JsonPathIterator it = json_path->begin();
-             OB_SUCC(ret) && it != json_path->end(); ++it) {
-          ObJsonPathNode *pnode = *it;
-          if (OB_ISNULL(pnode)) {
-            ret = OB_ERR_UNEXPECTED;
-          } else if (pnode->get_node_type() == JPN_ROOT) {
-            continue;
-          } else if (pnode->get_node_type() == JPN_MEMBER_WILDCARD) {
-            ret = OB_NOT_SUPPORTED;
-            LOG_WARN("wildcard not allowed in NESTED_PATHS", K(ret), K(path_str));
-            LOG_USER_ERROR(OB_NOT_SUPPORTED, "wildcard in NESTED_PATHS is");
-          } else if (pnode->get_node_type() != JPN_MEMBER) {
-            ret = OB_NOT_SUPPORTED;
-            LOG_WARN("only member paths allowed in NESTED_PATHS", K(ret), K(path_str));
-            LOG_USER_ERROR(OB_NOT_SUPPORTED, "non-member node in NESTED_PATHS is");
-          } else {
-            ++depth;
-          }
-        }
-        if (OB_SUCC(ret) && depth == 0) {
-          // Reject a bare root path like '$' (or any path with no member segments).
-          // NESTED_PATHS must point to a JSON sub-tree via at least one member step;
-          // a root-only path would silently be turned into a wildcard by the matcher
-          // and defeat the purpose of NESTED_PATHS.
+      int64_t depth = 0;
+      for (JsonPathIterator it = json_path->begin();
+           OB_SUCC(ret) && it != json_path->end(); ++it) {
+        ObJsonPathNode *pnode = *it;
+        if (OB_ISNULL(pnode)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (pnode->get_node_type() == JPN_ROOT) {
+          continue;
+        } else if (pnode->get_node_type() == JPN_MEMBER_WILDCARD) {
           ret = OB_NOT_SUPPORTED;
-          LOG_WARN("root path is not allowed in NESTED_PATHS", K(ret), K(path_str));
-          LOG_USER_ERROR(OB_NOT_SUPPORTED, "root path in NESTED_PATHS is");
-        } else if (OB_SUCC(ret) && depth > ObSearchIndexNestedKeyEncoder::MAX_DEPTH) {
+          LOG_WARN("wildcard not allowed in NESTED_PATHS", K(ret), K(path_str));
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "wildcard in NESTED_PATHS is");
+        } else if (pnode->get_node_type() != JPN_MEMBER) {
           ret = OB_NOT_SUPPORTED;
-          LOG_WARN("NESTED_PATHS depth exceeds max", K(ret), K(depth),
-                   K(ObSearchIndexNestedKeyEncoder::MAX_DEPTH));
-          char depth_buf[64];
-          (void)snprintf(depth_buf, sizeof(depth_buf),
-                         "NESTED_PATHS depth exceeding %ld is",
-                         static_cast<long>(ObSearchIndexNestedKeyEncoder::MAX_DEPTH));
-          LOG_USER_ERROR(OB_NOT_SUPPORTED, depth_buf);
+          LOG_WARN("only member paths allowed in NESTED_PATHS", K(ret), K(path_str));
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "non-member node in NESTED_PATHS is");
+        } else {
+          ++depth;
         }
+      }
+      if (OB_SUCC(ret) && depth == 0) {
+        // Reject a bare root path like '$' (or any path with no member segments).
+        // NESTED_PATHS must point to a JSON sub-tree via at least one member step;
+        // a root-only path would silently be turned into a wildcard by the matcher
+        // and defeat the purpose of NESTED_PATHS.
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("root path is not allowed in NESTED_PATHS", K(ret), K(path_str));
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "root path in NESTED_PATHS is");
+      } else if (OB_SUCC(ret) && depth > ObSearchIndexNestedKeyEncoder::MAX_DEPTH) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("NESTED_PATHS depth exceeds max", K(ret), K(depth),
+                 K(ObSearchIndexNestedKeyEncoder::MAX_DEPTH));
+        char depth_buf[64];
+        (void)snprintf(depth_buf, sizeof(depth_buf),
+                       "NESTED_PATHS depth exceeding %ld is",
+                       static_cast<long>(ObSearchIndexNestedKeyEncoder::MAX_DEPTH));
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, depth_buf);
       }
     }
   }
@@ -554,8 +572,8 @@ static void warn_duplicate_option_items(const common::ObIArray<common::ObString>
 }
 
 int print_length_prefixed_values(const char *data, int64_t len, int64_t &idx,
-                                        char *buf, int64_t buf_len, int64_t &pos,
-                                        bool with_quotes)
+                                 char *buf, int64_t buf_len, int64_t &pos,
+                                 bool with_quotes, ObSQLMode sql_mode)
 {
   int ret = OB_SUCCESS;
   bool first = true;
@@ -570,9 +588,25 @@ int print_length_prefixed_values(const char *data, int64_t len, int64_t &idx,
       LOG_WARN("invalid config format", K(ret), K(idx), K(value_len), K(len));
     } else if (!first && OB_FAIL(databuff_printf(buf, buf_len, pos, ", "))) {
       LOG_WARN("fail to print comma", K(ret));
-    } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, with_quotes ? "'%.*s'" : "%.*s",
-                                static_cast<int>(value_len), data + idx))) {
-      LOG_WARN("fail to print value", K(ret));
+    } else if (with_quotes) {
+      OZ (databuff_printf(buf, buf_len, pos, "'"));
+      for (int64_t i = 0; OB_SUCC(ret) && i < value_len; ++i) {
+        const char c = data[idx + i];
+        // Quote doubling works in both modes; backslashes are SQL escapes only in the default mode.
+        if (c == '\'') {
+          OZ (databuff_printf(buf, buf_len, pos, "''"));
+        } else if (c == '\\' && !(sql_mode & SMO_NO_BACKSLASH_ESCAPES)) {
+          OZ (databuff_printf(buf, buf_len, pos, "\\\\"));
+        } else {
+          OZ (databuff_printf(buf, buf_len, pos, "%c", c));
+        }
+      }
+      OZ (databuff_printf(buf, buf_len, pos, "'"));
+    } else {
+      if (OB_FAIL(databuff_printf(buf, buf_len, pos, "%.*s",
+                                  static_cast<int>(value_len), data + idx))) {
+        LOG_WARN("fail to print value", K(ret));
+      }
     }
     idx += value_len;
     first = false;
@@ -697,6 +731,7 @@ int ObSearchIndexConfigFilter::parse_nested_paths(const ObString &raw,
 }
 
 int ObSearchIndexConfigFilter::print_filter_option(const ParseNode *option,
+                                                  ObCollationType connection_collation,
                                                   common::ObSqlString &out)
 {
   int ret = OB_SUCCESS;
@@ -706,28 +741,28 @@ int ObSearchIndexConfigFilter::print_filter_option(const ParseNode *option,
     LOG_WARN("invalid search index filter option", K(ret), KP(option));
   } else {
     const ParseNode *list = option->children_[0];
+    ObArenaAllocator allocator(ObMemAttr(MTL_ID(), "SearchIdxPath"));
     if (option->type_ == T_SEARCH_INDEX_INCLUDE_PATHS) {
       common::ObSEArray<common::ObString, 8> items;
       OZ (out.append("INCLUDE_PATHS="));
-      OZ (append_search_index_list_items(list, out, true, &items));
+      OZ (append_search_index_list_items(list, out, option->type_, allocator, connection_collation, &items));
       if (OB_SUCC(ret)) {
         warn_duplicate_option_items(items, "INCLUDE_PATHS");
       }
     } else if (option->type_ == T_SEARCH_INDEX_EXCLUDE_PATHS) {
       common::ObSEArray<common::ObString, 8> items;
       OZ (out.append("EXCLUDE_PATHS="));
-      OZ (append_search_index_list_items(list, out, true, &items));
+      OZ (append_search_index_list_items(list, out, option->type_, allocator, connection_collation, &items));
       if (OB_SUCC(ret)) {
         warn_duplicate_option_items(items, "EXCLUDE_PATHS");
       }
     } else if (option->type_ == T_SEARCH_INDEX_INCLUDE_TYPES) {
       OZ (out.append("INCLUDE_TYPES="));
-      OZ (append_search_index_list_items(list, out, false));
+      OZ (append_search_index_list_items(list, out, option->type_, allocator, connection_collation));
     } else if (option->type_ == T_SEARCH_INDEX_NESTED_PATHS) {
       common::ObSEArray<common::ObString, 8> items;
-      OZ (validate_nested_path_items(list));
       OZ (out.append("NESTED_PATHS="));
-      OZ (append_search_index_list_items(list, out, true, &items));
+      OZ (append_search_index_list_items(list, out, option->type_, allocator, connection_collation, &items));
       if (OB_SUCC(ret)) {
         warn_duplicate_option_items(items, "NESTED_PATHS");
       }
@@ -742,7 +777,8 @@ int ObSearchIndexConfigFilter::print_filter_option(const ParseNode *option,
 int ObSearchIndexConfigFilter::print_schema(const ObSearchIndexModeConfig &mode,
                                             char *buf,
                                             int64_t buf_len,
-                                            int64_t &pos)
+                                            int64_t &pos,
+                                            ObSQLMode sql_mode)
 {
   int ret = OB_SUCCESS;
   const char *name = mode.is_fulltext() ? "FULLTEXT" : "VALUE";
@@ -757,7 +793,7 @@ int ObSearchIndexConfigFilter::print_schema(const ObSearchIndexModeConfig &mode,
     }
     const int64_t start = pos;
     if (OB_SUCC(ret) && OB_FAIL(ObSearchIndexConfigFilter::print_schema(
-        mode.filter_, buf, buf_len, pos, !mode.is_fulltext()))) {
+        mode.filter_, buf, buf_len, pos, sql_mode, !mode.is_fulltext()))) {
       LOG_WARN("failed to print search index mode filter", K(ret));
     }
     if (OB_SUCC(ret) && mode.is_fulltext()) {
@@ -819,7 +855,8 @@ int ObSearchIndexConfigFilter::print_schema(const ObSearchIndexModeConfig &mode,
 int ObSearchIndexConfigFilter::print_nested_paths(const ObString &nested_paths_filter,
                                                  char *buf,
                                                  int64_t buf_len,
-                                                 int64_t &pos)
+                                                 int64_t &pos,
+                                                 ObSQLMode sql_mode)
 {
   int ret = OB_SUCCESS;
   if (!nested_paths_filter.empty()) {
@@ -831,7 +868,7 @@ int ObSearchIndexConfigFilter::print_nested_paths(const ObString &nested_paths_f
       LOG_WARN("invalid column nested paths filter", K(ret), K(nested_paths_filter));
     } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, "NESTED_PATHS = ("))) {
       LOG_WARN("fail to print NESTED_PATHS key", K(ret));
-    } else if (OB_FAIL(print_length_prefixed_values(data, len, idx, buf, buf_len, pos, true))) {
+    } else if (OB_FAIL(print_length_prefixed_values(data, len, idx, buf, buf_len, pos, true, sql_mode))) {
       LOG_WARN("fail to print nested paths value", K(ret));
     } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, ")"))) {
       LOG_WARN("fail to print closing paren for nested paths", K(ret));
@@ -844,6 +881,7 @@ int ObSearchIndexConfigFilter::print_schema(const ObString &comment,
                                             char *buf,
                                             int64_t buf_len,
                                             int64_t &pos,
+                                            ObSQLMode sql_mode,
                                             bool print_types,
                                             const ObString &nested_paths_filter)
 {
@@ -864,7 +902,7 @@ int ObSearchIndexConfigFilter::print_schema(const ObString &comment,
       idx += 14;
       if (OB_FAIL(databuff_printf(buf, buf_len, pos, "%s = (", paths_key))) {
         LOG_WARN("fail to print paths key", K(ret));
-      } else if (OB_FAIL(print_length_prefixed_values(data, len, idx, buf, buf_len, pos, true))) {
+      } else if (OB_FAIL(print_length_prefixed_values(data, len, idx, buf, buf_len, pos, true, sql_mode))) {
         LOG_WARN("fail to print paths value", K(ret));
       } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, ")"))) {
         LOG_WARN("fail to print closing paren", K(ret));
@@ -876,7 +914,7 @@ int ObSearchIndexConfigFilter::print_schema(const ObString &comment,
     if (OB_SUCC(ret) && !nested_paths_filter.empty()) {
       if (section_printed && OB_FAIL(databuff_printf(buf, buf_len, pos, ", "))) {
         LOG_WARN("failed to print column nested paths separator", K(ret));
-      } else if (OB_FAIL(print_nested_paths(nested_paths_filter, buf, buf_len, pos))) {
+      } else if (OB_FAIL(print_nested_paths(nested_paths_filter, buf, buf_len, pos, sql_mode))) {
         LOG_WARN("failed to print column nested paths", K(ret));
       } else {
         section_printed = true;
@@ -891,7 +929,7 @@ int ObSearchIndexConfigFilter::print_schema(const ObString &comment,
         LOG_WARN("fail to print comma", K(ret));
       } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, "INCLUDE_TYPES = ("))) {
         LOG_WARN("fail to print INCLUDE_TYPES", K(ret));
-      } else if (OB_FAIL(print_length_prefixed_values(data, len, idx, buf, buf_len, pos, false))) {
+      } else if (OB_FAIL(print_length_prefixed_values(data, len, idx, buf, buf_len, pos, false, sql_mode))) {
         LOG_WARN("fail to print types value", K(ret));
       } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, ")"))) {
         LOG_WARN("fail to print closing paren", K(ret));

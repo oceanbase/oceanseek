@@ -26,6 +26,7 @@ public:
                      uint64_t tenant_data_version,
                      ObSchemaChecker *schema_checker,
                      const common::ObObjMeta &source_meta,
+                     common::ObCollationType connection_collation,
                      common::ObSqlString &comment);
 };
 

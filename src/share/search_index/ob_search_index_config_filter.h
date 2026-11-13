@@ -7,6 +7,7 @@
 #define OCEANBASE_SHARE_OB_SEARCH_INDEX_CONFIG_FILTER_H_
 
 #include <stdint.h>
+#include "common/sql_mode/ob_sql_mode.h"
 #include "lib/string/ob_string.h"
 #include "lib/container/ob_se_array.h"
 #include "lib/allocator/page_arena.h" // ObArenaAllocator
@@ -119,17 +120,21 @@ public:
   static bool is_type_indexed(const uint8_t type_mask, const common::ObJsonNodeType json_type);
 
   // Build a filter fragment from one option node, replacing the output.
-  static int print_filter_option(const ParseNode *option, common::ObSqlString &out);
+  static int print_filter_option(const ParseNode *option,
+                                 common::ObCollationType connection_collation,
+                                 common::ObSqlString &out);
   // Print one complete VALUE/FULLTEXT block, including parser options for FULLTEXT.
-  static int print_schema(const ObSearchIndexModeConfig &mode, char *buf, int64_t buf_len, int64_t &pos);
+  static int print_schema(const ObSearchIndexModeConfig &mode, char *buf, int64_t buf_len, int64_t &pos,
+                          ObSQLMode sql_mode = SMO_DEFAULT);
   // Print a normalized mode filter (paths and types), without WITH or mode wrappers.
   // Separately supplied column NESTED_PATHS is printed between paths and types.
   static int print_schema(const common::ObString &comment, char *buf, int64_t buf_len, int64_t &pos,
+                          ObSQLMode sql_mode,
                           bool print_types = true,
                           const common::ObString &nested_paths_filter = common::ObString());
   // Print only the column-level NESTED_PATHS option, without surrounding separators.
   static int print_nested_paths(const common::ObString &nested_paths_filter,
-                                char *buf, int64_t buf_len, int64_t &pos);
+                                char *buf, int64_t buf_len, int64_t &pos, ObSQLMode sql_mode);
   static bool is_valid_config_path(common::ObJsonPath *json_path);
   bool has_types() const { return type_mask_ != 0; }
   bool has_paths() const { return has_include_paths_ || has_exclude_paths_ || has_nested_paths_; }

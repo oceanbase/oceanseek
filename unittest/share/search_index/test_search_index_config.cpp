@@ -73,11 +73,15 @@ static ObObjMeta json_source_meta()
 }
 
 static int resolve_preview_sql(const std::string &query, ObSearchIndexConfig &config,
-                        const ObObjMeta &source_meta = json_source_meta())
+                        const ObObjMeta &source_meta = json_source_meta(),
+                        ObCollationType collation = CS_TYPE_UTF8MB4_BIN,
+                        ObSQLMode sql_mode = DEFAULT_MYSQL_MODE)
 {
   ObArenaAllocator allocator;
-  ObParser parser(allocator, DEFAULT_MYSQL_MODE);
-  ParseResult result;
+  ObCharsets4Parser charsets;
+  charsets.string_collation_ = collation;
+  ObParser parser(allocator, sql_mode, charsets);
+  ParseResult result = {};
   int ret = OB_SUCCESS;
   if (OB_FAIL(parser.parse(ObString(query.size(), query.data()), result))) {
     LOG_WARN("failed to parse search index test SQL", K(ret), K(query.c_str()));
@@ -90,7 +94,7 @@ static int resolve_preview_sql(const std::string &query, ObSearchIndexConfig &co
       ObSqlString comment;
       if (OB_FAIL(ObSearchIndexConfigResolver::resolve(
           find_node(result.result_tree_, T_SEARCH_INDEX_COLUMN_PARAMS),
-          ObString("test"), OB_SYS_TENANT_ID, DATA_VERSION_4_6_3_1, nullptr, source_meta, comment))) {
+          ObString("test"), OB_SYS_TENANT_ID, DATA_VERSION_4_6_3_1, nullptr, source_meta, collation, comment))) {
         LOG_WARN("failed to resolve search index test configuration", K(ret));
       } else if (OB_FAIL(config.decode(comment.string()))) {
         LOG_WARN("failed to decode search index test configuration", K(ret));
@@ -344,7 +348,7 @@ TEST_F(SearchIndexConfigTest, ddl_generates_expected_persisted_comment_bytes)
         ObSqlString comment;
         const int ret = ObSearchIndexConfigResolver::resolve(
             find_node(result.result_tree_, T_SEARCH_INDEX_COLUMN_PARAMS),
-            ObString("test"), OB_SYS_TENANT_ID, data_version, nullptr, json_source_meta(), comment);
+            ObString("test"), OB_SYS_TENANT_ID, data_version, nullptr, json_source_meta(), CS_TYPE_UTF8MB4_BIN, comment);
         if (data_version < DATA_VERSION_4_6_3_1 && item.legacy == nullptr) {
           EXPECT_EQ(OB_NOT_SUPPORTED, ret);
           EXPECT_TRUE(comment.empty());
@@ -985,7 +989,7 @@ TEST_F(SearchIndexConfigTest, resolver_returns_comments_independent_of_parse_tre
     for (int i = 0; i < 2; ++i) {
       ASSERT_EQ(OB_SUCCESS, ObSearchIndexConfigResolver::resolve(
           find_node(columns->children_[i], T_SEARCH_INDEX_COLUMN_PARAMS),
-          ObString("test"), OB_SYS_TENANT_ID, DATA_VERSION_4_6_3_1, nullptr, json_source_meta(), comments[i]));
+          ObString("test"), OB_SYS_TENANT_ID, DATA_VERSION_4_6_3_1, nullptr, json_source_meta(), CS_TYPE_UTF8MB4_BIN, comments[i]));
     }
     parser.free_result(result);
   }
@@ -2198,6 +2202,171 @@ TEST_F(SearchIndexConfigTest, nested_filter_enumeration_and_matching)
   EXPECT_EQ(ObString("$.a"), nested.at(0));
   EXPECT_EQ(OB_INVALID_ARGUMENT, ObSearchIndexConfigFilter::parse_nested_paths(
       ObString("NESTED_PATHS=100$.a"), nested));
+}
+
+TEST_F(SearchIndexConfigTest, test_search_index_config_sql_roundtrip)
+{
+  const char *options[] = {"INCLUDE_PATHS", "EXCLUDE_PATHS", "NESTED_PATHS"};
+  const char *literals[] = {R"('$."a''b"')", R"('$."a\\\\b"')", R"('$."é"')"};
+  const char *paths[] = {R"($."a'b")", R"($."a\\b")", R"($."é")"};
+  for (const char *option : options) {
+    for (int64_t i = 0; i < ARRAYSIZEOF(literals); ++i) {
+      SCOPED_TRACE(option);
+      SCOPED_TRACE(literals[i]);
+      ObSqlString ddl;
+      ObSearchIndexConfig config;
+      ObSqlString expected;
+      ASSERT_EQ(OB_SUCCESS, ddl.append_fmt(
+          "create table t(j json, search index si(j with(%s=(%s)))) organization=heap",
+          option, literals[i]));
+      ASSERT_EQ(OB_SUCCESS, resolve_preview_sql(
+          std::string(ddl.ptr(), ddl.length()), config));
+      ASSERT_EQ(OB_SUCCESS, expected.append_fmt("%s=%ld%s", option, strlen(paths[i]), paths[i]));
+      ASSERT_EQ(1, config.get_modes().count());
+      ASSERT_EQ(expected.string(), 0 == strcmp(option, "NESTED_PATHS")
+          ? config.get_nested_paths_filter() : config.get_modes().at(0).filter_);
+
+      // Replay the actual printer output through the SQL parser, without repairing it.
+      const ObSQLMode modes[] = {SMO_DEFAULT, SMO_NO_BACKSLASH_ESCAPES};
+      for (const ObSQLMode sql_mode : modes) {
+        SCOPED_TRACE(sql_mode);
+        char buf[1024];
+        int64_t pos = 0;
+        ASSERT_EQ(OB_SUCCESS, ObSearchIndexConfig::print_schema(
+            config.get_comment(), buf, sizeof(buf), pos, sql_mode));
+        if (i == 0) {
+          ObSqlString expected_sql;
+          ASSERT_EQ(OB_SUCCESS, expected_sql.append_fmt(" WITH (%s = ('$.\"a''b\"'))", option));
+          ASSERT_EQ(expected_sql.string(), ObString(static_cast<int32_t>(pos), buf));
+        }
+        ObSqlString replay;
+        ASSERT_EQ(OB_SUCCESS, replay.append_fmt("create search index si on t(j%.*s)", static_cast<int>(pos), buf));
+        ObSearchIndexConfig replay_config;
+        ASSERT_EQ(OB_SUCCESS, resolve_preview_sql(
+            std::string(replay.ptr(), replay.length()), replay_config, json_source_meta(),
+            CS_TYPE_UTF8MB4_BIN, sql_mode));
+        ASSERT_EQ(config.get_comment(), replay_config.get_comment());
+        ObSearchIndexConfigFilter filter(MTL_ID());
+        ASSERT_EQ(OB_SUCCESS, filter.init_from_comment(replay_config.get_comment()));
+
+        if (0 == strcmp(option, "INCLUDE_PATHS") && i == 1) {
+          ObSEArray<ObSearchIndexPathEncoder::JsonPathItem, 1> items;
+          ASSERT_EQ(OB_SUCCESS, items.push_back(
+              ObSearchIndexPathEncoder::make_object_path(ObString(R"(a\b)"))));
+          bool passed = false;
+          ASSERT_EQ(OB_SUCCESS, filter.is_indexed(items, ObJsonNodeType::J_DECIMAL, passed));
+          ASSERT_TRUE(passed);
+        }
+      }
+    }
+  }
+}
+
+TEST_F(SearchIndexConfigTest, test_search_index_config_latin1)
+{
+  const char *options[] = {"INCLUDE_PATHS", "EXCLUDE_PATHS", "NESTED_PATHS"};
+  for (const char *option : options) {
+    SCOPED_TRACE(option);
+    ObSqlString ddl;
+    ObSearchIndexConfig config;
+    ASSERT_EQ(OB_SUCCESS, ddl.append_fmt(
+        "create search index si on t(j with(%s=('$.\x22\xe9\x22', '$.\x22\xe8\x22')))", option));
+    ASSERT_EQ(OB_SUCCESS, resolve_preview_sql(
+        std::string(ddl.ptr(), ddl.length()), config, json_source_meta(), CS_TYPE_LATIN1_SWEDISH_CI));
+    ObSqlString expected;
+    // Both members grow from one to two bytes, and remain distinct.
+    ASSERT_EQ(OB_SUCCESS, expected.append_fmt("%s=6$.\"é\"6$.\"è\"", option));
+    ASSERT_EQ(1, config.get_modes().count());
+    ASSERT_EQ(expected.string(), 0 == strcmp(option, "NESTED_PATHS")
+        ? config.get_nested_paths_filter() : config.get_modes().at(0).filter_);
+    ObSearchIndexConfigFilter filter(MTL_ID());
+    ASSERT_EQ(OB_SUCCESS, filter.init_from_comment(config.get_comment()));
+    if (0 != strcmp(option, "NESTED_PATHS")) {
+      const char *members[] = {"é", "è", "e"};
+      for (int64_t i = 0; i < ARRAYSIZEOF(members); ++i) {
+        ObSEArray<ObSearchIndexPathEncoder::JsonPathItem, 1> items;
+        ASSERT_EQ(OB_SUCCESS, items.push_back(
+            ObSearchIndexPathEncoder::make_object_path(ObString(members[i]))));
+        bool passed = false;
+        ASSERT_EQ(OB_SUCCESS, filter.is_indexed(items, ObJsonNodeType::J_DECIMAL, passed));
+        ASSERT_EQ(0 == strcmp(option, "INCLUDE_PATHS") ? i < 2 : i == 2, passed);
+      }
+    }
+  }
+}
+
+TEST_F(SearchIndexConfigTest, mode_paths_charset_and_sql_roundtrip)
+{
+  // Exercise FULLTEXT and mixed VALUE/FULLTEXT mode printers.
+  const char *options[] = {
+    "FULLTEXT(INCLUDE_PATHS=(%s))",
+    "FULLTEXT(EXCLUDE_PATHS=(%s))",
+    "VALUE(INCLUDE_PATHS=(%s)), FULLTEXT(INCLUDE_PATHS=('$.text'))"
+  };
+  for (int64_t i = 0; i < ARRAYSIZEOF(options); ++i) {
+    ObSqlString mode_options;
+    // The member contains a latin1 character, an apostrophe and a backslash.
+    ASSERT_EQ(OB_SUCCESS, mode_options.append_fmt(options[i], "'$.\"\xe9''a\\\\\\\\b\"'"));
+    ObSqlString ddl;
+    ASSERT_EQ(OB_SUCCESS, ddl.append_fmt(
+        "CREATE ASYNC SEARCH INDEX si ON t(j WITH (%s))", mode_options.ptr()));
+    SCOPED_TRACE(ddl.ptr());
+    ObSearchIndexConfig config;
+    ASSERT_EQ(OB_SUCCESS, resolve_preview_sql(
+        std::string(ddl.ptr(), ddl.length()), config, json_source_meta(), CS_TYPE_LATIN1_SWEDISH_CI));
+    const char *path = R"($."é'a\\b")";
+    ObSqlString expected;
+    ASSERT_EQ(OB_SUCCESS, expected.append_fmt("%s=%ld%s",
+        i == 1 ? "EXCLUDE_PATHS" : "INCLUDE_PATHS", strlen(path), path));
+    ASSERT_EQ(expected.string(), config.get_modes().at(0).filter_);
+    for (const ObSQLMode sql_mode : {SMO_DEFAULT, SMO_NO_BACKSLASH_ESCAPES}) {
+      char buf[4096];
+      int64_t pos = 0;
+      ASSERT_EQ(OB_SUCCESS, ObSearchIndexConfig::print_schema(
+          config.get_comment(), buf, sizeof(buf), pos, sql_mode));
+      ObSearchIndexConfig replay;
+      ASSERT_EQ(OB_SUCCESS, resolve_preview_sql(
+          "CREATE ASYNC SEARCH INDEX si ON t(j" + std::string(buf, pos) + ")",
+          replay, json_source_meta(), CS_TYPE_UTF8MB4_BIN, sql_mode));
+      ASSERT_EQ(config.get_comment(), replay.get_comment());
+    }
+  }
+}
+
+TEST_F(SearchIndexConfigTest, test_search_index_config_invalid_charset_input)
+{
+  ParseNode path = {};
+  path.type_ = T_VARCHAR;
+  path.str_value_ = "$.\"\xff\"";
+  path.str_len_ = strlen(path.str_value_);
+  ParseNode *paths[] = {&path};
+  ParseNode option = {};
+  option.type_ = T_SEARCH_INDEX_INCLUDE_PATHS;
+  option.num_child_ = 1;
+  option.children_ = paths;
+  ObSqlString comment;
+  ASSERT_EQ(OB_ERR_INCORRECT_STRING_VALUE, ObSearchIndexConfigFilter::print_filter_option(
+      &option, CS_TYPE_ASCII_GENERAL_CI, comment));
+  // An incomplete multibyte tail must not be dropped to turn the input into "$.a".
+  path.str_value_ = "$.a\x81";
+  path.str_len_ = strlen(path.str_value_);
+  ASSERT_EQ(OB_ERR_INCORRECT_STRING_VALUE, ObSearchIndexConfigFilter::print_filter_option(
+      &option, CS_TYPE_GBK_CHINESE_CI, comment));
+}
+
+TEST_F(SearchIndexConfigTest, test_search_index_config_nested_validation)
+{
+  const char *paths[] = {"$", "$.a.*", "$.a[0]", "$."};
+  const int errors[] = {OB_NOT_SUPPORTED, OB_NOT_SUPPORTED, OB_NOT_SUPPORTED, OB_INVALID_ARGUMENT};
+  for (int64_t i = 0; i < ARRAYSIZEOF(paths); ++i) {
+    SCOPED_TRACE(paths[i]);
+    ObSqlString ddl;
+    ObSearchIndexConfig config;
+    ASSERT_EQ(OB_SUCCESS, ddl.append_fmt(
+        "create search index si on t(j with(nested_paths=('%s')))", paths[i]));
+    ASSERT_EQ(errors[i], resolve_preview_sql(
+        std::string(ddl.ptr(), ddl.length()), config, json_source_meta(), CS_TYPE_LATIN1_SWEDISH_CI));
+  }
 }
 
 } // namespace unittest

@@ -708,6 +708,29 @@ static int json_str_to_datum(ObIAllocator &allocator, const char *json_text, ObD
   return ret;
 }
 
+TEST_F(TestSearchIndexEncoder, test_generate_rows_escaped_path)
+{
+  ObArenaAllocator allocator(ObModIds::TEST);
+  ObSqlString raw_filter;
+  const char *path = R"($."a\\b")";
+  ASSERT_EQ(OB_SUCCESS, raw_filter.append_fmt("INCLUDE_PATHS=%ld%s", strlen(path), path));
+  ObSearchIndexConfig config;
+  ASSERT_EQ(OB_SUCCESS, config.decode(raw_filter.string()));
+  ObSearchIndexConfigFilter filter(MTL_ID());
+  ASSERT_EQ(OB_SUCCESS, filter.init_from_comment(config.get_comment()));
+  ObDatum datum;
+  ASSERT_EQ(OB_SUCCESS, json_str_to_datum(allocator, R"({"a\\b":1})", datum));
+  ObObjMeta meta;
+  meta.set_json();
+  meta.set_collation_type(CS_TYPE_UTF8MB4_BIN);
+  ObSearchIndexRowGenerator::Generator generator(allocator, allocator);
+  ASSERT_EQ(OB_SUCCESS, generator.init(0, meta, nullptr, &filter,
+                                      config.get_modes().at(0), false));
+  ObSearchIndexRows rows;
+  ASSERT_EQ(OB_SUCCESS, generator.generate_rows(0, datum, rows));
+  ASSERT_EQ(1, rows.count());
+}
+
 // Helper function to build expected encoded path for testing
 // Path encoding format: path_segment\x00\x1c ... \x00type
 static ObString build_expected_path(ObIAllocator &allocator,
@@ -1669,6 +1692,9 @@ TEST_F(TestSearchIndexEncoder, test_json_path_matcher_release_and_idempotent)
 
 int main(int argc, char** argv)
 {
+  if (oceanbase::common::OB_SUCCESS != oceanbase::common::ObCharset::init_charset()) {
+    return 1;
+  }
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }

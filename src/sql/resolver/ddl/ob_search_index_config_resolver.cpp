@@ -241,7 +241,7 @@ static int append_mode_comment(ObItemType curr_mode,
                                const ParseNode *curr_properties, const ParseNode *curr_fts_type,
                                const ObString &database_name, uint64_t tenant_id,
                                ObSchemaChecker *schema_checker, const ObObjMeta &source_meta,
-                               ObSqlString &comment)
+                               ObCollationType connection_collation, ObSqlString &comment)
 {
   int ret = OB_SUCCESS;
   ObSqlString filter;
@@ -250,7 +250,7 @@ static int append_mode_comment(ObItemType curr_mode,
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "JSON path/type options on a non-JSON search index column");
   } else if (path_option != nullptr
-      && OB_FAIL(ObSearchIndexConfigFilter::print_filter_option(path_option, filter))) {
+      && OB_FAIL(ObSearchIndexConfigFilter::print_filter_option(path_option, connection_collation, filter))) {
     LOG_WARN("failed to print search index paths", K(ret));
   }
   if (T_SEARCH_INDEX_FULLTEXT == curr_mode) {
@@ -260,7 +260,7 @@ static int append_mode_comment(ObItemType curr_mode,
   } else {
     if (OB_SUCC(ret) && curr_include_types != nullptr) {
       ObSqlString types;
-      if (OB_FAIL(ObSearchIndexConfigFilter::print_filter_option(curr_include_types, types))) {
+      if (OB_FAIL(ObSearchIndexConfigFilter::print_filter_option(curr_include_types, connection_collation, types))) {
         LOG_WARN("failed to print search index include types", K(ret));
       } else {
         // Normalize INCLUDE_TYPES for both flat and named VALUE configurations.
@@ -288,6 +288,7 @@ int ObSearchIndexConfigResolver::resolve(const ParseNode *column_options,
                                         uint64_t tenant_data_version,
                                         ObSchemaChecker *schema_checker,
                                         const ObObjMeta &source_meta,
+                                        ObCollationType connection_collation,
                                         ObSqlString &comment)
 {
   int ret = OB_SUCCESS;
@@ -329,7 +330,7 @@ int ObSearchIndexConfigResolver::resolve(const ParseNode *column_options,
       LOG_WARN("invalid search index mode", K(ret), K(curr_mode));
     } else if (OB_FAIL(append_mode_comment(curr_mode, curr_include_path, curr_exclude_path,
                                            curr_include_types, curr_parser, curr_properties, curr_fts_type,
-                                           database_name, tenant_id, schema_checker, source_meta, mode_comments))) {
+                                           database_name, tenant_id, schema_checker, source_meta, connection_collation, mode_comments))) {
       LOG_WARN("failed to append search index mode comment", K(ret));
     } else {
       mode_count = 1;
@@ -367,7 +368,7 @@ int ObSearchIndexConfigResolver::resolve(const ParseNode *column_options,
           LOG_WARN("invalid search index mode", K(ret), K(curr_mode));
         } else if (OB_FAIL(append_mode_comment(curr_mode, curr_include_path, curr_exclude_path,
                                                curr_include_types, curr_parser, curr_properties, curr_fts_type,
-                                               database_name, tenant_id, schema_checker, source_meta, mode_comments))) {
+                                               database_name, tenant_id, schema_checker, source_meta, connection_collation, mode_comments))) {
           LOG_WARN("failed to append search index mode comment", K(ret));
         } else {
           ++mode_count;
@@ -393,7 +394,7 @@ int ObSearchIndexConfigResolver::resolve(const ParseNode *column_options,
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "NESTED_PATHS on a non-JSON search index column");
   } else if (nested_path != nullptr
-             && OB_FAIL(ObSearchIndexConfigFilter::print_filter_option(nested_path, column_nested))) {
+             && OB_FAIL(ObSearchIndexConfigFilter::print_filter_option(nested_path, connection_collation, column_nested))) {
     LOG_WARN("failed to print search index nested paths", K(ret));
   } else if (OB_FAIL(comment.append_fmt("SEARCH_INDEX_CONFIG=1:%ld:%ld:",
                                          mode_count, column_nested.length()))) {

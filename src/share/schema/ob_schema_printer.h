@@ -190,7 +190,8 @@ public:
                          bool is_last,
                          char *buf,
                          int64_t buf_len,
-                         int64_t &pos) const;
+                         int64_t &pos,
+                         ObSQLMode sql_mode) const;
   int print_vector_index_column(const ObTableSchema &table_schema,
                                 const ObColumnSchemaV2 &column,
                                 bool is_last,
