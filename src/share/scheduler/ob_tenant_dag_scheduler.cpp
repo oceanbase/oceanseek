@@ -5,6 +5,7 @@
 #define USING_LOG_PREFIX COMMON
 #include "ob_tenant_dag_scheduler.h"
 #include "lib/thread/thread_mgr.h"
+#include "share/ob_debug_sync.h"
 #include "storage/compaction/ob_tenant_compaction_progress.h"
 #include "storage/compaction/ob_compaction_diagnose.h"
 #include "storage/compaction/ob_compaction_dag_ranker.h"
@@ -2287,6 +2288,12 @@ void ObTenantDagWorker::run1()
       status_ = DWS_FREE;
       cur_task = task_;
       task_ = NULL;
+#ifdef ERRSIM
+      // Pause after DWS_FREE, before business callbacks and returning to the pool.
+      if (OB_NOT_NULL(dag) && ObDagType::DAG_TYPE_START_MACRO_DELETE == dag->get_type()) {
+        DEBUG_SYNC(SS_HA_MACRO_DELETE_BEFORE_FINISH_TASK);
+      }
+#endif
       if (OB_FAIL(MTL(ObTenantDagScheduler*)->deal_with_finish_task(cur_task, *this, ret/*task error_code*/))) {
         COMMON_LOG(WARN, "failed to finish task", K(ret), KPC(cur_task));
       }
@@ -3804,29 +3811,40 @@ bool ObDagPrioScheduler::try_switch(ObTenantDagWorker &worker)
   bool need_pause = false;
   int tmp_ret = OB_SUCCESS;
 
+#ifdef ERRSIM
+  // Test hook: the outer stop check passed, but the priority lock is not held yet.
+  DEBUG_SYNC(DAG_WORKER_BEFORE_SWITCH_LOCK);
+#endif
   {
     common::SpinWLockGuard guard(prio_rwlock_);
-    if (running_task_cnts_ > adaptive_task_limit_) {
-      need_pause = true;
-    } else if (is_compaction_dag_prio() && check_need_load_shedding_(false /*for_schedule*/)) {
-      need_pause = true;
-      FLOG_INFO("[ADAPTIVE_SCHED]tenant cpu is at high level, pause current compaction task", K(priority_));
-    }
+#ifdef ERRSIM
+    // Test hook: prove that the stop recheck stays inside the priority lock.
+    DEBUG_SYNC(DAG_WORKER_AFTER_SWITCH_LOCK);
+#endif
+    // Recheck stop under the same lock used to wake paused workers.
+    if (!scheduler_->has_set_stop()) {
+      if (running_task_cnts_ > adaptive_task_limit_) {
+        need_pause = true;
+      } else if (is_compaction_dag_prio() && check_need_load_shedding_(false /*for_schedule*/)) {
+        need_pause = true;
+        FLOG_INFO("[ADAPTIVE_SCHED]tenant cpu is at high level, pause current compaction task", K(priority_));
+      }
 
-    if (need_pause) {
-      pause_worker_(worker);
-    } else if (!waiting_workers_.is_empty()) {
-      if (waiting_workers_.get_first()->need_wake_up()) {
-        // schedule_one will schedule the first worker on the waiting list first
-        if (OB_TMP_FAIL(schedule_one_())) {
-          if (OB_ENTRY_NOT_EXIST != tmp_ret) {
-            COMMON_LOG_RET(WARN, tmp_ret, "failed to schedule one task", K_(priority));
+      if (need_pause) {
+        pause_worker_(worker);
+      } else if (!waiting_workers_.is_empty()) {
+        if (waiting_workers_.get_first()->need_wake_up()) {
+          // schedule_one will schedule the first worker on the waiting list first
+          if (OB_TMP_FAIL(schedule_one_())) {
+            if (OB_ENTRY_NOT_EXIST != tmp_ret) {
+              COMMON_LOG_RET(WARN, tmp_ret, "failed to schedule one task", K_(priority));
+            }
           }
-        }
-        ObCurTraceId::set(worker.get_task()->get_dag()->get_dag_id());
-        if (OB_SUCCESS == tmp_ret) {
-          need_pause = true;
-          pause_worker_(worker);
+          ObCurTraceId::set(worker.get_task()->get_dag()->get_dag_id());
+          if (OB_SUCCESS == tmp_ret) {
+            need_pause = true;
+            pause_worker_(worker);
+          }
         }
       }
     }
@@ -4562,6 +4580,9 @@ void ObTenantDagScheduler::stop()
 void ObTenantDagScheduler::wait()
 {
   TG_WAIT(tg_id_);
+  if (IS_INIT) {
+    wait_worker_tasks_();
+  }
 }
 
 void ObTenantDagScheduler::inner_reload_config()
@@ -5670,28 +5691,60 @@ int ObTenantDagScheduler::try_reclaim_threads()
   return ret;
 }
 
-void ObTenantDagScheduler::destroy_all_workers()
+void ObTenantDagScheduler::wait_worker_tasks_()
 {
-  {
-    // resume all waiting workers
-    // all workers will run to complete since switch is forbedden after stop sign is set
-    for (int64_t i = 0; i < ObDagPrio::DAG_PRIO_MAX; ++i) {
-      prio_sche_[i].destroy_workers();
-    }
+  COMMON_LOG(INFO, "ObTenantDagScheduler starts to wait worker tasks");
+  // Mark DAGs stopped and resume paused workers so they can finish their tasks.
+  // The scheduler thread has exited.
+  for (int64_t i = 0; i < ObDagPrio::DAG_PRIO_MAX; ++i) {
+    prio_sche_[i].destroy_workers();
   }
 
-  // wait all workers finish, then delete all workers
+  const int64_t start_time = ObTimeUtility::current_time();
   while (true) {
-    // 100ms
-    ob_usleep(100 * 1000);
-    if (total_worker_cnt_ == free_workers_.get_size()) {
-      DLIST_REMOVE_ALL_NORET(worker, free_workers_) {
-        ob_delete(worker);
+    bool finished = false;
+    int64_t total_worker_cnt = 0;
+    int64_t free_worker_cnt = 0;
+    {
+      ObThreadCondGuard guard(scheduler_sync_);
+      if (OB_SUCCESS == guard.get_ret()) {
+        total_worker_cnt = total_worker_cnt_;
+        free_worker_cnt = free_workers_.get_size();
+        // DWS_FREE is set before deal_with_finish_task(); only returning to this
+        // list guarantees that the worker has finished its business callbacks.
+        finished = total_worker_cnt == free_worker_cnt;
       }
-      free_workers_.reset();
+    }
+    if (finished) {
       break;
     }
+#ifdef ERRSIM
+    // The wakeup scan is complete; only the last worker has not returned to the pool.
+    // Keep this after the completion check and outside scheduler_sync_.
+    if (is_user_tenant(MTL_ID()) && total_worker_cnt == free_worker_cnt + 1) {
+      DEBUG_SYNC(DAG_SCHEDULER_WAIT_LAST_WORKER);
+    }
+#endif
+    if (REACH_TIME_INTERVAL(10 * 1000 * 1000)) {
+      COMMON_LOG(INFO, "waiting for dag worker tasks", K(total_worker_cnt), K(free_worker_cnt),
+          "wait_time", ObTimeUtility::current_time() - start_time);
+    }
+    // Release scheduler_sync_ before waiting: workers need it to return to the pool.
+    ob_usleep(100 * 1000);
   }
+  COMMON_LOG(INFO, "ObTenantDagScheduler worker tasks drained",
+      "wait_time", ObTimeUtility::current_time() - start_time);
+}
+
+void ObTenantDagScheduler::destroy_all_workers()
+{
+  // reset() calls wait() before reclaiming workers. Keep the idle threads and
+  // worker objects alive until this phase; wait() may be called more than once.
+  OB_ASSERT(total_worker_cnt_ == free_workers_.get_size());
+  DLIST_REMOVE_ALL_NORET(worker, free_workers_) {
+    ob_delete(worker);
+  }
+  free_workers_.reset();
 }
 
 int ObTenantDagScheduler::set_compaction_dag_limit(const int64_t new_val)

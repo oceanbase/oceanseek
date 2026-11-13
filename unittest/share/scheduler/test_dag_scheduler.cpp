@@ -6,12 +6,14 @@
 #define USING_LOG_PREFIX TEST
 #include <getopt.h>
 #include <gtest/gtest.h>
+#include <thread>
 #define protected public
 #define private public
 #include "share/scheduler/test_dag_common.h"
 #include "storage/compaction/ob_batch_freeze_tablets_dag.h"
 #include "lib/random/ob_random.h"
 #include "lib/utility/ob_defer.h"
+#include "share/ob_debug_sync.h"
 
 int64_t dag_cnt = 1;
 int64_t stress_time= 1; // 100ms
@@ -721,6 +723,157 @@ private:
   int rets_[THREAD_CNT];
   int64_t ready_cnt_;
 };
+
+#ifdef ERRSIM
+// Exercise the real switch/stop-scan methods without background schedulers or
+// another in-flight switch that could accidentally rescue a late paused worker.
+class TestDagSwitchStop : public TestDagScheduler
+{
+public:
+  TestDagSwitchStop() : need_pause_(false), old_sync_timeout_(0) {}
+  void SetUp() override
+  {
+    TestDagScheduler::SetUp();
+    old_sync_timeout_ = GCONF.debug_sync_timeout;
+    ASSERT_TRUE(GCONF.debug_sync_timeout.set_value("30s"));
+    scheduler_->set_stop(false);
+    ObDagPrioScheduler &prio = scheduler_->prio_sche_[ObDagPrio::DAG_PRIO_DDL];
+    prio.scheduler_ = scheduler_;
+    prio.priority_ = ObDagPrio::DAG_PRIO_DDL;
+    scheduler_->clear_running_dag_cnts(ObDagType::DAG_TYPE_DDL);
+    for (int64_t i = 0; i < 2; ++i) {
+      tasks_[i].dag_ = &dags_[i];
+      ASSERT_EQ(OB_SUCCESS, workers_[i].cond_.init(ObWaitEventIds::DAG_WORKER_COND_WAIT));
+      workers_[i].set_task(&tasks_[i]);
+      workers_[i].status_ = ObTenantDagWorker::DWS_RUNNING;
+      ASSERT_TRUE(prio.running_workers_.add_last(&workers_[i]));
+      ++prio.running_task_cnts_;
+      scheduler_->add_total_running_task_cnt();
+      scheduler_->add_running_dag_cnts(ObDagType::DAG_TYPE_DDL);
+    }
+    // A legal 2 -> 1 limit reduction leaves two running workers temporarily over
+    // quota. Only workers_[0] calls try_switch; workers_[1] cannot wake it.
+    int64_t old_limit = 0;
+    int64_t new_limit = 0;
+    ASSERT_EQ(OB_SUCCESS, prio.set_thread_score(2, old_limit, new_limit));
+    ASSERT_EQ(OB_SUCCESS, prio.set_thread_score(1, old_limit, new_limit));
+    ASSERT_EQ(2, old_limit);
+    ASSERT_EQ(1, new_limit);
+    ASSERT_GT(prio.get_running_task_cnt(), prio.get_adaptive_limit());
+  }
+
+  void TearDown() override
+  {
+    // Always release/join on assertion failures; a broken stop check must fail
+    // the assertions below rather than hang the test process.
+    GDS.event_control_.signal("dag_switch_go");
+    if (switch_thread_.joinable()) {
+      switch_thread_.join();
+    }
+    ObDebugSyncAction action;
+    action.sync_point_ = DAG_WORKER_BEFORE_SWITCH_LOCK;
+    GDS.set_global_action(false, true, action);
+    action.sync_point_ = DAG_WORKER_AFTER_SWITCH_LOCK;
+    GDS.set_global_action(false, true, action);
+    GDS.event_control_.clear_event();
+    char timeout[64];
+    snprintf(timeout, sizeof(timeout), "%ldus", old_sync_timeout_);
+    GCONF.debug_sync_timeout.set_value(timeout);
+    scheduler_->prio_sche_[ObDagPrio::DAG_PRIO_DDL].running_workers_.reset();
+    scheduler_->prio_sche_[ObDagPrio::DAG_PRIO_DDL].waiting_workers_.reset();
+    scheduler_->set_stop(true);
+    TestDagScheduler::TearDown();
+  }
+
+  void start_switch(const ObDebugSyncPoint point)
+  {
+    ObDebugSyncAction action;
+    action.sync_point_ = point;
+    action.signal_ = "dag_switch_enter";
+    action.wait_ = "dag_switch_go";
+    action.execute_ = 1;
+    action.timeout_ = 30 * 1000 * 1000L;
+    ASSERT_EQ(OB_SUCCESS, GDS.set_global_action(false, false, action));
+    switch_thread_ = std::thread([this]() {
+      ObTenantEnv::set_tenant(&tenant_base_);
+      // yield() holds this lock through try_switch and setting DWS_WAITING.
+      ObThreadCondGuard guard(workers_[0].cond_);
+      need_pause_ = scheduler_->try_switch(workers_[0]);
+      if (need_pause_) {
+        workers_[0].status_ = ObTenantDagWorker::DWS_WAITING;
+      }
+      ObTenantEnv::set_tenant(nullptr);
+    });
+  }
+
+  bool switch_hook_reached()
+  {
+    ObDSEventControl &events = GDS.event_control_;
+    events.wait("dag_switch_enter", CHECK_TIMEOUT, false /*clear*/);
+    // Debug-sync wait returns success even on timeout; require the actual signal.
+    ObThreadCondGuard guard(events.cond_);
+    ObDSEventControl::Event *event = nullptr;
+    return OB_SUCCESS == events.find("dag_switch_enter", event)
+        && nullptr != event && event->signal_cnt_ > 0;
+  }
+
+  void release_switch()
+  {
+    ASSERT_EQ(OB_SUCCESS, GDS.event_control_.signal("dag_switch_go"));
+    switch_thread_.join();
+  }
+
+protected:
+  TestLPDag dags_[2];
+  AtomicIncTask tasks_[2];
+  ObTenantDagWorker workers_[2];
+  std::thread switch_thread_;
+  bool need_pause_;
+  int64_t old_sync_timeout_;
+};
+
+TEST_F(TestDagSwitchStop, stop_scan_before_late_switch)
+{
+  start_switch(DAG_WORKER_BEFORE_SWITCH_LOCK);
+  ASSERT_TRUE(switch_hook_reached());
+  ObDagPrioScheduler &prio = scheduler_->prio_sche_[ObDagPrio::DAG_PRIO_DDL];
+  scheduler_->set_stop(true);
+  prio.destroy_workers(); // The sole stop scan has completed before lock acquisition.
+  release_switch();
+  EXPECT_FALSE(need_pause_);
+  EXPECT_EQ(0, prio.waiting_workers_.get_size());
+  EXPECT_EQ(2, prio.running_workers_.get_size());
+  EXPECT_EQ(ObTenantDagWorker::DWS_RUNNING, workers_[0].status_);
+}
+
+TEST_F(TestDagSwitchStop, pause_before_stop_scan)
+{
+  start_switch(DAG_WORKER_BEFORE_SWITCH_LOCK);
+  ASSERT_TRUE(switch_hook_reached());
+  release_switch();
+  ObDagPrioScheduler &prio = scheduler_->prio_sche_[ObDagPrio::DAG_PRIO_DDL];
+  ASSERT_TRUE(need_pause_);
+  ASSERT_EQ(1, prio.waiting_workers_.get_size());
+  ASSERT_EQ(ObTenantDagWorker::DWS_WAITING, workers_[0].status_);
+  scheduler_->set_stop(true);
+  prio.destroy_workers();
+  EXPECT_EQ(ObTenantDagWorker::DWS_RUNNABLE, workers_[0].status_);
+}
+
+TEST_F(TestDagSwitchStop, stop_rechecked_after_priority_lock)
+{
+  start_switch(DAG_WORKER_AFTER_SWITCH_LOCK);
+  ASSERT_TRUE(switch_hook_reached());
+  // Stop after lock acquisition: checking only before the lock is insufficient.
+  scheduler_->set_stop(true);
+  release_switch();
+  ObDagPrioScheduler &prio = scheduler_->prio_sche_[ObDagPrio::DAG_PRIO_DDL];
+  EXPECT_FALSE(need_pause_);
+  EXPECT_EQ(0, prio.waiting_workers_.get_size());
+  EXPECT_EQ(2, prio.running_workers_.get_size());
+  prio.destroy_workers();
+}
+#endif
 
 TEST_F(TestDagScheduler, test_init)
 {

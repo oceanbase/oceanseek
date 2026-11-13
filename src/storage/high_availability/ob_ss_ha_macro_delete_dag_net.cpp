@@ -19,6 +19,7 @@
 #include "storage/backup/ob_ss_backup_utils.h"
 #include "share/backup/ob_backup_data_table_operator.h"
 #include "share/ob_srv_rpc_proxy.h"
+#include "share/ob_debug_sync.h"
 #include "share/ob_rpc_struct.h"
 #include "share/location_cache/ob_location_service.h"
 #include "observer/ob_server_event_history_table_operator.h"
@@ -910,6 +911,7 @@ int ObSSHAMacroDeleteTask::batch_delete_files_with_fallback_(
     LOG_WARN("file_path_array is empty, no files to delete", K(ret));
   } else {
     LOG_DEBUG("preparing to batch delete files", "file_count", file_path_array.count());
+    DEBUG_SYNC(SS_HA_MACRO_DELETE_BEFORE_BATCH_IO);
 #ifdef ERRSIM
     if (OB_FAIL(EN_SS_HA_MACRO_DELETE_FILE_FAILED)) {
       LOG_WARN("error injected for SS HA macro delete file, delete will always fail", K(ret));

@@ -373,6 +373,9 @@ using ObHMSClientUnifyPoolMgr = share::ObCatalogClientPoolMgr<oceanbase::share::
       ObPartTransCtxObjPool*,                        \
       ObTableScanIteratorObjPool*,                   \
       common::ObTenantIOManager*,                    \
+      /* Keep permissions alive until backup/archive and DAG users drain. */ \
+      /* ObSharedTimer must outlive this manager for task cancellation. */ \
+      share::ObBackupDestIOPermissionMgr*,           \
       storage::mds::ObTenantMdsService*,             \
       blocksstable::ObSharedMacroBlockMgr*,          \
       share::ObSharedMemAllocMgr*,                   \
@@ -535,7 +538,6 @@ using ObHMSClientUnifyPoolMgr = share::ObCatalogClientPoolMgr<oceanbase::share::
       observer::ObSessionTmpTableCleaner*,            \
       omt::ObTenantAiService*,                       \
       sql::ObSQLCCLRuleManager*,                     \
-      share::ObBackupDestIOPermissionMgr*,           \
       ObHMSClientUnifyPoolMgr*,                      \
       share::schema::ObAddIntervalPartitionController*, \
       observer::ObTenantTabletCleanupService*,        \

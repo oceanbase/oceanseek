@@ -1546,6 +1546,7 @@ private:
   int loop_ready_dag_lists();
   int create_worker();
   int try_reclaim_threads();
+  void wait_worker_tasks_();
   void destroy_all_workers();
   int set_thread_score(const int64_t priority, const int64_t concurrency);
   int set_compaction_dag_limit(const int64_t new_val);
