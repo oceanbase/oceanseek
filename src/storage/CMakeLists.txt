@@ -1357,7 +1357,6 @@ if(OB_BUILD_SHARED_STORAGE)
     shared_storage/ob_ss_reader_writer.cpp
     shared_storage/ob_segment_file_manager.cpp
     ddl/ob_ss_ddl_util.cpp
-    compaction/ob_major_pre_warmer.cpp
     compaction_v2/ob_ss_compact_helper.cpp
     compaction_v2/ob_ss_major_merge_ctx.cpp
     compaction_v2/ob_ss_link_major_task.cpp

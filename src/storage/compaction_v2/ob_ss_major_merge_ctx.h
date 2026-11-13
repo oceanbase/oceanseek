@@ -4,8 +4,7 @@
 #define STORAGE_COMPACTION_OB_TABLET_SS_MAJOR_MERGE_CTX_H_
 #include "storage/compaction/ob_tablet_merge_ctx.h"
 #include "storage/column_store/ob_co_merge_ctx.h"
-#include "storage/compaction/ob_major_pre_warmer.h"
-#include "storage/shared_storage/prewarm/ob_mc_prewarm_struct.h"
+#include "share/storage/ob_i_pre_warmer.h"
 #include "storage/compaction/ob_async_index_merge_ctx.h"
 #include "storage/incremental/atomic_protocol/ob_sstable_atomic_protocol.h"
 
@@ -21,9 +20,10 @@ public:
     : ObTabletMajorMergeCtx(param, allocator),
       task_cnt_(0),
       sswriter_epoch_(0),
-      pre_warm_writer_(param.tablet_id_.id(), param.merge_version_, param.reorganization_scn_),
-      major_pre_warm_param_(pre_warm_writer_)
-  {}
+      major_pre_warm_param_()
+  {
+    major_pre_warm_param_.type_ = share::MEM_PRE_WARM;
+  }
   virtual ~ObSSTabletMajorMergeCtx() { destroy(); }
   void destroy();
   virtual ObStorageObjectWriteStrategy get_io_write_strategy() const override;
@@ -35,8 +35,7 @@ public:
 private:
   int task_cnt_;
   int64_t sswriter_epoch_;
-  storage::ObHotTabletInfoWriter pre_warm_writer_;
-  ObMajorPreWarmerParam major_pre_warm_param_;
+  share::ObPreWarmerParam major_pre_warm_param_;
   storage::ObSSTableAtomicProtocol sstable_protocol_;
 };
 struct ObSSCOTabletMergeCtx : public ObCOTabletMergeCtx
@@ -48,10 +47,11 @@ struct ObSSCOTabletMergeCtx : public ObCOTabletMergeCtx
     : ObCOTabletMergeCtx(dag_net, param, allocator),
       task_cnt_(0),
       sswriter_epoch_(0),
-      pre_warm_writer_(param.tablet_id_.id(), param.merge_version_, param.reorganization_scn_),
-      major_pre_warm_param_(pre_warm_writer_),
+      major_pre_warm_param_(),
       update_tablet_failed_times_(0)
-  {}
+  {
+    major_pre_warm_param_.type_ = share::MEM_PRE_WARM;
+  }
   virtual ~ObSSCOTabletMergeCtx() { destroy(); }
   void destroy();
   virtual ObStorageObjectWriteStrategy get_io_write_strategy() const override;
@@ -63,8 +63,7 @@ struct ObSSCOTabletMergeCtx : public ObCOTabletMergeCtx
 private:
   int task_cnt_;
   int64_t sswriter_epoch_;
-  storage::ObHotTabletInfoWriter pre_warm_writer_;
-  ObMajorPreWarmerParam major_pre_warm_param_;
+  share::ObPreWarmerParam major_pre_warm_param_;
   int update_tablet_failed_times_;
   storage::ObSSTableAtomicProtocol sstable_protocol_;
 };
@@ -76,9 +75,10 @@ struct ObSSAsyncIndexMergeCtx : public ObAsyncIndexMergeCtx
     : ObAsyncIndexMergeCtx(param, allocator),
       task_cnt_(0),
       sswriter_epoch_(0),
-      pre_warm_writer_(param.tablet_id_.id(), param.merge_version_, param.reorganization_scn_),
-      major_pre_warm_param_(pre_warm_writer_)
-  {}
+      major_pre_warm_param_()
+  {
+    major_pre_warm_param_.type_ = share::MEM_PRE_WARM;
+  }
   virtual ~ObSSAsyncIndexMergeCtx() { destroy(); }
   void destroy();
   virtual ObStorageObjectWriteStrategy get_io_write_strategy() const override;
@@ -93,8 +93,7 @@ private:
 private:
   int task_cnt_;
   int64_t sswriter_epoch_;
-  storage::ObHotTabletInfoWriter pre_warm_writer_;
-  ObMajorPreWarmerParam major_pre_warm_param_;
+  share::ObPreWarmerParam major_pre_warm_param_;
   storage::ObSSTableAtomicProtocol sstable_protocol_;
 };
 } // namespace compaction

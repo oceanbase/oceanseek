@@ -17,9 +17,6 @@
 
 namespace oceanbase
 {
-namespace storage {
-  struct ObHotTabletInfoIndex;
-}
 namespace tools
 {
 
@@ -35,8 +32,6 @@ enum ObAdminDumpsstCmd
   DUMP_IS_DELETED_OBJ = 7,
   DUMP_META_LIST = 8, 
   DUMP_GC_INFO = 9, 
-  DUMP_PREWARM_INDEX = 10, 
-  DUMP_PREWARM_DATA = 11, 
   DUMP_MAX,
 };
 
@@ -60,12 +55,9 @@ private:
   void dump_table_store(const ObDumpMacroBlockContext &macro_block_context);
   void dump_storage_schema(const ObDumpMacroBlockContext &macro_block_context);
 #ifdef OB_BUILD_SHARED_STORAGE
-  void dump_prewarm_index(const ObDumpMacroBlockContext &macro_block_context);
-  void dump_prewarm_data(const ObDumpMacroBlockContext &macro_block_context);
   void dump_is_deleted_obj(const ObDumpMacroBlockContext &macro_block_context);
   void dump_meta_list(const ObDumpMacroBlockContext &macro_block_context);
   void dump_gc_info(const ObDumpMacroBlockContext &macro_block_context);
-  int do_dump_prewarm_index(const char *path, storage::ObHotTabletInfoIndex &index);
 #endif
 
 #ifdef OB_BUILD_TDE_SECURITY

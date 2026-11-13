@@ -1303,42 +1303,6 @@ int ObSSMacroCacheMgr::batch_modify_cache_type(const common::hash::ObHashSet<blo
   return ret;
 }
 
-int ObSSMacroCacheMgr::eliminate_macro_scp_blocks(const common::hash::ObHashSet<blocksstable::MacroBlockId> &macro_block_ids, 
-                                                  const common::hash::ObHashSet<int64_t> &tablet_ids,
-                                                  const int64_t elmination_time_us)
-{
-  int ret = OB_SUCCESS;
-  SSMacroCacheReqGuard guard(flying_req_cnt_);
-  int64_t bucket_cnt = 0;
-  common::hash::ObHashSet<MacroBlockId> eliminated_macro_ids;
-  const int64_t eliminated_macro_ids_cnt = 10000;
-  if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("macro cache mgr is not inited", KR(ret));
-  } else if (OB_UNLIKELY(is_stopped_)) {
-    ret = OB_SERVICE_STOPPED;
-    LOG_WARN("macro cache mgr is stopped", KR(ret));
-  } else if (OB_FAIL(eliminated_macro_ids.create(eliminated_macro_ids_cnt, ObMemAttr(MTL_ID(), "EliMacroSCP")))) {
-    LOG_WARN("fail to create eliminated_macro_ids", KR(ret));
-  } else {
-    SS_FOREACH_MAP_NODE_WITH_COND(meta_map_, SSMacroCacheMetaMap, node_iter, !is_stopped_, {
-      if (OB_FAIL(handle_eliminate_macro_scp_node_(node_iter->first,
-                                                   node_iter->second,
-                                                   macro_block_ids,
-                                                   tablet_ids,
-                                                   elmination_time_us,
-                                                   eliminated_macro_ids))) {
-        LOG_WARN("fail to handle eliminate macro scp node", KR(ret), K(node_iter->first));
-      }
-    });
-  }
-  if (OB_SUCC(ret) && !eliminated_macro_ids.empty()) {
-    if (OB_FAIL(batch_modify_cache_type(eliminated_macro_ids, ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK, ObSSMacroCacheType::MACRO_BLOCK))) {
-      LOG_WARN("fail to batch modify cache type", KR(ret), K(eliminated_macro_ids));
-    }
-  }
-  return ret;
-}
 
 int ObSSMacroCacheMgr::erase_unmarked_macro_cache_meta(const int64_t start_calc_size_time_us)
 {
@@ -1585,8 +1549,7 @@ int ObSSMacroCacheMgr::force_evict_by_macro_id(const MacroBlockId &macro_id)
 This function is used to evict a macro block from the macro cache and macro block KVCACHE.
 The following scenarios are involved.
 1. ob_admin del_ss_tablet_macro_cache/del_ss_macro_cache
-2. cold tablet or cold block evict
-3. clear ss_macro_cache/clear ss_hot_macro_cache
+2. clear ss_macro_cache/clear ss_hot_macro_cache
 */
 int ObSSMacroCacheMgr::evict_by_macro_id(const MacroBlockId &macro_id, bool &is_write_cache)
 {
@@ -1642,38 +1605,6 @@ int ObSSMacroCacheMgr::evict_by_macro_id(const MacroBlockId &macro_id, bool &is_
   return ret;
 }
 
-int ObSSMacroCacheMgr::batch_evict_by_macro_ids(const ObHashSet<MacroBlockId> &cold_macro_ids, ObHashSet<MacroBlockId> &evicted_macro_ids)
-{
-  int ret = OB_SUCCESS;
-  SSMacroCacheReqGuard guard(flying_req_cnt_);
-  if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("macro cache mgr is not inited", KR(ret));
-  } else if (OB_UNLIKELY(is_stopped_)) {
-    ret = OB_SERVICE_STOPPED;
-    LOG_WARN("macro cache mgr is stopped", KR(ret));
-  } else if (cold_macro_ids.empty()) {
-    // nothing to do
-  } else {
-    hash::ObHashSet<MacroBlockId>::const_iterator iter;
-    for (iter = cold_macro_ids.begin(); OB_SUCC(ret) && iter != cold_macro_ids.end(); ++iter) {
-      const MacroBlockId &cur_macro_id = iter->first;
-      bool is_write_cache = false;
-      if (OB_FAIL(evict_by_macro_id(cur_macro_id, is_write_cache))) {
-        LOG_WARN("fail to evict macro cache by id", KR(ret), K(cur_macro_id));
-      } else if (is_write_cache) {
-        if (OB_FAIL(evicted_macro_ids.erase_refactored(cur_macro_id))) {
-          if (OB_HASH_NOT_EXIST == ret) {
-            ret = OB_SUCCESS;
-          } else {
-            LOG_WARN("fail to erase evicted macro id", KR(ret), K(cur_macro_id));
-          }
-        }
-      }
-    }
-  }
-  return ret;
-}
 
 int ObSSMacroCacheMgr::batch_evict_by_macro_id_(const ObIArray<MacroBlockId> &macro_ids)
 {
@@ -1763,45 +1694,6 @@ int ObSSMacroCacheMgr::handle_evict_tablet_node_(
   return ret;
 }
 
-int ObSSMacroCacheMgr::handle_eliminate_macro_scp_node_(
-    const blocksstable::MacroBlockId &macro_id,
-    const ObSSMacroCacheMetaHandle &meta_handle,
-    const common::hash::ObHashSet<blocksstable::MacroBlockId> &macro_block_ids,
-    const common::hash::ObHashSet<int64_t> &tablet_ids,
-    const int64_t elmination_time_us,
-    common::hash::ObHashSet<blocksstable::MacroBlockId> &eliminated_macro_ids)
-{
-  int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(!meta_handle.is_valid())) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("meta handle should not be invalid", KR(ret), K(meta_handle));
-  } else if (elmination_time_us < meta_handle()->get_last_access_time_us()) {
-    // skip if the macro block is accessed after the elmination time
-  } else if (OB_FAIL(tablet_ids.exist_refactored(meta_handle()->get_effective_tablet_id()))) {
-    if (OB_HASH_EXIST == ret) {
-      ret = OB_SUCCESS; // ignore ret
-      if (OB_FAIL(macro_block_ids.exist_refactored(macro_id))) {
-        if (OB_HASH_EXIST == ret) {
-          ret = OB_SUCCESS; // ignore ret
-        } else if (OB_HASH_NOT_EXIST == ret) {
-          ret = OB_SUCCESS; // ignore ret
-          if (OB_FAIL(eliminated_macro_ids.set_refactored(macro_id, 0, true/*overwrite*/))) {
-            LOG_WARN("fail to set refactored", KR(ret), K(macro_id));
-          }
-        } else {
-          LOG_WARN("fail to check exist", KR(ret), K(macro_id));
-        }
-      } else {
-        // do nothing
-      }
-    } else if (OB_HASH_NOT_EXIST == ret) {
-      ret = OB_SUCCESS; // ignore ret
-    } else {
-      LOG_WARN("fail to check exist", KR(ret), K(macro_id));
-    }
-  }
-  return ret;
-}
 
 int ObSSMacroCacheMgr::handle_evict_bucket_batch_(
     const int64_t bucket_batch_cnt,
@@ -1902,22 +1794,6 @@ int ObSSMacroCacheMgr::evict_by_tablet_id(
   return ret;
 }
 
-int ObSSMacroCacheMgr::batch_evict_by_tablet_ids(const common::hash::ObHashSet<uint64_t> &cold_tablet_ids, 
-                                                 common::hash::ObHashSet<uint64_t> &evicted_tablet_ids)
-{
-  int64_t macro_read_cache_cnt = 0;
-  int64_t macro_write_cache_cnt = 0;
-  int ret = evict_tablets(nullptr /*tablet_id*/, &cold_tablet_ids, &evicted_tablet_ids,
-                          macro_read_cache_cnt, macro_write_cache_cnt);
-  if (OB_SUCC(ret)) {
-    if (macro_write_cache_cnt > 0) {
-      LOG_TRACE("remain tablet which has write cache to be evicted", KR(ret), K(macro_write_cache_cnt), K(macro_read_cache_cnt), K(evicted_tablet_ids), K(cold_tablet_ids));
-    } else {
-      LOG_TRACE("all tablets have been successfully evicted", KR(ret), K(macro_read_cache_cnt), K(cold_tablet_ids));
-    }
-  }
-  return ret;
-}
 
 int ObSSMacroCacheMgr::push_old_sstable_evict_task(
     const ObTabletID &tablet_id,

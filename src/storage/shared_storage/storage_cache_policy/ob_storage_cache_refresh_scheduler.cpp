@@ -4,7 +4,6 @@
  */
 #include <cstddef>
 #define USING_LOG_PREFIX STORAGE
-#include <type_traits>
 #include "lib/utility/ob_sort.h"
 #include "observer/omt/ob_tenant_config_mgr.h"
 #include "storage/shared_storage/storage_cache_policy/ob_storage_cache_refresh_scheduler.h"
@@ -40,39 +39,6 @@ private:
   ObIArray<uint64_t> &ids_in_map_;
 };
 
-class ObInvaidColdTabletCollectFunc
-{
-public:
-  ObInvaidColdTabletCollectFunc(ObIArray<uint64_t> &ids_to_erase,
-                                const hash::ObHashSet<uint64_t> &active_tablet_ids)
-      : ids_to_erase_(ids_to_erase),
-        active_tablet_ids_(active_tablet_ids)
-  {}
-
-  int operator()(common::hash::HashSetTypes<uint64_t>::pair_type &entry)
-  {
-    int ret = OB_SUCCESS;
-    const uint64_t tablet_id = entry.first;
-    if (OB_FAIL(active_tablet_ids_.exist_refactored(tablet_id))) {
-      if (OB_HASH_EXIST == ret) {
-        ret = OB_SUCCESS;
-      } else if (OB_HASH_NOT_EXIST == ret) {
-        ret = OB_SUCCESS;
-        if (OB_FAIL(ids_to_erase_.push_back(tablet_id))) {
-          LOG_WARN("fail to push back tablet id to erase list", KR(ret), K(tablet_id));
-        }
-      } else {
-        LOG_WARN("fail to check exist", KR(ret), K(tablet_id));
-      }
-    }
-    return ret;
-  }
-
-private:
-  ObIArray<uint64_t> &ids_to_erase_;
-  const hash::ObHashSet<uint64_t> &active_tablet_ids_;
-};
-
 class ObCollectAllTabletIDFunc
 {
 public:
@@ -93,87 +59,6 @@ public:
 private:
   ObIArray<uint64_t> &ids_;
 };
-
-template <typename T>
-class ObCopyIDToHashSetFunc
-{
-public:
-  explicit ObCopyIDToHashSetFunc(hash::ObHashSet<T> &target_set1, hash::ObHashSet<T> &target_set2)
-      : target_set1_(target_set1), target_set2_(target_set2)
-  {}
-
-  int operator()(typename common::hash::HashSetTypes<T>::pair_type &entry)
-  {
-    int ret = OB_SUCCESS;
-    const T id = entry.first;
-    if (OB_FAIL(target_set1_.set_refactored(id))) {
-      LOG_WARN("fail to set id to hash set", KR(ret), K(id));
-    } else if (OB_FAIL(target_set2_.set_refactored(id))) {
-      LOG_WARN("fail to set id to hash set", KR(ret), K(id));
-    }
-    return ret;
-  }
-
-private:
-  hash::ObHashSet<T> &target_set1_;
-  hash::ObHashSet<T> &target_set2_;
-};
-
-template <typename T>
-int do_evict_cold_items(
-    hash::ObHashSet<T> &need_evict_ids,
-    int (ObSSMacroCacheMgr::*batch_evict_func)(const hash::ObHashSet<T> &, hash::ObHashSet<T> &))
-{
-  int ret = OB_SUCCESS;
-  ObSSMacroCacheMgr *macro_cache_mgr = MTL(ObSSMacroCacheMgr *);
-  if (OB_ISNULL(macro_cache_mgr)) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument", KR(ret), KP(macro_cache_mgr));
-  } else if (need_evict_ids.size() > 0) {
-    FLOG_INFO("do evict cold items", "size", need_evict_ids.size());
-    const int64_t init_size = need_evict_ids.size();
-    // 1. Copy all ids that need to be evicted to all_ids
-    hash::ObHashSet<T> all_ids;
-    hash::ObHashSet<T> evicted_ids;
-    if (OB_FAIL(all_ids.create(init_size, ObMemAttr(MTL_ID(), "AllIds")))) {
-      LOG_WARN("fail to create all_ids", KR(ret), K(init_size));
-    } else if (OB_FAIL(evicted_ids.create(init_size, ObMemAttr(MTL_ID(), "EvictIds")))) {
-      LOG_WARN("fail to create evicted_ids", KR(ret), K(init_size));
-    } else {
-      ObCopyIDToHashSetFunc<T> copy_func(all_ids, evicted_ids);
-      if (OB_FAIL(need_evict_ids.foreach_refactored(copy_func))) {
-        LOG_WARN("fail to copy ids", KR(ret), K(need_evict_ids.size()));
-      }
-    }
-    // 2. Process ids in batches
-    if (OB_SUCC(ret) && all_ids.size() > 0) {
-      if (OB_FAIL((macro_cache_mgr->*batch_evict_func)(all_ids, evicted_ids))) {
-        LOG_WARN("fail to batch evict by ids", KR(ret), K(all_ids), K(evicted_ids));
-      } else if (evicted_ids.size() > 0) {
-        typename hash::ObHashSet<T>::const_iterator iter;
-        // for each id in evicted_ids, erase it from need_evict_ids
-        for (iter = evicted_ids.begin(); OB_SUCC(ret) && iter != evicted_ids.end(); iter++) {
-          const T &id = iter->first;
-          if (OB_FAIL(need_evict_ids.erase_refactored(id))) {
-            if (OB_HASH_NOT_EXIST == ret) {
-              ret = OB_SUCCESS;
-            } else {
-              LOG_WARN("fail to erase cold id", KR(ret), K(id));
-            }
-          }
-          if (OB_FAIL(ret)) {
-          } else {
-            // Only print log for tablet_id, not for macro_id
-            if (std::is_same<T, uint64_t>::value) {
-              FLOG_INFO("erase cold tablet id success", K(id));
-            }
-          }
-        }
-      }
-    }
-  }
-  return ret;
-}
 
 template <typename T>
 int clean_storage_cache_map(const hash::ObHashSet<uint64_t> &exist_ids,
@@ -248,24 +133,6 @@ bool is_need_refresh_type(const ObStorageCachePolicyRefreshType &type)
       || ObStorageCachePolicyRefreshType::REFRESH_TYPE_FORCE_REFRESH == type;
 }
 
-int get_clean_macro_interval(const uint64_t tenant_id, int64_t &clean_macro_interval)
-{
-  int ret = OB_SUCCESS;
-  clean_macro_interval = 0;
-  if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id))) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid tenant id", KR(ret), K(tenant_id));
-  } else {
-    omt::ObTenantConfigGuard tenant_config(TENANT_CONF(tenant_id));
-    if (OB_UNLIKELY(!tenant_config.is_valid())) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("fail to get tenant config", KR(ret), K(tenant_id));
-    } else {
-      clean_macro_interval = tenant_config->storage_cache_clean_macro_interval;
-    }
-  }
-  return ret;
-}
 
 int get_default_storage_cache_policy(
     const uint64_t tenant_id,
@@ -343,8 +210,7 @@ ObStorageRefreshCachePolicyTask::ObStorageRefreshCachePolicyTask()
     last_default_scp_type_(ObStorageCachePolicyType::MAX_POLICY),
     // Tenant Para `enable_manual_storage_cache_policy` default is true
     last_enable_manual_storage_cache_policy_(true),
-    last_is_suspend_storage_cache_task_(false),
-    last_clean_macro_interval_(0)
+    last_is_suspend_storage_cache_task_(false)
 {
 }
 
@@ -353,7 +219,6 @@ void ObStorageRefreshCachePolicyTask::destroy()
   last_default_scp_type_ = ObStorageCachePolicyType::MAX_POLICY;
   last_enable_manual_storage_cache_policy_ = true;
   last_is_suspend_storage_cache_task_ = false;
-  last_clean_macro_interval_ = 0;
   ObSCPTaskBase::destroy();
 }
 
@@ -367,8 +232,7 @@ int ObStorageRefreshCachePolicyTask::init(const uint64_t tenant_id)
     LOG_WARN("fail to get is_suspend_storage_cache_task", KR(ret), KPC(this));
   } else {
     bool force_refresh_scp = false;
-    bool force_reschedule_eliminate_macro_task = false;
-    sync_tenant_param_(force_refresh_scp, force_reschedule_eliminate_macro_task);
+    sync_tenant_param_(force_refresh_scp);
   }
   return ret;
 }
@@ -470,21 +334,10 @@ void ObStorageRefreshCachePolicyTask::runTimerTask()
   if (OB_FAIL(ret)) {
   } else if (!is_suspend) {
     bool force_refresh_scp = false;
-    bool force_reschedule_eliminate_macro_task = false;
-    sync_tenant_param_(force_refresh_scp, force_reschedule_eliminate_macro_task);
+    sync_tenant_param_(force_refresh_scp);
     ObStorageCachePolicyRefreshType refresh_type = REFRESH_TYPE_NORMAL;
     if (force_refresh_scp) {
       refresh_type = REFRESH_TYPE_CONFIG_CHANGE;
-    }
-    if (OB_FAIL(ret)) {
-    } else if (force_reschedule_eliminate_macro_task) {
-      ObStorageCachePolicyService *policy_service = MTL(ObStorageCachePolicyService *);
-      if (OB_ISNULL(policy_service)) {
-        ret = OB_INVALID_ARGUMENT;
-        LOG_WARN("policy service is null", KR(ret), KPC(this));
-      } else if (OB_FAIL(policy_service->refresh_policy_scheduler_.reschedule_eliminate_macro_task(last_clean_macro_interval_))) {
-        LOG_WARN("fail to reschedule eliminate macro task", KR(ret), K(last_clean_macro_interval_), KPC(this));
-      }
     }
     // Check the trigger status, if it is true means user is trying to trigger the refresh
     // Change the refresh type to force refresh to do the refresh
@@ -494,17 +347,6 @@ void ObStorageRefreshCachePolicyTask::runTimerTask()
       policy_service_->set_trigger_status(false);
     } 
     if (OB_FAIL(ret)) {
-    } else if (REFRESH_TYPE_FORCE_REFRESH == refresh_type) {
-      // Eliminate macro blocks when force refresh, the operation must be done before refresh tablet
-      // because the macro blocks will be accessed after the refresh tablet and it will be skipped by the elimination algorithm
-      ObStorageCacheEliminateMacroTask eliminate_macro_task;
-      if (OB_FAIL(eliminate_macro_task.init(tenant_id_))) {
-        LOG_WARN("fail to init eliminate macro task", KR(ret), KPC(this));
-      } else if (OB_FAIL(eliminate_macro_task.eliminate_macro_blocks())) {
-        LOG_WARN("fail to eliminate macro blocks", KR(ret), KPC(this));
-      }
-    } 
-    if (OB_FAIL(ret)) {
     } else if (OB_FAIL(policy_service_->trigger_or_refresh_tablet(refresh_type))) {
       LOG_WARN("fail to refresh schema policy map",KR(ret), KPC(this), K_SCP_REFRESH_TYPE(refresh_type));
     }
@@ -512,13 +354,12 @@ void ObStorageRefreshCachePolicyTask::runTimerTask()
   LOG_TRACE("[SCP]finish ObStorageRefreshCachePolicyTask::runTimerTask", KR(ret), KPC(this), K(is_suspend));
 }
 
-void ObStorageRefreshCachePolicyTask::sync_tenant_param_(bool &force_refresh_scp, bool &force_reschedule_eliminate_macro_task)
+void ObStorageRefreshCachePolicyTask::sync_tenant_param_(bool &force_refresh_scp)
 {
   int ret = OB_SUCCESS;
   // force_refresh_scp is used to indicate whether to force refresh the storage cache policy
   // scp means storage_cache_policy
   force_refresh_scp = false;
-  force_reschedule_eliminate_macro_task = false;
   if (IS_INIT) {
     ObStorageCachePolicyType cur_default_scp_type = ObStorageCachePolicyType::MAX_POLICY;
     bool cur_enable_manual_storage_cache_policy = false;
@@ -533,13 +374,6 @@ void ObStorageRefreshCachePolicyTask::sync_tenant_param_(bool &force_refresh_scp
 
       last_enable_manual_storage_cache_policy_ = cur_enable_manual_storage_cache_policy;
       last_default_scp_type_ = cur_default_scp_type;
-    }
-    int64_t clean_macro_interval = 0;
-    if (OB_SUCC(get_clean_macro_interval(tenant_id_, clean_macro_interval))) {
-      if (last_clean_macro_interval_ != clean_macro_interval) {
-        force_reschedule_eliminate_macro_task = true;
-      }
-      last_clean_macro_interval_ = clean_macro_interval;
     }
   }
 }
@@ -733,31 +567,6 @@ int ObStorageCacheCleanTask::collect_exist_part_ids_(
   return ret;
 }
 
-int ObStorageCacheCleanTask::clean_cold_tablet_ids_(const hash::ObHashSet<uint64_t> &active_tablet_ids, hash::ObHashSet<uint64_t> &cold_tablet_ids)
-{
-  int ret = OB_SUCCESS;
-  ObSEArray<uint64_t, 128> ids_to_erase;
-  ids_to_erase.set_attr(ObMemAttr(tenant_id_, "CleanTabletIds"));
-  if (cold_tablet_ids.size() > 0) {
-    ObInvaidColdTabletCollectFunc collect_func(ids_to_erase, active_tablet_ids);
-    if (OB_FAIL(cold_tablet_ids.foreach_refactored(collect_func))) {
-      LOG_WARN("fail to foreach refactored cold tablet ids", KR(ret), K(cold_tablet_ids.size()));
-    }
-  }
-  if (OB_SUCC(ret)) {
-    for (int64_t i = 0; OB_SUCC(ret) && i < ids_to_erase.count(); ++i) {
-      const uint64_t tablet_id = ids_to_erase.at(i);
-      if (OB_FAIL(cold_tablet_ids.erase_refactored(tablet_id))) {
-        if (OB_HASH_NOT_EXIST == ret) {
-          ret = OB_SUCCESS; // Already erased by another thread, ignore
-        } else {
-          LOG_WARN("fail to erase cold tablet id", KR(ret), K(tablet_id));
-        }
-      }
-    }
-  }
-  return ret;
-}
 
 int ObStorageCacheCleanTask::clean_tablet_status_()
 {
@@ -765,7 +574,6 @@ int ObStorageCacheCleanTask::clean_tablet_status_()
   hash::ObHashSet<uint64_t> active_tablet_ids;
   ObMemAttr copy_id_attr(tenant_id_, "SCPCopyTablet");
   hash::ObHashMap<int64_t, PolicyStatus> &tablet_status_map = policy_service_->get_tablet_status_map();
-  hash::ObHashMap<int64_t, int64_t> &macro_scp_tablet_table_map = policy_service_->get_macro_scp_tablet_table_map();
   const int64_t tablet_status_map_bucket_cnt = tablet_status_map.bucket_count();
   int64_t cleaned_tablet_count = 0;
   const int64_t start_time_us = ObTimeUtility::fast_current_time();
@@ -781,10 +589,6 @@ int ObStorageCacheCleanTask::clean_tablet_status_()
     LOG_WARN("fail to get active_tablet_ids", KR(ret), K(copy_id_attr), K(tablet_status_map_bucket_cnt));
   } else if (OB_FAIL(clean_storage_cache_map(active_tablet_ids, tablet_status_map, copy_id_attr))) {
     LOG_WARN("fail to clean part policy map", KR(ret), K(active_tablet_ids), KPC(this));
-  } else if (OB_FAIL(clean_storage_cache_map(active_tablet_ids, macro_scp_tablet_table_map, copy_id_attr))) {
-    LOG_WARN("fail to clean macro scp tablet table map", KR(ret), K(active_tablet_ids), KPC(this));
-  } else if (OB_FAIL(clean_cold_tablet_ids_(active_tablet_ids, policy_service_->get_need_evict_cold_tablet_ids()))) {
-    LOG_WARN("fail to clean cold tablet ids", KR(ret), K(active_tablet_ids), K(policy_service_->get_need_evict_cold_tablet_ids()));
   }
   const int64_t after_tablet_status_num = tablet_status_map.size();
   FLOG_INFO("[SCP]clean tablet status map finish", KR(ret), K(before_tablet_status_num), K(after_tablet_status_num));
@@ -972,20 +776,11 @@ void ObStorageForceRefreshCachePolicyTask::runTimerTask()
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("policy service should not be null", KR(ret), KPC(this));
   } else {
-    // Eliminate macro blocks when force refresh, the operation must be done before refresh tablet
-    // because the macro blocks will be accessed after the refresh tablet and it will be skipped by the elimination algorithm
-    ObStorageCacheEliminateMacroTask eliminate_macro_task;
-    if (OB_FAIL(eliminate_macro_task.init(tenant_id_))) {
-      LOG_WARN("fail to init eliminate macro task", KR(ret), KPC(this));
-    } else if (OB_FAIL(eliminate_macro_task.eliminate_macro_blocks())) {
-      LOG_WARN("fail to eliminate macro blocks", KR(ret), KPC(this));
-    }
-
     if (OB_SUCC(ret)) {
       // Go through trigger_or_refresh_tablet so that active_tablet_ids_ is refreshed
       // before refresh_schema_policy_map runs. Otherwise a tablet newly added between
       // the last NORMAL refresh and this RPC-driven force refresh would be silently
-      // skipped by generate_block_task / generate_partition_task while its status is
+      // skipped by generate_partition_task while its status is
       // still written into tablet_status_map_, leaving it stuck forever.
       if (OB_FAIL(policy_service_->trigger_or_refresh_tablet(REFRESH_TYPE_FORCE_REFRESH))) {
         LOG_WARN("fail to force refresh schema policy map", KR(ret), KPC(this));
@@ -994,182 +789,6 @@ void ObStorageForceRefreshCachePolicyTask::runTimerTask()
   }
   const int64_t cost_us = ObTimeUtility::current_time_us() - start_us;
   FLOG_INFO("[SCP] force refresh cache policy task finish", KR(ret), KPC(this), K(cost_us));
-}
-
-/*-----------------------------------------ObStorageCacheEliminateMacroTask-----------------------------------------*/
-
-int ObStorageCacheEliminateMacroTask::init(const uint64_t tenant_id)
-{
-  int ret = OB_SUCCESS;
-  if (OB_FAIL(ObSCPTaskBase::init(tenant_id))) {
-    LOG_WARN("fail to init base", KR(ret), K(tenant_id));
-  } else if (OB_FAIL(hot_macro_block_ids_.create(DEFAULT_HOT_MACRO_BLOCK_IDS_SIZE, ObMemAttr(tenant_id, "EliMacroIds")))) {
-    LOG_WARN("fail to create hot macro block set", KR(ret), K(tenant_id));
-  } else if (OB_FAIL(checked_tablet_ids_.create(DEFAULT_CHECKED_TABLET_IDS_SIZE, ObMemAttr(tenant_id, "EliMacroTablets")))) {
-    LOG_WARN("fail to create tablet ids", KR(ret), K(tenant_id));
-  }
-  return ret;
-}
-
-void ObStorageCacheEliminateMacroTask::destroy()
-{
-  hot_macro_block_ids_.destroy();
-  checked_tablet_ids_.destroy();
-  ObSCPTaskBase::destroy();
-}
-
-int ObStorageCacheEliminateMacroTask::insert_hot_macro_block_ids(const ObIArray<MacroBlockId> &hot_data_block_ids)
-{
-  int ret = OB_SUCCESS;
-  for (int64_t i = 0; OB_SUCC(ret) && i < hot_data_block_ids.count(); ++i) {
-    if (OB_FAIL(hot_macro_block_ids_.set_refactored(hot_data_block_ids.at(i), 0/*flag: 0--not cover exists object*/))) {
-      if (OB_HASH_EXIST == ret) {
-        ret = OB_SUCCESS;
-      } else {
-        LOG_WARN("fail to insert into hash set", KR(ret), K(i), "block_id", hot_data_block_ids.at(i));
-      }
-    }
-  }
-  return ret;
-}
-
-int ObStorageCacheEliminateMacroTask::eliminate_macro_blocks()
-{
-  int ret = OB_SUCCESS; 
-  const int64_t tenant_mem = MTL_MEM_SIZE();
-  const int64_t parallelism = MIN(64, (tenant_mem / 8 / 1024 / 1024 / 1024) * 8 + 8);
-  ObStorageCachePolicyPrewarmer prewarmer(parallelism);
-  const uint64_t tenant_id = MTL_ID();
-  hash::ObHashSet<uint64_t> active_tablet_ids; 
-  hash::ObHashMap<int64_t, PolicyStatus> &tablet_status_map = policy_service_->get_tablet_status_map();
-  hash::ObHashMap<int64_t, int64_t> &macro_scp_tablet_table_map = policy_service_->get_macro_scp_tablet_table_map();
-  hash::ObHashMap<int64_t, ObTablePolicyInfo> &table_policy_map = policy_service_->get_table_policy_map();
-  const int64_t tablet_status_map_bucket_cnt = tablet_status_map.bucket_count();
-  ObSSMacroCacheMgr *macro_cache_mgr = nullptr;
-  ObSEArray<MacroBlockId, 128> hot_data_block_ids;
-  ObSEArray<MacroBlockId, 16> meta_block_ids;
-  ObSEArray<MacroBlockId, 128> cold_data_block_ids;
-  hot_data_block_ids.set_attr(ObMemAttr(tenant_id, "EliHotIds"));
-  meta_block_ids.set_attr(ObMemAttr(tenant_id, "EliMetaIds"));
-  cold_data_block_ids.set_attr(ObMemAttr(tenant_id, "EliColdIds"));
-  ObTableStoreIterator table_store_iter;
-
-  const int64_t current_macro_block_count = hot_macro_block_ids_.size();
-  ObStorageCacheTabletTask tablet_task;
-  ObTablePolicyInfo table_policy_info;
-  ObStorageCachePolicy block_storage_cache_policy;
-  int64_t tablet_cnt = 0;
-  const int64_t start_us = ObTimeUtility::current_time_us();
-  bool succ = false;
-
-  ObMemAttr copy_id_attr(tenant_id_, "EliMacroTablets");
-  if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("not init", KR(ret));
-  } else if (OB_ISNULL(policy_service_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("policy service should not be null", KR(ret), KPC(this));
-  } else if (OB_FAIL(active_tablet_ids.create(tablet_status_map_bucket_cnt, copy_id_attr))) {
-    LOG_WARN("fail to create active_tablet_ids", KR(ret), K(copy_id_attr), K(tablet_status_map_bucket_cnt));
-  } else if (OB_FAIL(get_active_tablet_ids(active_tablet_ids, copy_id_attr))) {
-    LOG_WARN("fail to get active_tablet_ids", KR(ret), K(copy_id_attr), K(tablet_status_map_bucket_cnt));
-  } else if (OB_ISNULL(macro_cache_mgr = MTL(ObSSMacroCacheMgr *))) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("macro cache mgr should not be null", KR(ret), KPC(this));
-  } else {
-    hot_macro_block_ids_.reuse();
-    checked_tablet_ids_.reuse();
-    using TabletStatusMap = hash::ObHashMap<int64_t, PolicyStatus>;
-    SS_FOREACH_MAP_NODE(tablet_status_map, TabletStatusMap, node_iter, {
-      tablet_cnt++;
-      const PolicyStatus &tablet_status = node_iter->second;
-      const int64_t tablet_id = node_iter->first;
-      int64_t ls_id = ObLSID::INVALID_LS_ID;
-      tablet_task.destroy();
-      table_policy_info.reset();
-      block_storage_cache_policy.reset();
-      prewarmer.reset();
-      if (PolicyStatus::MACRO_HOT == tablet_status) {
-        int64_t table_id = OB_INVALID_ID;
-        if (OB_FAIL(active_tablet_ids.exist_refactored(tablet_id))) {
-          if (OB_HASH_EXIST == ret) {
-            ret = OB_SUCCESS;
-          } else if (OB_HASH_NOT_EXIST == ret) {
-            // do nothing
-          } else {
-            LOG_WARN("fail to check tablet id", KR(ret), K(tablet_id));
-          }
-        }
-        if (OB_FAIL(ret)) {
-        } else if (OB_FAIL(macro_scp_tablet_table_map.get_refactored(tablet_id, table_id))) {
-          LOG_WARN("fail to get table id", KR(ret), K(tablet_id));
-        } else if (OB_FAIL(table_policy_map.get_refactored(table_id, table_policy_info))) {
-          LOG_WARN("fail to get table policy info", KR(ret), K(table_id));
-        } else if (FALSE_IT(block_storage_cache_policy = table_policy_info.get_table_policy())) {
-        } else if (OB_FAIL(tablet_task.init_block_task(tenant_id, tablet_id, block_storage_cache_policy))) {
-            LOG_WARN("fail to init block task", KR(ret), K(tablet_task), K(tenant_id), K(tablet_id), K(block_storage_cache_policy));
-        } else if (OB_FAIL(get_tablet_ls_id(tenant_id, tablet_id, ls_id))) {
-          LOG_WARN("fail to get tablet ls id", KR(ret), K(tablet_id), K(tenant_id), K(tablet_task));
-        } else if (ObLSID::INVALID_LS_ID == ls_id) {
-          LOG_WARN("invalid ls id", KR(ret), K(tablet_id), K(tenant_id), K(tablet_task));
-        } else if (FALSE_IT(prewarmer.set_tablet_id(tablet_id))) {
-        } else if (FALSE_IT(prewarmer.set_ls_id(ls_id))) {
-        } else if (FALSE_IT(tablet_task.set_ls_id(ls_id))) {
-        } else if (OB_FAIL(tablet_task.set_status(ObStorageCacheTaskStatus::OB_STORAGE_CACHE_TASK_DOING))) {
-        } else if (OB_FAIL(prewarmer.filter_tablet_macro_blocks(hot_data_block_ids, meta_block_ids, cold_data_block_ids, &tablet_task))) {
-          LOG_WARN("fail to filter tablet macro blocks", KR(ret), K(tablet_task));
-        }
-        if (OB_FAIL(ret)) {
-        } else if (current_macro_block_count + hot_data_block_ids.count() > DEFAULT_HOT_MACRO_BLOCK_IDS_SIZE) {
-          // When the hashset is almost full, immediately perform a scan and deletion of the macroblock cache.
-          if (OB_FAIL(macro_cache_mgr->eliminate_macro_scp_blocks(hot_macro_block_ids_, checked_tablet_ids_, start_us))) {
-            LOG_WARN("fail to eliminate macro scp blocks", KR(ret), K(hot_macro_block_ids_), K(checked_tablet_ids_));
-          } else {
-            hot_macro_block_ids_.reuse();
-            checked_tablet_ids_.reuse();
-          }
-        }
-        if (OB_FAIL(ret)) {
-        } else if (OB_FAIL(insert_hot_macro_block_ids(hot_data_block_ids))) {
-          LOG_WARN("fail to insert hot macro block ids", KR(ret), K(hot_data_block_ids));
-        } else if (OB_FAIL(checked_tablet_ids_.set_refactored(tablet_id))) {
-          LOG_WARN("fail to set checked tablet id", KR(ret), K(tablet_id));
-        } else if (cold_data_block_ids.count() > 0) {
-          if (OB_FAIL(policy_service_->insert_cold_macro_block_ids(cold_data_block_ids))) {
-            LOG_WARN("fail to insert cold macro block ids", KR(ret), K(cold_data_block_ids.count()), K(tablet_id));
-          } else {
-            LOG_TRACE("[SCP] inserted cold macro block ids", K(cold_data_block_ids.count()), K(tablet_id));
-          }
-        }
-        hot_data_block_ids.reuse();
-        cold_data_block_ids.reuse();
-      }
-    });
-    
-    if (OB_HASH_NOT_EXIST == ret) {
-      ret = OB_SUCCESS;
-    }
-    if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(macro_cache_mgr->eliminate_macro_scp_blocks(hot_macro_block_ids_, checked_tablet_ids_, start_us))) {
-      LOG_WARN("fail to eliminate macro scp blocks", KR(ret), K(hot_macro_block_ids_), K(checked_tablet_ids_));
-    }
-  }
-  return ret;
-}
-
-void ObStorageCacheEliminateMacroTask::runTimerTask()
-{
-  int ret = OB_SUCCESS;
-  const int64_t start_us = ObTimeUtility::current_time_us();
-  if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("not init", KR(ret));
-  } else if (OB_ISNULL(policy_service_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("policy service should not be null", KR(ret), KPC(this));
-  } else if (OB_FAIL(eliminate_macro_blocks())) {
-    LOG_WARN("fail to eliminate macro blocks", KR(ret), KPC(this));
-  }
 }
 
 /*-----------------------------------------ObStorageCacheRefreshPolicyScheduler-----------------------------------------*/
@@ -1181,10 +800,7 @@ ObStorageCacheRefreshPolicyScheduler::ObStorageCacheRefreshPolicyScheduler()
     refresh_policy_task_(),
     daily_refresh_policy_task_(),
     force_refresh_policy_task_(),
-    clean_history_task_(),
-    eliminate_macro_task_(),
-    evict_cold_tablet_task_(),
-    evict_cold_macro_task_()
+    clean_history_task_()
 {
 }
 
@@ -1208,12 +824,6 @@ int ObStorageCacheRefreshPolicyScheduler::init(const uint64_t tenant_id)
     LOG_WARN("fail to init force refresh policy task", KR(ret), K(tenant_id));
   } else if (OB_FAIL(clean_history_task_.init(tenant_id))) {
     LOG_WARN("fail to init clean history task", KR(ret), K(tenant_id));
-  } else if (OB_FAIL(eliminate_macro_task_.init(tenant_id))) {
-    LOG_WARN("fail to init eliminate macro task", KR(ret), K(tenant_id));
-  } else if (OB_FAIL(evict_cold_tablet_task_.init(tenant_id))) {
-    LOG_WARN("fail to init evict cold tablet task", KR(ret), K(tenant_id));
-  } else if (OB_FAIL(evict_cold_macro_task_.init(tenant_id))) {
-    LOG_WARN("fail to init evict cold macro task", KR(ret), K(tenant_id));
   } else {
     tenant_id_ = tenant_id;
     is_inited_ = true;
@@ -1239,12 +849,6 @@ int ObStorageCacheRefreshPolicyScheduler::start()
     LOG_WARN("fail to schedule refresh daily policy task", KR(ret), K_(tg_id));
   } else if (OB_FAIL(schedule_task_(clean_history_task_, OB_STORAGE_CACHE_CLEAN_HISTORY_INTERVAL))) {
     LOG_WARN("fail to schedule clean history task", KR(ret), K_(tg_id));
-  } else if (OB_FAIL(schedule_task_(eliminate_macro_task_, OB_STORAGE_CACHE_ELIMINATE_MACRO_INTERVAL))) {
-    LOG_WARN("fail to schedule eliminate macro task", KR(ret), K_(tg_id));
-  } else if (OB_FAIL(schedule_task_(evict_cold_tablet_task_, OB_STORAGE_CACHE_EVICT_COLD_TABLET_INTERVAL))) {
-    LOG_WARN("fail to schedule evict cold tablet task", KR(ret), K_(tg_id));
-  } else if (OB_FAIL(schedule_task_(evict_cold_macro_task_, OB_STORAGE_CACHE_EVICT_COLD_MACRO_INTERVAL))) {
-    LOG_WARN("fail to schedule evict cold macro task", KR(ret), K_(tg_id));
   }
   return ret;
 }
@@ -1268,9 +872,6 @@ void ObStorageCacheRefreshPolicyScheduler::destroy()
 {
   if (IS_INIT && OB_LIKELY(OB_INVALID_TG_ID != tg_id_)) {
     TG_DESTROY(tg_id_);
-    evict_cold_macro_task_.destroy();
-    evict_cold_tablet_task_.destroy();
-    eliminate_macro_task_.destroy();
     clean_history_task_.destroy();
     force_refresh_policy_task_.destroy();
     daily_refresh_policy_task_.destroy();
@@ -1298,22 +899,6 @@ int ObStorageCacheRefreshPolicyScheduler::schedule_force_refresh_policy_task()
   return ret;
 }
 
-int ObStorageCacheRefreshPolicyScheduler::reschedule_eliminate_macro_task(const int64_t clean_macro_interval)
-{
-  int ret = OB_SUCCESS;
-  if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("not init", KR(ret));
-  } else if (OB_UNLIKELY(clean_macro_interval <= 0)) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument", KR(ret), K(clean_macro_interval));
-  } else {
-    TG_CANCEL_TASK(tg_id_, eliminate_macro_task_);
-    TG_WAIT_TASK(tg_id_, eliminate_macro_task_);
-    TG_SCHEDULE(tg_id_, eliminate_macro_task_, clean_macro_interval, true/*repeat*/);
-  }
-  return ret;
-}
 
 int ObStorageCacheRefreshPolicyScheduler::schedule_task_(
     ObTimerTask &task, const int64_t interval_us)
@@ -1332,66 +917,6 @@ int ObStorageCacheRefreshPolicyScheduler::schedule_task_(
     LOG_WARN("fail to schedule refresh tablet svr task", KR(ret), KPC(this), K(interval_us));
   }
   return ret;
-}
-
-/*-----------------------------------------ObStorageCacheEvictColdTabletTask-----------------------------------------*/
-ObStorageCacheEvictColdTabletTask::ObStorageCacheEvictColdTabletTask()
-  : ObSCPTaskBase()
-{
-}
-
-void ObStorageCacheEvictColdTabletTask::runTimerTask()
-{
-  int ret = OB_SUCCESS;
-  ObSCPTraceIdGuard scp_trace_id_guard;
-  bool is_suspend = false;
-  if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("not init", KR(ret));
-  } else if (OB_ISNULL(policy_service_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("policy service should not be null", KR(ret), KPC(this));
-  } else if (OB_FAIL(ObStorageCachePolicyHelper::is_storage_cache_task_suspended(tenant_id_, is_suspend))) {
-    LOG_WARN("fail to get is_suspend_storage_cache_task", KR(ret), KPC(this));
-  } else if (is_suspend) {
-    LOG_INFO("storage cache is suspended, skip evict cold tablet", KR(ret), KPC(this));
-  } else {
-    // batch tablet id avoid to traverse meta_map too much
-    hash::ObHashSet<uint64_t> &need_evict_cold_tablet_ids = policy_service_->get_need_evict_cold_tablet_ids();
-    if (OB_FAIL(do_evict_cold_items(need_evict_cold_tablet_ids, &ObSSMacroCacheMgr::batch_evict_by_tablet_ids))) {
-      LOG_WARN("fail to do evict cold tablet items", KR(ret));
-    }
-  }
-}
-
-/*-----------------------------------------ObStorageCacheEvictColdMacroTask-----------------------------------------*/
-ObStorageCacheEvictColdMacroTask::ObStorageCacheEvictColdMacroTask()
-  : ObSCPTaskBase()
-{
-}
-
-void ObStorageCacheEvictColdMacroTask::runTimerTask()
-{
-  int ret = OB_SUCCESS;
-  bool is_suspend = false;
-  ObSCPTraceIdGuard scp_trace_id_guard;
-  if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("not init", KR(ret));
-  } else if (OB_ISNULL(policy_service_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("policy service should not be null", KR(ret), KPC(this));
-  } else if (OB_FAIL(ObStorageCachePolicyHelper::is_storage_cache_task_suspended(tenant_id_, is_suspend))) {
-    LOG_WARN("fail to get is_suspend_storage_cache_task", KR(ret), KPC(this));
-  } else if (is_suspend) {
-    LOG_INFO("storage cache is suspended, skip evict cold macro", KR(ret), KPC(this));
-  } else {
-    hash::ObHashSet<blocksstable::MacroBlockId> &need_evict_cold_macro_block_ids = 
-        policy_service_->get_need_evict_cold_macro_block_ids();
-    if (OB_FAIL(do_evict_cold_items(need_evict_cold_macro_block_ids, &ObSSMacroCacheMgr::batch_evict_by_macro_ids))) {
-      LOG_WARN("fail to do evict cold macro items", KR(ret));
-    }
-  }
 }
 
 } // namespace storage

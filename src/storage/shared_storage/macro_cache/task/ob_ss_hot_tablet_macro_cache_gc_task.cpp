@@ -125,92 +125,6 @@ void ObSSHotTabletMacroCacheGCTask::runTimerTask()
   }
 }
 
-int ObSSHotTabletMacroCacheGCTask::gc_macro_hot_cache(const ObHashMap<ObLSID, int64_t/*ls_epoch*/> &ls_id_epoch_map,
-                                                      const ObHashMap<ObTabletID, ObLSID> &macro_hot_tablet_map)
-{
-  int ret = OB_SUCCESS;
-  int64_t batch_count = 0;
-  int64_t processed_tablet_count = 0;
-  ObMemAttr attr(MTL_ID(), "MacroHotCacheGC");
-  ObHashMap<ObTabletID, ObLSID> batch_map;
-  ObHashSet<MacroBlockId> macro_block_set;
-  const int64_t TABLET_BUCKET_NUM = ObBucketNumHelper::get_bucket_num_by_mtl_mem(ObGetBucketNumType::TABLET_TYPE);
-  const int64_t MACRO_BUCKET_NUM = ObBucketNumHelper::get_bucket_num_by_mtl_mem(ObGetBucketNumType::MACRO_TYPE);
-  if (OB_FAIL(check_init_and_stop_())) {
-    LOG_WARN("fail to check init and stop", KR(ret));
-  } else if (OB_ISNULL(macro_cache_mgr_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("macro cache mgr should not be null", KR(ret));
-  } else if (OB_FAIL(batch_map.create(TABLET_BUCKET_NUM, attr))) {
-    LOG_WARN("fail to create batch map", KR(ret));
-  } else if (OB_FAIL(macro_block_set.create(MACRO_BUCKET_NUM, attr))) {
-    LOG_WARN("fail to create macro block set", KR(ret));
-  } else {
-    ObHashMap<ObTabletID, ObLSID>::const_iterator cur_iter = macro_hot_tablet_map.begin();
-    const ObHashMap<ObTabletID, ObLSID>::const_iterator end_iter = macro_hot_tablet_map.end();
-    while (OB_SUCC(ret) && (cur_iter != end_iter)) {
-      const ObTabletID &tablet_id = cur_iter->first;
-      const ObLSID &ls_id = cur_iter->second;
-      bool is_get = false;
-      int tmp_ret = OB_SUCCESS;
-      if (OB_TMP_FAIL(get_macro_block_set_for_single_tablet(ls_id_epoch_map, tablet_id, ls_id, macro_block_set, is_get))) {
-        LOG_WARN("fail to get macro block set for single tablet", KR(tmp_ret), K(tablet_id), K(ls_id));
-        // ignore ret. skip this tablet
-      } else if (is_get) {
-        // add valid tablet to batch map
-        if (OB_FAIL(batch_map.set_refactored(tablet_id, ls_id))) {
-          LOG_WARN("fail to set tablet to batch map", KR(ret), K(tablet_id), K(ls_id));
-        } else {
-          processed_tablet_count++;
-          // if macro_block_set size is greater than or equal to MACRO_BUCKET_NUM, trigger a gc
-          if (macro_block_set.size() >= MACRO_BUCKET_NUM) {
-            ++batch_count;
-            if (OB_FAIL(macro_cache_mgr_->gc_hot_tablet_macro_cache(
-                macro_block_set, 1_day, false /*convert_to_auto*/))) {
-              LOG_WARN("fail to gc macro hot tablet macro cache", 
-                       KR(ret), K(batch_count), K(processed_tablet_count), 
-                       "tablet_count", macro_hot_tablet_map.size(),
-                       "macro_block_count", macro_block_set.size(),
-                       "batch_tablet_count", batch_map.size());
-            } else {
-              FLOG_INFO("finish gc macro hot tablets batch", 
-                       K(batch_count), K(processed_tablet_count), 
-                       "tablet_count", macro_hot_tablet_map.size(),
-                       "macro_block_count", macro_block_set.size(),
-                       "batch_tablet_count", batch_map.size());
-            }
-            // clear batch map and macro block set, prepare for next batch
-            batch_map.reuse();
-            macro_block_set.reuse();
-          }
-        }
-      }
-      cur_iter++;
-    }
-    
-    // process remaining tablets (if there are any unprocessed)
-    if (OB_SUCC(ret) && !batch_map.empty() && !macro_block_set.empty()) {
-      ++batch_count;
-      if (OB_FAIL(macro_cache_mgr_->gc_hot_tablet_macro_cache(
-          macro_block_set, 1_day, false /*convert_to_auto*/))) {
-        LOG_WARN("fail to gc macro hot tablet macro cache for remaining tablets", 
-                 KR(ret), K(batch_count), K(processed_tablet_count), 
-                 "tablet_count", macro_hot_tablet_map.size(),
-                 "macro_block_count", macro_block_set.size(),
-                 "batch_tablet_count", batch_map.size());
-      } else {
-        FLOG_INFO("finish gc macro hot tablets batch for remaining tablets", 
-                 K(batch_count), K(processed_tablet_count), 
-                 "tablet_count", macro_hot_tablet_map.size(),
-                 "macro_block_count", macro_block_set.size(),
-                 "batch_tablet_count", batch_map.size());
-      }
-    }
-  }
-  FLOG_INFO("finish gc all macro hot tablets", KR(ret), K(batch_count), K(processed_tablet_count), 
-            "tablet_count", macro_hot_tablet_map.size());
-  return ret;
-}
 
 int ObSSHotTabletMacroCacheGCTask::gc_hot_tablet_macro_cache(
     const int64_t idle_time_us,
@@ -220,7 +134,6 @@ int ObSSHotTabletMacroCacheGCTask::gc_hot_tablet_macro_cache(
   ObMemAttr attr(MTL_ID(), "HotTabCacheGC");
   ObHashSet<uint64_t> active_tablet_ids;
   ObHashMap<ObTabletID, ObLSID> hot_tablet_map;
-  ObHashMap<ObTabletID, ObLSID> macro_hot_tablet_map;
   ObHashMap<ObLSID, int64_t/*ls_epoch*/> ls_id_epoch_map;
   ObHashSet<MacroBlockId> macro_block_set;
   const int64_t TABLET_BUCKET_NUM = ObBucketNumHelper::get_bucket_num_by_mtl_mem(ObGetBucketNumType::TABLET_TYPE);
@@ -241,8 +154,6 @@ int ObSSHotTabletMacroCacheGCTask::gc_hot_tablet_macro_cache(
     LOG_WARN("fail to create active tablet snapshot", KR(ret), K(TABLET_BUCKET_NUM));
   } else if (OB_FAIL(hot_tablet_map.create(TABLET_BUCKET_NUM, attr))) {
     LOG_WARN("fail to create hot tablet map", KR(ret));
-  } else if (OB_FAIL(macro_hot_tablet_map.create(TABLET_BUCKET_NUM, attr))) {
-    LOG_WARN("fail to create macro hot tablet map", KR(ret));
   } else if (OB_FAIL(ls_id_epoch_map.create(8/*bucket_num*/, attr))) {
     LOG_WARN("fail to create ls id epoch map", KR(ret));
   } else if (OB_FAIL(macro_block_set.create(MACRO_BUCKET_NUM, attr))) {
@@ -250,7 +161,7 @@ int ObSSHotTabletMacroCacheGCTask::gc_hot_tablet_macro_cache(
   } else if (OB_FAIL(get_active_tablet_ids(active_tablet_ids, attr))) {
     LOG_WARN("fail to get active tablet snapshot", KR(ret), K(attr));
   } else if (OB_FAIL(storage_cache_policy_service->get_hot_tablets(
-      active_tablet_ids, hot_tablet_map, macro_hot_tablet_map))) {
+      active_tablet_ids, hot_tablet_map))) {
     LOG_WARN("fail to get hot tablets", KR(ret));
   } else if (OB_FAIL(get_ls_id_epoch_map(ls_id_epoch_map))) {
     LOG_WARN("fail to get ls id epoch map", KR(ret));

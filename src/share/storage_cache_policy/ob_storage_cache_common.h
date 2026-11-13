@@ -44,16 +44,19 @@ struct ObStorageCachePolicyStatus
     HOT = 0,
     AUTO = 1,
     NONE = 2,
-    MACRO_HOT = 3,
+    MACRO_HOT = 3, // Deprecated. Do not use or reuse this value.
+    // COLD uses value 4 in serialized administration requests.
     COLD = 4,
     MAX_STATUS
   };
   static int safely_get_str(const PolicyStatus &type, const char *&buf);
+  // Returns the status name, or UNKNOWN for an invalid value.
   static const char *get_str(const PolicyStatus &type);
   static PolicyStatus get_type(const ObString &type_str);
   static OB_INLINE bool is_valid(const PolicyStatus &type)
   {
-    return type >= 0 && type < PolicyStatus::MAX_STATUS;
+    return PolicyStatus::HOT == type || PolicyStatus::AUTO == type
+        || PolicyStatus::NONE == type || PolicyStatus::COLD == type;
   }
 };
 
@@ -93,7 +96,6 @@ int get_storage_cache_policy_type_from_str(const common::ObString &storage_cache
 
 int get_storage_cache_policy_type_from_part_str(const common::ObString &storage_cache_policy_part_str, 
                                                 ObStorageCachePolicyType &policy_type);
-bool is_valid_part_storage_cache_policy(const ObStorageCachePolicyType &policy_type);
 bool is_hot_or_auto_or_cold(const ObStorageCachePolicyType &part_policy);
 
 struct ObBoundaryColumnUnit
@@ -120,7 +122,6 @@ struct ObStorageCacheGranularity
   {
     PARTITION = 0,
     ROW = 1,
-    BLOCK = 2,
     MAX_GRANULARITY
   };
   static int safely_get_str(const GranularityType &type, const char *&buf);
@@ -159,7 +160,6 @@ public:
   int set_hot_retention_interval (const uint64_t interval);
   int set_hot_retention_unit (const ObDateUnitType unit);
   int check_retention_unit(const ObDateUnitType unit);
-  int set_hot_retention_time (const int64_t time);
   int set_mixed_retention_interval (const uint64_t interval);
   int set_mixed_retention_unit (const ObDateUnitType unit);
   int set_part_level (const int32_t level);
@@ -176,31 +176,12 @@ public:
   int32_t get_part_level() const { return part_level_; };
   int64_t get_table_id() const { return table_id_; };
   int convert_retention_unit(const ObDateUnitType unit, int64_t &rentention_time) const;
-  int convert_bound_to_column_unit(const ObString &partition_bound_val, int64_t &bound_time) const;
-  int check_boundary_column_with_partition(share::schema::ObPartition &partition) const;
-  int check_boundary_column_with_subpartition(share::schema::ObSubPartition &subpartition) const;
   int cal_hot_rentention_time(int64_t &hot_rentention_time) const;
   int cal_mixed_rentention_time(int64_t &mixed_rentention_time) const;
   int check_table_cache_policy() const;
-  bool is_valid_date_unit_type() const
-  {
-    return hot_retention_unit_ >= 0 && hot_retention_unit_ < ObDateUnitType::DATE_UNIT_MAX;
-  };
   bool is_partition_time_policy() const
   {
     return is_time_policy() && granularity_ == ObStorageCacheGranularity::PARTITION;
-  };
-  bool is_block_time_policy() const
-  {
-    return is_time_policy() && granularity_ == ObStorageCacheGranularity::BLOCK;
-  };
-  bool is_default_block_time_policy() const
-  {
-    return is_block_time_policy() && strlen(column_name_) == 0;
-  };
-  bool is_custom_block_time_policy() const
-  {
-    return is_block_time_policy() && strlen(column_name_) > 0;
   };
   bool operator ==(const ObStorageCachePolicy &policy) const;
   bool operator !=(const ObStorageCachePolicy &policy) const;

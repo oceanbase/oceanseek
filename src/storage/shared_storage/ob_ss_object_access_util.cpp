@@ -289,7 +289,7 @@ int ObSSObjectAccessUtil::check_if_hot_tablet(const uint64_t tablet_id, bool &is
 {
   int ret = OB_SUCCESS;
   is_hot = false;
-  if (is_valid_tenant_id(MTL_ID())) {
+  if (is_valid_tenant_id(MTL_ID()) && is_not_virtual_tenant_id(MTL_ID())) {
     ObStorageCachePolicyService *storage_cache_policy_service = nullptr;
     if (OB_ISNULL(storage_cache_policy_service = MTL(ObStorageCachePolicyService *))) {
       ret = OB_ERR_UNEXPECTED;
@@ -307,7 +307,7 @@ int ObSSObjectAccessUtil::check_if_cold_tablet(const uint64_t tablet_id, bool &i
 {
   int ret = OB_SUCCESS;
   is_cold = false;
-  if (is_valid_tenant_id(MTL_ID())) {
+  if (is_valid_tenant_id(MTL_ID()) && is_not_virtual_tenant_id(MTL_ID())) {
     ObStorageCachePolicyService *storage_cache_policy_service = nullptr;
     if (OB_ISNULL(storage_cache_policy_service = MTL(ObStorageCachePolicyService *))) {
       ret = OB_ERR_UNEXPECTED;
@@ -317,24 +317,6 @@ int ObSSObjectAccessUtil::check_if_cold_tablet(const uint64_t tablet_id, bool &i
     }
   } else {
     is_cold = false;
-  }
-  return ret;
-}
-
-int ObSSObjectAccessUtil::check_if_hot_or_macro_hot_tablet(const uint64_t tablet_id, bool &is_hot_or_macro_hot)
-{
-  int ret = OB_SUCCESS;
-  is_hot_or_macro_hot = false;
-  if (is_valid_tenant_id(MTL_ID()) && is_not_virtual_tenant_id(MTL_ID())) {
-    ObStorageCachePolicyService *storage_cache_policy_service = nullptr;
-    if (OB_ISNULL(storage_cache_policy_service = MTL(ObStorageCachePolicyService *))) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("storage cache policy service is null", KR(ret));
-    } else if (OB_FAIL(storage_cache_policy_service->is_hot_or_macro_hot_tablet(tablet_id, is_hot_or_macro_hot))) {
-      LOG_WARN("fail to check if hot or macro hot tablet", KR(ret), K(tablet_id));
-    }
-  } else {
-    is_hot_or_macro_hot = false;
   }
   return ret;
 }

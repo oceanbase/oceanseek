@@ -4811,7 +4811,7 @@ int TestFileManager::prepare_calibration_macro(const uint64_t tablet_id, MacroBl
     info.io_timeout_ms_ = DEFAULT_IO_WAIT_TIME_MS;
     info.mtl_tenant_id_ = MTL_ID();
     info.write_strategy_ = ObStorageObjectWriteStrategy::WRITE_BACK;
-    if (OB_FAIL(policy->update_tablet_status(tablet_id, PolicyStatus::HOT, 200001 /*table_id*/))) {
+    if (OB_FAIL(policy->update_tablet_status(tablet_id, PolicyStatus::HOT))) {
       LOG_WARN("fail to set calibration test policy", KR(ret), K(tablet_id));
     } else if (OB_FAIL(handle.set_macro_block_id(macro_id))) {
       LOG_WARN("fail to set calibration test macro id", KR(ret), K(macro_id));
@@ -5457,7 +5457,7 @@ TEST_F(TestFileManager, test_delete_tmp_seq_files_cache_type_record)
   // ====== 场景1：alloc(HOT)，meta map 变为 MACRO → free 仍用 HOT ======
   const uint64_t hot_to_cold_tablet_id = 101;
   ASSERT_EQ(OB_SUCCESS, policy_service->update_tablet_status(
-      hot_to_cold_tablet_id, PolicyStatus::HOT, 200001/*table_id*/));
+      hot_to_cold_tablet_id, PolicyStatus::HOT));
   ASSERT_EQ(OB_SUCCESS, write_fail_and_clean_tmp_seq_file(
       hot_to_cold_tablet_id,
       ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK,
@@ -5468,7 +5468,7 @@ TEST_F(TestFileManager, test_delete_tmp_seq_files_cache_type_record)
   // ====== 场景2：alloc(MACRO)，meta map 变为 HOT → free 仍用 MACRO ======
   const uint64_t auto_to_hot_tablet_id = 102;
   ASSERT_EQ(OB_SUCCESS, policy_service->update_tablet_status(
-      auto_to_hot_tablet_id, PolicyStatus::AUTO, 200002/*table_id*/));
+      auto_to_hot_tablet_id, PolicyStatus::AUTO));
   ASSERT_EQ(OB_SUCCESS, write_fail_and_clean_tmp_seq_file(
       auto_to_hot_tablet_id,
       ObSSMacroCacheType::MACRO_BLOCK,

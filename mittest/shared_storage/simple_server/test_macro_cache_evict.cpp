@@ -640,7 +640,7 @@ TEST_F(ObMacroCacheEvictTest, test_evict)
   ASSERT_NE(nullptr, disk_space_mgr);
   ObStorageCachePolicyService *policy_service = MTL(ObStorageCachePolicyService *);
   ASSERT_NE(nullptr, policy_service);
-  policy_service->update_tablet_status(200005, PolicyStatus::HOT, 200001); //HOT 0, mock tablet_id 200001
+  policy_service->update_tablet_status(200005, PolicyStatus::HOT); //HOT 0, mock tablet_id 200001
   ObTenantFileManager *tenant_file_mgr = MTL(ObTenantFileManager*);
   ASSERT_NE(nullptr, tenant_file_mgr);
 

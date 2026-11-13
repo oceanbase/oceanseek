@@ -851,7 +851,8 @@ int ObSSBaseWriter::check_if_need_write_lcache(
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("local cache prewarm service should not be null", KR(ret));
   } else if (FALSE_IT(prewarm_level = prewarm_service->get_major_prewarm_level())) {
-  } else if (OB_FAIL(ObSSObjectAccessUtil::check_if_hot_or_macro_hot_tablet(effective_tablet_id, is_hot_tablet))) {
+  } else if (OB_FAIL(ObSSObjectAccessUtil::check_if_hot_tablet(
+      effective_tablet_id, is_hot_tablet))) {
     LOG_WARN("fail to check if hot tablet", KR(ret), K(effective_tablet_id));
   } else if (is_hot_tablet) { // hot tablet, ignore prewarm level
     need_write_lcache = true;

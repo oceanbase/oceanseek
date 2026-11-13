@@ -11261,13 +11261,11 @@ static int get_query_partition_tier_status(
   } else {
     // tier已在入口校验；这里显式定义查询语义与Storage状态的映射关系。
     if (QUERY_DATA_TIER_PARSE_HOT == tier) {
-      is_match = (storage::PolicyStatus::HOT == status
-          || storage::PolicyStatus::MACRO_HOT == status);
+      is_match = (storage::PolicyStatus::HOT == status);
     } else if (QUERY_DATA_TIER_PARSE_COLD == tier) {
       is_match = (storage::PolicyStatus::COLD == status);
     } else if (QUERY_DATA_TIER_PARSE_NOT_COLD == tier) {
       is_match = (storage::PolicyStatus::HOT == status
-          || storage::PolicyStatus::MACRO_HOT == status
           || storage::PolicyStatus::AUTO == status);
     } else if (QUERY_DATA_TIER_PARSE_NOT_HOT == tier) {
       is_match = (storage::PolicyStatus::COLD == status

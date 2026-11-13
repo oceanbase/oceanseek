@@ -5832,10 +5832,6 @@ int ObTableSqlService::check_table_options(const ObTableSchema &table)
   } else if (!table.get_storage_cache_policy().empty()) {
     if (OB_FAIL(storage_cache_policy.load_from_string(table.get_storage_cache_policy()))) {
       LOG_WARN("failed to load storage cache policy", K(ret), K(table));
-    } else if (OB_UNLIKELY(storage_cache_policy.is_block_time_policy())) {
-      ret = OB_NOT_SUPPORTED;
-      LOG_WARN("block granularity storage cache policy is disabled", K(ret), K(table));
-      LOG_USER_ERROR(OB_NOT_SUPPORTED, "Block granularity storage cache policy is");
     }
   }
   return ret;

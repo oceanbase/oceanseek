@@ -114,18 +114,15 @@ class ObGetHotTabletCallback
 public:
   ObGetHotTabletCallback(
       const common::hash::ObHashSet<uint64_t> &active_tablet_ids,
-      common::hash::ObHashMap<common::ObTabletID, share::ObLSID> &hot_tablet_map,
-      common::hash::ObHashMap<common::ObTabletID, share::ObLSID> &macro_hot_tablet_map)
+      common::hash::ObHashMap<common::ObTabletID, share::ObLSID> &hot_tablet_map)
     : active_tablet_ids_(active_tablet_ids),
-      hot_tablet_map_(hot_tablet_map),
-      macro_hot_tablet_map_(macro_hot_tablet_map)
+      hot_tablet_map_(hot_tablet_map)
   {}
   virtual ~ObGetHotTabletCallback() {}
   int operator()(const common::hash::HashMapPair<int64_t, PolicyStatus> &pair);
 private:
   const common::hash::ObHashSet<uint64_t> &active_tablet_ids_;
   common::hash::ObHashMap<common::ObTabletID, share::ObLSID> &hot_tablet_map_;
-  common::hash::ObHashMap<common::ObTabletID, share::ObLSID> &macro_hot_tablet_map_;
 };
 
 class ObStorageCachePolicyService
@@ -148,10 +145,7 @@ public:
     schema_service_(nullptr),
     table_policy_map_(),
     part_policy_map_(),
-    tablet_status_map_(),
-    macro_scp_tablet_table_map_(),
-    cold_tablet_ids_(),
-    cold_macro_block_ids_()
+    tablet_status_map_()
   {
   }
   virtual ~ObStorageCachePolicyService()
@@ -163,7 +157,6 @@ public:
   static ObStorageCachePolicyService &get_instance();
 
 
-  uint64_t get_tenant_id() const { return tenant_id_; }
   int start();
   void stop();
   void wait();
@@ -172,9 +165,11 @@ public:
   int refresh_schema_policy_map(const ObStorageCachePolicyRefreshType &refresh_type);
   int tenant_need_refresh(bool &need_refresh);
   int get_tenant_schema_guard(share::schema::ObSchemaGetterGuard &schema_guard);
-  int handle_tablet_if_status_changed(const uint64_t tenant_id, const int64_t tablet_id, 
-                                      const PolicyStatus &policy_status, const ObStorageCachePolicy &table_policy,
-                                      const PolicyStatus &ori_policy_status);
+  int handle_tablet_if_status_changed(
+      const uint64_t tenant_id,
+      const int64_t tablet_id,
+      const PolicyStatus &policy_status,
+      const PolicyStatus &ori_policy_status);
   // Callers apply serviceability and inner-table filters separately from type eligibility.
   bool is_scp_candidate_table(const uint64_t table_id,
                               const share::schema::ObTableType table_type,
@@ -260,41 +255,31 @@ public:
   int check_tablet_status_changed(const uint64_t tablet_id, const PolicyStatus tablet_policy_status, 
                                   const ObStorageCachePolicyRefreshType &refresh_type,
                                   bool &tablet_status_changed, PolicyStatus &ori_tablet_status);
-  int update_tablet_status(const uint64_t tablet_id, const PolicyStatus new_tablet_status, const int64_t table_id);
+  int update_tablet_status(const uint64_t tablet_id, const PolicyStatus new_tablet_status);
   void set_trigger_status(const bool is_triggered);
   bool get_trigger_status() const;
   void set_need_generate_cache_task(const bool need_generate_cache_task);
   bool get_need_generate_cache_task() const;
   SCPTabletTaskMap &get_tablet_tasks();
-  const hash::ObHashSet<uint64_t> &get_current_active_tablet_ids() const;
   hash::ObHashMap<int64_t, PolicyStatus> &get_tablet_status_map();
   hash::ObHashMap<int64_t, ObTabletPolicyInfo> &get_part_policy_map();
   hash::ObHashMap<int64_t, ObTablePolicyInfo> &get_table_policy_map();
-  // This function is used to get the storage cache policy for macro scp, only for MACRO_HOT tablet
-  int get_storage_cache_policy_for_macro_scp(const uint64_t tablet_id, ObStorageCachePolicy &storage_cache_policy) const;
-  hash::ObHashMap<int64_t, int64_t> &get_macro_scp_tablet_table_map();
   int is_hot_tablet(const uint64_t tablet_id, bool &is_hot) const;
   int is_cold_tablet(const uint64_t tablet_id, bool &is_cold) const;
   int get_tablet_policy_status(const uint64_t tablet_id, PolicyStatus &policy_status) const;
-  int is_hot_or_macro_hot_tablet(const uint64_t tablet_id, bool &is_hot) const;
-  // 只收集 active_tablet_ids 快照中的 HOT/MACRO_HOT tablet。
+  // 只收集 active_tablet_ids 快照中的 HOT tablet。
   // 已确认 active 的 tablet 查询 LS 失败时返回错误，避免产生不完整引用集合。
   int get_hot_tablets(
       const common::hash::ObHashSet<uint64_t> &active_tablet_ids,
-      common::hash::ObHashMap<common::ObTabletID, share::ObLSID> &hot_tablet_map,
-      common::hash::ObHashMap<common::ObTabletID, share::ObLSID> &macro_hot_tablet_map);
+      common::hash::ObHashMap<common::ObTabletID, share::ObLSID> &hot_tablet_map);
   int check_can_trigger(bool &need_trigger);
   int trigger_skipped_macro_cache_tablets(const ObStorageCachePolicyRefreshType &refresh_type);
   int update_active_tablet_ids();
   int trigger_or_refresh_tablet(const ObStorageCachePolicyRefreshType &refresh_type);
-  int erase_cold_tablet_id(const int64_t tablet_id);
   // 异步提交 tablet 预热任务。task_prewarm_policy 指定新任务采用的预热策略：
   // HOT 仅对当前 HOT tablet 生效，AUTO 不校验 tablet 当前策略；已有未完成任务时不覆盖。
   int async_prewarm_tablet(const uint64_t tablet_id, const PolicyStatus task_prewarm_policy);
-  int insert_cold_macro_block_ids(const ObIArray<blocksstable::MacroBlockId> &macro_ids);
   TO_STRING_KV(K_(tenant_id), K_(is_inited), K_(is_stopped), K_(local_schema_version));
-  hash::ObHashSet<uint64_t> &get_need_evict_cold_tablet_ids() { return cold_tablet_ids_; }
-  hash::ObHashSet<blocksstable::MacroBlockId> &get_need_evict_cold_macro_block_ids() { return cold_macro_block_ids_; }
 
 public:
   static const int64_t POLICY_SCHEMA_REFRESH_TIME_THRESHOLD = 30*1000*1000; // 30s
@@ -304,7 +289,6 @@ public:
   static const int64_t MACRO_CACHE_FREE_SPACE_THRESHOLD = 10; // Macro cache available space threshold. Increment trigger requires available space to exceed the threshold.
   // One-hour fast-retry window, slow-retry interval and timeout-report interval.
   static constexpr int64_t RESTART_RETRY_TIME_THRESHOLD_S = 3600; // 1h
-  static const int64_t DEFAULT_MACRO_SCP_TABLET_TABLE_MAP_SIZE = 10000; // The maximum number of macro cache tablet table map
 public:
   ObStorageCacheTabletScheduler tablet_scheduler_;
   ObStorageCacheRefreshPolicyScheduler refresh_policy_scheduler_;
@@ -391,11 +375,6 @@ private:
   hash::ObHashMap<int64_t, ObTabletPolicyInfo> part_policy_map_;
   // It is provided for virtual tables to view the tablet information.
   hash::ObHashMap<int64_t, PolicyStatus> tablet_status_map_;
-  // Record the relationship between the macro cache tablet and the table, 
-  // the key is the tablet_id, the value is the table_id.
-  hash::ObHashMap<int64_t, int64_t> macro_scp_tablet_table_map_;
-  hash::ObHashSet<uint64_t> cold_tablet_ids_; // The tablet ids that need to be evicted for cold tablet
-  hash::ObHashSet<blocksstable::MacroBlockId> cold_macro_block_ids_; // The macro block ids that need to be evicted for cold macro blocks
 };
 
 #define OB_STORAGE_CACHE_SERVICE (oceanbase::storage::ObStorageCachePolicyService::get_instance())

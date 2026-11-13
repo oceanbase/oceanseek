@@ -27,7 +27,7 @@ public:
   {
     return second_id_ >= 0 || STRLEN(object_file_path_) > 0 || (STRLEN(uri_) > 0 && STRLEN(storage_info_str_) > 0);
   }
-  TO_STRING_KV(K(first_id_), K(second_id_), K(micro_id_), K_(tablet_id), K_(scn), K_(hex_length), K_(object_file_path), K_(uri), K_(prewarm_index));
+  TO_STRING_KV(K(first_id_), K(second_id_), K(micro_id_), K_(tablet_id), K_(scn), K_(hex_length), K_(object_file_path), K_(uri));
   uint64_t first_id_;
   int64_t second_id_;
   int64_t micro_id_;
@@ -38,7 +38,6 @@ public:
   char object_file_path_[common::OB_MAX_FILE_NAME_LENGTH] = {0};
   char uri_[common::OB_MAX_URI_LENGTH] = {0};
   char storage_info_str_[common::OB_MAX_BACKUP_STORAGE_INFO_LENGTH] = {0};
-  char prewarm_index_[common::OB_MAX_FILE_NAME_LENGTH] = {0};
 };
 
 struct ObDumpMacroBlockParam final

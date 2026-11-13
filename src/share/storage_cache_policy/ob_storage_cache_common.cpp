@@ -169,12 +169,6 @@ int get_storage_cache_policy_type_from_part_str(const common::ObString &storage_
   return ret;
 }
 
-bool is_valid_part_storage_cache_policy(const ObStorageCachePolicyType &part_policy)
-{
-  return !(storage::ObStorageCachePolicyType::MAX_POLICY == part_policy ||
-          storage::ObStorageCachePolicyType::TIME_POLICY == part_policy);
-}
-
 bool is_hot_or_auto_or_cold(const ObStorageCachePolicyType &part_policy)
 {
   return storage::ObStorageCachePolicyType::HOT_POLICY == part_policy ||
@@ -312,7 +306,7 @@ int ObStorageCacheGranularity::safely_get_str(const GranularityType &type, const
   return ret;
 }
 
-static const char *granularity_type_strs[] = {"PARTITION", "ROW", "BLOCK"};
+static const char *granularity_type_strs[] = {"PARTITION", "ROW"};
 
 const char *ObStorageCacheGranularity::get_str(const GranularityType &type)
 {
@@ -377,9 +371,9 @@ int ObStorageCachePolicy::check_table_cache_policy() const
   if (is_global_policy() && is_time_policy()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("global policy and time policy cannot coexist", K(ret));
-  } else if (granularity_ == ObStorageCacheGranularity::MAX_GRANULARITY) {
+  } else if (OB_UNLIKELY(!ObStorageCacheGranularity::is_valid(granularity_))) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid storage cache policy", K(ret), K(global_policy_));
+    LOG_WARN("invalid storage cache policy", KR(ret), K(global_policy_));
   } else if (granularity_ == ObStorageCacheGranularity::ROW) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("row granularity not supported yet", K(ret));
@@ -407,21 +401,15 @@ int ObStorageCachePolicy::to_json_string(char *buf, const int64_t buf_len, int64
   if (is_global_policy()) {
     databuff_print_kv(buf, buf_len, pos, "\"GLOBAL\"", ObStorageCacheGlobalPolicy::get_str(global_policy_));
   } else if (is_time_policy()) {
-    if (granularity_ == ObStorageCacheGranularity::BLOCK) {
-      if (is_default_block_time_policy()) {
-        // no need to print column name
-      } else { // print the real boundary_column
-        databuff_print_kv(buf, buf_len, pos, "\"COLUMN_NAME\"", column_name_);
-        J_COMMA();
-      }
-    } else if (granularity_ == ObStorageCacheGranularity::PARTITION) {
+    if (ObStorageCacheGranularity::PARTITION == granularity_) {
       databuff_print_kv(buf, buf_len, pos, "\"COLUMN_NAME\"", column_name_);
       J_COMMA();
     } else if (granularity_ == ObStorageCacheGranularity::ROW) {
       ret = OB_NOT_SUPPORTED;
       LOG_WARN("row granularity not supported yet", K(ret));
     } else {
-      // do nothing
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("unsupported storage cache policy granularity", KR(ret), K(granularity_));
     }
     if (OB_FAIL(ret)) {
     } else {
@@ -485,7 +473,11 @@ int ObStorageCachePolicy::load_from_string(const ObString &str)
         if (it->name_.case_compare("GLOBAL") == 0) {
           set_global_policy(ObStorageCacheGlobalPolicy::get_type(it->value_->get_string()));
         } else if (it->name_.case_compare("GRANULARITY") == 0) {
-          set_granularity(ObStorageCacheGranularity::get_type(it->value_->get_string()));
+          if (OB_FAIL(set_granularity(
+              ObStorageCacheGranularity::get_type(it->value_->get_string())))) {
+            LOG_WARN("fail to set storage cache granularity", KR(ret),
+                K(it->value_->get_string()));
+          }
         } else if (it->name_.case_compare("COLUMN_NAME") == 0) {
           set_column_name(it->value_->get_string().ptr(), it->value_->get_string().length());
         } else if (it->name_.case_compare("COLUMN_UNIT") == 0) {
@@ -514,8 +506,8 @@ int ObStorageCachePolicy::load_from_string(const ObString &str)
       }
     }
   }
-  if (OB_FAIL(check_table_cache_policy())) {
-    LOG_WARN("invalid storage cache policy", K(ret));
+  if (FAILEDx(check_table_cache_policy())) {
+    LOG_WARN("invalid storage cache policy", KR(ret));
   }
   return ret;
 }
@@ -560,9 +552,9 @@ int ObStorageCachePolicy::set_column_unit(const ObBoundaryColumnUnit::ColumnUnit
 int ObStorageCachePolicy::set_granularity(const ObStorageCacheGranularity::GranularityType granularity)
 {
   int ret = OB_SUCCESS;
-  if (ObStorageCacheGranularity::MAX_GRANULARITY == granularity) {
+  if (OB_UNLIKELY(!ObStorageCacheGranularity::is_valid(granularity))) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument", K(ret), K(granularity));
+    LOG_WARN("invalid argument", KR(ret), K(granularity));
   } else if (ObStorageCacheGranularity::ROW == granularity) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("row granularity not supported yet", K(ret));
@@ -785,15 +777,31 @@ int ObStorageCachePolicyStatus::safely_get_str(const PolicyStatus &type, const c
   return ret;
 }
 
-static const char *storage_cache_policy_status_type_strs[] = {"HOT", "AUTO", "NONE", "MACRO_HOT", "COLD"};
-
+// Maps explicit status values to names without requiring contiguous enum values.
+// Invalid values return the static UNKNOWN string.
 const char *ObStorageCachePolicyStatus::get_str(const PolicyStatus &type)
 {
-  const char *str = nullptr;
-  if (type < 0 || type >= PolicyStatus::MAX_STATUS) {
-    str = "UNKNOWN";
-  } else {
-    str = storage_cache_policy_status_type_strs[type];
+  const char *str = "UNKNOWN";
+  switch (type) {
+    case PolicyStatus::HOT: {
+      str = "HOT";
+      break;
+    }
+    case PolicyStatus::AUTO: {
+      str = "AUTO";
+      break;
+    }
+    case PolicyStatus::NONE: {
+      str = "NONE";
+      break;
+    }
+    case PolicyStatus::COLD: {
+      str = "COLD";
+      break;
+    }
+    default: {
+      break;
+    }
   }
   return str;
 }

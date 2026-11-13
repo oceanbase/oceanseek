@@ -8,12 +8,10 @@
 
 #include <stdint.h>
 #include "lib/utility/ob_print_utils.h"
-#include "lib/hash/ob_hashmap.h"
 #include "storage/blocksstable/ob_storage_object_handle.h"
 #include "storage/shared_storage/prewarm/ob_prewarm_parallelism_controller.h"
 #include "storage/shared_storage/prewarm/ob_ss_base_prewarmer.h"
 #include "share/storage_cache_policy/ob_storage_cache_common.h"
-#include "storage/shared_storage/prewarm/ob_storage_cache_policy_prewarmer.h"
 #include "storage/shared_storage/ob_ss_local_cache_stat.h"
 namespace oceanbase
 {
@@ -23,6 +21,7 @@ namespace blocksstable
   class ObMacroIdIterator;
   class ObSSTableMetaHandle;
   class ObSSTableSecMetaIterator;
+  class ObDataMacroBlockMeta;
   struct ObDatumRange;
 }
 namespace compaction
@@ -113,25 +112,17 @@ private:
                      blocksstable::ObSSTableSecMetaIterator *sec_meta_iter,
                      blocksstable::MacroBlockId &macro_id,
                      blocksstable::ObDataMacroBlockMeta &data_macro_block_meta);
-  int check_if_need_prewarm(const ObPrewarmMacroType type,
-                            const blocksstable::MacroBlockId &macro_id,
-                            const blocksstable::ObDataMacroBlockMeta &data_macro_block_meta,
-                            const ObPolicyStatusCalculator &policy_status_calculator,
-                            bool &is_need_prewarm);
-  // Init policy_status_calculator for MACRO_HOT tablet
-  int init_policy_status_calculator(ObPolicyStatusCalculator &policy_status_calculator);
-  // For MACRO_HOT tablet, handle existing macro block cache type based on macro policy status
-  int handle_exist_macro_cache_type_for_macro_hot(
+  // Checks cache presence and the data macro age without changing cache types.
+  int check_if_need_prewarm_(const ObPrewarmMacroType type,
       const blocksstable::MacroBlockId &macro_id,
       const blocksstable::ObDataMacroBlockMeta &data_macro_block_meta,
-      const ObPolicyStatusCalculator &policy_status_calculator);
+      bool &is_need_prewarm);
   int check_if_logic_version_in_one_day(const int64_t logic_version, bool &is_in_one_day);
   int aio_read_from_object_storage(const blocksstable::MacroBlockId &macro_id);
   // `prewarm_into_micro`: false means prewarm into macro cache, true means prewarm into micro cache.
   int batch_write_to_local_cache(ObSSTableMacroPrewarmInfo &prewarm_info);
   int single_write_to_macro_cache(const int64_t cur_read_idx, ObSSTableMacroPrewarmInfo &prewarm_info);
   int single_write_to_local_cache(const int64_t cur_read_idx, ObSSTableMacroPrewarmInfo &prewarm_info);
-  int try_modify_macro_cache_type_for_macro_hot(const blocksstable::MacroBlockId &macro_id);
   int batch_wait_read_handles();
   int single_wait_write_handle(const int64_t cur_write_idx, ObSSTableMacroPrewarmInfo &prewarm_info);
   void reset_io_resources();
@@ -140,13 +131,11 @@ private:
   int check_if_prewarm_data_macro(const bool is_hot_tablet,
                                   const compaction::ObSSMajorPrewarmLevel prewarm_level,
                                   bool &is_prewarm_data_macro);
-  bool is_hot_block_(const blocksstable::MacroBlockId &macro_id) const;
 
 private:
   static const int64_t ONE_DAY_NS = 24 * 60 * 60 * 1000L * 1000L * 1000L;
   static const int64_t MIN_PARALLELISM = 1;
   static const int64_t MAX_PARALLELISM = 8;
-  static const int64_t DEFAULT_MACRO_POLICY_STATUS_MAP_SIZE = 128;
   volatile bool &is_stop_;
   const blocksstable::ObSSTable *sstable_;
   uint64_t effective_tablet_id_;
@@ -158,8 +147,7 @@ private:
   int64_t read_handle_idx_;
   int64_t write_handle_idx_;
   common::ObArenaAllocator buf_allocator_;
-  bool is_hot_or_macro_hot_tablet_;
-  common::hash::ObHashMap<blocksstable::MacroBlockId, PolicyStatus> macro_policy_status_map_;
+  bool is_hot_tablet_;
 };
 
 

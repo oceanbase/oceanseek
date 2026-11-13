@@ -223,12 +223,6 @@ int ObStorageObjectTypeBase::get_macro_cache_type(const uint64_t effective_table
         LOG_WARN("fail to get tablet policy status", KR(ret), K(effective_tablet_id));
       } else if (PolicyStatus::HOT == policy_status) { // 1. partition-level storage_cache_policy
         macro_cache_type = ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK;
-      } else if ((PolicyStatus::MACRO_HOT == policy_status)) { // 2. block-level storage_cache_policy
-        if (is_major()) { // 2.1 consider major macro as non-hot data
-          macro_cache_type = ObSSMacroCacheType::MACRO_BLOCK;
-        } else { // 2.2 consider incremental macro as hot data
-          macro_cache_type = ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK;
-        }
       }
     }
   }

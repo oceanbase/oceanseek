@@ -263,44 +263,6 @@ int ObStorageCacheTabletScheduler::check_is_active_tablet(const int64_t tablet_i
   return ret;
 }
 
-int ObStorageCacheTabletScheduler::generate_block_task(const uint64_t tenant_id,
-                                                       const int64_t tablet_id, 
-                                                       const ObStorageCachePolicy &block_storage_cache_policy)
-{
-  int ret = OB_SUCCESS;
-  ObStorageCacheTabletTaskHandle ori_task_handle;
-  ObStorageCacheTabletTaskHandle task_handle;
-  ObStorageCacheTabletTask *task = nullptr;
-  bool is_active = false;
-  if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("tenant tablet storage cache tablet scheduler not init", KR(ret));
-  } else if (OB_UNLIKELY(!block_storage_cache_policy.is_block_time_policy())) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid block storage cache policy", KR(ret), K(block_storage_cache_policy));
-  } else if (OB_INVALID_TENANT_ID == tenant_id || common::ObTabletID::INVALID_TABLET_ID == tablet_id) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument", KR(ret), K(tenant_id), K(tablet_id));
-  } else if (OB_FAIL(check_is_active_tablet(tablet_id, is_active))) {
-    LOG_WARN("fail to check is active tablet", KR(ret), K(tablet_id), K(block_storage_cache_policy));
-  } else if (is_active) {
-    if (OB_ISNULL(task = OB_NEW(ObStorageCacheTabletTask, ObMemAttr(tenant_id_, "ObSCPBlock")))) { // Task will be freed in destructor function
-      ret = OB_ALLOCATE_MEMORY_FAILED;
-      LOG_WARN("fail to allocate memory for tablet task", KR(ret));
-    } else if (FALSE_IT(task_handle.set_ptr(task))) {
-    } else if (OB_FAIL(task->init_block_task(tenant_id, tablet_id, block_storage_cache_policy))) {
-      LOG_WARN("fail to init block task", KR(ret), KPC(task), K(tenant_id), K(tablet_id), K(block_storage_cache_policy));
-    } else if (OB_UNLIKELY(!task->is_valid())) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("task is not valid", KR(ret), KPC(task));
-    } else if (OB_FAIL(push_task(task_handle))) {
-      LOG_WARN("fail to push task", KR(ret), K(tenant_id), K(tablet_id), K(block_storage_cache_policy), KPC(task));
-    }
-  } else {
-    // do nothing
-  }
-  return ret;
-}
 
 int ObStorageCacheTabletScheduler::generate_partition_task(
     const uint64_t tenant_id,
@@ -444,10 +406,6 @@ int ObStorageCacheTabletScheduler::regenerate_task(const ObStorageCacheTabletTas
         task_handle()->get_policy_status()))) {
       LOG_WARN("fail to regenerate partition task", KR(ret), KPC(task_handle.get_ptr()));
     }
-  } else if (task_handle()->is_block_task()) {
-    if (OB_FAIL(generate_block_task(task_handle()->get_tenant_id(), task_handle()->get_tablet_id(), task_handle()->get_block_storage_cache_policy()))) {
-      LOG_WARN("fail to regenerate block task", KR(ret), KPC(task_handle.get_ptr()));
-    }
   } else {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid task type", KR(ret), KPC(task_handle.get_ptr()));
@@ -563,6 +521,9 @@ int ObStorageCacheTabletScheduler::convert_hot_to_auto(const int64_t tablet_id)
     } else if (OB_FAIL(ori_task_handle()->set_status(
         ObStorageCacheTaskStatus::OB_STORAGE_CACHE_TASK_CANCELED))) {
       LOG_WARN("fail to cancel origin task", KR(ret), KPC(ori_task_handle.get_ptr()));
+    }
+
+    if (OB_FAIL(ret)) {
     } else if (OB_FAIL(get_tablet_ls_id(tenant_id_, tablet_id, ls_id))) {
       LOG_WARN("fail to get tablet ls id", KR(ret), K(tenant_id), K(tablet_id), KPC(this));
     } else if (OB_FAIL(get_macro_blocks(ObLSID(ls_id), ObTabletID(tablet_id), data_block_ids, meta_block_ids))) {
@@ -803,32 +764,6 @@ int ObStorageCacheTabletScheduler::trigger_retry_waiting_tasks()
   return ret;
 }
 
-int ObStorageCacheTabletScheduler::cancel_task_by_tablet_id(const int64_t tablet_id)
-{
-  int ret = OB_SUCCESS;
-  ObStorageCacheTabletTaskHandle ori_task_handle;
-  if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("task is not init", KR(ret));
-  } else if (OB_UNLIKELY(common::ObTabletID::INVALID_TABLET_ID == tablet_id)) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument", KR(ret), K(tablet_id), KPC(this));
-  } else if (OB_FAIL(tablet_task_map_.get_refactored(tablet_id, ori_task_handle))) {
-    if (OB_HASH_NOT_EXIST == ret) {
-      ret = OB_SUCCESS;
-    } else {
-      LOG_WARN("fail to get task from map", KR(ret), K(tablet_id));
-    }
-  } else if (OB_UNLIKELY(!ori_task_handle.is_valid())) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("ori task handle is invalid", KR(ret), K(ori_task_handle));
-  } else if (OB_FAIL(ori_task_handle()->set_status(
-      ObStorageCacheTaskStatus::OB_STORAGE_CACHE_TASK_CANCELED))) {
-    LOG_WARN("fail to cancel origin task", KR(ret), KPC(ori_task_handle.get_ptr()));
-  }
-  return ret;
-}
-
 int ObStorageCacheTabletScheduler::invalidate_task_by_tablet_id(const int64_t tablet_id)
 {
   int ret = OB_SUCCESS;
@@ -850,45 +785,6 @@ int ObStorageCacheTabletScheduler::invalidate_task_by_tablet_id(const int64_t ta
     LOG_WARN("task handle is invalid", KR(ret), K(tablet_id), K(task_handle));
   } else if (OB_FAIL(task_handle()->set_canceled())) {
     LOG_WARN("fail to cancel task by schema", KR(ret), K(tablet_id), KPC(task_handle.get_ptr()));
-  }
-  return ret;
-}
-
-// micro cache is mark deleted, and clear in async thread; read macro cache is evicted directly, while write macro cache will first write to object storage, then convert to read cache.
-int ObStorageCacheTabletScheduler::evict_local_cache(const int64_t tablet_id, int64_t &macro_write_cache_cnt)
-{
-  int ret = OB_SUCCESS;
-  bool skip_non_active_tablet = false;
-  ObStorageCacheTabletTaskHandle ori_task_handle;
-  ObSSMacroCacheMgr *macro_cache_mgr = nullptr;
-  int64_t macro_read_cache_cnt = 0;
-  const uint64_t tenant_id = MTL_ID();
-  if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("task is not init", KR(ret));
-  } else if (common::ObTabletID::INVALID_TABLET_ID == tablet_id) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument", KR(ret), K(tablet_id), KPC(this));
-  } else if (OB_FAIL(active_tablet_ids_.exist_refactored(tablet_id))) {
-    if (OB_HASH_EXIST == ret) {
-      ret = OB_SUCCESS;
-    } else if (OB_HASH_NOT_EXIST == ret) {
-      skip_non_active_tablet = true;
-      ret = OB_SUCCESS;
-    } else {
-      LOG_WARN("fail to check exist in active tablet ids", KR(ret), K(tablet_id), K(tenant_id));
-    }
-  }
-  if (OB_FAIL(ret)) {
-  } else if (skip_non_active_tablet) {
-    // do nothing
-  } else if (OB_FAIL(cancel_task_by_tablet_id(tablet_id))) {
-    LOG_WARN("fail to cancel task by tablet id", KR(ret), K(tablet_id));
-  } else if (OB_ISNULL(macro_cache_mgr = MTL(ObSSMacroCacheMgr *))) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("ObSSMacroCacheMgr is null", KR(ret), K_(tenant_id));
-  } else if (OB_FAIL(macro_cache_mgr->evict_by_tablet_id(ObTabletID(tablet_id), macro_read_cache_cnt, macro_write_cache_cnt))) {
-    LOG_WARN("fail to delete tablet macro cache", KR(ret), K(tablet_id));
   }
   return ret;
 }
@@ -929,7 +825,6 @@ ObStorageCacheTabletTask::ObStorageCacheTabletTask()
     ls_id_(ObLSID::INVALID_LS_ID),
     tablet_id_(common::ObTabletID::INVALID_TABLET_ID),
     ref_count_(0),
-    block_storage_cache_policy_(),
     task_type_(ObStorageCacheTaskType::OB_STORAGE_CACHE_TASK_TYPE_MAX),
     task_lock_(common::ObLatchIds::STORAGE_CACHE_POLICY_TASK_LOCK),
     status_(ObStorageCacheTaskStatusType::OB_STORAGE_CACHE_TASK_STATUS_MAX),
@@ -968,32 +863,6 @@ int ObStorageCacheTabletTask::init_partition_task(
   return ret;
 }
 
-int ObStorageCacheTabletTask::init_block_task(
-                              const uint64_t tenant_id, 
-                              const int64_t tablet_id, 
-                              const ObStorageCachePolicy &block_storage_cache_policy)
-{
-  int ret = OB_SUCCESS;
-  if (IS_INIT) {
-    ret = OB_INIT_TWICE;
-    LOG_WARN("init twice", KR(ret));
-  } else if (OB_UNLIKELY(OB_INVALID_TENANT_ID == tenant_id
-      || common::ObTabletID::INVALID_TABLET_ID == tablet_id
-      || !block_storage_cache_policy.is_block_time_policy())) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid arguments", KR(ret), K(tenant_id), K(tablet_id), K(block_storage_cache_policy));
-  } else {
-    tenant_id_ = tenant_id;
-    tablet_id_ = tablet_id;
-    status_ = ObStorageCacheTaskStatus::OB_STORAGE_CACHE_TASK_INIT;
-    task_type_ = ObStorageCacheTaskType::OB_STORAGE_CACHE_BLOCK_TASK;
-    block_storage_cache_policy_ = block_storage_cache_policy;
-    policy_status_ = PolicyStatus::MACRO_HOT;
-    is_inited_ = true;
-    comment_allocator_.set_tenant_id(tenant_id);
-  }
-  return ret;
-}
 
 // Only used for test!!!!
 int ObStorageCacheTabletTask::init_for_test(
@@ -1033,7 +902,6 @@ void ObStorageCacheTabletTask::destroy()
   task_type_ = ObStorageCacheTaskType::OB_STORAGE_CACHE_TASK_TYPE_MAX;
   policy_status_ = PolicyStatus::MAX_STATUS;
   status_ = ObStorageCacheTaskStatusType::OB_STORAGE_CACHE_TASK_STATUS_MAX;
-  block_storage_cache_policy_.reset();
   tablet_id_ = common::ObTabletID::INVALID_TABLET_ID;
   tenant_id_ = OB_INVALID_TENANT_ID;
   ls_id_ = ObLSID::INVALID_LS_ID;
@@ -1345,11 +1213,6 @@ bool ObStorageCacheTabletTask::is_cold() const
   return (PolicyStatus::COLD == policy_status_);
 }
 
-bool ObStorageCacheTabletTask::is_macro_hot() const
-{
-  SpinRLockGuard guard(task_lock_);
-  return (PolicyStatus::MACRO_HOT == policy_status_);
-}
 
 int ObStorageCacheTabletTask::set_canceled()
 {
@@ -1392,17 +1255,10 @@ bool ObStorageCacheTabletTask::is_uncompleted() const
 bool ObStorageCacheTabletTask::is_valid() const
 {
   SpinRLockGuard guard(task_lock_);
-  bool is_valid = (OB_INVALID_TENANT_ID != tenant_id_) &&
-         (common::ObTabletID::INVALID_TABLET_ID != tablet_id_);
-  if (is_block_task()) {
-    is_valid = is_valid && 
-              (block_storage_cache_policy_.is_block_time_policy()) && 
-              (policy_status_ == PolicyStatus::MACRO_HOT);
-  } else if (is_partition_task()) {
-    is_valid = is_valid &&  
-               (policy_status_ == PolicyStatus::HOT || policy_status_ == PolicyStatus::AUTO);
-  }
-  return is_valid;
+  return OB_INVALID_TENANT_ID != tenant_id_
+      && common::ObTabletID::INVALID_TABLET_ID != tablet_id_
+      && is_partition_task()
+      && (PolicyStatus::HOT == policy_status_ || PolicyStatus::AUTO == policy_status_);
 }
 
 bool ObStorageCacheTabletTask::is_skipped_macro_cache() const
@@ -1457,11 +1313,6 @@ uint64_t ObStorageCacheTabletTask::get_tenant_id() const
   return tenant_id_;
 }
 
-ObStorageCachePolicy ObStorageCacheTabletTask::get_block_storage_cache_policy() const
-{
-  SpinRLockGuard guard(task_lock_);
-  return block_storage_cache_policy_;
-}
 
 ObStorageCacheTaskType ObStorageCacheTabletTask::get_task_type() const
 {
@@ -1580,11 +1431,6 @@ void ObStorageCacheTabletTask::set_end_time(const int64_t end_time)
   end_time_us_ = end_time;
 }
 
-void ObStorageCacheTabletTask::set_block_storage_cache_policy(const ObStorageCachePolicy &block_storage_cache_policy)
-{
-  SpinWLockGuard guard(task_lock_);
-  block_storage_cache_policy_ = block_storage_cache_policy;
-}
 
 void ObStorageCacheTabletTask::set_policy_status(const PolicyStatus &policy_status)
 {

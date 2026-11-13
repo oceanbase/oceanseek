@@ -13,7 +13,6 @@
 #include "storage/backup/ob_backup_data_struct.h"
 #include "share/ob_io_device_helper.h"
 #ifdef OB_BUILD_SHARED_STORAGE
-#include "storage/compaction/ob_major_pre_warmer.h"
 #include "storage/incremental/ob_ss_tablet_merge_helper.h"
 #endif
 namespace oceanbase
@@ -3170,18 +3169,8 @@ int ObMacroBlockWriter::build_pre_warmer(
       LOG_WARN("fail to create pre warmer", KR(ret), K(pre_warm_param));
     }
   } else if (MEM_AND_FILE_PRE_WARM == tmp_type) {
-#ifdef OB_BUILD_SHARED_STORAGE
-    const ObMajorPreWarmerParam *param = static_cast<const ObMajorPreWarmerParam *>(&pre_warm_param);
-    if ((ObSSMajorPrewarmLevel::PREWARM_NONE_LEVEL == param->pre_warm_level_)
-        || ((ObSSMajorPrewarmLevel::PREWARM_ONLY_META_LEVEL == param->pre_warm_level_)
-            && !is_for_index)) {
-      // do nothing
-    } else if (OB_FAIL(create_pre_warmer(MEM_AND_FILE_PRE_WARM, pre_warm_param, is_for_index, allocator, pre_warmer))) {
-      LOG_WARN("fail to create pre warmer", KR(ret), K(pre_warm_param));
-    }
-#else
     ret = OB_NOT_SUPPORTED;
-#endif
+    LOG_WARN("file prewarming is no longer supported", KR(ret), K(pre_warm_param));
   }
   if (OB_SUCC(ret) && OB_NOT_NULL(pre_warmer) && OB_FAIL(pre_warmer->init(nullptr))) {
     LOG_WARN("fail to init pre warmer", KR(ret));
@@ -3217,25 +3206,8 @@ int ObMacroBlockWriter::create_pre_warmer(
       }
     }
   } else if (ObPreWarmerType::MEM_AND_FILE_PRE_WARM == pre_warmer_type) {
-#ifdef OB_BUILD_SHARED_STORAGE
-    const ObMajorPreWarmerParam *param = static_cast<const ObMajorPreWarmerParam *>(&pre_warm_param);
-    if (is_for_index) {
-      if (OB_ISNULL(pre_warmer = OB_NEWx(ObMajorPreWarmer<ObIndexBlockCachePreWarmer>, &allocator,
-                                          param->pre_warm_writer_.meta_writer_))) {
-        ret = OB_ALLOCATE_MEMORY_FAILED; // use ret, must pre warm disk micro cache
-        LOG_WARN("fail to new major pre warmer", KR(ret));
-      }
-    } else {
-      if (OB_ISNULL(pre_warmer = OB_NEWx(ObMajorPreWarmer<ObDataBlockCachePreWarmer>, &allocator,
-                                          param->pre_warm_writer_.data_writer_))) {
-        ret = OB_ALLOCATE_MEMORY_FAILED; // use ret, must pre warm disk micro cache
-        LOG_WARN("fail to new major pre warmer", KR(ret));
-      }
-    }
-#else
     ret = OB_NOT_SUPPORTED;
-    LOG_WARN("do not support create mem and file pre warmer", KR(ret));
-#endif
+    LOG_WARN("file prewarming is no longer supported", KR(ret), K(pre_warm_param));
   }
   return ret;
 }

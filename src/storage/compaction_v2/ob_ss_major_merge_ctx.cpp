@@ -109,8 +109,6 @@ int ObSSTabletMajorMergeCtx::init_tablet_merge_info()
   } else if (OB_FAIL(ObTabletMergeCtx::init_tablet_merge_info())) {
     LOG_WARN("failed to init tablet merge info", KR(ret), KPC(this));
   } else if (FALSE_IT(task_cnt_ = get_concurrent_cnt())) {
-  } else if (OB_FAIL(major_pre_warm_param_.init(get_ls()->get_ls_id(), get_tablet_id()))) {
-    LOG_WARN("failed to init pre warm param", KR(ret), KPC(this));
   } else {
     // task_cnt_ 个数据任务序号段，再加 1 个索引树序号段。
     const int64_t seq_step_cnt = task_cnt_ + INDEX_TREE_MACRO_SEQ_SLOT_CNT;
@@ -144,9 +142,7 @@ int ObSSTabletMajorMergeCtx::update_tablet_after_merge()
   ObUpdateTableStoreParam param;
   int64_t epoch = 0;
   time_guard_click(ObStorageCompactionTimeGuard::EXECUTE);
-  if (OB_FAIL(pre_warm_writer_.complete())) {
-    LOG_WARN("failed to complete pre warm writer", KR(ret), K_(pre_warm_writer));
-  } else if (OB_FAIL(create_sstable(sstable))) {
+  if (OB_FAIL(create_sstable(sstable))) {
     LOG_WARN("failed to create sstable", KR(ret), "dag_param", get_dag_param());
     CTX_SET_DIAGNOSE_LOCATION(*this);
   } else if (OB_FAIL(build_update_table_store_param(sstable, param))) {
@@ -224,9 +220,7 @@ int ObSSCOTabletMergeCtx::update_tablet_after_merge()
   ObUpdateTableStoreParam param;
   int64_t curr_epoch = 0;
   time_guard_click(ObStorageCompactionTimeGuard::EXECUTE);
-  if (OB_FAIL(pre_warm_writer_.complete())) {
-    LOG_WARN("failed to complete pre warm writer", KR(ret), K_(pre_warm_writer));
-  } else if (OB_FAIL(ObCOTabletMergeCtx::create_sstable(sstable))) {
+  if (OB_FAIL(ObCOTabletMergeCtx::create_sstable(sstable))) {
     LOG_WARN("failed to create sstable", KR(ret));
   } else if (OB_FAIL(build_update_table_store_param(sstable, param))) {
     LOG_WARN("build table store update param fail", K(ret));
@@ -350,8 +344,6 @@ int ObSSCOTabletMergeCtx::init_tablet_merge_info()
   } else if (OB_FAIL(ObCOTabletMergeCtx::init_tablet_merge_info())) {
     LOG_WARN("failed to init tablet merge info", KR(ret), KPC(this));
   } else if (FALSE_IT(task_cnt_ = get_concurrent_cnt())) {
-  } else if (OB_FAIL(major_pre_warm_param_.init(get_ls()->get_ls_id(), get_tablet_id()))) {
-    LOG_WARN("failed to init pre warm param", KR(ret), KPC(this));
   } else {
     // task_cnt_ 个数据任务序号段，再加 1 个索引树序号段。
     const int64_t seq_step_cnt = task_cnt_ + INDEX_TREE_MACRO_SEQ_SLOT_CNT;
@@ -469,8 +461,6 @@ int ObSSAsyncIndexMergeCtx::init_tablet_merge_info()
   } else if (OB_FAIL(ObAsyncIndexMergeCtx::init_tablet_merge_info())) {
     LOG_WARN("failed to init tablet merge info", KR(ret), KPC(this));
   } else if (FALSE_IT(task_cnt_ = get_concurrent_cnt())) {
-  } else if (OB_FAIL(major_pre_warm_param_.init(get_ls()->get_ls_id(), get_tablet_id()))) {
-    LOG_WARN("failed to init pre warm param", KR(ret), KPC(this));
   } else {
     static_desc_.is_non_idem_major_ = is_non_idem_major;
     // 数据 writer 个数对应的序号段，再加 1 个索引树序号段。
@@ -511,9 +501,7 @@ int ObSSAsyncIndexMergeCtx::update_tablet_after_merge()
   ObUpdateTableStoreParam param;
   int64_t epoch = 0;
   time_guard_click(ObStorageCompactionTimeGuard::EXECUTE);
-  if (OB_FAIL(pre_warm_writer_.complete())) {
-    LOG_WARN("failed to complete pre warm writer", KR(ret), K_(pre_warm_writer));
-  } else if (OB_FAIL(create_sstable(sstable))) {
+  if (OB_FAIL(create_sstable(sstable))) {
     LOG_WARN("failed to create sstable", KR(ret), "dag_param", get_dag_param());
     CTX_SET_DIAGNOSE_LOCATION(*this);
   } else if (OB_ISNULL(sstable)) {

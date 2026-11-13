@@ -225,8 +225,7 @@ public:
       ret = OB_ERR_UNEXPECTED;
       SERVER_LOG(WARN, "ObStorageCacheTabletTaskHandle is invalid",
           KR(ret), K(entry.first), KPC(entry.second.get_ptr()));
-    } else if (tmp_task_handle()->is_hot() || tmp_task_handle()->is_macro_hot() ||
-               tmp_task_handle()->is_auto()) {
+    } else if (tmp_task_handle()->is_hot() || tmp_task_handle()->is_auto()) {
       if (OB_FAIL(tablet_tasks_.push_back(tmp_task_handle))) {
         SERVER_LOG(WARN, "fail to copy store handle", KR(ret), K(tablet_tasks_.count()));
       }

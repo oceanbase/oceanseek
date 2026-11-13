@@ -66,8 +66,6 @@ private:
                                             const share::ObLSID &ls_id,
                                             common::hash::ObHashSet<blocksstable::MacroBlockId> &macro_block_set,
                                             bool &is_get);
-  int gc_macro_hot_cache(const common::hash::ObHashMap<share::ObLSID, int64_t/*ls_epoch*/> &ls_id_epoch_map,
-                         const common::hash::ObHashMap<common::ObTabletID, share::ObLSID> &macro_hot_tablet_map);
 private:
   static constexpr int64_t SCHEDULE_INTERVAL_US = 1_min;
   ObSSMacroCacheMgr *macro_cache_mgr_;

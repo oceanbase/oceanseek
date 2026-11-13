@@ -8366,7 +8366,6 @@ TEST_F(ObAsyncIndexSnapshotTest, completed_major_protocol_recovers_publication)
     }
     if (0 == attempt) {
       const ObSSTable *sstable = nullptr;
-      ASSERT_EQ(OB_SUCCESS, ctx->pre_warm_writer_.complete());
       ASSERT_EQ(OB_SUCCESS, ctx->create_sstable(sstable));
       ASSERT_NE(nullptr, sstable);
       ASSERT_EQ(expected_rows.count(), sstable->get_row_count());

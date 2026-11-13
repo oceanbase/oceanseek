@@ -21,7 +21,6 @@
 #include "storage/compaction/ob_major_pre_warmer.h"
 #include "storage/shared_storage/ob_ss_local_cache_service.h"
 #include "storage/shared_storage/ob_ss_object_access_util.h"
-#include "storage/shared_storage/prewarm/ob_storage_cache_policy_prewarmer.h"
 #include "storage/shared_storage/storage_cache_policy/ob_storage_cache_service.h"
 
 namespace oceanbase
@@ -40,8 +39,7 @@ ObSSTableMacroPrewarmer::ObSSTableMacroPrewarmer(
     prewarm_type_(prewarm_type),
     parallelism_(1), read_handles_(), write_handles_(), read_handle_idx_(-1),
     write_handle_idx_(-1), buf_allocator_(),
-    is_hot_or_macro_hot_tablet_(false),
-    macro_policy_status_map_()
+    is_hot_tablet_(false)
 {
   MEMSET(write_sizes_, 0 , sizeof(write_sizes_));
   buf_allocator_.set_attr(ObMemAttr(MTL_ID(), "IncPrewarm"));
@@ -61,13 +59,8 @@ int ObSSTableMacroPrewarmer::do_prewarm(const ObTabletHandle &tablet_handle)
   PolicyStatus policy_status = PolicyStatus::MAX_STATUS;
   bool is_prewarm_data_macro = true;
   ObTablet *tablet = nullptr;
-  if (!macro_policy_status_map_.created()) {
-    if (OB_FAIL(macro_policy_status_map_.create(DEFAULT_MACRO_POLICY_STATUS_MAP_SIZE, "MacroPolicyMap"))) {
-      LOG_WARN("fail to create macro policy status map", KR(ret));
-    }
-  }
-  if (OB_FAIL(ret)) {
-  } else if (OB_ISNULL(tablet = tablet_handle.get_obj())) {
+  is_hot_tablet_ = false;
+  if (OB_ISNULL(tablet = tablet_handle.get_obj())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("tablet pointer is null", KR(ret), KP(tablet));
   } else if (FALSE_IT(effective_tablet_id_ = tablet->get_tablet_id().id())) {
@@ -85,8 +78,8 @@ int ObSSTableMacroPrewarmer::do_prewarm(const ObTabletHandle &tablet_handle)
   } else if (FALSE_IT(prewarm_level = prewarm_service->get_major_prewarm_level())) {
   } else if (PolicyStatus::COLD == policy_status) {
     // tablet is cold, no need to prewarm
-  } else if (PolicyStatus::HOT == policy_status || PolicyStatus::MACRO_HOT == policy_status) {
-    is_hot_or_macro_hot_tablet_ = true;
+  } else if (PolicyStatus::HOT == policy_status) {
+    is_hot_tablet_ = true;
     if (OB_FAIL(handle_hot_tablet(prewarm_level, tablet_handle))) {
       LOG_WARN("fail to handle hot tablet", KR(ret), K(prewarm_level));
     }
@@ -253,13 +246,9 @@ int ObSSTableMacroPrewarmer::prewarm_macros(
     uint64_t macro_logic_version = 0;
     bool is_need_prewarm = false;
     bool is_get_next_macro_failed = false;
-    ObPolicyStatusCalculator policy_status_calculator;
     if (OB_FAIL(get_macro_iter(type, tablet_handle, meta_handle, macro_id_iter, allocator,
                                datum_range, sec_meta_iter))) {
       LOG_WARN("fail to get macro iter", KR(ret), K(type), "type_str", get_prewarm_macro_type_str(type));
-    } else if (OB_FAIL(init_policy_status_calculator(policy_status_calculator))) {
-      // Init policy_status_calculator before loop (only for MACRO_HOT tablet)
-      LOG_WARN("fail to init policy status calculator", KR(ret), K(effective_tablet_id_));
     }
     while (OB_SUCC(ret) && !is_stop_ && !is_iter_end) {
       is_get_next_macro_failed = false;
@@ -274,7 +263,8 @@ int ObSSTableMacroPrewarmer::prewarm_macros(
           LOG_WARN("fail to get next macro id", KR(ret), K(type), "type_str", get_prewarm_macro_type_str(type));
         }
       } else if (FALSE_IT(prewarm_info.iterated_macro_cnt_++)) {
-      } else if (OB_FAIL(check_if_need_prewarm(type, macro_id, data_macro_block_meta, policy_status_calculator, is_need_prewarm))) {
+      } else if (OB_FAIL(check_if_need_prewarm_(
+          type, macro_id, data_macro_block_meta, is_need_prewarm))) {
         LOG_WARN("fail to check if need prewarm", KR(ret), K(macro_id), K(data_macro_block_meta));
       } else if (!is_need_prewarm) {
         prewarm_info.skipped_macro_cnt_++;
@@ -399,33 +389,10 @@ int ObSSTableMacroPrewarmer::get_next_macro(
   return ret;
 }
 
-int ObSSTableMacroPrewarmer::init_policy_status_calculator(ObPolicyStatusCalculator &policy_status_calculator)
-{
-  int ret = OB_SUCCESS;
-  PolicyStatus tablet_policy_status = PolicyStatus::MAX_STATUS;
-  ObStorageCachePolicy storage_cache_policy;
-  ObStorageCachePolicyService *storage_cache_service = nullptr;
-  if (OB_FAIL(ObSSObjectAccessUtil::get_tablet_policy_status(effective_tablet_id_, tablet_policy_status))) {
-    LOG_WARN("fail to get tablet policy status", KR(ret), K(effective_tablet_id_));
-  } else if (PolicyStatus::MACRO_HOT == tablet_policy_status) {
-    // Only MACRO_HOT needs policy_status_calculator
-    if (OB_ISNULL(storage_cache_service = MTL(ObStorageCachePolicyService *))) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("storage cache service is null", KR(ret));
-    } else if (OB_FAIL(storage_cache_service->get_storage_cache_policy_for_macro_scp(effective_tablet_id_, storage_cache_policy))) {
-      LOG_WARN("fail to get storage cache policy", KR(ret));
-    } else if (OB_FAIL(policy_status_calculator.init(storage_cache_policy))) {
-      LOG_WARN("fail to init policy status calculator", KR(ret), K(storage_cache_policy));
-    }
-  }
-  return ret;
-}
-
-int ObSSTableMacroPrewarmer::check_if_need_prewarm(
+int ObSSTableMacroPrewarmer::check_if_need_prewarm_(
     const ObPrewarmMacroType type,
     const MacroBlockId &macro_id,
     const ObDataMacroBlockMeta &data_macro_block_meta,
-    const ObPolicyStatusCalculator &policy_status_calculator,
     bool &is_need_prewarm)
 {
   int ret = OB_SUCCESS;
@@ -441,125 +408,21 @@ int ObSSTableMacroPrewarmer::check_if_need_prewarm(
   } else if (OB_FAIL(ObSSObjectAccessUtil::get_tablet_policy_status(effective_tablet_id_, policy_status))) {
     LOG_WARN("fail to get tablet policy status", KR(ret), K(effective_tablet_id_));
   } else if (is_exist) {
-    // Macro already exists in local cache, no need to prewarm
-    // Meta macros do not have data macro meta, so they cannot use macro-hot data policy
-    // But for MACRO_HOT tablet, need to handle cache type adjustment for both data and meta macros
-    if (PolicyStatus::MACRO_HOT == policy_status) {
-      if (ObPrewarmMacroType::DATA_MACRO == type) {
-        if (OB_FAIL(handle_exist_macro_cache_type_for_macro_hot(macro_id, data_macro_block_meta, policy_status_calculator))) {
-          LOG_WARN("fail to handle exist macro cache type for macro hot", KR(ret), K(macro_id));
-        }
-      } else if (ObPrewarmMacroType::META_MACRO == type) {
-        // Meta macros are essential for query, always treat as hot
-        if (OB_FAIL(macro_cache_mgr->modify_macro_cache_type(
-            macro_id, ObSSMacroCacheType::MACRO_BLOCK, ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK))) {
-          LOG_WARN("fail to modify meta macro cache type for macro hot tablet", KR(ret), K(macro_id));
-        }
-      }
-    }
-    is_need_prewarm = false; // already exist, skip this macro
-  } else { // !is_exist
-    if (PolicyStatus::MACRO_HOT == policy_status) {
-      if (ObPrewarmMacroType::META_MACRO == type) {
-        // Meta macros do not have data macro meta, so they cannot use macro-hot data policy
-        // But they are essential for query, always treat as hot
-        is_need_prewarm = true;
-        if (OB_FAIL(macro_policy_status_map_.set_refactored(macro_id, PolicyStatus::HOT))) {
-          if (OB_HASH_EXIST == ret) {
-            ret = OB_SUCCESS;
-          } else {
-            LOG_WARN("fail to set macro policy status map for meta macro", KR(ret), K(macro_id));
-          }
-        }
-      } else if (ObPrewarmMacroType::DATA_MACRO != type) {
-        ret = OB_INVALID_ARGUMENT;
-        LOG_WARN("invalid prewarm macro type", KR(ret), K(type), K(macro_id));
-      } else if (OB_UNLIKELY(!policy_status_calculator.is_inited())) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("policy status calculator is not inited for MACRO_HOT tablet", KR(ret), K(effective_tablet_id_));
-      } else {
-        PolicyStatus macro_block_policy_status = PolicyStatus::MAX_STATUS;
-        if (OB_FAIL(policy_status_calculator.get_macro_block_status(data_macro_block_meta, macro_block_policy_status))) {
-          LOG_WARN("fail to get macro block policy status", KR(ret), K(data_macro_block_meta));
-        } else if (PolicyStatus::HOT == macro_block_policy_status) {
-          // do nothing
-        } else if (PolicyStatus::COLD == macro_block_policy_status) {
-          is_need_prewarm = false; // exceed cold retention time, skip this macro
-        } else if (PolicyStatus::AUTO == macro_block_policy_status) {
-          bool is_in_one_day = false;
-          if (ObPrewarmMacroType::DATA_MACRO == type) {
-            if (OB_FAIL(check_if_logic_version_in_one_day(data_macro_block_meta.get_logic_id().logic_version_, is_in_one_day))) {
-              LOG_WARN("fail to check if logic version in one day", KR(ret), K(data_macro_block_meta.get_logic_id().logic_version_));
-            } else if (!is_in_one_day) {
-              is_need_prewarm = false; // logic version is not in one day, skip this macro
-            }
-          }
-        } else {
-          ret = OB_INVALID_ARGUMENT;
-          LOG_WARN("invalid macro block policy status", KR(ret), K(macro_block_policy_status));
-        }
-        if (OB_FAIL(ret)) {
-        } else if (OB_FAIL(macro_policy_status_map_.set_refactored(macro_id, macro_block_policy_status))) {
-          // Record macro block of MACRO_HOT tablet in macro policy status map
-          if (OB_HASH_EXIST == ret) {
-            ret = OB_SUCCESS; // ignore ret
-          } else {
-            LOG_WARN("fail to set macro policy status map", KR(ret), K(macro_id), K(macro_block_policy_status));
-          }
-        }
-      }
-    } else if (PolicyStatus::HOT == policy_status || PolicyStatus::AUTO == policy_status) {
-      const int64_t macro_logic_version = data_macro_block_meta.get_logic_id().logic_version_;
+    is_need_prewarm = false;
+  } else if (PolicyStatus::HOT == policy_status || PolicyStatus::AUTO == policy_status) {
+    if (ObPrewarmMacroType::DATA_MACRO == type) {
       bool is_in_one_day = false;
-      if (ObPrewarmMacroType::DATA_MACRO == type) {
-        if (OB_FAIL(check_if_logic_version_in_one_day(data_macro_block_meta.get_logic_id().logic_version_, is_in_one_day))) {
-          LOG_WARN("fail to check if logic version in one day", KR(ret), K(macro_logic_version));
-        } else if (!is_in_one_day) {
-          is_need_prewarm = false; // logic version is not in one day, skip this macro
-        }
+      if (OB_FAIL(check_if_logic_version_in_one_day(
+          data_macro_block_meta.get_logic_id().logic_version_, is_in_one_day))) {
+        LOG_WARN("fail to check if logic version in one day", KR(ret), K(macro_id));
+      } else if (!is_in_one_day) {
+        is_need_prewarm = false;
       }
     }
   }
   return ret;
 }
 
-int ObSSTableMacroPrewarmer::handle_exist_macro_cache_type_for_macro_hot(
-    const MacroBlockId &macro_id,
-    const ObDataMacroBlockMeta &data_macro_block_meta,
-    const ObPolicyStatusCalculator &policy_status_calculator)
-{
-  int ret = OB_SUCCESS;
-  ObSSMacroCacheMgr *macro_cache_mgr = nullptr;
-  PolicyStatus macro_block_policy_status = PolicyStatus::MAX_STATUS;
-  if (OB_UNLIKELY(!macro_id.is_valid())) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid macro id", KR(ret), K(macro_id));
-  } else if (OB_UNLIKELY(!policy_status_calculator.is_inited())) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("policy status calculator is not inited", KR(ret), K(macro_id));
-  } else if (OB_ISNULL(macro_cache_mgr = MTL(ObSSMacroCacheMgr *))) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("macro cache mgr is null", KR(ret));
-  } else if (OB_FAIL(policy_status_calculator.get_macro_block_status(data_macro_block_meta, macro_block_policy_status))) {
-    LOG_WARN("fail to get macro block policy status", KR(ret), K(data_macro_block_meta));
-  } else if (PolicyStatus::HOT == macro_block_policy_status) {
-    // HOT macro: modify cache type from MACRO_BLOCK to HOT_TABLET_MACRO_BLOCK
-    if (OB_FAIL(macro_cache_mgr->modify_macro_cache_type(
-        macro_id, ObSSMacroCacheType::MACRO_BLOCK, ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK))) {
-      LOG_WARN("fail to modify macro cache type to HOT_TABLET_MACRO_BLOCK", KR(ret), K(macro_id));
-    }
-  } else if (PolicyStatus::AUTO == macro_block_policy_status || PolicyStatus::COLD == macro_block_policy_status) {
-    // AUTO/COLD macro: modify cache type from HOT_TABLET_MACRO_BLOCK to MACRO_BLOCK
-    if (OB_FAIL(macro_cache_mgr->modify_macro_cache_type(
-        macro_id, ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK, ObSSMacroCacheType::MACRO_BLOCK))) {
-      LOG_WARN("fail to modify macro cache type to MACRO_BLOCK", KR(ret), K(macro_id));
-    }
-  } else {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid macro block policy status", KR(ret), K(macro_block_policy_status));
-  }
-  return ret;
-}
 
 int ObSSTableMacroPrewarmer::check_if_logic_version_in_one_day(const int64_t logic_version, bool &is_in_one_day)
 {
@@ -621,7 +484,7 @@ int ObSSTableMacroPrewarmer::batch_write_to_local_cache(
       // do nothing
     } else {
       PrewarmLocalCacheType ss_prewarm_local_cache_type = PrewarmLocalCacheType::SS_PREWARM_MAX_TYPE;
-      const bool is_hot_block = is_hot_block_(read_handles_[i].get_macro_id());
+      const bool is_hot_block = is_hot_tablet_;
       check_prewarm_cache_type(read_handles_[i].get_macro_id(), read_handles_[i].get_buffer(), read_handles_[i].get_data_size(), is_hot_block, ss_prewarm_local_cache_type);
       if (ObSSPrewarmLocalCacheType::is_skipped(ss_prewarm_local_cache_type)) {
         prewarm_info.skipped_macro_cnt_++;
@@ -649,54 +512,12 @@ int ObSSTableMacroPrewarmer::batch_write_to_local_cache(
       ret = (OB_SUCC(ret) ? tmp_ret : ret);
       has_failed_io = true;
       LOG_WARN("failed to do wait write_handle", KR(tmp_ret), KR(ret), K(i));
-    } else if (OB_TMP_FAIL(try_modify_macro_cache_type_for_macro_hot(write_handles_[i].get_macro_id()))) {
-      LOG_WARN("fail to try modify macro cache type", KR(tmp_ret), K(i),
-               "macro_id", write_handles_[i].get_macro_id());
     }
   }
   try_adjust_parallelism(has_failed_io, MIN_PARALLELISM, MAX_PARALLELISM, parallelism_);
   return ret;
 }
 
-int ObSSTableMacroPrewarmer::try_modify_macro_cache_type_for_macro_hot(const MacroBlockId &macro_id)
-{
-  int ret = OB_SUCCESS;
-  PolicyStatus policy_status = PolicyStatus::MAX_STATUS;
-  ObSSMacroCacheMgr *macro_cache_mgr = nullptr;
-  if (OB_UNLIKELY(!macro_id.is_valid())) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid macro id", KR(ret), K(macro_id));
-  } else if (OB_ISNULL(macro_cache_mgr = MTL(ObSSMacroCacheMgr *))) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("ObSSMacroCacheMgr is NULL", KR(ret));
-  } else if (OB_FAIL(macro_policy_status_map_.get_refactored(macro_id, policy_status))) {
-    // Only hot macro blocks of MACRO_HOT tablet stored in macro policy status map
-    if (OB_HASH_NOT_EXIST == ret) {
-      ret = OB_SUCCESS; // not in map, no need to modify
-    } else {
-      LOG_WARN("fail to get macro policy status", KR(ret), K(macro_id));
-    }
-  } else if (PolicyStatus::HOT == policy_status) {
-    // If the macro is hot, modify the macro cache type to HOT_TABLET_MACRO_BLOCK
-    if (OB_FAIL(macro_cache_mgr->modify_macro_cache_type(
-        macro_id, ObSSMacroCacheType::MACRO_BLOCK, ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK))) {
-      LOG_WARN("fail to modify macro cache type to HOT_TABLET_MACRO_BLOCK", KR(ret), K(macro_id));
-    } else {
-      LOG_TRACE("[SCP] update macro cache status to HOT_TABLET_MACRO_BLOCK", KR(ret), K(macro_id));
-    }
-  } else if (PolicyStatus::AUTO == policy_status || PolicyStatus::COLD == policy_status) {
-    if (OB_FAIL(macro_cache_mgr->modify_macro_cache_type(
-        macro_id, ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK, ObSSMacroCacheType::MACRO_BLOCK))) {
-      LOG_WARN("fail to modify macro cache type to MACRO_BLOCK", KR(ret), K(macro_id));
-    } else {
-      LOG_TRACE("[SCP] update macro cache status to MACRO_BLOCK", KR(ret), K(macro_id));
-    }
-  } else {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected macro policy status", KR(ret), K(macro_id), K(policy_status));
-  }
-  return ret;
-}
 
 int ObSSTableMacroPrewarmer::single_write_to_local_cache(const int64_t cur_read_idx, ObSSTableMacroPrewarmInfo &prewarm_info)
 {
@@ -708,19 +529,16 @@ int ObSSTableMacroPrewarmer::single_write_to_local_cache(const int64_t cur_read_
   } else if (read_handles_[cur_read_idx].is_empty()) {
       // do nothing
   } else {
-    const bool is_hot_block = is_hot_block_(read_handles_[cur_read_idx].get_macro_id());
+    const bool is_hot_block = is_hot_tablet_;
     check_prewarm_cache_type(read_handles_[cur_read_idx].get_macro_id(), read_handles_[cur_read_idx].get_buffer(),
         read_handles_[cur_read_idx].get_data_size(), is_hot_block, ss_prewarm_local_cache_type);
     if (ObSSPrewarmLocalCacheType::is_skipped(ss_prewarm_local_cache_type)) {
       prewarm_info.skipped_macro_cnt_++;
     } else if (ObSSPrewarmLocalCacheType::is_macro_cache(ss_prewarm_local_cache_type)) { // prewarm into macro cache
-      const MacroBlockId &macro_id = read_handles_[cur_read_idx].get_macro_id();
       if (OB_FAIL(single_write_to_macro_cache(cur_read_idx, prewarm_info))) {
         LOG_WARN("failed to do single write to local cache", KR(ret), K(cur_read_idx));
       } else if (OB_FAIL(single_wait_write_handle(write_handle_idx_, prewarm_info))) {
         LOG_WARN("failed to do wait write_handle", KR(ret), K(write_handle_idx_));
-      } else if (OB_FAIL(try_modify_macro_cache_type_for_macro_hot(macro_id))) {
-        LOG_WARN("fail to try modify macro cache type", KR(ret), K(macro_id));
       }
     } else {
       ret = OB_ERR_UNEXPECTED;
@@ -813,7 +631,6 @@ void ObSSTableMacroPrewarmer::reset_io_resources()
   read_handle_idx_ = -1;
   MEMSET(write_sizes_, 0 , sizeof(write_sizes_));
   buf_allocator_.clear();
-  macro_policy_status_map_.clear();
 }
 
 int ObSSTableMacroPrewarmer::alloc_file_size_for_write(
@@ -840,24 +657,6 @@ int ObSSTableMacroPrewarmer::alloc_file_size_for_write(
              K_(effective_tablet_id), K(file_size), K(macro_id));
   }
   return ret;
-}
-
-// Returns whether the specified macro block should be treated as hot.
-// - AUTO tablet: always returns false.
-// - HOT / MACRO_HOT tablet: defaults to true.
-// - If a per-macro policy entry exists for the block, the result is overridden
-//   by that entry, and only PolicyStatus::HOT is treated as hot.
-bool ObSSTableMacroPrewarmer::is_hot_block_(const MacroBlockId &macro_id) const
-{
-  bool is_hot = is_hot_or_macro_hot_tablet_;
-  if (is_hot) {
-    PolicyStatus macro_status = PolicyStatus::MAX_STATUS;
-    int ret = macro_policy_status_map_.get_refactored(macro_id, macro_status);
-    if (OB_SUCC(ret)) {
-      is_hot = (PolicyStatus::HOT == macro_status);
-    }
-  }
-  return is_hot;
 }
 
 int ObSSTableMacroPrewarmer::check_if_prewarm_data_macro(

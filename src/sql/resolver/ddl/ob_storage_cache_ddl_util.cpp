@@ -266,16 +266,8 @@ int ObDDLResolver::resolve_storage_cache_time_attribute(const ParseNode *node, O
           ret = OB_NOT_SUPPORTED;
           LOG_USER_ERROR(OB_NOT_SUPPORTED, "This granularity is");
           LOG_WARN("failed. granularity type is not supported", K(ret), K(string_v));
-        } else {
-          if (ObStorageCacheGranularity::BLOCK == granularity) {
-            ret = OB_NOT_SUPPORTED;
-            LOG_WARN("block granularity storage cache policy is disabled", K(ret), K(string_v));
-            LOG_USER_ERROR(OB_NOT_SUPPORTED, "Block granularity storage cache policy is");
-          }
-          if (OB_FAIL(ret)) {
-          } else if (OB_FAIL(cache_policy.set_granularity(granularity))) {
-            LOG_WARN("failed to set granularity", K(ret), K(granularity));
-          }
+        } else if (OB_FAIL(cache_policy.set_granularity(granularity))) {
+          LOG_WARN("fail to set granularity", KR(ret), K(granularity));
         }
         break;
       }
@@ -411,11 +403,6 @@ int ObDDLResolver::check_create_stmt_storage_cache_policy(const ObString &storag
         ObStorageCachePolicy storage_cache_policy;
         if (OB_FAIL(storage_cache_policy.load_from_string(storage_cache_policy_str))) {
           LOG_WARN("failed to load storage cache policy", K(ret));
-        } else if (stmt::T_CREATE_INDEX == stmt_->get_stmt_type()
-            && OB_FAIL(ObStorageCacheUtil::check_column_store_index_storage_cache_policy(
-                storage_cache_policy,
-                static_cast<ObCreateIndexStmt *>(stmt_)->get_create_index_arg()))) {
-          LOG_WARN("failed to check column store index storage cache policy", KR(ret), K(storage_cache_policy));
         } else if (OB_FAIL(check_storage_cache_policy(storage_cache_policy, table_schema))) {
           LOG_WARN("failed to check storage cache policy", K(ret));
         }
@@ -426,74 +413,6 @@ int ObDDLResolver::check_create_stmt_storage_cache_policy(const ObString &storag
     LOG_WARN("invalid stmt type for check storage cache policy", K(ret), K(storage_cache_policy_str), K(stmt_->get_stmt_type()), K(table_schema->get_table_id()));
   }
 
-  if (OB_SUCC(ret) && stmt::T_CREATE_TABLE == stmt_->get_stmt_type()) {
-    ObCreateTableStmt *create_table_stmt = static_cast<ObCreateTableStmt*>(stmt_);
-    const ObSArray<obrpc::ObCreateIndexArg> &index_arg_list = create_table_stmt->get_index_arg_list();
-    for (int64_t i = 0; OB_SUCC(ret) && i < index_arg_list.count(); ++i) {
-      const ObCreateIndexArg &create_index_arg = index_arg_list.at(i);
-      ObStorageCachePolicy index_storage_cache_policy;
-      if (OB_ISNULL(create_index_arg.index_option_.storage_cache_policy_) ||
-          create_index_arg.index_option_.storage_cache_policy_.empty()) {
-        // do nothing
-      } else if (OB_FAIL(index_storage_cache_policy.load_from_string(
-          create_index_arg.index_option_.storage_cache_policy_))) {
-        LOG_WARN("failed to load index storage cache policy", KR(ret), K(i), K(create_index_arg));
-      } else if (OB_FAIL(ObStorageCacheUtil::check_column_store_index_storage_cache_policy(
-          index_storage_cache_policy, create_index_arg))) {
-        LOG_WARN("failed to check column store index storage cache policy",
-            KR(ret), K(i), K(index_storage_cache_policy), K(create_index_arg));
-      }
-    }
-  }
-  return ret;
-}
-
-int ObStorageCacheUtil::check_column_store_index_storage_cache_policy(
-    const ObStorageCachePolicy &storage_cache_policy,
-    const ObCreateIndexArg &create_index_arg)
-{
-  int ret = OB_SUCCESS;
-  if (storage_cache_policy.is_block_time_policy()
-      && (create_index_arg.index_cgs_.count() > 0 || create_index_arg.exist_all_column_group_)) {
-    ret = OB_NOT_SUPPORTED;
-    LOG_USER_ERROR(OB_NOT_SUPPORTED, "Block granularity storage cache policy on column store index is");
-    LOG_WARN("block granularity storage cache policy is not supported on column store index",
-        KR(ret), K(storage_cache_policy), K(create_index_arg));
-  }
-  return ret;
-}
-
-int ObStorageCacheUtil::check_column_store_storage_cache_policy(
-    const ObStorageCachePolicy &storage_cache_policy,
-    const ObTableSchema &table_schema)
-{
-  int ret = OB_SUCCESS;
-  bool has_column_group = false;
-  if (!storage_cache_policy.is_block_time_policy()) {
-    // do nothing
-  } else {
-    ObTableSchema::const_column_group_iterator iter = table_schema.column_group_begin();
-    ObTableSchema::const_column_group_iterator end = table_schema.column_group_end();
-    for (; OB_SUCC(ret) && iter != end && !has_column_group; ++iter) {
-      const ObColumnGroupSchema *column_group = *iter;
-      if (OB_ISNULL(column_group)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("column group schema is null", KR(ret), K(table_schema));
-      } else if (ObColumnGroupType::ALL_COLUMN_GROUP == column_group->get_column_group_type()
-          || ObColumnGroupType::SINGLE_COLUMN_GROUP == column_group->get_column_group_type()
-          || ObColumnGroupType::NORMAL_COLUMN_GROUP == column_group->get_column_group_type()) {
-        has_column_group = true;
-      }
-    }
-
-    if (OB_FAIL(ret)) {
-    } else if (has_column_group) {
-      ret = OB_NOT_SUPPORTED;
-      LOG_USER_ERROR(OB_NOT_SUPPORTED, "Block granularity storage cache policy on column store table is");
-      LOG_WARN("block granularity storage cache policy is not supported on column store table",
-          KR(ret), K(storage_cache_policy), K(table_schema));
-    }
-  }
   return ret;
 }
 
@@ -534,10 +453,6 @@ int ObDDLResolver::check_alter_stmt_storage_cache_policy(const ObTableSchema *or
               ObStorageCachePolicy add_index_storage_cache_policy;
               if (OB_FAIL(add_index_storage_cache_policy.load_from_string(add_index_arg->index_option_.storage_cache_policy_))) {
                 LOG_WARN("failed to load storage cache policy", K(ret));
-              } else if (OB_FAIL(ObStorageCacheUtil::check_column_store_index_storage_cache_policy(
-                  add_index_storage_cache_policy, *add_index_arg))) {
-                LOG_WARN("failed to check column store index storage cache policy",
-                    KR(ret), K(add_index_storage_cache_policy), KPC(add_index_arg));
               } else if (OB_FAIL(check_storage_cache_policy(add_index_storage_cache_policy, add_index_schema))) {
                 LOG_WARN("failed to check storage cache policy", K(ret));
               }
@@ -596,13 +511,6 @@ int ObDDLResolver::check_alter_stmt_storage_cache_policy(const ObTableSchema *or
         } else {
           if (OB_FAIL(storage_cache_policy.load_from_string(alter_table_schema.get_storage_cache_policy()))) {
             LOG_WARN("failed to load storage cache policy", K(ret));
-          } else if (storage_cache_policy.is_block_time_policy()
-              && OB_DDL_ADD_COLUMN_GROUP == alter_table_schema.alter_type_) {
-            if (OB_FAIL(ObStorageCacheUtil::check_column_store_storage_cache_policy(
-                storage_cache_policy, alter_table_schema))) {
-              LOG_WARN("failed to check column store storage cache policy",
-                  KR(ret), K(storage_cache_policy), K(alter_table_schema));
-            }
           }
 
           if (FAILEDx(check_storage_cache_policy(storage_cache_policy, ori_table_schema))) {
@@ -631,12 +539,6 @@ int ObDDLResolver::check_storage_cache_policy(ObStorageCachePolicy &storage_cach
     ret = OB_NOT_SUPPORTED;
     SQL_RESV_LOG(WARN, "only allow to set storage cache policy for user table", K(ret));
   } else if (FALSE_IT(is_create_stmt = (stmt::T_CREATE_TABLE == stmt_->get_stmt_type() || stmt::T_CREATE_INDEX == stmt_->get_stmt_type()))) {
-  } else if (storage_cache_policy.is_block_time_policy()) {
-    if (OB_FAIL(ObStorageCacheUtil::check_column_store_storage_cache_policy(
-        storage_cache_policy, *tbl_schema))) {
-      LOG_WARN("failed to check column store storage cache policy",
-          KR(ret), K(storage_cache_policy), KPC(tbl_schema));
-    }
   } else if (storage_cache_policy.is_partition_time_policy()) {
     if (!tbl_schema->is_partitioned_table()) {
       ret = OB_NOT_SUPPORTED;
@@ -662,19 +564,10 @@ int ObDDLResolver::check_storage_cache_policy(ObStorageCachePolicy &storage_cach
     // Check if the column is time type
     ObString column_name(storage_cache_policy.get_column_name());
     if (OB_ISNULL(column_schema = const_cast<share::schema::ObColumnSchemaV2*>(tbl_schema->get_column_schema(column_name)))) {
-      if (storage_cache_policy.is_block_time_policy()) { // block granularity time policy
-        if (storage_cache_policy.is_default_block_time_policy()) { // block time policy with default boundary column
-          // do nothing
-        } else { // block time policy with custom boundary column
-          ret = OB_INVALID_ARGUMENT;
-          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "boudary column of storage cache policy, the column does not exist");
-          LOG_WARN("storage cache policy column is not exists", K(ret), K(column_name));
-        }
-      } else { // partition or row granularity time policy
-        ret = OB_INVALID_ARGUMENT;
-        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "boudary column of storage cache policy, the column does not exist");
-        LOG_WARN("storage cache policy column is not exists", K(ret), K(column_name));
-      }
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+          "boudary column of storage cache policy, the column does not exist");
+      LOG_WARN("storage cache policy column does not exist", KR(ret), K(column_name));
     } else if (!column_schema->is_part_key_column() && !column_schema->is_subpart_key_column()) {
       /* not part key, skip*/
     } else {
@@ -694,23 +587,6 @@ int ObDDLResolver::check_storage_cache_policy(ObStorageCachePolicy &storage_cach
       }
     }
 
-    if (OB_FAIL(ret)) {
-    } else if (storage_cache_policy.is_custom_block_time_policy()) {
-      if (OB_ISNULL(column_schema)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("column schema is null", KR(ret), K(column_name), K(storage_cache_policy));
-      } else {
-        share::schema::ObSkipIndexColumnAttr skip_index_attr = column_schema->get_skip_index_attr();
-        if (skip_index_attr.has_min_max()) {
-          // do nothing
-        } else {
-          // create a new skip index attribute with min/max for block time policy
-          skip_index_attr.set_min_max();
-          column_schema->set_skip_index_attr(skip_index_attr.get_packed_value());
-        }
-      }
-    }
-    
     if (OB_FAIL(ret)) {
     } else if (OB_NOT_NULL(column_schema)) {
       switch(ob_obj_type_class(column_schema->get_data_type())) {
@@ -1170,15 +1046,6 @@ int ObStorageCacheUtil::print_table_storage_cache_policy(const ObTableSchema &ta
       if (OB_FAIL(ret)) {
       } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, "storage_cache_policy ("))) {
         LOG_WARN("failed to print storage cache policy element", KR(ret), K(storage_cache_policy), K(pos));
-      } else if (storage_cache_policy.is_block_time_policy()) {
-        if (storage_cache_policy.is_default_block_time_policy()) {
-          // do nothing if the column is default value for block
-        } else { // print the real boundary_column
-          if (OB_FAIL(databuff_printf(buf, buf_len, pos, "boundary_column = %.*s, ",
-                                                          column_name.length(), column_name.ptr()))) {
-            LOG_WARN("failed to print boudary column", K(ret), K(storage_cache_policy), K(pos));
-          }
-        }
       } else if (storage_cache_policy.is_partition_time_policy()) {
         if (OB_FAIL(databuff_printf(buf, buf_len, pos, "boundary_column = %.*s, ",
                                                         column_name.length(), column_name.ptr()))) {
@@ -1404,10 +1271,6 @@ int ObStorageCacheUtil::get_range_part_level(const share::schema::ObTableSchema 
   if (storage_cache_policy.is_time_policy() && !tbl_schema.is_partitioned_table()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", KR(ret), K(tbl_schema));
-  } else if (storage_cache_policy.is_block_time_policy()) {
-    // 块级时间策略不依赖分区边界列。默认块级策略甚至没有边界列,
-    // 若在此查列会误报 boundary column not exist,故直接沿用表自身的分区层级
-    part_level = tbl_schema.get_part_level();
   } else if (storage_cache_policy.is_partition_time_policy()) {
     const share::schema::ObColumnSchemaV2 *column_schema = nullptr;
     ObString column_name(storage_cache_policy.get_column_name());

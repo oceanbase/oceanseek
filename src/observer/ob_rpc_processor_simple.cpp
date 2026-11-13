@@ -4881,7 +4881,6 @@ int ObTriggerStorageCacheP::process()
           policy_status = PolicyStatus::COLD;
         }
         PolicyStatus ori_policy_status = PolicyStatus::MAX_STATUS;
-        ObStorageCachePolicy table_policy;
         LOG_INFO("[SCP]rpc_processor: calling update status and handle tablet",
             K(tenant_id), K(tablet_id), K(policy_status_val), K(policy_status));
         if (OB_FAIL(storage_cache_service->get_tablet_policy_status(tablet_id, ori_policy_status))) {
@@ -4893,10 +4892,10 @@ int ObTriggerStorageCacheP::process()
           }
         }
         if (OB_FAIL(ret)) {
-        } else if (OB_FAIL(storage_cache_service->update_tablet_status(tablet_id, policy_status, OB_INVALID_ID))) {
+        } else if (OB_FAIL(storage_cache_service->update_tablet_status(tablet_id, policy_status))) {
           LOG_WARN("[SCP]rpc_processor: fail to update tablet status", KR(ret), K(tablet_id), K(policy_status));
         } else if (OB_FAIL(storage_cache_service->handle_tablet_if_status_changed(
-            tenant_id, tablet_id, policy_status, table_policy, ori_policy_status))) {
+            tenant_id, tablet_id, policy_status, ori_policy_status))) {
           LOG_WARN("[SCP]rpc_processor: fail to handle tablet if status changed",
               KR(ret), K(tenant_id), K(tablet_id), K(policy_status));
         } else {

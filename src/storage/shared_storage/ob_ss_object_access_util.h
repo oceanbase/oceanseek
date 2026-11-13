@@ -40,7 +40,6 @@ public:
                               blocksstable::ObStorageObjectHandle &object_handle);
   static int check_if_hot_tablet(const uint64_t tablet_id, bool &is_hot);
   static int check_if_cold_tablet(const uint64_t tablet_id, bool &is_cold);
-  static int check_if_hot_or_macro_hot_tablet(const uint64_t tablet_id, bool &is_hot_or_macro_hot);
   static int get_tablet_policy_status(const uint64_t tablet_id, PolicyStatus &policy_status);
   // hot_tablet_alloc_timeout_us == 0 means try once without retry when allocating hot tablet macro cache space.
   static int async_write_file_to_macro_cache(

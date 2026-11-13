@@ -30,8 +30,7 @@ int get_tablet_ls_id(const int64_t tenant_id, const uint64_t tablet_id, int64_t 
 enum ObStorageCacheTaskType : uint8_t
 { 
   OB_STORAGE_CACHE_PARTITION_TASK = 0,
-  OB_STORAGE_CACHE_BLOCK_TASK = 1,
-  OB_STORAGE_CACHE_TASK_TYPE_MAX
+  OB_STORAGE_CACHE_TASK_TYPE_MAX = 2
 };
 
 class ObStorageCacheTabletScheduler : public lib::TGTaskHandler
@@ -48,16 +47,14 @@ public:
   void wait(); 
   void destroy();
   int check_is_active_tablet(const int64_t tablet_id, bool &is_active) const;
-  int generate_block_task(const uint64_t tenant_id, const int64_t tablet_id, const ObStorageCachePolicy &block_storage_cache_policy);
   int generate_partition_task(const uint64_t tenant_id, const int64_t tablet_id, const PolicyStatus &policy_status);
   int push_task(ObStorageCacheTabletTaskHandle &task_handle);
   int cancel_task(ObStorageCacheTabletTaskHandle &task_handle);
-  int cancel_task_by_tablet_id(const int64_t tablet_id);
   // schema 不可服务时强制取消任意状态任务，阻止 resume/skipped 路径重新生成。
   int invalidate_task_by_tablet_id(const int64_t tablet_id);
   virtual void handle(void *task_handle) override;
   virtual void handle_drop(void *task_handle) override;
-  int convert_hot_to_auto(const int64_t tablet_id); // Provided for auto task
+  int convert_hot_to_auto(const int64_t tablet_id);
   int convert_macro_blks_to_auto(const ObIArray<MacroBlockId> &block_ids);
 
   int get_skipped_macro_cache_tasks(ObIArray<uint64_t> &unfinished_tablet_ids);
@@ -70,7 +67,6 @@ public:
   bool get_exist_skipped_tablet() const { return exist_skipped_tablet_; }
   void set_exist_skipped_tablet(const bool exist_skipped_tablet) { exist_skipped_tablet_ = exist_skipped_tablet; }
   bool has_retry_waiting_task() const { return ATOMIC_LOAD(&has_retry_waiting_task_); }
-  int evict_local_cache(const int64_t tablet_id, int64_t &macro_write_cache_cnt);
   TO_STRING_KV(K_(tenant_id), K_(is_inited), K_(tg_id),
       "has_retry_waiting_task", has_retry_waiting_task());
 public:
@@ -101,7 +97,6 @@ struct ObStorageCacheTaskStatus
     OB_STORAGE_CACHE_TASK_STATUS_MAX
   };
   static const char *get_str(const TaskStatus &type);
-  static TaskStatus get_type(const char *type_str);
   static OB_INLINE bool is_valid(const TaskStatus &type)
   {
     return type >= 0 && type < TaskStatus::OB_STORAGE_CACHE_TASK_STATUS_MAX;
@@ -131,7 +126,6 @@ public:
     destroy();
   };
   int init_partition_task(const uint64_t tenant_id, const int64_t tablet_id, const PolicyStatus &policy_status);
-  int init_block_task(const uint64_t tenant_id, const int64_t tablet_id, const ObStorageCachePolicy &block_storage_cache_policy);
   void destroy();
   void inc_ref_count();
   void dec_ref_count();
@@ -140,7 +134,6 @@ public:
   PolicyStatus get_policy_status() const;
   bool is_hot() const;
   bool is_auto() const;
-  bool is_macro_hot() const;
   bool is_cold() const;
   bool is_canceled() const;
   bool is_completed() const;
@@ -153,7 +146,6 @@ public:
   bool need_retry_skipped_task() const;
   bool need_retry_push_task() const;
   bool is_partition_task() const { return task_type_ == ObStorageCacheTaskType::OB_STORAGE_CACHE_PARTITION_TASK; }
-  bool is_block_task() const { return task_type_ == ObStorageCacheTaskType::OB_STORAGE_CACHE_BLOCK_TASK; }
   
   int64_t get_tablet_id() const;
   int64_t get_ls_id() const;
@@ -165,7 +157,6 @@ public:
   int64_t get_end_time() const;
   int get_result() const;
   int get_comment(common::ObIAllocator &allocator, ObString &comment) const;
-  ObStorageCachePolicy get_block_storage_cache_policy() const;
   ObStorageCacheTaskType get_task_type() const;
 
   // 将任意有效状态强制置为 CANCELED，阻止 resume/skipped 路径重新生成任务。
@@ -197,7 +188,6 @@ public:
   void set_ls_id(const int64_t ls_id);
   void set_tenant_id(const uint64_t tenant_id);
   void set_prewarm_stat(const ObSSPrewarmStat &stat);
-  void set_block_storage_cache_policy(const ObStorageCachePolicy &block_storage_cache_policy);
   void set_policy_status(const PolicyStatus &policy_status);
   void set_task_type(const ObStorageCacheTaskType task_type);
 
@@ -225,7 +215,6 @@ private:
   int64_t ls_id_;
   int64_t tablet_id_;
   int64_t ref_count_;
-  ObStorageCachePolicy block_storage_cache_policy_;
   ObStorageCacheTaskType task_type_;
   common::SpinRWLock task_lock_;
   ObStorageCacheTaskStatusType status_;

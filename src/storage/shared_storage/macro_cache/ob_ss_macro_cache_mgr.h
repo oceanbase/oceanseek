@@ -398,7 +398,6 @@ public:
   int clear_is_marked();
   int batch_modify_cache_type(const common::hash::ObHashSet<blocksstable::MacroBlockId> &macro_block_ids, 
       const ObSSMacroCacheType ori_cache_type, const ObSSMacroCacheType new_cache_type);
-  int eliminate_macro_scp_blocks(const common::hash::ObHashSet<blocksstable::MacroBlockId> &macro_block_ids, const common::hash::ObHashSet<int64_t> &tablet_ids, const int64_t elmination_time_us);
   int erase_unmarked_macro_cache_meta(const int64_t start_calc_size_time_us);
   int get_macro_cache_meta(const blocksstable::MacroBlockId &macro_id,
                            bool &is_exist,
@@ -506,11 +505,7 @@ public:
   int force_evict_by_macro_id(const blocksstable::MacroBlockId &macro_id);
   // evict_by_macro_id: Do not wait for write cache to become read cache
   int evict_by_macro_id(const blocksstable::MacroBlockId &macro_id, bool &is_write_cache);
-  int batch_evict_by_macro_ids(const common::hash::ObHashSet<blocksstable::MacroBlockId> &cold_macro_ids,
-                               common::hash::ObHashSet<blocksstable::MacroBlockId> &evicted_macro_ids);
   int evict_by_tablet_id(const ObTabletID &tablet_id, int64_t &macro_read_cache_cnt, int64_t &macro_write_cache_cnt);
-  int batch_evict_by_tablet_ids(const common::hash::ObHashSet<uint64_t> &cold_tablet_ids, 
-                                common::hash::ObHashSet<uint64_t> &evicted_tablet_ids);
   // interface for prewarm
   int divide_bucket_range(const int64_t split_count,
                           common::ObIArray<ObSSMacroCacheBucketIdxRange> &bucket_ranges);
@@ -614,12 +609,6 @@ private:
                                 common::hash::ObHashSet<uint64_t> *evicted_tablet_ids,
                                 ObIArray<blocksstable::MacroBlockId> &read_cache_macro_ids,
                                 ObIArray<blocksstable::MacroBlockId> &write_cache_macro_ids);
-  int handle_eliminate_macro_scp_node_(const blocksstable::MacroBlockId &macro_id,
-                                       const ObSSMacroCacheMetaHandle &meta_handle,
-                                       const common::hash::ObHashSet<blocksstable::MacroBlockId> &macro_block_ids,
-                                       const common::hash::ObHashSet<int64_t> &tablet_ids,
-                                       const int64_t elmination_time_us,
-                                       common::hash::ObHashSet<blocksstable::MacroBlockId> &eliminated_macro_ids);
   int handle_evict_bucket_batch_(const int64_t bucket_batch_cnt,
                                  int64_t &bucket_cnt,
                                  ObIArray<blocksstable::MacroBlockId> &read_cache_macro_ids,

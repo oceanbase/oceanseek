@@ -25,10 +25,6 @@ using namespace oceanbase::common::hash;
 using namespace oceanbase::share;
 using namespace oceanbase::share::schema;
 
-// 定义在下方,follow 链逐层降级需在此提前声明
-static void convert_follow_macro_hot_status(
-    const ObSimpleTableSchemaV2 *follow_table_schema, PolicyStatus &policy_status);
-
 /*-----------------------------------------ObTablePolicyInfo-----------------------------------------*/
 int ObTablePolicyInfo::init(const int64_t table_id, const ObStorageCachePolicy &table_policy, const int64_t table_schema_version)
 {
@@ -166,16 +162,10 @@ int ObStorageCachePolicyService::init(const uint64_t tenant_id)
     LOG_WARN("fail to create tablet policy map", KR(ret));
   } else if (OB_FAIL(tablet_status_map_.create(DEFAULT_TABLET_STATUS_MAP_SIZE, ObMemAttr(MTL_ID(),"TabletStatusMap")))) {
     LOG_WARN("fail to create tablet status map", KR(ret));
-  } else if (OB_FAIL(macro_scp_tablet_table_map_.create(DEFAULT_MACRO_SCP_TABLET_TABLE_MAP_SIZE, ObMemAttr(MTL_ID(),"TabletTableMap")))) {
-    LOG_WARN("fail to create macro scp tablet table map", KR(ret));
   } else if (OB_FAIL(refresh_policy_scheduler_.init(tenant_id))) {
     LOG_WARN("fail to init refresh scheduler", KR(ret), K(tenant_id));
   } else if (OB_FAIL(tablet_scheduler_.init(tenant_id))) {
     LOG_WARN("fail to init tablet scheduler", KR(ret), K(tenant_id));
-  } else if (OB_FAIL(cold_tablet_ids_.create(DEFAULT_TABLET_STATUS_MAP_SIZE, ObMemAttr(MTL_ID(),"ColdTabletIds")))) {
-    LOG_WARN("fail to create need evict cold tablet ids map", KR(ret));
-  } else if (OB_FAIL(cold_macro_block_ids_.create(100000, ObMemAttr(MTL_ID(),"ColdMacroIds")))) {
-    LOG_WARN("fail to create need evict cold macro block ids map", KR(ret));
   } else {
     first_loop_run_competed_ = false;
     last_restart_retry_time_s_ = 0;
@@ -261,11 +251,8 @@ void ObStorageCachePolicyService::destroy()
       first_loop_run_competed_ = false;
       last_restart_retry_time_s_ = 0;
       last_restart_retry_timeout_report_time_s_ = 0;
-      cold_macro_block_ids_.destroy();
-      cold_tablet_ids_.destroy();
       tablet_scheduler_.destroy();
       refresh_policy_scheduler_.destroy();
-      macro_scp_tablet_table_map_.destroy();
       tablet_status_map_.destroy();
       part_policy_map_.destroy();
       table_policy_map_.destroy();
@@ -881,11 +868,6 @@ int ObStorageCachePolicyService::cal_effective_table_policy_status(
             data_table_schema, schema_guard, table_policy_status, depth + 1))) {
           LOG_WARN("fail to cal effective table policy status",
               KR(ret), K(depth), KPC(simple_table_schema), KPC(data_table_schema));
-        } else {
-          // 每跳 follow 都按当前 follow 表类型对 MACRO_HOT 逐层降级,保证与分区路径(逐层入 map 时已转换)
-          // 语义一致:如 main(MACRO_HOT)→domain(vec→AUTO)→snapshot(AUTO)→meta(AUTO),
-          // 避免根表 MACRO_HOT 透传到叶子后只按叶子类型转换、与分区路径产生分歧
-          convert_follow_macro_hot_status(simple_table_schema, table_policy_status);
         }
       }
     }
@@ -931,21 +913,6 @@ int ObStorageCachePolicyService::get_table_policy_for_global_index(const ObSimpl
     }
   }
   return ret;
-}
-
-// follow 表继承到上游的块级 MACRO_HOT 时,自身可能不含时间列、无法做块级宏块过滤,故降级为整表状态:
-// 向量索引 / LOB piece表体积大 → AUTO(避免 HOT 挤占本地缓存);LOB meta + 其余索引 → HOT。
-// 非 MACRO_HOT 状态原样透传。
-static void convert_follow_macro_hot_status(
-    const ObSimpleTableSchemaV2 *follow_table_schema, PolicyStatus &policy_status)
-{
-  if (OB_NOT_NULL(follow_table_schema) && PolicyStatus::MACRO_HOT == policy_status) {
-    if (follow_table_schema->is_vec_index() || follow_table_schema->is_aux_lob_piece_table()) {
-      policy_status = PolicyStatus::AUTO;
-    } else {
-      policy_status = PolicyStatus::HOT;
-    }
-  }
 }
 
 int ObStorageCachePolicyService::cal_follow_table_partition_policy_status(const ObBasePartition *partition, 
@@ -1046,9 +1013,6 @@ int ObStorageCachePolicyService::cal_follow_table_partition_policy_status(const 
       }
     }
   }
-  if (OB_SUCC(ret)) {
-    convert_follow_macro_hot_status(follow_table_schema, index_partition_policy_status);
-  }
   return ret;
 }
 
@@ -1077,9 +1041,7 @@ int ObStorageCachePolicyService::cal_partition_policy_status_from_table(const Ob
       LOG_WARN("invalid argument", KR(ret), K(table_policy.get_global_policy()));
     }
   } else if (table_policy.is_time_policy()) {
-    if (table_policy.is_block_time_policy()) {
-      partition_policy_status = PolicyStatus::MACRO_HOT;
-    } else if (table_policy.is_partition_time_policy()) {
+    if (table_policy.is_partition_time_policy()) {
       // If the boundary column is a partition column of the first-level partition, then part_level is the first-level partition. 
       // The same is true for second-level partitions.
       if (share::schema::PARTITION_LEVEL_ONE == table_policy.get_part_level()) {
@@ -1184,10 +1146,6 @@ int ObStorageCachePolicyService::cal_sub_partition_policy_status(const ObSubPart
                     LOG_WARN("fail to cal part policy status", KR(ret), K(obj), K(table_policy));
                   }
                 }
-                break;
-              }
-              case PolicyStatus::MACRO_HOT: {
-                sub_part_policy_status = PolicyStatus::MACRO_HOT;
                 break;
               }
               default: {
@@ -1393,8 +1351,6 @@ int ObStorageCachePolicyService::cal_index_table_policy_status(const ObSimpleTab
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("table policy status can not be max or none status", KR(ret), K(data_table_status), KPC(simple_table_schema));
       } else {
-        // 若上游有效策略是块级 MACRO_HOT,follow 表降级为整表状态(向量/LOB→AUTO,其余索引→HOT)
-        convert_follow_macro_hot_status(simple_table_schema, data_table_status);
         index_table_policy_status = data_table_status;
       }
     }
@@ -1442,9 +1398,7 @@ int ObStorageCachePolicyService::cal_table_policy_status(const ObStorageCachePol
         }
       }
     } else if (table_policy.is_time_policy()) {
-      if (table_policy.is_block_time_policy()) {
-        table_policy_status = PolicyStatus::MACRO_HOT;
-      } else if (table_policy.is_partition_time_policy()) {
+      if (table_policy.is_partition_time_policy()) {
         table_policy_status = PolicyStatus::NONE;
       } else {
         ret = OB_INVALID_ARGUMENT;
@@ -1559,10 +1513,6 @@ int ObStorageCachePolicyService::retrive_table_policy(const ObSimpleTableSchemaV
         LOG_WARN("table schema is null", KR(ret), K(table_id));
       } else if (OB_FAIL(table_policy.load_from_string(full_table_schema->get_storage_cache_policy()))) {
         LOG_WARN("fail to load table policy from string", KR(ret), K(table_id), K(full_table_schema->get_storage_cache_policy()));
-      } else if (table_policy.is_block_time_policy()) {
-        ret = OB_NOT_SUPPORTED;
-        LOG_ERROR("block granularity storage cache policy is disabled",
-            KR(ret), K(table_id), K(full_table_schema->get_storage_cache_policy()));
       } else if (full_table_schema->is_partitioned_table()) {
         if (OB_FAIL(sql::ObStorageCacheUtil::get_range_part_level(*full_table_schema, table_policy, part_level))) {
           LOG_WARN("fail to get range part level", KR(ret), K(table_policy));
@@ -1599,49 +1549,18 @@ int ObStorageCachePolicyService::retrive_table_policy(const ObSimpleTableSchemaV
   return ret;
 }
 
-int ObStorageCachePolicyService::erase_cold_tablet_id(const int64_t tablet_id)
-{
-  int ret = OB_SUCCESS;
-  if (OB_FAIL(cold_tablet_ids_.erase_refactored(tablet_id))) {
-    if (OB_HASH_NOT_EXIST == ret) {
-      ret = OB_SUCCESS;
-    } else {
-      LOG_WARN("fail to erase need evict cold tablet id", KR(ret), K(tablet_id));
-    }
-  }
-  if (OB_FAIL(ret)) {
-  } else {
-    FLOG_INFO("erase need evict cold tablet id success", K(tablet_id));
-  }
-  return ret;
-}
-
-int ObStorageCachePolicyService::insert_cold_macro_block_ids(const ObIArray<blocksstable::MacroBlockId> &macro_ids)
-{
-  int ret = OB_SUCCESS;
-  for (int64_t i = 0; OB_SUCC(ret) && i < macro_ids.count(); ++i) {
-    if (OB_FAIL(cold_macro_block_ids_.set_refactored(macro_ids.at(i), 0/*flag: 0--not cover exists object*/))) {
-      if (OB_HASH_EXIST == ret) {
-        ret = OB_SUCCESS;
-      } else {
-        LOG_WARN("fail to insert cold macro block id", KR(ret), K(i), "block_id", macro_ids.at(i));
-      }
-    }
-  }
-  FLOG_INFO("finish insert cold macro block ids", K(ret),K(macro_ids.count()), K(macro_ids));
-  return ret;
-}
-int ObStorageCachePolicyService::handle_tablet_if_status_changed(const uint64_t tenant_id,
-                                                                 const int64_t tablet_id, 
-                                                                 const PolicyStatus &policy_status,
-                                                                 const ObStorageCachePolicy &table_policy,
-                                                                 const PolicyStatus &ori_policy_status)
+int ObStorageCachePolicyService::handle_tablet_if_status_changed(
+    const uint64_t tenant_id,
+    const int64_t tablet_id,
+    const PolicyStatus &policy_status,
+    const PolicyStatus &ori_policy_status)
 {
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("storage cache service not init", KR(ret));
-  } else if (OB_UNLIKELY(PolicyStatus::MAX_STATUS == policy_status || PolicyStatus::NONE == policy_status)) {
+  } else if (OB_UNLIKELY(!ObStorageCachePolicyStatus::is_valid(policy_status)
+      || PolicyStatus::NONE == policy_status)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid policy status", KR(ret), K(tenant_id), K(tablet_id), K(policy_status));
   } else if (OB_INVALID_TENANT_ID == tenant_id || common::ObTabletID::INVALID_TABLET_ID == tablet_id) {
@@ -1649,49 +1568,17 @@ int ObStorageCachePolicyService::handle_tablet_if_status_changed(const uint64_t 
     LOG_WARN("invalid argument", KR(ret), K(tenant_id), K(tablet_id), K(policy_status), KPC(this));
   } else if (get_need_generate_cache_task()) {
     if (PolicyStatus::HOT == policy_status) {
-      if (PolicyStatus::COLD == ori_policy_status) {
-        if (OB_FAIL(erase_cold_tablet_id(tablet_id))) {
-          LOG_WARN("fail to erase need evict cold tablet id", KR(ret), K(tenant_id), K(tablet_id), K(policy_status), KPC(this));
-        }
+      if (OB_FAIL(tablet_scheduler_.generate_partition_task(tenant_id, tablet_id, policy_status))) {
+        LOG_WARN("fail to push partition task", KR(ret), K(tenant_id), K(tablet_id),
+            K(policy_status));
       }
-      if (OB_SUCC(ret) && OB_FAIL(tablet_scheduler_.generate_partition_task(tenant_id, tablet_id, policy_status))) {
-        LOG_WARN("fail to push partition task", KR(ret), K(tenant_id), K(tablet_id), K(policy_status), KPC(this));
-      }
-    } else if (PolicyStatus::COLD == policy_status) {
-      // 逐 tablet 调用 evict_by_tablet_id 会重复遍历宏缓存 meta_map。统一入队后，批量任务只扫描一次；
-      // non-active tablet 无缓存时直接完成，有残留时一并清理；含写缓存的 tablet 保留至下轮重试。
-      if (OB_FAIL(tablet_scheduler_.cancel_task_by_tablet_id(tablet_id))) {
-        LOG_WARN("fail to cancel cache task by tablet id",
-            KR(ret), K(tenant_id), K(tablet_id), K(policy_status), K(ori_policy_status));
-      } else if (OB_FAIL(cold_tablet_ids_.set_refactored(tablet_id))) {
-        if (OB_HASH_EXIST == ret) {
-          ret = OB_SUCCESS;
-        } else {
-          LOG_WARN("fail to set need evict cold tablet id",
-              KR(ret), K(tenant_id), K(tablet_id), K(policy_status), KPC(this));
-        }
-      }
-      if (OB_SUCC(ret)) {
-        FLOG_INFO("queue cold tablet for batch cache eviction",
-            K(tenant_id), K(tablet_id), K(policy_status), KPC(this));
-      }
-    } else if (PolicyStatus::AUTO == policy_status) {
+    } else if (PolicyStatus::AUTO == policy_status || PolicyStatus::COLD == policy_status) {
+      // AUTO and COLD share the existing HOT-cache demotion path.
       if (PolicyStatus::HOT == ori_policy_status) {
         if (OB_FAIL(tablet_scheduler_.convert_hot_to_auto(tablet_id))) {
-          LOG_WARN("fail to convert hot to auto in local cache", KR(ret), K(tenant_id), K(tablet_id), K(policy_status), KPC(this));
+          LOG_WARN("fail to convert hot to ordinary cache", KR(ret), K(tenant_id),
+              K(tablet_id), K(policy_status));
         }
-      } else if (PolicyStatus::COLD == ori_policy_status) {
-        // COLD -> AUTO 只需撤销异步 cold eviction。
-        if (OB_FAIL(erase_cold_tablet_id(tablet_id))) {
-          LOG_WARN("fail to erase need evict cold tablet id", KR(ret), K(tenant_id), K(tablet_id), K(policy_status), KPC(this));
-        }
-      }
-    } else if (PolicyStatus::MACRO_HOT == policy_status) {
-      if (PolicyStatus::COLD == ori_policy_status && OB_FAIL(erase_cold_tablet_id(tablet_id))) {
-        LOG_WARN("fail to erase need evict cold tablet id", KR(ret),
-            K(tenant_id), K(tablet_id), K(policy_status), KPC(this));
-      } else if (OB_FAIL(tablet_scheduler_.generate_block_task(tenant_id, tablet_id, table_policy))) {
-        LOG_WARN("fail to push block task", KR(ret), K(tenant_id), K(tablet_id), K(policy_status), KPC(this));
       }
     } else {
       ret = OB_INVALID_ARGUMENT;
@@ -2648,10 +2535,11 @@ int ObStorageCachePolicyService::handle_non_partitioned_table(
       LOG_WARN("fail to check tablet status changed", KR(ret),
           K(tablet_id), K(table_policy_status), K_SCP_REFRESH_TYPE(refresh_type));
     } else if (tablet_status_changed
-        && OB_FAIL(handle_tablet_if_status_changed(tenant_id_, tablet_id, table_policy_status, table_policy, ori_tablet_status))) {
+        && OB_FAIL(handle_tablet_if_status_changed(
+            tenant_id_, tablet_id, table_policy_status, ori_tablet_status))) {
       LOG_WARN("fail to push task", KR(ret), K(tablet_id), K_SCP_REFRESH_TYPE(refresh_type), KPC(this));
     } else if (tablet_status_changed
-        && OB_FAIL(update_tablet_status(tablet_id, table_policy_status, table_id))) {
+        && OB_FAIL(update_tablet_status(tablet_id, table_policy_status))) {
       LOG_WARN("fail to update tablet status", KR(ret), K(tablet_id), K(table_policy_status));
     } else if (OB_FAIL(table_policy_map_.set_refactored(
         table_id, table_policy_info, true/*overwrite*/))) {
@@ -2865,16 +2753,16 @@ int ObStorageCachePolicyService::handle_partition(const ObPartition *partition,
       // Only the level one partition need to generate tablet task
       // Update the tablet status map and part policy map after the tablet task is generated
       int64_t tablet_id = partition->get_tablet_id().id();
-      int64_t table_id = partition->get_table_id();
       bool tablet_status_changed = false;
       if (OB_FAIL(check_tablet_status_changed(
           tablet_id, partition_policy_status, refresh_type, tablet_status_changed, ori_partition_policy_status))) {
         LOG_WARN("fail to check tablet status changed", KR(ret),
             K(tablet_id), K(partition_policy_status), K_SCP_REFRESH_TYPE(refresh_type));
       } else if (tablet_status_changed && OB_FAIL(handle_tablet_if_status_changed(
-        tenant_id_, tablet_id, partition_policy_status, table_policy, ori_partition_policy_status))) {
+        tenant_id_, tablet_id, partition_policy_status, ori_partition_policy_status))) {
         LOG_WARN("fail to push task", KR(ret), K(tablet_id), K(partition_policy_status));
-      } else if (tablet_status_changed && OB_FAIL(update_tablet_status(tablet_id, partition_policy_status, table_id))) {
+      } else if (tablet_status_changed
+          && OB_FAIL(update_tablet_status(tablet_id, partition_policy_status))) {
         LOG_WARN("fail to update tablet status", KR(ret), K(tablet_id), K(partition_policy_status));
       }
       LOG_TRACE("[SCP]finish cal partition", KR(ret), K(partition_policy_status), K(tablet_status_changed), K(tablet_policy_info), K(tablet_id));
@@ -2927,7 +2815,6 @@ int ObStorageCachePolicyService::handle_subpartitions(const ObSubPartition *sub_
     PolicyStatus ori_sub_partition_policy_status = PolicyStatus::MAX_STATUS;
     int64_t tablet_id = sub_partition->get_tablet_id().id();
     bool tablet_status_changed = false;
-    int64_t table_id = sub_partition->get_table_id();
     // Apply the same rule to a reused sub_part_id: forced recalculation overwrites the old entry
     // directly, while the no-recalculation path still validates schema-version monotonicity.
     if (!sub_partition_policy_need_calc
@@ -2947,9 +2834,10 @@ int ObStorageCachePolicyService::handle_subpartitions(const ObSubPartition *sub_
         LOG_WARN("fail to check tablet status changed", KR(ret),
             K(tablet_id), K(sub_partition_policy_status), K_SCP_REFRESH_TYPE(refresh_type));
       } else if (tablet_status_changed && OB_FAIL(handle_tablet_if_status_changed(
-        tenant_id_, tablet_id, sub_partition_policy_status, table_policy, ori_sub_partition_policy_status))) {
+        tenant_id_, tablet_id, sub_partition_policy_status, ori_sub_partition_policy_status))) {
         LOG_WARN("fail to push task", KR(ret), K(tablet_id), K(sub_partition_policy_status));
-      } else if (tablet_status_changed && OB_FAIL(update_tablet_status(tablet_id, sub_partition_policy_status, table_id))) {
+      } else if (tablet_status_changed
+          && OB_FAIL(update_tablet_status(tablet_id, sub_partition_policy_status))) {
         LOG_WARN("fail to update tablet status", KR(ret), K(tablet_id), K(sub_partition_policy_status));
       } else if (OB_FAIL(tablet_policy_info.init(sub_partition))) {
         LOG_WARN("fail to init sub partition policy info", KR(ret), K(sub_partition));
@@ -3003,28 +2891,21 @@ int ObStorageCachePolicyService::check_tablet_status_changed(const uint64_t tabl
   return ret;
 }
 
-int ObStorageCachePolicyService::update_tablet_status(const uint64_t tablet_id, const PolicyStatus new_tablet_status, const int64_t table_id)
+int ObStorageCachePolicyService::update_tablet_status(
+    const uint64_t tablet_id, const PolicyStatus new_tablet_status)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(common::ObTabletID::INVALID_TABLET_ID == tablet_id || 
-                  PolicyStatus::MAX_STATUS == new_tablet_status ||
+                  !ObStorageCachePolicyStatus::is_valid(new_tablet_status) ||
                   PolicyStatus::NONE == new_tablet_status)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid tablet id or new_tablet_status", KR(ret), K(tablet_id), K(new_tablet_status));
   } else if (OB_UNLIKELY(ObTabletID(tablet_id).is_ls_inner_tablet())) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("ls inner tablet is always hot and does not support status changes",
-        KR(ret), K(tenant_id_), K(tablet_id), K(new_tablet_status), K(table_id));
+        KR(ret), K(tenant_id_), K(tablet_id), K(new_tablet_status));
   } else if (OB_FAIL(tablet_status_map_.set_refactored(tablet_id, new_tablet_status, true/*overwrite*/))) {
     LOG_WARN("fail to set tablet status", KR(ret), K(tablet_id), K(new_tablet_status));
-  } else if (PolicyStatus::MACRO_HOT == new_tablet_status) {
-    if (OB_FAIL(macro_scp_tablet_table_map_.set_refactored(tablet_id, table_id))) {
-      if (OB_HASH_EXIST == ret) {
-        ret = OB_SUCCESS;
-      } else {
-        LOG_WARN("fail to set macro scp tablet table map", KR(ret), K(tablet_id), K(table_id));
-      }
-    }
   }
   return ret;
 }
@@ -3058,11 +2939,6 @@ SCPTabletTaskMap &ObStorageCachePolicyService::get_tablet_tasks()
   return tablet_scheduler_.tablet_task_map_;
 }
 
-const hash::ObHashSet<uint64_t> &ObStorageCachePolicyService::get_current_active_tablet_ids() const
-{
-  return tablet_scheduler_.active_tablet_ids_;
-}
-
 hash::ObHashMap<int64_t, PolicyStatus> &ObStorageCachePolicyService::get_tablet_status_map()
 {
   return tablet_status_map_;
@@ -3078,10 +2954,6 @@ hash::ObHashMap<int64_t, ObTablePolicyInfo> &ObStorageCachePolicyService::get_ta
   return table_policy_map_;
 }
 
-hash::ObHashMap<int64_t, int64_t> &ObStorageCachePolicyService::get_macro_scp_tablet_table_map()
-{
-  return macro_scp_tablet_table_map_;
-}
 
 int ObStorageCachePolicyService::get_tablet_policy_status(const uint64_t tablet_id, PolicyStatus &policy_status) const
 {
@@ -3106,51 +2978,6 @@ int ObStorageCachePolicyService::get_tablet_policy_status(const uint64_t tablet_
     } else {
       LOG_WARN("fail to get tablet status", KR(ret), K(tablet_id));
     }
-  }
-  return ret;
-}
-
-// This function is used to get the storage cache policy for macro scp, only for MACRO_HOT tablet
-int ObStorageCachePolicyService::get_storage_cache_policy_for_macro_scp(const uint64_t tablet_id, ObStorageCachePolicy &storage_cache_policy) const
-{
-  int ret = OB_SUCCESS;
-  storage_cache_policy.reset();
-  int64_t table_id = OB_INVALID_ID;
-  ObTablePolicyInfo table_policy_info;
-  PolicyStatus policy_status = PolicyStatus::AUTO;
-  if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("storage cache policy service is not init", KR(ret));
-  } else if (OB_UNLIKELY(is_stopped_)) {
-    ret = OB_SERVICE_STOPPED;
-    LOG_WARN("storage cache policy service is stopped", KR(ret));
-  } else if (OB_FAIL(tablet_status_map_.get_refactored(tablet_id, policy_status))) {
-    if (OB_HASH_NOT_EXIST == ret) {
-      ret = OB_SUCCESS;
-    } else {
-      LOG_WARN("fail to get tablet status", KR(ret), K(tablet_id));
-    }
-  } else if (PolicyStatus::MACRO_HOT == policy_status) {
-    // If tablet is MACRO_HOT, the following map should have the corresponding values
-    if (OB_FAIL(macro_scp_tablet_table_map_.get_refactored(tablet_id, table_id))) {
-      LOG_WARN("fail to get table id", KR(ret), K(tablet_id));
-    } else if (OB_FAIL(table_policy_map_.get_refactored(table_id, table_policy_info))) {
-      LOG_WARN("fail to get table policy info", KR(ret), K(table_id));
-    } else if (FALSE_IT(storage_cache_policy = table_policy_info.get_table_policy())) {
-    }
-  }
-  return ret;
-}
-
-int ObStorageCachePolicyService::is_hot_or_macro_hot_tablet(const uint64_t tablet_id, bool &is_hot) const
-{
-  int ret = OB_SUCCESS;
-  is_hot = false;
-  PolicyStatus policy_status = PolicyStatus::MAX_STATUS;
-  if (OB_FAIL(get_tablet_policy_status(tablet_id, policy_status))) {
-    LOG_WARN("fail to get tablet policy status", KR(ret), K(tablet_id), KP(this));
-  } else if (PolicyStatus::HOT == policy_status || PolicyStatus::MACRO_HOT == policy_status) {
-    is_hot = true;
   }
   return ret;
 }
@@ -3218,12 +3045,10 @@ int ObGetHotTabletCallback::operator()(const HashMapPair<int64_t, PolicyStatus> 
 
 int ObStorageCachePolicyService::get_hot_tablets(
     const ObHashSet<uint64_t> &active_tablet_ids,
-    ObHashMap<ObTabletID, ObLSID> &hot_tablet_map,
-    ObHashMap<ObTabletID, ObLSID> &macro_hot_tablet_map)
+    ObHashMap<ObTabletID, ObLSID> &hot_tablet_map)
 {
   int ret = OB_SUCCESS;
-  ObGetHotTabletCallback get_hot_tablet_callback(
-      active_tablet_ids, hot_tablet_map, macro_hot_tablet_map);
+  ObGetHotTabletCallback get_hot_tablet_callback(active_tablet_ids, hot_tablet_map);
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("storage cache policy service is not init", KR(ret));

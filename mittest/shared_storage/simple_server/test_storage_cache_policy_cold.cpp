@@ -22,6 +22,7 @@
 #undef protected
 #include "lib/mysqlclient/ob_mysql_transaction.h"
 #include "lib/utility/ob_defer.h"
+#include "lib/utility/ob_test_util.h"
 #include "lib/utility/ob_tracepoint.h"
 #include "share/ob_cluster_version.h"
 #include "share/ob_dml_sql_splicer.h"
@@ -48,6 +49,44 @@ namespace oceanbase
 {
 namespace unittest
 {
+
+// ----------------------------------------------------------------------------
+// 状态名称正确映射，COLD 的 RPC 编号保持兼容，非法状态不能被误识别。
+//
+// 场景：使用 HOT/AUTO/NONE/COLD，以及非法编号 3、MAX_STATUS 和 255。
+// 操作：查询状态有效性、显示文本和带校验的字符串转换接口。
+// 校验：有效状态显示对应名称；COLD 仍为 4；非法状态显示 UNKNOWN 并返回参数错误。
+// ----------------------------------------------------------------------------
+TEST(ObStorageCachePolicyStatusTest, policy_status_string_mapping)
+{
+  LOG_INFO("========== policy_status_string_mapping begin ==========");
+  const char *status_str = nullptr;
+
+  // 直接校验全部有效名称，确保映射不依赖编号连续。
+  LOG_INFO("step 1: verify valid policy status names");
+  ASSERT_STREQ("HOT", ObStorageCachePolicyStatus::get_str(PolicyStatus::HOT));
+  ASSERT_STREQ("AUTO", ObStorageCachePolicyStatus::get_str(PolicyStatus::AUTO));
+  ASSERT_STREQ("NONE", ObStorageCachePolicyStatus::get_str(PolicyStatus::NONE));
+
+  // RPC 编号是独立兼容性预期，不能随被测枚举一起调整。
+  LOG_INFO("step 2: verify cold RPC value and name", K(PolicyStatus::COLD));
+  ASSERT_EQ(4, static_cast<int>(PolicyStatus::COLD));
+  ASSERT_TRUE(ObStorageCachePolicyStatus::is_valid(PolicyStatus::COLD));
+  OK(ObStorageCachePolicyStatus::safely_get_str(PolicyStatus::COLD, status_str));
+  ASSERT_STREQ("COLD", status_str);
+
+  // 同时覆盖枚举范围内的非法值、上界哨兵和底层整数类型的最大值。
+  const PolicyStatus invalid_statuses[] = {
+      static_cast<PolicyStatus>(3), PolicyStatus::MAX_STATUS, static_cast<PolicyStatus>(255)};
+  for (const PolicyStatus invalid_status : invalid_statuses) {
+    LOG_INFO("step 3: verify invalid status is rejected", K(invalid_status));
+    ASSERT_FALSE(ObStorageCachePolicyStatus::is_valid(invalid_status));
+    ASSERT_STREQ("UNKNOWN", ObStorageCachePolicyStatus::get_str(invalid_status));
+    ASSERT_EQ(OB_INVALID_ARGUMENT,
+        ObStorageCachePolicyStatus::safely_get_str(invalid_status, status_str));
+  }
+  LOG_INFO("========== policy_status_string_mapping end ==========");
+}
 
 class MockBlockPolicySchemaService final : public share::schema::ObMultiVersionSchemaService
 {
@@ -110,23 +149,20 @@ TEST_F(ObStorageCachePolicyColdTest, test_ls_inner_tablets_are_always_hot)
     const common::ObTabletID tablet_id(ObLS::INNER_TABLET_ID_LIST[i]);
     PolicyStatus policy_status = PolicyStatus::MAX_STATUS;
     bool is_hot = false;
-    bool is_hot_or_macro_hot = false;
     bool is_cold = true;
     LOG_INFO("step 1: verify fixed ls inner tablet policy", K(i), K(tablet_id));
     OK(policy_service->get_tablet_policy_status(tablet_id.id(), policy_status));
     OK(policy_service->is_hot_tablet(tablet_id.id(), is_hot));
-    OK(policy_service->is_hot_or_macro_hot_tablet(tablet_id.id(), is_hot_or_macro_hot));
     OK(policy_service->is_cold_tablet(tablet_id.id(), is_cold));
     LOG_INFO("step 1 done", K(i), K(tablet_id), K(policy_status),
-        K(is_hot), K(is_hot_or_macro_hot), K(is_cold));
+        K(is_hot), K(is_cold));
     ASSERT_EQ(PolicyStatus::HOT, policy_status);
     ASSERT_TRUE(is_hot);
-    ASSERT_TRUE(is_hot_or_macro_hot);
     ASSERT_FALSE(is_cold);
 
     // 固定 HOT 状态不允许通过内部状态更新接口改成 AUTO。
     const int ret = policy_service->update_tablet_status(
-        tablet_id.id(), PolicyStatus::AUTO, OB_INVALID_ID);
+        tablet_id.id(), PolicyStatus::AUTO);
     LOG_INFO("step 2: verify status change is rejected", K(ret), K(i), K(tablet_id));
     ASSERT_EQ(OB_NOT_SUPPORTED, ret);
   }
@@ -363,158 +399,174 @@ static int init_mock_partitioned_table_schema(
   return ret;
 }
 
-// hot to cold，test evict local cache
+// ----------------------------------------------------------------------------
+// HOT 降级为 AUTO/COLD 时保留缓存；没有历史任务记录也必须完成类型转换。
+//
+// 场景：预热真实 tablet，分别构造 AUTO 无任务、COLD 无任务、COLD 有任务三种切换。
+// 操作：切换前记录实际存在的数据块和元数据块；部分场景清除已完成的任务记录。
+// 校验：切换后每个已缓存块仍存在，类型均为 MACRO_BLOCK，策略状态与目标一致。
+// ----------------------------------------------------------------------------
 TEST_F(ObStorageCachePolicyColdTest, test_convert_hot_to_cold)
 {
-  FLOG_INFO("[TEST] start test_convert_hot_auto_to_cold_evict");
+  LOG_INFO("========== test_convert_hot_to_cold begin ==========");
   share::ObTenantSwitchGuard tguard;
   OK(tguard.switch_to(run_ctx_.tenant_id_));
   exe_prepare_sql();
-  
   ObStorageCachePolicyService *policy_service = MTL(ObStorageCachePolicyService *);
-  ASSERT_NE(nullptr, policy_service);
   ObSSMacroCacheMgr *macro_cache_mgr = MTL(ObSSMacroCacheMgr *);
+  ASSERT_NE(nullptr, policy_service);
   ASSERT_NE(nullptr, macro_cache_mgr);
 
-  // Test case 1: hot to cold
+  // 构造当前 tablet 真正引用的宏块，转换过程不能补读缺失块。
   OK(exe_sql("create table test_hot_to_cold (a int)"));
   set_ls_and_tablet_id_for_run_ctx("test_hot_to_cold");
-
-  OK(exe_sql("insert into test_hot_to_cold values (1)"));
-  OK(exe_sql("insert into test_hot_to_cold values (2)"));
-  OK(exe_sql("insert into test_hot_to_cold values (3)"));
-  OK(TestCompactionUtil::medium_compact(run_ctx_.tenant_id_, run_ctx_.tablet_id_.id(), run_ctx_.ls_id_));
-  
-  // 1. set hot policy, wait prewarm task finished
-  OK(exe_sql("alter table test_hot_to_cold storage_cache_policy (global = 'hot');"));
-  wait_task_finished(run_ctx_.tablet_id_.id());
-  
-  // 2. check macro block in cache
-  ObSEArray<MacroBlockId, 128> data_block_ids;
-  ObSEArray<MacroBlockId, 128> meta_block_ids;
-  data_block_ids.set_attr(ObMemAttr(run_ctx_.tenant_id_, "DataBlockIDs"));
-  meta_block_ids.set_attr(ObMemAttr(run_ctx_.tenant_id_, "MetaBlockIDs"));
-  OK(get_macro_blocks(run_ctx_.ls_id_, run_ctx_.tablet_id_, data_block_ids, meta_block_ids));
-  FLOG_INFO("[TEST] data_block_ids", K(data_block_ids));
-  FLOG_INFO("[TEST] meta_block_ids", K(meta_block_ids));
-  bool is_exist = false;
-  int64_t macro_count_before_evict = 0;
-
-  for (int i = 0; i < data_block_ids.count(); i++) {
-    if (data_block_ids.at(i).is_shared_data_or_meta()) {
-      OK(macro_cache_mgr->exist(data_block_ids.at(i), is_exist));
-      if (is_exist) {
-        macro_count_before_evict++;
-        FLOG_INFO("[TEST] macro block in cache before evict", K(i), K(data_block_ids.at(i)));
-      }
-    }
+  OK(exe_sql("insert into test_hot_to_cold values (1), (2), (3)"));
+  OK(TestCompactionUtil::medium_compact(
+      run_ctx_.tenant_id_, run_ctx_.tablet_id_.id(), run_ctx_.ls_id_));
+  ObSEArray<MacroBlockId, 128> block_ids;
+  ObSEArray<MacroBlockId, 16> meta_ids;
+  const ObMemAttr attr(MTL_ID(), "ColdKeepBlocks");
+  block_ids.set_attr(attr);
+  meta_ids.set_attr(attr);
+  OK(get_macro_blocks(run_ctx_.ls_id_, run_ctx_.tablet_id_, block_ids, meta_ids));
+  for (int64_t i = 0; i < meta_ids.count(); ++i) {
+    OK(block_ids.push_back(meta_ids.at(i)));
   }
-  FLOG_INFO("[TEST] macro_count_before_evict", K(macro_count_before_evict));
-  ASSERT_GT(macro_count_before_evict, 0);
-  FLOG_INFO("[TEST] before evict, macro count in cache", K(macro_count_before_evict));
-  
-  // 3. convert to cold policy, should trigger evict local cache
-  OK(exe_sql("alter table test_hot_to_cold storage_cache_policy (global = 'cold');"));
-  ASSERT_EQ(OB_SUCCESS, policy_service->trigger_or_refresh_tablet(ObStorageCachePolicyRefreshType::REFRESH_TYPE_NORMAL));
-  // 4. 等待定时批量任务淘汰宏块
-  int64_t macro_count_after_evict = macro_count_before_evict;
-  int64_t wait_time = 0;
-  FLOG_INFO("[TEST] after evict, data_block_ids", K(data_block_ids));
-  while (macro_count_after_evict > 0 && wait_time < 60) {
-    sleep(1);
-    wait_time++;
-    macro_count_after_evict = 0;
-    for (int i = 0; i < data_block_ids.count(); i++) {
-      if (data_block_ids.at(i).is_shared_data_or_meta()) {
-        OK(macro_cache_mgr->exist(data_block_ids.at(i), is_exist));
+
+  const PolicyStatus targets[] = {PolicyStatus::AUTO, PolicyStatus::COLD, PolicyStatus::COLD};
+  const char *target_sql[] = {
+      "alter table test_hot_to_cold storage_cache_policy (global = 'auto')",
+      "alter table test_hot_to_cold storage_cache_policy (global = 'cold')",
+      "alter table test_hot_to_cold storage_cache_policy (global = 'cold')"};
+  for (int64_t scenario = 0; scenario < ARRAYSIZEOF(targets); ++scenario) {
+    LOG_INFO("step 1: prepare hot cache", K(scenario), K(targets[scenario]));
+    OK(exe_sql("alter table test_hot_to_cold storage_cache_policy (global = 'hot')"));
+    OK(policy_service->trigger_or_refresh_tablet(REFRESH_TYPE_NORMAL));
+    wait_task_finished(run_ctx_.tablet_id_.id());
+    ObSEArray<MacroBlockId, 128> cached_ids;
+    cached_ids.set_attr(attr);
+    for (int64_t i = 0; i < block_ids.count(); ++i) {
+      if (block_ids.at(i).is_shared_data_or_meta()) {
+        bool is_exist = false;
+        ObSSMacroCacheMetaHandle handle;
+        OK(macro_cache_mgr->get_macro_cache_meta(block_ids.at(i), is_exist, handle));
         if (is_exist) {
-          macro_count_after_evict++;
-          FLOG_INFO("[TEST] macro block in cache after evict", K(i), K(data_block_ids.at(i)));
+          ASSERT_TRUE(handle.is_valid());
+          ASSERT_EQ(ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK, handle()->get_cache_type());
+          OK(cached_ids.push_back(block_ids.at(i)));
         }
       }
     }
+    LOG_INFO("step 1 done: capture existing hot blocks", K(scenario), K(cached_ids.count()));
+    ASSERT_GT(cached_ids.count(), 0);
+
+    // 前两个场景只删除任务记录，保留缓存，复现历史清理后的状态。
+    if (scenario < ARRAYSIZEOF(targets) - 1) {
+      OK(policy_service->get_tablet_tasks().erase_refactored(run_ctx_.tablet_id_.id()));
+      ObStorageCacheTabletTaskHandle task_handle;
+      ASSERT_EQ(OB_HASH_NOT_EXIST,
+          policy_service->get_tablet_tasks().get_refactored(
+              run_ctx_.tablet_id_.id(), task_handle));
+    }
+    LOG_INFO("step 2: demote cached blocks", K(scenario), K(targets[scenario]));
+    OK(exe_sql(target_sql[scenario]));
+    OK(policy_service->trigger_or_refresh_tablet(REFRESH_TYPE_NORMAL));
+    PolicyStatus status = PolicyStatus::MAX_STATUS;
+    OK(policy_service->get_tablet_policy_status(run_ctx_.tablet_id_.id(), status));
+    ASSERT_EQ(targets[scenario], status);
+
+    // 比较同一批块的存在性和实际类型，不能仅比较总数。
+    for (int64_t i = 0; i < cached_ids.count(); ++i) {
+      bool is_exist = false;
+      ObSSMacroCacheMetaHandle handle;
+      OK(macro_cache_mgr->get_macro_cache_meta(cached_ids.at(i), is_exist, handle));
+      LOG_INFO("step 3: verify retained block", K(scenario), K(i), K(is_exist), K(handle));
+      ASSERT_TRUE(is_exist);
+      ASSERT_TRUE(handle.is_valid());
+      ASSERT_EQ(ObSSMacroCacheType::MACRO_BLOCK, handle()->get_cache_type());
+    }
   }
-  FLOG_INFO("[TEST] after evict, macro count in cache", K(macro_count_after_evict));
-  ASSERT_EQ(0, macro_count_after_evict);
-  OK(exe_sql("drop table if exists test_hot_to_cold"));
-  FLOG_INFO("[TEST] finish test_convert_hot_to_cold");
+  OK(exe_sql("drop table test_hot_to_cold"));
+  LOG_INFO("========== test_convert_hot_to_cold end ==========");
 }
 
+// ----------------------------------------------------------------------------
+// AUTO 与 COLD 切换只改变策略，已有普通缓存保持存在且类型不变。
+//
+// 场景：通过显式 AUTO 预热构造真实缓存，不依赖租户的自动预热配置。
+// 操作：记录实际缓存块，再依次切换到 COLD 和 AUTO。
+// 校验：每次切换后原有块均存在且仍为 MACRO_BLOCK。
+// ----------------------------------------------------------------------------
 TEST_F(ObStorageCachePolicyColdTest, test_convert_auto_to_cold)
 {
-  FLOG_INFO("[TEST] start test_convert_hot_auto_to_cold_evict");
+  LOG_INFO("========== test_convert_auto_to_cold begin ==========");
   share::ObTenantSwitchGuard tguard;
   OK(tguard.switch_to(run_ctx_.tenant_id_));
   exe_prepare_sql();
-  
   ObStorageCachePolicyService *policy_service = MTL(ObStorageCachePolicyService *);
-  ASSERT_NE(nullptr, policy_service);
   ObSSMacroCacheMgr *macro_cache_mgr = MTL(ObSSMacroCacheMgr *);
+  ASSERT_NE(nullptr, policy_service);
   ASSERT_NE(nullptr, macro_cache_mgr);
-
-  OK(exe_sql("drop table if exists test_auto_to_cold"));
-  OK(exe_sql("alter system set default_storage_cache_policy = 'auto'"));
-  OK(exe_sql("create table test_auto_to_cold (a int)"));
+  OK(exe_sql("create table test_auto_to_cold (a int) storage_cache_policy (global = 'auto')"));
   set_ls_and_tablet_id_for_run_ctx("test_auto_to_cold");
+  OK(exe_sql("insert into test_auto_to_cold values (1), (2)"));
+  OK(TestCompactionUtil::medium_compact(
+      run_ctx_.tenant_id_, run_ctx_.tablet_id_.id(), run_ctx_.ls_id_));
+  OK(policy_service->trigger_or_refresh_tablet(REFRESH_TYPE_NORMAL));
+  OK(policy_service->async_prewarm_tablet(run_ctx_.tablet_id_.id(), PolicyStatus::AUTO));
+  wait_task_finished(run_ctx_.tablet_id_.id());
 
-  OK(exe_sql("insert into test_auto_to_cold values (1)"));
-  OK(exe_sql("insert into test_auto_to_cold values (2)"));
-  OK(TestCompactionUtil::medium_compact(run_ctx_.tenant_id_, run_ctx_.tablet_id_.id(), run_ctx_.ls_id_));
-  
-  // 1. set auto policy
-  OK(exe_sql("alter table test_auto_to_cold storage_cache_policy (global = 'auto');"));
- 
-  // 2. get macro block id
-  ObSEArray<MacroBlockId, 128> auto_data_block_ids;
-  ObSEArray<MacroBlockId, 128> auto_meta_block_ids;
-  auto_data_block_ids.set_attr(ObMemAttr(run_ctx_.tenant_id_, "AutoDataBlkIDs"));
-  auto_meta_block_ids.set_attr(ObMemAttr(run_ctx_.tenant_id_, "AutoMetaBlkIDs"));
-  OK(get_macro_blocks(run_ctx_.ls_id_, run_ctx_.tablet_id_, auto_data_block_ids, auto_meta_block_ids));
-  FLOG_INFO("[TEST] auto policy before evict, auto_data_block_ids", K(auto_data_block_ids));
-  FLOG_INFO("[TEST] auto policy before evict, auto_meta_block_ids", K(auto_meta_block_ids));
-  int64_t macro_count_before_evict = 0;
-  bool is_exist = false;
-  for (int i = 0; i < auto_data_block_ids.count(); i++) {
-    if (auto_data_block_ids.at(i).is_shared_data_or_meta()) {    
-      FLOG_INFO("[TEST] check macro block in cache before evict", K(i), K(auto_data_block_ids.at(i)));
-      OK(macro_cache_mgr->exist(auto_data_block_ids.at(i), is_exist));
+  // 建立非空的缓存基线，避免没有缓存时断言空通过。
+  ObSEArray<MacroBlockId, 128> block_ids;
+  ObSEArray<MacroBlockId, 16> meta_ids;
+  ObSEArray<MacroBlockId, 128> cached_ids;
+  const ObMemAttr attr(MTL_ID(), "AutoColdKeep");
+  block_ids.set_attr(attr);
+  meta_ids.set_attr(attr);
+  cached_ids.set_attr(attr);
+  OK(get_macro_blocks(run_ctx_.ls_id_, run_ctx_.tablet_id_, block_ids, meta_ids));
+  for (int64_t i = 0; i < meta_ids.count(); ++i) {
+    OK(block_ids.push_back(meta_ids.at(i)));
+  }
+  for (int64_t i = 0; i < block_ids.count(); ++i) {
+    if (block_ids.at(i).is_shared_data_or_meta()) {
+      bool is_exist = false;
+      ObSSMacroCacheMetaHandle handle;
+      OK(macro_cache_mgr->get_macro_cache_meta(block_ids.at(i), is_exist, handle));
       if (is_exist) {
-        macro_count_before_evict++;
-        FLOG_INFO("[TEST] macro block in cache before evict", K(i), K(auto_data_block_ids.at(i)));
+        ASSERT_TRUE(handle.is_valid());
+        ASSERT_EQ(ObSSMacroCacheType::MACRO_BLOCK, handle()->get_cache_type());
+        OK(cached_ids.push_back(block_ids.at(i)));
       }
     }
   }
-  FLOG_INFO("[TEST] auto policy before evict, macro count", K(macro_count_before_evict));
-  
-  // 3. convert to cold policy
-  OK(exe_sql("alter table test_auto_to_cold storage_cache_policy (global = 'cold');"));
-  ASSERT_EQ(OB_SUCCESS, policy_service->trigger_or_refresh_tablet(ObStorageCachePolicyRefreshType::REFRESH_TYPE_NORMAL));
-  
-  // 4. check macro block evicted
-  int64_t macro_count_after_evict = auto_data_block_ids.count();
-  int64_t wait_time = 0;
-  while(macro_count_after_evict > 0 && wait_time < 60) {
-    sleep(1);
-    wait_time++;
-    if (wait_time % 60 == 0) {
-      FLOG_INFO("[TEST] macros remaining in cache after eviction", K(macro_count_after_evict));
-    }
-    macro_count_after_evict = 0;
-    for (int i = 0; i < auto_data_block_ids.count(); i++) {
-      if (auto_data_block_ids.at(i).is_shared_data_or_meta()) {
-        OK(macro_cache_mgr->exist(auto_data_block_ids.at(i), is_exist));
-        if (is_exist) {
-          ObSSMacroCacheMetaHandle meta_handle;
-          OK(macro_cache_mgr->get_macro_cache_meta(auto_data_block_ids.at(i), is_exist, meta_handle));
-          macro_count_after_evict++;
-          FLOG_INFO("[TEST] macro block in cache after evict", K(i), K(auto_data_block_ids.at(i)), K(meta_handle()->get_is_write_cache()));
-        }
-      }
+  LOG_INFO("step 1 done: capture ordinary cache blocks", K(cached_ids.count()));
+  ASSERT_GT(cached_ids.count(), 0);
+
+  // COLD 不删除已有缓存，切回 AUTO 也不搬移缓存。
+  const PolicyStatus target_statuses[] = {PolicyStatus::COLD, PolicyStatus::AUTO};
+  const char *target_sql[] = {
+      "alter table test_auto_to_cold storage_cache_policy (global = 'cold')",
+      "alter table test_auto_to_cold storage_cache_policy (global = 'auto')"};
+  for (int64_t scenario = 0; scenario < ARRAYSIZEOF(target_sql); ++scenario) {
+    LOG_INFO("step 2: switch non-hot policy", K(scenario));
+    OK(exe_sql(target_sql[scenario]));
+    OK(policy_service->trigger_or_refresh_tablet(REFRESH_TYPE_NORMAL));
+    PolicyStatus status = PolicyStatus::MAX_STATUS;
+    OK(policy_service->get_tablet_policy_status(run_ctx_.tablet_id_.id(), status));
+    ASSERT_EQ(target_statuses[scenario], status);
+    for (int64_t i = 0; i < cached_ids.count(); ++i) {
+      bool is_exist = false;
+      ObSSMacroCacheMetaHandle handle;
+      OK(macro_cache_mgr->get_macro_cache_meta(cached_ids.at(i), is_exist, handle));
+      LOG_INFO("step 2 done: verify retained block", K(scenario), K(i), K(is_exist), K(handle));
+      ASSERT_TRUE(is_exist);
+      ASSERT_TRUE(handle.is_valid());
+      ASSERT_EQ(ObSSMacroCacheType::MACRO_BLOCK, handle()->get_cache_type());
     }
   }
-  ASSERT_EQ(0, macro_count_after_evict);
-  OK(exe_sql("drop table if exists test_auto_to_cold"));
-  FLOG_INFO("[TEST] finish test_convert_auto_to_cold");
+  OK(exe_sql("drop table test_auto_to_cold"));
+  LOG_INFO("========== test_convert_auto_to_cold end ==========");
 }
 
 // cold to hot，macro will become hot macro
@@ -693,12 +745,16 @@ TEST_F(ObStorageCachePolicyColdTest, test_cold_policy_cache_behavior)
   // 2. trigger refresh to ensure tablet status is updated to cold in tablet_status_map_
   ASSERT_EQ(OB_SUCCESS, policy_service->trigger_or_refresh_tablet(ObStorageCachePolicyRefreshType::REFRESH_TYPE_NORMAL));
 
-  // 3. wait for the asynchronous cold tablet task to evict macro cache
+  // 3. 显式清理测试基线；COLD 策略切换不再负责清缓存。
   const int64_t evict_timeout_us = 60 * 1000 * 1000L; // 60s
   const int64_t evict_start_us = ObTimeUtility::current_time();
   bool all_macro_cache_evicted = false;
   while (!all_macro_cache_evicted
       && ObTimeUtility::current_time() - evict_start_us < evict_timeout_us) {
+    int64_t read_cache_count = 0;
+    int64_t write_cache_count = 0;
+    OK(macro_cache_mgr->evict_by_tablet_id(
+        run_ctx_.tablet_id_, read_cache_count, write_cache_count));
     all_macro_cache_evicted = true;
     for (int64_t i = 0; i < data_block_ids.count(); ++i) {
       if (data_block_ids.at(i).is_shared_data_or_meta()) {
@@ -834,10 +890,16 @@ TEST_F(ObStorageCachePolicyColdTest, test_cold_policy_cache_behavior)
   FLOG_INFO("[TEST] finish test_cold_policy_cache_behavior");
 }
 
-// cold policy evicts write cache with requeue until all write cache is cleared
-TEST_F(ObStorageCachePolicyColdTest, test_cold_evict_write_cache_task)
+// ----------------------------------------------------------------------------
+// COLD 切换保留写缓存，共用的类型转换接口也不能删除块或清除写缓存标记。
+//
+// 场景：构造不属于当前 macro_info 的 PRIVATE_DATA_MACRO 写缓存。
+// 操作：切换 COLD 验证缓存保留，再显式调用 AUTO/COLD 共用的宏块类型转换接口。
+// 校验：块仍存在、类型降为 MACRO_BLOCK，写缓存标记和 tablet 归属不变。
+// ----------------------------------------------------------------------------
+TEST_F(ObStorageCachePolicyColdTest, test_cold_preserves_write_cache)
 {
-  FLOG_INFO("[TEST] start test_cold_evict_write_cache_task");
+  LOG_INFO("========== test_cold_preserves_write_cache begin ==========");
   share::ObTenantSwitchGuard tguard;
   OK(tguard.switch_to(run_ctx_.tenant_id_));
   exe_prepare_sql();
@@ -851,7 +913,6 @@ TEST_F(ObStorageCachePolicyColdTest, test_cold_evict_write_cache_task)
   OK(exe_sql("create table test_cold_write_cache (a int)"));
   set_ls_and_tablet_id_for_run_ctx("test_cold_write_cache");
   const uint64_t tablet_id = run_ctx_.tablet_id_.id();
-  const uint64_t server_id = 1;
   OK(exe_sql("insert into test_cold_write_cache values (1)"));
   OK(exe_sql("insert into test_cold_write_cache values (2)"));
   OK(exe_sql("insert into test_cold_write_cache values (3)"));
@@ -877,6 +938,7 @@ TEST_F(ObStorageCachePolicyColdTest, test_cold_evict_write_cache_task)
   
   const int64_t MACRO_BLOCK_COUNT = 3;
   ObSEArray<MacroBlockId, 16> constructed_macro_ids;
+  constructed_macro_ids.set_attr(ObMemAttr(MTL_ID(), "ColdWriteKeep"));
   for (int64_t i = 0; i < MACRO_BLOCK_COUNT; i++) {
     MacroBlockId macro_id;
     macro_id.set_storage_object_type((uint64_t)ObStorageObjectType::PRIVATE_DATA_MACRO);
@@ -916,173 +978,38 @@ TEST_F(ObStorageCachePolicyColdTest, test_cold_evict_write_cache_task)
   // 4. Get initial write cache size
   int64_t initial_write_cache_size = macro_cache_mgr->get_write_cache_size();
   FLOG_INFO("[TEST] initial write cache size", K(initial_write_cache_size));
-  // exist other macro blocks in write cache
-  ASSERT_GT(initial_write_cache_size, WRITE_IO_SIZE * MACRO_BLOCK_COUNT);
   
-  // 5. Add tablet to active_tablet_ids (required for eviction task)
+  // 5. 保持 tablet 为 active，沿用普通策略切换路径。
   ASSERT_EQ(OB_SUCCESS, policy_service->tablet_scheduler_.active_tablet_ids_.set_refactored(tablet_id));
   
-  // 6. Convert to cold policy to trigger eviction
+  // 6. 策略切换只处理当前 tablet 引用；构造的额外写缓存也不能被 COLD 批量删除。
   OK(exe_sql("alter table test_cold_write_cache storage_cache_policy (global = 'cold');"));
-  ASSERT_EQ(OB_SUCCESS, policy_service->trigger_or_refresh_tablet(ObStorageCachePolicyRefreshType::REFRESH_TYPE_NORMAL));
-  ASSERT_EQ(OB_HASH_EXIST, policy_service->get_need_evict_cold_tablet_ids().exist_refactored(tablet_id));
-  policy_service->refresh_policy_scheduler_.evict_cold_tablet_task_.runTimerTask();
-
-  // 7. Verify all constructed macros are evicted from cache
-  int64_t remaining_macro_count = constructed_macro_ids.count();
-  is_exist = false;
-  int64_t wait_time = 0;
-  while(remaining_macro_count > 0 && wait_time < 60) {
-    sleep(1);
-    wait_time++;
-    if (wait_time % 60 == 0) {
-      FLOG_INFO("[TEST] macros remaining in cache after eviction", K(remaining_macro_count));
-    }
-    remaining_macro_count = 0;
-    for (int i = 0; i < constructed_macro_ids.count(); i++) {
-      OK(macro_cache_mgr->exist(constructed_macro_ids.at(i), is_exist));
-      if (is_exist) {
-        remaining_macro_count++;
-      }
-    }
+  OK(policy_service->trigger_or_refresh_tablet(REFRESH_TYPE_NORMAL));
+  for (int64_t i = 0; i < constructed_macro_ids.count(); ++i) {
+    ObSSMacroCacheMetaHandle handle;
+    OK(macro_cache_mgr->meta_map_.get_refactored(constructed_macro_ids.at(i), handle));
+    ASSERT_TRUE(handle.is_valid());
+    ASSERT_TRUE(handle()->get_is_write_cache());
   }
-  ASSERT_EQ(0, remaining_macro_count);
-  OK(exe_sql("drop table if exists test_cold_write_cache"));
-  FLOG_INFO("[TEST] finish test_cold_evict_write_cache_requeue");
-}
 
-// 宏块粒度（BLOCK）的存储缓存策略已禁用，保留历史测试但不执行。
-// TEST_F(ObStorageCachePolicyColdTest, test_macro_block_cold_elimination)
-// {
-//   FLOG_INFO("[TEST] start test_macro_block_cold_elimination");
-//   share::ObTenantSwitchGuard tguard;
-//   bool is_exist = false;
-//   OK(tguard.switch_to(run_ctx_.tenant_id_));
-//   exe_prepare_sql();
-//
-//   ObStorageCachePolicyService *policy_service = MTL(ObStorageCachePolicyService *);
-//   ASSERT_NE(nullptr, policy_service);
-//   ObSSMacroCacheMgr *macro_cache_mgr = MTL(ObSSMacroCacheMgr *);
-//   ASSERT_NE(nullptr, macro_cache_mgr);
-//   ObSSMemMacroCache *mem_macro_cache = MTL(ObSSMemMacroCache *);
-//   ASSERT_NE(nullptr, mem_macro_cache);
-//
-//   OK(exe_sql("create table test_cold_macro (a int primary key, b int)"));
-//   set_ls_and_tablet_id_for_run_ctx("test_cold_macro");
-//
-//   OK(exe_sql("insert into test_cold_macro values (1, 1)"));
-//   OK(exe_sql("insert into test_cold_macro values (2, 2)"));
-//   OK(exe_sql("insert into test_cold_macro values (3, 3)"));
-//   OK(TestCompactionUtil::medium_compact(run_ctx_.tenant_id_, run_ctx_.tablet_id_.id(), run_ctx_.ls_id_));
-//
-//   FLOG_INFO("[TEST] Step 1: Created table and data, waiting for data to be persisted");
-//
-//   OK(exe_sql("alter table test_cold_macro storage_cache_policy (global = 'hot');"));
-//   wait_task_finished(run_ctx_.tablet_id_.id());
-//
-//   ObSEArray<MacroBlockId, 128> data_block_ids;
-//   ObSEArray<MacroBlockId, 128> meta_block_ids;
-//   data_block_ids.set_attr(ObMemAttr(run_ctx_.tenant_id_, "DataBlockIDs"));
-//   meta_block_ids.set_attr(ObMemAttr(run_ctx_.tenant_id_, "MetaBlockIDs"));
-//   OK(get_macro_blocks(run_ctx_.ls_id_, run_ctx_.tablet_id_, data_block_ids, meta_block_ids));
-//
-//   FLOG_INFO("[TEST] Step 2: Get macro blocks", K(data_block_ids.count()), K(meta_block_ids.count()));
-//
-//   check_macro_blocks_type(ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK);
-//
-//   int64_t initial_macro_count = 0;
-//   ObSEArray<MacroBlockId, 16> cached_macro_ids;
-//   for (int i = 0; i < data_block_ids.count(); i++) {
-//     if (data_block_ids.at(i).is_shared_data_or_meta()) {
-//       OK(macro_cache_mgr->exist(data_block_ids.at(i), is_exist));
-//       if (is_exist) {
-//         initial_macro_count++;
-//         OK(cached_macro_ids.push_back(data_block_ids.at(i)));
-//       }
-//     }
-//   }
-//   FLOG_INFO("[TEST] Step 3: Initial cached macro count", K(initial_macro_count), K(cached_macro_ids));
-//   ASSERT_GT(initial_macro_count, 0);
-//
-//   OK(exe_sql("alter table test_cold_macro storage_cache_policy "
-//              "(granularity = 'block', hot_retention = 10 SECOND, mixed_retention = 1 SECOND);"));
-//   ASSERT_EQ(OB_SUCCESS, policy_service->trigger_or_refresh_tablet(ObStorageCachePolicyRefreshType::REFRESH_TYPE_NORMAL));
-//   FLOG_INFO("[TEST] Step 4: Switched to macro_hot time policy");
-//
-//   int64_t macro_count_after_policy_change = 0;
-//   for (int i = 0; i < cached_macro_ids.count(); i++) {
-//     OK(macro_cache_mgr->exist(cached_macro_ids.at(i), is_exist));
-//     if (is_exist) {
-//       macro_count_after_policy_change++;
-//     }
-//   }
-//   FLOG_INFO("[TEST] Step 5: Macro count after policy change", K(macro_count_after_policy_change));
-//   ASSERT_EQ(initial_macro_count, macro_count_after_policy_change);
-//
-//   const uint64_t tablet_id = run_ctx_.tablet_id_.id();
-//   ASSERT_EQ(OB_SUCCESS, policy_service->tablet_scheduler_.active_tablet_ids_.set_refactored(tablet_id));
-//
-//   const int64_t wait_seconds = 15;
-//   FLOG_INFO("[TEST] Step 6: Waiting for macros to age beyond retention time",
-//             "wait_seconds", wait_seconds, "hot_retention", 1, "mixed_retention", 1);
-//
-//   sleep(wait_seconds);
-//
-//   FLOG_INFO("[TEST] Step 7 completed: Macros have aged, now triggering eliminate task");
-//
-//   ObStorageCacheEliminateMacroTask &eliminate_task =
-//       policy_service->refresh_policy_scheduler_.eliminate_macro_task_;
-//   ASSERT_EQ(OB_SUCCESS, eliminate_task.eliminate_macro_blocks());
-//
-//   hash::ObHashSet<MacroBlockId> &cold_macro_ids = policy_service->get_need_evict_cold_macro_block_ids();
-//   int64_t cold_macro_count = cold_macro_ids.size();
-//   FLOG_INFO("[TEST] Step 8: Cold macros identified by eliminate task", K(cold_macro_count), K(cold_macro_ids));
-//
-//   ASSERT_TRUE(cold_macro_ids.created());
-//   ASSERT_GT(cold_macro_count, 0);
-//
-//   FLOG_INFO("[TEST] Step 9: Successfully identified cold macros, proceeding with eviction");
-//
-//   ObStorageCacheEvictColdMacroTask &evict_cold_macro_task =
-//         policy_service->refresh_policy_scheduler_.evict_cold_macro_task_;
-//   evict_cold_macro_task.runTimerTask();
-//
-//   int64_t evict_wait_time = 0;
-//   int64_t remaining_cold_count = cold_macro_ids.size();
-//   FLOG_INFO("[TEST] Start waiting for cold macro eviction", K(remaining_cold_count));
-//   while(remaining_cold_count > 0 && evict_wait_time < 60) {
-//     sleep(1);
-//     evict_wait_time++;
-//     int64_t prev_count = remaining_cold_count;
-//     remaining_cold_count = cold_macro_ids.size();
-//     if (remaining_cold_count != prev_count || evict_wait_time % 5 == 0) {
-//       FLOG_INFO("[TEST] Waiting for cold macro eviction",
-//                 K(remaining_cold_count), K(evict_wait_time), "prev_count", prev_count, "delta", prev_count - remaining_cold_count);
-//     }
-//   }
-//
-//   FLOG_INFO("[TEST] Step 10: Cold macro eviction completed", "final_cold_count", cold_macro_ids.size(), "wait_time", evict_wait_time);
-//
-//   int64_t evicted_count = 0;
-//   int64_t still_cached_count = 0;
-//   for (int i = 0; i < cached_macro_ids.count(); i++) {
-//     FLOG_INFO("[TEST] check cold macro not in macro cache", K(cached_macro_ids.at(i)));
-//     OK(macro_cache_mgr->exist(cached_macro_ids.at(i), is_exist));
-//     FLOG_INFO("[TEST] macro exist check result", K(cached_macro_ids.at(i)), K(is_exist));
-//     if (is_exist) {
-//       still_cached_count++;
-//       FLOG_INFO("[TEST] Warning: Cold macro still exists in cache after eviction!", "macro_id", cached_macro_ids.at(i));
-//     } else {
-//       evicted_count++;
-//     }
-//     ASSERT_FALSE(is_exist);
-//   }
-//   FLOG_INFO("[TEST] Final eviction verification", K(evicted_count), K(still_cached_count),
-//             "total_count", cached_macro_ids.count());
-//
-//   OK(exe_sql("drop table if exists test_cold_macro"));
-//   FLOG_INFO("[TEST] finish test_macro_block_cold_conversion_and_real_elimination");
-// }
+  // 额外构造的块不在 macro_info 中，显式验证现有共用转换原语的写缓存语义。
+  OK(policy_service->tablet_scheduler_.convert_macro_blks_to_auto(constructed_macro_ids));
+  for (int64_t i = 0; i < constructed_macro_ids.count(); ++i) {
+    const MacroBlockId &macro_id = constructed_macro_ids.at(i);
+    ObSSMacroCacheMetaHandle handle;
+    OK(macro_cache_mgr->meta_map_.get_refactored(macro_id, handle));
+    LOG_INFO("step 7: verify retained write cache", K(i), K(macro_id), K(handle));
+    ASSERT_TRUE(handle.is_valid());
+    ASSERT_EQ(ObSSMacroCacheType::MACRO_BLOCK, handle()->get_cache_type());
+    ASSERT_TRUE(handle()->get_is_write_cache());
+    ASSERT_EQ(tablet_id, handle()->get_effective_tablet_id());
+    // 显式回收测试构造的块，不把清理责任交给 COLD 策略。
+    bool is_write_cache = false;
+    OK(macro_cache_mgr->evict_by_macro_id(macro_id, is_write_cache));
+  }
+  OK(exe_sql("drop table if exists test_cold_write_cache"));
+  LOG_INFO("========== test_cold_preserves_write_cache end ==========");
+}
 
 TEST_F(ObStorageCachePolicyColdTest, test_cold_merge)
 {
@@ -2113,7 +2040,7 @@ TEST_F(ObStorageCachePolicyColdTest, test_invalidate_tablet_tasks_from_schema)
 }
 
 // ============================================================================
-// BLOCK 存储缓存策略禁用路径（2 个用例）
+// 退役 BLOCK 粒度的解析错误传播（2 个用例）
 // ============================================================================
 
 // ----------------------------------------------------------------------------
@@ -2122,7 +2049,7 @@ TEST_F(ObStorageCachePolicyColdTest, test_invalidate_tablet_tasks_from_schema)
 // 场景：通过正常 SQL 创建一张 GLOBAL AUTO 表，再复制其完整 schema。
 // 操作：直接把 schema 副本改为 BLOCK，绕过 SQL resolver 调用 check_table_options；
 //       随后把同一 schema 改回 GLOBAL AUTO 作为对照。
-// 校验：BLOCK 返回 OB_NOT_SUPPORTED；GLOBAL AUTO 返回 OB_SUCCESS。
+// 校验：未知粒度 BLOCK 返回 OB_INVALID_ARGUMENT；GLOBAL AUTO 返回 OB_SUCCESS。
 // ----------------------------------------------------------------------------
 TEST_F(ObStorageCachePolicyColdTest, test_reject_block_policy_before_schema_persistence)
 {
@@ -2151,7 +2078,7 @@ TEST_F(ObStorageCachePolicyColdTest, test_reject_block_policy_before_schema_pers
   LOG_INFO("step 1 done: full schema fetched",
       K(table_schema->get_table_id()), K(table_schema->get_storage_cache_policy()));
 
-  // step 2：直接注入 BLOCK 字符串，验证 schema 落库兜底不依赖 resolver。
+  // step 2：直接注入 BLOCK 字符串，验证持久化检查会传播未知粒度的解析错误。
   share::schema::ObTableSchema test_schema;
   OK(test_schema.assign(*table_schema));
   OK(test_schema.set_storage_cache_policy(BLOCK_POLICY));
@@ -2159,9 +2086,9 @@ TEST_F(ObStorageCachePolicyColdTest, test_reject_block_policy_before_schema_pers
       K(test_schema.get_table_id()), K(test_schema.get_storage_cache_policy()));
   int ret = share::schema::ObTableSqlService::check_table_options(test_schema);
   LOG_INFO("step 2 done: BLOCK policy checked", KR(ret), K(test_schema.get_table_id()));
-  ASSERT_EQ(OB_NOT_SUPPORTED, ret);
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ret);
 
-  // step 3：改回 GLOBAL AUTO，确认新增 guard 不影响合法策略。
+  // step 3：改回 GLOBAL AUTO，确认合法策略仍能通过检查。
   OK(test_schema.set_storage_cache_policy(storage::OB_DEFAULT_STORAGE_CACHE_POLICY_STR));
   LOG_INFO("step 3: verify GLOBAL AUTO policy is accepted",
       K(test_schema.get_table_id()), K(test_schema.get_storage_cache_policy()));
@@ -2180,8 +2107,8 @@ TEST_F(ObStorageCachePolicyColdTest, test_reject_block_policy_before_schema_pers
 //
 // 场景：手工构造 TIME simple schema 和带 BLOCK JSON 的 full schema。
 // 操作：通过隔离的 mock schema service 注入 full schema，直接调用 retrive_table_policy，
-//       完全绕过 SQL resolver 和 schema 持久化 guard。
-// 校验：返回 OB_NOT_SUPPORTED，输出的 ObTablePolicyInfo 保持未初始化状态。
+//       完全绕过 SQL resolver 和 schema 持久化检查。
+// 校验：未知粒度 BLOCK 返回 OB_INVALID_ARGUMENT，ObTablePolicyInfo 保持未初始化。
 // ----------------------------------------------------------------------------
 TEST_F(ObStorageCachePolicyColdTest, test_retrive_rejects_injected_block_policy)
 {
@@ -2222,7 +2149,7 @@ TEST_F(ObStorageCachePolicyColdTest, test_retrive_rejects_injected_block_policy)
   ASSERT_EQ(ObStorageCachePolicyType::TIME_POLICY,
       simple_table_schema.get_storage_cache_policy_type());
 
-  // step 3：从 mock schema service 加载 BLOCK full schema，验证 runtime guard 直接拒绝。
+  // step 3：加载 BLOCK full schema，验证 runtime 会传播未知粒度的解析错误。
   LOG_INFO("step 3: retrieve injected BLOCK policy", K(TEST_TABLE_ID));
   ObStorageCachePolicyService policy_service;
   policy_service.tenant_id_ = OB_SYS_TENANT_ID;
@@ -2231,7 +2158,7 @@ TEST_F(ObStorageCachePolicyColdTest, test_retrive_rejects_injected_block_policy)
   const int ret = policy_service.retrive_table_policy(&simple_table_schema, table_policy_info);
   LOG_INFO("step 3 done: injected BLOCK policy retrieved",
       KR(ret), K(TEST_TABLE_ID), K(table_policy_info));
-  ASSERT_EQ(OB_NOT_SUPPORTED, ret);
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ret);
   ASSERT_FALSE(table_policy_info.is_inited());
   LOG_INFO("========== test_retrive_rejects_injected_block_policy end ==========",
       K(TEST_TABLE_ID), KR(ret));
