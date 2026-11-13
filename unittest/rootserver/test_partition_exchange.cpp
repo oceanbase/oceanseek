@@ -25,6 +25,67 @@ public:
   using ObPartitionExchange::check_search_index_definition_compatibility_;
 };
 
+TEST(TestPartitionExchange, reject_fulltext_partition_exchange)
+{
+  const ObIndexType index_types[] = {
+      INDEX_TYPE_FTS_INDEX_LOCAL,
+      INDEX_TYPE_ASYNC_FTS_INDEX_LOCAL,
+      INDEX_TYPE_SEARCH_DEF_INDEX_LOCAL,
+      INDEX_TYPE_ASYNC_SEARCH_DEF_INDEX_LOCAL,
+      INDEX_TYPE_DOC_ID_ROWKEY_LOCAL};
+  for (const ObPartitionLevel level : {PARTITION_LEVEL_ONE, PARTITION_LEVEL_TWO}) {
+    for (const ObIndexType index_type : index_types) {
+      // Cover either side alone and both sides carrying an index.
+      for (int64_t sides = 1; sides <= 3; ++sides) {
+        SCOPED_TRACE(static_cast<int>(level));
+        SCOPED_TRACE(static_cast<int>(index_type));
+        SCOPED_TRACE(sides);
+        ObTableSchema schemas[2];
+        for (int64_t i = 0; i < 2; ++i) {
+          schemas[i].set_tenant_id(1001);
+          schemas[i].set_table_id(500001 + i);
+          schemas[i].set_table_type(USER_TABLE);
+          if (sides & (1 << i)) {
+            ASSERT_EQ(OB_SUCCESS, schemas[i].add_simple_index_info(
+                ObAuxTableMetaInfo(500101 + i, USER_INDEX, index_type)));
+          }
+        }
+        ObTableSchema &partitioned = schemas[0];
+        partitioned.set_part_level(level);
+        partitioned.set_part_num(1);
+        partitioned.get_part_option().set_part_func_type(PARTITION_FUNC_TYPE_RANGE);
+        ObPartition part;
+        part.set_tenant_id(1001);
+        part.set_table_id(partitioned.get_table_id());
+        part.set_part_id(0);
+        part.set_part_idx(0);
+        ASSERT_EQ(OB_SUCCESS, part.set_part_name("p0"));
+        if (PARTITION_LEVEL_TWO == level) {
+          partitioned.get_sub_part_option().set_part_func_type(PARTITION_FUNC_TYPE_RANGE);
+          part.set_sub_part_num(1);
+          ObSubPartition subpart;
+          subpart.set_tenant_id(1001);
+          subpart.set_table_id(partitioned.get_table_id());
+          subpart.set_part_id(0);
+          subpart.set_sub_part_id(0);
+          subpart.set_sub_part_idx(0);
+          ASSERT_EQ(OB_SUCCESS, subpart.set_part_name("sp0"));
+          ASSERT_EQ(OB_SUCCESS, part.add_partition(subpart));
+        }
+        ASSERT_EQ(OB_SUCCESS, partitioned.add_partition(part));
+        const ObString partition_name = PARTITION_LEVEL_ONE == level ? "p0" : "sp0";
+        const int expected_ret = INDEX_TYPE_FTS_INDEX_LOCAL == index_type
+            || INDEX_TYPE_ASYNC_FTS_INDEX_LOCAL == index_type ? OB_NOT_SUPPORTED : OB_SUCCESS;
+        EXPECT_EQ(expected_ret, ObPartitionExchange::check_partition_exchange_schema_for_user(
+            schemas[0], schemas[1], partition_name, DATA_VERSION_4_6_2_1, level));
+        // An earlier partition lookup error must not be replaced by the fulltext restriction.
+        EXPECT_EQ(OB_UNKNOWN_PARTITION, ObPartitionExchange::check_partition_exchange_schema_for_user(
+            schemas[0], schemas[1], "missing", DATA_VERSION_4_6_2_1, level));
+      }
+    }
+  }
+}
+
 TEST(TestPartitionExchange, reject_sync_async_search_definition_types)
 {
   ObDDLService ddl_service;

@@ -389,6 +389,22 @@ int ObPartitionExchange::check_partition_exchange_schema_for_user(
     }
   }
 
+  // Check logical fulltext indexes only: doc-id mapping tables can also belong
+  // to other index families. Both SQL resolution and RS execution use this check.
+  const ObTableSchema *exchange_schemas[] = {&base_table_schema, &inc_table_schema};
+  for (int64_t i = 0; OB_SUCC(ret) && i < 2; ++i) {
+    const ObIArray<ObAuxTableMetaInfo> &index_infos = exchange_schemas[i]->get_simple_index_infos();
+    for (int64_t j = 0; OB_SUCC(ret) && j < index_infos.count(); ++j) {
+      const ObAuxTableMetaInfo &index_info = index_infos.at(j);
+      if (is_fts_index_aux(index_info.index_type_) || is_async_fts_index(index_info.index_type_)) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("partition exchange with fulltext index is not supported", KR(ret),
+            "table_id", exchange_schemas[i]->get_table_id(), K(index_info));
+        LOG_USER_ERROR(OB_NOT_SUPPORTED,
+            "Exchange partition or subpartition involving a table with a fulltext index is");
+      }
+    }
+  }
   return ret;
 }
 
