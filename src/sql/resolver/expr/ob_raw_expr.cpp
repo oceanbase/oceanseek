@@ -4651,13 +4651,6 @@ bool ObSysFunRawExpr::inner_json_expr_same_as(
     bool_ret = l_expr->same_as(*r_expr, check_context);
   }
 
-  if (bool_ret
-      && l_expr->get_expr_type() == r_expr->get_expr_type()
-      && (T_FUN_SYS_JSON_VALUE == l_expr->get_expr_type()
-          || T_FUN_SYS_JSON_EXTRACT == l_expr->get_expr_type())) {
-    bool_ret = (l_expr->get_pick() == r_expr->get_pick());
-  }
-
   return bool_ret;
 }
 
@@ -4740,6 +4733,12 @@ bool ObSysFunRawExpr::inner_same_as(
            T_FUN_SYS_CALC_PARTITION_TABLET_ID == get_expr_type()) &&
           get_ref_table_id() != expr.get_ref_table_id()) { // for calc_partition_id
         bool_ret = false;
+      }
+
+      if (bool_ret
+          && (T_FUN_SYS_JSON_VALUE == get_expr_type()
+              || T_FUN_SYS_JSON_EXTRACT == get_expr_type())) {
+        bool_ret = get_pick() == s_expr->get_pick();
       }
 
       // for json partial update
