@@ -1527,33 +1527,33 @@ TEST_F(ObDASBooleanQueryTest, selected_probe_is_ordered_after_all_driver_candida
 TEST_F(ObDASBooleanQueryTest, topk_range_probe_cost_respects_work_and_opt_out)
 {
   const int64_t n = 8841823;
-  EXPECT_TRUE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 880000, n, 10, 1000));
-  EXPECT_TRUE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 7920000, n, 100, 1000));
-  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 88000, n, 10, 1000));
-  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 880000, n, 100, 1000));
-  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 7920000, n, 10, 1000000000));
-  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 7920000, n, 10, 0));
-  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 7920000, n, 0, 1));
-  EXPECT_TRUE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, n, n, 101, 1));
-  EXPECT_TRUE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, n, n, 1000, 1));
-  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, n, n, 1001, 1));
+  EXPECT_TRUE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 880000, n, 10, 1000, 0.0));
+  EXPECT_TRUE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 7920000, n, 100, 1000, 0.0));
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 88000, n, 10, 1000, 0.0));
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 880000, n, 100, 1000, 0.0));
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 7920000, n, 10, 1000000000, 0.0));
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 7920000, n, 10, 0, 0.0));
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 7920000, n, 0, 1, 0.0));
+  EXPECT_TRUE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, n, n, 101, 1, 0.0));
+  EXPECT_TRUE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, n, n, 1000, 1, 0.0));
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, n, n, 1001, 1, 0.0));
   EXPECT_TRUE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(
-      1000000000, 100000000, 1000000000, 1000, 1));
-  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(-1, 7920000, n, 10, 1000));
-  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 0, n, 10, 1000));
-  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, n + 1, n, 10, 1000));
+      1000000000, 100000000, 1000000000, 1000, 1, 0.0));
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(-1, 7920000, n, 10, 1000, 0.0));
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 0, n, 10, 1000, 0.0));
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, n + 1, n, 10, 1000, 0.0));
 }
 
 TEST_F(ObDASBooleanQueryTest, topk_probe_default_ratio_calibration_is_monotonic)
 {
   const int64_t n = 8841823;
-  EXPECT_TRUE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 880000, n, 10, 1000));
-  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 880000, n, 10, 2000));
-  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 440000, n, 10, 1000));
-  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 440000, n, 10, 250));
-  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 88000, n, 10, 1));
-  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 88000, n, 10, 0));
-  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 7920000, n, 10, 1000000000));
+  EXPECT_TRUE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 880000, n, 10, 1000, 0.0));
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 880000, n, 10, 2000, 0.0));
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 440000, n, 10, 1000, 0.0));
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 440000, n, 10, 250, 0.0));
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 88000, n, 10, 1, 0.0));
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 88000, n, 10, 0, 0.0));
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 7920000, n, 10, 1000000000, 0.0));
 }
 
 TEST_F(ObDASBooleanQueryTest, topk_probe_small_ratio_preserves_work_budget_floor)
@@ -1561,10 +1561,57 @@ TEST_F(ObDASBooleanQueryTest, topk_probe_small_ratio_preserves_work_budget_floor
   const int64_t n = 8841823;
   const int64_t ratios[] = {1, 10, 100, 256, 512, 1000};
   for (const int64_t ratio : ratios) {
-    EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 88000, n, 10, ratio));
-    EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 440000, n, 10, ratio));
-    EXPECT_TRUE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 880000, n, 10, ratio));
+    EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 88000, n, 10, ratio, 0.0));
+    EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 440000, n, 10, ratio, 0.0));
+    EXPECT_TRUE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, 880000, n, 10, ratio, 0.0));
   }
+}
+
+TEST_F(ObDASBooleanQueryTest, topk_match_penalty_distinguishes_saturated_match_costs)
+{
+  const int64_t n = 8841823;
+  const int64_t f = 884183;
+  EXPECT_TRUE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, f, n, 10, 1000, 0.0));
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, f, n, 10, 1000, 0.125));
+  EXPECT_TRUE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(5305093, f, n, 10, 1000, 0.125));
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(6189276, f, n, 10, 1000, 0.125));
+  EXPECT_TRUE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(6631367, f, n, 10, 1000, 0.1));
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(6631367, f, n, 10, 1000, 0.125));
+}
+
+TEST_F(ObDASBooleanQueryTest, topk_match_penalty_applies_outside_match_cap)
+{
+  // MATCH caps candidates at 100. The penalty still raises their cost above F.
+  EXPECT_TRUE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(100, 25610, 100000, 1, 1000, 0.0));
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(100, 25610, 100000, 1, 1000, 0.8));
+}
+
+TEST_F(ObDASBooleanQueryTest, topk_match_penalty_preserves_equality_and_budget_floor)
+{
+  // At beta=.25, G0=1024 and U=256: the weighted cost is exactly 327680.
+  EXPECT_TRUE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(1048576, 327680, 1048576, 10, 1000, 0.25));
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(1048576, 327679, 1048576, 10, 1000, 0.25));
+  EXPECT_TRUE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(1048576, 327681, 1048576, 10, 1000, 0.25));
+  // K=1 and K=4 must use the same minimum candidate budget of 128.
+  for (const int64_t f : {400000, 600000, 884183}) {
+    EXPECT_EQ(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(8841823, f, 8841823, 1, 1000, 0.125),
+              ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(8841823, f, 8841823, 4, 1000, 0.125));
+  }
+}
+
+TEST_F(ObDASBooleanQueryTest, topk_match_penalty_clamps_selectivity_and_handles_invalid_weight)
+{
+  const int64_t n = 8841823;
+  const int64_t f = 884183;
+  // Both cardinalities exceed the candidate cap; m must not exceed one.
+  EXPECT_TRUE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, f, n, 10, 1000, 0.05));
+  EXPECT_TRUE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(2 * n, f, n, 10, 1000, 0.05));
+  for (const double beta : {-1.0, std::numeric_limits<double>::quiet_NaN(),
+                            std::numeric_limits<double>::infinity()}) {
+    EXPECT_TRUE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, f, n, 10, 1000, beta));
+  }
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(n, f, 0, 10, 1000, 0.125));
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(0, f, n, 10, 1000, 0.125));
 }
 
 TEST_F(ObDASBooleanQueryTest, topk_range_probe_generation_preserves_legacy_and_guards)

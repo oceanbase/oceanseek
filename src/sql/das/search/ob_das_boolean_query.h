@@ -238,7 +238,7 @@ private:
       bool &skip_bmm) const;
   static bool is_topk_range_probe_cost_effective(
       int64_t match_rows, int64_t filter_rows, int64_t table_rows,
-      int64_t topk, int64_t primary_get_ratio);
+      int64_t topk, int64_t primary_get_ratio, double beta_match);
   static void move_selected_probe_after_drivers(
       common::ObIArray<ObIDASSearchRtDef *> &required_clauses,
       ObIDASSearchRtDef *probe_clause);

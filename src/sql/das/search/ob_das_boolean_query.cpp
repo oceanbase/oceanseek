@@ -4,6 +4,7 @@
  */
 
 #define USING_LOG_PREFIX SQL_DAS
+#include <cmath>
 #include "lib/container/ob_heap.h"
 #include "ob_das_boolean_query.h"
 #include "ob_das_search_define.h"
@@ -55,6 +56,7 @@ constexpr int64_t TOPK_PROBE_MIN_CANDIDATES = 128;
 constexpr int64_t TOPK_PROBE_CANDIDATES_PER_HIT = 32;
 constexpr int64_t TOPK_PROBE_REFERENCE_GET_TO_SCAN_RATIO = 256;
 constexpr int64_t TOPK_PROBE_REFERENCE_OPTION_RATIO = 1000;
+constexpr double TOPK_PROBE_MATCH_PENALTY = 0.125;
 
 class ObDASTopKProbeCostGuard
 {
@@ -1471,7 +1473,7 @@ void ObDASBooleanQueryRtDef::move_selected_probe_after_drivers(
 
 bool ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(
     int64_t match_rows, int64_t filter_rows, int64_t table_rows,
-    int64_t topk, int64_t primary_get_ratio)
+    int64_t topk, int64_t primary_get_ratio, double beta_match)
 {
   bool prefer_probe = false;
   if (match_rows > 0 && filter_rows > 0 && table_rows > 0
@@ -1488,7 +1490,14 @@ bool ObDASBooleanQueryRtDef::is_topk_range_probe_cost_effective(
         static_cast<double>(TOPK_PROBE_REFERENCE_GET_TO_SCAN_RATIO),
         static_cast<double>(TOPK_PROBE_REFERENCE_GET_TO_SCAN_RATIO)
             * static_cast<double>(primary_get_ratio) / TOPK_PROBE_REFERENCE_OPTION_RATIO);
-    prefer_probe = candidate_rows <= static_cast<double>(filter_rows) / get_to_scan_ratio;
+    const double match_selectivity = std::min(1.0, static_cast<double>(match_rows) / table_rows);
+    // This weights total execution risk, not the number of point gets. Keep it
+    // outside the candidate cap, including when match_rows limits the budget.
+    // Retain the original decision if the helper receives an invalid weight.
+    const double risk_weight = std::isfinite(beta_match) && beta_match >= 0.0
+        ? 1.0 + beta_match * match_selectivity : 1.0;
+    prefer_probe = candidate_rows * risk_weight
+        <= static_cast<double>(filter_rows) / get_to_scan_ratio;
   }
   return prefer_probe;
 }
@@ -1538,10 +1547,12 @@ int ObDASBooleanQueryRtDef::choose_topk_range_probe(
       const int64_t table_rows = search_ctx.get_row_count().cost();
       const int64_t topk = search_ctx.get_generating_topk_limit();
       const int64_t primary_get_ratio = ctdef->get_primary_get_ratio();
+      const double beta_match = TOPK_PROBE_MATCH_PENALTY;
+      const bool prefer_probe = is_topk_range_probe_cost_effective(
+          match_rows, filter_rows, table_rows, topk, primary_get_ratio, beta_match);
       LOG_TRACE("try topk range probe optimization", K(topk), K(match_rows),
-          K(filter_rows), K(table_rows), K(primary_get_ratio));
-      if (is_topk_range_probe_cost_effective(
-          match_rows, filter_rows, table_rows, topk, primary_get_ratio)) {
+          K(filter_rows), K(table_rows), K(primary_get_ratio), K(beta_match), K(prefer_probe));
+      if (prefer_probe) {
         probe_clause = filter_rtdef;
         LOG_TRACE("selected topk range probe optimization");
       }
