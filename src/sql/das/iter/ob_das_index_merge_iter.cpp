@@ -703,10 +703,8 @@ int ObDASIndexMergeIter::compare(IndexMergeRowStore &cur_store, IndexMergeRowSto
       if (OB_ISNULL(cur_datums) || OB_ISNULL(cmp_datums)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected nullptr", K(ret), K(cur_datums), K(cmp_datums));
-      } else if (OB_UNLIKELY(cur_datums->is_null() || cmp_datums->is_null())) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unexpected null datum", K(ret), KPC(cur_datums), KPC(cmp_datums));
       } else {
+        // Nullable clustering keys still require comparing every column of the complete rowkey.
         ObObj cur_obj;
         ObObj cmp_obj;
         for (int64_t i = 0; (cmp_ret == 0) && OB_SUCC(ret) && i < rowkey_exprs_->count(); i++) {
