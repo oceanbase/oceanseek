@@ -1399,6 +1399,8 @@ int ObHTableGetDescHandler::get_cf_desc(ObTableExecCtx &ctx)
       if (OB_ISNULL(table_schema)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("table schema is null", K(ret));
+      } else if (table_schema->get_database_id() != credential.database_id_) {
+        continue;
       } else if (OB_FAIL(ObTTLUtil::parse_kv_attributes(table_schema->get_kv_attributes(), kv_attr))) {
         LOG_WARN("failed to parse kv attributes", K(ret), K(table_schema->get_kv_attributes()));
       } else {
@@ -1475,13 +1477,24 @@ int ObHTableDisableTableHandler::handle(ObTableExecCtx &ctx, ObTableMetaResponse
                                                                   table_group_id,
                                                                   table_iter))) {
     LOG_WARN("failed to get table schemas", K(ret), K(tenant_id), K(table_group_id));
-  } else if (OB_FAIL(table_iter.get_next(schema))) {
-    if (OB_ITER_END == ret) {
-      ret = OB_SUCCESS; // empty tablegroup
-    } else {
-      LOG_WARN("fail to get next table schema", K(ret), K(tenant_id), K(table_group_id));
-    }
   } else {
+    while (OB_SUCC(ret)) {
+      if (OB_FAIL(table_iter.get_next(schema))) {
+        if (OB_ITER_END == ret) {
+          ret = OB_KV_HBASE_TABLE_NOT_FOUND;
+          LOG_WARN("table group not found in current database", K(ret), K_(table_group_name));
+        } else {
+          LOG_WARN("fail to get next table schema", K(ret), K(tenant_id), K(table_group_id));
+        }
+      } else if (OB_ISNULL(schema)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("table schema is null", K(ret));
+      } else if (schema->get_database_id() == ctx.get_credential().database_id_) {
+        break;
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
     // 2. check if sub-tables is disabled. if disabled，then return OB_KV_TABLE_NOT_DISABLED
     ObKVAttr kv_attr;
     if (OB_ISNULL(schema)) {
@@ -1533,14 +1546,24 @@ int ObHTableEnableTableHandler::handle(ObTableExecCtx &ctx, ObTableMetaResponse 
                                                                   table_group_id,
                                                                   table_iter))) {
     LOG_WARN("failed to get table schemas", K(ret), K(tenant_id), K(table_group_id));
-  } else if (OB_FAIL(table_iter.get_next(schema))) {
-    if (OB_ITER_END == ret) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("failed to get table schemas", K(ret), K(tenant_id), K(table_group_id));
-    } else {
-      LOG_WARN("fail to get next table schema", K(ret), K(tenant_id), K(table_group_id));
-    }
   } else {
+    while (OB_SUCC(ret)) {
+      if (OB_FAIL(table_iter.get_next(schema))) {
+        if (OB_ITER_END == ret) {
+          ret = OB_KV_HBASE_TABLE_NOT_FOUND;
+          LOG_WARN("table group not found in current database", K(ret), K_(table_group_name));
+        } else {
+          LOG_WARN("fail to get next table schema", K(ret), K(tenant_id), K(table_group_id));
+        }
+      } else if (OB_ISNULL(schema)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("table schema is null", K(ret));
+      } else if (schema->get_database_id() == ctx.get_credential().database_id_) {
+        break;
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
     // 2. check if sub-tables is enabled. if enabled，then return OB_KV_TABLE_NOT_ENABLED
     ObKVAttr kv_attr;
     if (OB_ISNULL(schema)) {

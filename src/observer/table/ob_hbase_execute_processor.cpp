@@ -284,7 +284,12 @@ int ObHbaseExecuteP::check_mode_defense()
   int ret = OB_SUCCESS;
   bool is_multi_cf_req = arg_.cf_rows_.count() > 1;
   bool is_series_mode = schema_cache_guard_.get_hbase_mode_type() == ObHbaseModeType::OB_HBASE_SERIES_TYPE;
-  if (is_series_mode) {
+  if (schema_cache_guard_.get_hbase_mode_type() == ObHbaseModeType::OB_INVALID_MODE_TYPE) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("accessing non-hbase schema table via hbase client is not supported",
+             K(ret), K(schema_cache_guard_.get_table_name_str()));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "accessing non-hbase schema table via hbase client");
+  } else if (is_series_mode) {
     if (is_multi_cf_req) {
       ret = OB_NOT_SUPPORTED;
       LOG_WARN("for timeseries table, multi-family hbase put does not support", K(ret), K(arg_.cf_rows_));
