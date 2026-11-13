@@ -2499,24 +2499,24 @@ int ObMultiVersionMicroBlockRowScanner::lock_for_read(
     if (OB_TRANS_CTX_NOT_EXIST == ret
         && context_->tablet_id_.is_ls_mds_tablet()
         && context_->query_flag_.is_select_follower()) {
-        const int64_t snapshot_version = context_->trans_version_range_.snapshot_version_;
-      if (snapshot_version >= sstable_->get_end_scn().get_val_for_tx()) {
-        ret = OB_ERR_UNEXPECTED;
-        STORAGE_LOG(ERROR, "follower mds read: tx ctx missing but read snapshot beyond sstable end_scn",
-                    K(snapshot_version), K(sstable_->get_end_scn()), K(lock_for_read_arg));
-      } else {
-        ret = OB_SUCCESS;
-        lfr_result.can_read_ = context_->query_flag_.iter_uncommitted_row();
-        lfr_result.trans_version_.set_min();
-        lfr_result.prepare_version_.set_min();
-        lfr_result.end_scn_ = SCN::max_scn();
-        lfr_result.tx_state_ = transaction::ObTxState::INIT;
-        STORAGE_LOG(INFO, "[MDS_DEBUG] follower mds lock_for_read: CTX_NOT_EXIST",
-                    K(snapshot_version), "end_scn", sstable_->get_end_scn(),
-                    "data_trans_id", lock_for_read_arg.data_trans_id_,
-                    K(context_->query_flag_),
-                    K(context_->tablet_id_));
-      }
+      // A follower may load shared MDS rows ahead of local transaction replay.
+      // Neither the read snapshot nor the SSTable end SCN proves that both
+      // TxCtx and TxData have been recovered. Waiting for a later transaction
+      // here can block the earlier log whose replay is doing this read.
+      // Recovery committed reads therefore treat this version as temporarily
+      // invisible, allowing an older or empty result even if it has committed
+      // elsewhere. Reads including uncommitted rows expose it as undecided.
+      ret = OB_SUCCESS;
+      lfr_result.can_read_ = context_->query_flag_.iter_uncommitted_row();
+      lfr_result.trans_version_.set_min();
+      lfr_result.prepare_version_.set_min();
+      lfr_result.end_scn_ = SCN::max_scn();
+      lfr_result.tx_state_ = transaction::ObTxState::INIT;
+      STORAGE_LOG(DEBUG, "[MDS_DEBUG] follower mds lock_for_read: CTX_NOT_EXIST",
+                  "snapshot_version", context_->trans_version_range_.snapshot_version_,
+                  "end_scn", sstable_->get_end_scn(),
+                  "data_trans_id", lock_for_read_arg.data_trans_id_,
+                  K(context_->query_flag_), K(context_->tablet_id_));
     }
     if (OB_FAIL(ret)) {
       LOG_WARN("failed to check transaction status", K(ret), K(lock_for_read_arg), K(context_->query_flag_));

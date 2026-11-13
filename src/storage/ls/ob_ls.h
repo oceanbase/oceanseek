@@ -1199,8 +1199,7 @@ private:
 private:
   bool is_inited_;
   uint64_t tenant_id_;
-  // set running state of ls.
-  // WARN: MUST PROTECT WITH LS LOCK.
+  // Serialize running-state transitions with the LS lock. State samples are atomic.
   ObLSRunningState running_state_;
   // protected by lock_, and change while running/disk state changed
   int64_t state_seq_;

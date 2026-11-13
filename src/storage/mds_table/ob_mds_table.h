@@ -323,21 +323,18 @@ private:
   {
     ObMdsRowReadInfo()
       : trans_version_(INT64_MAX),
-        row_trans_id_(),
-        writer_tx_id_(0),
+        writer_tx_id_(),
         is_uncommitted_(false)
     {}
     void reset()
     {
       trans_version_ = INT64_MAX;
-      row_trans_id_.reset();
-      writer_tx_id_ = 0;
+      writer_tx_id_.reset();
       is_uncommitted_ = false;
     }
-    TO_STRING_KV(K_(trans_version), K_(row_trans_id), K_(writer_tx_id), K_(is_uncommitted));
+    TO_STRING_KV(K_(trans_version), K_(writer_tx_id), K_(is_uncommitted));
     int64_t trans_version_;
-    transaction::ObTransID row_trans_id_;
-    int64_t writer_tx_id_;
+    transaction::ObTransID writer_tx_id_;
     bool is_uncommitted_;
   };
   struct ObMdsReadArg
@@ -447,10 +444,8 @@ private:
     }
     TO_STRING_KV(KP_(row_info), KP_(key), KP_(value), KP_(meta), KP_(kv_convert_func));
   };
-  // Read the row info (including row_trans_id_ used for lock detection) for a
-  // single mds key. Internally forces read_uncommitted=true: row_trans_id_ is
-  // only populated when the SSTable scan is configured with iter_uncommitted_row,
-  // so this entry point owns that invariant on behalf of callers (e.g. is_locked_by_others).
+  // Read the writer identity from WRITER_TRANS_ID for lock detection on one MDS
+  // key. Include uncommitted rows so callers can observe the current lock owner.
   template <typename K, typename V>
   int get_mds_row_read_info_(
       common::ObIAllocator *allocator,
@@ -491,7 +486,6 @@ private:
       ObMdsValueMeta &meta);
   int prepare_mds_read_snapshot_(
       const share::SCN &read_snapshot,
-      const ObTabletHandle &ls_mds_handle,
       share::SCN &effective_read_snapshot,
       bool &is_select_follower);
   int direct_commit_mds_node_(const common::ObTabletID &tablet_id,
@@ -570,9 +564,7 @@ inline int ObMdsTable::get_mds_row_read_info_(common::ObIAllocator *allocator,
   if (OB_FAIL(key.mds_serialize(key_buf, static_cast<int64_t>(sizeof(key_buf)), pos))) {
     MDS_LOG(WARN, "failed to serialize mds key", K(ret));
   } else {
-    // read_uncommitted is hardcoded true: ObMdsRowReadInfo::row_trans_id_ is
-    // sourced from ObDatumRow::get_trans_id(), which only returns a meaningful
-    // value when the underlying scan was opened with iter_uncommitted_row.
+    // Include the uncommitted version when checking who owns the row lock.
     ObMdsReadArg read_arg(
         allocator,
         tablet_id,

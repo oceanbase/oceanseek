@@ -20,14 +20,17 @@ namespace storage {
 
 class ObTxDataCacheKey : public common::ObIKVCacheKey {
 public:
-  ObTxDataCacheKey() : tenant_id_(0), ls_id_(0), tx_id_(0) {}
-  ObTxDataCacheKey(int64_t tenant_id, share::ObLSID ls_id, transaction::ObTransID tx_id)
-      : tenant_id_(tenant_id), ls_id_(ls_id), tx_id_(tx_id) {}
+  ObTxDataCacheKey() : tenant_id_(0), ls_id_(0), ls_epoch_(-1), tx_table_epoch_(-1), tx_id_(0) {}
+  ObTxDataCacheKey(int64_t tenant_id, share::ObLSID ls_id, int64_t ls_epoch,
+                   int64_t tx_table_epoch, transaction::ObTransID tx_id)
+      : tenant_id_(tenant_id), ls_id_(ls_id), ls_epoch_(ls_epoch),
+        tx_table_epoch_(tx_table_epoch), tx_id_(tx_id) {}
   ~ObTxDataCacheKey() {}
 
   bool is_valid() const
   {
-    bool is_valid = common::is_valid_tenant_id(tenant_id_) && ls_id_.is_valid() && tx_id_.is_valid();
+    bool is_valid = common::is_valid_tenant_id(tenant_id_) && ls_id_.is_valid()
+        && ls_epoch_ >= 0 && tx_table_epoch_ >= 0 && tx_id_.is_valid();
     return is_valid;
   }
 
@@ -35,13 +38,15 @@ public:
 
   transaction::ObTransID get_tx_id() const { return tx_id_; }
 
-  TO_STRING_KV(K_(tenant_id), K_(ls_id), K_(tx_id));
+  TO_STRING_KV(K_(tenant_id), K_(ls_id), K_(ls_epoch), K_(tx_table_epoch), K_(tx_id));
 
 public:  // derived from ObIKVCacheKey
   virtual bool operator==(const ObIKVCacheKey &other) const
   {
     const ObTxDataCacheKey &rhs = static_cast<const ObTxDataCacheKey&>(other);
-    bool equal = (tenant_id_ == rhs.get_tenant_id() && ls_id_ == rhs.get_ls_id() && tx_id_ == rhs.get_tx_id());
+    bool equal = (tenant_id_ == rhs.get_tenant_id() && ls_id_ == rhs.get_ls_id()
+        && ls_epoch_ == rhs.ls_epoch_ && tx_table_epoch_ == rhs.tx_table_epoch_
+        && tx_id_ == rhs.get_tx_id());
     return equal;
   }
 
@@ -50,6 +55,8 @@ public:  // derived from ObIKVCacheKey
     uint64_t hash_code = 0;
     hash_code = murmurhash(&tenant_id_, sizeof(tenant_id_), hash_code);
     hash_code = murmurhash(&ls_id_, sizeof(ls_id_), hash_code);
+    hash_code = murmurhash(&ls_epoch_, sizeof(ls_epoch_), hash_code);
+    hash_code = murmurhash(&tx_table_epoch_, sizeof(tx_table_epoch_), hash_code);
     hash_code = murmurhash(&tx_id_, sizeof(tx_id_), hash_code);
     return hash_code;
   }
@@ -65,7 +72,8 @@ public:  // derived from ObIKVCacheKey
       ret = OB_INVALID_ARGUMENT;
       STORAGE_LOG(WARN, "invalid argument", KR(ret), K(buf_len), K(size()));
     } else {
-      ObTxDataCacheKey *new_key = new (buf) ObTxDataCacheKey(tenant_id_, ls_id_, tx_id_);
+      ObTxDataCacheKey *new_key = new (buf) ObTxDataCacheKey(
+          tenant_id_, ls_id_, ls_epoch_, tx_table_epoch_, tx_id_);
       if (OB_ISNULL(new_key)) {
         ret = OB_ERR_UNEXPECTED;
         STORAGE_LOG(WARN, "new key ptr is null", KR(ret), KPC(this));
@@ -79,6 +87,9 @@ public:  // derived from ObIKVCacheKey
 private:
   int64_t tenant_id_;
   share::ObLSID ls_id_;
+  // LS recreation and repeated online of the same LS are distinct generations.
+  int64_t ls_epoch_;
+  int64_t tx_table_epoch_;
   transaction::ObTransID tx_id_;
 };
 

@@ -259,10 +259,8 @@ struct ObLockForReadArg
   bool read_elr_;
   // When true, lock_for_read bypasses the tenant-wide TX_DATA_KV_CACHE (and the
   // per-context mini cache) and queries tx_ctx_table_ / tx_data_table_ directly.
-  // Used by MDS read_uncommitted paths that may execute on an LS whose replay
-  // has not caught up after rebuild: the kv_cache key includes ls_id but is not
-  // invalidated on LS rebuild, so it can hand back a stale COMMIT decision that
-  // races the local tx_ctx still being in RUNNING/replaying state.
+  // MDS read_uncommitted paths use this to resolve the local transaction state
+  // directly. The shared cache also isolates LS creation and online generations.
   bool skip_cache_;
   // When set, lock_for_read never infers the tx state from remote participants
   // (check_for_standby) on a standby/restore replica. If the state is locally

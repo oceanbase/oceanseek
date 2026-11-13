@@ -756,7 +756,8 @@ int ObTxTable::check_tx_data_in_mini_cache_(ObReadTxDataArg &read_tx_data_arg, O
 int ObTxTable::check_tx_data_in_kv_cache_(ObReadTxDataArg &read_tx_data_arg, ObITxDataCheckFunctor &fn)
 {
   int ret = OB_SUCCESS;
-  ObTxDataCacheKey key(MTL_ID(), ls_id_, read_tx_data_arg.tx_id_);
+  const ObTxDataCacheKey key(MTL_ID(), ls_id_, ls_->get_ls_epoch(),
+                             read_tx_data_arg.read_epoch_, read_tx_data_arg.tx_id_);
   ObTxDataValueHandle val_handle;
 
   if (OB_FAIL(OB_TX_DATA_KV_CACHE.get_row(key, val_handle))) {
@@ -836,7 +837,7 @@ int ObTxTable::check_tx_data_in_tables_(ObReadTxDataArg &read_tx_data_arg, ObITx
         }
 
         int tmp_ret = OB_SUCCESS;
-        if (OB_TMP_FAIL(put_tx_data_into_kv_cache_(*tx_data))) {
+        if (OB_TMP_FAIL(put_tx_data_into_kv_cache_(*tx_data, read_tx_data_arg.read_epoch_))) {
           STORAGE_LOG(WARN, "put tx data into kv cache failed", KR(tmp_ret), KPC(tx_data));
         }
       }
@@ -846,10 +847,12 @@ int ObTxTable::check_tx_data_in_tables_(ObReadTxDataArg &read_tx_data_arg, ObITx
   return ret;
 }
 
-int ObTxTable::put_tx_data_into_kv_cache_(const ObTxData &tx_data)
+int ObTxTable::put_tx_data_into_kv_cache_(const ObTxData &tx_data, const int64_t read_epoch)
 {
   int ret = OB_SUCCESS;
-  const ObTxDataCacheKey key(MTL_ID(), ls_id_, tx_data.tx_id_);
+  // A read from an earlier online generation must not populate the current
+  // generation, even if online() ran while this read was in flight.
+  const ObTxDataCacheKey key(MTL_ID(), ls_id_, ls_->get_ls_epoch(), read_epoch, tx_data.tx_id_);
   ObTxDataCacheValue cache_value;
 
   if (OB_FAIL(cache_value.init(tx_data))) {

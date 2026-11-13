@@ -100,8 +100,8 @@ struct ObITabletMdsInterface::IsLockedByOthersOp
         }
       } else {
         const bool is_self_tx = self_writer_.writer_type_ == mds::WriterType::TRANSACTION
-                             && row_info_.row_trans_id_.is_valid()
-                             && row_info_.row_trans_id_.get_id() == self_writer_.writer_id_;
+                             && row_info_.writer_tx_id_.is_valid()
+                             && row_info_.writer_tx_id_.get_id() == self_writer_.writer_id_;
         is_locked_ = row_info_.is_uncommitted_ && !is_self_tx;
         MDS_LOG(TRACE, "success to get is locked by others state", K(ret), KPC(&self_iface_), K(is_locked_));
       }

@@ -412,7 +412,7 @@ private:
   int check_tx_data_in_mini_cache_(ObReadTxDataArg &read_tx_data_arg, ObITxDataCheckFunctor &fn);
   int check_tx_data_in_kv_cache_(ObReadTxDataArg &read_tx_data_arg, ObITxDataCheckFunctor &fn);
   int check_tx_data_in_tables_(ObReadTxDataArg &read_tx_data_arg, ObITxDataCheckFunctor &fn);
-  int put_tx_data_into_kv_cache_(const ObTxData &tx_data);
+  int put_tx_data_into_kv_cache_(const ObTxData &tx_data, const int64_t read_epoch);
   int get_recycle_scn_(const int64_t tx_result_retention_s, share::SCN &real_recycle_scn);
   void check_state_and_epoch_(const transaction::ObTransID tx_id,
                               const int64_t read_epoch,

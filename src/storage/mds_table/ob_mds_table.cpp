@@ -388,7 +388,7 @@ int ObMdsTable::table_scan_by_mds_type_(
     LOG_WARN("ls tablet service is null", K(ret), KP(ls_));
   } else if (OB_FAIL(ls_tablet_svr->get_tablet(LS_MDS_TABLET, ls_mds_handle))) {
     LOG_WARN("failed to get ls mds tablet", K(ret), K_(ls_id));
-  } else if (OB_FAIL(prepare_mds_read_snapshot_(read_snapshot, ls_mds_handle, effective_read_snapshot, is_follower))) {
+  } else if (OB_FAIL(prepare_mds_read_snapshot_(read_snapshot, effective_read_snapshot, is_follower))) {
     LOG_WARN("prepare mds scan snapshot failed", K(ret), K_(ls_id), K(read_snapshot), K(is_follower));
   } else if (OB_FAIL(build_mds_scan_key_range_(allocator, tablet_id, transfer_scn, mds_unit_id,
                                                key_range_buf, key_range))) {
@@ -481,7 +481,6 @@ int ObMdsTable::build_mds_scan_key_range_(
 
 int ObMdsTable::prepare_mds_read_snapshot_(
     const share::SCN &read_snapshot,
-    const ObTabletHandle &ls_mds_handle,
     share::SCN &effective_read_snapshot,
     bool &is_follower)
 {
@@ -490,36 +489,25 @@ int ObMdsTable::prepare_mds_read_snapshot_(
   is_follower = false;
   common::ObRole ls_role = common::ObRole::INVALID_ROLE;
   int64_t proposal_id = 0;
-  if (OB_FAIL(ls_->get_log_handler()->get_role(ls_role, proposal_id))) {
+  if (OB_UNLIKELY(!read_snapshot.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid read snapshot", K(ret), K_(ls_id), K(read_snapshot));
+  } else if (OB_ISNULL(ls_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ls is null", K(ret), K_(ls_id), K(read_snapshot), KP(ls_));
+  } else if (ls_->is_offline()) {
+    ret = OB_LS_OFFLINE;
+    LOG_WARN("ls is offline", K(ret), K_(ls_id), K(read_snapshot), KPC(ls_));
+  } else if (OB_FAIL(ls_->get_log_handler()->get_role(ls_role, proposal_id))) {
     LOG_WARN("get ls role failed", K(ret), K_(ls_id));
   } else if (common::ObRole::FOLLOWER == ls_role) {
     is_follower = true;
-    share::SCN max_decided_scn;
-    if (OB_FAIL(ls_->get_max_decided_scn(max_decided_scn))) {
-      LOG_WARN("get_max_decided_scn failed", K(ret), K_(ls_id));
-      if (OB_STATE_NOT_MATCH == ret) {
-        if (ls_->is_offline()) {
-          ret = OB_LS_OFFLINE;
-          LOG_WARN("ls is offline", K(ret), K_(ls_id), KPC(ls_));
-        }
-      }
-    } else if (!max_decided_scn.is_valid()) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("max_decided_scn is invalid", K(ret), K_(ls_id));
-    } else if (read_snapshot > max_decided_scn) {
-      // On follower, read_snapshot may exceed max_decided_scn after restart or
-      // during recovery replay and would otherwise return OB_SNAPSHOT_DISCARDED.
-      // Clamp to max(max_decided_scn, multi_version_start) so recovery can still
-      // read MDS (e.g. TabletStatus). Other MDS types may be restricted later.
-      // TODO: restrict recovery reads to required MDS types only.
-      int64_t multi_version_start = ls_mds_handle.get_obj()->get_multi_version_start();
-      share::SCN multi_version_start_scn;
-      if (OB_FAIL(multi_version_start_scn.convert_for_tx(multi_version_start))) {
-        LOG_ERROR("convert for tx failed", K(ret), K(multi_version_start));
-      } else {
-        effective_read_snapshot = share::SCN::max(max_decided_scn, multi_version_start_scn);
-      }
-    }
+    // Latest-value point and range reads use MAX and skip undecided versions.
+    // Replay progress is a caller precondition, not a visibility snapshot:
+    // replay callers order dependencies before their own barrier log; callers
+    // outside replay wait for the required continuous replay position.
+    // Keep explicit historical snapshots unchanged as well. Raising one to MVS
+    // or lowering one to local progress would silently read a different version.
   }
   return ret;
 }
@@ -542,8 +530,8 @@ int ObMdsTable::fill_mds_row_read_info_(
             ObMdsTabletSchemaDef::MDS_TABLET_SCHEMA_COL_IDX::WRITER_TRANS_ID);
     row_info.reset();
     row_info.trans_version_ = src_row.storage_datums_[trans_version_col_idx].get_int();
-    row_info.row_trans_id_ = src_row.get_trans_id();
-    row_info.writer_tx_id_ = src_row.storage_datums_[writer_tx_id_col_idx].get_int();
+    row_info.writer_tx_id_ = transaction::ObTransID(
+        src_row.storage_datums_[writer_tx_id_col_idx].get_int());
     row_info.is_uncommitted_ = (row_info.trans_version_ == INT64_MAX);
   }
   return ret;
@@ -1125,7 +1113,7 @@ int ObMdsTable::setup_single_merge_for_read_(
     LOG_WARN("ls tablet service is null", K(ret), KP(ls_));
   } else if (OB_FAIL(ls_tablet_svr->get_tablet(LS_MDS_TABLET, resources.ls_mds_handle))) {
     LOG_WARN("failed to get ls mds tablet", K(ret), K_(ls_id));
-  } else if (OB_FAIL(prepare_mds_read_snapshot_(read_arg.read_snapshot_, resources.ls_mds_handle, effective_read_snapshot, is_follower))) {
+  } else if (OB_FAIL(prepare_mds_read_snapshot_(read_arg.read_snapshot_, effective_read_snapshot, is_follower))) {
     LOG_WARN("prepare mds read snapshot failed", K(ret), K_(ls_id), K(is_follower));
   } else if (OB_FAIL(resources.alloc_access_objs())) {
     LOG_WARN("failed to alloc mds get access objects", KR(ret));

@@ -432,14 +432,18 @@ int LockForReadFunctor::operator()(const ObTxData &tx_data, ObTxCCCtx *tx_cc_ctx
     // such cases, reads will experience exceptions that the txn is in a RUNNING
     // state without tx_ctx. Therefore, we need to tolerate this exception.
     if (lock_for_read_arg_.skip_lock_) {
-      result_.can_read_ = lock_for_read_arg_.read_uncommitted_;
+      const bool is_rollback = tx_data.op_guard_.is_valid()
+          && tx_data.op_guard_->get_undo_status_list().is_contain(
+              lock_for_read_arg_.data_sql_sequence_, state);
+      // The outcome is undecided, but replayed rollback ranges are already known.
+      result_.can_read_ = lock_for_read_arg_.read_uncommitted_ && !is_rollback;
       // trans_version_ / prepare_version_ default to min from result_.reset()
       // upstream; tx is undecided here so we leave them as the non-effective
       // default and only set the fields whose semantics deviate from default.
       result_.end_scn_.set_max();
       result_.tx_state_ = transaction::ObTxState::INIT;
       set_may_exist_undecided_state_in_tx_data_table();
-      STORAGE_LOG(INFO, "tx data is running while tx ctx not replayed, skip read because of arg.skip_lock", K(tx_data), KPC(this));
+      STORAGE_LOG(INFO, "tx data is running while tx ctx not replayed, skip lock", K(tx_data), KPC(this));
       ret = OB_SUCCESS;
     } else {
       ret = OB_REPLICA_NOT_READABLE;

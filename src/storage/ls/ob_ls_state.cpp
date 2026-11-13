@@ -25,6 +25,7 @@ namespace storage
 int ObLSRunningState::StateHelper::switch_state(const int64_t op)
 {
   int ret = OB_SUCCESS;
+  int64_t state = ATOMIC_LOAD(&state_);
   static const int64_t N = State::INVALID;
   static const int64_t LS_INIT = State::LS_INIT;
   static const int64_t LS_RUNNING = State::LS_RUNNING;
@@ -44,24 +45,25 @@ int ObLSRunningState::StateHelper::switch_state(const int64_t op)
   if (OB_UNLIKELY(!Ops::is_valid(op))) {
     LOG_WARN("invalid argument", K(op));
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_UNLIKELY(!State::is_valid(state_))) {
-    LOG_WARN("ObLSRunningState current state is invalid", K_(state), K(op));
+  } else if (OB_UNLIKELY(!State::is_valid(state))) {
+    LOG_WARN("ObLSRunningState current state is invalid", K(state), K(op));
     ret = OB_ERR_UNEXPECTED;
   } else {
-    const int64_t new_state = STATE_MAP[state_][op];
+    const int64_t new_state = STATE_MAP[state][op];
     if (OB_UNLIKELY(!State::is_valid(new_state))) {
       ret = OB_STATE_NOT_MATCH;
     } else {
-      last_state_ = state_;
-      state_ = new_state;
+      last_state_ = state;
+      ATOMIC_STORE(&state_, new_state);
+      state = new_state;
     }
   }
   if (OB_SUCC(ret)) {
     _LOG_INFO("ObLSRunningState switch state success(ls_id=%jd, %s ~> %s, op=%s)",
-              ls_id_.id(), State::state_str(last_state_), State::state_str(state_), Ops::op_str(op));
+              ls_id_.id(), State::state_str(last_state_), State::state_str(state), Ops::op_str(op));
   } else {
     _LOG_ERROR("ObLSRunningState switch state error(ret=%d, ls_id=%jd, state=%s, op=%s)",
-               ret, ls_id_.id(), State::state_str(state_), Ops::op_str(op));
+               ret, ls_id_.id(), State::state_str(state), Ops::op_str(op));
   }
   return ret;
 }

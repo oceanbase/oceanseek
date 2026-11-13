@@ -3,7 +3,10 @@
  * 本文件包含机密及专有信息，未经授权不得使用或披露。
  */
 #define UNITTEST_DEBUG
+#include <atomic>
 #include <cstring>
+#include <memory>
+#include <thread>
 #include <gtest/gtest.h>
 #define private public
 #define protected public
@@ -11,6 +14,7 @@
 #include "storage/mds_table/ob_mds_type_registry.h"
 #include "storage/mds_table/ob_mds_table.h"
 #include "storage/mds_table/ob_mds_type_id_map.h"
+#include "storage/mds_table/ob_mds_tablet_schema.h"
 #include "storage/mds_table/ob_mds_trans_node_value.h"
 #include "storage/mds_table/ob_mds_single_row_mvcc_ctx.h"
 #include "storage/mds_table/ob_tablet_mds_reloc_batch_arg.h"
@@ -20,9 +24,29 @@
 #include "storage/memtable/mvcc/ob_mvcc_define.h"
 #include "storage/tablet/ob_tablet_create_delete_mds_user_data.h"
 #include "storage/tablet/ob_tablet_mds_reloc_status.h"
+#include "storage/tablet/ob_mds_scan_param_helper.h"
+#include "storage/ls/ob_ls.h"
 #include "lib/allocator/page_arena.h"
+#include "share/ob_cluster_version.h"
 
 namespace oceanbase {
+namespace {
+common::ObRole mds_test_role = common::FOLLOWER;
+int mds_test_role_ret = common::OB_SUCCESS;
+}
+
+namespace logservice {
+// Exercise the real MDS snapshot preparation without a PALF service. No replay
+// service or MDS tablet is installed: latest reads must not derive their
+// snapshot from local progress or the tablet's historical retention boundary.
+int ObLogHandler::get_role(common::ObRole &role, int64_t &proposal_id) const
+{
+  role = mds_test_role;
+  proposal_id = 1;
+  return mds_test_role_ret;
+}
+}
+
 namespace unittest {
 
 using namespace common;
@@ -81,6 +105,9 @@ public:
   virtual ~TestMdsTableUnit() {}
   static void SetUpTestCase()
   {
+    // Query table parameters build versioned read info without a tenant module.
+    ASSERT_EQ(OB_SUCCESS, ObClusterVersion::get_instance().init(DATA_CURRENT_VERSION));
+    ObClusterVersion::get_instance().update_data_version(DATA_CURRENT_VERSION);
     ASSERT_EQ(OB_SUCCESS,
               (ObMdsTypeRegistry::get_instance().register_type<DummyKey, TestMdsVal>(TEST_MDS_TYPE)));
     ASSERT_EQ(OB_SUCCESS,
@@ -90,11 +117,153 @@ public:
               (ObMdsTypeRegistry::get_instance().register_type<DummyKey, ObTabletMdsRelocStatus>(
                   RELOC_MDS_TYPE)));
   }
-  virtual void SetUp() {}
-  virtual void TearDown() {}
+  static void TearDownTestCase()
+  {
+    ObClusterVersion::get_instance().update_data_version(0);
+    ObClusterVersion::get_instance().destroy();
+  }
+  virtual void SetUp()
+  {
+    mds_test_role = common::FOLLOWER;
+    mds_test_role_ret = OB_SUCCESS;
+  }
+  virtual void TearDown()
+  {
+    ObMdsTabletSchemaHelper::get_instance().reset();
+  }
 private:
   DISALLOW_COPY_AND_ASSIGN(TestMdsTableUnit);
 };
+
+TEST_F(TestMdsTableUnit, latest_and_historical_snapshots_are_not_clamped)
+{
+  std::unique_ptr<ObLS> ls(new ObLS());
+  ASSERT_EQ(OB_SUCCESS, ls->running_state_.create_finish(ls->get_ls_id()));
+  ASSERT_EQ(OB_SUCCESS, ls->running_state_.online(ls->get_ls_id()));
+  ObMdsTable table;
+  table.ls_ = ls.get();
+  for (const auto role : {common::FOLLOWER, common::LEADER}) {
+    mds_test_role = role;
+    for (const int64_t version : {int64_t(80), int64_t(200), INT64_MAX}) {
+      share::SCN requested;
+      share::SCN effective;
+      bool is_follower = false;
+      ASSERT_EQ(OB_SUCCESS, requested.convert_for_tx(version));
+      ASSERT_EQ(OB_SUCCESS,
+                table.prepare_mds_read_snapshot_(requested, effective, is_follower));
+      EXPECT_EQ(requested, effective);
+      EXPECT_EQ(common::FOLLOWER == role, is_follower);
+    }
+  }
+  share::SCN effective;
+  bool is_follower = false;
+  mds_test_role_ret = OB_STATE_NOT_MATCH;
+  EXPECT_EQ(OB_STATE_NOT_MATCH, table.prepare_mds_read_snapshot_(
+      share::SCN::max_scn(), effective, is_follower));
+  ASSERT_EQ(OB_SUCCESS, ls->running_state_.pre_offline(ls->get_ls_id()));
+  ASSERT_EQ(OB_SUCCESS, ls->running_state_.post_offline(ls->get_ls_id()));
+  EXPECT_EQ(OB_LS_OFFLINE, table.prepare_mds_read_snapshot_(
+      share::SCN::max_scn(), effective, is_follower));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, table.prepare_mds_read_snapshot_(
+      share::SCN::invalid_scn(), effective, is_follower));
+}
+
+TEST_F(TestMdsTableUnit, snapshot_preparation_during_running_state_transitions)
+{
+  std::unique_ptr<ObLS> ls(new ObLS());
+  const share::ObLSID ls_id(1);
+  ASSERT_EQ(OB_SUCCESS, ls->running_state_.create_finish(ls_id));
+  ObMdsTable table;
+  table.ls_ = ls.get();
+  std::atomic<bool> finished(false);
+  int writer_ret = OB_SUCCESS;
+  std::thread writer([&]() {
+    for (int i = 0; i < 512 && OB_SUCCESS == writer_ret; ++i) {
+      if (OB_SUCCESS != (writer_ret = ls->running_state_.online(ls_id))) {
+      } else if (OB_SUCCESS != (writer_ret = ls->running_state_.pre_offline(ls_id))) {
+      } else {
+        writer_ret = ls->running_state_.post_offline(ls_id);
+      }
+    }
+    finished.store(true);
+  });
+  do {
+    share::SCN effective;
+    bool is_follower = false;
+    const int ret = table.prepare_mds_read_snapshot_(
+        share::SCN::max_scn(), effective, is_follower);
+    EXPECT_TRUE(OB_SUCCESS == ret || OB_LS_OFFLINE == ret);
+    if (OB_SUCCESS == ret) {
+      EXPECT_TRUE(effective.is_max());
+      EXPECT_TRUE(is_follower);
+    }
+    // Exercise all lock-free state readers, including diagnostic formatting.
+    (void)ls->is_running();
+    (void)ls->is_stopped();
+    char buffer[128];
+    ls->running_state_.to_string(buffer, sizeof(buffer));
+  } while (!finished.load());
+  writer.join();
+  EXPECT_EQ(OB_SUCCESS, writer_ret);
+  EXPECT_TRUE(ls->is_offline());
+  EXPECT_FALSE(ls->is_running());
+}
+
+TEST_F(TestMdsTableUnit, point_and_range_latest_reads_share_visibility_flags)
+{
+  ObMdsTabletSchemaHelper &schema = ObMdsTabletSchemaHelper::get_instance();
+  ASSERT_EQ(OB_SUCCESS, schema.init());
+  const auto *query_table_param = schema.get_query_table_param();
+  ASSERT_NE(nullptr, query_table_param);
+  ObArenaAllocator allocator;
+  const ObVersionRange versions(0, share::SCN::max_scn().get_val_for_tx());
+  ObTableScanParam point;
+  ObTableScanParam range;
+  ASSERT_EQ(OB_SUCCESS, ObMdsScanParamHelper::init_mds_get_scan_param(
+      allocator, share::ObLSID(1001), versions, false, true, INT64_MAX,
+      *query_table_param, point));
+  ASSERT_EQ(OB_SUCCESS, ObMdsScanParamHelper::build_mds_unit_range_scan_param(
+      allocator, share::ObLSID(1001), ObTabletID(200001), share::SCN::base_scn(),
+      TEST_MDS_TYPE, INT64_MAX, versions, true, range));
+  for (const auto *param : {&point, &range}) {
+    EXPECT_EQ(INT64_MAX, param->read_version_range_.snapshot_version_);
+    EXPECT_TRUE(param->scan_flag_.is_select_follower());
+    EXPECT_TRUE(param->scan_flag_.skip_lock_for_read());
+    EXPECT_FALSE(param->scan_flag_.iter_uncommitted_row());
+  }
+  // Lock ownership / own-writer inspection is an explicit separate operation.
+  ObTableScanParam writer;
+  ASSERT_EQ(OB_SUCCESS, ObMdsScanParamHelper::init_mds_get_scan_param(
+      allocator, share::ObLSID(1001), versions, true, true, INT64_MAX,
+      *query_table_param, writer));
+  EXPECT_TRUE(writer.scan_flag_.iter_uncommitted_row());
+  EXPECT_TRUE(writer.scan_flag_.skip_lock_for_read());
+}
+
+TEST_F(TestMdsTableUnit, sstable_row_info_preserves_writer_after_scan)
+{
+  blocksstable::ObDatumRow row;
+  ASSERT_EQ(OB_SUCCESS, row.init(ObMdsTabletSchemaDef::MDS_SSTABLE_COLUMN_CNT));
+  const int64_t version_idx = static_cast<int64_t>(
+      ObMdsTabletSchemaDef::MDS_TABLET_SSTABLE_COL_IDX::TRANS_VERSION);
+  const int64_t writer_idx = ObMdsTabletSchemaDef::get_phy_col_idx(
+      row.get_column_count(), ObMdsTabletSchemaDef::MDS_TABLET_SCHEMA_COL_IDX::WRITER_TRANS_ID);
+  row.storage_datums_[writer_idx].set_int(12345);
+  // The scan output is a logical row: its physical transaction ID and U flag
+  // have been cleared even when TRANS_VERSION still marks an undecided writer.
+  row.trans_id_.reset();
+  row.mvcc_row_flag_.set_uncommitted_row(false);
+  ObMdsTable::ObMdsRowReadInfo info;
+  for (const int64_t version : {INT64_MAX, int64_t(160)}) {
+    row.storage_datums_[version_idx].set_int(version);
+    ASSERT_EQ(OB_SUCCESS, ObMdsTable::fill_mds_row_read_info_(row, info));
+    EXPECT_EQ(ObTransID(12345), info.writer_tx_id_);
+    EXPECT_EQ(version, info.trans_version_);
+    EXPECT_EQ(version == INT64_MAX, info.is_uncommitted_);
+  }
+  info.reset();
+  EXPECT_FALSE(info.writer_tx_id_.is_valid());
+}
 
 TEST_F(TestMdsTableUnit, mds_memtable_overrides_data_policies)
 {

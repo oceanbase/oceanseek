@@ -7,6 +7,7 @@
 #define OCEABASE_STORAGE_LS_STATE_
 
 #include <cstdint>
+#include "lib/atomic/ob_atomic.h"
 #include"lib/utility/ob_print_utils.h" 
 
 namespace oceanbase
@@ -25,19 +26,21 @@ public:
   ~ObLSRunningState() {}
   bool is_offline() const
   {
-    return (State::LS_INIT == state_ ||
-            State::LS_OFFLINING == state_ ||
-            State::LS_OFFLINED == state_ ||
-            State::LS_STOPPED == state_);
+    const int64_t state = ATOMIC_LOAD(&state_);
+    return (State::LS_INIT == state ||
+            State::LS_OFFLINING == state ||
+            State::LS_OFFLINED == state ||
+            State::LS_STOPPED == state);
   }
   bool is_running() const
   {
-    return State::LS_RUNNING == state_;
+    return State::LS_RUNNING == ATOMIC_LOAD(&state_);
   }
   bool is_stopped() const
   {
-    return (State::LS_INIT == state_ ||
-            State::LS_STOPPED == state_);
+    const int64_t state = ATOMIC_LOAD(&state_);
+    return (State::LS_INIT == state ||
+            State::LS_STOPPED == state);
   }
   int create_finish(const share::ObLSID &ls_id);
   int online(const share::ObLSID &ls_id);
@@ -120,7 +123,7 @@ private:
   {
   public:
     explicit StateHelper(const share::ObLSID &ls_id, int64_t &state)
-      : ls_id_(ls_id), state_(state), last_state_(state) {}
+      : ls_id_(ls_id), state_(state), last_state_(ATOMIC_LOAD(&state)) {}
     ~StateHelper() {}
     int switch_state(const int64_t op);
   private:
@@ -129,8 +132,9 @@ private:
     int64_t last_state_;
   };
 public:
-  TO_STRING_KV(K_(state));
+  TO_STRING_KV("state", ATOMIC_LOAD(&state_));
 private:
+  // Transitions are serialized by the LS lock; readers may sample without it.
   int64_t state_;
 };
 
