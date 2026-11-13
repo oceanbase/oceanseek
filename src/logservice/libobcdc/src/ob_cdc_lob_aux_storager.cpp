@@ -203,29 +203,98 @@ int ObCDCLobAuxStorager::put(
     const char *lob_data,
     const int64_t lob_data_len)
 {
-  int ret = OB_SUCCESS;
+  return put_value_(key, key_type, ObLobAuxReadValueType::PAYLOAD, lob_data, lob_data_len);
+}
 
+int ObCDCLobAuxStorager::put_no_logging(const ObLobAuxKey &key)
+{
+  return put_value_(key, "lob_no_logging", ObLobAuxReadValueType::NO_LOGGING,
+                    nullptr/*data*/, 0/*data_len*/);
+}
+
+int ObCDCLobAuxStorager::put_value_(
+    const ObLobAuxKey &key,
+    const char *key_type,
+    const ObLobAuxReadValueType type,
+    const char *data,
+    const int64_t data_len)
+{
+  int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_ERROR("ObCDCLobAuxStorager has not been initialized", KR(ret));
   } else if (OB_UNLIKELY(!key.is_valid()) || OB_ISNULL(key_type)
-      || OB_ISNULL(lob_data) || OB_UNLIKELY(lob_data_len <= 0)) {
+      || ((ObLobAuxReadValueType::PAYLOAD != type) && (ObLobAuxReadValueType::NO_LOGGING != type))
+      || ((ObLobAuxReadValueType::PAYLOAD == type) && ((nullptr == data) || (data_len <= 0)))
+      || ((ObLobAuxReadValueType::NO_LOGGING == type) && ((nullptr != data) || (0 != data_len)))) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_ERROR("invalid argument", KR(ret), K(key), K(lob_data), K(lob_data_len));
+    LOG_ERROR("invalid argument", KR(ret), K(key), K(key_type), K(type), K(data), K(data_len));
   } else if (!enable_memory_) {
-    if (OB_FAIL(disk_put_(key, key_type, lob_data, lob_data_len))) {
-      LOG_ERROR("disk_put_ failed", KR(ret), K(key), K(lob_data), K(lob_data_len));
+    if (OB_FAIL(disk_put_(key, key_type, type, data, data_len))) {
+      LOG_ERROR("disk_put_ failed", KR(ret), K(key), K(type), K(data), K(data_len));
     }
-  } else if (OB_FAIL(memory_put_(key, key_type, lob_data, lob_data_len))) {
+  } else if (OB_FAIL(memory_put_(key, key_type, type, data, data_len))) {
     if (OB_ALLOCATE_MEMORY_FAILED != ret) {
-      LOG_ERROR("memory_put_ failed", KR(ret), K(key), K(lob_data), K(lob_data_len));
-    } else if (OB_FAIL(disk_put_(key, key_type, lob_data, lob_data_len))) {
-      LOG_ERROR("disk_put_ failed", KR(ret), K(key), K(lob_data), K(lob_data_len));
+      LOG_ERROR("memory_put_ failed", KR(ret), K(key), K(type), K(data), K(data_len));
+    } else if (OB_FAIL(disk_put_(key, key_type, type, data, data_len))) {
+      LOG_ERROR("disk_put_ failed", KR(ret), K(key), K(type), K(data), K(data_len));
     }
   }
   if (OB_SUCC(ret)) {
     ATOMIC_INC(&stat_info_.put_req_cnt_);
-    ATOMIC_AAF(&stat_info_.put_data_total_size_, lob_data_len);
+    ATOMIC_AAF(&stat_info_.put_data_total_size_, CACHE_VALUE_HEADER_SIZE + data_len);
+  }
+  return ret;
+}
+
+int ObCDCLobAuxStorager::decode_value_(
+    const char *data,
+    const int64_t data_len,
+    ObLobAuxReadValue &value)
+{
+  int ret = OB_SUCCESS;
+  value.reset();
+  if (OB_ISNULL(data) || (data_len < CACHE_VALUE_HEADER_SIZE) || (data_len > INT32_MAX)) {
+    ret = OB_INVALID_DATA;
+    LOG_ERROR("invalid data", KR(ret), K(data), K(data_len));
+  } else if (static_cast<char>(ObLobAuxReadValueType::PAYLOAD) == data[0]) {
+    if (data_len > CACHE_VALUE_HEADER_SIZE) {
+      value.type_ = ObLobAuxReadValueType::PAYLOAD;
+      value.payload_.assign_ptr(data + CACHE_VALUE_HEADER_SIZE,
+          static_cast<int32_t>(data_len - CACHE_VALUE_HEADER_SIZE));
+    } else {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_ERROR("invalid data", KR(ret), K(data), K(data_len));
+    }
+  } else if (static_cast<char>(ObLobAuxReadValueType::NO_LOGGING) == data[0]) {
+    if (CACHE_VALUE_HEADER_SIZE == data_len) {
+      value.type_ = ObLobAuxReadValueType::NO_LOGGING;
+    } else {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_ERROR("unexpected data", KR(ret), K(data), K(data_len));
+    }
+  } else {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("unexpected data", KR(ret), K(data), K(data_len));
+  }
+  return ret;
+}
+
+int ObCDCLobAuxStorager::get(
+    ObIAllocator &allocator,
+    const ObLobAuxKey &key,
+    ObLobAuxReadValue &value)
+{
+  int ret = OB_SUCCESS;
+  const char *data = nullptr;
+  int64_t data_len = 0;
+  value.reset();
+  if (OB_FAIL(get_encoded_value_(allocator, key, data, data_len))) {
+    if (OB_ENTRY_NOT_EXIST != ret) {
+      LOG_ERROR("get_encoded_value_ failed", KR(ret), K(key));
+    }
+  } else if (OB_FAIL(decode_value_(data, data_len, value))) {
+    LOG_ERROR("invalid lob auxiliary cache value", KR(ret), K(key), K(data_len));
   }
   return ret;
 }
@@ -237,31 +306,37 @@ int ObCDCLobAuxStorager::put(
 int ObCDCLobAuxStorager::memory_put_(
     const ObLobAuxKey &key,
     const char *key_type,
+    const ObLobAuxReadValueType type,
     const char *lob_data,
     const int64_t lob_data_len)
 {
   int ret = OB_SUCCESS;
-  const int64_t alloc_size = lob_data_len + key.seq_id_.length();
+  const int64_t encoded_len = CACHE_VALUE_HEADER_SIZE + lob_data_len;
+  const int64_t alloc_size = encoded_len + key.seq_id_.length();
   char *alloc_buf = static_cast<char *>(lob_aux_allocator_.alloc(alloc_size));
   if (OB_ISNULL(alloc_buf)) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_DEBUG("lob aux allocator alloc failed, fallback to disk", KR(ret), K(key), K(alloc_size),
         "memory_hold", SIZE_TO_STR(lob_aux_allocator_.allocated()));
   } else {
-    MEMCPY(alloc_buf, lob_data, lob_data_len);
+    // Encode directly in cache-owned memory to avoid a temporary payload copy.
+    alloc_buf[0] = static_cast<char>(type);
+    if (ObLobAuxReadValueType::PAYLOAD == type) {
+      MEMCPY(alloc_buf + CACHE_VALUE_HEADER_SIZE, lob_data, lob_data_len);
+    }
     ObLobAuxKey stored_key = key;
     if (!key.seq_id_.empty()) {
-      MEMCPY(alloc_buf + lob_data_len, key.seq_id_.ptr(), key.seq_id_.length());
-      stored_key.seq_id_.assign_ptr(alloc_buf + lob_data_len, key.seq_id_.length());
+      MEMCPY(alloc_buf + encoded_len, key.seq_id_.ptr(), key.seq_id_.length());
+      stored_key.seq_id_.assign_ptr(alloc_buf + encoded_len, key.seq_id_.length());
     }
-    ObLobAuxValue value(alloc_buf, alloc_buf/*lob_data*/, lob_data_len);
+    ObLobAuxValue value(alloc_buf, alloc_buf/*lob_data*/, encoded_len);
     if (OB_FAIL(lob_aux_map_.insert(stored_key, value))) {
       LOG_ERROR("[OBCDC][LOB_AUX][PUT][MEM] lob_aux_map_ insert failed", KR(ret), KCSTRING(key_type),
           K(key), K(lob_data), K(lob_data_len));
       lob_aux_allocator_.free(alloc_buf);
     } else {
       ATOMIC_INC(&stat_info_.mem_put_req_cnt_);
-      ATOMIC_AAF(&stat_info_.mem_put_data_total_size_, lob_data_len);
+      ATOMIC_AAF(&stat_info_.mem_put_data_total_size_, encoded_len);
       LOG_DEBUG("[OBCDC][LOB_AUX][PUT][MEM] lob_aux_map_ insert succ", KCSTRING(key_type), K(key), K(value));
     }
   }
@@ -271,29 +346,43 @@ int ObCDCLobAuxStorager::memory_put_(
 int ObCDCLobAuxStorager::disk_put_(
     const ObLobAuxKey &key,
     const char *key_type,
+    const ObLobAuxReadValueType type,
     const char *lob_data,
     const int64_t lob_data_len)
 {
   int ret = OB_SUCCESS;
+  ObArenaAllocator allocator(ObMemAttr(OB_SERVER_TENANT_ID, "CDCLobCache"));
+  const int64_t encoded_len = CACHE_VALUE_HEADER_SIZE + lob_data_len;
+  char *buf = nullptr;
   std::string key_str;
   void *cf_handle = nullptr;
   if (OB_FAIL(get_cf_handle(key.tenant_id_, cf_handle))) {
     LOG_ERROR("get_cf_handle fail", KR(ret), KCSTRING(key_type), K(key));
   } else if (OB_FAIL(key.get_key(key_str))) {
     LOG_ERROR("get key_str fail", KR(ret), KCSTRING(key_type), K(key));
-  } else if (OB_FAIL(store_service_->put(cf_handle, key_str, ObSlice(lob_data, lob_data_len)))) {
-    if (OB_IN_STOP_STATE != ret) {
-      LOG_ERROR("[OBCDC][LOB_AUX][PUT][DISK] store_service_ put fail", KR(ret), KCSTRING(key_type),
-          K(key), KCSTRING(key_str.c_str()), K(lob_data_len));
-    }
+  } else if (OB_ISNULL(buf = static_cast<char *>(allocator.alloc(encoded_len)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_ERROR("alloc memory failed", KR(ret), K(key), K(key_type), K(type), K(encoded_len));
   } else {
-    LOG_DEBUG("[OBCDC][LOB_AUX][PUT][DISK] store_service_ insert succ", KCSTRING(key_type), K(key),
-        KCSTRING(key_str.c_str()), K(lob_data_len));
+    // The store service requires a contiguous encoded value only on the disk path.
+    buf[0] = static_cast<char>(type);
+    if (ObLobAuxReadValueType::PAYLOAD == type) {
+      MEMCPY(buf + CACHE_VALUE_HEADER_SIZE, lob_data, lob_data_len);
+    }
+    if (OB_FAIL(store_service_->put(cf_handle, key_str, ObSlice(buf, encoded_len)))) {
+      if (OB_IN_STOP_STATE != ret) {
+        LOG_ERROR("[OBCDC][LOB_AUX][PUT][DISK] store_service_ put fail", KR(ret), KCSTRING(key_type),
+            K(key), KCSTRING(key_str.c_str()), K(encoded_len));
+      }
+    } else {
+      LOG_DEBUG("[OBCDC][LOB_AUX][PUT][DISK] store_service_ insert succ", KCSTRING(key_type), K(key),
+          KCSTRING(key_str.c_str()), K(encoded_len));
+    }
   }
   return ret;
 }
 
-int ObCDCLobAuxStorager::get(
+int ObCDCLobAuxStorager::get_encoded_value_(
     ObIAllocator &allocator,
     const ObLobAuxKey &key,
     const char *&lob_data,
@@ -304,17 +393,17 @@ int ObCDCLobAuxStorager::get(
     ret = OB_NOT_INIT;
     LOG_ERROR("ObCDCLobAuxStorager has not been initialized", KR(ret));
   } else if (!enable_memory_) {
-    if (OB_FAIL(disk_get_(allocator, key, lob_data, lob_data_len))) {
+    if (OB_FAIL(disk_get_raw_(allocator, key, lob_data, lob_data_len))) {
       if (OB_ENTRY_NOT_EXIST != ret) {
-        LOG_ERROR("disk_get_ failed", KR(ret), K(key));
+        LOG_ERROR("disk_get_raw_ failed", KR(ret), K(key));
       }
     }
-  } else if (OB_FAIL(memory_get_(key, lob_data, lob_data_len))) {
+  } else if (OB_FAIL(memory_get_raw_(key, lob_data, lob_data_len))) {
     if (OB_ENTRY_NOT_EXIST != ret) {
-      LOG_ERROR("memory_get_ failed", KR(ret), K(key));
-    } else if (OB_FAIL(disk_get_(allocator, key, lob_data, lob_data_len))) {
+      LOG_ERROR("memory_get_raw_ failed", KR(ret), K(key));
+    } else if (OB_FAIL(disk_get_raw_(allocator, key, lob_data, lob_data_len))) {
       if (OB_ENTRY_NOT_EXIST != ret) {
-        LOG_ERROR("disk_get_ failed", KR(ret), K(key));
+        LOG_ERROR("disk_get_raw_ failed", KR(ret), K(key));
       }
     }
   }
@@ -325,7 +414,7 @@ int ObCDCLobAuxStorager::get(
   return ret;
 }
 
-int ObCDCLobAuxStorager::memory_get_(
+int ObCDCLobAuxStorager::memory_get_raw_(
     const ObLobAuxKey &key,
     const char *&lob_data,
     int64_t &lob_data_len)
@@ -350,7 +439,7 @@ int ObCDCLobAuxStorager::memory_get_(
   return ret;
 }
 
-int ObCDCLobAuxStorager::disk_get_(
+int ObCDCLobAuxStorager::disk_get_raw_(
     ObIAllocator &allocator,
     const ObLobAuxKey &key,
     const char *&lob_data,

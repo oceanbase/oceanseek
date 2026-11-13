@@ -333,6 +333,12 @@ protected:
       ObObjMeta &obj_meta,
       ObObj &obj);
 
+private:
+  int handle_extblob_column_(
+      const ColumnSchemaInfo &column_schema_info,
+      const bool is_col_nop,
+      ColValueList &cols);
+
 protected:
   common::ObIAllocator     &allocator_;
   bool                     deserialized_;

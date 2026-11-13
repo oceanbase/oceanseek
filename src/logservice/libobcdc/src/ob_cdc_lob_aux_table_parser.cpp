@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX OBLOG
 
 #include "ob_cdc_lob_aux_table_parser.h"
+#include "ob_log_instance.h"
 
 namespace oceanbase
 {
@@ -272,10 +273,6 @@ int ObCDCLobAuxTableParser::parse_lob_aux_table_row(
       LOG_ERROR("parse lob meta table row failed", KR(ret));
     } else if (!is_summary) {
       // Non-summary Meta rows do not carry chunk data and are not cached.
-    } else if (OB_UNLIKELY(!extra_info.lob_chunk_type_.in_table()
-        && !extra_info.lob_chunk_type_.out_table())) {
-      ret = OB_NOT_SUPPORTED;
-      LOG_ERROR("unsupported lob chunk type in summary", KR(ret), K(extra_info), K(meta_info));
     } else if (OB_FAIL(encode_summary_value(allocator, meta_info, cache_value))) {
       LOG_ERROR("encode lob summary cache value failed", KR(ret), K(meta_info));
     } else {
@@ -331,10 +328,36 @@ int ObCDCLobAuxTableParser::parse_lob_meta_summary_info_(
     // Non-summary Meta rows do not carry Summary extra info.
   } else if (OB_FAIL(extra_info.deserialize(allocator, meta_info.lob_extra_info_))) {
     LOG_ERROR("deserialize lob summary failed", KR(ret), K(meta_info));
-  } else if (OB_UNLIKELY(
-      storage::ObLobMetaExtraInfo::LOB_META_SUMMARY != extra_info.extra_info_type_)) {
+  } else if (OB_FAIL(validate_summary_info(extra_info, meta_info.byte_len_))) {
+    LOG_ERROR("invalid or unsupported lob summary", KR(ret), K(extra_info), K(meta_info));
+  }
+  return ret;
+}
+
+int ObCDCLobAuxTableParser::validate_summary_info(
+    const storage::ObLobMetaExtraInfo &extra_info,
+    const uint64_t byte_len)
+{
+  int ret = OB_SUCCESS;
+  if (storage::ObLobMetaExtraInfo::LOB_META_SUMMARY != extra_info.extra_info_type_) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_ERROR("unexpected lob extra info type in summary meta", KR(ret), K(extra_info), K(meta_info));
+    LOG_ERROR("unexpected lob summary extra info type", KR(ret), K(extra_info));
+  } else if ((!extra_info.lob_chunk_type_.in_table()
+          && !extra_info.lob_chunk_type_.out_table()
+          && !extra_info.lob_chunk_type_.external_reference())
+      || !storage::is_valid_lob_last_write_type(extra_info.last_write_type_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("unexpected lob summary extra info", KR(ret), K(extra_info));
+  } else if (extra_info.lob_chunk_type_.external_reference()) {
+    if (0 != extra_info.chunk_count_ || !extra_info.external_lob_info_.is_valid()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_ERROR("unexpected lob summary extra info", KR(ret), K(extra_info));
+    }
+  } else if (byte_len > static_cast<uint64_t>(INT64_MAX - 1)
+      || ((0 == byte_len) != (0 == extra_info.chunk_count_))
+      || (byte_len > 0 && extra_info.chunk_count_ > byte_len)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("unexpected lob summary extra info", KR(ret), K(extra_info));
   }
   return ret;
 }

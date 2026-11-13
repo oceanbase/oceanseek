@@ -45,6 +45,7 @@ struct ObLobImageAssembleDesc final
 
 struct ObLobColCtx final
 {
+public:
   ObLobColCtx() { reset(); }
   ~ObLobColCtx() { reset(); }
 
@@ -55,6 +56,7 @@ struct ObLobColCtx final
     col_ref_cnt_ = 0;
     expected_byte_len_ = 0;
     chunk_count_ = 0;
+    padding_ = false;
   }
 
   int init(
@@ -71,9 +73,13 @@ struct ObLobColCtx final
   void set_col_ref_cnt(const uint64_t col_ref_cnt) { ATOMIC_SET(&col_ref_cnt_, col_ref_cnt); }
   uint64_t dec_col_ref_cnt() { return ATOMIC_SAF(&col_ref_cnt_, 1); }
   uint64_t get_col_ref_cnt() const { return ATOMIC_LOAD(&col_ref_cnt_); }
+  bool is_padding() const { return ATOMIC_LOAD(&padding_); }
+  void mark_padding() { ATOMIC_STORE(&padding_, true); }
 
-  TO_STRING_KV("col_ref_cnt", get_col_ref_cnt(), K_(expected_byte_len), K_(chunk_count));
+  TO_STRING_KV("col_ref_cnt", get_col_ref_cnt(), K_(expected_byte_len), K_(chunk_count),
+      "padding", is_padding());
 
+public:
   common::ObString **fragment_cb_array_;
   common::ObString lob_column_value_;
   uint64_t col_ref_cnt_;
@@ -81,6 +87,9 @@ struct ObLobColCtx final
   uint64_t expected_byte_len_;
   // LOB image 的分片数量，用于分配分片槽位、初始化引用计数、控制拼接，以及 ResourceCollector 精确清理 Piece。
   uint64_t chunk_count_;
+
+private:
+  bool padding_;
 };
 
 struct ObLobDataGetCtx final
@@ -117,6 +126,9 @@ struct ObLobDataGetCtx final
   {
     return is_new_col ? new_lob_col_ctx_ : old_lob_col_ctx_;
   }
+
+  bool is_force_padding_by_append() const { return ATOMIC_LOAD(&force_padding_by_append_); }
+  void set_force_padding_by_append() { ATOMIC_STORE(&force_padding_by_append_, true); }
 
   common::ObString **get_fragment_cb_array(const bool is_new_col)
   {
@@ -163,6 +175,7 @@ struct ObLobDataGetCtx final
   ObLobColCtx new_lob_col_ctx_;
   ObLobColCtx old_lob_col_ctx_;
   ObLobDataGetCtx *next_;
+  bool force_padding_by_append_;
 };
 
 typedef LightyList<ObLobDataGetCtx> ObLobDataGetCtxList;
@@ -181,15 +194,15 @@ struct ObLobMergerTask
   ObLobMergerTaskType type_;
 };
 
+// One Prepare task coordinates both old and new images of a LOB column, starting with new.
 struct ObLobImagePrepareTask final : public ObLobMergerTask
 {
-  ObLobImagePrepareTask(ObLobDataGetCtx &host, const bool is_new_col) :
-    ObLobMergerTask(ObLobMergerTaskType::PREPARE), host_(host), is_new_col_(is_new_col) {}
+  explicit ObLobImagePrepareTask(ObLobDataGetCtx &host) :
+    ObLobMergerTask(ObLobMergerTaskType::PREPARE), host_(host) {}
   ~ObLobImagePrepareTask() override {}
-  bool is_valid() const { return host_.has_image_desc(is_new_col_/*is_new_col*/); }
-  TO_STRING_KV(K_(type), K_(is_new_col), K_(host));
+  bool is_valid() const { return host_.has_image_desc(true) || host_.has_image_desc(false); }
+  TO_STRING_KV(K_(type), K_(host));
   ObLobDataGetCtx &host_;
-  bool is_new_col_;
 };
 
 struct ObLobColFragTask final : public ObLobMergerTask

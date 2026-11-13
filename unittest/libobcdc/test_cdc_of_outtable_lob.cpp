@@ -24,6 +24,7 @@
 #include "logservice/libobcdc/src/ob_log_part_trans_parser.h"
 #undef private
 #include "logservice/libobcdc/src/ob_log_instance.h"
+#include "logservice/libobcdc/src/ob_log_formatter.h"
 #include "logservice/libobcdc/src/ob_log_meta_manager.h"
 #include "logservice/libobcdc/src/ob_log_store_service.h"
 #include "logservice/libobcdc/src/ob_log_tenant_mgr.h"
@@ -48,6 +49,29 @@ public:
   {
     LOG_WARN_RET(err_no, "unexpected lob merger error callback", KCSTRING(fmt));
   }
+};
+
+// The callback is synchronous with completion, as it is in production. Tests
+// inspect completion and pending counts inside the callback before observing it.
+class ObLobCompletionFormatter final : public IObLogFormatter
+{
+public:
+  int start() override { return OB_SUCCESS; }
+  void stop() override {}
+  void mark_stop_flag() override {}
+  int push(IStmtTask *task, volatile bool &stop_flag) override
+  { return push_single_task(task, stop_flag); }
+  int push_single_task(IStmtTask *task, volatile bool &) override
+  {
+    if (on_callback_) { on_callback_(task); }
+    ATOMIC_INC(&callback_count_);
+    return OB_SUCCESS;
+  }
+  int get_task_count(int64_t &br, int64_t &entry, int64_t &merger) override
+  { br = entry = merger = 0; return OB_SUCCESS; }
+  int64_t get_callback_count() const { return ATOMIC_LOAD(&callback_count_); }
+  int64_t callback_count_ = 0;
+  std::function<void(IStmtTask *)> on_callback_;
 };
 
 // Only tenant lookup and the external store are replaced. Cache lookup, retry,
@@ -195,7 +219,7 @@ protected:
     return ret;
   }
 
-  enum class LobWaitResult { STOP, PUBLISH };
+  enum class LobWaitResult { STOP, PUBLISH, NO_LOGGING };
 
   int run_missing_lob_wait(const LobWaitResult result)
   {
@@ -206,16 +230,31 @@ protected:
     ObArenaAllocator allocator;
     PartTransTask task;
     task.set_allocator(OB_MALLOC_NORMAL_BLOCK_SIZE, allocator);
-    IStmtTask stmt(IStmtTask::STMT_TYPE_DML, task);
+    ObLogEntryTask entry(task);
+    MacroBlockMutatorRow row(allocator,
+        blocksstable::ObDmlRowFlag(blocksstable::ObDmlFlag::DF_UPDATE),
+        transaction::ObTxSEQ(10, 3));
+    std::vector<ObObj> row_values(1);
+    row_values[0].set_int(1);
+    const int row_ret = init_macroblock_row(allocator, row_values, 1, row);
+    if (OB_SUCCESS != row_ret) { return row_ret; }
+    DmlStmtTask stmt(task, entry, row);
     ObLobDataOutRowCtxList row_ctx_list(allocator);
     ObLobDataGetCtx get_ctx;
     ObString seq_id;
+    ObString marker_seq;
+    ObLobCompletionFormatter formatter;
+    IObLogFormatter *saved_formatter = nullptr;
     LobWaitTenantMgr tenant_mgr(TENANT_ID);
     MissingLobStore store;
     IObLogTenantMgr *saved_tenant_mgr = nullptr;
     const std::string expected_data("lob\0data", 8/*count*/);
     bool saw_pending = false;
     bool published = false;
+    bool other_fragment_finished = false;
+    bool saw_wait_after_padding = false;
+    int64_t store_get_count_after_padding = 0;
+    int64_t cache_get_count_after_padding = 0;
     bool used_stop_fallback = false;
     volatile bool stop_flag = false;
     int publish_ret = OB_SUCCESS;
@@ -228,6 +267,11 @@ protected:
       LOG_WARN("init merger environment failed", KR(ret));
     } else {
       saved_tenant_mgr = instance_->tenant_mgr_;
+      saved_formatter = instance_->formatter_;
+      instance_->formatter_ = &formatter;
+      if (LobWaitResult::NO_LOGGING == result) {
+        instance_->unsupported_lob_handling_mode_ = ObUnsupportedLobHandlingMode::PADDING;
+      }
       instance_->tenant_mgr_ = &tenant_mgr;
       ret = ObLobSeqId::get_seq_id(allocator, 1/*idx*/, seq_id);
     }
@@ -246,11 +290,25 @@ protected:
           expected_lob_id_, operation_seq, true/*is_new_col*/))) {
         LOG_WARN("reset get ctx failed", KR(ret));
       } else if (OB_FAIL(get_ctx.get_lob_col_ctx(true/*is_new_col*/).init(
-          1/*chunk_count*/, expected_data.length(), allocator))) {
+          LobWaitResult::NO_LOGGING == result ? 2 : 1,
+          expected_data.length(), allocator))) {
         LOG_WARN("init lob col ctx failed", KR(ret));
       } else {
         row_ctx_list.add(&get_ctx);
       }
+    }
+    if (OB_SUCC(ret) && LobWaitResult::NO_LOGGING == result) {
+      ret = ObLobSeqId::get_seq_id(allocator, 2, marker_seq);
+      if (OB_SUCC(ret)) {
+        const ObLobAuxKey marker_key(commit_version, TENANT_ID, trans_id, LOB_PIECE_TABLE_ID,
+            expected_lob_id_, operation_seq, marker_seq);
+        ret = instance_->lob_aux_storager_.put_no_logging(marker_key);
+      }
+      formatter.on_callback_ = [&](IStmtTask *completed) {
+        EXPECT_EQ(&stmt, completed);
+        EXPECT_EQ(0, task.get_pending_lob_format_count());
+        EXPECT_TRUE(row_ctx_list.is_all_lob_callback_done());
+      };
     }
     LOG_INFO("missing-data step 1 complete: fragment context prepared", KR(ret), K(commit_version));
     if (OB_SUCC(ret)) {
@@ -276,6 +334,39 @@ protected:
               LOG_INFO("missing-data transition: request stop after pending signal", K(commit_version));
             }
             stop_flag = true;
+          } else if (LobWaitResult::NO_LOGGING == result && !published) {
+            if (!other_fragment_finished) {
+              // Another fragment can mark the image PADDING, but the missing
+              // fragment must still wait for the marker at its own key.
+              ObLobColFragTask marker_task(get_ctx);
+              marker_task.reset(true, marker_seq, 1);
+              publish_ret = merger_.handle_fragment_task_(marker_task, stop_flag);
+              other_fragment_finished = OB_SUCCESS == publish_ret;
+              if (other_fragment_finished) {
+                EXPECT_TRUE(get_ctx.get_lob_col_ctx(true).is_padding());
+                EXPECT_EQ(2U, get_ctx.get_lob_col_ctx(true).get_col_ref_cnt());
+                EXPECT_GT(task.get_pending_lob_format_count(), 0);
+                EXPECT_FALSE(row_ctx_list.is_all_lob_callback_done());
+                EXPECT_EQ(0, formatter.get_callback_count());
+                store_get_count_after_padding = store.get_count_;
+                cache_get_count_after_padding =
+                    ATOMIC_LOAD(&instance_->lob_aux_storager_.stat_info_.get_req_cnt_);
+              } else {
+                stop_flag = true;
+              }
+            } else {
+              // Reaching a later cache miss proves PADDING did not retire this
+              // fragment. Only now publish its own NO_LOGGING marker.
+              saw_wait_after_padding = true;
+              EXPECT_GT(store.get_count_, store_get_count_after_padding);
+              EXPECT_TRUE(get_ctx.get_lob_col_ctx(true).is_padding());
+              EXPECT_EQ(2U, get_ctx.get_lob_col_ctx(true).get_col_ref_cnt());
+              EXPECT_GT(task.get_pending_lob_format_count(), 0);
+              EXPECT_FALSE(row_ctx_list.is_all_lob_callback_done());
+              EXPECT_EQ(0, formatter.get_callback_count());
+              publish_ret = instance_->lob_aux_storager_.put_no_logging(key);
+              published = OB_SUCCESS == publish_ret;
+            }
           } else if (LobWaitResult::PUBLISH == result && !published) {
             // Publish into the real memory cache only after the merger has
             // asked the dispatcher to make progress; the next retry finds it.
@@ -310,22 +401,53 @@ protected:
           "col_ref_count", get_ctx.get_lob_col_ctx(true/*is_new_col*/).get_col_ref_cnt());
       if (OB_SUCCESS == ret) {
         EXPECT_TRUE(published);
-        EXPECT_EQ(expected_data, std::string(fragment.ptr(), fragment.length()));
+        if (LobWaitResult::NO_LOGGING == result) {
+          EXPECT_TRUE(other_fragment_finished);
+          EXPECT_TRUE(saw_wait_after_padding);
+          EXPECT_EQ(nullptr, fragment.ptr());
+          EXPECT_TRUE(get_ctx.get_lob_col_ctx(true).is_padding());
+          EXPECT_EQ(cache_get_count_after_padding + 1,
+              ATOMIC_LOAD(&instance_->lob_aux_storager_.stat_info_.get_req_cnt_));
+        } else {
+          EXPECT_EQ(expected_data, std::string(fragment.ptr(), fragment.length()));
+        }
         EXPECT_EQ(1U, get_ctx.get_lob_col_ctx(true/*is_new_col*/).get_col_ref_cnt());
+        if (LobWaitResult::NO_LOGGING == result) {
+          // Release the image Prepare reference after the pending wait retires.
+          // The column coordinator must still prevent an early callback.
+          ATOMIC_INC(&merger_.lob_data_list_task_count_);
+          EXPECT_EQ(0U, get_ctx.get_lob_col_ctx(true).dec_col_ref_cnt());
+          EXPECT_EQ(OB_SUCCESS, merger_.finish_lob_image_(get_ctx, true, stop_flag));
+          EXPECT_FALSE(row_ctx_list.is_all_lob_callback_done());
+          EXPECT_EQ(0, formatter.get_callback_count());
+          EXPECT_EQ(1, merger_.lob_data_list_task_count_);
+          // This fragment-only test explicitly supplies the coordinator's final
+          // completion. Callback verifies pending=0 before it can reclaim state.
+          EXPECT_EQ(OB_SUCCESS,
+              merger_.after_fragment_progress_done_(get_ctx, row_ctx_list, stop_flag));
+          EXPECT_EQ(1, formatter.get_callback_count());
+          EXPECT_EQ(0, merger_.lob_data_list_task_count_);
+        }
       } else {
         EXPECT_EQ(nullptr, fragment.ptr());
         EXPECT_EQ(0, fragment.length());
         EXPECT_EQ(2U, get_ctx.get_lob_col_ctx(true/*is_new_col*/).get_col_ref_cnt());
       }
     }
-    // Release only a successfully published piece, preserving the original cleanup order.
+    // Release the delayed payload or this fragment's marker only after publication.
     LOG_INFO("missing-data step 4: clean published data and detach doubles", KR(ret), K(published));
     if (published) {
       EXPECT_EQ(OB_SUCCESS, instance_->lob_aux_storager_.memory_del_(key));
     }
+    if (nullptr != instance_ && !marker_seq.empty()) {
+      const ObLobAuxKey marker_key(commit_version, TENANT_ID, trans_id, LOB_PIECE_TABLE_ID,
+          expected_lob_id_, operation_seq, marker_seq);
+      EXPECT_EQ(OB_SUCCESS, instance_->lob_aux_storager_.memory_del_(marker_key));
+    }
     // The instance must not retain pointers to the local test doubles.
     if (nullptr != instance_) {
       instance_->tenant_mgr_ = saved_tenant_mgr;
+      instance_->formatter_ = saved_formatter;
       instance_->lob_aux_storager_.store_service_ = nullptr;
       LOG_INFO("missing-data step 4 complete: doubles detached", KR(ret), K(commit_version),
           "cache_count", instance_->lob_aux_storager_.lob_aux_map_.count());
@@ -352,9 +474,17 @@ protected:
     extra_info.last_write_type_ = last_write_type;
     if (OB_FAIL(extra_info.lob_chunk_type_.from_string(lob_chunk_type))) {
       LOG_WARN("parse lob chunk type failed", KR(ret), KCSTRING(lob_chunk_type));
-    } else if (OB_FAIL(extra_info.serialize(allocator, meta_info.lob_extra_info_))) {
-      LOG_WARN("serialize lob summary extra info failed", KR(ret), K(extra_info));
     } else {
+      if (extra_info.lob_chunk_type_.external_reference()) {
+        extra_info.external_lob_info_.url_ = ObString::make_string("oss://example/object");
+        extra_info.external_lob_info_.length_ = byte_len;
+        extra_info.external_lob_info_.kind_ = ObExternalBlobKind::REFERENCE;
+      }
+      if (OB_FAIL(extra_info.serialize(allocator, meta_info.lob_extra_info_))) {
+        LOG_WARN("serialize lob summary extra info failed", KR(ret), K(extra_info));
+      }
+    }
+    if (OB_SUCC(ret)) {
       meta_info.byte_len_ = byte_len;
       meta_info.char_len_ = byte_len;
       if (OB_FAIL(ObCDCLobAuxTableParser::encode_summary_value(
@@ -491,7 +621,9 @@ protected:
       const bool parse_pieces = true,
       const blocksstable::ObDmlFlag dml_flag = blocksstable::ObDmlFlag::DF_INSERT,
       const bool is_new_col = true,
-      const ObLobLastWriteType last_write_type = ObLobLastWriteType::INSERT)
+      const ObLobLastWriteType last_write_type = ObLobLastWriteType::INSERT,
+      const bool is_ddl = true,
+      const char *lob_chunk_type = "OUT_TABLE")
   {
     int ret = OB_SUCCESS;
     const int64_t commit_version = next_commit_version_++;
@@ -523,8 +655,9 @@ protected:
       LOG_WARN("init part mgr failed", KR(ret));
     } else if (OB_FAIL(prepare_part_trans_task(task, trans_id, commit_version))) {
       LOG_WARN("prepare part trans task failed", KR(ret));
-    } else if (OB_FAIL(build_summary_cache_value("OUT_TABLE", summary_byte_len,
-        pieces.size(), allocator, summary_value, last_write_type))) {
+    } else if (OB_FAIL(build_summary_cache_value(lob_chunk_type, summary_byte_len,
+        0 == STRCMP(lob_chunk_type, "EXTERNAL_REFERENCE") ? 0 : pieces.size(),
+        allocator, summary_value, last_write_type))) {
       LOG_WARN("build summary cache value failed", KR(ret));
     } else if (OB_FAIL(instance_->lob_aux_storager_.put(
         summary_key, "summary", summary_value.ptr(), summary_value.length()))) {
@@ -608,18 +741,17 @@ protected:
       }
     }
 
-    // Synchronous prepare exercises production assembly without a Formatter worker.
+    // Synchronous column Prepare also supplies the final coordinator completion.
     if (OB_SUCC(ret)) {
       LOG_INFO("pipeline step 4: assemble requested image", K(commit_version), K(summary_byte_len),
           K(is_new_col), "dml_flag", static_cast<int>(dml_flag));
       row_ctx_list.reset(&stmt, TENANT_ID, trans_id,
-          LOB_META_TABLE_ID, LOB_PIECE_TABLE_ID, true/*is_ddl*/);
+          LOB_META_TABLE_ID, LOB_PIECE_TABLE_ID, is_ddl);
       if (OB_FAIL(get_ctx.reset(&row_ctx_list, LOB_COLUMN_IDX,
           blocksstable::ObDmlRowFlag(dml_flag), expected_lob_id_, operation_seq, is_new_col))) {
       } else {
         row_ctx_list.add(&get_ctx);
-        ObLobImagePrepareTask prepare_task(get_ctx, is_new_col);
-        ret = merger_.handle_prepare_task_(prepare_task, true/*is_sync*/, stop_flag);
+        ret = merger_.handle_prepare_task_(get_ctx, true/*is_sync*/, stop_flag);
       }
       LOG_INFO("pipeline step 4 complete: image assembly result", KR(ret), K(commit_version),
           "all_callbacks_done", row_ctx_list.is_all_lob_callback_done());
@@ -637,13 +769,13 @@ protected:
           "cache_count", instance_->lob_aux_storager_.lob_aux_map_.count());
       const char *cached_data = nullptr;
       int64_t cached_len = 0;
-      EXPECT_EQ(OB_ENTRY_NOT_EXIST, instance_->lob_aux_storager_.memory_get_(
+      EXPECT_EQ(OB_ENTRY_NOT_EXIST, instance_->lob_aux_storager_.memory_get_raw_(
           summary_key, cached_data, cached_len));
       for (size_t i = 0; i < seq_ids.size(); ++i) {
         const ObLobAuxKey key(commit_version, TENANT_ID, trans_id, LOB_PIECE_TABLE_ID,
             expected_lob_id_, operation_seq, seq_ids[i]);
         EXPECT_EQ(OB_ENTRY_NOT_EXIST,
-            instance_->lob_aux_storager_.memory_get_(key, cached_data, cached_len));
+            instance_->lob_aux_storager_.memory_get_raw_(key, cached_data, cached_len));
         LOG_INFO("pipeline step 5: piece cache removal checked", K(commit_version), K(i), K(cached_len));
       }
     } else {
@@ -661,6 +793,145 @@ protected:
     }
     LOG_INFO("pipeline complete: return scenario result", KR(ret), K(commit_version),
         "cache_count", instance_->lob_aux_storager_.lob_aux_map_.count());
+    return ret;
+  }
+
+  // Exercise the production single-worker queue with both image descriptors.
+  // APPEND deliberately has no old Summary: a reversed or independent Prepare
+  // dispatch would wait forever and the bounded test would fail.
+  int run_async_column_policy(const ObLobLastWriteType new_write,
+      const ObLobLastWriteType old_write, const bool publish_old,
+      const bool expected_new_padding, const bool expected_old_padding,
+      const bool expected_force_padding_by_append, const bool same_key = false,
+      const char *new_chunk_type = "OUT_TABLE", const char *old_chunk_type = "OUT_TABLE",
+      const bool new_no_logging = false, const uint64_t new_chunk_count = 1)
+  {
+    int ret = init_merger_environment();
+    ObArenaAllocator allocator;
+    PartTransTask task;
+    task.set_allocator(OB_MALLOC_NORMAL_BLOCK_SIZE, allocator);
+    ObLogEntryTask entry(task);
+    MacroBlockMutatorRow row(allocator,
+        blocksstable::ObDmlRowFlag(blocksstable::ObDmlFlag::DF_UPDATE),
+        transaction::ObTxSEQ(10, 3));
+    std::vector<ObObj> row_values(1);
+    row_values[0].set_int(1);
+    const int row_ret = init_macroblock_row(allocator, row_values, 1, row);
+    if (OB_SUCCESS != row_ret) { return row_ret; }
+    DmlStmtTask stmt(task, entry, row);
+    ObLobDataOutRowCtxList list(allocator);
+    ObLobDataGetCtx ctx;
+    ObLobCompletionFormatter formatter;
+    IObLogFormatter *saved_formatter = nullptr;
+    volatile bool stop_flag = false;
+    const int64_t commit = next_commit_version_++;
+    const transaction::ObTransID tx_id(commit);
+    const transaction::ObTxSEQ new_seq(10, 3);
+    const transaction::ObTxSEQ old_seq = same_key ? new_seq : transaction::ObTxSEQ(20, 3);
+    const std::string new_data("new\0value", 9);
+    const std::string old_data("old\0value", 9);
+    ObString piece_seq;
+    int64_t cache_get_count_before_push = 0;
+    if (OB_SUCC(ret)) {
+      instance_->unsupported_lob_handling_mode_ = ObUnsupportedLobHandlingMode::PADDING;
+      saved_formatter = instance_->formatter_;
+      instance_->formatter_ = &formatter;
+      ret = prepare_part_trans_task(task, tx_id, commit);
+    }
+    if (OB_SUCC(ret)) { ret = ObLobSeqId::get_seq_id(allocator, 1, piece_seq); }
+    if (OB_SUCC(ret)) {
+      list.reset(&stmt, TENANT_ID, tx_id, LOB_META_TABLE_ID, LOB_PIECE_TABLE_ID, false);
+      ret = ctx.reset(&list, LOB_COLUMN_IDX,
+          blocksstable::ObDmlRowFlag(blocksstable::ObDmlFlag::DF_UPDATE),
+          expected_lob_id_, new_seq, true);
+    }
+    if (OB_SUCC(ret)) { ret = ctx.set_image_desc(expected_lob_id_, old_seq, false); }
+    if (OB_SUCC(ret)) {
+      list.add(&ctx);
+      auto publish_image = [&](const transaction::ObTxSEQ &seq,
+          const ObLobLastWriteType write_type, const std::string &data,
+          const char *chunk_type) {
+        ObString summary;
+        const bool external = 0 == STRCMP(chunk_type, "EXTERNAL_REFERENCE");
+        const bool no_logging = new_no_logging && seq == new_seq;
+        const uint64_t chunks = no_logging ? new_chunk_count : 1;
+        const uint64_t bytes = no_logging ? MAX(static_cast<uint64_t>(data.length()), chunks) : data.length();
+        int image_ret = build_summary_cache_value(chunk_type, bytes,
+            external ? 0 : chunks, allocator, summary, write_type);
+        const ObLobAuxKey summary_key(commit, TENANT_ID, tx_id, LOB_META_TABLE_ID,
+            expected_lob_id_, seq, expected_summary_seq_id_);
+        if (OB_SUCC(image_ret)) {
+          image_ret = instance_->lob_aux_storager_.put(
+              summary_key, "summary", summary.ptr(), summary.length());
+        }
+        if (OB_SUCC(image_ret) && !external && ObLobLastWriteType::INSERT == write_type) {
+          const ObLobAuxKey data_key(commit, TENANT_ID, tx_id, LOB_PIECE_TABLE_ID,
+              expected_lob_id_, seq, piece_seq);
+          if (no_logging) {
+            // Every fragment must read its own marker, including tasks handled
+            // inline when the single worker's queue is full.
+            for (uint64_t i = 0; OB_SUCC(image_ret) && i < chunks; ++i) {
+              ObString marker_seq;
+              image_ret = ObLobSeqId::get_seq_id(allocator, i + 1, marker_seq);
+              if (OB_SUCC(image_ret)) {
+                const ObLobAuxKey marker_key(commit, TENANT_ID, tx_id, LOB_PIECE_TABLE_ID,
+                    expected_lob_id_, seq, marker_seq);
+                image_ret = instance_->lob_aux_storager_.put_no_logging(marker_key);
+              }
+            }
+          } else {
+            image_ret = instance_->lob_aux_storager_.put(data_key, "piece", data.data(), data.length());
+          }
+        }
+        return image_ret;
+      };
+      ret = publish_image(new_seq, new_write, new_data, new_chunk_type);
+      if (OB_SUCC(ret) && publish_old && !same_key) {
+        ret = publish_image(old_seq, old_write, old_data, old_chunk_type);
+      }
+      formatter.on_callback_ = [&](IStmtTask *completed) {
+        EXPECT_EQ(&stmt, completed);
+        EXPECT_TRUE(list.is_all_lob_callback_done());
+        EXPECT_EQ(0, task.get_pending_lob_format_count());
+        EXPECT_EQ(0U, ctx.get_lob_col_ctx(true).get_col_ref_cnt());
+        EXPECT_EQ(0U, ctx.get_lob_col_ctx(false).get_col_ref_cnt());
+      };
+    }
+    if (OB_SUCC(ret)) {
+      cache_get_count_before_push = ATOMIC_LOAD(&instance_->lob_aux_storager_.stat_info_.get_req_cnt_);
+      ret = merger_.push(list, stop_flag);
+    }
+    if (OB_SUCC(ret)) {
+      const int64_t deadline = get_timestamp() + 5 * _SEC_;
+      while (0 == formatter.get_callback_count() && get_timestamp() < deadline) { ob_usleep(1000); }
+      if (0 == formatter.get_callback_count()) { ret = OB_TIMEOUT; }
+    }
+    // Join before stack contexts or the callback target are destroyed, even if
+    // a regression leaves a worker waiting for the deliberately missing key.
+    merger_.stop();
+    if (OB_SUCC(ret)) {
+      EXPECT_EQ(1, formatter.get_callback_count());
+      EXPECT_EQ(expected_force_padding_by_append, ctx.is_force_padding_by_append());
+      EXPECT_EQ(expected_new_padding, ctx.get_lob_col_ctx(true).is_padding());
+      EXPECT_EQ(expected_old_padding, ctx.get_lob_col_ctx(false).is_padding());
+      EXPECT_EQ(0, merger_.lob_data_list_task_count_);
+      if (new_no_logging && !same_key && ObLobLastWriteType::INSERT == old_write
+          && 0 == STRCMP(old_chunk_type, "OUT_TABLE")) {
+        // This scenario reads two Summaries, every new marker and the old payload.
+        EXPECT_EQ(static_cast<int64_t>(new_chunk_count) + 3,
+            ATOMIC_LOAD(&instance_->lob_aux_storager_.stat_info_.get_req_cnt_)
+                - cache_get_count_before_push);
+      }
+      if (!expected_new_padding) {
+        const ObString &actual = ctx.get_new_lob_column_value();
+        EXPECT_EQ(new_data, std::string(actual.ptr(), actual.length()));
+      }
+      if (!expected_old_padding) {
+        const ObString &actual = ctx.get_old_lob_column_value();
+        EXPECT_EQ(same_key ? new_data : old_data, std::string(actual.ptr(), actual.length()));
+      }
+    }
+    if (nullptr != instance_) { instance_->formatter_ = saved_formatter; }
     return ret;
   }
 
@@ -799,6 +1070,8 @@ protected:
 //   B. Payload validation and subscription/rollback filtering (5 cases)
 //   C. Waiting for missing pieces and stopping                (2 cases)
 //   D. System LS DDL                                          (4 cases)
+// Additional policy cases cover per-image results, coordinated APPEND, typed
+// NO_LOGGING per-fragment markers and exact completion accounting.
 
 // ============================================================================
 // A. Log ingestion and LOB image assembly (4 cases)
@@ -1023,13 +1296,14 @@ TEST_F(TestCDCOfOuttableLob, outtable_parser_rollback_retains_transaction_branch
   OK(ret);
   const ObLobAuxKey key(2002 /*commit_version*/, TENANT_ID, trans_id, LOB_PIECE_TABLE_ID,
       expected_lob_id_, arg.lob_operation_seq_no_, seq_id);
-  const char *data = nullptr;
-  int64_t data_len = 0;
-  ret = instance_->lob_aux_storager_.get(allocator, key, data, data_len);
+  ObLobAuxReadValue cached_value;
+  ret = instance_->lob_aux_storager_.get(allocator, key, cached_value);
+  const int64_t data_len = cached_value.payload_.length();
   LOG_INFO("step 3: surviving branch read back", K(ret), K(data_len),
       "expected_data_length", arg.data_.length());
   OK(ret);
-  EXPECT_EQ("payload", std::string(data, data_len));
+  EXPECT_FALSE(cached_value.is_no_logging());
+  EXPECT_EQ(ObString::make_string("payload"), cached_value.payload_);
   ret = instance_->lob_aux_storager_.del(key);
   LOG_INFO("step 4: surviving branch cache released", K(ret),
       "cache_count", instance_->lob_aux_storager_.lob_aux_map_.count());
@@ -1085,7 +1359,7 @@ TEST_F(TestCDCOfOuttableLob, outtable_parser_filters_unsubscribed_data)
 // Scenario: A marker has a valid identity and no payload; malformed variants invert the flag/data relation.
 // Steps: Enqueue the marker, reject malformed variants, then exercise subscription and rollback decisions.
 // Checks: Task owns one marker node; malformed bodies return OB_INVALID_DATA; filtered markers succeed;
-//         a subscribed marker returns OB_NOT_SUPPORTED. None of these paths populate the piece cache.
+//         ERROR rejects a consumed marker; PADDING stores a typed marker with no payload.
 TEST_F(TestCDCOfOuttableLob, outtable_no_logging_marker_respects_filtering)
 {
   // The same marker must survive ingress so Parser can apply transaction and subscription rules.
@@ -1139,6 +1413,16 @@ TEST_F(TestCDCOfOuttableLob, outtable_no_logging_marker_respects_filtering)
   EXPECT_EQ(OB_NOT_SUPPORTED, ret);
   EXPECT_EQ(0, instance_->lob_aux_storager_.lob_aux_map_.count());
 
+  instance_->unsupported_lob_handling_mode_ = ObUnsupportedLobHandlingMode::PADDING;
+  OK(parse_outtable_body(marker, task, &tenant));
+  const ObLobAuxKey marker_key(2004, TENANT_ID, task.get_trans_id(), LOB_PIECE_TABLE_ID,
+      expected_lob_id_, marker.lob_operation_seq_no_, seq_id);
+  ObLobAuxReadValue cached_marker;
+  OK(instance_->lob_aux_storager_.get(allocator, marker_key, cached_marker));
+  EXPECT_TRUE(cached_marker.is_no_logging());
+  EXPECT_TRUE(cached_marker.payload_.empty());
+  OK(instance_->lob_aux_storager_.del(marker_key));
+
   // Rollback precedes both subscription lookup and the no-logging error.
   OK(task.push_rollback_to_info(palf::LSN(3 /*offset*/),
       transaction::ObTxSEQ(20 /*seq*/, 3 /*branch*/), transaction::ObTxSEQ(5 /*seq*/, 3 /*branch*/)));
@@ -1152,8 +1436,8 @@ TEST_F(TestCDCOfOuttableLob, outtable_no_logging_marker_respects_filtering)
 // B5. No-logging ExtInfo markers fail explicitly only after their table passes subscription filtering.
 // Scenario: An old-image marker carries a valid piece identity and an empty payload.
 // Steps: Parse it before and after subscribing the PIECE table, then parse inconsistent flag/data pairs.
-// Checks: Filtering succeeds; a consumed marker returns OB_NOT_SUPPORTED; inconsistent bodies return
-//         OB_INVALID_DATA. The auxiliary cache remains empty throughout.
+// Checks: Filtering succeeds; ERROR rejects a consumed marker; PADDING stores a typed marker;
+//         DDL stays strict, and inconsistent bodies return OB_INVALID_DATA.
 TEST_F(TestCDCOfOuttableLob, lob_data_ext_info_no_logging_marker_respects_filtering)
 {
   // Use the production ExtInfo decoder and publisher without constructing unrelated mutator rows.
@@ -1198,6 +1482,20 @@ TEST_F(TestCDCOfOuttableLob, lob_data_ext_info_no_logging_marker_respects_filter
   EXPECT_EQ(OB_NOT_SUPPORTED, ret);
   EXPECT_EQ(0, instance_->lob_aux_storager_.lob_aux_map_.count());
 
+  instance_->unsupported_lob_handling_mode_ = ObUnsupportedLobHandlingMode::PADDING;
+  OK(parse_ext_info());
+  const ObLobAuxKey marker_key(2005, TENANT_ID, task.get_trans_id(), LOB_PIECE_TABLE_ID,
+      expected_lob_id_, log.lob_operation_seq_no_, log.seq_id_);
+  ObLobAuxReadValue cached_marker;
+  OK(instance_->lob_aux_storager_.get(allocator, marker_key, cached_marker));
+  EXPECT_TRUE(cached_marker.is_no_logging());
+  EXPECT_TRUE(cached_marker.payload_.empty());
+  OK(instance_->lob_aux_storager_.del(marker_key));
+  task.set_type(PartTransTask::TASK_TYPE_DDL_TRANS);
+  EXPECT_EQ(OB_NOT_SUPPORTED, parse_ext_info());
+  EXPECT_EQ(0, instance_->lob_aux_storager_.lob_aux_map_.count());
+  task.set_type(PartTransTask::TASK_TYPE_DML_TRANS);
+
   // Marker validity is independent of the consumer's ability to reconstruct the LOB.
   for (const bool is_logging : {false, true}) {
     log.is_logging_ = is_logging;
@@ -1210,9 +1508,98 @@ TEST_F(TestCDCOfOuttableLob, lob_data_ext_info_no_logging_marker_respects_filter
   }
 }
 
+TEST_F(TestCDCOfOuttableLob, error_mode_rejects_unsupported_dml_summaries)
+{
+  OK(init_merger_environment());
+  instance_->unsupported_lob_handling_mode_ = ObUnsupportedLobHandlingMode::ERROR;
+  for (const ObLobLastWriteType write_type : {ObLobLastWriteType::APPEND,
+      ObLobLastWriteType::MULTIPART_WRITE}) {
+    EXPECT_EQ(OB_NOT_SUPPORTED, run_outtable_pipeline({"payload"}, 7, false,
+        blocksstable::ObDmlFlag::DF_INSERT, true, write_type, false));
+  }
+  EXPECT_EQ(OB_NOT_SUPPORTED, run_outtable_pipeline({"payload"}, 7, false,
+      blocksstable::ObDmlFlag::DF_INSERT, true, ObLobLastWriteType::INSERT,
+      false, "EXTERNAL_REFERENCE"));
+}
+
+TEST_F(TestCDCOfOuttableLob, padding_mode_keeps_ddl_and_unknown_chunk_type_strict)
+{
+  OK(init_merger_environment());
+  instance_->unsupported_lob_handling_mode_ = ObUnsupportedLobHandlingMode::PADDING;
+  for (const ObLobLastWriteType write_type : {ObLobLastWriteType::APPEND,
+      ObLobLastWriteType::MULTIPART_WRITE}) {
+    EXPECT_EQ(OB_NOT_SUPPORTED, run_outtable_pipeline({"payload"}, 7, false,
+        blocksstable::ObDmlFlag::DF_INSERT, true, write_type, true));
+    // An unknown chunk type must fail during decoding before Summary classification;
+    // PADDING must preserve that protocol error.
+    EXPECT_EQ(OB_INVALID_ARGUMENT, run_outtable_pipeline({"payload"}, 7, false,
+        blocksstable::ObDmlFlag::DF_INSERT, true, write_type, false, "UNKNOWN_CHUNK_TYPE"));
+  }
+  EXPECT_EQ(OB_NOT_SUPPORTED, run_outtable_pipeline({"payload"}, 7, false,
+      blocksstable::ObDmlFlag::DF_INSERT, true, ObLobLastWriteType::INSERT,
+      true, "EXTERNAL_REFERENCE"));
+}
+
+// A new APPEND must finish without looking up an old Summary that was never logged.
+TEST_F(TestCDCOfOuttableLob, padding_new_append_skips_absent_old_summary_single_worker)
+{
+  OK(run_async_column_policy(ObLobLastWriteType::APPEND, ObLobLastWriteType::INSERT,
+      false, true, true, true));
+}
+
+// Historical APPEND on the old side must preserve a separately recoverable new image.
+TEST_F(TestCDCOfOuttableLob, padding_old_append_preserves_normal_new_image)
+{
+  OK(run_async_column_policy(ObLobLastWriteType::INSERT, ObLobLastWriteType::APPEND,
+      true, false, true, false));
+}
+
+TEST_F(TestCDCOfOuttableLob, padding_new_multipart_preserves_normal_old_image)
+{
+  OK(run_async_column_policy(ObLobLastWriteType::MULTIPART_WRITE, ObLobLastWriteType::INSERT,
+      true, true, false, false));
+}
+
+TEST_F(TestCDCOfOuttableLob, padding_old_multipart_preserves_normal_new_image)
+{
+  OK(run_async_column_policy(ObLobLastWriteType::INSERT, ObLobLastWriteType::MULTIPART_WRITE,
+      true, false, true, false));
+}
+
+TEST_F(TestCDCOfOuttableLob, padding_external_summary_preserves_normal_old_image)
+{
+  OK(run_async_column_policy(ObLobLastWriteType::INSERT, ObLobLastWriteType::INSERT,
+      true, true, false, false, false, "EXTERNAL_REFERENCE"));
+}
+
+TEST_F(TestCDCOfOuttableLob, padding_old_external_summary_preserves_normal_new_image)
+{
+  OK(run_async_column_policy(ObLobLastWriteType::INSERT, ObLobLastWriteType::INSERT,
+      true, false, true, false, false, "OUT_TABLE", "EXTERNAL_REFERENCE"));
+}
+
+TEST_F(TestCDCOfOuttableLob, no_logging_all_fragments_complete_with_inline_dispatch)
+{
+  // 64 fragments exceed the 16-slot single-worker queue. Every queued or inline
+  // fragment must read its own marker before the image completes once.
+  OK(run_async_column_policy(ObLobLastWriteType::INSERT, ObLobLastWriteType::INSERT,
+      true, true, false, false, false, "OUT_TABLE", "OUT_TABLE", true, 64));
+}
+
+TEST_F(TestCDCOfOuttableLob, normal_same_key_old_new_images_complete_once)
+{
+  OK(run_async_column_policy(ObLobLastWriteType::INSERT, ObLobLastWriteType::INSERT,
+      true, false, false, false, true));
+}
+
 // ============================================================================
 // C. Waiting for missing pieces and stopping (2 cases)
 // ============================================================================
+
+TEST_F(TestCDCOfOuttableLob, no_logging_pending_fragment_waits_for_own_marker_before_callback)
+{
+  OK(run_missing_lob_wait(LobWaitResult::NO_LOGGING));
+}
 
 // C1. Stop a wait for a missing piece and restore the pending count.
 // Scenario: The real fragment handler cannot find the piece in either cache or storage.
@@ -1305,13 +1692,14 @@ TEST_F(TestCDCOfOuttableLob, ddl_outtable_filters_piece_table_and_full_rollback_
   OK(ret);
   const ObLobAuxKey key(3001 /*commit_version*/, TENANT_ID, task.get_trans_id(), arg.lob_aux_table_id_,
       expected_lob_id_, arg.lob_operation_seq_no_, seq_id);
-  const char *data = nullptr;
-  int64_t len = 0;
-  ret = instance_->lob_aux_storager_.memory_get_(key, data, len);
+  ObLobAuxReadValue cached_value;
+  ret = instance_->lob_aux_storager_.get(allocator, key, cached_value);
+  const int64_t len = cached_value.payload_.length();
   LOG_INFO("step 5: surviving DDL piece read back", K(ret), K(len),
       "expected_data_length", arg.data_.length());
   OK(ret);
-  EXPECT_EQ("ddl chunk", std::string(data, len));
+  EXPECT_FALSE(cached_value.is_no_logging());
+  EXPECT_EQ(ObString::make_string("ddl chunk"), cached_value.payload_);
   ret = instance_->lob_aux_storager_.del(key);
   LOG_INFO("step 6: DDL piece cache released", K(ret),
       "cache_count", instance_->lob_aux_storager_.lob_aux_map_.count());
@@ -1544,6 +1932,7 @@ TEST_F(TestCDCOfOuttableLob, ddl_outtable_no_logging_marker_respects_filtering)
 {
   // System LS filtering uses DDL identity rather than the user-table subscription cache.
   OK(init_merger_environment());
+  instance_->unsupported_lob_handling_mode_ = ObUnsupportedLobHandlingMode::PADDING;
   ObArenaAllocator allocator;
   PartTransTask task;
   task.set_allocator(OB_MALLOC_NORMAL_BLOCK_SIZE, allocator);

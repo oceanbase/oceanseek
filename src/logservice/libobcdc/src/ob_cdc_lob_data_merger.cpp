@@ -224,8 +224,7 @@ int ObCDCLobDataMerger::merge_ddl_lob(
         LOG_ERROR("unexpected non-insert ddl lob task", KR(ret), KPC(lob_data_get_ctx));
       } else {
         // Prepare 和它生成的 Fragment 都在当前线程执行，不向 Merger 队列发布任务。
-        ObLobImagePrepareTask prepare_task(*lob_data_get_ctx, true/*is_new_col*/);
-        if (OB_FAIL(handle_prepare_task_(prepare_task, true/*is_sync*/, stop_flag))) {
+        if (OB_FAIL(handle_prepare_task_(*lob_data_get_ctx, true/*is_sync*/, stop_flag))) {
           if (OB_IN_STOP_STATE != ret) {
             LOG_ERROR("merge ddl lob image failed", KR(ret), KPC(lob_data_get_ctx));
           }
@@ -263,7 +262,7 @@ int ObCDCLobDataMerger::handle(void *data, const int64_t thread_index, volatile 
     if (OB_UNLIKELY(!prepare_task->is_valid())) {
       ret = OB_INVALID_ARGUMENT;
       LOG_ERROR("invalid lob image prepare task", KR(ret), KPC(prepare_task), K(thread_index));
-    } else if (OB_FAIL(handle_prepare_task_(*prepare_task, false/*is_sync*/, stop_flag))) {
+    } else if (OB_FAIL(handle_prepare_task_(prepare_task->host_, false/*is_sync*/, stop_flag))) {
       if (OB_IN_STOP_STATE != ret) {
         LOG_ERROR("handle prepare task failed", KR(ret), KPC(prepare_task), K(thread_index));
       }
@@ -339,12 +338,8 @@ int ObCDCLobDataMerger::push_lob_column_(
       && !lob_data_get_ctx.has_image_desc(true/*is_new_col*/))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_ERROR("lob data get context has no image descriptor", KR(ret), K(lob_data_get_ctx));
-  } else if (lob_data_get_ctx.has_image_desc(false/*is_new_col*/)
-      && OB_FAIL(push_prepare_task_(allocator, lob_data_get_ctx, false/*is_new_col*/, stop_flag))) {
-    LOG_ERROR("push old image prepare task failed", KR(ret), K(lob_data_get_ctx));
-  } else if (lob_data_get_ctx.has_image_desc(true/*is_new_col*/)
-      && OB_FAIL(push_prepare_task_(allocator, lob_data_get_ctx, true/*is_new_col*/, stop_flag))) {
-    LOG_ERROR("push new image prepare task failed", KR(ret), K(lob_data_get_ctx));
+  } else if (OB_FAIL(push_prepare_task_(allocator, lob_data_get_ctx, stop_flag))) {
+    LOG_ERROR("push lob image prepare task failed", KR(ret), K(lob_data_get_ctx));
   }
 
   return ret;
@@ -353,7 +348,6 @@ int ObCDCLobDataMerger::push_lob_column_(
 int ObCDCLobDataMerger::push_prepare_task_(
     ObIAllocator &allocator,
     ObLobDataGetCtx &lob_data_get_ctx,
-    const bool is_new_col,
     volatile bool &stop_flag)
 {
   int ret = OB_SUCCESS;
@@ -361,9 +355,9 @@ int ObCDCLobDataMerger::push_prepare_task_(
   ObLobImagePrepareTask *task = static_cast<ObLobImagePrepareTask *>(allocator.alloc(sizeof(ObLobImagePrepareTask)));
   if (OB_ISNULL(task)) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
-    LOG_ERROR("allocate lob image prepare task failed", KR(ret), K(is_new_col), K(lob_data_get_ctx));
+    LOG_ERROR("allocate lob image prepare task failed", KR(ret), K(lob_data_get_ctx));
   } else {
-    new(task) ObLobImagePrepareTask(lob_data_get_ctx, is_new_col);
+    new(task) ObLobImagePrepareTask(lob_data_get_ctx);
     const uint64_t hash_value = ATOMIC_FAA(&round_value_, 1);
     do {
       if (OB_FAIL(ObLobDataMergerThread::push(
@@ -381,28 +375,99 @@ int ObCDCLobDataMerger::push_prepare_task_(
 }
 
 int ObCDCLobDataMerger::handle_prepare_task_(
-    ObLobImagePrepareTask &task,
+    ObLobDataGetCtx &lob_data_get_ctx,
     const bool is_sync,
     volatile bool &stop_flag)
 {
   int ret = OB_SUCCESS;
-  ObLobDataGetCtx &lob_data_get_ctx = task.host_;
   ObLobDataOutRowCtxList *list = static_cast<ObLobDataOutRowCtxList *>(lob_data_get_ctx.host_);
-  const ObLobImageAssembleDesc &desc = lob_data_get_ctx.get_image_desc(task.is_new_col_);
+  const bool has_new_image_desc = lob_data_get_ctx.has_image_desc(true);
+  const bool has_old_image_desc = lob_data_get_ctx.has_image_desc(false);
+  if (OB_ISNULL(list) || OB_UNLIKELY(!has_new_image_desc && !has_old_image_desc)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_ERROR("invalid lob column prepare context", KR(ret), KPC(list));
+  } else {
+    if (has_new_image_desc) {
+      if (OB_FAIL(prepare_lob_image_(
+          lob_data_get_ctx, true/*is_new_col*/, is_sync, stop_flag))) {
+        if (OB_IN_STOP_STATE != ret) {
+          LOG_ERROR("prepare new lob image failed", KR(ret), K(lob_data_get_ctx), K(is_sync));
+        }
+      }
+    }
+    if (OB_SUCC(ret) && has_old_image_desc && !is_in_stop_status(stop_flag)) {
+      if (lob_data_get_ctx.is_force_padding_by_append()) {
+        // A new APPEND may not log the outrow old image's Summary;
+        // complete it as PADDING without starting its get.
+        if (OB_FAIL(complete_padding_image_(lob_data_get_ctx, false/*is_new_col*/, stop_flag))) {
+          if (OB_IN_STOP_STATE != ret) {
+            LOG_ERROR("complete old padding lob image failed", KR(ret), K(lob_data_get_ctx));
+          }
+        }
+      } else {
+        if (OB_FAIL(prepare_lob_image_(
+            lob_data_get_ctx, false/*is_new_col*/, is_sync, stop_flag))) {
+          if (OB_IN_STOP_STATE != ret) {
+            LOG_ERROR("prepare old lob image failed", KR(ret), K(lob_data_get_ctx), K(is_sync));
+          }
+        }
+      }
+    }
+    if (OB_SUCC(ret) && !is_in_stop_status(stop_flag)) {
+      // This may callback Formatter and release the column. No access to the
+      // column, list or task is allowed after dropping this reservation.
+      if (OB_FAIL(after_fragment_progress_done_(lob_data_get_ctx, *list, stop_flag))) {
+        if (OB_IN_STOP_STATE != ret) {
+          LOG_ERROR("after_fragment_progress_done_ failed", KR(ret));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObCDCLobDataMerger::complete_padding_image_(
+    ObLobDataGetCtx &lob_data_get_ctx,
+    const bool is_new_col,
+    volatile bool &stop_flag)
+{
+  int ret = OB_SUCCESS;
+  ObLobColCtx &col_ctx = lob_data_get_ctx.get_lob_col_ctx(is_new_col);
+  if (OB_UNLIKELY(0 != col_ctx.get_col_ref_cnt())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("padding image is already scheduled", KR(ret), K(is_new_col), K(col_ctx));
+  } else {
+    col_ctx.mark_padding();
+    // No fragment tasks are created for this image, so Prepare can finish it directly.
+    if (OB_FAIL(finish_lob_image_(lob_data_get_ctx, is_new_col, stop_flag))) {
+      LOG_ERROR("finish lob image failed", KR(ret));
+    }
+  }
+  return ret;
+}
+
+int ObCDCLobDataMerger::prepare_lob_image_(
+    ObLobDataGetCtx &lob_data_get_ctx,
+    const bool is_new_col,
+    const bool is_sync,
+    volatile bool &stop_flag)
+{
+  int ret = OB_SUCCESS;
+  ObLobDataOutRowCtxList *list = static_cast<ObLobDataOutRowCtxList *>(lob_data_get_ctx.host_);
+  const ObLobImageAssembleDesc &desc = lob_data_get_ctx.get_image_desc(is_new_col);
   IStmtTask *stmt_task = nullptr;
   char summary_seq_buf[storage::ObLobSeqId::LOB_SEQ_ID_MIN_LEN];
   ObString summary_seq_id(sizeof(summary_seq_buf), summary_seq_buf);
-  const char *summary_data = nullptr;
-  int64_t summary_data_len = 0;
+  ObLobAuxReadValue summary_value;
   uint64_t byte_len = 0;
   uint64_t char_len = 0;
   storage::ObLobMetaExtraInfo extra_info;
 
   if (OB_ISNULL(list) || OB_ISNULL(stmt_task = list->get_stmt_task())) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_ERROR("invalid host of lob prepare task", KR(ret), KPC(list), K(task));
+    LOG_ERROR("invalid host of lob image", KR(ret), KPC(list), K(lob_data_get_ctx), K(is_new_col));
   } else if (OB_FAIL(storage::ObLobSeqId::get_summary_seq_id(summary_seq_id))) {
-    LOG_ERROR("generate summary seq id failed", KR(ret), K(task));
+    LOG_ERROR("generate summary seq id failed", KR(ret), K(lob_data_get_ctx), K(is_new_col));
   } else {
     const ObLobAuxKey key(stmt_task->get_host().get_trans_commit_version(), list->get_tenant_id(),
         list->get_trans_id(), list->get_aux_lob_meta_table_id(), desc.lob_id_,
@@ -410,34 +475,48 @@ int ObCDCLobDataMerger::handle_prepare_task_(
     ObCDCLobAuxStorager &storager = TCTX.lob_aux_storager_;
     ObIAllocator &allocator = list->get_allocator();
     RETRY_FUNC_ON_ERROR_WITH_LOB_DISPATCH_RELAX(OB_ENTRY_NOT_EXIST, is_in_stop_status(stop_flag),
-        stmt_task->get_host(), key, storager, get, allocator, key, summary_data, summary_data_len);
+        stmt_task->get_host(), key, storager, get, allocator, key, summary_value);
     if (OB_SUCC(ret)) {
-      ObString summary_value(summary_data_len, summary_data);
-      if (OB_FAIL(ObCDCLobAuxTableParser::decode_summary_value(
-          allocator, summary_value, byte_len, char_len, extra_info))) {
-        LOG_ERROR("decode lob summary failed", KR(ret), K(key));
-      } else if (OB_UNLIKELY(storage::ObLobMetaExtraInfo::LOB_META_SUMMARY != extra_info.extra_info_type_)) {
+      if (summary_value.is_no_logging()) { // summary should never be no_logging
         ret = OB_ERR_UNEXPECTED;
-        LOG_ERROR("unexpected lob extra info type in summary cache", KR(ret), K(extra_info), K(key));
-      } else if (OB_UNLIKELY(storage::ObLobLastWriteType::INSERT != extra_info.last_write_type_)) {
-        // CDC 仅支持 INSERT 类型的 LOB，不支持 APPEND 和 MULTIPART_WRITE 类型的 LOB
-        ret = OB_NOT_SUPPORTED;
-        LOG_ERROR("unsupported lob last write type", KR(ret), K(extra_info), K(key));
-      } else if (OB_UNLIKELY(
-          (!extra_info.lob_chunk_type_.in_table() && !extra_info.lob_chunk_type_.out_table())
-          || (byte_len > static_cast<uint64_t>(INT64_MAX - 1))
-          || ((0 == byte_len) != (0 == extra_info.chunk_count_))
-          || ((byte_len > 0) && (extra_info.chunk_count_ > byte_len)))) {
-        ret = OB_NOT_SUPPORTED;
-        LOG_ERROR("invalid lob summary", KR(ret), K(extra_info), K(key));
-      } else if (OB_FAIL(build_and_dispatch_fragment_tasks_(
-          task, extra_info.chunk_count_, byte_len, is_sync, stop_flag))) {
-        if (OB_IN_STOP_STATE != ret) {
-          LOG_ERROR("build and dispatch fragment tasks failed", KR(ret), K(extra_info), K(key));
+        LOG_ERROR("lob summary cannot be a no-logging marker", KR(ret), K(key));
+      } else if (OB_FAIL(ObCDCLobAuxTableParser::decode_summary_value(
+          allocator, summary_value.payload_, byte_len, char_len, extra_info))) {
+        LOG_ERROR("decode lob summary failed", KR(ret), K(key));
+      } else if (OB_FAIL(ObCDCLobAuxTableParser::validate_summary_info(extra_info, byte_len))) {
+        LOG_ERROR("fail to validate lob summary info", KR(ret), K(extra_info), K(byte_len), K(key));
+      } else {
+        if ((storage::ObLobLastWriteType::INSERT != extra_info.last_write_type_)
+            || (!extra_info.lob_chunk_type_.in_table()
+                && !extra_info.lob_chunk_type_.out_table())) {
+          if (list->is_ddl() || !TCTX.is_unsupported_lob_padding_mode()) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_ERROR("unsupported lob image", KR(ret), K(extra_info), K(key),
+                "is_ddl", list->is_ddl());
+          } else {
+            // A new APPEND makes the outrow images unavailable.
+            // Set the flag so Prepare skips the outrow old Summary lookup,
+            // which could otherwise wait indefinitely. Inline old values are preserved.
+            if (is_new_col
+                && (storage::ObLobLastWriteType::APPEND == extra_info.last_write_type_)) {
+              lob_data_get_ctx.set_force_padding_by_append();
+            }
+            if (OB_FAIL(complete_padding_image_(lob_data_get_ctx, is_new_col, stop_flag))) {
+              if (OB_IN_STOP_STATE != ret) {
+                LOG_ERROR("complete_padding_image_ failed", KR(ret), K(is_new_col));
+              }
+            }
+          }
+        } else if (OB_FAIL(build_and_dispatch_fragment_tasks_(
+            lob_data_get_ctx, is_new_col, extra_info.chunk_count_, byte_len, is_sync, stop_flag))) {
+          if (OB_IN_STOP_STATE != ret) {
+            LOG_ERROR("build and dispatch fragment tasks failed", KR(ret), K(extra_info), K(key));
+          }
         }
       }
     } else if (OB_IN_STOP_STATE != ret) {
-      LOG_ERROR("get lob summary from auxiliary storager failed", KR(ret), K(key), K(task));
+      LOG_ERROR("get lob summary from auxiliary storager failed", KR(ret), K(key),
+          K(lob_data_get_ctx), K(is_new_col));
     }
   }
   if (is_in_stop_status(stop_flag)) {
@@ -447,17 +526,17 @@ int ObCDCLobDataMerger::handle_prepare_task_(
 }
 
 int ObCDCLobDataMerger::build_and_dispatch_fragment_tasks_(
-    ObLobImagePrepareTask &task,
+    ObLobDataGetCtx &lob_data_get_ctx,
+    const bool is_new_col,
     const uint64_t chunk_count,
     const uint64_t expected_byte_len,
     const bool is_sync,
     volatile bool &stop_flag)
 {
   int ret = OB_SUCCESS;
-  ObLobDataGetCtx &lob_data_get_ctx = task.host_;
   ObLobDataOutRowCtxList *list = static_cast<ObLobDataOutRowCtxList *>(lob_data_get_ctx.host_);
   ObIAllocator &allocator = list->get_allocator();
-  ObLobColCtx &col_ctx = lob_data_get_ctx.get_lob_col_ctx(task.is_new_col_);
+  ObLobColCtx &col_ctx = lob_data_get_ctx.get_lob_col_ctx(is_new_col);
   char summary_seq_buf[storage::ObLobSeqId::LOB_SEQ_ID_MIN_LEN];
   ObString summary_seq_id(sizeof(summary_seq_buf), summary_seq_buf);
 
@@ -470,7 +549,9 @@ int ObCDCLobDataMerger::build_and_dispatch_fragment_tasks_(
     // 避免临时内存在 LogEntryTask arena 中滞留到 task reset。
     ObArenaAllocator seq_id_allocator(ObMemAttr(list->get_tenant_id(), "CDCLobSeqTmp"));
     storage::ObLobSeqIdGenerator seq_id_generator(summary_seq_id, &seq_id_allocator);
-    for (uint64_t idx = 0; OB_SUCC(ret) && (idx < chunk_count) && !is_in_stop_status(stop_flag); ++idx) {
+    // NO_LOGGING still provides one marker per fragment; dispatch all the fragments.
+    for (uint64_t idx = 0; OB_SUCC(ret) && (idx < chunk_count)
+        && !is_in_stop_status(stop_flag); ++idx) {
       ObString generated_seq_id;
       ObLobColFragTask *fragment_task = nullptr;
       char *seq_id_buf = nullptr;
@@ -479,7 +560,7 @@ int ObCDCLobDataMerger::build_and_dispatch_fragment_tasks_(
       } else if (is_sync) {
         // 同步分片不会离开当前调用栈，可以直接使用生成的 seq_id，无需分配任务和深拷贝。
         ObLobColFragTask sync_fragment_task(lob_data_get_ctx);
-        sync_fragment_task.reset(task.is_new_col_, generated_seq_id, idx);
+        sync_fragment_task.reset(is_new_col, generated_seq_id, idx);
         if (OB_FAIL(handle_fragment_task_(sync_fragment_task, stop_flag))) {
           if (OB_IN_STOP_STATE != ret) {
             LOG_ERROR("handle synchronous lob fragment failed", KR(ret), K(sync_fragment_task));
@@ -488,16 +569,17 @@ int ObCDCLobDataMerger::build_and_dispatch_fragment_tasks_(
       } else if (OB_ISNULL(fragment_task = static_cast<ObLobColFragTask *>(
           allocator.alloc(sizeof(ObLobColFragTask))))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
-        LOG_ERROR("allocate lob fragment task failed", KR(ret), K(idx), K(chunk_count), K(task));
+        LOG_ERROR("allocate lob fragment task failed", KR(ret), K(idx), K(chunk_count),
+            K(lob_data_get_ctx), K(is_new_col));
       } else if (OB_ISNULL(seq_id_buf = static_cast<char *>(allocator.alloc(generated_seq_id.length())))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
         LOG_ERROR("allocate lob fragment seq id failed", KR(ret), K(idx), K(chunk_count),
-            "seq_id_len", generated_seq_id.length(), K(task));
+            "seq_id_len", generated_seq_id.length(), K(lob_data_get_ctx), K(is_new_col));
       } else {
         MEMCPY(seq_id_buf, generated_seq_id.ptr(), generated_seq_id.length());
         ObString task_seq_id(generated_seq_id.length(), seq_id_buf);
         new(fragment_task) ObLobColFragTask(lob_data_get_ctx);
-        fragment_task->reset(task.is_new_col_, task_seq_id, idx);
+        fragment_task->reset(is_new_col, task_seq_id, idx);
         const uint64_t hash_value = ATOMIC_FAA(&round_value_, 1);
         // Prepare task 本身运行在 Merger worker 中。队列满时如果继续阻塞等待入队，
         // 可能导致所有 worker 都被 Prepare task 占用，没有 worker 消费队列中的 Fragment task。
@@ -518,10 +600,12 @@ int ObCDCLobDataMerger::build_and_dispatch_fragment_tasks_(
     }
     if (OB_SUCC(ret) && is_in_stop_status(stop_flag)) {
       ret = OB_IN_STOP_STATE;
-    } else if (OB_SUCC(ret) && (0 == col_ctx.dec_col_ref_cnt())) {
-      if (OB_FAIL(finish_lob_image_(lob_data_get_ctx, task.is_new_col_, stop_flag))) {
-        if (OB_IN_STOP_STATE != ret) {
-          LOG_ERROR("finish lob image failed", KR(ret), K(task), K(lob_data_get_ctx));
+    } else if (OB_SUCC(ret)) {
+      // All fragments have been dispatched. Release Prepare's reserved reference;
+      // each fragment releases its own reference after reading its payload or marker.
+      if (0 == col_ctx.dec_col_ref_cnt()) {
+        if (OB_FAIL(finish_lob_image_(lob_data_get_ctx, is_new_col, stop_flag))) {
+          LOG_ERROR("finish lob image failed", KR(ret));
         }
       }
     }
@@ -537,9 +621,11 @@ int ObCDCLobDataMerger::handle_fragment_task_(
   ObLobDataGetCtx &lob_data_get_ctx = task.host_;
   ObLobDataOutRowCtxList *list = static_cast<ObLobDataOutRowCtxList *>(lob_data_get_ctx.host_);
   const ObLobImageAssembleDesc &desc = lob_data_get_ctx.get_image_desc(task.is_new_col_);
+  ObLobColCtx &col_ctx = lob_data_get_ctx.get_lob_col_ctx(task.is_new_col_);
   IStmtTask *stmt_task = nullptr;
   ObString **fragments = lob_data_get_ctx.get_fragment_cb_array(task.is_new_col_);
-  if (OB_ISNULL(list) || OB_ISNULL(stmt_task = list->get_stmt_task()) || OB_ISNULL(fragments)) {
+  if (OB_ISNULL(list) || OB_ISNULL(stmt_task = list->get_stmt_task()) || OB_ISNULL(fragments)
+      || OB_UNLIKELY(task.idx_ >= col_ctx.chunk_count_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_ERROR("invalid lob fragment task context", KR(ret), KPC(list), KP(stmt_task),
         KP(fragments), K(task));
@@ -547,30 +633,35 @@ int ObCDCLobDataMerger::handle_fragment_task_(
     const ObLobAuxKey key(stmt_task->get_host().get_trans_commit_version(), list->get_tenant_id(),
         list->get_trans_id(), list->get_aux_lob_piece_table_id(), desc.lob_id_,
         desc.lob_operation_seq_no_, task.seq_id_);
-    const char *piece_data = nullptr;
-    int64_t piece_data_len = 0;
+    ObLobAuxReadValue value;
     ObCDCLobAuxStorager &storager = TCTX.lob_aux_storager_;
     RETRY_FUNC_ON_ERROR_WITH_LOB_DISPATCH_RELAX(OB_ENTRY_NOT_EXIST, is_in_stop_status(stop_flag),
-        stmt_task->get_host(), key, storager, get, list->get_allocator(), key, piece_data, piece_data_len);
+        stmt_task->get_host(), key, storager, get, list->get_allocator(), key, value);
     if (OB_SUCC(ret)) {
-      const ObLobColCtx &col_ctx = lob_data_get_ctx.get_lob_col_ctx(task.is_new_col_);
-      if (OB_UNLIKELY((task.idx_ >= col_ctx.chunk_count_)
-          || OB_ISNULL(piece_data)
-          || (piece_data_len <= 0)
-          || (piece_data_len > storage::ObLobMetaUtil::LOB_OUTTABLE_BLOCK_DATA_SIZE))) {
-        ret = OB_INVALID_ARGUMENT;
-        LOG_ERROR("invalid lob piece cache value", KR(ret), K(key), K(piece_data_len),
-            K(task.idx_), K(col_ctx.chunk_count_));
-      } else if (OB_FALSE_IT(fragments[task.idx_]->assign_ptr(piece_data, piece_data_len))) {
-      } else if (0 == lob_data_get_ctx.dec_col_ref_cnt(task.is_new_col_)) {
-        if (OB_FAIL(finish_lob_image_(lob_data_get_ctx, task.is_new_col_, stop_flag))) {
-          if (OB_IN_STOP_STATE != ret) {
-            LOG_ERROR("finish lob image failed", KR(ret), K(task), K(lob_data_get_ctx));
-          }
+      if (value.is_no_logging()) {
+        if (list->is_ddl() || !TCTX.is_unsupported_lob_padding_mode()) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_ERROR("cannot reconstruct no-logging lob image", KR(ret), K(key),
+              "is_ddl", list->is_ddl());
+        } else {
+          col_ctx.mark_padding();
+        }
+      } else { // !value.is_no_logging()
+        if (OB_UNLIKELY(OB_ISNULL(value.payload_.ptr()) || (value.payload_.length() <= 0)
+            || (value.payload_.length() > storage::ObLobMetaUtil::LOB_OUTTABLE_BLOCK_DATA_SIZE))) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_ERROR("invalid lob piece cache value", KR(ret), K(key), "piece_data_len",
+              value.payload_.length());
+        } else {
+          fragments[task.idx_]->assign_ptr(value.payload_.ptr(), value.payload_.length());
         }
       }
-    } else if (OB_IN_STOP_STATE != ret) {
-      LOG_ERROR("get lob piece from auxiliary storager failed", KR(ret), K(key), K(task));
+    }
+    if (OB_SUCC(ret) && 0 == col_ctx.dec_col_ref_cnt()) {
+      // The callback may release task/column memory; do not access them afterwards.
+      if (OB_FAIL(finish_lob_image_(lob_data_get_ctx, task.is_new_col_, stop_flag))) {
+        LOG_ERROR("finish lob image failed", KR(ret));
+      }
     }
   }
   if (is_in_stop_status(stop_flag)) {
@@ -584,11 +675,20 @@ int ObCDCLobDataMerger::finish_lob_image_(
     const bool is_new_col,
     volatile bool &stop_flag)
 {
+  // Prepare finishes a direct PADDING image without fragment tasks; otherwise,
+  // only the caller that releases the final image reference enters this function.
   int ret = OB_SUCCESS;
   ObLobDataOutRowCtxList *list = static_cast<ObLobDataOutRowCtxList *>(lob_data_get_ctx.host_);
+  ObLobColCtx &col_ctx = lob_data_get_ctx.get_lob_col_ctx(is_new_col);
   if (OB_ISNULL(list)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_ERROR("list is nullptr", KR(ret));
+  } else if (col_ctx.is_padding()) {
+    if (OB_FAIL(after_fragment_progress_done_(lob_data_get_ctx, *list, stop_flag))) {
+      if (OB_IN_STOP_STATE != ret) {
+        LOG_ERROR("after_fragment_progress_done_ failed", KR(ret));
+      }
+    }
   } else if (OB_FAIL(handle_when_outrow_log_fragment_progress_done_(
         lob_data_get_ctx, is_new_col, *list, stop_flag))) {
     LOG_ERROR("handle when outrow log fragment progress done failed", KR(ret),
@@ -614,8 +714,7 @@ int ObCDCLobDataMerger::handle_when_outrow_log_fragment_progress_done_(
   } else if (OB_FAIL(after_fragment_progress_done_(
       lob_data_get_ctx, lob_data_out_row_ctx_list, stop_flag))) {
     if (OB_IN_STOP_STATE != ret) {
-      LOG_ERROR("finish lob image failed", KR(ret), K(is_new_col),
-          K(lob_data_get_ctx), K(lob_data_out_row_ctx_list));
+      LOG_ERROR("after_fragment_progress_done_ failed", KR(ret));
     }
   }
   return ret;

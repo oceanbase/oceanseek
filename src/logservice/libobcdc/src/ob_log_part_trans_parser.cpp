@@ -1300,7 +1300,8 @@ int ObLogPartTransParser::parse_lob_outtable_data_log_(
   if (OB_FAIL(ret)) {
   } else if (need_rollback || need_filter) {
     LOG_DEBUG("skip rolled back or filtered lob outtable data log", K(log));
-  } else if (!log.is_logging()) {
+  } else if (!log.is_logging()
+      && (!TCTX.is_unsupported_lob_padding_mode() || part_trans_task.is_ddl_trans())) {
     ret = OB_NOT_SUPPORTED;
     LOG_ERROR("CDC cannot reconstruct LOB data under _no_logging mode",
         KR(ret), K(log), K(part_trans_task));
@@ -1309,10 +1310,17 @@ int ObLogPartTransParser::parse_lob_outtable_data_log_(
         part_trans_task.get_tenant_id(), part_trans_task.get_trans_id(),
         log.get_lob_aux_table_id(), log.get_lob_id(), log.get_lob_operation_seq_no(),
         log.get_seq_id());
-    if (OB_FAIL(TCTX.lob_aux_storager_.put(key, "lob_outtable_data", log.get_data().ptr(),
-        log.get_data().length()))) {
-      LOG_ERROR("publish lob outtable data log failed", KR(ret), K(key), K(log));
-    } else if (!part_trans_task.is_sys_ls_part_trans()) {
+    if (log.is_logging()) {
+      if (OB_FAIL(TCTX.lob_aux_storager_.put(key, "lob_outtable_data", log.get_data().ptr(),
+                  log.get_data().length()))) {
+        LOG_ERROR("publish lob outtable data log failed", KR(ret), K(key), K(log));
+      }
+    } else { // !log.is_logging_
+      if (OB_FAIL(TCTX.lob_aux_storager_.put_no_logging(key))) {
+        LOG_ERROR("publish lob outtable no-logging marker failed", KR(ret), K(key), K(log));
+      }
+    }
+    if (OB_SUCC(ret) && !part_trans_task.is_sys_ls_part_trans()) {
       ATOMIC_AAF(&remaining_log_size_, buf_len); // only dml update remaining_log_size_ for statistics
     }
   }
@@ -1374,12 +1382,11 @@ int ObLogPartTransParser::publish_lob_summary_ext_info_log_(
   } else if (OB_FAIL(extra_info.deserialize(part_trans_task.get_allocator(), log.lob_info_))) {
     LOG_ERROR("deserialize lob summary extra info failed", KR(ret), K(lob_id),
         K(log));
-  } else if (OB_UNLIKELY(storage::ObLobMetaExtraInfo::LOB_META_SUMMARY
-      != extra_info.extra_info_type_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_ERROR("unexpected lob summary extra info type", KR(ret), K(lob_id),
-        K(log), K(extra_info));
+  } else if (OB_FAIL(ObCDCLobAuxTableParser::validate_summary_info(extra_info, log.byte_len_))) {
+    LOG_ERROR("invalid or unsupported lob summary ext info", KR(ret), K(lob_id), K(extra_info));
   } else {
+    // Cache valid summaries even when the owning column is not output.
+    // Support checks are deferred to main-row parsing and Merger.
     storage::ObLobMetaInfo meta_info;
     common::ObString cache_value;
     meta_info.lob_id_ = lob_id;
@@ -1404,6 +1411,10 @@ int ObLogPartTransParser::publish_lob_summary_ext_info_log_(
   return ret;
 }
 
+// APPEND fragments are still cached and may be written to RocksDB. In PADDING mode,
+// Merger reads the Summary, marks the image as PADDING, and skips the fragments.
+// These writes could be avoided, but only the Summary carries the APPEND marker;
+// a data log alone cannot identify APPEND, so this path cannot safely skip caching.
 int ObLogPartTransParser::publish_lob_data_ext_info_log_(
     ObLogTenant *tenant,
     const common::ObLobId &lob_id,
@@ -1431,7 +1442,8 @@ int ObLogPartTransParser::publish_lob_data_ext_info_log_(
     LOG_DEBUG("filter lob data ext info log",
         "tenant_id", part_trans_task.get_tenant_id(),
         "trans_id", part_trans_task.get_trans_id(), K(lob_id), K(log));
-  } else if (!log.is_logging_) {
+  } else if (!log.is_logging_
+      && (!TCTX.is_unsupported_lob_padding_mode() || part_trans_task.is_ddl_trans())) {
     ret = OB_NOT_SUPPORTED;
     LOG_ERROR("CDC cannot reconstruct LOB data under _no_logging mode",
         KR(ret), K(lob_id), K(log), K(part_trans_task));
@@ -1439,9 +1451,15 @@ int ObLogPartTransParser::publish_lob_data_ext_info_log_(
     const ObLobAuxKey key(part_trans_task.get_trans_commit_version(),
         part_trans_task.get_tenant_id(), part_trans_task.get_trans_id(),
         log.lob_aux_table_id_, lob_id, log.lob_operation_seq_no_, log.seq_id_);
-    if (OB_FAIL(TCTX.lob_aux_storager_.put(
-        key, "lob_data_ext_info", log.lob_data_.ptr(), log.lob_data_.length()))) {
-      LOG_ERROR("publish lob data ext info log failed", KR(ret), K(key), K(log));
+    if (log.is_logging_) {
+      if (OB_FAIL(TCTX.lob_aux_storager_.put(key, "lob_data_ext_info",
+                  log.lob_data_.ptr(), log.lob_data_.length()))) {
+        LOG_ERROR("publish lob data ext info log failed", KR(ret), K(key), K(log));
+      }
+    } else { // !log.is_logging_
+      if (OB_FAIL(TCTX.lob_aux_storager_.put_no_logging(key))) {
+        LOG_ERROR("publish lob data ext info no-logging marker failed", KR(ret), K(key), K(log));
+      }
     }
   }
   return ret;

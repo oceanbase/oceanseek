@@ -60,16 +60,23 @@ void ObLogFormatter::RowValue::reset()
   (void)memset(is_null_lob_columns_, 0, sizeof(is_null_lob_columns_));
   (void)memset(is_diff_, 0, sizeof(is_diff_));
   (void)memset(is_old_col_nop_, 0, sizeof(is_old_col_nop_));
+  (void)memset(is_new_col_padding_, 0, sizeof(is_new_col_padding_));
+  (void)memset(is_old_col_padding_, 0, sizeof(is_old_col_padding_));
 }
 
 int ObLogFormatter::RowValue::init(const int64_t column_num, const bool contain_old_column)
 {
-  column_num_ = column_num;
-  contain_old_column_ = contain_old_column;
-  new_column_array_ = NULL;
-  old_column_array_ = NULL;
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY((column_num <= 0) || (column_num > common::OB_MAX_COLUMN_NUMBER))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_ERROR("invalid column count for RowValue", KR(ret), K(column_num),
+        "max_column_num", common::OB_MAX_COLUMN_NUMBER);
+  } else {
+    column_num_ = column_num;
+    contain_old_column_ = contain_old_column;
+    new_column_array_ = NULL;
+    old_column_array_ = NULL;
 
-  if (column_num > 0) {
     (void)memset(new_columns_, 0, column_num * sizeof(new_columns_[0]));
     (void)memset(old_columns_, 0, column_num * sizeof(old_columns_[0]));
     (void)memset(orig_default_value_, 0, column_num * sizeof(orig_default_value_[0]));
@@ -80,9 +87,11 @@ int ObLogFormatter::RowValue::init(const int64_t column_num, const bool contain_
     (void)memset(is_null_lob_columns_, 0, column_num * sizeof(is_null_lob_columns_[0]));
     (void)memset(is_diff_, 0, column_num * sizeof(is_diff_[0]));
     (void)memset(is_old_col_nop_, 0, column_num * sizeof(is_old_col_nop_[0]));
+    (void)memset(is_new_col_padding_, 0, column_num * sizeof(is_new_col_padding_[0]));
+    (void)memset(is_old_col_padding_, 0, column_num * sizeof(is_old_col_padding_[0]));
   }
 
-  return OB_SUCCESS;
+  return ret;
 }
 
 ObLogFormatter::ObLogFormatter() : inited_(false),
@@ -1201,6 +1210,8 @@ int ObLogFormatter::build_row_value_(
       // NOTE: Logic for determining whether an old value is included: the data in the old value is not empty
       if (OB_FAIL(rv->init(column_num, old_cols->num_ > 0))) {
         LOG_ERROR("init RowValue fail", KR(ret), K(column_num));
+      } else if (OB_FAIL(init_lob_padding_(*rv, *tb_schema_info, *lob_ctx_cols))) {
+        LOG_ERROR("initialize lob padding state failed", KR(ret));
       }
       // fill new column value
       else if (OB_FAIL(fill_normal_cols_(*stmt_task, rv, *new_cols, *lob_ctx_cols, simple_table_schema,
@@ -1253,6 +1264,64 @@ int ObLogFormatter::build_row_value_(
   return ret;
 }
 
+int ObLogFormatter::init_lob_padding_(
+    RowValue &row_value,
+    const TableSchemaInfo &table_schema_info,
+    ObLobDataOutRowCtxList &lob_ctx_cols)
+{
+  int ret = OB_SUCCESS;
+  // 1. extblob
+  for (int64_t idx = 0; OB_SUCC(ret) && (idx < row_value.column_num_); ++idx) {
+    ColumnSchemaInfo *column = nullptr;
+    if (OB_FAIL(table_schema_info.get_column_schema_info(idx, false, column))) {
+      LOG_ERROR("get user column schema failed", KR(ret), K(idx));
+    } else if (OB_ISNULL(column)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_ERROR("column is null", KR(ret), K(idx));
+    } else if (column->get_meta_type().is_extblob() && TCTX.is_unsupported_lob_padding_mode()) {
+      // Schema decides this before NULL/NOP/default processing, without reading a locator.
+      row_value.is_new_col_padding_[idx] = true;
+      row_value.is_old_col_padding_[idx] = true;
+    }
+  }
+
+  // 2. APPEND, MULTIPART_WRITE, NO_LOGGING in ObLobDataGetCtx
+  for (ObLobDataGetCtx *ctx = lob_ctx_cols.get_lob_data_get_ctx_list().head_;
+       OB_SUCC(ret) && (nullptr != ctx); ctx = ctx->get_next()) {
+    ColumnSchemaInfo *column = nullptr;
+    if (OB_FAIL(table_schema_info.get_column_schema_info_of_column_id(ctx->column_id_, column))) {
+      LOG_ERROR("get lob column schema failed", KR(ret), K(ctx->column_id_));
+    } else if (OB_ISNULL(column)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_ERROR("column is null", KR(ret), K(ctx->column_id_));
+    } else if (!column->is_usr_column() && column->is_udt_column()) {
+      // A hidden XML/UDT LOB contributes to its visible user column.
+      const uint64_t udt_set_id = column->get_udt_set_id();
+      if (OB_FAIL(table_schema_info.get_main_column_of_udt(udt_set_id, column))) {
+        LOG_ERROR("get main udt column failed", KR(ret), K(udt_set_id));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_ISNULL(column) || !column->is_usr_column()
+          || (column->get_usr_column_idx() < 0)
+          || (column->get_usr_column_idx() >= row_value.column_num_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_ERROR("invalid output column for lob", KR(ret), KPC(column));
+      } else {
+        const int64_t idx = column->get_usr_column_idx();
+        row_value.is_new_col_padding_[idx] |=
+            (ctx->is_force_padding_by_append()
+             || ctx->get_lob_col_ctx(true/*is_new_value*/).is_padding());
+        // APPEND only forces an outrow old image; inline values remain trustworthy.
+        row_value.is_old_col_padding_[idx] |=
+            ((ctx->has_image_desc(false/*is_new_value*/) && ctx->is_force_padding_by_append())
+             || ctx->get_lob_col_ctx(false/*is_new_value*/).is_padding());
+      }
+    }
+  }
+  return ret;
+}
+
 int ObLogFormatter::handle_lob_ctx_cols_(
     const uint64_t tenant_id,
     const uint64_t aux_lob_meta_tid,
@@ -1283,12 +1352,18 @@ int ObLogFormatter::handle_lob_ctx_cols_(
       lob_ctx_cols->reset(&dml_stmt_task, tenant_id, trans_id,
           aux_lob_meta_tid, aux_lob_piece_tid, false/*is_ddl*/);
 
+      // Increment before publishing the statement to the LOB Merger. A worker
+      // can finish and call back before push() returns, especially for PADDING-only
+      // work that does not need payload assembly. Incrementing after push() could
+      // let the callback decrement first and temporarily make the count negative.
+      // On success, the callback decrements the count when it queues the statement
+      // back to Formatter.
+      ATOMIC_INC(&stmt_in_lob_merger_count_);
       if (OB_FAIL(lob_data_merger->push(*lob_ctx_cols, stop_flag))) {
+        ATOMIC_DEC(&stmt_in_lob_merger_count_);
         if (OB_IN_STOP_STATE != ret) {
           LOG_ERROR("ObCDCLobDataMerger push failed", KR(ret));
         }
-      } else {
-        ATOMIC_INC(&stmt_in_lob_merger_count_);
       }
     }
   }
@@ -1454,6 +1529,9 @@ int ObLogFormatter::fill_normal_cols_(
               K(tb_schema_info),
               K(column_id),
               KPC(column_schema_info));
+        } else if ((is_new_value && rv->is_new_col_padding_[usr_column_idx])
+            || (!is_new_value && rv->is_old_col_padding_[usr_column_idx])) {
+          // Preserve the output slot, but do not convert an unavailable LOB or build its UDT value.
         } else if (OB_FAIL(group_udt_column_values_(
             *column_schema_info,
             tz_info_wrap,
@@ -1662,28 +1740,44 @@ int ObLogFormatter::cal_virtual_generated_column_value_(
     const VirtualColInfo &virtual_col_info)
 {
   int ret = OB_SUCCESS;
+  const uint64_t virtual_gen_column_id = virtual_col_info.col_id_;
+  ColumnSchemaInfo *column_schema_info = nullptr;
+  int16_t virtual_usr_column_idx = OB_INVALID_INDEX;
 
   if (OB_ISNULL(rv) || OB_ISNULL(full_table_schema) || OB_ISNULL(tz_info_wrap)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_ERROR("invalid argument", KR(ret), K(rv), K(full_table_schema), K(tz_info_wrap));
+  } else if (OB_FAIL(tb_schema_info.get_column_schema_info_of_column_id(
+        virtual_gen_column_id, column_schema_info))) {
+    LOG_ERROR("get_column_schema failed", KR(ret), K(virtual_gen_column_id));
+  } else if (OB_ISNULL(column_schema_info)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("column_schema_info is nullptr", KR(ret), K(virtual_gen_column_id),
+        K(column_schema_info));
+  } else if (!column_schema_info->is_usr_column()) {
+    // Hidden or excluded virtual columns have no output slot and need no calculation.
+  } else if (FALSE_IT(virtual_usr_column_idx = column_schema_info->get_usr_column_idx())) {
+  } else if (OB_UNLIKELY((virtual_usr_column_idx < 0)
+                         || (virtual_usr_column_idx >= rv->column_num_))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("virtual generated column index is out of range", KR(ret), K(virtual_gen_column_id),
+        K(virtual_usr_column_idx), K(rv->column_num_));
   } else {
     ObIAllocator &allocator = stmt_task.get_redo_log_entry_task().get_allocator();
 
-    const uint64_t virtual_gen_column_id = virtual_col_info.col_id_;
-    ColumnSchemaInfo *column_schema_info = nullptr;
     const int64_t dependcy_column_cnt = virtual_col_info.dep_col_infos_.count();
     ObObj cells[dependcy_column_cnt];
     common::ObSEArray<sql::ObCalcGeneratedColumnInfo *, 4> dependcy_column_infos;
     sql::ObTempExpr *column_temp_expr = nullptr;
     bool is_expr_in_cache = false;
     bool has_nop_val = false;
+    bool has_padding_input = false;
 
     // try get column_temp_expr from column_schema_info
-    if (OB_FAIL(tb_schema_info.get_column_schema_info_of_column_id(virtual_gen_column_id, column_schema_info))) {
-      LOG_ERROR("get_column_schema failed", KR(ret), K(virtual_gen_column_id));
-    } else if (OB_ISNULL(column_schema_info)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_ERROR("column_schema_info is nullptr", KR(ret), K(virtual_gen_column_id), K(column_schema_info));
+    if ((is_new_row && rv->is_new_col_padding_[virtual_usr_column_idx])
+        || (!is_new_row && rv->is_old_col_padding_[virtual_usr_column_idx])) {
+      // Preserve PADDING and skip dependency evaluation and value calculation below.
+      has_padding_input = true;
     } else if (FALSE_IT(column_temp_expr = column_schema_info->get_column_temp_expr())) {
     } else if (OB_NOT_NULL(column_temp_expr)) {
       is_expr_in_cache = true;
@@ -1695,7 +1789,12 @@ int ObLogFormatter::cal_virtual_generated_column_value_(
     if (OB_SUCC(ret)) {
       common::ObSEArray<sql::ObCalcGeneratedColumnInfo *, 4> empty_dependcy_column_infos;
       ObNewRow empty_dependcy_column_vals;
-      for (int64_t idx = 0; OB_SUCC(ret) && !has_nop_val && idx < dependcy_column_cnt; idx++) {
+      // Keep scanning after NOP to detect PADDING in later dependencies.
+      // Example: for INSERT with dependencies [NOP, PADDING], propagate PADDING
+      // to the generated column instead of falling back to its default value.
+      for (int64_t idx = 0;
+           OB_SUCC(ret) && !has_padding_input && (idx < dependcy_column_cnt);
+           idx++) {
         const uint64_t column_id = virtual_col_info.dep_col_infos_[idx].col_id_;
         const auto *column_schema = full_table_schema->get_column_schema(column_id);
         ColumnSchemaInfo *column_schema_info = nullptr;
@@ -1713,6 +1812,12 @@ int ObLogFormatter::cal_virtual_generated_column_value_(
           ret = OB_ERR_UNEXPECTED;
           LOG_ERROR("column_schema_info is NULL", KR(ret), K(column_id), K(column_schema_info));
         } else if (FALSE_IT(usr_column_idx = column_schema_info->get_usr_column_idx())) {
+        } else if (OB_UNLIKELY((usr_column_idx < 0) || (usr_column_idx >= rv->column_num_))) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_ERROR("usr_column_idx is out of range", KR(ret), K(usr_column_idx), K(rv->column_num_));
+        } else if ((is_new_row && rv->is_new_col_padding_for_update(usr_column_idx))
+            || (!is_new_row && rv->is_old_col_padding_[usr_column_idx])) {
+          has_padding_input = true;
         } else if (!is_expr_in_cache && OB_FAIL(construct_generated_column_info_(full_table_schema, column_schema,
             column_schema_info, false/*is_generated_column*/, empty_dependcy_column_infos, empty_dependcy_column_vals,
             *dep_generated_column_info))) {
@@ -1741,12 +1846,18 @@ int ObLogFormatter::cal_virtual_generated_column_value_(
 
     // calculate virtual generated column
     if (OB_SUCC(ret)) {
-      if (has_nop_val) {
+      if (has_padding_input) {
         if (is_new_row) {
-          rv->is_changed_[column_schema_info->get_usr_column_idx()] = false;
+          rv->is_new_col_padding_[virtual_usr_column_idx] = true;
+        } else {
+          rv->is_old_col_padding_[virtual_usr_column_idx] = true;
+        }
+      } else if (has_nop_val) {
+        if (is_new_row) {
+          rv->is_changed_[virtual_usr_column_idx] = false;
         }
         // mark column value padding, maybe minimal or outrow lob
-        rv->is_old_col_nop_[column_schema_info->get_usr_column_idx()] = true;
+        rv->is_old_col_nop_[virtual_usr_column_idx] = true;
       } else {
         const auto *column_schema = full_table_schema->get_column_schema(virtual_gen_column_id);
         sql::ObCalcGeneratedColumnInfo virtual_generated_column_info(allocator);
@@ -1790,10 +1901,10 @@ int ObLogFormatter::cal_virtual_generated_column_value_(
                 "column_id", column_schema->get_column_id(),
                 K(res_obj), K(column_schema), K(tz_info_wrap));
           } else if (is_new_row) {
-            rv->new_columns_[column_schema_info->get_usr_column_idx()] = res_str;
-            rv->is_changed_[column_schema_info->get_usr_column_idx()] = true;
+            rv->new_columns_[virtual_usr_column_idx] = res_str;
+            rv->is_changed_[virtual_usr_column_idx] = true;
           } else {
-            rv->old_columns_[column_schema_info->get_usr_column_idx()] = res_str;
+            rv->old_columns_[virtual_usr_column_idx] = res_str;
           }
         }
 
@@ -1898,9 +2009,11 @@ int ObLogFormatter::fill_orig_default_value_(
             "table_schema_version", simple_table_schema->get_schema_version(),
             K(usr_column_index), K(column_count));
       } else {
-        // Determine if it is a newly added column, if it is a newly added column, then fill in the original default value
-        // If neither the new value nor the old value has a value, then it must be a newly added column
-        if (NULL != rv->new_columns_[usr_column_index]
+        // Prepare the original schema default only when both images are absent.
+        // PADDING marks an unavailable value, so it must not be replaced by a default value.
+        if (rv->is_new_col_padding_[usr_column_index]
+            || rv->is_old_col_padding_[usr_column_index]
+            || NULL != rv->new_columns_[usr_column_index]
             || NULL != rv->old_columns_[usr_column_index]) {
           rv->orig_default_value_[usr_column_index] = NULL;
         } else {
@@ -2124,7 +2237,10 @@ int ObLogFormatter::format_dml_delete_(IBinlogRecord *br_data, const RowValue *r
   } else {
     for (int64_t i = 0; OB_SUCCESS == ret && i < row_value->column_num_; i++) {
       // Handling primary key values
-      if (row_value->is_rowkey_[i]) {
+      if (row_value->is_old_col_padding_[i]) {
+        ObLogBR::mark_value_populated_by_cdc(*br_data, false /*is_new_col*/,
+            "unsupported lob old image", i);
+      } else if (row_value->is_rowkey_[i]) {
         // The primary key value is taken from the primary key value recorded in the new columns, regardless of whether it is a full column log or not
         // The primary key is set by the fill_rowkey_cols_() function, which must be placed in the new column
         // DELETE operations use the original primary key value and do not need to use the primary key value from the old value
@@ -2192,7 +2308,10 @@ int ObLogFormatter::format_dml_insert_(IBinlogRecord *br_data, const RowValue *r
     LOG_ERROR("invalid argument", KR(ret), K(br_data), K(row_value));
   } else {
     for (int64_t i = 0; OB_SUCCESS == ret && i < row_value->column_num_; i++) {
-      if (!row_value->is_changed_[i]) {
+      if (row_value->is_new_col_padding_[i]) {
+        ObLogBR::mark_value_populated_by_cdc(*br_data, true /*is_new_col*/,
+            "unsupported lob new image", i);
+      } else if (!row_value->is_changed_[i]) {
         // use defualt value in case of format old data with new schema(e.g. add column)
         ObString *str_val = row_value->orig_default_value_[i];
 
@@ -2240,7 +2359,11 @@ int ObLogFormatter::format_dml_update_(IBinlogRecord *br_data, const RowValue *r
   } else {
     for (int i = 0; OB_SUCCESS == ret && i < row_value->column_num_; i++) {
       // fill column value after update
-      if (! row_value->is_changed_[i]) {
+      if (row_value->is_new_col_padding_for_update(i)) {
+        // An unchanged new image inherits unavailability along with the old value.
+        ObLogBR::mark_value_populated_by_cdc(*br_data, true /*is_new_col*/,
+            "unsupported lob new image or old backfill", i);
+      } else if (! row_value->is_changed_[i]) {
         if (row_value->contain_old_column_) {
           // In the case of a full column log, for update, if a column is not updated, the new value is filled with the value in old_column
           // If there is no corresponding value in the old column either, the original default value is filled
@@ -2285,7 +2408,10 @@ int ObLogFormatter::format_dml_update_(IBinlogRecord *br_data, const RowValue *r
       if (OB_SUCC(ret)) {
         // fill column value before update
         bool is_changed = row_value->is_changed_[i];
-        if (row_value->contain_old_column_) {
+        if (row_value->is_old_col_padding_[i]) {
+          ObLogBR::mark_value_populated_by_cdc(*br_data, false /*is_new_col*/,
+              "unsupported lob old image", i);
+        } else if (row_value->contain_old_column_) {
           // For full column logging, the old value is always filled with the value in old_column for updates
           // If there is no valid value in the old column, the original default value is filled
           ObString *str_val = row_value->old_columns_[i];
@@ -2326,7 +2452,10 @@ int ObLogFormatter::format_dml_put_(IBinlogRecord *br_data, const RowValue *row_
     LOG_ERROR("invalid argument", KR(ret), K(br_data), K(row_value));
   } else {
     for (int64_t i = 0; OB_SUCCESS == ret && i < row_value->column_num_; i++) {
-      if (!row_value->is_changed_[i]) {
+      if (row_value->is_new_col_padding_[i]) {
+        ObLogBR::mark_value_populated_by_cdc(*br_data, true /*is_new_col*/,
+            "unsupported lob new image", i);
+      } else if (!row_value->is_changed_[i]) {
         ObString *str_val = row_value->orig_default_value_[i];
 
         if (OB_ISNULL(str_val)) {
@@ -2581,7 +2710,7 @@ int ObLogFormatter::parse_aux_lob_table_(
 
 // APPEND 会直接 update 已有out-row LOB 的 Summary，而没有将 Summary 的更新拆成 delete + insert，
 // (参见 ObLobAppender::write_meta_summary_)；若直接跳过 update，Merger 会等待缺失的 Summary，
-// 且无法执行不支持类型的检查，因此在这里检查新 Summary 并直接拒绝。
+// 且无法执行不支持类型的检查。PADDING 模式必须发布它，供 Merger 结束对应镜像。
 int ObLogFormatter::check_lob_meta_update_supported_(
     const ObCDCLobAuxTableType table_type,
     DmlStmtTask &stmt_task,
@@ -2602,8 +2731,13 @@ int ObLogFormatter::check_lob_meta_update_supported_(
     } else if (!is_summary) {
       // 非 Summary 的 Meta UPDATE 仍跳过。
     } else if (storage::ObLobLastWriteType::APPEND == extra_info.last_write_type_) {
-      ret = OB_NOT_SUPPORTED;
-      LOG_ERROR("lob append is not supported in cdc", KR(ret), K(extra_info), K(meta_info), K(stmt_task));
+      if (!TCTX.is_unsupported_lob_padding_mode()) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_ERROR("unsupported lob summary update", KR(ret), K(extra_info), K(meta_info), K(stmt_task));
+      } else if (OB_FAIL(publish_aux_lob_table_row_(stmt_task.get_redo_log_entry_task(),
+          stmt_task, *new_cols, table_type, "META_UPDATE_SUMMARY"))) {
+        LOG_ERROR("publish unsupported lob summary update failed", KR(ret), K(stmt_task));
+      }
     } else {
       // 可能人工运维操作 lob meta 表，引入对 Summary 的 UPDATE。这种情况，忽略即可，不能报错进而导致 CDC 挂掉。
       LOG_INFO("manual lob meta update summary is ignored", K(extra_info), K(meta_info), K(stmt_task));
@@ -2622,7 +2756,9 @@ int ObLogFormatter::publish_aux_lob_table_row_(
 {
   int ret = OB_SUCCESS;
 
-  if (OB_UNLIKELY((!stmt_task.is_insert() && !stmt_task.is_delete()) || OB_ISNULL(key_type))) {
+  if (OB_UNLIKELY((!stmt_task.is_insert() && !stmt_task.is_delete()
+      && !(stmt_task.is_update() && ObCDCLobAuxTableType::META == table_type))
+      || OB_ISNULL(key_type))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_ERROR("invalid auxiliary lob row", KR(ret), K(stmt_task), KP(key_type));
   } else {

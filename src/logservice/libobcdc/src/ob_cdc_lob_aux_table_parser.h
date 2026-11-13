@@ -35,6 +35,11 @@ public:
       common::ObLobId &lob_id,
       common::ObString &seq_id,
       common::ObString &cache_value);
+  // Check structure before any policy-based early completion. Unknown chunk types
+  // are rejected during decoding; legacy INVALID_TYPE retains its IN_TABLE meaning.
+  static int validate_summary_info(
+      const storage::ObLobMetaExtraInfo &extra_info,
+      const uint64_t byte_len);
   // Encode fields needed by Merger together with the serialized ObLobMetaExtraInfo.
   // This value is private to CDC auxiliary storage and is not an Observer log format.
   static int encode_summary_value(

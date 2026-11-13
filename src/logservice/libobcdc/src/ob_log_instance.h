@@ -24,6 +24,7 @@
 #include "ob_log_mysql_proxy.h"                           // ObLogMysqlProxy
 #include "ob_log_work_mode.h"                             // WorkingMode
 #include "ob_log_meta_data_refresh_mode.h"                // RefreshMode
+#include "ob_cdc_lob_handling_mode.h"                      // ObUnsupportedLobHandlingMode
 #include "ob_cdc_lob_aux_storager.h"                 // ObCDCLobAuxStorager
 #include "ob_cdc_global_info.h"                           // ObCDCGlobalInfo
 #include "ob_log_fetcher_dispatcher.h"                    // ObLogFetcherDispatcher
@@ -151,6 +152,10 @@ public:
   const char *get_log_file() const;
   void set_disable_redirect_log(const bool flag) { disable_redirect_log_ = flag; }
   OB_INLINE bool is_running() const { return is_running_; }
+  bool is_unsupported_lob_padding_mode() const
+  {
+    return ObUnsupportedLobHandlingMode::PADDING == unsupported_lob_handling_mode_;
+  }
   static void print_version();
   int set_assign_log_dir(const char *log_dir, const int64_t log_dir_len);
 
@@ -396,6 +401,8 @@ public:
   bool                      enable_filter_mow_lob_;
   std::string               drc_message_factory_binlog_record_type_;
   WorkingMode               working_mode_;
+  // Parsed once before components start; runtime config reload does not change this policy.
+  ObUnsupportedLobHandlingMode unsupported_lob_handling_mode_;
   RefreshMode               refresh_mode_;
   ClientFetchingMode        fetching_mode_;
   bool                      is_tenant_sync_mode_;

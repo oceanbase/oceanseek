@@ -163,6 +163,7 @@ ObLogInstance::ObLogInstance() :
     enable_filter_sys_tenant_(false),
     drc_message_factory_binlog_record_type_(),
     working_mode_(WorkingMode::UNKNOWN_MODE),
+    unsupported_lob_handling_mode_(ObUnsupportedLobHandlingMode::ERROR),
     refresh_mode_(RefreshMode::UNKNOWN_REFRSH_MODE),
     fetching_mode_(ClientFetchingMode::FETCHING_MODE_UNKNOWN),
     is_tenant_sync_mode_(false),
@@ -617,6 +618,10 @@ int ObLogInstance::init_common_(uint64_t start_tstamp_ns, ERROR_CALLBACK err_cb)
     // check config items are valid or not
     else if (OB_FAIL(TCONF.check_all())) {
       LOG_ERROR("check config fail", KR(ret));
+    } else if (OB_FAIL(parse_unsupported_lob_handling_mode(
+        TCONF.unsupported_lob_handling_mode.str(), unsupported_lob_handling_mode_))) {
+      LOG_ERROR("fail to parse unsupported_lob_handling_mode", KR(ret),
+          "unsupported_lob_handling_mode", TCONF.unsupported_lob_handling_mode.str());
     } else if (OB_FAIL(dump_config_())) {
       LOG_ERROR("dump_config_ fail", KR(ret));
     } else if (OB_FAIL(lib::ThreadPool::set_thread_count(DAEMON_THREAD_COUNT))) {
@@ -1540,6 +1545,7 @@ void ObLogInstance::do_destroy_(const bool force_destroy)
     is_schema_split_mode_ = true;
     enable_filter_sys_tenant_ = false;
     working_mode_ = WorkingMode::UNKNOWN_MODE;
+    unsupported_lob_handling_mode_ = ObUnsupportedLobHandlingMode::ERROR;
     refresh_mode_ = RefreshMode::UNKNOWN_REFRSH_MODE;
     fetching_mode_ = ClientFetchingMode::FETCHING_MODE_UNKNOWN;
     is_tenant_sync_mode_ = false;

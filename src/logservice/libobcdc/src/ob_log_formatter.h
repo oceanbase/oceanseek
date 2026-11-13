@@ -138,6 +138,20 @@ private:
     bool is_null_lob_columns_[common::OB_MAX_COLUMN_NUMBER];  // lob column value not recorded in log
     bool is_diff_[common::OB_MAX_COLUMN_NUMBER]; // is lob_diff column
     bool is_old_col_nop_[common::OB_MAX_COLUMN_NUMBER];       // old column that marked nop in log(most likely happened in minimal mode)
+    bool is_new_col_padding_[common::OB_MAX_COLUMN_NUMBER];
+    bool is_old_col_padding_[common::OB_MAX_COLUMN_NUMBER];
+
+    // it is for update.
+    // 1. new image is marked PADDING,
+    // 2. an unchanged new image must be backfilled from an old image, which is marked PADDING.
+    // (e.g., in FULL mode, old image log is written for a non-updated lob col.
+    //  APPEND/NO_LOGGING old image marked PADDING in init_lob_padding_(), meanwhile there is
+    //  no new image log and the new image should backfilled from the old image).
+    bool is_new_col_padding_for_update(const int64_t idx) const
+    {
+      return is_new_col_padding_[idx]
+          || (!is_changed_[idx] && contain_old_column_ && is_old_col_padding_[idx]);
+    }
 
     // invoke before handle format stmt task
     // incase of usage of column_num but row doesn't contain valid column and column_num is not set
@@ -234,6 +248,11 @@ private:
       bool &cur_stmt_need_callback,
       const int64_t thread_index,
       volatile bool &stop_flag);
+  int init_lob_padding_(
+      RowValue &row_value,
+      const TableSchemaInfo &table_schema_info,
+      ObLobDataOutRowCtxList &lob_ctx_cols);
+
   int handle_lob_ctx_cols_(
       const uint64_t tenant_id,
       const uint64_t aux_lob_meta_tid,

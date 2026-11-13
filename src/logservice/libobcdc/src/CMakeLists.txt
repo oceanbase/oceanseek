@@ -30,6 +30,7 @@ ob_set_subtarget(obcdc_object_list common
   ob_cdc_define.cpp
   ob_cdc_tablet_to_table_info.cpp
   ob_cdc_lob_ctx.cpp
+  ob_cdc_lob_handling_mode.cpp
   ob_cdc_lob_data_merger.cpp
   ob_cdc_lob_aux_storager.cpp
   ob_cdc_global_info.cpp

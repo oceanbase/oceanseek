@@ -41,6 +41,8 @@ public:
 /////////////////////////////////////////////////////////////////////////////////////////
 
 class IObLogErrHandler;
+struct ObLobAuxKey;
+struct ObLobAuxReadValue;
 
 typedef common::ObMQThread<IObCDCLobDataMerger::MAX_PARSER_NUM> ObLobDataMergerThread;
 
@@ -84,17 +86,26 @@ private:
   int push_prepare_task_(
       ObIAllocator &allocator,
       ObLobDataGetCtx &lob_data_get_ctx,
-      const bool is_new_col,
       volatile bool &stop_flag);
   int handle_prepare_task_(
-      ObLobImagePrepareTask &task,
+      ObLobDataGetCtx &lob_data_get_ctx,
       const bool is_sync,
+      volatile bool &stop_flag);
+  int prepare_lob_image_(
+      ObLobDataGetCtx &lob_data_get_ctx,
+      const bool is_new_col,
+      const bool is_sync,
+      volatile bool &stop_flag);
+  int complete_padding_image_(
+      ObLobDataGetCtx &lob_data_get_ctx,
+      const bool is_new_col,
       volatile bool &stop_flag);
   int handle_fragment_task_(
       ObLobColFragTask &task,
       volatile bool &stop_flag);
   int build_and_dispatch_fragment_tasks_(
-      ObLobImagePrepareTask &task,
+      ObLobDataGetCtx &lob_data_get_ctx,
+      const bool is_new_col,
       const uint64_t chunk_count,
       const uint64_t expected_byte_len,
       const bool is_sync,

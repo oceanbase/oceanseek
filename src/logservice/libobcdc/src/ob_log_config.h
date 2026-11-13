@@ -8,6 +8,7 @@
 
 #include <map>
 #include "share/ob_define.h"
+#include "share/config/ob_config_helper.h"
 #include "share/parameter/ob_parameter_macro.h"
 #define CONFIG_LOCK_EXEMPTION
 #include "share/config/ob_common_config.h"    // ObInitConfigContainer
@@ -15,6 +16,7 @@
 
 #include "ob_log_common.h"
 #include "ob_log_fake_common_config.h"        // ObLogFakeCommonConfig
+#include "ob_cdc_lob_handling_mode.h"
 
 ////////////// Define member variables of type INT, no limit on maximum value //////////////
 // DEF: default value
@@ -51,6 +53,12 @@ namespace oceanbase
 {
 namespace libobcdc
 {
+class ObConfigUnsupportedLobHandlingModeChecker : public common::ObConfigChecker
+{
+public:
+  virtual bool check(const common::ObConfigItem &item) const override;
+};
+
 class ObLogConfig : public common::ObBaseConfig
 {
   typedef std::map<std::string, std::string> ConfigMap;
@@ -605,6 +613,9 @@ public:
   // tenatn level sync config end //
 
   // lob data storage
+  DEF_STR_WITH_CHECKER(unsupported_lob_handling_mode, OB_CLUSTER_PARAMETER, "ERROR",
+      ObConfigUnsupportedLobHandlingModeChecker,
+      "unsupported LOB handling mode: ERROR or PADDING");
   // enable_lob_data_storage_memory : default is enable
   T_DEF_BOOL(enable_lob_data_storage_memory, OB_CLUSTER_PARAMETER, 1, "0:disabled, 1:enabled");
   // lob_data_storage_memory_limit takes effect only when enable_lob_data_storage_memory is true.

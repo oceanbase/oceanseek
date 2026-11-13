@@ -90,7 +90,7 @@ access_specifier:                                                               
         : common::ObConfig ## param ## Item(                                   \
             local_container(), scope, #name, def, args)                        \
     {                                                                          \
-      add_checker(OB_NEW(checker, g_config_mem_attr));                         \
+      add_checker(OB_NEW(checker, common::g_config_mem_attr));                 \
     }                                                                          \
     template <class T>                                                         \
     ObConfig ## param ## Item ## _ ## name& operator=(T value)                 \

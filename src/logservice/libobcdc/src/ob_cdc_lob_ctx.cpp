@@ -101,6 +101,7 @@ void ObLobDataGetCtx::reset()
   new_lob_col_ctx_.reset();
   old_lob_col_ctx_.reset();
   next_ = nullptr;
+  force_padding_by_append_ = false;
 }
 
 int ObLobDataGetCtx::reset(
@@ -147,8 +148,9 @@ int ObLobDataGetCtx::set_col_value(const bool is_new_col, const char *buf, const
 
 void ObLobDataGetCtx::inc_lob_col_value_count(bool &is_lob_col_value_handle_done)
 {
+  // Every column waits for its valid images and the column Prepare's final action.
   const int8_t total_value_count = static_cast<int8_t>(
-      (old_image_desc_.is_valid() ? 1 : 0) + (new_image_desc_.is_valid() ? 1 : 0));
+      (old_image_desc_.is_valid() ? 1 : 0) + (new_image_desc_.is_valid() ? 1 : 0) + 1);
   const int8_t lob_col_value_handle_done_count = ATOMIC_AAF(&lob_col_value_handle_done_count_, 1);
   is_lob_col_value_handle_done = (total_value_count == lob_col_value_handle_done_count);
   LOG_DEBUG("inc_lob_col_value_count", K(total_value_count), K(lob_col_value_handle_done_count));

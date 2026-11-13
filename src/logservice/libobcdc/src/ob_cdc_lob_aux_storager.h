@@ -103,11 +103,33 @@ struct ObLobAuxKey final
   common::ObString seq_id_;
 };
 
-// ObLobAuxValue 记录一条 LOB 辅助数据在内存缓存中的分配信息和数据视图，内存布局是 [lob_data][seq_id]。
-// alloc_buf_：allocator 返回的完整内存块首地址，用于删除缓存记录时释放内存。
-// lob_data_：完整内存块中的 LOB 数据起始地址，是供读取方使用的数据视图。
-// lob_data_len_：lob_data_ 指向的 LOB 数据长度。
-// 该结构体只记录上述信息，不负责释放 alloc_buf_，内存由 ObCDCLobAuxStorager 统一管理。
+enum class ObLobAuxReadValueType : uint8_t
+{
+  PAYLOAD = 0,
+  NO_LOGGING = 1,
+};
+
+struct ObLobAuxReadValue final
+{
+  ObLobAuxReadValue() { reset(); }
+  void reset() { type_ = ObLobAuxReadValueType::PAYLOAD; payload_.reset(); }
+  bool is_no_logging() const { return ObLobAuxReadValueType::NO_LOGGING == type_; }
+  TO_STRING_KV(K_(type), K_(payload));
+
+  ObLobAuxReadValueType type_;
+  // Payload memory is owned by the cache for memory reads,
+  // or allocated from the caller's allocator for disk reads.
+  common::ObString payload_;
+};
+
+// ObLobAuxValue records the allocation details and data view of a LOB auxiliary cache entry.
+// Memory layout: [encoded cache value][seq_id].
+// alloc_buf_: Start of the full memory block returned by the allocator, used to free the block
+//             when the cache entry is deleted.
+// lob_data_: Start of the LOB data within the memory block, exposed as a data view to readers.
+// lob_data_len_: Length of the LOB data referenced by lob_data_.
+// This struct only stores this information and does not free alloc_buf_.
+// Memory is managed by ObCDCLobAuxStorager.
 struct ObLobAuxValue final
 {
   ObLobAuxValue() :
@@ -213,12 +235,11 @@ public:
       const char *key_type,
       const char *lob_data,
       const int64_t lob_data_len);
-
+  int put_no_logging(const ObLobAuxKey &key);
   int get(
       ObIAllocator &allocator,
       const ObLobAuxKey &key,
-      const char *&lob_data,
-      int64_t &lob_data_len);
+      ObLobAuxReadValue &value);
 
   int del(
       ObLobDataOutRowCtxList &lob_data_out_row_ctx_list,
@@ -233,6 +254,32 @@ public:
   void print_stat_info();
 
 private:
+  static const int64_t CACHE_VALUE_HEADER_SIZE = 1;
+  int put_value_(
+      const ObLobAuxKey &key,
+      const char *key_type,
+      const ObLobAuxReadValueType type,
+      const char *data,
+      const int64_t data_len);
+  int get_encoded_value_(
+      ObIAllocator &allocator,
+      const ObLobAuxKey &key,
+      const char *&data,
+      int64_t &data_len);
+  static int decode_value_(
+      const char *data,
+      const int64_t data_len,
+      ObLobAuxReadValue &value);
+  int memory_get_raw_(
+      const ObLobAuxKey &key,
+      const char *&data,
+      int64_t &data_len);
+  int disk_get_raw_(
+      ObIAllocator &allocator,
+      const ObLobAuxKey &key,
+      const char *&data,
+      int64_t &data_len);
+
   int del_lob_image_(
       const int64_t commit_version,
       const uint64_t tenant_id,
@@ -245,25 +292,18 @@ private:
   int memory_put_(
       const ObLobAuxKey &key,
       const char *key_type,
+      const ObLobAuxReadValueType type,
       const char *lob_data,
       const int64_t lob_data_len);
-  int memory_get_(
-      const ObLobAuxKey &key,
-      const char *&lob_data,
-      int64_t &lob_data_len);
   int memory_del_(const ObLobAuxKey &key);
   int memory_del_(const uint64_t tenant_id, const int64_t commit_version);
 
   int disk_put_(
       const ObLobAuxKey &key,
       const char *key_type,
+      const ObLobAuxReadValueType type,
       const char *lob_data,
       const int64_t lob_data_len);
-  int disk_get_(
-      ObIAllocator &allocator,
-      const ObLobAuxKey &key,
-      const char *&lob_data,
-      int64_t &lob_data_len);
   int disk_del_(const ObLobAuxKey &key);
   int disk_del_(void* cf_family, const int64_t commit_version);
 

@@ -1,6 +1,6 @@
 /**
- * Copyright (c) 2021 OceanBase
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright (C) 2026 OceanBase
+ * 本文件包含机密及专有信息，未经授权不得使用或披露。
  */
 
 #define USING_LOG_PREFIX OBLOG
@@ -17,6 +17,20 @@ namespace oceanbase
 {
 namespace libobcdc
 {
+
+bool ObConfigUnsupportedLobHandlingModeChecker::check(const ObConfigItem &item) const
+{
+  bool b_ret = true;
+  int ret = OB_SUCCESS;
+  ObUnsupportedLobHandlingMode mode = ObUnsupportedLobHandlingMode::ERROR;
+  if (OB_FAIL(parse_unsupported_lob_handling_mode(item.str(), mode))) {
+    b_ret = false;
+    LOG_ERROR("invalid unsupported_lob_handling_mode, allowed values are ERROR and PADDING",
+        KR(ret), "unsupported_lob_handling_mode", item.str());
+  }
+  return b_ret;
+}
+
 ObLogConfig &ObLogConfig::get_instance()
 {
   static ObLogConfig config;

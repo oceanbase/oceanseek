@@ -147,9 +147,10 @@ int MutatorRow::parse_columns_(
         LOG_ERROR("get_column_info", KR(ret), K(table_id), K(column_stored_idx));
       } else if (OB_NOT_NULL(column_schema_info)
           && OB_UNLIKELY(column_schema_info->get_meta_type().is_extblob())) {
-        ret = OB_NOT_SUPPORTED;
-        LOG_ERROR("CDC does not support EXTBLOB columns", KR(ret), K(tenant_id), K(table_id),
-            K(column_id), K(column_stored_idx), K(is_parse_new_col));
+        if (OB_FAIL(handle_extblob_column_(*column_schema_info, datum.is_nop(), cols))) {
+          LOG_ERROR("handle EXTBLOB column failed", KR(ret), K(tenant_id), K(table_id),
+              K(column_id), K(column_stored_idx), K(is_parse_new_col));
+        }
       } else if (datum.is_nop()) {
         OBLOG_FORMATTER_LOG(DEBUG, "handle nop datum", K(column_stored_idx), K(is_parse_new_col), K(datum));
         if (OB_NOT_NULL(column_schema_info) && column_schema_info->is_usr_column()) {
@@ -272,6 +273,50 @@ int MutatorRow::parse_columns_(
     ret = OB_ITER_END == ret ? OB_SUCCESS : ret;
   }
 
+  return ret;
+}
+
+int MutatorRow::handle_extblob_column_(
+    const ColumnSchemaInfo &column_schema_info,
+    const bool is_col_nop,
+    ColValueList &cols)
+{
+  int ret = OB_SUCCESS;
+
+  // Only columns selected for CDC output have valid output slots and need handling.
+  // For example, after an instant DROP COLUMN of an EXTBLOB, it may remain hidden in redo,
+  // but CDC does not output it and must not trigger an error or get an output placeholder.
+  if (column_schema_info.is_usr_column()) {
+    const uint64_t column_id = column_schema_info.get_column_id();
+    if (!TCTX.is_unsupported_lob_padding_mode()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_ERROR("CDC does not support EXTBLOB columns in ERROR mode", KR(ret), K(column_id));
+    } else {
+      ColValue *cv_node = nullptr;
+      if (OB_ISNULL(cv_node = static_cast<ColValue *>(allocator_.alloc(sizeof(ColValue))))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("allocate memory for EXTBLOB placeholder failed", KR(ret), K(column_id),
+            "size", sizeof(ColValue));
+      } else {
+        // Keep a placeholder for each present EXTBLOB column, including NULL/NOP,
+        // so skipping its payload does not erase the old image
+        // (RowValue::contain_old_column_ is decided by old_cols->num_ > 0
+        // in ObLogFormatter::build_row_value_).
+        // Formatter marks it PADDING without parsing a locator or assembling LOB data.
+        cv_node->reset();
+        cv_node->column_id_ = column_id;
+        cv_node->is_col_nop_ = is_col_nop;
+        if (OB_FAIL(cols.add(cv_node))) {
+          LOG_ERROR("add EXTBLOB placeholder failed", KR(ret), K(column_id));
+        }
+      }
+
+      if (OB_FAIL(ret) && OB_NOT_NULL(cv_node)) {
+        allocator_.free(cv_node);
+        cv_node = nullptr;
+      }
+    }
+  }
   return ret;
 }
 
