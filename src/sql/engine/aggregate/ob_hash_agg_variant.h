@@ -121,10 +121,10 @@ struct IsInitVisitor : public boost::static_visitor<bool>
   }
 };
 
-struct ReuseVisitor : public boost::static_visitor<>
+struct ReuseVisitor : public boost::static_visitor<int>
 {
   template <typename T>
-  void operator() (T &t)
+  int operator() (T &t)
   {
     return t->reuse();
   }
@@ -446,12 +446,14 @@ public:
     return boost::apply_visitor(visitor, hash_table_ptr_);
   }
 
-  void reuse()
+  int reuse()
   {
+    int ret = OB_SUCCESS;
     if (inited_) {
       ReuseVisitor visitor;
-      return boost::apply_visitor(visitor, hash_table_ptr_);
+      ret = boost::apply_visitor(visitor, hash_table_ptr_);
     }
+    return ret;
   }
   int resize(ObIAllocator *allocator, int64_t bucket_num)
   {

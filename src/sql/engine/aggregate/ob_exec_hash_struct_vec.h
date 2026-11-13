@@ -227,26 +227,38 @@ public:
       ret = common::OB_INVALID_ARGUMENT;
       SQL_ENG_LOG(WARN, "invalid capacity", K(ret), K(capacity));
     } else {
-      use_contiguous_ = (capacity <= BUCKET_ARRAY_CONTIGUOUS_THRESHOLD);
+      const bool use_contiguous = capacity <= BUCKET_ARRAY_CONTIGUOUS_THRESHOLD;
+      if (use_contiguous != use_contiguous_) {
+        destroy();
+      }
+      use_contiguous_ = use_contiguous;
       if (use_contiguous_) {
-        contiguous_array_.reset();
+        // ObArray::reuse() otherwise releases buffers larger than its block size.
+        contiguous_array_.set_block_size(MAX(OB_MALLOC_NORMAL_BLOCK_SIZE,
+                                            contiguous_array_.get_data_size()));
+        contiguous_array_.reuse();
         if (OB_FAIL(contiguous_array_.prepare_allocate(capacity))) {
           SQL_ENG_LOG(WARN, "failed to prepare_allocate contiguous array", K(ret), K(capacity));
-        }
-        segmented_array_ = nullptr;
-      } else {
-        contiguous_array_.reset();
-        void *buf = allocator_.alloc(sizeof(SegmentedArrayType));
-        if (OB_ISNULL(buf)) {
-          ret = common::OB_ALLOCATE_MEMORY_FAILED;
-          SQL_ENG_LOG(WARN, "failed to alloc SegmentedArrayType", K(ret));
         } else {
-          segmented_array_ = new(buf) SegmentedArrayType(allocator_);
+          // ObArray retains constructed elements on reuse. Clear the buckets
+          // with the same zero-initialized representation as SegmentedArrayType.
+          MEMSET(static_cast<void *>(&contiguous_array_.at(0)),
+                 0, sizeof(GroupRowBucket) * capacity);
+        }
+      } else {
+        if (nullptr == segmented_array_) {
+          void *buf = allocator_.alloc(sizeof(SegmentedArrayType));
+          if (OB_ISNULL(buf)) {
+            ret = common::OB_ALLOCATE_MEMORY_FAILED;
+            SQL_ENG_LOG(WARN, "failed to alloc SegmentedArrayType", K(ret));
+          } else {
+            segmented_array_ = new(buf) SegmentedArrayType(allocator_);
+          }
+        }
+        if (OB_SUCC(ret)) {
+          segmented_array_->reuse();
           if (OB_FAIL(segmented_array_->init(capacity))) {
             SQL_ENG_LOG(WARN, "failed to init segmented array", K(ret), K(capacity));
-            segmented_array_->~SegmentedArrayType();
-            allocator_.free(segmented_array_);
-            segmented_array_ = nullptr;
           }
         }
       }
@@ -278,12 +290,15 @@ public:
 
   int64_t count() const
   {
-    return use_contiguous_ ? contiguous_array_.count() : segmented_array_->count();
+    return use_contiguous_ ? contiguous_array_.count()
+                           : (nullptr == segmented_array_ ? 0 : segmented_array_->count());
   }
 
   void reuse()
   {
     if (use_contiguous_) {
+      contiguous_array_.set_block_size(MAX(OB_MALLOC_NORMAL_BLOCK_SIZE,
+                                          contiguous_array_.get_data_size()));
       contiguous_array_.reuse();
     } else if (nullptr != segmented_array_) {
       segmented_array_->reuse();
@@ -1095,14 +1110,14 @@ public:
     return group_store_.reset();
   }
 
-  void reuse()
+  int reuse()
   {
     int ret = common::OB_SUCCESS;
     if (nullptr != buckets_) {
       int64_t bucket_num = get_bucket_num();
       buckets_->reuse();
       if (OB_FAIL(buckets_->init(bucket_num))) {
-        SQL_ENG_LOG(ERROR, "resize bucket array failed", K(size_), K(bucket_num), K(get_bucket_num()));
+        SQL_ENG_LOG(ERROR, "resize bucket array failed", K(ret), K(size_), K(bucket_num));
       }
     }
     if (col_has_null_.count() > 0) {
@@ -1116,6 +1131,7 @@ public:
     }
     item_alloc_.reset_remain_one_page();
     probe_cnt_ = 0;
+    return ret;
   }
 
   int resize(ObIAllocator *allocator, int64_t bucket_num);
@@ -1365,7 +1381,7 @@ int ObExtendHashTableVec<GroupRowBucket>::resize(ObIAllocator *allocator, int64_
       }
     }
   } else {
-    reuse();
+    ret = reuse();
   }
   return ret;
 }

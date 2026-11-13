@@ -176,8 +176,9 @@ int ObHashPartInfrasVecGroup::free_one_hp_infras(HashPartInfrasVec *&hp_infras, 
     if (!hp_infras->is_inited()) {
     } else if (hp_infras->get_bucket_num() > est_bucket_num_ * RATIO || force_destroy) {
       hp_infras->destroy();
-    } else {
-      hp_infras->reuse();
+    } else if (OB_FAIL(hp_infras->reuse())) {
+      SQL_ENG_LOG(WARN, "failed to reuse hash partition infrastructure", K(ret));
+      hp_infras->destroy();
     }
     if (!hp_infras_free_list_.add_last(hp_infras)) {
       ret = OB_ERR_UNEXPECTED;

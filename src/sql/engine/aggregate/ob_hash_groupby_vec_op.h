@@ -205,7 +205,7 @@ public:
       runtime_limit_(-1)
   {
   }
-  void reset(bool for_rescan);
+  int reset(bool for_rescan);
   virtual int inner_open() override;
   virtual int inner_close() override;
   virtual int inner_rescan() override;

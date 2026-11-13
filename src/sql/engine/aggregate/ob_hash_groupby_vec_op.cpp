@@ -57,14 +57,17 @@ int ObHashGroupByVecSpec::add_group_expr(ObExpr *expr)
   return ret;
 }
 
-void ObHashGroupByVecOp::reset(bool for_rescan)
+int ObHashGroupByVecOp::reset(bool for_rescan)
 {
+  int ret = OB_SUCCESS;
   curr_group_id_ = common::OB_INVALID_INDEX;
   cur_group_item_idx_ = 0;
   cur_group_item_buf_ = nullptr;
   part_shift_ = sizeof(uint64_t) * CHAR_BIT / 2;
   if (for_rescan) {
-    local_group_rows_.reuse();
+    if (OB_FAIL(local_group_rows_.reuse())) {
+      LOG_WARN("failed to reuse hash table", K(ret));
+    }
     batch_aggr_rows_table_.reset();
   }
   sql_mem_processor_.reset();
@@ -103,6 +106,7 @@ void ObHashGroupByVecOp::reset(bool for_rescan)
   }
   reorder_aggr_rows_ = eval_ctx_.max_batch_size_ >= MIN_BATCH_SIZE_REORDER_AGGR_ROWS
                            && MY_SPEC.aggr_stage_ != ObThreeStageAggrStage::THIRD_STAGE;
+  return ret;
 }
 
 int ObHashGroupByVecOp::inner_open()
@@ -518,8 +522,8 @@ void ObHashGroupByVecOp::destroy()
 int ObHashGroupByVecOp::inner_switch_iterator()
 {
   int ret = OB_SUCCESS;
-  reset(true);
-  if (OB_FAIL(ObGroupByVecOp::inner_switch_iterator())) {
+  OZ(reset(true));
+  if (OB_SUCC(ret) && OB_FAIL(ObGroupByVecOp::inner_switch_iterator())) {
     LOG_WARN("failed to rescan", K(ret));
   }
   return ret;
@@ -528,9 +532,10 @@ int ObHashGroupByVecOp::inner_switch_iterator()
 int ObHashGroupByVecOp::inner_rescan()
 {
   int ret = OB_SUCCESS;
-  reset(true);
+  OZ(reset(true));
   bypass_ctrl_.llc_est_.reset();
-  if (OB_FAIL(ObGroupByVecOp::inner_rescan())) {
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(ObGroupByVecOp::inner_rescan())) {
     LOG_WARN("failed to rescan", K(ret));
   } else {
     iter_end_ = false;
@@ -2643,7 +2648,7 @@ int ObHashGroupByVecOp::by_pass_restart_round()
       OZ(local_group_rows_.resize(&mem_context_->get_malloc_allocator(),
                                   INIT_BKT_SIZE_FOR_ADAPTIVE_GBY));
     } else {
-      OX(local_group_rows_.reuse());
+      OZ(local_group_rows_.reuse());
     }
   }
   OZ(reinit_group_store());
@@ -2878,7 +2883,7 @@ int ObHashGroupByVecOp::reset_for_ordered_rescan()
   // set to nullptr to avoid reset
   child_vec_holder_ = nullptr;
   first_group_vec_holder_ = nullptr;
-  reset(true);
+  OZ(reset(true));
   cur_grouping_id_ = group_id;
   ordered_gby_state_ = state;
   child_iter_end_ = child_iter_end;
@@ -3066,13 +3071,13 @@ int ObHashGroupByVecOp::get_ordered_first_stage_batch(const int64_t batch_size)
         if (distinct_bypass_ctrl_.rebuild_times_exceeded()) {
           distinct_bypass_ctrl_.start_by_pass();
         } else {
-          hp_infras_->reset_hash_table_for_by_pass();
+          OZ(hp_infras_->reset_hash_table_for_by_pass());
           distinct_bypass_ctrl_.probe_cnt_ = 0;
           distinct_bypass_ctrl_.reset_state();
           distinct_bypass_ctrl_.inc_rebuild_times();
         }
       }
-      if (read_child && OB_FAIL(get_next_batch_from_child(batch_size, child_brs))) {
+      if (OB_SUCC(ret) && read_child && OB_FAIL(get_next_batch_from_child(batch_size, child_brs))) {
         LOG_WARN("failed to get next batch from child", K(ret));
       }
       if (OB_FAIL(ret)) {

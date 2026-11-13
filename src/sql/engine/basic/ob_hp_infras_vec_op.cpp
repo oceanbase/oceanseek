@@ -202,7 +202,7 @@ void ObIHashPartInfrastructure::reset()
   has_dump_preprocess_part_ = false;
 }
 
-void ObIHashPartInfrastructure::reuse()
+int ObIHashPartInfrastructure::reuse()
 {
   left_row_store_iter_.reset();
   right_row_store_iter_.reset();
@@ -232,6 +232,7 @@ void ObIHashPartInfrastructure::reuse()
   need_rewind_ = false;
   is_inited_pre_part_ = false;
   has_dump_preprocess_part_ = false;
+  return OB_SUCCESS;
 }
 
 int ObIHashPartInfrastructure::rewind()
@@ -1698,11 +1699,13 @@ int64_t ObHashPartInfrastructureVecImpl::get_bucket_num() const
   return hp_infras_->get_bucket_num();
 }
 
-void ObHashPartInfrastructureVecImpl::reset_hash_table_for_by_pass()
+int ObHashPartInfrastructureVecImpl::reset_hash_table_for_by_pass()
 {
+  int ret = OB_SUCCESS;
   if (nullptr != hp_infras_) {
-    hp_infras_->reset_hash_table_for_by_pass();
+    ret = hp_infras_->reset_hash_table_for_by_pass();
   }
+  return ret;
 }
 
 int64_t ObHashPartInfrastructureVecImpl::get_hash_table_size() const
@@ -1746,9 +1749,9 @@ int64_t ObHashPartInfrastructureVecImpl::estimate_total_count() const
   return hp_infras_->estimate_total_count();
 }
 
-void ObHashPartInfrastructureVecImpl::reuse()
+int ObHashPartInfrastructureVecImpl::reuse()
 {
-  hp_infras_->reuse();
+  return hp_infras_->reuse();
 }
 
 int64_t ObHashPartInfrastructureVecImpl::get_total_mem_used() const

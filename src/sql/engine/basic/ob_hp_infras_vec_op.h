@@ -242,13 +242,13 @@ public:
 
 public:
   virtual void reset();
-  virtual void reuse();
+  virtual int reuse();
   virtual int rewind();
   virtual void destroy();
   virtual int64_t get_hash_bucket_num() = 0;
   virtual int64_t get_bucket_num() const = 0;
   virtual int64_t get_each_bucket_size() const = 0;
-  virtual void reset_hash_table_for_by_pass() = 0;
+  virtual int reset_hash_table_for_by_pass() = 0;
   virtual int64_t get_hash_table_size() const = 0;
   virtual int64_t get_hash_table_mem_used() const = 0;
   virtual int extend_hash_table_l3() = 0;
@@ -636,17 +636,18 @@ public:
   }
   virtual ~ObHashPartInfrastructureVec();
   void reset() override;
-  void reuse() override;
+  int reuse() override;
   void destroy() override;
   int rewind() override;
   int64_t get_hash_bucket_num() override { return hash_table_.get_bucket_num(); }
   int64_t get_bucket_num() const override { return hash_table_.get_bucket_num(); }
   int64_t get_each_bucket_size() const override { return sizeof(HashBucket); }
-  void reset_hash_table_for_by_pass() override
+  int reset_hash_table_for_by_pass() override
   {
-    hash_table_.reuse();
+    int ret = hash_table_.reuse();
     hash_table_row_store_iter_.reset();
     preprocess_part_.store_.reset();
+    return ret;
   }
   int64_t get_hash_table_size() const override { return hash_table_.size(); }
   int64_t get_hash_table_mem_used() const override { return hash_table_.mem_used(); }
@@ -806,7 +807,7 @@ public:
     return ret;
   }
   void reset();
-  void reuse();
+  int reuse();
   int rewind();
   void destroy();
   bool is_destroyed() const { return is_destroyed_; }
@@ -887,7 +888,7 @@ public:
   int open_hash_table_part();
   int64_t get_hash_bucket_num();
   int64_t get_bucket_num() const;
-  void reset_hash_table_for_by_pass();
+  int reset_hash_table_for_by_pass();
   int64_t get_hash_table_size() const;
   int extend_hash_table_l3();
   bool hash_table_full();
@@ -938,10 +939,11 @@ void ObHashPartInfrastructureVec<HashBucket>::reset()
 }
 
 template<typename HashBucket>
-void ObHashPartInfrastructureVec<HashBucket>::reuse()
+int ObHashPartInfrastructureVec<HashBucket>::reuse()
 {
-  hash_table_.reuse();
+  int ret = hash_table_.reuse();
   ObIHashPartInfrastructure::reuse();
+  return ret;
 }
 
 template<typename HashBucket>
@@ -955,8 +957,9 @@ template<typename HashBucket>
 int ObHashPartInfrastructureVec<HashBucket>::rewind()
 {
   int ret = OB_SUCCESS;
-  hash_table_.reuse();
-  if (OB_FAIL(ObIHashPartInfrastructure::rewind())) {
+  if (OB_FAIL(hash_table_.reuse())) {
+    SQL_ENG_LOG(WARN, "failed to reuse hash table", K(ret));
+  } else if (OB_FAIL(ObIHashPartInfrastructure::rewind())) {
     SQL_ENG_LOG(WARN, "failed to rewind", K(ret));
   }
   return ret;

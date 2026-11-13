@@ -434,9 +434,9 @@ int ObHashDistinctVecOp::build_distinct_data_for_batch_by_pass(const int64_t bat
           bypass_ctrl_.llc_est_.est_cnt_at_bypass_start_ = bypass_ctrl_.llc_est_.est_cnt_;
           bypass_ctrl_.llc_est_.last_downsample_est_ = bypass_ctrl_.llc_est_.est_cnt_;
           bypass_ctrl_.start_by_pass();
-          hp_infras_.reset_hash_table_for_by_pass();
+          OZ(hp_infras_.reset_hash_table_for_by_pass());
           popular_array_temp_.reuse();
-          if (skew_detection_enabled_ && popular_map_.size() > 0) {
+          if (OB_SUCC(ret) && skew_detection_enabled_ && popular_map_.size() > 0) {
             if (OB_FAIL(hp_infras_.resize(INIT_BUCKET_COUNT_FOR_POPULAR))) {
               LOG_WARN("failed to resize for popular", K(ret));
             }
@@ -466,7 +466,7 @@ int ObHashDistinctVecOp::build_distinct_data_for_batch_by_pass(const int64_t bat
               K(bypass_ctrl_.rebuild_times_), K(dynamic_threshold), K(MY_SPEC.id_));
           }
           if (OB_SUCC(ret)) {
-            hp_infras_.reset_hash_table_for_by_pass();
+            OZ(hp_infras_.reset_hash_table_for_by_pass());
             popular_array_temp_.reuse();
             bypass_ctrl_.probe_cnt_ = 0;
             bypass_ctrl_.reset_state();
