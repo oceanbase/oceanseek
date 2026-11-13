@@ -161,16 +161,12 @@ int ObTabletFullDirectLoadMgrV2::open(const int64_t current_execution_id, share:
       LOG_WARN("set handle failed", K(ret));
     } else if (OB_FAIL(tablet_handle.get_obj()->get_ddl_kv_mgr(ddl_kv_mgr_handle, true/*try_create*/))) {
       LOG_WARN("create ddl kv mgr failed", K(ret));
-    } else if (OB_FAIL(ddl_kv_mgr_handle.get_obj()->add_idempotence_checker())) {
-      LOG_WARN("add idempotence checker failed", K(ret));
     } else if (nullptr != lob_tablet_mgr) {
       ObTabletHandle lob_tablet_handle;
       if (OB_FAIL(ObDDLUtil::ddl_get_tablet(ls_handle, lob_tablet_mgr->get_tablet_id(), lob_tablet_handle))) {
         LOG_WARN("get tablet handle failed", K(ret), K(ls_id_), KPC(lob_tablet_mgr));
       } else if (OB_FAIL(lob_tablet_handle.get_obj()->get_ddl_kv_mgr(lob_kv_mgr_handle, true/*try_create*/))) {
         LOG_WARN("create ddl kv mgr failed", K(ret));
-      } else if (OB_FAIL(lob_kv_mgr_handle.get_obj()->add_idempotence_checker())) {
-        LOG_WARN("add idempotence checker failed", K(ret));
       }
     }
   }

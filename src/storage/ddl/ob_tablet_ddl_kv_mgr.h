@@ -215,8 +215,6 @@ private:
   int wrlock(const int64_t timeout_us, uint32_t &lock_tid);
   void unlock(const uint32_t lock_tid);
   void cleanup_unlock();
-  int add_idempotence_checker();
-  int add_idempotence_checker_nolock();
   int handle_ddl_kv_queue_overflow(const ObDDLKVType ddl_kv_type);
   int add_tablet_to_ddl_log_handler(const share::ObLSID &ls_id,
                                     const common::ObTabletID &tablet_id);

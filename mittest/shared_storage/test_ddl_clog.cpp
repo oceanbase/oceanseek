@@ -3,7 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <atomic>
 #include <string>
+#include <thread>
 #include <gtest/gtest.h>
 #define USING_LOG_PREFIX STORAGE
 #define protected public
@@ -12,6 +14,8 @@
 #include "src/storage/ob_i_table.h"
 #include "src/storage/ddl/ob_ddl_merge_task.h"
 #include "src/storage/ddl/ob_ddl_merge_task_utils.h"
+#include "src/storage/ddl/ob_tablet_ddl_kv_mgr.h"
+#include "src/storage/ddl/ob_tablet_ddl_kv.h"
 #include "mittest/mtlenv/mock_tenant_module_env.h"
 #include "unittest/storage/test_tablet_helper.h"
 #include "unittest/storage/mock_ob_log_handler.h"
@@ -174,6 +178,7 @@ class TestDDLClogCase : public ::testing::Test
   }
 
   void prepare_schema();
+  void prepare_ddl_kv_mgr(ObDDLKvMgrHandle &ddl_kv_mgr_handle);
 
   /* basic info for mack tablet */
   static const uint64_t tenant_id_ = 1;
@@ -374,6 +379,235 @@ void TestDDLClogCase::SetUpTestCase()
 void TestDDLClogCase::TearDownTestCase()
 {
   MockTenantModuleEnv::get_instance().destroy();
+}
+
+void TestDDLClogCase::prepare_ddl_kv_mgr(ObDDLKvMgrHandle &ddl_kv_mgr_handle)
+{
+  ObLSService *ls_service = MTL(ObLSService *);
+  ObLSHandle ls_handle;
+  ObTabletHandle tablet_handle;
+  ObTableSchema schema;
+  const ObTabletID tablet_id(get_next_tablet_id());
+  ASSERT_NE(nullptr, ls_service);
+  ASSERT_EQ(OB_SUCCESS, ls_service->get_ls(ObLSID(ls_id_), ls_handle, ObLSGetMod::DDL_MOD));
+  ASSERT_EQ(OB_SUCCESS, generate_table(get_next_table_id(), column_count_, rowkey_count_, schema));
+  ASSERT_EQ(OB_SUCCESS, TestTabletHelper::create_tablet(ls_handle, tablet_id, schema, allocator_));
+  ASSERT_EQ(OB_SUCCESS, ls_handle.get_ls()->get_tablet(
+      tablet_id, tablet_handle, 0, ObMDSGetTabletMode::READ_WITHOUT_CHECK));
+  ASSERT_EQ(OB_SUCCESS, tablet_handle.get_obj()->get_ddl_kv_mgr(ddl_kv_mgr_handle, true /* try_create */));
+}
+
+TEST_F(TestDDLClogCase, test_idem_checker_skips_unused_tablets)
+{
+  ObDDLKvMgrHandle mgr_handle;
+  prepare_ddl_kv_mgr(mgr_handle);
+  ASSERT_TRUE(mgr_handle.is_valid());
+  ObTabletDDLKvMgr &mgr = *mgr_handle.get_obj();
+  ASSERT_FALSE(mgr.idem_checker_.is_inited());
+  const MacroBlockId block_id = TestSSCommonUtil::gen_macro_block_id(1);
+  const ObLogicMacroBlockId logic_id;
+  bool exists = true;
+
+  const ObDirectLoadType non_idem_types[] = {
+    DIRECT_LOAD_DDL, DIRECT_LOAD_LOAD_DATA, DIRECT_LOAD_INCREMENTAL, DIRECT_LOAD_INCREMENTAL_MAJOR
+  };
+  for (const ObDirectLoadType type : non_idem_types) {
+    exists = true;
+    ASSERT_EQ(OB_SUCCESS, mgr.check_idem_block_exist(
+        DDL_MB_DATA_TYPE, type, block_id, logic_id, 123, ObITable::MAJOR_SSTABLE, exists));
+    EXPECT_FALSE(exists);
+    ASSERT_EQ(OB_SUCCESS, mgr.set_idem_block_checksum(
+        DDL_MB_DATA_TYPE, type, block_id, logic_id, 123, ObITable::MAJOR_SSTABLE));
+    EXPECT_FALSE(mgr.idem_checker_.is_inited());
+  }
+
+  const ObDirectLoadType idem_types[] = {
+    SS_IDEM_DIRECT_LOAD_DDL, SS_IDEM_DIRECT_LOAD_DATA, DIRECT_LOAD_DDL_V2, DIRECT_LOAD_LOAD_DATA_V2
+  };
+  for (const ObDirectLoadType type : idem_types) {
+    exists = true;
+    ASSERT_EQ(OB_SUCCESS, mgr.check_idem_block_exist(
+        DDL_MB_SS_EMPTY_DATA_TYPE, type, block_id, logic_id, 0, ObITable::MAJOR_SSTABLE, exists));
+    EXPECT_FALSE(exists);
+    ASSERT_EQ(OB_SUCCESS, mgr.set_idem_block_checksum(
+        DDL_MB_SS_EMPTY_DATA_TYPE, type, block_id, logic_id, 0, ObITable::MAJOR_SSTABLE));
+    EXPECT_FALSE(mgr.idem_checker_.is_inited());
+    exists = true;
+    ASSERT_EQ(OB_SUCCESS, mgr.check_idem_block_exist(
+        DDL_MB_DATA_TYPE, type, block_id, logic_id, 123, ObITable::MAJOR_SSTABLE, exists));
+    EXPECT_FALSE(exists);
+    EXPECT_FALSE(mgr.idem_checker_.is_inited());
+  }
+
+  const MacroBlockId invalid_block_id;
+  EXPECT_EQ(OB_INVALID_ARGUMENT, mgr.check_idem_block_exist(
+      DDL_MB_DATA_TYPE, SS_IDEM_DIRECT_LOAD_DDL, invalid_block_id, logic_id, 123, ObITable::MAJOR_SSTABLE, exists));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, mgr.set_idem_block_checksum(
+      DDL_MB_DATA_TYPE, SS_IDEM_DIRECT_LOAD_DDL, invalid_block_id, logic_id, 123, ObITable::MAJOR_SSTABLE));
+  EXPECT_FALSE(mgr.idem_checker_.is_inited());
+}
+
+TEST_F(TestDDLClogCase, test_idem_checker_checksum_and_cleanup)
+{
+  ObDDLKvMgrHandle mgr_handle;
+  prepare_ddl_kv_mgr(mgr_handle);
+  ASSERT_TRUE(mgr_handle.is_valid());
+  ObTabletDDLKvMgr &mgr = *mgr_handle.get_obj();
+  const MacroBlockId block_id = TestSSCommonUtil::gen_macro_block_id(1);
+  const ObLogicMacroBlockId logic_id;
+  bool exists = false;
+
+  ASSERT_EQ(OB_SUCCESS, mgr.set_idem_block_checksum(
+      DDL_MB_DATA_TYPE, SS_IDEM_DIRECT_LOAD_DDL, block_id, logic_id, 123, ObITable::MAJOR_SSTABLE));
+  ASSERT_TRUE(mgr.idem_checker_.is_inited());
+  ASSERT_EQ(OB_SUCCESS, mgr.check_idem_block_exist(
+      DDL_MB_DATA_TYPE, SS_IDEM_DIRECT_LOAD_DDL, block_id, logic_id, 123, ObITable::MAJOR_SSTABLE, exists));
+  EXPECT_TRUE(exists);
+  ASSERT_EQ(OB_SUCCESS, mgr.set_idem_block_checksum(
+      DDL_MB_DATA_TYPE, SS_IDEM_DIRECT_LOAD_DDL, block_id, logic_id, 123, ObITable::MAJOR_SSTABLE));
+  EXPECT_EQ(1, mgr.idem_checker_.checksum_map_.size());
+  EXPECT_EQ(OB_ERR_UNEXPECTED, mgr.check_idem_block_exist(
+      DDL_MB_DATA_TYPE, SS_IDEM_DIRECT_LOAD_DDL, block_id, logic_id, 456, ObITable::MAJOR_SSTABLE, exists));
+  EXPECT_FALSE(exists);
+  EXPECT_EQ(OB_ERR_UNEXPECTED, mgr.set_idem_block_checksum(
+      DDL_MB_DATA_TYPE, SS_IDEM_DIRECT_LOAD_DDL, block_id, logic_id, 456, ObITable::MAJOR_SSTABLE));
+  EXPECT_EQ(1, mgr.idem_checker_.checksum_map_.size());
+
+  // The table type is part of the idempotence key.
+  ASSERT_EQ(OB_SUCCESS, mgr.check_idem_block_exist(
+      DDL_MB_DATA_TYPE, SS_IDEM_DIRECT_LOAD_DDL, block_id, logic_id, 456, ObITable::DDL_DUMP_SSTABLE, exists));
+  EXPECT_FALSE(exists);
+  ASSERT_EQ(OB_SUCCESS, mgr.set_idem_block_checksum(
+      DDL_MB_DATA_TYPE, SS_IDEM_DIRECT_LOAD_DDL, block_id, logic_id, 456, ObITable::DDL_DUMP_SSTABLE));
+  EXPECT_EQ(2, mgr.idem_checker_.checksum_map_.size());
+
+  // Having no DDL KVs is not sufficient to end checksum tracking.
+  ASSERT_EQ(0, mgr.get_count());
+  ASSERT_EQ(OB_SUCCESS, mgr.release_ddl_kvs(DDL_KV_FULL, share::SCN::max_scn()));
+  EXPECT_TRUE(mgr.idem_checker_.is_inited());
+  EXPECT_EQ(2, mgr.idem_checker_.checksum_map_.size());
+  ASSERT_EQ(OB_SUCCESS, mgr.remove_idempotence_checker());
+  ASSERT_EQ(OB_SUCCESS, mgr.remove_idempotence_checker());
+
+  for (int64_t i = 0; i < 3; ++i) {
+    exists = true;
+    ASSERT_EQ(OB_SUCCESS, mgr.check_idem_block_exist(
+        DDL_MB_DATA_TYPE, SS_IDEM_DIRECT_LOAD_DDL, block_id, logic_id, i, ObITable::MAJOR_SSTABLE, exists));
+    EXPECT_FALSE(exists);
+    EXPECT_FALSE(mgr.idem_checker_.is_inited());
+    ASSERT_EQ(OB_SUCCESS, mgr.set_idem_block_checksum(
+        DDL_MB_DATA_TYPE, SS_IDEM_DIRECT_LOAD_DDL, block_id, logic_id, i, ObITable::MAJOR_SSTABLE));
+    ASSERT_EQ(OB_SUCCESS, mgr.check_idem_block_exist(
+        DDL_MB_DATA_TYPE, SS_IDEM_DIRECT_LOAD_DDL, block_id, logic_id, i, ObITable::MAJOR_SSTABLE, exists));
+    EXPECT_TRUE(exists);
+    ASSERT_EQ(OB_SUCCESS, mgr.cleanup());
+    EXPECT_TRUE(mgr.idem_checker_.is_inited());
+    EXPECT_EQ(1, mgr.idem_checker_.checksum_map_.size());
+    exists = false;
+    ASSERT_EQ(OB_SUCCESS, mgr.check_idem_block_exist(
+        DDL_MB_DATA_TYPE, SS_IDEM_DIRECT_LOAD_DDL, block_id, logic_id, i, ObITable::MAJOR_SSTABLE, exists));
+    EXPECT_TRUE(exists);
+    ASSERT_EQ(OB_SUCCESS, mgr.remove_idempotence_checker());
+    EXPECT_FALSE(mgr.idem_checker_.is_inited());
+    EXPECT_EQ(0, mgr.idem_checker_.checksum_map_.bucket_count());
+  }
+}
+
+TEST_F(TestDDLClogCase, test_idem_checker_survives_ddl_kv_release)
+{
+  ObDDLKvMgrHandle mgr_handle;
+  prepare_ddl_kv_mgr(mgr_handle);
+  ASSERT_TRUE(mgr_handle.is_valid());
+  ObTabletDDLKvMgr &mgr = *mgr_handle.get_obj();
+  const MacroBlockId block_id = TestSSCommonUtil::gen_macro_block_id(1);
+  const ObLogicMacroBlockId logic_id;
+  ASSERT_EQ(OB_SUCCESS, mgr.set_idem_block_checksum(
+      DDL_MB_DATA_TYPE, SS_IDEM_DIRECT_LOAD_DDL, block_id, logic_id, 123, ObITable::MAJOR_SSTABLE));
+
+  share::SCN start_scn;
+  share::SCN freeze_scn;
+  ASSERT_EQ(OB_SUCCESS, start_scn.convert_for_tx(100));
+  ASSERT_EQ(OB_SUCCESS, freeze_scn.convert_for_tx(200));
+  ASSERT_EQ(OB_SUCCESS, mgr.set_max_freeze_scn(start_scn));
+  ObDDLKVHandle kv_handle;
+  ASSERT_EQ(OB_SUCCESS, mgr.alloc_ddl_kv(
+      start_scn, mock_snapshot_version, DATA_VERSION_4_6_0_0, kv_handle, DDL_KV_FULL));
+  ASSERT_TRUE(kv_handle.is_valid());
+  ASSERT_EQ(1, mgr.get_count());
+  ASSERT_EQ(DDL_KV_FULL, kv_handle.get_obj()->get_ddl_kv_type());
+  ASSERT_EQ(OB_SUCCESS, kv_handle.get_obj()->freeze(freeze_scn));
+  ASSERT_EQ(freeze_scn, kv_handle.get_obj()->get_freeze_scn());
+  // Model a completed dump; closing through prepare_sstable would require log replay.
+  kv_handle.get_obj()->is_closed_ = true;
+  kv_handle.reset(); // Leave the manager as the only owner before releasing the KV.
+
+  ASSERT_EQ(OB_SUCCESS, mgr.release_ddl_kvs(DDL_KV_FULL, start_scn));
+  ASSERT_EQ(1, mgr.get_count());
+  ASSERT_EQ(OB_SUCCESS, mgr.release_ddl_kvs(DDL_KV_FULL, freeze_scn));
+  ASSERT_EQ(0, mgr.get_count());
+  ASSERT_TRUE(mgr.idem_checker_.is_inited());
+  EXPECT_EQ(1, mgr.idem_checker_.checksum_map_.size());
+  bool exists = false;
+  ASSERT_EQ(OB_SUCCESS, mgr.check_idem_block_exist(
+      DDL_MB_DATA_TYPE, SS_IDEM_DIRECT_LOAD_DDL, block_id, logic_id, 123, ObITable::MAJOR_SSTABLE, exists));
+  EXPECT_TRUE(exists);
+  ASSERT_EQ(OB_SUCCESS, mgr.set_idem_block_checksum(
+      DDL_MB_DATA_TYPE, SS_IDEM_DIRECT_LOAD_DDL, block_id, logic_id, 123, ObITable::MAJOR_SSTABLE));
+  EXPECT_EQ(1, mgr.idem_checker_.checksum_map_.size());
+  ASSERT_EQ(OB_SUCCESS, mgr.remove_idempotence_checker());
+  EXPECT_FALSE(mgr.idem_checker_.is_inited());
+}
+
+TEST_F(TestDDLClogCase, test_idem_checker_concurrent_first_write)
+{
+  ObDDLKvMgrHandle mgr_handle;
+  prepare_ddl_kv_mgr(mgr_handle);
+  ASSERT_TRUE(mgr_handle.is_valid());
+  ObTabletDDLKvMgr &mgr = *mgr_handle.get_obj();
+  const ObLogicMacroBlockId logic_id;
+  const uint64_t tenant_id = MTL_ID();
+  const int64_t thread_count = 4;
+  for (int64_t round = 0; round < 3; ++round) {
+    std::atomic<int64_t> ready(0);
+    std::atomic<bool> start(false);
+    std::thread threads[thread_count];
+    int results[thread_count];
+    for (int64_t i = 0; i < thread_count; ++i) {
+      results[i] = OB_ERR_UNEXPECTED;
+      threads[i] = std::thread([&, i, tenant_id]() {
+        ready.fetch_add(1);
+        while (!start.load()) {
+          std::this_thread::yield();
+        }
+        int ret = OB_ERR_UNEXPECTED;
+        MTL_SWITCH(tenant_id) {
+          ret = mgr.set_idem_block_checksum(
+              DDL_MB_DATA_TYPE, SS_IDEM_DIRECT_LOAD_DDL, TestSSCommonUtil::gen_macro_block_id(i + 1),
+              logic_id, i, ObITable::MAJOR_SSTABLE);
+        }
+        results[i] = ret;
+      });
+    }
+    while (ready.load() < thread_count) {
+      std::this_thread::yield();
+    }
+    start.store(true);
+    for (int64_t i = 0; i < thread_count; ++i) {
+      threads[i].join();
+    }
+    ASSERT_TRUE(mgr.idem_checker_.is_inited());
+    EXPECT_EQ(thread_count, mgr.idem_checker_.checksum_map_.size());
+    for (int64_t i = 0; i < thread_count; ++i) {
+      EXPECT_EQ(OB_SUCCESS, results[i]);
+      bool exists = false;
+      ASSERT_EQ(OB_SUCCESS, mgr.check_idem_block_exist(
+          DDL_MB_DATA_TYPE, SS_IDEM_DIRECT_LOAD_DDL, TestSSCommonUtil::gen_macro_block_id(i + 1),
+          logic_id, i, ObITable::MAJOR_SSTABLE, exists));
+      EXPECT_TRUE(exists);
+    }
+    ASSERT_EQ(OB_SUCCESS, mgr.remove_idempotence_checker());
+    EXPECT_FALSE(mgr.idem_checker_.is_inited());
+  }
 }
 
 TEST_F(TestDDLClogCase, test_finish_log_write)
