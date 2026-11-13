@@ -698,8 +698,26 @@ int ObSearchIndexValueEncoder::encode_json_scalar(ObIAllocator &allocator,
       }
       case ObJsonNodeType::J_OPAQUE: {
         ObString opaque_data = json.get_string();
-        if (OB_FAIL(encode_string(allocator, opaque_data, value, enc_param))) {
+        ObString encoded_data;
+        if (OB_FAIL(encode_string(allocator, opaque_data, encoded_data, enc_param))) {
           LOG_WARN("fail to encode opaque", K(ret));
+        } else {
+          // JSON compares OPAQUE field types before their payload bytes.
+          const uint16_t field_type = static_cast<uint16_t>(json.field_type());
+          const int64_t type_len = sizeof(field_type);
+          const int64_t data_len = MIN(encoded_data.length(), SEARCH_INDEX_VALUE_LENGTH - type_len);
+          unsigned char *mem = static_cast<unsigned char *>(allocator.alloc(type_len + data_len));
+          int64_t pos = 0;
+          if (OB_ISNULL(mem)) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+            LOG_WARN("fail to allocate opaque value", K(ret), K(data_len));
+          } else if (OB_FAIL(ObOrderPerservingEncoder::encode_from_uint16(field_type, mem, pos))) {
+            LOG_WARN("fail to encode opaque field type", K(ret), K(field_type));
+          } else {
+            MEMCPY(mem + pos, encoded_data.ptr(), data_len);
+            pos += data_len;
+            value.assign_ptr(reinterpret_cast<char *>(mem), pos);
+          }
         }
         break;
       }

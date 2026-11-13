@@ -306,7 +306,7 @@ TEST_F(TestSearchIndexEncoder, json_scalar_encoding_bytes)
   }
   ObJsonWrapper array_view;
   ASSERT_EQ(OB_SUCCESS, make_binary_wrapper(allocator, array, array_view));
-  // Fixed bytes captured from the pre-wrapper encoder; query and write paths must agree.
+  // Query and write paths must agree on these bytes, including the OPAQUE field type.
   const char *expected[] = {
     "c20000000d149aa4360dfb38d3075bcd1600000000",
     "3efffffff5f2af9cfacd0d27feffffffff",
@@ -324,7 +324,7 @@ TEST_F(TestSearchIndexEncoder, json_scalar_encoding_bytes)
     "800513b807406240",
     "800fbe8f",
     "9995de000001e240",
-    "410001420000"
+    "001f410001420000"
   };
   for (int64_t i = 0; i < ARRAYSIZEOF(nodes); ++i) {
     SCOPED_TRACE(i);
