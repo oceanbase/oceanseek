@@ -569,6 +569,17 @@ public:
 
   int get_max_decided_scn(share::SCN & scn);
 
+  // Publish a durable CLEAR log SCN with the ctx lock held, before exiting.
+  // Do not acquire rwlock_: the normal lock order is manager -> ctx.
+  void update_max_clear_scn(const share::SCN &clear_scn)
+  {
+    if (clear_scn.is_valid()) {
+      max_clear_scn_.inc_update(clear_scn);
+    }
+  }
+  // Upper bound for cleared transactions, including continuous recovery progress.
+  int get_max_clear_scn(share::SCN &scn);
+
   int do_standby_cleanup();
 
   int errsim_switch_to_followr_gracefully();
@@ -581,6 +592,7 @@ public:
                K_(tx_ls_state_mgr),
                K_(total_tx_ctx_count),
                K_(active_tx_count),
+               K_(max_clear_scn),
                K_(ls_retain_ctx_mgr),
                K_(aggre_rec_scn),
                K_(prev_aggre_rec_scn),
@@ -703,6 +715,11 @@ private:
 
   // See the ObLSTxCtxMgr's member function update_max_replay_commit_version
   share::SCN max_replay_commit_version_;
+
+  // Durable CLEAR log SCNs may be ahead of continuous apply/replay.
+  // Keep this across role changes/offline; after restart the replay checkpoint
+  // covers historical CLEAR logs that are skipped instead of replayed again.
+  share::SCN max_clear_scn_;
 
   // Recover log timestamp for aggregated tx ctx. For the purpose of Durability,
   // we need a space to store rec_log_ts for checkpoint[1]. Although tx ctx

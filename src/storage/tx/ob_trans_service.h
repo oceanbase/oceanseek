@@ -335,7 +335,8 @@ public:
                     const bool is_rollback,
                     const int64_t expire_ts);
   int get_max_commit_version(share::SCN &commit_version) const;
-  int get_max_decided_scn(const share::ObLSID &ls_id, share::SCN & scn);
+  int get_max_decided_scn(const share::ObLSID &ls_id, share::SCN &scn);
+  int get_max_clear_scn(const share::ObLSID &ls_id, share::SCN &scn);
   TenantConfigCache &get_tenant_config_cache() { return tenant_config_cache_; }
   int refresh_tenant_config() { return tenant_config_cache_.refresh(); }
   #include "ob_trans_service_v4.h"

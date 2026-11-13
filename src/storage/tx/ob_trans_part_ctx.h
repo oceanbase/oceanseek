@@ -884,6 +884,8 @@ protected:
                        const int64_t participant_id) override;
 private:
   int apply_2pc_msg_(const ObTwoPhaseCommitMsgType msg_type);
+  // Merge the terminal log watermark carried by an orphan COMMIT/ABORT response into the
+  // local LS watermark, so the generated CLEAR request cannot be older than the responded peer.
   static share::SCN get_orphan_clear_scn_(const ObTxMsg &recv_msg, const share::SCN &local_scn);
   int set_2pc_upstream_(const share::ObLSID&upstream);
   int set_2pc_participants_(const ObTxCommitParts &participants);

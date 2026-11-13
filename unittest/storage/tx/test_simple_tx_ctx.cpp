@@ -4,12 +4,17 @@
  */
 
 #include <gtest/gtest.h>
+#include <functional>
+#include <thread>
 #include "lib/utility/ob_defer.h"
 #define private public
 #define protected public
 #define UNITTEST
 
 #include "storage/tx/ob_mock_tx_ctx.h"
+#include "storage/tx/ob_mock_tx_log_adapter.h"
+#include "storage/tx/ob_trans_ctx_mgr_v4.h"
+#include "storage/tx_table/tx_table_local_buffer.h"
 #include "lib/alloc/ob_malloc_allocator.h"
 #include "share/ob_cluster_version.h"
 
@@ -21,6 +26,9 @@ using namespace share;
 
 namespace unittest
 {
+// Observe publication at the existing test replacement of set_exiting_().
+static std::function<void(const ObTransCtx &)> before_exiting_hook;
+
 class TestMockObTxCtx : public ::testing::Test
 {
 protected:
@@ -279,9 +287,369 @@ TEST_F(TestMockObTxCtx, abort_watermark_aggregation_and_orphan_clear)
   EXPECT_EQ(larger_scn, ObPartTransCtx::get_orphan_clear_scn_(resp, larger_scn));
   resp.max_abort_log_scn_.reset();
   EXPECT_EQ(local_scn, ObPartTransCtx::get_orphan_clear_scn_(resp, local_scn));
+}
+
+// Field case 2026111000120508270: the coordinator LS has already dropped the txn context and
+// receives a COMMIT_RESP whose commit_log_scn is newer than its own decided watermark. The
+// orphan CLEAR must cover the participant watermark, otherwise the participant rejects it
+// with -4016 while the strict receiver-side validation stays in place.
+TEST_F(TestMockObTxCtx, orphan_commit_resp_watermark_drives_clear)
+{
+  SCN commit_scn;
+  SCN local_scn;
+  SCN larger_scn;
+  ASSERT_EQ(OB_SUCCESS, commit_scn.convert_for_tx(1794310435396031002));
+  ASSERT_EQ(OB_SUCCESS, local_scn.convert_for_tx(1794310435383927000));
+  ASSERT_EQ(OB_SUCCESS, larger_scn.convert_for_tx(1794310435396031003));
+
   Ob2pcCommitRespMsg commit_resp;
-  commit_resp.commit_log_scn_ = larger_scn;
+  commit_resp.commit_log_scn_ = commit_scn;
+
+  ObTxData data;
+  WatermarkTxCtx leaf;
+  leaf.change_to_leader();
+  ASSERT_EQ(OB_SUCCESS, leaf.init(ObLSID(1), ObTransID(1), nullptr, &data, &mailbox_mgr_));
+  ASSERT_EQ(OB_SUCCESS, leaf.set_downstream_state(ObTxState::COMMIT));
+  ASSERT_EQ(OB_SUCCESS, leaf.ctx_tx_data_.set_end_log_ts(commit_scn));
+
+  // A CLEAR built from the local LS watermark alone is rejected by the participant.
+  Ob2pcClearReqMsg stale_clear;
+  stale_clear.sender_ = ObLSID(1001);
+  stale_clear.max_commit_log_scn_ = local_scn;
+  leaf.msg_2pc_cache_ = &stale_clear;
+  EXPECT_EQ(OB_ERR_UNEXPECTED, leaf.apply_2pc_msg_(ObTwoPhaseCommitMsgType::OB_MSG_TX_CLEAR_REQ));
+  leaf.msg_2pc_cache_ = nullptr;
+
+  // Merging the response watermark produces a CLEAR the participant accepts.
+  Ob2pcClearReqMsg clear;
+  clear.sender_ = ObLSID(1001);
+  clear.max_commit_log_scn_ = ObPartTransCtx::get_orphan_clear_scn_(commit_resp, local_scn);
+  EXPECT_EQ(commit_scn, clear.max_commit_log_scn_);
+  leaf.msg_2pc_cache_ = &clear;
+  ASSERT_EQ(OB_SUCCESS, leaf.apply_2pc_msg_(ObTwoPhaseCommitMsgType::OB_MSG_TX_CLEAR_REQ));
+  leaf.msg_2pc_cache_ = nullptr;
+
+  // A newer local watermark is never lowered.
+  EXPECT_EQ(larger_scn, ObPartTransCtx::get_orphan_clear_scn_(commit_resp, larger_scn));
+
+  // An invalid field, as sent by an older version, keeps the original local watermark.
+  commit_resp.commit_log_scn_.reset();
   EXPECT_EQ(local_scn, ObPartTransCtx::get_orphan_clear_scn_(commit_resp, local_scn));
+
+  // The ABORT branch keeps its behavior.
+  Ob2pcAbortRespMsg abort_resp;
+  abort_resp.max_abort_log_scn_ = commit_scn;
+  EXPECT_EQ(commit_scn, ObPartTransCtx::get_orphan_clear_scn_(abort_resp, local_scn));
+}
+
+class OrphanWatermarkLogAdapter : public MockTxLogAdapter
+{
+public:
+  int get_max_decided_scn(SCN &scn) override
+  {
+    ++query_count_;
+    if (on_query_) {
+      on_query_();
+    }
+    scn = continuous_scn_;
+    return ret_;
+  }
+  SCN continuous_scn_ = SCN::min_scn();
+  int ret_ = OB_SUCCESS;
+  int query_count_ = 0;
+  std::function<void()> on_query_;
+};
+
+TEST_F(TestMockObTxCtx, orphan_clear_covers_sibling_after_coordinator_exit)
+{
+  OrphanWatermarkLogAdapter adapter;
+  ObLSTxCtxMgr mgr;
+  // Only the watermark APIs are exercised; no map or log writer is needed.
+  mgr.is_inited_ = true;
+  mgr.tx_log_adapter_ = &adapter;
+  DEFER(mgr.is_inited_ = false);
+  SCN local_scn, sender_commit, sibling_commit, original_clear, result;
+  ASSERT_EQ(OB_SUCCESS, local_scn.convert_for_tx(80));
+  ASSERT_EQ(OB_SUCCESS, sender_commit.convert_for_tx(100));
+  ASSERT_EQ(OB_SUCCESS, sibling_commit.convert_for_tx(200));
+  ASSERT_EQ(OB_SUCCESS, original_clear.convert_for_tx(201));
+  adapter.continuous_scn_ = local_scn;
+  mgr.update_max_clear_scn(original_clear);
+
+  Ob2pcCommitRespMsg resp;
+  resp.commit_log_scn_ = sender_commit;
+  // Merging just the sender would still miss the higher sibling COMMIT.
+  EXPECT_LT(ObPartTransCtx::get_orphan_clear_scn_(resp, local_scn), sibling_commit);
+  ASSERT_EQ(OB_SUCCESS, mgr.get_max_clear_scn(result));
+  EXPECT_EQ(original_clear, ObPartTransCtx::get_orphan_clear_scn_(resp, result));
+  EXPECT_GE(result, sibling_commit);
+  EXPECT_EQ(0, adapter.query_count_);
+
+  // Do not change the continuous progress API or the minimum recovery position.
+  ASSERT_EQ(OB_SUCCESS, mgr.get_max_decided_scn(result));
+  EXPECT_EQ(local_scn, result);
+  EXPECT_EQ(1, adapter.query_count_);
+  ASSERT_EQ(OB_SUCCESS, mgr.update_aggre_log_ts_wo_lock(sender_commit));
+  ASSERT_EQ(OB_SUCCESS, mgr.update_aggre_log_ts_wo_lock(local_scn));
+  EXPECT_EQ(local_scn, mgr.aggre_rec_scn_);
+}
+
+TEST_F(TestMockObTxCtx, orphan_clear_uses_recovery_progress_until_clear_published)
+{
+  OrphanWatermarkLogAdapter adapter;
+  ObLSTxCtxMgr mgr;
+  mgr.is_inited_ = true;
+  mgr.tx_log_adapter_ = &adapter;
+  DEFER(mgr.is_inited_ = false);
+  SCN checkpoint, historical_clear, result;
+  ASSERT_EQ(OB_SUCCESS, checkpoint.convert_for_tx(301));
+  ASSERT_EQ(OB_SUCCESS, historical_clear.convert_for_tx(300));
+  // After restart no historical CLEAR has updated the in-memory maximum.
+  // Replay skips SCNs < checkpoint and returns checkpoint - 1 as its baseline.
+  adapter.continuous_scn_ = SCN::scn_dec(checkpoint);
+  ASSERT_TRUE(mgr.max_clear_scn_.is_min());
+  adapter.ret_ = OB_STATE_NOT_MATCH;
+  EXPECT_EQ(OB_STATE_NOT_MATCH, mgr.get_max_clear_scn(result));
+  EXPECT_EQ(1, adapter.query_count_);
+
+  adapter.ret_ = OB_SUCCESS;
+  ASSERT_EQ(OB_SUCCESS, mgr.get_max_clear_scn(result));
+  EXPECT_GE(result, historical_clear);
+  EXPECT_EQ(2, adapter.query_count_);
+  EXPECT_TRUE(mgr.max_clear_scn_.is_min());
+
+  // The CLEAR exactly at the filtering point must be replayed/registered.
+  mgr.update_max_clear_scn(checkpoint);
+  // Later redo can advance continuous progress without changing the bound
+  // already provided by the published CLEAR for its completed transaction.
+  ASSERT_EQ(OB_SUCCESS, adapter.continuous_scn_.convert_for_tx(401));
+  ASSERT_EQ(OB_SUCCESS, mgr.get_max_clear_scn(result));
+  EXPECT_EQ(checkpoint, result);
+  EXPECT_GE(result, historical_clear);
+  EXPECT_EQ(2, adapter.query_count_);
+  ASSERT_EQ(OB_SUCCESS, mgr.offline());
+  EXPECT_EQ(checkpoint, mgr.max_clear_scn_.atomic_load());
+
+  // A published CLEAR also avoids an unavailable continuous-progress query.
+  adapter.ret_ = OB_STATE_NOT_MATCH;
+  ASSERT_EQ(OB_SUCCESS, mgr.get_max_clear_scn(result));
+  EXPECT_EQ(checkpoint, result);
+  EXPECT_EQ(2, adapter.query_count_);
+}
+
+TEST_F(TestMockObTxCtx, orphan_clear_rechecks_publication_during_recovery_query)
+{
+  OrphanWatermarkLogAdapter adapter;
+  ObLSTxCtxMgr mgr;
+  mgr.is_inited_ = true;
+  mgr.tx_log_adapter_ = &adapter;
+  DEFER(mgr.is_inited_ = false);
+  SCN clear_scn, result;
+  ASSERT_EQ(OB_SUCCESS, adapter.continuous_scn_.convert_for_tx(300));
+  ASSERT_EQ(OB_SUCCESS, clear_scn.convert_for_tx(601));
+  // Deterministically publish after the initial empty read, during the query.
+  adapter.on_query_ = [&]() { mgr.update_max_clear_scn(clear_scn); };
+  ASSERT_EQ(OB_SUCCESS, mgr.get_max_clear_scn(result));
+  EXPECT_EQ(clear_scn, result);
+  EXPECT_EQ(1, adapter.query_count_);
+
+  ASSERT_EQ(OB_SUCCESS, mgr.get_max_clear_scn(result));
+  EXPECT_EQ(clear_scn, result);
+  EXPECT_EQ(1, adapter.query_count_);
+}
+
+TEST_F(TestMockObTxCtx, orphan_clear_retries_after_failed_progress_query)
+{
+  for (int query_error : {OB_STATE_NOT_MATCH, OB_TIMEOUT}) {
+    SCOPED_TRACE(query_error);
+    OrphanWatermarkLogAdapter adapter;
+    ObLSTxCtxMgr mgr;
+    mgr.is_inited_ = true;
+    mgr.tx_log_adapter_ = &adapter;
+    DEFER(mgr.is_inited_ = false);
+    SCN clear_scn, result;
+    ASSERT_EQ(OB_SUCCESS, clear_scn.convert_for_tx(601));
+    ASSERT_EQ(OB_SUCCESS, adapter.continuous_scn_.convert_for_tx(901));
+    adapter.ret_ = query_error;
+    ASSERT_TRUE(mgr.max_clear_scn_.is_min());
+    adapter.on_query_ = [&]() { mgr.update_max_clear_scn(clear_scn); };
+    ASSERT_EQ(query_error, mgr.get_max_clear_scn(result));
+    EXPECT_EQ(1, adapter.query_count_);
+
+    // Retry uses the concurrently published CLEAR without another query or
+    // consuming the previous failed query's unusable output.
+    ASSERT_EQ(OB_SUCCESS, mgr.get_max_clear_scn(result));
+    EXPECT_EQ(clear_scn, result);
+    EXPECT_EQ(1, adapter.query_count_);
+  }
+}
+
+TEST_F(TestMockObTxCtx, max_clear_scn_uses_published_clear_after_manager_stop)
+{
+  for (int published = 0; published < 2; ++published) {
+    SCOPED_TRACE(published);
+    OrphanWatermarkLogAdapter adapter;
+    ObLSTxCtxMgr mgr;
+    mgr.tx_log_adapter_ = &adapter;
+    DEFER(mgr.is_inited_ = false);
+    SCN clear_scn, result;
+    ASSERT_EQ(OB_SUCCESS, clear_scn.convert_for_tx(201));
+    EXPECT_EQ(OB_NOT_INIT, mgr.get_max_clear_scn(result));
+
+    mgr.is_inited_ = true;
+    ASSERT_EQ(OB_SUCCESS, mgr.tx_ls_state_mgr_.init(ObLSID(1)));
+    ASSERT_EQ(OB_SUCCESS, mgr.tx_ls_state_mgr_.switch_tx_ls_state(ObTxLSStateMgr::TxLSAction::START));
+    if (published) {
+      mgr.update_max_clear_scn(clear_scn);
+    }
+    ASSERT_EQ(OB_SUCCESS, mgr.tx_ls_state_mgr_.switch_tx_ls_state(ObTxLSStateMgr::TxLSAction::STOP));
+    if (published) {
+      // A published watermark remains usable while the stopped manager is alive.
+      ASSERT_EQ(OB_SUCCESS, mgr.get_max_clear_scn(result));
+      EXPECT_EQ(clear_scn, result);
+    } else {
+      EXPECT_EQ(OB_STATE_NOT_MATCH, mgr.get_max_clear_scn(result));
+    }
+    EXPECT_EQ(OB_STATE_NOT_MATCH, mgr.get_max_decided_scn(result));
+    EXPECT_EQ(0, adapter.query_count_);
+  }
+}
+
+TEST_F(TestMockObTxCtx, clear_watermark_is_published_before_exiting)
+{
+  // Check the leader callback, complete/incomplete replay and filtered replay.
+  for (int mode = 0; mode < 4; ++mode) {
+    SCOPED_TRACE(mode);
+    ObLSTxCtxMgr mgr;
+    ObTxData data;
+    MockObTxCtx ctx;
+    ASSERT_EQ(OB_SUCCESS, ctx.init(ObLSID(1), ObTransID(1), nullptr, &data, &mailbox_mgr_));
+    ctx.ls_tx_ctx_mgr_ = &mgr;
+    ctx.exec_info_.trans_type_ = TransType::DIST_TRANS;
+    SCN clear_scn, recovery_scn;
+    ASSERT_EQ(OB_SUCCESS, clear_scn.convert_for_tx(201));
+    ASSERT_EQ(OB_SUCCESS, recovery_scn.convert_for_tx(100));
+    ctx.rec_log_ts_ = recovery_scn;
+    bool observed_exit = false;
+    before_exiting_hook = [&](const ObTransCtx &exiting_ctx) {
+      EXPECT_FALSE(exiting_ctx.is_exiting_);
+      EXPECT_EQ(clear_scn, mgr.max_clear_scn_.atomic_load());
+      observed_exit = true;
+    };
+    DEFER(before_exiting_hook = nullptr);
+    if (mode != 3) {
+      mgr.inc_active_tx_count();
+    }
+    if (mode == 0) {
+      ctx.exec_info_.max_applied_log_ts_ = clear_scn;
+      ASSERT_EQ(OB_SUCCESS, ctx.on_clear());
+    } else {
+      ctx.role_state_ = TxCtxRoleState::FOLLOWER;
+      ctx.exec_info_.max_applying_log_ts_ = clear_scn;
+      ctx.exec_info_.max_applying_part_log_no_ = mode == 3 ? 1 : 0;
+      ctx.replay_completeness_.set(mode != 2);
+      ASSERT_EQ(OB_SUCCESS, ctx.set_downstream_state(ObTxState::COMMIT));
+      ObTxClearLogTempRef ref;
+      ObTxClearLog log(ref);
+      ASSERT_EQ(OB_SUCCESS, ctx.replay_clear(log, palf::LSN(100), clear_scn, 0));
+    }
+    EXPECT_EQ(mode != 3, observed_exit);
+    EXPECT_EQ(mode != 3, ctx.is_exiting_);
+    EXPECT_EQ(clear_scn, mgr.max_clear_scn_.atomic_load());
+    EXPECT_EQ(recovery_scn, mgr.aggre_rec_scn_);
+    mailbox_mgr_.reset();
+  }
+}
+
+TEST_F(TestMockObTxCtx, non_clear_cleanup_does_not_publish_clear_watermark)
+{
+  for (int published = 0; published < 2; ++published) {
+    SCOPED_TRACE(published);
+    ObLSTxCtxMgr mgr;
+    ObTxData data;
+    MockObTxCtx ctx;
+    ASSERT_EQ(OB_SUCCESS, ctx.init(ObLSID(1), ObTransID(1), nullptr, &data, &mailbox_mgr_));
+    ctx.ls_tx_ctx_mgr_ = &mgr;
+    SCN recovery_scn, clear_scn, terminal_scn;
+    ASSERT_EQ(OB_SUCCESS, recovery_scn.convert_for_tx(100));
+    ASSERT_EQ(OB_SUCCESS, clear_scn.convert_for_tx(201));
+    ASSERT_EQ(OB_SUCCESS, terminal_scn.convert_for_tx(350));
+    ctx.rec_log_ts_ = recovery_scn;
+    if (published) {
+      mgr.update_max_clear_scn(clear_scn);
+    }
+    const SCN expected = mgr.max_clear_scn_.atomic_load();
+
+    // ABORT and local COMMIT use this common cleanup path. Their terminal SCNs
+    // must neither initialize nor advance the maximum durable CLEAR log SCN.
+    ASSERT_EQ(OB_SUCCESS, ctx.trans_clear_(terminal_scn));
+    EXPECT_EQ(expected, mgr.max_clear_scn_.atomic_load());
+    EXPECT_EQ(recovery_scn, mgr.aggre_rec_scn_);
+    ASSERT_EQ(OB_SUCCESS, ctx.trans_clear_(SCN::invalid_scn()));
+    EXPECT_EQ(expected, mgr.max_clear_scn_.atomic_load());
+    EXPECT_EQ(recovery_scn, mgr.aggre_rec_scn_);
+    mailbox_mgr_.reset();
+  }
+}
+
+TEST_F(TestMockObTxCtx, exited_clear_is_not_checkpointed)
+{
+  ObLSTxCtxMgr mgr;
+  ObTxData data;
+  MockObTxCtx ctx;
+  ASSERT_EQ(OB_SUCCESS, ctx.init(ObLSID(1), ObTransID(1), nullptr, &data, &mailbox_mgr_));
+  ctx.ls_tx_ctx_mgr_ = &mgr;
+  ctx.role_state_ = TxCtxRoleState::FOLLOWER;
+  ctx.exec_info_.trans_type_ = TransType::DIST_TRANS;
+  ctx.exec_info_.need_checksum_ = false;
+  ctx.replay_completeness_.set(true);
+  SCN start_scn, commit_scn, clear_scn;
+  ASSERT_EQ(OB_SUCCESS, start_scn.convert_for_tx(100));
+  ASSERT_EQ(OB_SUCCESS, commit_scn.convert_for_tx(200));
+  ASSERT_EQ(OB_SUCCESS, clear_scn.convert_for_tx(201));
+  ctx.ctx_tx_data_.test_set_tx_id(1);
+  ASSERT_EQ(OB_SUCCESS, ctx.ctx_tx_data_.set_start_log_ts(start_scn));
+  ASSERT_EQ(OB_SUCCESS, ctx.ctx_tx_data_.set_commit_version(commit_scn));
+  ASSERT_EQ(OB_SUCCESS, ctx.ctx_tx_data_.set_end_log_ts(commit_scn));
+  ASSERT_EQ(OB_SUCCESS, ctx.ctx_tx_data_.set_state(ObTxData::COMMIT));
+  ctx.exec_info_.max_applying_log_ts_ = clear_scn;
+  ctx.exec_info_.max_applying_part_log_no_ = 0;
+  ctx.exec_info_.max_applied_log_ts_ = commit_scn;
+  ASSERT_EQ(OB_SUCCESS, ctx.set_downstream_state(ObTxState::COMMIT));
+  mgr.inc_active_tx_count();
+  ObTxClearLogTempRef ref;
+  ObTxClearLog log(ref);
+  ASSERT_EQ(OB_SUCCESS, ctx.replay_clear(log, palf::LSN(100), clear_scn, 0));
+  ASSERT_TRUE(ctx.is_exiting_);
+
+  common::ObArenaAllocator allocator;
+  storage::ObTxLocalBuffer buffer(allocator);
+  int64_t serialize_size = 0;
+  // CLEAR contexts exit and must not be persisted on the supported branch.
+  ASSERT_EQ(OB_TRANS_CTX_NOT_EXIST, ctx.serialize_tx_ctx_to_buffer(buffer, serialize_size));
+}
+
+TEST_F(TestMockObTxCtx, completed_clear_watermark_never_regresses)
+{
+  ObLSTxCtxMgr mgr;
+  std::vector<std::thread> workers;
+  for (int i = 0; i < 4; ++i) {
+    workers.emplace_back([&, i]() {
+      for (int j = 100; j > 0; --j) {
+        SCN scn;
+        scn.convert_for_tx(i * 100 + j);
+        mgr.update_max_clear_scn(scn);
+      }
+    });
+  }
+  for (auto &worker : workers) {
+    worker.join();
+  }
+  SCN expected;
+  ASSERT_EQ(OB_SUCCESS, expected.convert_for_tx(400));
+  EXPECT_EQ(expected, mgr.max_clear_scn_.atomic_load());
+  mgr.update_max_clear_scn(SCN::invalid_scn());
+  EXPECT_EQ(expected, mgr.max_clear_scn_.atomic_load());
 }
 
 class AbortProtocolCtx : public WatermarkTxCtx
@@ -578,6 +946,9 @@ namespace transaction
     int tmp_ret = OB_SUCCESS;
 
     if (!is_exiting_) {
+      if (unittest::before_exiting_hook) {
+        unittest::before_exiting_hook(*this);
+      }
       is_exiting_ = true;
       print_trace_log_if_necessary_();
 

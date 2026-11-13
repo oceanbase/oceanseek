@@ -370,6 +370,9 @@ int ObPartTransCtx::on_clear()
 {
   int ret = OB_SUCCESS;
 
+  // common_on_success_ has recorded this durable CLEAR log's SCN. Publish it
+  // before cleanup and exiting, including when subsequent cleanup fails.
+  ls_tx_ctx_mgr_->update_max_clear_scn(exec_info_.max_applied_log_ts_);
   (void)unregister_timeout_task_();
   (void)trans_clear_(exec_info_.max_applied_log_ts_);
   (void)set_exiting_();

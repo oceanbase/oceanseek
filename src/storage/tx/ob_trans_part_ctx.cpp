@@ -1682,6 +1682,11 @@ int ObPartTransCtx::recover_tx_ctx_table_info(ObTxCtxTableInfo &ctx_info)
                || (exec_info_.trans_type_ == TransType::DIST_TRANS
                    && ObTxState::CLEAR == exec_info_.state_)
                || (ObTxState::ABORT == exec_info_.state_)) {
+      if (ObTxState::CLEAR == exec_info_.state_) {
+        // Retained contexts are not supported on this branch, so CLEAR contexts
+        // must not be checkpointed.
+        TRANS_LOG(ERROR, "unexpected CLEAR state in recovered tx context", K(ctx_info), KPC(this));
+      }
       set_exiting_();
       TRANS_LOG(INFO, "set exiting with a finished trx in recover", K(ret), KPC(this));
     }
@@ -6378,6 +6383,8 @@ int ObPartTransCtx::replay_clear(const ObTxClearLog &clear_log,
     TRANS_LOG(WARN, "check replay available failed", KR(ret), K(offset), K(timestamp), K(*this));
   } else if (!need_replay) {
     TRANS_LOG(INFO, "need not replay log", K(clear_log), K(timestamp), K(offset), K(*this));
+    // Even filtered replay observes a durable CLEAR log.
+    ls_tx_ctx_mgr_->update_max_clear_scn(timestamp);
     // no need to replay
     if (OB_FAIL(trans_clear_(timestamp))) {
       TRANS_LOG(WARN, "transaction clear error", KR(ret), "context", *this);
@@ -6408,6 +6415,8 @@ int ObPartTransCtx::replay_clear(const ObTxClearLog &clear_log,
       }
     }
     if (OB_SUCC(ret)) {
+      // Publish this CLEAR log's SCN before removing its context.
+      ls_tx_ctx_mgr_->update_max_clear_scn(timestamp);
       set_exiting_();
     }
   }

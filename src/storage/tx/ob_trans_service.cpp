@@ -707,6 +707,31 @@ int ObTransService::get_max_decided_scn(const share::ObLSID &ls_id, share::SCN &
   return ret;
 }
 
+int ObTransService::get_max_clear_scn(const share::ObLSID &ls_id, share::SCN &scn)
+{
+  int ret = OB_SUCCESS;
+
+  ObLSTxCtxMgr *ls_tx_mgr_ptr = nullptr;
+  if (IS_NOT_INIT) {
+    TRANS_LOG(WARN, "ObTransService not inited");
+    ret = OB_NOT_INIT;
+  } else if (OB_UNLIKELY(!is_running_)) {
+    TRANS_LOG(WARN, "ObTransService is not running");
+    ret = OB_NOT_RUNNING;
+  } else if (!ls_id.is_valid()) {
+    TRANS_LOG(WARN, "invalid argument", K(ls_id));
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(tx_ctx_mgr_.get_ls_tx_ctx_mgr(ls_id, ls_tx_mgr_ptr))) {
+    TRANS_LOG(WARN, "get ls tx ctx mgr failed", K(ret));
+  } else {
+    if (OB_FAIL(ls_tx_mgr_ptr->get_max_clear_scn(scn))) {
+      TRANS_LOG(WARN, "get max clear scn failed", K(ret));
+    }
+    tx_ctx_mgr_.revert_ls_tx_ctx_mgr(ls_tx_mgr_ptr);
+  }
+  return ret;
+}
+
 int ObTransService::check_dup_table_lease_valid(const ObLSID ls_id,
                                                 bool &is_dup_ls,
                                                 bool &is_lease_valid)

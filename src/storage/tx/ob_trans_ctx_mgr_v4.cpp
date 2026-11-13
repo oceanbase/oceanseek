@@ -188,6 +188,7 @@ int ObLSTxCtxMgr::init(const int64_t tenant_id,
     lock_table_ = lock_table;
     txs_ = txs;
     ts_mgr_ = ts_mgr;
+    max_clear_scn_.set_min();
     aggre_rec_scn_.reset();
     prev_aggre_rec_scn_.reset();
     online_ts_ = 0;
@@ -220,6 +221,7 @@ void ObLSTxCtxMgr::reset()
   total_request_by_transfer_dest_ = 0;
   leader_takeover_ts_.reset();
   max_replay_commit_version_.reset();
+  max_clear_scn_.set_min();
   aggre_rec_scn_.reset();
   prev_aggre_rec_scn_.reset();
   online_ts_ = 0;
@@ -1184,6 +1186,25 @@ int ObLSTxCtxMgr::get_max_decided_scn(share::SCN &scn)
     TRANS_LOG(WARN, "this ls has beend stopped", KPC(this));
   } else if (OB_FAIL(tx_log_adapter_->get_max_decided_scn(scn))) {
     TRANS_LOG(WARN, "get max decided scn failed", K(ret));
+  }
+  return ret;
+}
+
+int ObLSTxCtxMgr::get_max_clear_scn(share::SCN &scn)
+{
+  int ret = OB_SUCCESS;
+  // A transaction publishes its durable CLEAR SCN before exiting. Later
+  // continuous progress is not needed to cover that transaction's participants.
+  scn = max_clear_scn_.atomic_load();
+  if (scn.is_min()) {
+    // After restart, continuous progress covers historical CLEAR logs skipped
+    // by the recovery checkpoint until a new CLEAR watermark is published.
+    if (OB_FAIL(get_max_decided_scn(scn))) {
+      TRANS_LOG(WARN, "get continuous watermark for max clear scn failed", K(ret), K_(ls_id));
+    } else {
+      // Include a CLEAR published while the recovery query was running.
+      scn = share::SCN::max(scn, max_clear_scn_.atomic_load());
+    }
   }
   return ret;
 }

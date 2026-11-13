@@ -266,12 +266,17 @@ void ObPartTransCtx::build_tx_common_msg_(const ObLSID &receiver,
 share::SCN ObPartTransCtx::get_orphan_clear_scn_(const ObTxMsg &recv_msg, const share::SCN &local_scn)
 {
   SCN clear_scn = local_scn;
+  // local_scn must cover the original CLEAR, including all participants. A single
+  // response only covers its sender/subtree and cannot replace that global bound.
   if (TX_2PC_ABORT_RESP == recv_msg.get_msg_type()) {
     const Ob2pcAbortRespMsg &abort_resp = static_cast<const Ob2pcAbortRespMsg &>(recv_msg);
-    // Keep the original local watermark for old/orphan responses without a SCN.
-    // The receiver's existing validation and retry behavior remain unchanged.
     if (abort_resp.max_abort_log_scn_.is_valid()) {
       clear_scn = SCN::max(clear_scn, abort_resp.max_abort_log_scn_);
+    }
+  } else if (TX_2PC_COMMIT_RESP == recv_msg.get_msg_type()) {
+    const Ob2pcCommitRespMsg &commit_resp = static_cast<const Ob2pcCommitRespMsg &>(recv_msg);
+    if (commit_resp.commit_log_scn_.is_valid()) {
+      clear_scn = SCN::max(clear_scn, commit_resp.commit_log_scn_);
     }
   }
   return clear_scn;
@@ -314,6 +319,8 @@ int ObPartTransCtx::post_orphan_msg_(const ObTwoPhaseCommitMsgType &msg_type,
       ret = OB_ERR_UNEXPECTED;
       TRANS_LOG(WARN, "trans service is null", K(ret));
     } else if (ls_deleted) {
+      // Normal LS GC waits for GTS >= offline_scn before deleting the LS status
+      // entry. A fresh GTS therefore covers its historical CLEAR logs as well.
       bool unused = false;
       SCN scn;
       ObTsMgr *ts_mgr = trans_service->get_ts_mgr();
@@ -327,8 +334,8 @@ int ObPartTransCtx::post_orphan_msg_(const ObTwoPhaseCommitMsgType &msg_type,
       }
       TRANS_LOG(INFO, "ls is deleted, use gts to build clear request", K(ret), K(clear_req));
     } else {
-      if (OB_FAIL(trans_service->get_max_decided_scn(clear_req.sender_, clear_req.max_commit_log_scn_))) {
-        TRANS_LOG(WARN, "get max get_max_decided_scn failed", K(ret), K(clear_req));
+      if (OB_FAIL(trans_service->get_max_clear_scn(clear_req.sender_, clear_req.max_commit_log_scn_))) {
+        TRANS_LOG(WARN, "get max clear scn failed", K(ret), K(clear_req));
       }
     }
     if (OB_SUCC(ret)) {
