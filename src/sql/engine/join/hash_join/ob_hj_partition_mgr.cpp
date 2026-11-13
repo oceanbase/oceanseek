@@ -161,7 +161,7 @@ int ObHJPartitionMgr::get_or_create_part(int32_t level,
           LOG_WARN("failed to alloc for ObPartitionStore");
         } else {
           ObPartitionStore *partition_store = new (temp_buf1) ObPartitionStore(tenant_id_, alloc_);
-          part_pair.left_->set_partition_store(partition_store);
+          part_pair.left_->set_partition_store(partition_store, true /* is_store_created_by_hj */);
         }
       }
     }
@@ -178,7 +178,7 @@ int ObHJPartitionMgr::get_or_create_part(int32_t level,
           LOG_WARN("failed to alloc for ObPartitionStore");
         } else {
           ObPartitionStore *partition_store = new (temp_buf2) ObPartitionStore(tenant_id_, alloc_);
-          part_pair.right_->set_partition_store(partition_store);
+          part_pair.right_->set_partition_store(partition_store, true /* is_store_created_by_hj */);
         }
       }
     }
@@ -195,18 +195,8 @@ int ObHJPartitionMgr::get_or_create_part(int32_t level,
       }
     }
     if (OB_FAIL(ret)) {
-      if (nullptr != buf1) {
-        alloc_.free(buf1);
-      }
-      if (nullptr != buf2) {
-        alloc_.free(buf2);
-      }
-      if (nullptr != temp_buf1) {
-        alloc_.free(temp_buf1);
-      }
-      if (nullptr != temp_buf2) {
-        alloc_.free(temp_buf2);
-      }
+      free(part_pair.left_);
+      free(part_pair.right_);
     }
   }
 

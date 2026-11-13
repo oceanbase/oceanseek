@@ -111,6 +111,7 @@ sql_unittest(test_type_coverage
 # Phase 8: Hash Join operator tests
 sql_unittest(test_hash_join_op
   test_hash_join_op.cpp
+  test_hash_join_memory.cpp
   ob_op_test_engine.cpp
   ob_op_test_data_source.cpp
 )

@@ -783,7 +783,6 @@ void ObHashJoinVecOp::destroy()
 int ObHashJoinVecOp::inner_close()
 {
   int ret = OB_SUCCESS;
-  sql_mem_processor_.unregister_profile();
   if (is_shared_) {
     IGNORE_RETURN sync_wait_close();
   }
@@ -799,10 +798,62 @@ int ObHashJoinVecOp::inner_close()
   if (nullptr != alloc_) {
     join_table_.free(alloc_);
   }
+  join_filter_partition_splitter_ = nullptr;
+  sql_mem_processor_.unregister_profile();
   if (nullptr != mem_context_) {
     mem_context_->reuse();
   }
   if (OB_FAIL(ObJoinVecOp::inner_close())) {
+  }
+  return ret;
+}
+
+int ObHashJoinVecOp::acquire_workarea(
+    int64_t estimated_size, lib::MemoryContext &mem_context, ObSqlMemMgrProcessor *&processor)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(mem_context_) || OB_ISNULL(alloc_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("hash join context must be opened before materialization", K(ret));
+  } else if (OB_FAIL(sql_mem_processor_.init(alloc_,
+                 ctx_.get_my_session()->get_effective_tenant_id(), estimated_size,
+                 MY_SPEC.type_, MY_SPEC.id_, &ctx_))) {
+    LOG_WARN("failed to initialize material workarea", K(ret));
+  } else {
+    mem_context = mem_context_;
+    processor = &sql_mem_processor_;
+  }
+  return ret;
+}
+
+int ObHashJoinVecOp::prepare_join_filter_partitions(ObJoinFilterPartitionSplitter &splitter)
+{
+  int ret = OB_SUCCESS;
+  const int64_t part_count = splitter.get_part_count();
+  if (OB_ISNULL(part_mgr_) || !top_part_level() || part_count <= 0
+      || 0 != part_mgr_->get_part_list_size()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected state when preparing join filter partitions", K(ret), KP(part_mgr_),
+             K(part_level_), K(part_count));
+  } else {
+    const int64_t part_shift = part_shift_ + min(__builtin_ctz(part_count), 8);
+    for (int64_t i = 0; OB_SUCC(ret) && i < part_count; ++i) {
+      ObHJPartition *part = nullptr;
+      ObPartitionStore *store = splitter.get_partition(i);
+      if (OB_ISNULL(store)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("join filter partition store is null", K(ret), K(i));
+      } else if (OB_FAIL(part_mgr_->get_or_create_part(part_level_, part_shift,
+                     (static_cast<int64_t>(part_round_) << 32) + i, true, part, false, false))) {
+        LOG_WARN("failed to create join filter partition pair", K(ret), K(i));
+      } else {
+        part->set_partition_store(store, false /* is_store_created_by_hj */);
+      }
+    }
+    if (OB_FAIL(ret)) {
+      // Drop borrowed references before JF destroys a partially prepared splitter.
+      part_mgr_->reset();
+    }
   }
   return ret;
 }
@@ -1073,8 +1124,13 @@ int ObHashJoinVecOp::calc_basic_info(bool global_info)
   int64_t input_size = 0;
   int64_t out_row_count = 0;
   if (NONE == hj_processor_) {
-    // estimate
-    if (top_part_level()) {
+    if (is_top_level_process_with_join_filter()) {
+      for (int64_t i = 0; i < join_filter_partition_splitter_->get_part_count(); ++i) {
+        ObPartitionStore *partition = join_filter_partition_splitter_->get_partition(i);
+        row_count += partition->get_row_count_in_memory();
+        input_size += partition->get_size_in_memory();
+      }
+    } else if (top_part_level()) {
       // use estimate value with px if hava
       if (OB_FAIL(ObPxEstimateSizeUtil::get_px_size(
           &ctx_, MY_SPEC.px_est_size_factor_, left_->get_spec().rows_, row_count))) {
@@ -1595,7 +1651,7 @@ int ObHashJoinVecOp::dump_build_table(int64_t row_count, bool force_update)
           row_count, sql_mem_processor_.get_mem_bound(), tmp_need_dump);
         return tmp_need_dump;
       },
-      tmp_need_dump, mem_used))) {
+      tmp_need_dump, get_mem_used()))) {
       LOG_WARN("failed to extend max memory size", K(ret));
     }
     if (tmp_need_dump) {
@@ -3057,7 +3113,8 @@ int ObHashJoinVecOp::fill_partition_from_join_filter(int64_t &num_left_rows)
     LOG_WARN("part_count not match", K(part_count_), K(join_filter_partition_splitter_->get_part_count()));
   } else {
     for (int64_t i = 0; i < part_count_; ++i) {
-      left_part_array_[i]->set_partition_store(join_filter_partition_splitter_->get_partition(i));
+      left_part_array_[i]->set_partition_store(
+          join_filter_partition_splitter_->get_partition(i), false /* is_store_created_by_hj */);
     }
   }
   if (OB_SUCC(ret)) {

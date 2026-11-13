@@ -19,7 +19,7 @@ class ObPartitionStore
 {
 public:
   ObPartitionStore(int64_t tenant_id, common::ObIAllocator &alloc)
-      : tenant_id_(tenant_id), alloc_this_from_(&alloc), row_store_(&alloc)
+      : tenant_id_(tenant_id), row_store_(&alloc)
   {}
   virtual ~ObPartitionStore();
 
@@ -75,12 +75,10 @@ public:
   inline  int64_t get_dump_size() { return row_store_.get_file_size(); }
   inline  ObTempRowStore &get_row_store() { return row_store_; }
 
-  inline const common::ObIAllocator *get_alloc_this_from() const { return alloc_this_from_; }
   TO_STRING_KV(K(n_get_rows_), K(extra_size_));
 
 protected:
   uint64_t tenant_id_;
-  const common::ObIAllocator *alloc_this_from_;
   ObTempRowStore row_store_;
   ObTempRowStore::Iterator store_iter_;
   int64_t n_get_rows_{0};

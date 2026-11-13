@@ -48,22 +48,12 @@ private:
   int64_t max_batch_size_;
 };
 
+// Only failed initialization destroys the splitter; HJ closes store data on normal exit.
 ObJoinFilterPartitionSplitter::~ObJoinFilterPartitionSplitter()
 {
-  if (partition_array_.count() > 0) {
-    for (int64_t i = 0; i < partition_array_.count(); ++i) {
-      partition_array_.at(i)->~ObPartitionStore();
-    }
-    // all ObPartitionStore are alloc at once, so free the first
-    malloc_alloc_->free(partition_array_.at(0));
-    partition_array_.reset();
+  for (int64_t i = 0; i < partition_array_.count(); ++i) {
+    partition_array_.at(i)->~ObPartitionStore();
   }
-  if (OB_NOT_NULL(part_idxes_)) {
-    malloc_alloc_->free(part_idxes_);
-  }
-  output_vectors_.reset();
-  row_meta_.reset();
-  stores_mgr_.reset();
 }
 
 int ObJoinFilterPartitionSplitter::init(int64_t tenant_id, lib::MemoryContext mem_context,
@@ -85,8 +75,8 @@ int ObJoinFilterPartitionSplitter::init(int64_t tenant_id, lib::MemoryContext me
   hash_join_hash_exprs_ = &hash_join_hash_exprs;
   output_exprs_ = &output_exprs;
   row_extra_size_ = extra_hash_count * sizeof(uint64_t);
-  partition_array_.set_allocator(malloc_alloc_);
-  row_meta_.set_allocator(malloc_alloc_);
+  partition_array_.set_allocator(arena_alloc_);
+  row_meta_.set_allocator(arena_alloc_);
   OZ(row_meta_.init(output_exprs, row_extra_size_));
   OZ(ObVecAllocUtil::vec_alloc_ptrs(arena_alloc_, part_added_rows_, sizeof(part_added_rows_) * max_batch_size_,
                        null_skip_bitmap_, ObBitVector::memory_size(max_batch_size_),
@@ -99,7 +89,7 @@ int ObJoinFilterPartitionSplitter::init(int64_t tenant_id, lib::MemoryContext me
   }
 
   if (OB_SUCC(ret)) {
-    output_vectors_.set_allocator(malloc_alloc_);
+    output_vectors_.set_allocator(arena_alloc_);
     OZ(output_vectors_.prepare_allocate(output_exprs.count()));
     for (int64_t i = 0; OB_SUCC(ret) && i < output_exprs.count(); ++i) {
       output_vectors_.at(i) = output_exprs.at(i)->get_vector(eval_ctx);
@@ -112,8 +102,13 @@ void ObJoinFilterPartitionSplitter::reuse_for_rescan()
 {
   // only reset data, not reset partition rule
   total_row_count_ = 0;
+  first_dumped_part_idx_ = part_count_;
+  if (nullptr != build_cols_have_null_) {
+    build_cols_have_null_->reset(hash_join_hash_exprs_->count());
+  }
   for (int64_t i = 0; i < part_count_; ++i) {
     partition_array_.at(i)->close();
+    partition_array_.at(i)->set_memory_limit(0);
   }
 }
 
@@ -135,7 +130,7 @@ int ObJoinFilterPartitionSplitter::prepare_join_partitions(ObIOEventObserver *io
   first_dumped_part_idx_ = part_count_;
   if (OB_FAIL(create_partitions(io_event_observer, output_exprs_))) {
     LOG_WARN("failed to create_partitions", K(part_count_));
-  } else if (OB_FAIL(stores_mgr_.init(max_batch_size_, part_count_, *malloc_alloc_))) {
+  } else if (OB_FAIL(stores_mgr_.init(max_batch_size_, part_count_, *arena_alloc_))) {
     LOG_WARN("failed to init stores manager");
   } else {
     for (int64_t part_idx = 0; OB_SUCC(ret) && part_idx < part_count_; ++part_idx) {
@@ -169,13 +164,12 @@ int ObJoinFilterPartitionSplitter::create_partitions(ObIOEventObserver *io_event
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("partition count is less then 0", K(part_count_), K(ret));
   } else {
-    char *mem = nullptr;
     // create partition ptr array
     if (OB_FAIL(partition_array_.init(part_count_))) {
       LOG_WARN("failed to init partition_array_");
     } else {
       // create real partition
-      char *mem = static_cast<char *>(malloc_alloc_->alloc(sizeof(ObPartitionStore) * part_count_));
+      char *mem = static_cast<char *>(arena_alloc_->alloc(sizeof(ObPartitionStore) * part_count_));
       if (NULL == mem) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
         LOG_WARN("fail to alloc mem for hj part");
@@ -198,7 +192,7 @@ int ObJoinFilterPartitionSplitter::create_partitions(ObIOEventObserver *io_event
 
     // create part_idxes_
     if (OB_SUCC(ret)) {
-      if (OB_ISNULL(part_idxes_ = static_cast<int64_t *>(malloc_alloc_->alloc(
+      if (OB_ISNULL(part_idxes_ = static_cast<int64_t *>(arena_alloc_->alloc(
                         sizeof(int64_t) * max_batch_size_)))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
         LOG_WARN("fail to alloc memory", K(max_batch_size_));
@@ -373,14 +367,14 @@ int ObJoinFilterPartitionSplitter::dump_from_back_to_front(int64_t need_dump_siz
             bool updated = false;
             ObJoinFilterMaxAvailableMemChecker max_available_mem_checker(get_row_count_in_memory());
             ObJoinFilterExtendMaxMemChecker extend_max_mem_checker(
-                sql_mem_processor_->get_data_size());
+                mem_context_->used());
             if (OB_FAIL(sql_mem_processor_->update_max_available_mem_size_periodically(
                     &mem_context_->get_malloc_allocator(), max_available_mem_checker, updated))) {
               LOG_WARN("failed to update remain memory size periodically", K(ret));
             } else if ((updated || need_dump())
                        && OB_FAIL(sql_mem_processor_->extend_max_memory_size(
                               &mem_context_->get_malloc_allocator(), extend_max_mem_checker,
-                              dump_all, sql_mem_processor_->get_data_size()))) {
+                              dump_all, mem_context_->used()))) {
               LOG_WARN("fail to extend max memory size", K(ret), K(updated));
             }
           }

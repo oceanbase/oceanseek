@@ -623,8 +623,7 @@ bool ObJoinFilterOp::is_valid()
 
 ObJoinFilterOp::ObJoinFilterOp(ObExecContext &exec_ctx, const ObOpSpec &spec, ObOpInput *input)
     : ObOperator(exec_ctx, spec, input), join_filter_hash_values_(NULL),
-      lucky_devil_champions_(), profile_(ObSqlWorkAreaType::HASH_WORK_AREA),
-      sql_mem_processor_(profile_, op_monitor_info_)
+      lucky_devil_champions_()
 {
 }
 
@@ -661,7 +660,10 @@ int ObJoinFilterOp::do_create_filter_rescan()
     bf_vec_msg_->bloom_filter_.reset_for_rescan();
   }
   if (MY_SPEC.is_material_controller()) {
-    partition_splitter_->reuse_for_rescan();
+    if (nullptr != partition_splitter_) {
+      partition_splitter_->reuse_for_rescan();
+    }
+    sql_mem_processor_ = nullptr;
     if (MY_SPEC.is_shared_join_filter()) {
       static_cast<ObJoinFilterOpInput *>(input_)
           ->share_info_.shared_jf_constructor_->reset_for_rescan();
@@ -877,6 +879,9 @@ int ObJoinFilterOp::join_filter_create_do_material(const int64_t max_row_cnt)
 {
   int ret = OB_SUCCESS;
   const ObBatchRows *child_brs = nullptr;
+  if (nullptr == sql_mem_processor_ && OB_FAIL(init_material_partitions())) {
+    LOG_WARN("failed to initialize material partitions", K(ret));
+  }
   while (OB_SUCC(ret)) {
     clear_evaluated_flag();
     if (OB_FAIL(child_->get_next_batch(max_row_cnt, child_brs))) {
@@ -941,12 +946,17 @@ int ObJoinFilterOp::build_and_broadcast_runtime_filter()
 {
   int ret = OB_SUCCESS;
   // send piece datahub msg, and wait the whole msg, then the total row is get
-  int64_t worker_row_count = partition_splitter_->get_total_row_count();
+  int64_t worker_row_count = 0;
   int64_t total_row_count = 0;
-  if (force_dump_ && OB_FAIL(partition_splitter_->force_dump_all_partition())) {
-    LOG_WARN("failed to force dump all partition");
-  } else if (OB_FAIL(partition_splitter_->finish_add_row())) {
-    LOG_WARN("failed to finish add row");
+  if (nullptr != partition_splitter_) {
+    worker_row_count = partition_splitter_->get_total_row_count();
+    if (force_dump_ && OB_FAIL(partition_splitter_->force_dump_all_partition())) {
+      LOG_WARN("failed to force dump all partition");
+    } else if (OB_FAIL(partition_splitter_->finish_add_row())) {
+      LOG_WARN("failed to finish add row");
+    }
+  }
+  if (OB_FAIL(ret)) {
   } else if (OB_FAIL(get_exec_row_count_and_ndv(worker_row_count, total_row_count))) {
     LOG_WARN("failed to get exec row count");
   } else if (OB_FAIL(group_controller_->apply(group_init_bloom_filter, worker_row_count,
@@ -959,8 +969,8 @@ int ObJoinFilterOp::build_and_broadcast_runtime_filter()
   } else {
     has_sent_runtime_filter_ = true;
     // for the controller, it need to add row info manually
-    op_monitor_info_.output_row_count_ += partition_splitter_->get_total_row_count();
-    INC_METRIC_VAL(ObMetricId::OUTPUT_ROWS, partition_splitter_->get_total_row_count());
+    op_monitor_info_.output_row_count_ += worker_row_count;
+    INC_METRIC_VAL(ObMetricId::OUTPUT_ROWS, worker_row_count);
   }
   return ret;
 }
@@ -1339,40 +1349,19 @@ int ObJoinFilterOp::open_join_filter_create()
 
 int ObJoinFilterOp::init_material_parameters()
 {
-  // 1.create mem ctx
-  // 2.estimate row count, memory size of current worker
-  // 3.init sql memory processor
-  // 4.init partition splitter, create partitions
-  // 5.other parameters
-
   int ret = OB_SUCCESS;
-  int64_t total_row_count = MY_SPEC.filter_len_;
-  int64_t worker_row_count = 0;
-  int64_t worker_memory_size = 0;
   const int64_t max_batch_size = max(1, MY_SPEC.max_batch_size_);
-  uint16_t extra_hash_count = MY_SPEC.jf_material_control_info_.extra_hash_count_;
-  const common::ObCompressorType compress_type = parent_->get_spec().compress_type_;
+  const uint16_t extra_hash_count = MY_SPEC.jf_material_control_info_.extra_hash_count_;
   skip_left_null_ = (INNER_JOIN == MY_SPEC.join_type_) || (LEFT_SEMI_JOIN == MY_SPEC.join_type_)
                     || (RIGHT_SEMI_JOIN == MY_SPEC.join_type_)
                     || (RIGHT_OUTER_JOIN == MY_SPEC.join_type_);
-
-  int64_t tenant_id = ctx_.get_my_session()->get_effective_tenant_id();
-  lib::ContextParam param;
-  param.set_mem_attr(tenant_id, "ArenaJoinFilter", ObCtxIds::WORK_AREA)
-      .set_properties(lib::USE_TL_PAGE_OPTIONAL);
+  const uint64_t tenant_id = ctx_.get_my_session()->get_effective_tenant_id();
   ObTenantConfigGuard tenant_config(TENANT_CONF(tenant_id));
   if (!tenant_config.is_valid()) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid tenant config", K(ret));
-  } else if (FALSE_IT(force_dump_ = tenant_config->_force_hash_join_spill)) {
-  } else if (OB_FAIL(ROOT_CONTEXT->CREATE_CONTEXT(mem_context_, param))) {
-    LOG_WARN("create memory context failed");
-  } else if (OB_FAIL(ObPxEstimateSizeUtil::get_px_size(
-                 &ctx_, parent_->get_spec().px_est_size_factor_, spec_.rows_, worker_row_count))) {
-    LOG_WARN("failed to get px size");
   } else {
-    worker_row_count = max(worker_row_count, ObHashJoinVecOp::MIN_ROW_COUNT);
-    worker_memory_size = worker_row_count * (MY_SPEC.width_ + sizeof(uint64_t));
+    force_dump_ = tenant_config->_force_hash_join_spill;
   }
 
   // Consistent with build_row in hash join
@@ -1406,25 +1395,6 @@ int ObJoinFilterOp::init_material_parameters()
     }
   }
 
-
-  if (OB_FAIL(ret)) {
-  } else if (OB_FAIL(sql_mem_processor_.init(&(mem_context_->get_malloc_allocator()), tenant_id,
-                                             worker_memory_size, MY_SPEC.type_, MY_SPEC.id_,
-                                             &ctx_))) {
-    LOG_WARN("failed to init sql mem mgr");
-  } else if (OB_ISNULL(partition_splitter_ =
-                           OB_NEWx(ObJoinFilterPartitionSplitter, &ctx_.get_allocator()))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-    LOG_WARN("failed to allocate memory for ObJoinFilterPartitionSplitter");
-  } else if (OB_FAIL(partition_splitter_->init(tenant_id, mem_context_, eval_ctx_,
-                                               &sql_mem_processor_, MY_SPEC.full_hash_join_keys_,
-                                               *build_rows_output_, extra_hash_count, max_batch_size,
-                                               compress_type))) {
-    LOG_WARN("failed to init partition splitter");
-  } else if (OB_FAIL(partition_splitter_->prepare_join_partitions(
-                 &io_event_observer_, worker_row_count, worker_memory_size))) {
-    LOG_WARN("failed to prepare join partitions");
-  }
 
   if (OB_SUCC(ret)) {
     void *buf = ctx_.get_allocator().alloc(sizeof(const ObJoinFilterStoreRow *) * max_batch_size);
@@ -1463,12 +1433,75 @@ int ObJoinFilterOp::init_material_parameters()
   }
 
   if (OB_SUCC(ret)) {
-    LOG_TRACE("init material parameters", K(MY_SPEC.filter_len_), K(worker_row_count),
-              K(worker_memory_size), K(max_batch_size), K(partition_splitter_->get_part_count()),
+    LOG_TRACE("init material parameters", K(MY_SPEC.filter_len_),
               K(skip_left_null_), K(force_dump_), K(MY_SPEC.join_keys_.count()),
               K(MY_SPEC.full_hash_join_keys_.count()), K(extra_hash_count));
   }
 
+  return ret;
+}
+
+int ObJoinFilterOp::init_material_partitions()
+{
+  // 1.estimate row count, memory size of current worker
+  // 2.acquire hash join workarea
+  // 3.create or reuse stores, then attach them to HJ before reading input
+
+  int ret = OB_SUCCESS;
+  const int64_t max_batch_size = max(1, MY_SPEC.max_batch_size_);
+  int64_t worker_row_count = 0;
+  int64_t worker_memory_size = 0;
+  ObSqlMemMgrProcessor *processor = nullptr;
+  if (OB_ISNULL(parent_) || PHY_VEC_HASH_JOIN != parent_->get_spec().type_) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("material join filter must have a hash join parent", K(ret));
+  } else if (OB_FAIL(ObPxEstimateSizeUtil::get_px_size(
+                 &ctx_, parent_->get_spec().px_est_size_factor_, spec_.rows_, worker_row_count))) {
+    LOG_WARN("failed to get px size", K(ret));
+  } else {
+    worker_row_count = max(worker_row_count, ObHashJoinVecOp::MIN_ROW_COUNT);
+    worker_memory_size = worker_row_count * (MY_SPEC.width_ + sizeof(uint64_t));
+    ObHashJoinVecOp *hash_join = static_cast<ObHashJoinVecOp *>(parent_);
+    if (OB_FAIL(hash_join->acquire_workarea(worker_memory_size, mem_context_, processor))) {
+      LOG_WARN("failed to initialize hash join workarea", K(ret));
+    } else if (OB_ISNULL(mem_context_) || OB_ISNULL(processor)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid hash join workarea", K(ret), KP(mem_context_.ref_context()), KP(processor));
+    } else {
+      ObJoinFilterPartitionSplitter *splitter = partition_splitter_;
+      if (nullptr == splitter) {
+        splitter = OB_NEWx(ObJoinFilterPartitionSplitter, &mem_context_->get_arena_allocator());
+        if (OB_ISNULL(splitter)) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("failed to allocate partition splitter", K(ret));
+        } else if (OB_FAIL(splitter->init(ctx_.get_my_session()->get_effective_tenant_id(),
+                       mem_context_, eval_ctx_, processor, MY_SPEC.full_hash_join_keys_,
+                       *build_rows_output_, MY_SPEC.jf_material_control_info_.extra_hash_count_,
+                       max_batch_size, parent_->get_spec().compress_type_))) {
+          LOG_WARN("failed to initialize partition splitter", K(ret));
+        } else if (OB_FAIL(splitter->prepare_join_partitions(
+                       &io_event_observer_, worker_row_count, worker_memory_size))) {
+          LOG_WARN("failed to prepare join partitions", K(ret));
+        }
+      }
+      if (OB_SUCC(ret) && OB_FAIL(hash_join->prepare_join_filter_partitions(*splitter))) {
+        LOG_WARN("failed to prepare join filter partition wrappers", K(ret));
+      }
+      if (OB_FAIL(ret) && nullptr != splitter && nullptr == partition_splitter_) {
+        splitter->~ObJoinFilterPartitionSplitter();
+      } else if (OB_SUCC(ret)) {
+        partition_splitter_ = splitter;
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    sql_mem_processor_ = processor;
+    sql_mem_processor_->update_used_mem_size(mem_context_->used());
+  }
+  if (OB_SUCC(ret)) {
+    LOG_TRACE("init material partitions", K(worker_row_count), K(worker_memory_size),
+              K(max_batch_size), K(partition_splitter_->get_part_count()));
+  }
   return ret;
 }
 
@@ -1565,19 +1598,19 @@ int ObJoinFilterOp::process_dump()
   bool should_dump = false;
   ObJoinFilterMaxAvailableMemChecker max_available_mem_checker(
       partition_splitter_->get_row_count_in_memory());
-  ObJoinFilterExtendMaxMemChecker extend_max_mem_checker(sql_mem_processor_.get_data_size());
+  ObJoinFilterExtendMaxMemChecker extend_max_mem_checker(mem_context_->used());
   if (!GCONF.is_sql_operator_dump_enabled()) {
     // do nothing, disable dump
-  } else if (OB_FAIL(sql_mem_processor_.update_max_available_mem_size_periodically(
+  } else if (OB_FAIL(sql_mem_processor_->update_max_available_mem_size_periodically(
                &mem_context_->get_malloc_allocator(), max_available_mem_checker, updated))) {
     LOG_WARN("failed to update max available memory size periodically", K(ret));
   } else if ((updated || need_dump())
-             && OB_FAIL(sql_mem_processor_.extend_max_memory_size(
+             && OB_FAIL(sql_mem_processor_->extend_max_memory_size(
                   &mem_context_->get_malloc_allocator(), extend_max_mem_checker, should_dump,
-                  sql_mem_processor_.get_data_size()))) {
+                  mem_context_->used()))) {
     LOG_WARN("fail to extend max memory size", K(ret), K(updated));
   } else if (should_dump) {
-    int64_t need_dump_size = mem_context_->used() - sql_mem_processor_.get_mem_bound();
+    int64_t need_dump_size = mem_context_->used() - sql_mem_processor_->get_mem_bound();
     if (OB_FAIL(partition_splitter_->dump_from_back_to_front(need_dump_size))) {
       LOG_WARN("failed to dump_from_back_to_front");
     }
@@ -1627,7 +1660,7 @@ void ObJoinFilterOp::read_join_filter_hash_values_from_store(
   }
 }
 
-int ObJoinFilterOp::send_datahub_count_row_msg(int64_t &total_row_count,
+int ObJoinFilterOp::send_datahub_count_row_msg(int64_t worker_row_count, int64_t &total_row_count,
                                                ObTMArray<ObJoinFilterNdv *> &ndv_info)
 {
   int ret = OB_SUCCESS;
@@ -1642,7 +1675,7 @@ int ObJoinFilterOp::send_datahub_count_row_msg(int64_t &total_row_count,
     piece_msg.source_dfo_id_ = handler->get_sqc_proxy().get_dfo_id();
     piece_msg.target_dfo_id_ = handler->get_sqc_proxy().get_dfo_id();
     piece_msg.piece_count_ = 1;
-    piece_msg.total_rows_ = partition_splitter_->get_total_row_count();
+    piece_msg.total_rows_ = worker_row_count;
     piece_msg.sqc_id_ = handler->get_sqc_proxy().get_sqc_id();
     piece_msg.each_sqc_has_full_data_ = MY_SPEC.jf_material_control_info_.each_sqc_has_full_data_;
     if (OB_FAIL(piece_msg.ndv_info_.prepare_allocate(ndv_info.count()))) {
@@ -1725,7 +1758,7 @@ int ObJoinFilterOp::get_exec_row_count_and_ndv(const int64_t worker_row_count, i
     ObTMArray<ObJoinFilterNdv *> ndv_info;
     if (OB_FAIL(group_controller_->apply(group_build_ndv_info_before_aggregate, ndv_info))) {
       LOG_WARN("failed to group group_collect_worker_in_filter_ndv");
-    } else if (OB_FAIL(send_datahub_count_row_msg(total_row_count, ndv_info))) {
+    } else if (OB_FAIL(send_datahub_count_row_msg(worker_row_count, total_row_count, ndv_info))) {
       LOG_WARN("failed to sync row count");
     }
   }
@@ -1892,7 +1925,7 @@ int ObJoinFilterOp::init_bloom_filter(const int64_t worker_row_count, const int6
 int ObJoinFilterOp::fill_bloom_filter() {
   int ret = OB_SUCCESS;
   int64_t max_batch_size = max(1, MY_SPEC.max_batch_size_);
-  int64_t part_count = partition_splitter_->get_part_count();
+  const int64_t part_count = nullptr == partition_splitter_ ? 0 : partition_splitter_->get_part_count();
   int64_t read_rows = 0;
   ObPartitionStore *cur_partition = nullptr;
   if (OB_ISNULL(bf_vec_msg_)) {
@@ -2272,17 +2305,15 @@ int ObJoinFilterOp::init_local_msg_from_shared_msg(ObP2PDatahubMsgBase &msg)
 int ObJoinFilterOp::close_join_filter_create()
 {
   int ret = OB_SUCCESS;
-  sql_mem_processor_.unregister_profile();
   if (OB_FAIL(release_local_msg())) {
     LOG_WARN("failed release local msg", K(ret));
   } else if (OB_FAIL(release_shared_msg())) {
     LOG_WARN("failed release local msg", K(ret));
   }
-  if (MY_SPEC.is_material_controller()) {
-    if (nullptr != mem_context_) {
-      mem_context_->reuse();
-    }
-  }
+  // HJ closes partition data before reusing its arena.
+  partition_splitter_ = nullptr;
+  sql_mem_processor_ = nullptr;
+  mem_context_ = nullptr;
   return ret;
 }
 

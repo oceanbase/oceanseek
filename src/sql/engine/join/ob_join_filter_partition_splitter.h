@@ -131,7 +131,7 @@ private:
   int create_partitions(ObIOEventObserver *io_event_observer, const ObExprPtrIArray *exprs);
   inline bool need_dump() const
   {
-    return sql_mem_processor_->get_data_size() > sql_mem_processor_->get_mem_bound();
+    return mem_context_->used() > sql_mem_processor_->get_mem_bound();
   }
 
   template <bool StoreJoinFilterHashValue>
@@ -157,16 +157,14 @@ private:
   int32_t row_extra_size_{0};
   RowMeta row_meta_;
 
-  lib::MemoryContext mem_context_;
+  lib::MemoryContext mem_context_{nullptr};
   common::ObIAllocator *arena_alloc_{nullptr};
   common::ObIAllocator *malloc_alloc_{nullptr};
 
-  // allocated by arena_alloc_
   ObJoinFilterStoreRow **part_added_rows_{nullptr};
   ObBitVector *null_skip_bitmap_{nullptr};
   ObBitVector *build_cols_have_null_{nullptr};
 
-  // allocated by malloc_alloc_
   ObFixedArray<ObPartitionStore *, common::ObIAllocator> partition_array_;
   ObFixedArray<ObIVector *, common::ObIAllocator> output_vectors_;
   int64_t *part_idxes_{nullptr};

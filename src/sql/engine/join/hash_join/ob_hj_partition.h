@@ -151,9 +151,12 @@ public:
     set_pre_total_size(total_size);
   }
 
-  void set_partition_store(ObPartitionStore *partition_store) {
+  void set_partition_store(ObPartitionStore *partition_store, bool is_store_created_by_hj) {
     partition_store_ = partition_store;
+    is_store_created_by_hj_ = is_store_created_by_hj;
   }
+
+  bool is_store_created_by_hj() const { return is_store_created_by_hj_; }
 
   ObPartitionStore *get_partition_store() {
     return partition_store_;
@@ -161,6 +164,7 @@ public:
 
 private:
   ObPartitionStore *partition_store_{nullptr};
+  bool is_store_created_by_hj_{false};
   int32_t part_level_;
   int64_t part_shift_;
   int64_t partno_; // high: batch_round low: part_id

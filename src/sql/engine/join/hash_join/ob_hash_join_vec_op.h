@@ -366,6 +366,10 @@ public:
   virtual int inner_get_next_row() { return common::OB_NOT_IMPLEMENT; };
   virtual void destroy() override;
   virtual int inner_close() override;
+  // called by join filter operator
+  int acquire_workarea(int64_t estimated_size, lib::MemoryContext &mem_context,
+                       ObSqlMemMgrProcessor *&processor);
+  int prepare_join_filter_partitions(ObJoinFilterPartitionSplitter &splitter);
   inline JoinHashTable &get_hash_table()
   {
     return join_table_;

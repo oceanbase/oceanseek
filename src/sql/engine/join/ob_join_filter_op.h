@@ -331,15 +331,9 @@ public:
     local_rf_msgs_.reset();
     shared_rf_msgs_.reset();
     row_meta_.reset();
-    sql_mem_processor_.unregister_profile_if_necessary();
-    if (OB_NOT_NULL(partition_splitter_)){
-      partition_splitter_->~ObJoinFilterPartitionSplitter();
-      partition_splitter_ = nullptr;
-    }
-    if (OB_LIKELY(NULL != mem_context_)) {
-      DESTROY_CONTEXT(mem_context_);
-      mem_context_ = NULL;
-    }
+    partition_splitter_ = nullptr;
+    sql_mem_processor_ = nullptr;
+    mem_context_ = nullptr;
     ObOperator::destroy();
   }
   ObJoinFilterPartitionSplitter *get_partition_splitter() { return partition_splitter_; }
@@ -375,11 +369,12 @@ private:
                                    ObP2PDatahubMsgBase::ObP2PDatahubMsgType dh_msg_type);
 
   int init_material_parameters();
+  int init_material_partitions();
   int init_material_group_exec_info();
   int process_dump();
   inline bool need_dump() const
   {
-    return sql_mem_processor_.get_data_size() > sql_mem_processor_.get_mem_bound();
+    return mem_context_->used() > sql_mem_processor_->get_mem_bound();
   }
   int calc_join_filter_hash_values(const ObBatchRows &brs);
   uint64_t *get_join_filter_hash_values() { return join_filter_hash_values_; }
@@ -390,7 +385,8 @@ private:
 
   int get_exec_row_count_and_ndv(const int64_t worker_row_count, int64_t &total_row_count);
   bool can_sync_row_count_locally();
-  int send_datahub_count_row_msg(int64_t &total_row_count, ObTMArray<ObJoinFilterNdv *> &ndv_info);
+  int send_datahub_count_row_msg(int64_t worker_row_count, int64_t &total_row_count,
+                                ObTMArray<ObJoinFilterNdv *> &ndv_info);
 
   int fill_range_filter(const ObBatchRows &brs);
   int fill_in_filter(const ObBatchRows &brs, uint64_t *hash_join_hash_values);
@@ -474,8 +470,8 @@ public:
 
   // only the controller has the right to use these variables
   bool skip_left_null_{false};
-  ObSqlWorkAreaProfile profile_;
-  ObSqlMemMgrProcessor sql_mem_processor_;
+  // use hash join's mem_ctx and sql_mem_processor
+  ObSqlMemMgrProcessor *sql_mem_processor_{nullptr};
   lib::MemoryContext mem_context_{nullptr};
   ObJoinFilterPartitionSplitter *partition_splitter_{nullptr};
   RowMeta row_meta_;

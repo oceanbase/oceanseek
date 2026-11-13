@@ -54,15 +54,12 @@ public:
   void free(ObHJPartition *&part) {
     if (NULL != part) {
       ObPartitionStore *partition_store = part->get_partition_store();
-      const common::ObIAllocator *partition_store_allocator = nullptr;
-      if (partition_store != nullptr) {
-        partition_store_allocator = partition_store->get_alloc_this_from();
-      }
+      const bool is_store_created_by_hj = part->is_store_created_by_hj();
       part->~ObHJPartition();
       alloc_.free(part);
       part = NULL;
       part_count_ --;
-      if (&alloc_ == partition_store_allocator) {
+      if (nullptr != partition_store && is_store_created_by_hj) {
         partition_store->~ObPartitionStore();
         alloc_.free(partition_store);
       }
