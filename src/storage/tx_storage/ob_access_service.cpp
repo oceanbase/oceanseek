@@ -590,13 +590,26 @@ int ObAccessService::construct_store_ctx_other_variables_(
     LOG_ERROR("tablet service should not be null.", K(ret), K(ls_id));
   } else if (OB_FAIL(tablet_service->check_allow_to_read())) {
     if (OB_REPLICA_NOT_READABLE == ret) {
-      // 恢复日志期间 LS 还不可读，但 fork 需要读取 reorg 信息调度 DAG，这里单独放行。
+      // Reorg scans drive Fork local land before restore or ADD/MIGRATE/REPLACE can finish replay.
+      // Keep this admission check consistent with ObLSTabletService::table_scan.
       if (tablet_id.is_ls_reorg_info_tablet()) {
         share::ObLSRestoreStatus restore_status;
         if (OB_FAIL(ls.get_restore_status(restore_status))) {
           LOG_WARN("failed to get ls restore status", K(ret), K(ls_id), K(tablet_id));
         } else if (restore_status.is_ss_restore_clog()) {
           ret = OB_SUCCESS;
+        } else if (restore_status.is_none() && ls.is_running()) {
+          ObMigrationStatus migration_status = ObMigrationStatus::OB_MIGRATION_STATUS_MAX;
+          if (OB_FAIL(ls.get_migration_status(migration_status))) {
+            LOG_WARN("failed to get ls migration status", K(ret), K(ls_id), K(tablet_id));
+          } else {
+            ret = ObMigrationStatus::OB_MIGRATION_STATUS_ADD == migration_status
+                || ObMigrationStatus::OB_MIGRATION_STATUS_MIGRATE == migration_status
+                || ObMigrationStatus::OB_MIGRATION_STATUS_REPLACE == migration_status
+                ? OB_SUCCESS : OB_REPLICA_NOT_READABLE;
+          }
+        } else {
+          ret = OB_REPLICA_NOT_READABLE;
         }
       }
       if (OB_REPLICA_NOT_READABLE == ret) {

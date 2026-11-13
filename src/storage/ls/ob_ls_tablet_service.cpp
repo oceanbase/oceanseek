@@ -729,13 +729,24 @@ int ObLSTabletService::table_scan(ObTabletHandle &tablet_handle, ObTableScanIter
     LOG_WARN("not inited", K(ret), K_(is_inited));
   } else if (FALSE_IT(allow_to_read_mgr_.load_allow_to_read_info(allow_to_read))) {
   } else if (!allow_to_read) {
-    // 恢复日志期间 LS 还不可读，但 fork 需要读取 reorg 信息调度 DAG，这里单独放行。
+    // Fork FINISH replay waits for local land, which is scheduled by scanning reorg.
+    // Online ADD/MIGRATE/REPLACE replicas must finish local land while normal
+    // reads remain disabled. REPLACE also waits for replay before leader takeover.
     if (tablet_id.is_ls_reorg_info_tablet()) {
       ObLSRestoreStatus restore_status;
       if (OB_FAIL(ls_->get_restore_status(restore_status))) {
         LOG_WARN("failed to get ls restore status", K(ret), K(tablet_id), KPC(ls_));
-      } else {
-        allow_to_read = restore_status.is_ss_restore_clog();
+      } else if (restore_status.is_ss_restore_clog()) {
+        allow_to_read = true;
+      } else if (restore_status.is_none() && ls_->is_running()) {
+        ObMigrationStatus migration_status = ObMigrationStatus::OB_MIGRATION_STATUS_MAX;
+        if (OB_FAIL(ls_->get_migration_status(migration_status))) {
+          LOG_WARN("failed to get ls migration status", K(ret), K(tablet_id), KPC(ls_));
+        } else {
+          allow_to_read = ObMigrationStatus::OB_MIGRATION_STATUS_ADD == migration_status
+              || ObMigrationStatus::OB_MIGRATION_STATUS_MIGRATE == migration_status
+              || ObMigrationStatus::OB_MIGRATION_STATUS_REPLACE == migration_status;
+        }
       }
     }
     if (OB_SUCC(ret) && !allow_to_read) {
