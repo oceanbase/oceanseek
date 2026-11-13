@@ -1476,6 +1476,70 @@ TEST_F(TestDASAsyncIVFScanIter, post_filter_rowkeys_reuse_memory_across_rounds)
   EXPECT_LT(iter.filter_rowkey_objs_.get_capacity(), 513);
 }
 
+TEST_F(TestDASAsyncIVFScanIter, unfiltered_duplicate_rounds_do_not_stop_refill)
+{
+  ObDASIVFAsyncIter iter;
+  iter.limit_param_.limit_ = 2;
+  iter.limit_param_.offset_ = 1;
+  blocksstable::ObIvfTopKCollector collector;
+  ASSERT_EQ(OB_SUCCESS, collector.init(3, allocator_));
+  blocksstable::ObIvfKnnSearchResult candidates;
+  int64_t collected_count = 0;
+  auto add = [&](int64_t cid, int64_t vid, float distance) {
+    blocksstable::ObIvfKnnEntry entry;
+    entry.cid_ = cid; entry.vid_ = vid; entry.distance_ = distance;
+    return candidates.add(entry);
+  };
+  ASSERT_EQ(OB_SUCCESS, add(0, 7, 3.0F));
+  ASSERT_EQ(OB_SUCCESS, add(0, 9, 2.0F));
+  ASSERT_EQ(OB_SUCCESS, iter.collect_async_ivf_candidates(candidates, collector, collected_count));
+  ASSERT_EQ(2, collected_count);
+  candidates.reset();
+  ASSERT_EQ(OB_SUCCESS, add(1, 7, 1.0F)); // same VID in another CID, better distance
+  ASSERT_EQ(OB_SUCCESS, add(1, 9, 2.0F));
+  ASSERT_EQ(OB_SUCCESS, iter.collect_async_ivf_candidates(candidates, collector, collected_count));
+  EXPECT_EQ(2, collected_count);
+  EXPECT_LT(collected_count, iter.limit_param_.limit_ + iter.limit_param_.offset_);
+  candidates.reset();
+  ASSERT_EQ(OB_SUCCESS, iter.collect_async_ivf_candidates(candidates, collector, collected_count));
+  EXPECT_EQ(2, collected_count); // an empty round must not alter progress
+  ASSERT_EQ(OB_SUCCESS, add(2, 11, 0.5F));
+  ASSERT_EQ(OB_SUCCESS, iter.collect_async_ivf_candidates(candidates, collector, collected_count));
+  EXPECT_EQ(3, collected_count);
+  ASSERT_EQ(OB_SUCCESS, iter.append_async_ivf_topk(collector));
+  ASSERT_EQ(3, iter.saved_rowkeys_.count());
+  const uint64_t expected[] = {11, 7, 9};
+  for (int64_t i = 0; i < ARRAYSIZEOF(expected); ++i) {
+    EXPECT_EQ(expected[i], iter.saved_rowkeys_.at(i).get_obj_ptr()[0].get_uint64());
+  }
+}
+
+TEST_F(TestDASAsyncIVFScanIter, unfiltered_unique_count_caps_at_limit_plus_offset)
+{
+  ObDASIVFAsyncIter iter;
+  iter.limit_param_.limit_ = 2;
+  iter.limit_param_.offset_ = 1;
+  blocksstable::ObIvfTopKCollector collector;
+  ASSERT_EQ(OB_SUCCESS, collector.init(3, allocator_));
+  const int64_t vids[] = {10, 20, 20, 30, 40, 50, 20};
+  const float distances[] = {3.0F, 2.0F, 4.0F, 1.0F, 0.5F, 10.0F, 0.1F};
+  blocksstable::ObIvfKnnSearchResult candidates;
+  for (int64_t i = 0; i < ARRAYSIZEOF(vids); ++i) {
+    blocksstable::ObIvfKnnEntry entry;
+    entry.cid_ = i; entry.vid_ = vids[i]; entry.distance_ = distances[i];
+    ASSERT_EQ(OB_SUCCESS, candidates.add(entry));
+  }
+  int64_t collected_count = 0;
+  ASSERT_EQ(OB_SUCCESS, iter.collect_async_ivf_candidates(candidates, collector, collected_count));
+  EXPECT_EQ(3, collected_count);
+  ASSERT_EQ(OB_SUCCESS, iter.append_async_ivf_topk(collector));
+  ASSERT_EQ(3, iter.saved_rowkeys_.count());
+  const uint64_t expected[] = {20, 40, 30};
+  for (int64_t i = 0; i < ARRAYSIZEOF(expected); ++i) {
+    EXPECT_EQ(expected[i], iter.saved_rowkeys_.at(i).get_obj_ptr()[0].get_uint64());
+  }
+}
+
 TEST_F(TestDASAsyncIVFScanIter, post_filter_duplicate_batches_do_not_stop_refill)
 {
   ObDASIVFAsyncIter iter;

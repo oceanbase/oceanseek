@@ -1304,9 +1304,9 @@ TEST_F(TestIvfSSTableScanIter, async_ivf_soar_k2_refills_third_centroid)
       tablet_handle_, ranges));
   ASSERT_EQ(OB_SUCCESS, das_iter.segment_group_ctx_.calc_query_version_ranges(sql_scn));
 
-  for (int mode : {0, 1, 2, 3}) { // unfiltered, PRE, all filtered, VID7 deleted
+  for (int mode : {0, 1, 2, 4, 5, 3}) { // unfiltered, PRE, all filtered, OFFSET, first-round full, VID7 deleted
     SCOPED_TRACE(mode);
-    const bool use_das = mode == 0 || mode == 3;
+    const bool use_das = mode == 0 || mode == 3 || mode == 4 || mode == 5;
     ObIvfSearcherGuard searcher;
     ObRoaringBitmap allowed(&allocator_);
     ObIvfPreFilter filter;
@@ -1321,14 +1321,25 @@ TEST_F(TestIvfSSTableScanIter, async_ivf_soar_k2_refills_third_centroid)
       ASSERT_EQ(OB_SUCCESS, deleted->value_add(7));
       ASSERT_EQ(OB_SUCCESS, das_iter.deletion_bitmap_handle_.init_from_bitmap(allocator_, deleted));
     }
-    ObSEArray<ObIvfSSTableScanIter *, 8> scan_iters;
-    DEFER(das_iter.release_async_ivf_segment_scan_iters(scan_iters));
     ObIvfKnnSearchParam param;
     if (use_das) {
-      // Exercise real DAS parameter binding for both SOAR duplicates and deleted VIDs.
+      // Exercise the production refill loop, not a test-only seen/accepted loop.
       ASSERT_FALSE(das_iter.is_iter_filter());
-      ASSERT_EQ(OB_SUCCESS, das_iter.prepare_async_ivf_scan(2, nullptr, scan_iters));
-      ASSERT_EQ(1, scan_iters.count());
+      das_iter.saved_rowkeys_.reuse();
+      das_iter.limit_param_.limit_ = mode == 4 ? 1 : 2;
+      das_iter.limit_param_.offset_ = mode == 4 ? 1 : 0;
+      das_iter.nprobes_ = mode == 5 ? 3 : 1;
+      ASSERT_EQ(OB_SUCCESS, das_iter.scan_async_ivf_segments_iteratively(false));
+      EXPECT_EQ(mode == 5 ? 1 : 3, das_iter.adaptive_ctx_.iter_times_);
+      ASSERT_EQ(mode == 3 ? 1 : 2, das_iter.saved_rowkeys_.count());
+      EXPECT_EQ(mode == 3 ? 9 : 7,
+          das_iter.saved_rowkeys_.at(0).get_obj_ptr()[0].get_uint64());
+      if (mode != 3) {
+        EXPECT_EQ(9, das_iter.saved_rowkeys_.at(1).get_obj_ptr()[0].get_uint64());
+      }
+      // OFFSET is consumed above this DAS iterator. Its candidate set must
+      // still contain K = LIMIT + OFFSET unique rows, including the second VID.
+      continue;
     } else {
       // Retain the storage-level PRE continuation and empty-whitelist coverage.
       fill_search_params(param, query, dim, 2);
@@ -1347,15 +1358,8 @@ TEST_F(TestIvfSSTableScanIter, async_ivf_soar_k2_refills_third_centroid)
     int64_t rounds = 0;
     bool has_active_segment = false;
     do {
-      if (use_das) {
-        ASSERT_EQ(OB_SUCCESS, das_iter.scan_async_ivf_segments(
-            rounds == 0, 1, scan_iters, result, has_active_segment));
-        ASSERT_EQ(mode == 3 && rounds < 2 ? 0 : 1, result.count());
-        if (result.count() > 0) { EXPECT_EQ(rounds < 2 ? 7 : 9, result.at(0).vid_); }
-      } else {
-        ASSERT_EQ(OB_SUCCESS, searcher->knn_search(param, result));
-        has_active_segment = searcher->has_remaining_centroids();
-      }
+      ASSERT_EQ(OB_SUCCESS, searcher->knn_search(param, result));
+      has_active_segment = searcher->has_remaining_centroids();
       round.reuse();
       for (int64_t i = 0; i < result.count(); ++i) {
         sql::ObDASVectorCandidate c;
@@ -1368,7 +1372,7 @@ TEST_F(TestIvfSSTableScanIter, async_ivf_soar_k2_refills_third_centroid)
     } while (accepted < 2 && has_active_segment);
     // A complete empty PRE set ends immediately without opening a CID cursor.
     EXPECT_EQ(mode == 2 ? 1 : 3, rounds);
-    EXPECT_EQ(mode == 2 ? 0 : mode == 3 ? 1 : 2, accepted);
+    EXPECT_EQ(mode == 2 ? 0 : 2, accepted);
   }
 }
 

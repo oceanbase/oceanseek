@@ -2998,9 +2998,10 @@ int ObDASIVFAsyncIter::collect_async_ivf_candidates(
     const ObIvfKnnEntry &entry = candidates.at(i);
     if (OB_FAIL(collector.push(entry.cid_, entry.vid_, entry.distance_))) {
       LOG_WARN("failed to collect async ivf candidate", K(ret), K(i), K(entry));
-    } else {
-      ++collected_count;
     }
+  }
+  if (OB_SUCC(ret)) {
+    collected_count = collector.size();
   }
   return ret;
 }
@@ -3023,7 +3024,6 @@ int ObDASIVFAsyncIter::collect_filtered_async_ivf_candidates(
     const ObIvfRowkeyDistEntry &entry = candidates.at(i);
     const ObObj *vid_obj = nullptr;
     uint64_t vid = 0;
-    bool retained = false;
     if (OB_UNLIKELY(1 != entry.rowkey_.get_obj_cnt()
                     || OB_ISNULL(vid_obj = entry.rowkey_.get_obj_ptr())
                     || !vid_obj->is_uint64())) {
@@ -3033,15 +3033,13 @@ int ObDASIVFAsyncIter::collect_filtered_async_ivf_candidates(
     } else if (OB_UNLIKELY(vid > static_cast<uint64_t>(INT64_MAX))) {
       ret = OB_INVALID_DATA;
       LOG_WARN("filtered async ivf vid is out of range", K(ret), K(i), K(vid));
-    } else if (OB_FALSE_IT(retained = collector.contains(static_cast<int64_t>(vid)))) {
     } else if (OB_FAIL(collector.push(
                    unused_cid, static_cast<int64_t>(vid), entry.distance_))) {
       LOG_WARN("failed to collect filtered async ivf candidate", K(ret), K(i), K(entry));
-    } else if (!retained && collected_count < limit_param_.limit_ + limit_param_.offset_) {
-      // push() also succeeds for duplicate VIDs. Only new retained rows count
-      // towards the refill stop condition; a full heap stays at LIMIT + OFFSET.
-      ++collected_count;
     }
+  }
+  if (OB_SUCC(ret)) {
+    collected_count = collector.size();
   }
   return ret;
 }

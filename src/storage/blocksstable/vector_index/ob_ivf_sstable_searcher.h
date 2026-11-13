@@ -352,6 +352,7 @@ public:
   int push(int64_t cid, int64_t vid, float distance);
   // Only retained, exact-distance candidates are tracked, not all scanned VIDs.
   bool contains(int64_t vid) const;
+  int64_t size() const { return nullptr == heap_ ? 0 : heap_->count(); }
   int get_distance_threshold(float &distance) const;
   int finish(ObIvfKnnSearchResult &result);
   void reset();
