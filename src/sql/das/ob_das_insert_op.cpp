@@ -751,8 +751,7 @@ OB_SERIALIZE_MEMBER((ObDASInsertResult, ObIDASTaskResult),
                     result_buffer_,
                     is_duplicated_,
                     response_snapshot_,
-                    outtable_lob_control_key_collector_ // FARM COMPAT WHITELIST
-                    );
+                    outtable_lob_control_key_collector_);
 
 void ObDASConflictIterator::reset()
 {

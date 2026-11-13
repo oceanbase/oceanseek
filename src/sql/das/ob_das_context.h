@@ -203,7 +203,7 @@ private:
 public:
   union {
     uint64_t flags_;
-    struct { // FARM COMPAT WHITELIST
+    struct {
       uint64_t is_fk_cascading_                 : 1; //fk starts to trigger nested sql
       uint64_t need_check_server_               : 1; //need to check if partitions hit the same server
       uint64_t same_server_                     : 1; //if partitions hit the same server, could be local or remote

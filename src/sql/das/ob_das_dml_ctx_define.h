@@ -118,7 +118,7 @@ public:
   common::ObFixedArray<transaction::ObEncryptMetaCache, common::ObIAllocator> encrypt_meta_;
   union {
     uint64_t flags_;
-    struct { // FARM COMPAT WHITELIST
+    struct {
       uint64_t is_total_quantity_log_           : 1;
       uint64_t is_ignore_                       : 1;
       uint64_t is_batch_stmt_                   : 1;

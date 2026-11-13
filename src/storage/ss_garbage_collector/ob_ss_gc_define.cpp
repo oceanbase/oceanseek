@@ -97,9 +97,8 @@ bool ObSSGCTabletWithDelScn::is_valid() const
 
 /****************************** ObSSGCTabletWithMetaScn *********************************/
 OB_SERIALIZE_MEMBER(ObSSGCTabletWithMetaScn, gc_tablet_, meta_scn_,
-    clog_checkpoint_scn_, // FARM COMPAT WHITELIST
-    orig_clog_checkpoint_scn_ // FARM COMPAT WHITELIST
-    );
+    clog_checkpoint_scn_,
+    orig_clog_checkpoint_scn_);
 
 bool ObSSGCTabletWithMetaScn::is_valid() const
 {
@@ -112,8 +111,7 @@ bool ObSSGCTabletWithMetaScn::is_valid() const
 OB_SERIALIZE_MEMBER(ObSSGCTabletStudyResult, gc_tablet_, study_info_.min_dep_meta_scn_,
     study_info_.min_major_snapshot_, study_info_.clog_checkpoint_scn_,
     study_info_.multi_version_start_,
-    study_info_.orig_clog_checkpoint_scn_ // FARM COMPAT WHITELIST
-    );
+    study_info_.orig_clog_checkpoint_scn_);
 
 bool ObSSGCTabletStudyResult::is_valid() const
 {

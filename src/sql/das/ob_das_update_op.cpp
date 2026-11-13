@@ -984,7 +984,6 @@ int ObDASUpdateResult::assign_outtable_lob_control_keys(
 
 OB_SERIALIZE_MEMBER((ObDASUpdateResult, ObIDASTaskResult),
                     affected_rows_,
-                    outtable_lob_control_key_collector_ // FARM COMPAT WHITELIST
-                    );
+                    outtable_lob_control_key_collector_);
 }  // namespace sql
 }  // namespace oceanbase
