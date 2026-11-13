@@ -26,6 +26,7 @@ namespace blocksstable
 {
 ERRSIM_POINT_DEF(EN_NO_NEED_MERGE_MICRO_BLK);
 ERRSIM_POINT_DEF(EN_NO_SHARED_MACRO);
+ERRSIM_POINT_DEF(EN_MACRO_BLOCK_CLOSE_WRITE_FAILED);
 
 class ObIntConstUniform
 {
@@ -460,7 +461,16 @@ int ObMacroBlockWriter::ObDefaultMacroBlockFlusher::write_disk(ObMacroBlock& mac
       object_info.write_strategy_ = macro_block_writer_->data_store_desc_->get_io_write_strategy();
     }
     
-    if (OB_FAIL(macro_handle_->async_write(object_info))) {
+#ifdef ERRSIM
+    // A zero thread ID disables this fault while the test changes its settings.
+    if (is_close_flush
+        && GETTID() == ATOMIC_LOAD(&EN_MACRO_BLOCK_CLOSE_WRITE_FAILED.item_.cond_)
+        && OB_FAIL(OB_E(EN_MACRO_BLOCK_CLOSE_WRITE_FAILED, GETTID()) OB_SUCCESS)) {
+      STORAGE_LOG(WARN, "ERRSIM closing macro block write failed", K(ret),
+          K(macro_handle_->get_macro_id()));
+    }
+#endif
+    if (OB_SUCC(ret) && OB_FAIL(macro_handle_->async_write(object_info))) {
       STORAGE_LOG(WARN, "Fail to async write block", K(ret), K(macro_handle_), K(object_info));
     }
   }

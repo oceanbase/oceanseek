@@ -250,27 +250,29 @@ int CopySSMacroBlockWriter::wait()
       }
     }
   }
-  int64_t index_last_macro_seq = index_block_rebuilder_.get_last_macro_seq();
-  meta_macro_seq_ = MAX(index_last_macro_seq + 1, meta_macro_seq_);
   return ret;
 }
 
-int CopySSMacroBlockWriter::close(ObArenaAllocator& allocator)
+int CopySSMacroBlockWriter::close(ObArenaAllocator &allocator)
 {
   int ret = OB_SUCCESS;
+  int64_t next_meta_seq = -1;
   ObSSTableMergeRes res;
   share::ObPreWarmerParam pre_warm_param(share::ObPreWarmerType::PRE_WARM_TYPE_NONE);
-  int64_t index_last_macro_seq = 0;
   if (OB_FAIL(index_block_rebuilder_.close())) {
     LOG_WARN("close index rebuilder fail", K(ret));
-  } else if (FALSE_IT(index_last_macro_seq = index_block_rebuilder_.get_last_macro_seq())) {
-  } else if (index_last_macro_seq >= meta_macro_seq_ && FALSE_IT(meta_macro_seq_ = index_last_macro_seq + 1)) {
-  } else if (OB_FAIL(sstable_index_builder_.close_with_macro_seq(res,
-                                                                 meta_macro_seq_,
-                                                                 OB_DEFAULT_MACRO_BLOCK_SIZE,
-                                                                 0,
-                                                                 pre_warm_param))) {
-    LOG_WARN("close sstable index builder fail", K(ret));
+  } else if (FALSE_IT(next_meta_seq = index_block_rebuilder_.get_last_macro_seq())) {
+  } else if (OB_UNLIKELY(next_meta_seq < 0)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid next meta sequence", K(ret), K(next_meta_seq));
+  } else {
+    // Successful close includes the final buffered block and leaves the next sequence.
+    // CopySS starts at zero, which is also returned when no clustered writer exists.
+    meta_macro_seq_ = next_meta_seq;
+    if (OB_FAIL(sstable_index_builder_.close_with_macro_seq(
+        res, meta_macro_seq_, OB_DEFAULT_MACRO_BLOCK_SIZE, 0, pre_warm_param))) {
+      LOG_WARN("close sstable index builder fail", K(ret));
+    }
   }
   if (OB_SUCC(ret)) {
     if (OB_FAIL(create_sstable_(res, allocator, result_sstable_handle_))) {
@@ -426,7 +428,6 @@ int CopySSMacroBlockWriter::IOCtx::try_append_index()
                                                                    -1))) {
       LOG_WARN("append index fail", K(ret));
     }
-    host_->refresh_meta_macro_seq();
     if (buf) {
       host_->get_allocator().free(buf);
       ATOMIC_STORE(&macro_buf_, NULL);
@@ -499,13 +500,6 @@ int CopySSMacroBlockWriter::IOCtx::init(CopySSMacroBlockWriter *host,
     stage_ = Stage::READ;
   }
   return ret;
-}
-
-void CopySSMacroBlockWriter::refresh_meta_macro_seq()
-{
-  int64_t index_last_macro_seq = index_block_rebuilder_.get_last_macro_seq();
-  LOG_INFO("", K(index_last_macro_seq), K(meta_macro_seq_));
-  meta_macro_seq_ = MAX(index_last_macro_seq + 1, meta_macro_seq_);
 }
 
 ObStorageObjectType CopySSMacroBlockWriter::get_storage_obj_type_() const

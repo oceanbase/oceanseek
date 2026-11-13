@@ -20,6 +20,7 @@ function(ob_unittest_observer case)
 endfunction()
 
 ob_unittest_observer(test_prewarm_by_size test_prewarm_by_size.cpp)
+ob_unittest_observer(test_copy_ss_macro_writer test_copy_ss_macro_writer.cpp)
 ob_unittest_observer(test_ss_local_minor_upload_watermark test_ss_local_minor_upload_watermark.cpp)
 ob_unittest_observer(test_shared_storage_tx_data_gc test_shared_storage_tx_data_gc.cpp)
 ob_unittest_observer(test_storage_cache_policy_cold test_storage_cache_policy_cold.cpp)

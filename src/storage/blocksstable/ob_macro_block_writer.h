@@ -190,7 +190,13 @@ public:
   int close();
   void dump_block_and_writer_buffer();
   inline ObMacroBlocksWriteCtx &get_macro_block_write_ctx() { return block_write_ctx_; }
-  inline int64_t get_last_macro_seq() const { return OB_ISNULL(macro_seq_generator_) ? -1 : macro_seq_generator_->get_current(); } /* save our seq num */
+  // Returns the generator cursor, or -1 when no generator exists.
+  // For an exclusive INC sequence, after successful close(), this is the next start
+  // sequence. With no physical writes, it remains the input start.
+  inline int64_t get_last_macro_seq() const
+  {
+    return OB_ISNULL(macro_seq_generator_) ? -1 : macro_seq_generator_->get_current();
+  }
   TO_STRING_KV(K_(block_write_ctx));
 
   static int build_micro_writer(const ObDataStoreDesc *data_store_desc,

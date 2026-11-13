@@ -1770,7 +1770,7 @@ int ObSSTableIndexBuilder::close_with_macro_seq_inner(
                  pre_warm_param, res, macro_seq, macro_seq_end, callback))) {
     STORAGE_LOG(WARN, "fail to merge index tree", K(ret), KP(callback));
   } else if (OB_FAIL(build_meta_tree(
-                 pre_warm_param, res, ++macro_seq, macro_seq_end, callback))) {
+                 pre_warm_param, res, macro_seq, macro_seq_end, callback))) {
     STORAGE_LOG(WARN, "fail to build meta tree", K(ret), KP(callback));
   }
 

@@ -87,7 +87,6 @@ protected:
   }
   common::ObIAllocator &get_allocator() { return allocator_; }
   blocksstable::ObIndexBlockRebuilder &get_index_builder() { return index_block_rebuilder_; }
-  void refresh_meta_macro_seq();
 public:
   struct IOCtx : public common::ObIOCallback, public common::ObDLinkBase<IOCtx> {
     IOCtx(const int64_t macro_seq_start, const int64_t limit)

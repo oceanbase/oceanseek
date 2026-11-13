@@ -992,7 +992,7 @@ TEST_F(TestIndexTree, test_index_macro_writer)
   ObMacroBlockWriter container_macro_writer;
   ObMacroSeqParam seq_param;
   seq_param.seq_type_ = ObMacroSeqParam::SEQ_TYPE_INC;
-  seq_param.start_ = 0;
+  seq_param.start_ = 999;
   const ObPreWarmerParam pre_warm_param(MEM_PRE_WARM);
   ObSSTablePrivateObjectCleaner cleaner;
   ret = container_macro_writer.open(desc, 0/*parallel_idx*/, seq_param/*start_seq*/, pre_warm_param, cleaner);
@@ -1007,7 +1007,59 @@ TEST_F(TestIndexTree, test_index_macro_writer)
     ASSERT_EQ(OB_SUCCESS, container_macro_writer.append_row(multi_row));
   }
   ASSERT_EQ(OB_SUCCESS, container_macro_writer.close());
+  const int64_t written_block_count =
+      container_macro_writer.get_macro_block_write_ctx().macro_block_list_.count();
+  ASSERT_GT(written_block_count, 0);
+  ASSERT_EQ(seq_param.start_ + written_block_count, container_macro_writer.get_last_macro_seq());
   LOG_INFO("FINISH TestIndexTree.test_index_macro_writer");
+}
+
+TEST_F(TestIndexTree, test_in_memory_trees_do_not_consume_macro_sequence)
+{
+  table_schema_.set_micro_index_clustered(false);
+  ObWholeDataStoreDesc data_desc;
+  ObSSTableIndexBuilder sstable_builder(false /* need_writer_buffer */);
+  prepare_index_builder(data_desc, sstable_builder);
+  sstable_builder.optimization_mode_ = ObSSTableIndexBuilder::ObSpaceOptimizationMode::DISABLE;
+
+  ObMacroBlockWriter data_writer;
+  ObMacroSeqParam seq_param;
+  seq_param.seq_type_ = ObMacroSeqParam::SEQ_TYPE_INC;
+  seq_param.start_ = 0;
+  const ObPreWarmerParam pre_warm_param(MEM_PRE_WARM);
+  ObSSTablePrivateObjectCleaner cleaner;
+  ASSERT_EQ(OB_SUCCESS, data_writer.open(
+      data_desc.get_desc(), 0 /* parallel_idx */, seq_param, pre_warm_param, cleaner));
+
+  ObDatumRow row;
+  ObDatumRow multi_row;
+  ASSERT_EQ(OB_SUCCESS, row.init(allocator_, TEST_COLUMN_CNT));
+  ASSERT_EQ(OB_SUCCESS, multi_row.init(allocator_, MAX_TEST_COLUMN_CNT));
+  ASSERT_EQ(OB_SUCCESS, row_generate_.get_next_row(0, row));
+  convert_to_multi_version_row(row, table_schema_.get_rowkey_column_num(),
+      table_schema_.get_column_count(), SNAPSHOT_VERSION, DF_INSERT, multi_row);
+  ASSERT_EQ(OB_SUCCESS, data_writer.append_row(multi_row));
+  ASSERT_EQ(0, data_writer.get_macro_block_write_ctx().macro_block_list_.count());
+  ASSERT_EQ(OB_SUCCESS, data_writer.close());
+  // close() moves the data block IDs into the root context.
+  ASSERT_EQ(1, sstable_builder.roots_.count());
+  ASSERT_NE(nullptr, sstable_builder.roots_[0]);
+  ASSERT_NE(nullptr, sstable_builder.roots_[0]->data_write_ctx_);
+  ASSERT_EQ(1, sstable_builder.roots_[0]->data_write_ctx_->get_macro_block_count());
+  ASSERT_EQ(1, data_writer.get_last_macro_seq());
+
+  // One data block keeps both trees in memory, so neither stage consumes a sequence.
+  // An extra increment would exhaust this otherwise unused [999, 1000) range.
+  int64_t next_meta_seq = 999;
+  ObSSTableMergeRes res;
+  ASSERT_EQ(OB_SUCCESS, sstable_builder.close_with_macro_seq(
+      res, next_meta_seq, OB_DEFAULT_MACRO_BLOCK_SIZE, 0, pre_warm_param,
+      1000 /* macro_seq_end */));
+  ASSERT_EQ(1, res.data_block_ids_.count());
+  ASSERT_EQ(0, res.other_block_ids_.count());
+  ASSERT_TRUE(res.root_desc_.is_mem_type());
+  ASSERT_TRUE(res.data_root_desc_.is_mem_type());
+  ASSERT_EQ(999, next_meta_seq);
 }
 
 TEST_F(TestIndexTree, test_empty_index_tree)
@@ -1022,12 +1074,14 @@ TEST_F(TestIndexTree, test_empty_index_tree)
   ObMacroBlockWriter data_writer;
   ObMacroSeqParam seq_param;
   seq_param.seq_type_ = ObMacroSeqParam::SEQ_TYPE_INC;
-  seq_param.start_ = 0;
+  seq_param.start_ = 999;
   const ObPreWarmerParam pre_warm_param(MEM_PRE_WARM);
   ObSSTablePrivateObjectCleaner cleaner;
   ASSERT_EQ(OB_SUCCESS, data_writer.open(data_desc.get_desc(), 0/*parallel_idx*/, seq_param/*start_seq*/, pre_warm_param, cleaner));
   // do not insert any data
   ASSERT_EQ(OB_SUCCESS, data_writer.close());
+  ASSERT_EQ(0, data_writer.get_macro_block_write_ctx().macro_block_list_.count());
+  ASSERT_EQ(seq_param.start_, data_writer.get_last_macro_seq());
   ASSERT_EQ(1, sstable_builder.roots_.count());
   ObSSTableMergeRes res;
   ret = sstable_builder.close(res);
