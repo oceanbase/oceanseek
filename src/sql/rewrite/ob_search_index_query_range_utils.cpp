@@ -358,7 +358,8 @@ int cumulative_path_is_enclosing(
       } else if (node->get_node_type() == JPN_MEMBER) {
         ObJsonPathBasicNode *basic_node = static_cast<ObJsonPathBasicNode *>(node);
         ObString seg(basic_node->get_object().len_, basic_node->get_object().object_name_);
-        if (seg.empty() || seg_i >= members.count() || 0 != seg.compare(members.at(seg_i))) {
+        // An empty member name is valid and still identifies a nested boundary.
+        if (seg_i >= members.count() || 0 != seg.compare(members.at(seg_i))) {
           ok = false;
         } else {
           ++seg_i;

@@ -8677,17 +8677,26 @@ int ObDSLResolver::resolve_nested(ObIJsonBase &req_node, ObDSLQuery *&query,
 
   // Validate col_name is a valid JSON column and internal_path is declared in NESTED_PATHS
   if (OB_SUCC(ret)) {
+    ObArenaAllocator tmp_allocator(ObModIds::JSON_PARSER, OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
+    ObSEArray<ObString, 8, ModulePageAllocator, true> path_segs;
     if (OB_FAIL(get_declared_nested_paths_for_column(col_name, declared_paths))) {
       LOG_WARN("failed to get declared nested paths for column", K(ret), K(col_name));
+    } else if (OB_FAIL(split_dotted_path(tmp_allocator, internal_path, path_segs))) {
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "nested query path, invalid nested path format");
+      LOG_WARN("fail to split nested path", K(ret), K(internal_path));
     } else {
       bool found = false;
-      for (int64_t k = 0; k < declared_paths.count(); ++k) {
-        if (0 == declared_paths.at(k).compare(internal_path)) {
+      for (int64_t k = 0; OB_SUCC(ret) && !found && k < declared_paths.count(); ++k) {
+        ObSEArray<ObString, 8, ModulePageAllocator, true> declared_segs;
+        if (OB_FAIL(split_dotted_path(tmp_allocator, declared_paths.at(k), declared_segs))) {
+          LOG_WARN("fail to split declared nested path", K(ret), K(declared_paths.at(k)));
+        } else if (declared_segs.count() == path_segs.count()
+                   && is_ancestor(declared_segs, path_segs, true)) {
+          // Compare decoded members, so $.a and $."a" name the same path.
           found = true;
-          break;
         }
       }
-      if (!found) {
+      if (OB_SUCC(ret) && !found) {
         ret = OB_INVALID_ARGUMENT;
         LOG_USER_ERROR(OB_INVALID_ARGUMENT, "nested query path, path not declared in NESTED_PATHS");
         LOG_WARN("nested path not declared in NESTED_PATHS", K(ret), K(internal_path), K(col_name));
