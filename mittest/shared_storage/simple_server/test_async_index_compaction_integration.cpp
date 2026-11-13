@@ -642,6 +642,9 @@ void ObAsyncIndexCompactionTest::prepare_async_index_merge_candidate(
   const int64_t mock_major_snapshot = get_mock_major_snapshot(ctx);
   ASSERT_EQ(OB_SUCCESS, get_ls_handle(ctx.ls_id_, ls_handle));
   ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, fts_index_tablet_id, fts_index_handle));
+  // Shared metadata must exist before mock inputs replace the initial empty Major.
+  ASSERT_EQ(OB_SUCCESS, MTL(ObSSMetaService *)->create_tablet(ctx.ls_id_,
+      fts_index_tablet_id, fts_index_handle.get_obj()->get_reorganization_scn(), true /*check_lease*/));
   ASSERT_EQ(OB_SUCCESS, add_major_to_tablet(ls_handle, fts_index_tablet_id, mock_major_snapshot));
   ASSERT_EQ(OB_SUCCESS, fill_inc_major_segments(
       ls_handle, fts_index_tablet_id, mock_major_snapshot,
@@ -1340,6 +1343,9 @@ void ObAsyncIndexCompactionTest::run_build_async_index_medium_info_with_merge_ta
 
   ObTabletHandle index_handle;
   ASSERT_EQ(OB_SUCCESS, ls_handle.get_ls()->get_tablet(fts_tablet_id, index_handle));
+  // Shared metadata must exist before mock inputs replace the initial empty Major.
+  ASSERT_EQ(OB_SUCCESS, MTL(ObSSMetaService *)->create_tablet(ctx.ls_id_,
+      fts_tablet_id, index_handle.get_obj()->get_reorganization_scn(), true /*check_lease*/));
   ObStorageSchema *storage_schema = nullptr;
   ASSERT_EQ(OB_SUCCESS, index_handle.get_obj()->load_storage_schema(allocator_, storage_schema));
   ASSERT_NE(nullptr, storage_schema);
@@ -2562,6 +2568,9 @@ void ObAsyncIndexCompactionTest::run_async_index_compaction_execute(
     ObTabletHandle fts_index_handle;
     ObStorageSchema *storage_schema = nullptr;
     ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, fts_index_tablet_id, fts_index_handle));
+    // Preserve the Shared initial tablet before replacing local inputs.
+    ASSERT_EQ(OB_SUCCESS, MTL(ObSSMetaService *)->create_tablet(ctx.ls_id_,
+        fts_index_tablet_id, fts_index_handle.get_obj()->get_reorganization_scn(), true /*check_lease*/));
     std::cout << "fts_index_tablet_id=" << fts_index_tablet_id.id_ << std::endl;
     std::cout << "tablet snapshot=" << fts_index_handle.get_obj()->get_snapshot_version() << std::endl;
     std::cout << "last major snapshot=" << fts_index_handle.get_obj()->get_last_major_snapshot_version() << std::endl;
@@ -2748,6 +2757,9 @@ void ObAsyncIndexCompactionTest::run_async_index_compaction_execute_with_nonempt
     ObTabletHandle fts_index_handle;
     ObStorageSchema *storage_schema = nullptr;
     ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, fts_index_tablet_id, fts_index_handle));
+    // Preserve the Shared initial tablet before replacing local inputs.
+    ASSERT_EQ(OB_SUCCESS, MTL(ObSSMetaService *)->create_tablet(ctx.ls_id_,
+        fts_index_tablet_id, fts_index_handle.get_obj()->get_reorganization_scn(), true /*check_lease*/));
     ASSERT_EQ(OB_SUCCESS, fts_index_handle.get_obj()->load_storage_schema(allocator_, storage_schema));
     ASSERT_NE(nullptr, storage_schema);
     ASSERT_EQ(OB_SUCCESS, add_non_empty_major_to_tablet(
@@ -3034,6 +3046,9 @@ void ObAsyncIndexCompactionTest::run_async_index_inc_major_compaction_schedule_a
     ObTabletHandle fts_index_handle;
     ObStorageSchema *storage_schema = nullptr;
     ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, fts_index_tablet_id, fts_index_handle));
+    // The readiness check needs Shared metadata even before the first output exists.
+    ASSERT_EQ(OB_SUCCESS, MTL(ObSSMetaService *)->create_tablet(ctx.ls_id_,
+        fts_index_tablet_id, fts_index_handle.get_obj()->get_reorganization_scn(), true /*check_lease*/));
     ASSERT_EQ(OB_SUCCESS, fts_index_handle.get_obj()->load_storage_schema(allocator_, storage_schema));
     ASSERT_NE(nullptr, storage_schema);
     ASSERT_EQ(OB_SUCCESS, add_major_to_tablet(
@@ -3589,6 +3604,9 @@ void ObAsyncIndexCompactionTest::run_async_index_alternating_medium_inc_major_me
     ObTabletHandle fts_index_handle;
     ObStorageSchema *storage_schema = nullptr;
     ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, fts_index_tablet_id, fts_index_handle));
+    // The readiness check needs Shared metadata even before the first output exists.
+    ASSERT_EQ(OB_SUCCESS, MTL(ObSSMetaService *)->create_tablet(ctx.ls_id_,
+        fts_index_tablet_id, fts_index_handle.get_obj()->get_reorganization_scn(), true /*check_lease*/));
     ASSERT_EQ(OB_SUCCESS, fts_index_handle.get_obj()->load_storage_schema(allocator_, storage_schema));
     ASSERT_NE(nullptr, storage_schema);
     ASSERT_EQ(OB_SUCCESS, add_non_empty_major_to_tablet(
@@ -3733,6 +3751,59 @@ bool ObAsyncIndexCompactionTest::has_major_sstable_at_snapshot(
     }
   }
   return found;
+}
+
+TEST_F(ObAsyncIndexCompactionTest, progressive_merge_num_reaches_async_indexes)
+{
+  share::ObTenantSwitchGuard tguard;
+  OK(tguard.switch_to(run_ctx_.tenant_id_));
+  exe_prepare_sql();
+  const char *name = "t_async_reuse_setting";
+  OK(exe_sql("create table t_async_reuse_setting (id int, body varchar(128), doc json, "
+      "async fulltext index ft(body), async search index st(doc)) organization heap "
+      "async_index_params='ASYNC_REFRESH_INTERVAL=-1'"));
+  DEFER((void)exe_sql("drop table if exists t_async_reuse_setting"));
+  common::ObMySQLProxy &sql_proxy = get_curr_simple_server().get_sql_proxy2();
+  sqlclient::ObISQLConnection *conn = nullptr;
+  OK(sql_proxy.acquire(conn));
+  ASSERT_NE(nullptr, conn);
+  DEFER((void)sql_proxy.close(conn, OB_SUCCESS));
+  int64_t data_id = 0;
+  int64_t fts_id = 0;
+  int64_t search_def_id = 0;
+  OK(get_data_table_id(*conn, name, data_id));
+  OK(get_aux_table_id(*conn, data_id, INDEX_TYPE_ASYNC_FTS_INDEX_LOCAL, fts_id));
+  OK(get_aux_table_id(*conn, data_id, INDEX_TYPE_ASYNC_SEARCH_DEF_INDEX_LOCAL, search_def_id));
+  const int64_t merge_nums[] = {1, 8, 0};
+  for (int64_t i = 0; i < ARRAYSIZEOF(merge_nums); ++i) {
+    SCOPED_TRACE(merge_nums[i]);
+    ObSqlString sql;
+    OK(sql.assign_fmt("alter table %s progressive_merge_num=%ld", name, merge_nums[i]));
+    OK(exe_sql(sql.ptr()));
+    ObSchemaGetterGuard guard;
+    OK(MTL(ObTenantSchemaService *)->get_schema_service()->get_tenant_schema_guard(MTL_ID(), guard));
+    // A search def owns a data child plus one or two text children; all of them must follow.
+    const ObTableSchema *def_schema = nullptr;
+    OK(guard.get_table_schema(MTL_ID(), search_def_id, def_schema));
+    ASSERT_NE(nullptr, def_schema);
+    ObSEArray<uint64_t, 8> table_ids;
+    OK(table_ids.push_back(data_id));
+    OK(table_ids.push_back(fts_id));
+    OK(table_ids.push_back(search_def_id));
+    ObSEArray<uint64_t, 3> search_aux_ids;
+    OK(def_schema->get_search_aux_index_tids(search_aux_ids));
+    ASSERT_GE(search_aux_ids.count(), 2);
+    ASSERT_LE(search_aux_ids.count(), 3);
+    for (int64_t j = 0; j < search_aux_ids.count(); ++j) {
+      OK(table_ids.push_back(search_aux_ids.at(j)));
+    }
+    for (int64_t j = 0; j < table_ids.count(); ++j) {
+      const ObTableSchema *schema = nullptr;
+      OK(guard.get_table_schema(MTL_ID(), table_ids.at(j), schema));
+      ASSERT_NE(nullptr, schema);
+      ASSERT_EQ(merge_nums[i], schema->get_progressive_merge_num());
+    }
+  }
 }
 
 TEST_F(ObAsyncIndexCompactionTest, tenant_major_refresh_barrier_mds)
@@ -3888,6 +3959,9 @@ TEST_F(ObAsyncIndexCompactionTest, tenant_major_schedules_at_common_published_sn
   ObTabletHandle index_handle;
   ObStorageSchema *storage_schema = nullptr;
   ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, fts_tablet_id, index_handle));
+  // Shared metadata must exist before mock inputs replace the initial empty Major.
+  ASSERT_EQ(OB_SUCCESS, MTL(ObSSMetaService *)->create_tablet(ctx.ls_id_,
+      fts_tablet_id, index_handle.get_obj()->get_reorganization_scn(), true /*check_lease*/));
   ASSERT_EQ(OB_SUCCESS, index_handle.get_obj()->load_storage_schema(allocator_, storage_schema));
   ASSERT_NE(nullptr, storage_schema);
   ASSERT_EQ(OB_SUCCESS, add_non_empty_major_to_tablet(
@@ -6130,6 +6204,12 @@ void ObAsyncIndexCompactionTest::verify_async_delete_drop(const bool recyclebin)
   resolve_multi_async_index_tablet_ctx(table_name, ctx);
   ObLSHandle ls_handle;
   ASSERT_EQ(OB_SUCCESS, get_ls_handle(ctx.ls_id_, ls_handle));
+  ObTabletHandle initial_delete_handle;
+  ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, ctx.delete_index_tablet_id_, initial_delete_handle));
+  // Keep the Shared base available for the pending-medium readiness check after DROP.
+  ASSERT_EQ(OB_SUCCESS, MTL(ObSSMetaService *)->create_tablet(ctx.ls_id_,
+      ctx.delete_index_tablet_id_, initial_delete_handle.get_obj()->get_reorganization_scn(),
+      true /*check_lease*/));
   const int64_t base_snapshot = get_mock_major_snapshot(ctx);
   const int64_t merge_snapshot = base_snapshot + DEFAULT_INC_MAJOR_STEP;
   const uint64_t deleted_doc_id = 7;
@@ -7002,6 +7082,10 @@ TEST_F(ObAsyncIndexCompactionTest, async_delete_gc_preserves_merge_and_refresh_p
   ASSERT_EQ(OB_SUCCESS, get_ls_handle(ctx.ls_id_, ls_handle));
   ObLS &ls = *ls_handle.get_ls();
   const ObTabletID &tablet_id = ctx.delete_index_tablet_id_;
+  ObTabletHandle initial_delete_handle;
+  ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, tablet_id, initial_delete_handle));
+  ASSERT_EQ(OB_SUCCESS, MTL(ObSSMetaService *)->create_tablet(ctx.ls_id_,
+      tablet_id, initial_delete_handle.get_obj()->get_reorganization_scn(), true /*check_lease*/));
   const int64_t old_major = get_max_tablet_create_commit_version(ctx) + 1;
   const int64_t latest_major = old_major + 1;
   const int64_t inc_count = OB_ASYNC_INDEX_SSTABLE_COUNT_THRESHOLD;
@@ -7539,11 +7623,11 @@ public:
     ObStorageSchema *schema = nullptr;
     ASSERT_EQ(OB_SUCCESS, tablet.get_obj()->load_storage_schema(allocator_, schema));
     DEFER(ObTabletObjLoadHelper::free(allocator_, schema));
+    // First Shared Tablet creation requires the initial empty Major. Do it
+    // before replacing that Major with this case's deterministic inputs.
+    ASSERT_EQ(OB_SUCCESS, MTL(ObSSMetaService *)->create_tablet(
+        tablets_.ls_id_, tablet_id_, tablet.get_obj()->get_reorganization_scn(), true));
     if (parallel_retry || bitmap_retry) {
-      // First Shared Tablet creation requires the initial empty Major. Do it
-      // before replacing that Major with this case's deterministic inputs.
-      ASSERT_EQ(OB_SUCCESS, MTL(ObSSMetaService *)->create_tablet(
-          tablets_.ls_id_, tablet_id_, tablet.get_obj()->get_reorganization_scn(), true));
       ASSERT_EQ(OB_SUCCESS, add_non_empty_inv_sstable_to_tablet(
           ls_, tablet_id_, *schema, MEDIUM_MERGE, 0, base_,
           parallel_retry ? 1024 : 32, 1, true /*micro_index_clustered*/,

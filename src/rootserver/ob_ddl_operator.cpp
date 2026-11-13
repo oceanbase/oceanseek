@@ -4813,8 +4813,66 @@ int ObDDLOperator::update_aux_table(
           } else if ((nullptr != idx_schema_versions) &&
               OB_FAIL(idx_schema_versions->push_back(std::make_pair(new_aux_table_schema.get_table_id(), new_schema_version)))) {
             RS_LOG(WARN, "fail to push_back array", K(ret), KPC(idx_schema_versions), K(new_schema_version));
+          } else if (is_async_search_def_index(new_aux_table_schema.get_index_type())
+              && OB_FAIL(update_search_aux_progressive_merge_num(
+                  new_aux_table_schema, schema_guard, trans, idx_schema_versions))) {
+            LOG_WARN("failed to update search auxiliary progressive options", KR(ret), K(new_aux_table_schema));
           }
         }
+      }
+    }
+  }
+  return ret;
+}
+
+// Every physical child of a Search Def (data, text match, text match phrase) merges with its own
+// schema, so each of them must receive the user's reuse setting.
+int ObDDLOperator::update_search_aux_progressive_merge_num(
+    const ObTableSchema &search_schema,
+    ObSchemaGetterGuard &schema_guard,
+    ObMySQLTransaction &trans,
+    ObIArray<std::pair<uint64_t, int64_t>> *idx_schema_versions)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<uint64_t, 3> aux_table_ids;
+  ObSchemaService *schema_service = schema_service_.get_schema_service();
+  const uint64_t tenant_id = search_schema.get_tenant_id();
+  if (OB_ISNULL(schema_service)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("schema service is null", KR(ret));
+  } else if (OB_FAIL(search_schema.get_search_aux_index_tids(aux_table_ids))) {
+    LOG_WARN("failed to get search auxiliary index ids", KR(ret), K(search_schema));
+  }
+  // A building Search Def may have no physical children yet. Allow that state:
+  // create_aux_index() reads the current main-table schema when creating them,
+  // and ObIndexBuilder inherits its progressive_merge_num.
+  for (int64_t i = 0; OB_SUCC(ret) && i < aux_table_ids.count(); ++i) {
+    const uint64_t aux_table_id = aux_table_ids.at(i);
+    int64_t schema_version = OB_INVALID_VERSION;
+    const ObTableSchema *aux_schema = nullptr;
+    ObTableSchema new_aux_schema;
+    if (OB_FAIL(schema_guard.get_table_schema(tenant_id, aux_table_id, aux_schema))) {
+      LOG_WARN("failed to get search auxiliary index schema", KR(ret), K(tenant_id), K(aux_table_id));
+    } else if (OB_ISNULL(aux_schema)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("search auxiliary index schema is null", KR(ret), K(aux_table_id));
+    } else if (aux_schema->get_progressive_merge_num() == search_schema.get_progressive_merge_num()) {
+      // Avoid generating a schema version when the physical index is already synchronized.
+    } else if (OB_FAIL(new_aux_schema.assign(*aux_schema))) {
+      LOG_WARN("failed to copy search auxiliary index schema", KR(ret), K(aux_table_id));
+    } else if (OB_FAIL(schema_service_.gen_new_schema_version(tenant_id, schema_version))) {
+      LOG_WARN("failed to generate search auxiliary schema version", KR(ret), K(tenant_id));
+    } else {
+      // Preserve the physical index's specialized storage options.
+      new_aux_schema.set_progressive_merge_num(search_schema.get_progressive_merge_num());
+      new_aux_schema.set_schema_version(schema_version);
+      if (OB_FAIL(schema_service->get_table_sql_service().only_update_table_options(
+          trans, new_aux_schema, OB_DDL_ALTER_TABLE))) {
+        LOG_WARN("failed to update search auxiliary index options", KR(ret), K(aux_table_id));
+      } else if (nullptr != idx_schema_versions
+          && OB_FAIL(idx_schema_versions->push_back(std::make_pair(aux_table_id, schema_version)))) {
+        LOG_WARN("failed to record search auxiliary index schema version", KR(ret),
+            K(aux_table_id), K(schema_version));
       }
     }
   }

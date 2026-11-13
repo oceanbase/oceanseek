@@ -1533,7 +1533,7 @@ public:
   void verify_empty_search_inc_copies_inv_meta(
       const char *table_name,
       const bool has_nested_key);
-  void assert_async_index_version_range_cnt_at_least(
+  void assert_latest_async_index_version_range(
       const ObLSID &ls_id, const ObTabletID &tablet_id, const int64_t expect_min);
   int get_tablet_inc_major_cnt(const ObTablet &tablet, int64_t &inc_major_cnt);
   int count_inc_major_segments_with_snapshot_lt(
@@ -1969,6 +1969,17 @@ void ObAsyncIndexCompactionTest::wait_async_index_flags(const bool enabled)
 void ObAsyncIndexCompactionTest::prepare_delete_index_publish_for_merge(
     const MultiAsyncIndexTabletCtx &ctx, ObLSHandle &ls_handle)
 {
+  // Model the commit publication separately from installing the mock tables.
+  for (int64_t i = 0; i < ctx.fts_index_tablet_ids_.count(); ++i) {
+    ObTabletHandle index_handle;
+    int64_t materialized_snapshot = 0;
+    ASSERT_EQ(OB_SUCCESS, get_tablet_handle(
+        ctx.ls_id_, ctx.fts_index_tablet_ids_.at(i), index_handle));
+    ASSERT_EQ(OB_SUCCESS, index_handle.get_obj()->get_async_index_max_published_version(
+        materialized_snapshot));
+    ASSERT_EQ(OB_SUCCESS, publish_async_index_version(
+        ls_handle, ctx.fts_index_tablet_ids_.at(i), materialized_snapshot));
+  }
   int64_t snapshot = 0;
   ASSERT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicyHelper::calc_schedule_snapshot_version(
       *ls_handle.get_ls(), ctx.fts_index_tablet_ids_, snapshot));
@@ -1988,6 +1999,8 @@ void ObAsyncIndexCompactionTest::prepare_delete_index_publish_for_merge(
   ASSERT_EQ(OB_SUCCESS,
       delete_handle.get_obj()->get_async_index_max_published_version(published));
   ASSERT_GE(published, snapshot);
+  ASSERT_EQ(OB_SUCCESS, publish_async_index_version(
+      ls_handle, ctx.delete_index_tablet_id_, snapshot));
 }
 
 void ObAsyncIndexCompactionTest::exe_prepare_sql()
@@ -2551,7 +2564,7 @@ int ObAsyncIndexCompactionTest::mock_inc_major_sstable(
   param.is_co_table_without_cgs_ = false;
   param.co_base_snapshot_version_ = 0;
   param.column_cnt_ = param.rowkey_column_cnt_;
-  compaction::ObUncommitTxDesc tx_desc(trans_id, 200);
+  compaction::ObUncommitTxDesc tx_desc(trans_id, ObTxSEQ::from_seq(200).cast_to_int());
   param.uncommit_tx_info_.push_back(tx_desc);
   param.uncommit_tx_info_.set_info_status_record_seq();
   ObSSTableMergeRes::fill_column_checksum_for_empty_major(param.column_cnt_, param.column_checksums_);

@@ -34,6 +34,12 @@ TEST_F(TestInvIdxSSTablePrepare, inc_major_wrap_preserves_full_merge)
     dag_param.merge_type_ = INC_MAJOR_MERGE;
     dag_param.exec_mode_ = EXEC_MODE_OUTPUT;
     ObAsyncIndexMergeCtx ctx(dag_param, allocator_);
+    table_schema_.set_progressive_merge_num(0);
+    void *schema_buf = allocator_.alloc(sizeof(ObStorageSchema));
+    ASSERT_NE(nullptr, schema_buf);
+    ObStorageSchema *storage_schema = new (schema_buf) ObStorageSchema();
+    OK(storage_schema->init(allocator_, table_schema_, lib::Worker::CompatMode::MYSQL));
+    ctx.static_param_.schema_ = storage_schema;
     OK(ctx.static_param_.tables_handle_.add_sstable(&input, ObStorageMetaHandle()));
     OK(ctx.static_param_.init_sstable_logic_seq());
     const bool wrapped = seq + 1 == ObMacroDataSeq::MAX_SSTABLE_SEQ;
@@ -100,6 +106,12 @@ TEST_F(TestInvIdxSSTablePrepare, inc_major_wrap_rewrites_old_generation_zero_mac
     dag_param.merge_type_ = merge_case.merge_type_;
     dag_param.exec_mode_ = EXEC_MODE_OUTPUT;
     ObAsyncIndexMergeCtx ctx(dag_param, allocator_);
+    table_schema_.set_progressive_merge_num(0);
+    void *schema_buf = allocator_.alloc(sizeof(ObStorageSchema));
+    ASSERT_NE(nullptr, schema_buf);
+    ObStorageSchema *storage_schema = new (schema_buf) ObStorageSchema();
+    OK(storage_schema->init(allocator_, table_schema_, lib::Worker::CompatMode::MYSQL));
+    ctx.static_param_.schema_ = storage_schema;
     OK(ctx.static_param_.tables_handle_.add_sstable(&input, ObStorageMetaHandle()));
     OK(ctx.static_param_.init_sstable_logic_seq());
     if (merge_case.force_full_merge_) {

@@ -1057,6 +1057,12 @@ public:
       share::ObRawObjPrivArray &new_obj_priv_array);
 
 private:
+  int update_search_aux_progressive_merge_num(
+      const share::schema::ObTableSchema &search_schema,
+      share::schema::ObSchemaGetterGuard &schema_guard,
+      common::ObMySQLTransaction &trans,
+      common::ObIArray<std::pair<uint64_t, int64_t>> *idx_schema_versions);
+
   virtual int init_tenant_tablegroup(const uint64_t tenant_id,
                                      common::ObMySQLTransaction &trans);
   virtual int init_tenant_database(const share::schema::ObTenantSchema &tenant_schema,

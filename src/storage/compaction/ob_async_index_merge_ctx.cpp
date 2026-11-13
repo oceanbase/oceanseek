@@ -520,15 +520,20 @@ int ObAsyncIndexMergeCtx::cal_merge_param()
     LOG_WARN("tables handle is invalid for async index merge", KR(ret), K(static_param_.tables_handle_));
   } else {
     static_param_.merge_level_ = MACRO_BLOCK_MERGE_LEVEL;
-    // ObStaticMergeParam::init_sstable_logic_seq() in ob_basic_tablet_merge_ctx.cpp
-    // sets is_full_merge_ = true when INC_MAJOR wraps to generation 0.
-    // Otherwise, INC_MAJOR uses max(input generation) + 1, which is at least 1.
-    if (is_inc_major_merge(get_merge_type())) {
-      static_param_.is_full_merge_ = 0 == static_param_.sstable_logic_seq_;
-    } else if (is_major_merge(get_merge_type())) {
-      static_param_.is_full_merge_ = false;
+    if (OB_ISNULL(static_param_.schema_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("async index merge schema is null", KR(ret), KPC(this));
     } else {
-      static_param_.is_full_merge_ = false;
+      // PROGRESSIVE_MERGE_NUM is repurposed as a persistent reuse switch here,
+      // not a step count: any positive value disables macro-block reuse until
+      // the user sets it back to 0.
+      const bool reuse_disabled_by_user = static_param_.schema_->get_progressive_merge_num() > 0;
+      // ObStaticMergeParam::init_sstable_logic_seq() in ob_basic_tablet_merge_ctx.cpp
+      // sets is_full_merge_ = true when INC_MAJOR wraps to generation 0.
+      // Otherwise, INC_MAJOR uses max(input generation) + 1, which is at least 1.
+       const bool inc_major_generation_wrap =
+          is_inc_major_merge(get_merge_type()) && 0 == static_param_.sstable_logic_seq_;
+      static_param_.is_full_merge_ = reuse_disabled_by_user || inc_major_generation_wrap;
     }
   }
   return ret;
