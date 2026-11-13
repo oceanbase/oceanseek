@@ -1234,6 +1234,12 @@ int ObExprRangeConverter::get_single_in_range_node(const ObColumnRefRawExpr *col
       bool cur_always_true = true;
       bool is_valid = true;
       int64_t val_idx = -1;
+      const ObObjType target_type = column_meta->column_type_.get_type();
+      const ObObjType *encode_type = nullptr;
+      if (nullptr != const_expr && ob_is_integer_type(target_type)
+          && ob_is_integer_type(const_expr->get_result_type().get_type())) {
+        encode_type = &target_type;
+      }
       if (OB_ISNULL(const_expr)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("get null expr");
@@ -1256,7 +1262,7 @@ int ObExprRangeConverter::get_single_in_range_node(const ObColumnRefRawExpr *col
         cur_can_be_extract = false;
         cur_always_true = true;
       } else if (is_search_index && OB_FAIL(get_final_search_index_value_param_idx(*const_expr,
-          nullptr, val_idx))) {
+          encode_type, val_idx))) {
         LOG_WARN("failed to get final search index value param idx", K(ret));
       } else if (!is_search_index && OB_FAIL(get_final_expr_idx(const_expr, column_meta, val_idx))) {
         LOG_WARN("failed to get final expr idx", K(ret));
@@ -4664,6 +4670,9 @@ int ObExprRangeConverter::gen_search_index_cmp_node(const ObColumnRefRawExpr &co
     // When the column value may exceed the index value encoding limit
     // (need_constraint), add a string length constraint on the constant.
     int64_t value_param_idx = -1;
+    const ObObjType target_type = column_expr.get_result_type().get_type();
+    const ObObjType *encode_type = ob_is_integer_type(target_type)
+        && ob_is_integer_type(const_expr->get_result_type().get_type()) ? &target_type : nullptr;
     const bool need_constraint = ctx_.search_index_range_ctx_->need_constraint();
     bool can_extract = true;
     if (need_constraint && OB_FAIL(check_str_length_for_search_index_range(const_expr, can_extract))) {
@@ -4671,7 +4680,7 @@ int ObExprRangeConverter::gen_search_index_cmp_node(const ObColumnRefRawExpr &co
     }
     if (OB_FAIL(ret) || !can_extract) {
       // do nothing
-    } else if (OB_FAIL(get_final_search_index_value_param_idx(*const_expr, nullptr, value_param_idx))) {
+    } else if (OB_FAIL(get_final_search_index_value_param_idx(*const_expr, encode_type, value_param_idx))) {
       LOG_WARN("failed to get final search index value param idx", K(ret));
     } else if (OB_FAIL(fill_scalar_search_index_range_node(column_expr, value_param_idx,
                                                            cmp_type, null_safe, range_node))) {

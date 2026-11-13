@@ -1451,17 +1451,11 @@ bool ObQueryRange::can_be_extract_range(ObItemType cmp_type,
     }
   }
   if (bret && is_search_index) {
-    // Search index encodes the literal using its own obj_meta at runtime
-    // (see ob_expr_search_index_inner.cpp::calc_search_index_inner_value), while
-    // the stored index entries are encoded with the column's obj_meta at insert
-    // time (see ob_search_index_generator.cpp). If the literal's encoder method
-    // differs from the column's, the byte strings diverge for the same value
-    // and the search index lookup silently misses (e.g. BIGINT UNSIGNED column
-    // vs signed INT literal). Reject such type combinations so the predicate
-    // falls back to a base-table/regular-index scan with a post-scan filter.
-    // The JSON column has its own encoding path with runtime constraints in
-    // gen_search_index_cmp_node, so skip it to avoid breaking that path.
+    // Scalar integer ranges encode the parameter using the target column type
+    // and represent out-of-domain values with runtime bounds. Other scalar
+    // types still require compatible encoders; JSON has its own constrained path.
     if (!col_type.is_json() && !calc_type.is_json()
+        && !(ob_is_integer_type(col_type.get_type()) && ob_is_integer_type(data_type))
         && !share::ObSearchIndexValueEncoder::is_search_index_encode_compatible(
                col_type.get_type(), data_type)) {
       bret = false;

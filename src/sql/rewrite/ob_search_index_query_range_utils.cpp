@@ -217,7 +217,8 @@ int ObSearchIndexQueryRangeUtils::build_value_expr(ObQueryRangeCtx &ctx,
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("not a search index", K(ret));
   } else {
-    // Create type expression: null if cmp_type is null, otherwise create a const int expr
+    // NULL encodes by input type; ObJsonType requests JSON encoding; an integer
+    // ObObjType selects the scalar column domain for runtime integer bounds.
     if (OB_ISNULL(cmp_type)) {
       if (OB_FAIL(ObRawExprUtils::build_null_expr(*ctx.expr_factory_, type_expr))) {
         LOG_WARN("failed to build null expr for type", K(ret));

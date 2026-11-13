@@ -233,6 +233,91 @@ ObExprSearchIndexInnerValue::~ObExprSearchIndexInnerValue()
 {
 }
 
+enum ObSearchIndexIntegerBoundState
+{
+  SEARCH_INDEX_INTEGER_NORMAL,
+  SEARCH_INDEX_INTEGER_BELOW_MIN,
+  SEARCH_INDEX_INTEGER_ABOVE_MAX,
+};
+
+static int encode_search_index_integer_value(ObIAllocator &allocator,
+                                             const ObDatum &datum,
+                                             const ObObjType input_type,
+                                             const ObObjType target_type,
+                                             ObString &value)
+{
+  int ret = OB_SUCCESS;
+  ObSearchIndexIntegerBoundState bound_state = SEARCH_INDEX_INTEGER_NORMAL;
+  int64_t signed_value = 0;
+  uint64_t unsigned_value = 0;
+  if (ob_is_int_tc(target_type) && ob_is_int_tc(input_type)) {
+    const int64_t input_value = datum.get_int();
+    if (input_value < INT_MIN_VAL[target_type]) {
+      bound_state = SEARCH_INDEX_INTEGER_BELOW_MIN;
+    } else if (input_value > INT_MAX_VAL[target_type]) {
+      bound_state = SEARCH_INDEX_INTEGER_ABOVE_MAX;
+    } else {
+      signed_value = input_value;
+    }
+  } else if (ob_is_int_tc(target_type) && ob_is_uint_tc(input_type)) {
+    const uint64_t input_value = datum.get_uint64();
+    if (input_value > static_cast<uint64_t>(INT_MAX_VAL[target_type])) {
+      bound_state = SEARCH_INDEX_INTEGER_ABOVE_MAX;
+    } else {
+      signed_value = static_cast<int64_t>(input_value);
+    }
+  } else if (ob_is_uint_tc(target_type) && ob_is_int_tc(input_type)) {
+    const int64_t input_value = datum.get_int();
+    if (input_value < 0) {
+      bound_state = SEARCH_INDEX_INTEGER_BELOW_MIN;
+    } else if (static_cast<uint64_t>(input_value) > UINT_MAX_VAL[target_type]) {
+      bound_state = SEARCH_INDEX_INTEGER_ABOVE_MAX;
+    } else {
+      unsigned_value = static_cast<uint64_t>(input_value);
+    }
+  } else if (ob_is_uint_tc(target_type) && ob_is_uint_tc(input_type)) {
+    const uint64_t input_value = datum.get_uint64();
+    if (input_value > UINT_MAX_VAL[target_type]) {
+      bound_state = SEARCH_INDEX_INTEGER_ABOVE_MAX;
+    } else {
+      unsigned_value = input_value;
+    }
+  } else {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("unexpected integer type combination",
+             K(ret), K(input_type), K(target_type));
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (SEARCH_INDEX_INTEGER_NORMAL != bound_state) {
+    // Integer keys are always eight bytes. A seven-byte zero prefix sorts before
+    // every legal key; eight 0xFF bytes followed by zero sort after every key.
+    // These synthetic bounds cannot collide with an indexed integer or SQL NULL.
+    const bool is_lower = SEARCH_INDEX_INTEGER_BELOW_MIN == bound_state;
+    const int64_t bound_len = is_lower ? sizeof(int64_t) - 1 : sizeof(int64_t) + 1;
+    char *buf = static_cast<char *>(allocator.alloc(bound_len));
+    if (OB_ISNULL(buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate integer bound", K(ret), K(bound_len));
+    } else {
+      MEMSET(buf, is_lower ? 0x00 : 0xFF, bound_len);
+      if (!is_lower) {
+        buf[bound_len - 1] = 0x00;
+      }
+      value.assign_ptr(buf, bound_len);
+    }
+  } else if (ob_is_int_tc(target_type)) {
+    if (OB_FAIL(ObSearchIndexValueEncoder::encode_int(allocator, signed_value, value))) {
+      LOG_WARN("failed to encode signed integer search value", K(ret), K(target_type), K(signed_value));
+    }
+  } else {
+    if (OB_FAIL(ObSearchIndexValueEncoder::encode_uint(allocator, unsigned_value, value))) {
+      LOG_WARN("failed to encode unsigned integer search value", K(ret), K(target_type), K(unsigned_value));
+    }
+  }
+  return ret;
+}
+
 int ObExprSearchIndexInnerValue::calc_result_type2(ObExprResType &type,
                                                    ObExprResType &type1,
                                                    ObExprResType &type2,
@@ -298,6 +383,17 @@ int ObExprSearchIndexInnerValue::calc_search_index_inner_value(const ObExpr &exp
                                                           obj_meta,
                                                           value))) {
         LOG_WARN("fail to calc search index value from obj", K(ret));
+      }
+    } else if (ob_is_integer_type(expr.args_[0]->obj_meta_.get_type())
+               && ob_is_integer_type(static_cast<ObObjType>(cmp_type_datum->get_int()))) {
+      // Keep the parameter unchanged in the plan. Its value can cross the target
+      // column's domain between executions, so encode or bound it at runtime.
+      if (OB_FAIL(encode_search_index_integer_value(alloc_guard.get_allocator(),
+                                                    *param_datum,
+                                                    expr.args_[0]->obj_meta_.get_type(),
+                                                    static_cast<ObObjType>(cmp_type_datum->get_int()),
+                                                    value))) {
+        LOG_WARN("failed to encode integer search value", K(ret));
       }
     } else {
       // Convert JSON comparison parameters to JSON and use JSON encoding.
