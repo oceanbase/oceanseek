@@ -1772,6 +1772,7 @@ int check_will_be_having_domain_index_operation(
       ObSchemaGetterGuard &dest_schema_guard,
       ObDDLOperator &ddl_operator,
       common::ObMySQLTransaction &trans,
+      ObTableSchema &new_hidden_table_schema,
       ObSArray<ObTableSchema> &new_table_schemas,
       ObSArray<uint64_t> &index_ids);
   int add_new_mlog_schema(
@@ -1789,6 +1790,15 @@ int check_will_be_having_domain_index_operation(
       const common::ObIArray<uint64_t> &drop_cols_id_arr,
       const bool is_oracle_mode,
       bool &need_rebuild);
+  bool has_logical_async_index(
+      const common::ObIArray<share::schema::ObAuxTableMetaInfo> &index_infos) const;
+  bool has_logical_async_index(
+      const common::ObIArray<share::schema::ObTableSchema> &index_schemas) const;
+  int reconcile_hidden_table_async_index_options(
+      share::schema::ObTableSchema &working_hidden_table_schema,
+      const bool actual_has_async_index,
+      ObDDLOperator &ddl_operator,
+      common::ObMySQLTransaction &trans);
   int reconstruct_index_schema(
       obrpc::ObAlterTableArg &alter_table_arg,
       const share::schema::ObTableSchema &orig_table_schema,
@@ -1801,6 +1811,7 @@ int check_will_be_having_domain_index_operation(
       common::ObIAllocator &allocator,
       oceanbase::rootserver::ObDDLOperator &ddl_operator, 
       common::ObMySQLTransaction &trans, 
+      share::schema::ObTableSchema &new_hidden_table_schema,
       common::ObSArray<share::schema::ObTableSchema> &new_table_schemas,
       common::ObSArray<uint64_t> &index_ids,
       hash::ObHashMap<uint64_t, uint64_t> &vec_id_map);

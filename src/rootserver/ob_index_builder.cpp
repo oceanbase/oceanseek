@@ -1883,7 +1883,7 @@ int ObIndexBuilder::submit_drop_search_index_task_(
     const bool in_offline_ddl_white_list = arg.is_hidden_ || data_schema.get_in_offline_ddl_white_list();
     if (OB_FAIL(ddl_operator.update_index_status(index_schema.get_tenant_id(),
             param.def_index_schema_->get_data_table_id(), param.def_index_schema_->get_table_id(),
-            INDEX_STATUS_UNAVAILABLE, in_offline_ddl_white_list, trans, nullptr))) {
+            INDEX_STATUS_UNAVAILABLE, in_offline_ddl_white_list, trans, nullptr /* ddl_stmt_str */))) {
       LOG_WARN("fail to make dropping search index unavailable", KR(ret), KPC(param.def_index_schema_));
     }
   }

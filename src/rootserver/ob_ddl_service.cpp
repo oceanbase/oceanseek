@@ -23234,20 +23234,18 @@ int ObDDLService::add_new_index_schema(obrpc::ObAlterTableArg &alter_table_arg,
                                        ObSchemaGetterGuard &dest_schema_guard,
                                        ObDDLOperator &ddl_operator,
                                        common::ObMySQLTransaction &trans,
+                                       ObTableSchema &new_table_schema,
                                        ObSArray<ObTableSchema> &new_table_schemas,
                                        ObSArray<uint64_t> &index_ids)
 {
   int ret = OB_SUCCESS;
   ObSchemaService *schema_service = schema_service_->get_schema_service();
-  ObTableSchema new_table_schema;
   if (OB_FAIL(check_inner_stat())) {
     LOG_WARN("variable is not init", K(ret));
   } else if (!alter_table_arg.is_alter_columns_) {
   } else if (OB_ISNULL(schema_service)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("schema service is null", K(ret), KP(schema_service));
-  } else if (OB_FAIL(new_table_schema.assign(hidden_table_schema))) {
-    LOG_WARN("fail to assign schema", K(ret));
   } else {
     ObIndexBuilder index_builder(*this);
     HEAP_VAR(AddIndexNameHashSet, add_index_name_set) {
@@ -23357,13 +23355,6 @@ int ObDDLService::add_new_index_schema(obrpc::ObAlterTableArg &alter_table_arg,
                                                           index_schema))) {
                   LOG_WARN("failed to generate index schema!", K(ret));
                 } else {
-                  if (share::schema::is_async_fts_index(create_index_arg->index_type_) && !new_table_schema.has_async_index()) {
-                    if (OB_FAIL(ObFtsIndexBuilderUtil::mark_data_table_async_index_flag(new_table_schema))) {
-                      LOG_WARN("failed to mark async index flag on offline data table", K(ret));
-                    } else if (OB_FAIL(ddl_operator.update_table_attribute(new_table_schema, trans, OB_DDL_ALTER_TABLE))) {
-                      LOG_WARN("failed to persist async index flag on offline data table", K(ret));
-                    }
-                  }
                   bool is_exist = false;
                   ObString final_index_name;
                   if (OB_FAIL(ret)) {
@@ -23563,6 +23554,7 @@ int ObDDLService::reconstruct_index_schema(obrpc::ObAlterTableArg &alter_table_a
                                            ObIAllocator &allocator,
                                            oceanbase::rootserver::ObDDLOperator &ddl_operator, 
                                            common::ObMySQLTransaction &trans, 
+                                           ObTableSchema &new_table_schema,
                                            ObSArray<ObTableSchema> &new_table_schemas,
                                            ObSArray<uint64_t> &index_ids,
                                            hash::ObHashMap<uint64_t, uint64_t> &vec_id_map)
@@ -23579,15 +23571,12 @@ int ObDDLService::reconstruct_index_schema(obrpc::ObAlterTableArg &alter_table_a
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("schema service is null", K(ret), KP(schema_service));
   } else {
-    ObTableSchema new_table_schema;
     ObSEArray<ObAuxTableMetaInfo, 16> simple_index_infos;
     static const int64_t DEFAULT_MAP_HASH_SIZE = 64;
     int64_t hash_capacity = common::hash::cal_next_prime(DEFAULT_MAP_HASH_SIZE);
     common::hash::ObHashMap<ObString, common::ObSEArray<ObString, common::OB_PREALLOCATED_NUM>> generate_column_name_map;
     if (OB_FAIL(orig_table_schema.get_simple_index_infos(simple_index_infos))) {
       LOG_WARN("get simple_index_infos failed", K(ret));
-    } else if (OB_FAIL(new_table_schema.assign(hidden_table_schema))) {
-      LOG_WARN("fail to assign schema", K(ret));
     } else if (OB_FAIL(orig_table_schema.check_if_oracle_compat_mode(is_oracle_mode))) {
       LOG_WARN("failed to check if oralce compat mode", K(ret));
     } else if (OB_FAIL(generate_column_name_map.create(hash_capacity, "OfflineDDL", "OfflineDDL"))) {
@@ -24005,6 +23994,65 @@ int ObDDLService::add_new_mlog_schema(
   return ret;
 }
 
+bool ObDDLService::has_logical_async_index(
+    const ObIArray<ObAuxTableMetaInfo> &index_infos) const
+{
+  bool bool_ret = false;
+  for (int64_t i = 0; !bool_ret && i < index_infos.count(); ++i) {
+    const ObIndexType index_type = index_infos.at(i).index_type_;
+    bool_ret = share::schema::is_async_logical_index(index_type);
+  }
+  return bool_ret;
+}
+
+bool ObDDLService::has_logical_async_index(
+    const ObIArray<ObTableSchema> &index_schemas) const
+{
+  bool bool_ret = false;
+  for (int64_t i = 0; !bool_ret && i < index_schemas.count(); ++i) {
+    const ObIndexType index_type = index_schemas.at(i).get_index_type();
+    bool_ret = share::schema::is_async_logical_index(index_type);
+  }
+  return bool_ret;
+}
+
+int ObDDLService::reconcile_hidden_table_async_index_options(
+    ObTableSchema &working_hidden_table_schema,
+    const bool actual_has_async_index,
+    ObDDLOperator &ddl_operator,
+    ObMySQLTransaction &trans)
+{
+  int ret = OB_SUCCESS;
+  if (working_hidden_table_schema.has_async_index() != actual_has_async_index) {
+    if (actual_has_async_index) {
+      if (OB_FAIL(ObFtsIndexBuilderUtil::mark_data_table_async_index_flag(
+              working_hidden_table_schema))) {
+        LOG_WARN("failed to mark hidden table async index options", K(ret),
+                 K(working_hidden_table_schema));
+      }
+    } else {
+      working_hidden_table_schema.del_table_flag(HAS_ASYNC_INDEX_FLAG);
+      if (OB_FAIL(working_hidden_table_schema.set_async_index_params(
+              ObString::make_empty_string()))) {
+        LOG_WARN("failed to clear hidden table async index params", K(ret),
+                 K(working_hidden_table_schema));
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (FALSE_IT(working_hidden_table_schema.set_in_offline_ddl_white_list(true))) {
+    } else if (OB_FAIL(ddl_operator.update_table_attribute(
+                   working_hidden_table_schema, trans, OB_DDL_ALTER_TABLE))) {
+      LOG_WARN("failed to reconcile hidden table async index options", K(ret),
+               K(actual_has_async_index), K(working_hidden_table_schema));
+    } else if (OB_FAIL(storage::ObTabletAsyncIndexRefreshInfoMdsHelper::register_membership(
+                   working_hidden_table_schema, trans))) {
+      LOG_WARN("failed to reconcile hidden table async index membership", K(ret),
+               K(actual_has_async_index), K(working_hidden_table_schema));
+    }
+  }
+  return ret;
+}
+
 int ObDDLService::rebuild_hidden_table_index_in_trans(obrpc::ObAlterTableArg &alter_table_arg,
                                                       ObSArray<uint64_t> &index_ids)
 {
@@ -24022,7 +24070,8 @@ int ObDDLService::rebuild_hidden_table_index_in_trans(obrpc::ObAlterTableArg &al
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid tz_info_wrap", K(tz_info_wrap), K(ret));
   } else {
-    ObDDLSQLTransaction trans(schema_service_);    
+    ObDDLSQLTransaction trans(schema_service_);
+    ObDDLOperator ddl_operator(*schema_service_, *sql_proxy_);
     ObSchemaGetterGuard hold_buf_src_tenant_schema_guard;
     ObSchemaGetterGuard hold_buf_dst_tenant_schema_guard;
     ObSchemaGetterGuard *src_tenant_schema_guard = nullptr;
@@ -24031,9 +24080,11 @@ int ObDDLService::rebuild_hidden_table_index_in_trans(obrpc::ObAlterTableArg &al
     hold_buf_dst_tenant_schema_guard.set_session_id(alter_table_arg.session_id_);
     const ObTableSchema *orig_table_schema = nullptr;
     const ObTableSchema *hidden_table_schema = nullptr;
+    ObTableSchema working_hidden_table_schema;
     int64_t refreshed_schema_version = 0;
     ObArray<uint64_t> drop_cols_id_arr;
     bool has_mlog_table = false;
+    bool actual_has_async_index = false;
     if (OB_FAIL(get_tenant_schema_guard_with_version_in_inner_table(src_tenant_id, dst_tenant_id,
          hold_buf_src_tenant_schema_guard, hold_buf_dst_tenant_schema_guard,
          src_tenant_schema_guard, dst_tenant_schema_guard))) {
@@ -24049,11 +24100,14 @@ int ObDDLService::rebuild_hidden_table_index_in_trans(obrpc::ObAlterTableArg &al
                                                         orig_table_schema,
                                                         hidden_table_schema))) {
       LOG_WARN("failed to get orig and hidden table schema", K(ret));
+    } else if (OB_FAIL(working_hidden_table_schema.assign(*hidden_table_schema))) {
+      LOG_WARN("failed to assign hidden table schema", K(ret), KPC(hidden_table_schema));
     } else if (OB_FALSE_IT(has_mlog_table = orig_table_schema->has_mlog_table())) {
     } else if (hidden_table_schema->get_simple_index_infos().count() > 0
         || hidden_table_schema->has_mlog_table()) {
       // if there is any index in the hidden table, all indexes are already rebuilt because the rebuild is wrap in a transaction
       const common::ObIArray<ObAuxTableMetaInfo> &index_infos = hidden_table_schema->get_simple_index_infos();
+      actual_has_async_index = has_logical_async_index(index_infos);
       for (int64_t i = 0; OB_SUCC(ret) && i < index_infos.count(); ++i) {
         if (OB_FAIL(index_ids.push_back(index_infos.at(i).table_id_))) {
           LOG_WARN("push back index id failed", K(ret));
@@ -24065,7 +24119,6 @@ int ObDDLService::rebuild_hidden_table_index_in_trans(obrpc::ObAlterTableArg &al
         }
       }
     } else {
-      ObDDLOperator ddl_operator(*schema_service_, *sql_proxy_);
       if (OB_FAIL(col_name_map.init(*orig_table_schema, *hidden_table_schema, alter_table_schema))) {
         LOG_WARN("failed to init column name map", K(ret), K(alter_table_schema), KPC(orig_table_schema));
       } else if (OB_FAIL(vec_id_map.create(16, "HashVecId"))) {
@@ -24083,6 +24136,7 @@ int ObDDLService::rebuild_hidden_table_index_in_trans(obrpc::ObAlterTableArg &al
                                                   alter_table_arg.allocator_,
                                                   ddl_operator,
                                                   trans,
+                                                  working_hidden_table_schema,
                                                   new_table_schemas,
                                                   index_ids,
                                                   vec_id_map))) {
@@ -24094,6 +24148,7 @@ int ObDDLService::rebuild_hidden_table_index_in_trans(obrpc::ObAlterTableArg &al
                                               *dst_tenant_schema_guard,
                                               ddl_operator,
                                               trans,
+                                              working_hidden_table_schema,
                                               new_table_schemas,
                                               index_ids))) {
         LOG_WARN("failed to add new index schema", K(ret));
@@ -24120,8 +24175,17 @@ int ObDDLService::rebuild_hidden_table_index_in_trans(obrpc::ObAlterTableArg &al
         if (OB_FAIL(ObVectorIndexUtil::resume_dbms_vector_job_attribute_if_need(
             trans, dst_tenant_id, new_table_schemas, vec_id_map))) {
           LOG_WARN("failed to resume dbms jobs attribute", K(ret), K(dst_tenant_id));
+        } else {
+          actual_has_async_index = has_logical_async_index(new_table_schemas);
         }
       }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(reconcile_hidden_table_async_index_options(
+                   working_hidden_table_schema, actual_has_async_index, ddl_operator, trans))) {
+      LOG_WARN("failed to reconcile hidden table async index options", K(ret),
+               K(dst_tenant_id), "table_id", hidden_table_schema->get_table_id(),
+               K(actual_has_async_index));
     }
     if (trans.is_started()) {
       int temp_ret = OB_SUCCESS;

@@ -4,6 +4,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <gmock/gmock.h>
 #define USING_LOG_PREFIX RS
 #define protected public
 #define private public
@@ -12,19 +13,57 @@
 #include "rootserver/ddl_task/ob_index_build_task.h"
 #include "rootserver/ddl_task/ob_vec_index_build_task.h"
 #include "rootserver/ddl_task/ob_vec_ivf_index_build_task.h"
+#include "rootserver/ob_ddl_service.h"
+#include "rootserver/ob_ddl_operator.h"
 #include "share/ob_server_struct.h"
 #include "share/ob_ddl_sim_point.h"
+#include "share/schema/ob_multi_version_schema_service.h"
+#include "share/schema/ob_table_sql_service.h"
+#include "storage/tablet/ob_async_index_refresh_info_mds_helper.h"
 
 #define LOG_FILE_PATH "./test_table_redefinition_task.log"
 
 namespace oceanbase
 {
+namespace storage
+{
+class AsyncIndexMembershipWriterMock
+{
+public:
+  MOCK_METHOD5(write, int(const uint64_t, const common::ObIArray<common::ObTabletID> &,
+                          const ObTabletAsyncIndexRefreshInfo &, common::ObMySQLTransaction &,
+                          const int64_t));
+};
+
+static AsyncIndexMembershipWriterMock *membership_writer_mock = nullptr;
+
+// Keep the real membership construction; replace only the shared library's tablet write boundary.
+int ObTabletAsyncIndexRefreshInfoMdsHelper::register_tablets_refresh_info_(
+    const uint64_t tenant_id,
+    const common::ObIArray<common::ObTabletID> &tablet_ids,
+    const ObTabletAsyncIndexRefreshInfo &refresh_info,
+    common::ObMySQLTransaction &trans,
+    const int64_t expected_published_version)
+{
+  int ret = OB_SUCCESS;
+  if (nullptr == membership_writer_mock) {
+    ADD_FAILURE() << "unexpected async-index membership write";
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    ret = membership_writer_mock->write(
+        tenant_id, tablet_ids, refresh_info, trans, expected_published_version);
+  }
+  return ret;
+}
+} // namespace storage
+
 namespace unittest
 {
 
 using namespace oceanbase::common;
 using namespace oceanbase::rootserver;
 using namespace oceanbase::share;
+using namespace oceanbase::share::schema;
 
 #define ASSERT_SUCC(expr) ASSERT_EQ(OB_SUCCESS, (expr))
 
@@ -97,6 +136,236 @@ public:
 
   static void check_legacy_task_recovery(bool has_snapshot);
 };
+
+TEST_F(TestTableRedefinitionTask, logical_async_index_detection)
+{
+  ObDDLService ddl_service;
+  ObSEArray<ObAuxTableMetaInfo, 4> index_infos;
+  ASSERT_SUCC(index_infos.push_back(
+      ObAuxTableMetaInfo(500001, USER_INDEX, INDEX_TYPE_NORMAL_LOCAL)));
+  ASSERT_SUCC(index_infos.push_back(
+      ObAuxTableMetaInfo(500002, USER_INDEX, INDEX_TYPE_ASYNC_DELETE_INDEX_LOCAL)));
+  ASSERT_SUCC(index_infos.push_back(
+      ObAuxTableMetaInfo(500003, USER_INDEX, INDEX_TYPE_ASYNC_SEARCH_DATA_INDEX_LOCAL)));
+  ASSERT_FALSE(ddl_service.has_logical_async_index(index_infos));
+  ASSERT_SUCC(index_infos.push_back(
+      ObAuxTableMetaInfo(500004, USER_INDEX, INDEX_TYPE_ASYNC_SEARCH_DEF_INDEX_LOCAL)));
+  ASSERT_TRUE(ddl_service.has_logical_async_index(index_infos));
+
+  ObSArray<ObTableSchema> index_schemas;
+  ObTableSchema index_schema;
+  index_schema.set_index_type(INDEX_TYPE_ASYNC_DELETE_INDEX_LOCAL);
+  ASSERT_SUCC(index_schemas.push_back(index_schema));
+  index_schema.reset();
+  index_schema.set_index_type(INDEX_TYPE_ASYNC_SEARCH_DATA_INDEX_LOCAL);
+  ASSERT_SUCC(index_schemas.push_back(index_schema));
+  ASSERT_FALSE(ddl_service.has_logical_async_index(index_schemas));
+  index_schema.reset();
+  index_schema.set_index_type(INDEX_TYPE_ASYNC_FTS_INDEX_LOCAL);
+  ASSERT_SUCC(index_schemas.push_back(index_schema));
+  ASSERT_TRUE(ddl_service.has_logical_async_index(index_schemas));
+}
+
+class RecordingHiddenTableDDLOperator : public ObDDLOperator
+{
+public:
+  RecordingHiddenTableDDLOperator(ObMultiVersionSchemaService &schema_service,
+                                  ObMySQLProxy &sql_proxy)
+      : ObDDLOperator(schema_service, sql_proxy), update_count_(0), update_ret_(OB_SUCCESS),
+        trans_(nullptr), updated_schema_(nullptr) {}
+
+  int update_table_attribute(ObTableSchema &schema, ObMySQLTransaction &trans,
+                             const ObSchemaOperationType op,
+                             const ObString *ddl_stmt_str = nullptr) override
+  {
+    int ret = OB_SUCCESS;
+    ++update_count_;
+    trans_ = &trans;
+    EXPECT_EQ(OB_DDL_ALTER_TABLE, op);
+    EXPECT_EQ(nullptr, ddl_stmt_str);
+    if (OB_FAIL(ObTableSqlService::check_ddl_allowed(schema))) {
+    } else {
+      updated_schema_ = &schema;
+      ret = update_ret_;
+    }
+    return ret;
+  }
+
+  int64_t update_count_;
+  int update_ret_;
+  ObMySQLTransaction *trans_;
+  const ObTableSchema *updated_schema_;
+};
+
+class TestHiddenTableAsyncIndexOptions : public ::testing::Test
+{
+public:
+  static void SetUpTestCase()
+  {
+    ASSERT_SUCC(ObCompatModeGetter::instance().init(nullptr));
+    lib::Worker::CompatMode mode = lib::Worker::CompatMode::MYSQL;
+    ASSERT_SUCC(ObCompatModeGetter::instance().set_tenant_compat_mode(1002, mode));
+  }
+
+  static void TearDownTestCase() { ObCompatModeGetter::instance().destroy(); }
+
+  TestHiddenTableAsyncIndexOptions()
+      : ddl_service_(), schema_service_(), sql_proxy_(),
+        ddl_operator_(schema_service_, sql_proxy_), trans_(), working_schema_(),
+        membership_writer_(), expected_has_async_index_(false), membership_ret_(OB_SUCCESS) {}
+
+  void SetUp() override
+  {
+    storage::membership_writer_mock = &membership_writer_;
+    working_schema_.set_tenant_id(1002);
+    working_schema_.set_database_id(500001);
+    working_schema_.set_table_id(500002);
+    working_schema_.set_schema_version(100);
+    working_schema_.set_table_type(USER_TABLE);
+    working_schema_.set_table_state_flag(TABLE_STATE_HIDDEN_OFFLINE_DDL);
+    ASSERT_FALSE(working_schema_.get_in_offline_ddl_white_list());
+    ASSERT_EQ(OB_OP_NOT_ALLOW, ObTableSqlService::check_ddl_allowed(working_schema_));
+    working_schema_.set_tablet_id(300001);
+    working_schema_.set_rowkey_column_num(1);
+    working_schema_.set_max_used_column_id(OB_APP_MIN_COLUMN_ID);
+    working_schema_.add_table_flag(ROW_LEVEL_SECURITY_FLAG);
+    ASSERT_SUCC(working_schema_.set_table_name("__hidden_async_reconcile"));
+    ObColumnSchemaV2 column;
+    column.set_tenant_id(1002);
+    column.set_table_id(500002);
+    column.set_column_id(OB_APP_MIN_COLUMN_ID);
+    column.set_rowkey_position(1);
+    column.set_data_type(ObIntType);
+    column.set_nullable(false);
+    ASSERT_SUCC(column.set_column_name("id"));
+    ASSERT_SUCC(working_schema_.add_column(column));
+    ASSERT_TRUE(working_schema_.is_valid());
+  }
+
+  void TearDown() override { storage::membership_writer_mock = nullptr; }
+
+  int check_membership(const uint64_t tenant_id, const ObIArray<ObTabletID> &tablet_ids,
+                       const storage::ObTabletAsyncIndexRefreshInfo &info,
+                       ObMySQLTransaction &trans, const int64_t expected_published_version)
+  {
+    EXPECT_EQ(1002, tenant_id);
+    EXPECT_EQ(1, tablet_ids.count());
+    if (1 == tablet_ids.count()) {
+      EXPECT_EQ(ObTabletID(300001), tablet_ids.at(0));
+    }
+    EXPECT_EQ(1, ddl_operator_.update_count_);
+    EXPECT_EQ(&working_schema_, ddl_operator_.updated_schema_);
+    EXPECT_TRUE(working_schema_.get_in_offline_ddl_white_list());
+    EXPECT_EQ(TABLE_STATE_HIDDEN_OFFLINE_DDL, working_schema_.get_table_state_flag());
+    EXPECT_EQ(&trans_, ddl_operator_.trans_);
+    EXPECT_EQ(&trans_, &trans);
+    EXPECT_EQ(expected_has_async_index_, info.has_async_index());
+    EXPECT_EQ(working_schema_.has_async_index(), info.has_async_index());
+    EXPECT_EQ(storage::ObTabletAsyncIndexRefreshInfo::INVALID_PUBLISHED_VERSION,
+              info.get_published_version());
+    EXPECT_TRUE(info.get_refresh_snapshots().empty());
+    EXPECT_EQ(0, expected_published_version);
+    return membership_ret_;
+  }
+
+  void expect_membership_write(const bool has_async_index)
+  {
+    expected_has_async_index_ = has_async_index;
+    EXPECT_CALL(membership_writer_, write(1002, testing::_, testing::_, testing::Ref(trans_), 0))
+        .WillOnce(testing::Invoke(this, &TestHiddenTableAsyncIndexOptions::check_membership));
+  }
+
+  ObDDLService ddl_service_;
+  ObMultiVersionSchemaService schema_service_;
+  ObMySQLProxy sql_proxy_;
+  RecordingHiddenTableDDLOperator ddl_operator_;
+  ObMySQLTransaction trans_;
+  ObTableSchema working_schema_;
+  testing::StrictMock<storage::AsyncIndexMembershipWriterMock> membership_writer_;
+  bool expected_has_async_index_;
+  int membership_ret_;
+};
+
+TEST_F(TestHiddenTableAsyncIndexOptions, clears_last_logical_index_and_membership)
+{
+  working_schema_.add_table_flag(HAS_ASYNC_INDEX_FLAG);
+  ASSERT_SUCC(working_schema_.set_async_index_params(ObString::make_string("refresh_interval=30s")));
+  ObSEArray<ObTableSchema, 1> indexes;
+  expect_membership_write(false);
+  ASSERT_SUCC(ddl_service_.reconcile_hidden_table_async_index_options(
+      working_schema_, ddl_service_.has_logical_async_index(indexes), ddl_operator_, trans_));
+  EXPECT_FALSE(working_schema_.has_async_index());
+  EXPECT_TRUE(working_schema_.get_async_index_params().empty());
+  EXPECT_EQ(ROW_LEVEL_SECURITY_FLAG, working_schema_.get_table_flags());
+  EXPECT_EQ(OB_APP_MIN_COLUMN_ID, working_schema_.get_max_used_column_id());
+}
+
+TEST_F(TestHiddenTableAsyncIndexOptions, marks_first_logical_index_and_membership)
+{
+  ObSEArray<ObTableSchema, 1> indexes;
+  ObTableSchema index;
+  index.set_index_type(INDEX_TYPE_ASYNC_FTS_INDEX_LOCAL);
+  index.set_index_status(INDEX_STATUS_UNAVAILABLE);
+  ASSERT_SUCC(indexes.push_back(index));
+  expect_membership_write(true);
+  ASSERT_SUCC(ddl_service_.reconcile_hidden_table_async_index_options(
+      working_schema_, ddl_service_.has_logical_async_index(indexes), ddl_operator_, trans_));
+  EXPECT_TRUE(working_schema_.has_async_index());
+  EXPECT_FALSE(working_schema_.get_async_index_params().empty());
+  EXPECT_EQ(ROW_LEVEL_SECURITY_FLAG | HAS_ASYNC_INDEX_FLAG,
+            working_schema_.get_table_flags());
+}
+
+TEST_F(TestHiddenTableAsyncIndexOptions, marking_search_index_preserves_custom_params)
+{
+  const ObString params = ObString::make_string("refresh_interval=30s");
+  ASSERT_SUCC(working_schema_.set_async_index_params(params));
+  ObSEArray<ObAuxTableMetaInfo, 1> indexes;
+  ASSERT_SUCC(indexes.push_back(
+      ObAuxTableMetaInfo(500003, USER_INDEX, INDEX_TYPE_ASYNC_SEARCH_DEF_INDEX_LOCAL)));
+  expect_membership_write(true);
+  ASSERT_SUCC(ddl_service_.reconcile_hidden_table_async_index_options(
+      working_schema_, ddl_service_.has_logical_async_index(indexes), ddl_operator_, trans_));
+  EXPECT_TRUE(working_schema_.has_async_index());
+  EXPECT_EQ(params, working_schema_.get_async_index_params());
+}
+
+TEST_F(TestHiddenTableAsyncIndexOptions, matching_membership_skips_writes)
+{
+  EXPECT_CALL(membership_writer_, write(testing::_, testing::_, testing::_, testing::_, testing::_))
+      .Times(0);
+  ASSERT_SUCC(ddl_service_.reconcile_hidden_table_async_index_options(
+      working_schema_, false, ddl_operator_, trans_));
+  working_schema_.add_table_flag(HAS_ASYNC_INDEX_FLAG);
+  const ObString params = ObString::make_string("refresh_interval=30s");
+  ASSERT_SUCC(working_schema_.set_async_index_params(params));
+  ASSERT_SUCC(ddl_service_.reconcile_hidden_table_async_index_options(
+      working_schema_, true, ddl_operator_, trans_));
+  EXPECT_EQ(0, ddl_operator_.update_count_);
+  EXPECT_TRUE(working_schema_.has_async_index());
+  EXPECT_EQ(params, working_schema_.get_async_index_params());
+  EXPECT_FALSE(working_schema_.get_in_offline_ddl_white_list());
+}
+
+TEST_F(TestHiddenTableAsyncIndexOptions, schema_failure_does_not_register_membership)
+{
+  working_schema_.add_table_flag(HAS_ASYNC_INDEX_FLAG);
+  ddl_operator_.update_ret_ = OB_TIMEOUT;
+  EXPECT_CALL(membership_writer_, write(testing::_, testing::_, testing::_, testing::_, testing::_))
+      .Times(0);
+  EXPECT_EQ(OB_TIMEOUT, ddl_service_.reconcile_hidden_table_async_index_options(
+      working_schema_, false, ddl_operator_, trans_));
+  EXPECT_EQ(1, ddl_operator_.update_count_);
+}
+
+TEST_F(TestHiddenTableAsyncIndexOptions, membership_failure_is_returned_to_transaction_owner)
+{
+  working_schema_.add_table_flag(HAS_ASYNC_INDEX_FLAG);
+  membership_ret_ = OB_TRANS_KILLED;
+  expect_membership_write(false);
+  EXPECT_EQ(OB_TRANS_KILLED, ddl_service_.reconcile_hidden_table_async_index_options(
+      working_schema_, false, ddl_operator_, trans_));
+}
 
 // SQL 代理不可用时状态切换会退出；已成功任务的取消不能提前污染最终结果码。
 TEST_F(TestTableRedefinitionTask, cancel_after_success_preserves_result_before_persistence)
