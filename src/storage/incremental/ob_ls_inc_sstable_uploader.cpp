@@ -614,48 +614,34 @@ int ObLSIncSSTableUploader::check_inc_major_ddl_checkpoint_(
   pending = false;
   const ObTabletID tablet_ids[] = {batch_key.get_tablet_id(),
       batch_key.get_lob_meta_tablet_id(), batch_key.get_lob_piece_tablet_id()};
-  ObArenaAllocator allocator(ObMemAttr(MTL_ID(), "IncDumpCheck"));
   ObTabletHandle local_tablet;
-  ObTabletHandle shared_tablet;
   ObTableStoreIterator dumps;
-  // Shared covers this batch through dumps or final IncMajor publication.
+  // Compare local DDL progress with the cached Shared LS checkpoint.
+  // Late dump publication is still guarded by the Shared TableStore filter.
   for (int64_t i = 0; OB_SUCC(ret) && !pending && i < ARRAYSIZEOF(tablet_ids); ++i) {
     if (!tablet_ids[i].is_valid()) {
       continue;
     }
     if (OB_FAIL(ls_.get_tablet(tablet_ids[i], local_tablet,
         ObTabletCommon::DEFAULT_GET_TABLET_NO_WAIT, ObMDSGetTabletMode::READ_ALL_COMMITED))) {
-      UPLOADER_LOG(WARN, "get local tablet for inc major dump check failed",
-                   K(batch_key), K(tablet_ids[i]));
+      UPLOADER_LOG(WARN, "get local tablet for inc major dump check failed", K(batch_key), K(tablet_ids[i]));
     } else if (OB_FAIL(local_tablet.get_obj()->get_inc_major_ddl_sstables(
         dumps, batch_key.get_trans_id(), batch_key.get_seq_no()))) {
       UPLOADER_LOG(WARN, "get batch dumps for checkpoint check failed", K(batch_key), K(tablet_ids[i]));
     } else if (0 == dumps.count()) {
       // No dump remains for this batch; skip the checkpoint check.
-    } else if (OB_FAIL(MTL(ObSSMetaService *)->get_tablet(ls_.get_ls_id(), tablet_ids[i],
-        local_tablet.get_obj()->get_reorganization_scn(), allocator, shared_tablet))) {
-      if (OB_TABLET_NOT_EXIST == ret) {
-        ret = OB_SUCCESS;
-        pending = true;
-        UPLOADER_LOG(INFO, "inc major dump check waits for shared tablet", K(batch_key), K(tablet_ids[i]));
-      } else {
-        UPLOADER_LOG(WARN, "get shared tablet for inc major dump check failed",
-                     K(batch_key), K(tablet_ids[i]));
-      }
     } else {
       const SCN target_scn = local_tablet.get_obj()->get_ddl_checkpoint_scn();
-      const SCN shared_scn = shared_tablet.get_obj()->get_ddl_checkpoint_scn();
-      pending = shared_scn < target_scn;
+      // The cache already stores scn_dec(raw Shared LS ss_checkpoint_scn), so equality covers target_scn.
+      const SCN ss_checkpoint_scn = ckpt_scn_on_ss_ls_meta_.atomic_load();
+      pending = ss_checkpoint_scn < target_scn;
       if (pending) {
-        UPLOADER_LOG(INFO, "inc major dump check waits for shared DDL checkpoint",
-                     K(batch_key), K(tablet_ids[i]), K(target_scn), K(shared_scn));
+        UPLOADER_LOG(INFO, "inc major dump check waits for cached shared LS checkpoint",
+                     K(batch_key), K(tablet_ids[i]), K(target_scn), K(ss_checkpoint_scn));
       }
     }
-    // Release tablet handles before reusing the memory backing the shared tablet.
     dumps.reset();
-    shared_tablet.reset();
     local_tablet.reset();
-    allocator.reuse();
   }
   return ret;
 }
