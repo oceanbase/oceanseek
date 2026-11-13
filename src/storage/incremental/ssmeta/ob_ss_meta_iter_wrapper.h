@@ -414,12 +414,14 @@ private:
   // 同时提取非幂等 Major 宏块的 op_id。
   static int get_sstable_macro_op_id_(
       const common::ObTabletID &tablet_id,
+      const share::SCN &reorganization_scn,
       const blocksstable::MacroBlockId &macro_id,
       int64_t &minor_op_id,
       int64_t &inc_major_op_id,
       int64_t &non_idem_major_op_id);
   static int accumulate_sstable_macro_op_id_(
       const common::ObTabletID &tablet_id,
+      const share::SCN &reorganization_scn,
       blocksstable::ObMacroIdIterator &macro_iter,
       int64_t &max_minor_op_id,
       int64_t &max_inc_major_op_id,

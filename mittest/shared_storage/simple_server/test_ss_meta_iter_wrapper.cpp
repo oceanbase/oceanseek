@@ -2807,7 +2807,7 @@ TEST_F(TestSSMetaIterWrapper, get_lock_row_op_ids_from_persisted_metadata)
   ASSERT_EQ(6, mini_data_macro_id.seq_id());
   ASSERT_EQ(OB_SUCCESS,
       ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
-          cur_tablet_id, mini_data_macro_id, minor_op_id, inc_major_op_id,
+          cur_tablet_id, SCN::min_scn(), mini_data_macro_id, minor_op_id, inc_major_op_id,
           non_idem_major_op_id));
   ASSERT_EQ(17, minor_op_id);
   ASSERT_EQ(-1, inc_major_op_id);
@@ -2821,7 +2821,7 @@ TEST_F(TestSSMetaIterWrapper, get_lock_row_op_ids_from_persisted_metadata)
           mini_meta_macro_id));
   ASSERT_EQ(OB_SUCCESS,
       ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
-          cur_tablet_id, mini_meta_macro_id, minor_op_id, inc_major_op_id,
+          cur_tablet_id, SCN::min_scn(), mini_meta_macro_id, minor_op_id, inc_major_op_id,
           non_idem_major_op_id));
   ASSERT_EQ(19, minor_op_id);
   ASSERT_EQ(-1, inc_major_op_id);
@@ -2838,7 +2838,7 @@ TEST_F(TestSSMetaIterWrapper, get_lock_row_op_ids_from_persisted_metadata)
           minor_data_macro_id));
   ASSERT_EQ(OB_SUCCESS,
       ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
-          cur_tablet_id, minor_data_macro_id, minor_op_id, inc_major_op_id,
+          cur_tablet_id, SCN::min_scn(), minor_data_macro_id, minor_op_id, inc_major_op_id,
           non_idem_major_op_id));
   ASSERT_EQ(23, minor_op_id);
   ASSERT_EQ(-1, inc_major_op_id);
@@ -2852,7 +2852,7 @@ TEST_F(TestSSMetaIterWrapper, get_lock_row_op_ids_from_persisted_metadata)
           minor_meta_macro_id));
   ASSERT_EQ(OB_SUCCESS,
       ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
-          cur_tablet_id, minor_meta_macro_id, minor_op_id, inc_major_op_id,
+          cur_tablet_id, SCN::min_scn(), minor_meta_macro_id, minor_op_id, inc_major_op_id,
           non_idem_major_op_id));
   ASSERT_EQ(25, minor_op_id);
   ASSERT_EQ(-1, inc_major_op_id);
@@ -2867,7 +2867,7 @@ TEST_F(TestSSMetaIterWrapper, get_lock_row_op_ids_from_persisted_metadata)
           inc_major_compaction_data_macro_id));
   ASSERT_EQ(OB_SUCCESS,
       ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
-          cur_tablet_id, inc_major_compaction_data_macro_id, minor_op_id, inc_major_op_id,
+          cur_tablet_id, SCN::min_scn(), inc_major_compaction_data_macro_id, minor_op_id, inc_major_op_id,
           non_idem_major_op_id));
   ASSERT_EQ(-1, minor_op_id);
   ASSERT_EQ(27, inc_major_op_id);
@@ -2881,7 +2881,7 @@ TEST_F(TestSSMetaIterWrapper, get_lock_row_op_ids_from_persisted_metadata)
           inc_major_compaction_meta_macro_id));
   ASSERT_EQ(OB_SUCCESS,
       ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
-          cur_tablet_id, inc_major_compaction_meta_macro_id, minor_op_id, inc_major_op_id,
+          cur_tablet_id, SCN::min_scn(), inc_major_compaction_meta_macro_id, minor_op_id, inc_major_op_id,
           non_idem_major_op_id));
   ASSERT_EQ(-1, minor_op_id);
   ASSERT_EQ(29, inc_major_op_id);
@@ -2896,7 +2896,7 @@ TEST_F(TestSSMetaIterWrapper, get_lock_row_op_ids_from_persisted_metadata)
           inc_major_ddl_data_macro_id));
   ASSERT_EQ(OB_SUCCESS,
       ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
-          cur_tablet_id, inc_major_ddl_data_macro_id, minor_op_id, inc_major_op_id,
+          cur_tablet_id, SCN::min_scn(), inc_major_ddl_data_macro_id, minor_op_id, inc_major_op_id,
           non_idem_major_op_id));
   ASSERT_EQ(-1, minor_op_id);
   ASSERT_EQ(-1, inc_major_op_id);
@@ -2910,7 +2910,7 @@ TEST_F(TestSSMetaIterWrapper, get_lock_row_op_ids_from_persisted_metadata)
           inc_major_ddl_meta_macro_id));
   ASSERT_EQ(OB_SUCCESS,
       ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
-          cur_tablet_id, inc_major_ddl_meta_macro_id, minor_op_id, inc_major_op_id,
+          cur_tablet_id, SCN::min_scn(), inc_major_ddl_meta_macro_id, minor_op_id, inc_major_op_id,
           non_idem_major_op_id));
   ASSERT_EQ(-1, minor_op_id);
   ASSERT_EQ(-1, inc_major_op_id);
@@ -2919,7 +2919,7 @@ TEST_F(TestSSMetaIterWrapper, get_lock_row_op_ids_from_persisted_metadata)
   // 的宏块列表里会混有 SHARED_MINI 宏块，取 op_id 时不能因类型不符而报错。
   ASSERT_EQ(OB_SUCCESS,
       ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
-          cur_tablet_id, mini_data_macro_id, minor_op_id, inc_major_op_id,
+          cur_tablet_id, SCN::min_scn(), mini_data_macro_id, minor_op_id, inc_major_op_id,
           non_idem_major_op_id));
   ASSERT_EQ(17, minor_op_id);
   ASSERT_EQ(-1, inc_major_op_id);
@@ -2935,7 +2935,7 @@ TEST_F(TestSSMetaIterWrapper, get_lock_row_op_ids_from_persisted_metadata)
           other_tablet_macro_id));
   ASSERT_EQ(OB_SUCCESS,
       ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
-          cur_tablet_id, other_tablet_macro_id, minor_op_id, inc_major_op_id,
+          cur_tablet_id, SCN::min_scn(), other_tablet_macro_id, minor_op_id, inc_major_op_id,
           non_idem_major_op_id));
   ASSERT_EQ(-1, minor_op_id);
   ASSERT_EQ(-1, inc_major_op_id);
@@ -2943,7 +2943,7 @@ TEST_F(TestSSMetaIterWrapper, get_lock_row_op_ids_from_persisted_metadata)
   // 不使用两套 lock 的宏块（这里用 tablet sub meta 代表）同样跳过。
   ASSERT_EQ(OB_SUCCESS,
       ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
-          cur_tablet_id, table_store_macro_id, minor_op_id, inc_major_op_id,
+          cur_tablet_id, SCN::min_scn(), table_store_macro_id, minor_op_id, inc_major_op_id,
           non_idem_major_op_id));
   ASSERT_EQ(-1, minor_op_id);
   ASSERT_EQ(-1, inc_major_op_id);
@@ -2968,7 +2968,7 @@ TEST_F(TestSSMetaIterWrapper, restore_major_macro_op_id)
     MacroBlockId ordinary_id;
     ASSERT_EQ(OB_SUCCESS, make_sstable_macro_id(tablet_id, type, 10000, 0, ordinary_id));
     ASSERT_EQ(OB_SUCCESS, ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
-        cur_tablet_id, ordinary_id, minor_op_id, inc_major_op_id, non_idem_major_op_id));
+        cur_tablet_id, SCN::min_scn(), ordinary_id, minor_op_id, inc_major_op_id, non_idem_major_op_id));
     EXPECT_EQ(-1, minor_op_id);
     EXPECT_EQ(-1, inc_major_op_id);
     EXPECT_EQ(-1, non_idem_major_op_id);
@@ -2980,13 +2980,13 @@ TEST_F(TestSSMetaIterWrapper, restore_major_macro_op_id)
       MacroBlockId major_id;
       ASSERT_EQ(OB_SUCCESS, make_sstable_macro_id(tablet_id, type, op_id, 0, major_id));
       ASSERT_EQ(OB_SUCCESS, ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
-          cur_tablet_id, major_id, minor_op_id, inc_major_op_id,
+          cur_tablet_id, SCN::min_scn(), major_id, minor_op_id, inc_major_op_id,
           non_idem_major_op_id));
       EXPECT_EQ(-1, minor_op_id);
       EXPECT_EQ(-1, inc_major_op_id);
       EXPECT_EQ(op_id, non_idem_major_op_id);
       ASSERT_EQ(OB_SUCCESS, ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
-          ObTabletID(tablet_id + 1), major_id, minor_op_id, inc_major_op_id,
+          ObTabletID(tablet_id + 1), SCN::min_scn(), major_id, minor_op_id, inc_major_op_id,
           non_idem_major_op_id));
       EXPECT_EQ(-1, non_idem_major_op_id);
     }
@@ -3014,15 +3014,63 @@ TEST_F(TestSSMetaIterWrapper, restore_major_op_id_accumulates_reused_macro_block
   ObMacroIdIterator other_iter;
   ASSERT_EQ(OB_SUCCESS, other_iter.init(ids, 1, ObMacroIdIterator::Type::OTHER_BLOCK));
   ASSERT_EQ(OB_SUCCESS, ObSSMetaTabletLockRowHelper::accumulate_sstable_macro_op_id_(
-      tablet_id, other_iter, minor, inc_major, non_idem_major));
+      tablet_id, SCN::min_scn(), other_iter, minor, inc_major, non_idem_major));
   ASSERT_EQ(7, non_idem_major);
   ObMacroIdIterator data_iter;
   ASSERT_EQ(OB_SUCCESS, data_iter.init(ids + 1, 3, ObMacroIdIterator::Type::DATA_BLOCK));
   ASSERT_EQ(OB_SUCCESS, ObSSMetaTabletLockRowHelper::accumulate_sstable_macro_op_id_(
-      tablet_id, data_iter, minor, inc_major, non_idem_major));
+      tablet_id, SCN::min_scn(), data_iter, minor, inc_major, non_idem_major));
   EXPECT_EQ(91, non_idem_major);
   EXPECT_EQ(-1, minor);
   EXPECT_EQ(-1, inc_major);
+}
+
+TEST_F(TestSSMetaIterWrapper, restore_macro_op_id_reorganization_scope)
+{
+  using namespace tablet_macro_id_iter_helper;
+  using namespace blocksstable;
+  const ObTabletID tablet_id(REAL_TABLET_TEST_ID_BASE + 10);
+  const SCN reorganization_scn = make_scn(100);
+  for (const auto type : {ObStorageObjectType::SHARED_MINI_META_MACRO,
+                         ObStorageObjectType::SHARED_MINI_DATA_MACRO}) {
+    MacroBlockId ids[3];
+    // Transfer retains old-generation blocks with a larger op_id.
+    ASSERT_EQ(OB_SUCCESS, make_sstable_macro_id(tablet_id.id(), type, 4, 0, ids[0]));
+    for (int64_t i = 1; i < 3; ++i) {
+      ASSERT_EQ(OB_SUCCESS, make_sstable_macro_id(tablet_id.id(), type, i - 1, 0, ids[i]));
+      ids[i].set_reorganization_scn(reorganization_scn.get_val_for_tx());
+    }
+    int64_t minor_op_id = -1;
+    int64_t inc_major_op_id = -1;
+    int64_t non_idem_major_op_id = -1;
+    ObMacroIdIterator macro_iter;
+    const auto iter_type = ObStorageObjectType::SHARED_MINI_META_MACRO == type
+        ? ObMacroIdIterator::Type::OTHER_BLOCK : ObMacroIdIterator::Type::DATA_BLOCK;
+    ASSERT_EQ(OB_SUCCESS, macro_iter.init(ids, 3, iter_type));
+    ASSERT_EQ(OB_SUCCESS, ObSSMetaTabletLockRowHelper::accumulate_sstable_macro_op_id_(
+        tablet_id, reorganization_scn, macro_iter, minor_op_id, inc_major_op_id,
+        non_idem_major_op_id));
+    EXPECT_EQ(1, minor_op_id);
+    EXPECT_EQ(2, minor_op_id + 1);
+    EXPECT_EQ(-1, inc_major_op_id);
+    EXPECT_EQ(-1, non_idem_major_op_id);
+  }
+
+  // The third ID of an LS inner tablet is ls_id, not reorganization_scn.
+  const ObTabletID inner_tablet_id(ObTabletID::LS_TX_DATA_TABLET_ID);
+  MacroBlockId inner_macro_id;
+  ASSERT_EQ(OB_SUCCESS, make_sstable_macro_id(inner_tablet_id.id(),
+      ObStorageObjectType::SHARED_MINI_META_MACRO, 17, 0, inner_macro_id));
+  ASSERT_EQ(1001, inner_macro_id.ls_id());
+  int64_t minor_op_id = -1;
+  int64_t inc_major_op_id = -1;
+  int64_t non_idem_major_op_id = -1;
+  ASSERT_EQ(OB_SUCCESS, ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
+      inner_tablet_id, SCN::min_scn(), inner_macro_id, minor_op_id, inc_major_op_id,
+      non_idem_major_op_id));
+  EXPECT_EQ(17, minor_op_id);
+  EXPECT_EQ(-1, inc_major_op_id);
+  EXPECT_EQ(-1, non_idem_major_op_id);
 }
 
 TEST_F(TestSSMetaIterWrapper, restore_ivf_lock_row_and_allocate_next_attempt)
