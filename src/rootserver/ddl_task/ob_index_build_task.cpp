@@ -2236,7 +2236,8 @@ int ObIndexBuildTask::cleanup_impl()
     LOG_WARN("fail to persist async vector child result", K(ret));
   } else if (snapshot_version_ > 0
              && !parent_managed
-             && !(create_index_arg_.is_offline_rebuild_ && parent_task_id_ > 0)
+             && !(create_index_arg_.is_offline_rebuild_ && parent_task_id_ > 0
+                  && is_async_index(create_index_arg_.index_type_))
              && OB_FAIL(release_snapshot(snapshot_version_))) {
     LOG_WARN("release snapshot failed", K(ret), K(object_id_), K(index_table_id_), K(snapshot_version_));
   } else if (OB_FAIL(report_error_code(unused_str))) {

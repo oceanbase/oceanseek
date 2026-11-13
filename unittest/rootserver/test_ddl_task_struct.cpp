@@ -828,6 +828,71 @@ TEST_F(TestAsyncVectorChildCleanup, offline_restore_and_other_indexes_keep_exist
   ASSERT_EQ(0, proxy_.writes_);
 }
 
+#ifdef ERRSIM
+TEST_F(TestAsyncVectorChildCleanup, offline_snapshot_cleanup_retries_and_preserves_ownership_after_recovery)
+{
+  using namespace share::schema;
+  const ObIndexType owned_types[] = {INDEX_TYPE_NORMAL_LOCAL, INDEX_TYPE_UNIQUE_LOCAL,
+      INDEX_TYPE_NORMAL_GLOBAL, INDEX_TYPE_UNIQUE_GLOBAL, INDEX_TYPE_FTS_DOC_WORD_LOCAL};
+  const ObIndexType borrowed_types[] = {INDEX_TYPE_ASYNC_FTS_INDEX_LOCAL,
+      INDEX_TYPE_ASYNC_SEARCH_DATA_INDEX_LOCAL, INDEX_TYPE_ASYNC_IVF_INDEX_LOCAL};
+  auto &mgr = share::ObDDLSimPointMgr::get_instance();
+  auto &report_repeats = mgr.all_points_[share::REPORT_DDL_RET_CODE_FAILED].action_->max_repeat_times_;
+  const int64_t old_report_repeats = report_repeats;
+  report_repeats = 2;
+  DEFER(report_repeats = old_report_repeats);
+  share::ObTenantDDLSimContext context;
+  context.tenant_id_ = child_.tenant_id_;
+  ASSERT_SUCC(mgr.tenant_map_.set_refactored(child_.tenant_id_, context));
+  DEFER(mgr.tenant_map_.erase_refactored(child_.tenant_id_));
+  const share::ObDDLSimPointMgr::TaskSimPoint release_key(
+      child_.tenant_id_, child_.task_id_, share::DDL_TASK_RELEASE_SNAPSHOT_FAILED);
+  const share::ObDDLSimPointMgr::TaskSimPoint report_key(
+      child_.tenant_id_, child_.task_id_, share::REPORT_DDL_RET_CODE_FAILED);
+  for (const auto status : {share::ObDDLTaskStatus::SUCCESS, share::ObDDLTaskStatus::FAIL}) {
+    for (const bool owns_snapshot : {true, false}) {
+      const ObIndexType *types = owns_snapshot ? owned_types : borrowed_types;
+      const int64_t count = owns_snapshot ? ARRAYSIZEOF(owned_types) : ARRAYSIZEOF(borrowed_types);
+      for (int64_t i = 0; i < count; ++i) {
+        SCOPED_TRACE(static_cast<int>(status));
+        SCOPED_TRACE(static_cast<int>(types[i]));
+        child_.task_status_ = status;
+        child_.ret_code_ = share::ObDDLTaskStatus::FAIL == status ? OB_CANCELED : OB_SUCCESS;
+        child_.need_retry_ = true;
+        child_.create_index_arg_.index_type_ = types[i];
+        child_.create_index_arg_.is_offline_rebuild_ = true;
+        ASSERT_SUCC(mgr.task_sim_map_.set_refactored(release_key, 0));
+        DEFER(mgr.task_sim_map_.erase_refactored(release_key));
+        // Stop reporting before any schema/SQL access when the child borrows its snapshot.
+        ASSERT_SUCC(mgr.task_sim_map_.set_refactored(report_key, 0));
+        DEFER(mgr.task_sim_map_.erase_refactored(report_key));
+        const int ret = child_.cleanup();
+        ASSERT_TRUE(OB_EAGAIN == ret || OB_TIMEOUT == ret);
+        ASSERT_TRUE(child_.need_retry_);
+        ASSERT_EQ(9001, child_.snapshot_version_);
+        ObIndexBuildTask recovered;
+        restore_child(recovered, false);
+        ASSERT_TRUE(recovered.create_index_arg_.is_offline_rebuild_);
+        ASSERT_EQ(types[i], recovered.create_index_arg_.index_type_);
+        const int recovered_ret = recovered.cleanup();
+        ASSERT_TRUE(OB_EAGAIN == recovered_ret || OB_TIMEOUT == recovered_ret);
+        ASSERT_TRUE(recovered.need_retry_);
+        ASSERT_EQ(9001, recovered.snapshot_version_);
+        ASSERT_EQ(child_.ret_code_, recovered.ret_code_);
+        int64_t release_count = 0;
+        int64_t report_count = 0;
+        ASSERT_SUCC(mgr.task_sim_map_.get_refactored(release_key, release_count));
+        ASSERT_SUCC(mgr.task_sim_map_.get_refactored(report_key, report_count));
+        ASSERT_EQ(owns_snapshot ? 2 : 0, release_count);
+        ASSERT_EQ(owns_snapshot ? 0 : 2, report_count);
+        ASSERT_EQ(0, proxy_.reads_);
+        ASSERT_EQ(0, proxy_.writes_);
+      }
+    }
+  }
+}
+#endif
+
 TEST_F(TestAsyncVectorChildCleanup, nonterminal_or_uninitialized_task_cannot_report_result)
 {
   child_.task_status_ = share::ObDDLTaskStatus::REDEFINITION;
