@@ -25,6 +25,9 @@
 #include "storage/shared_storage/common/ob_ss_common_info.h"
 #include "storage/shared_storage/ob_ss_local_cache_service.h"
 #include "storage/shared_storage/macro_cache/macro_block_kvcache/ob_ss_tenant_macro_block_kvcache_mgr.h"
+#ifdef ERRSIM
+#include "observer/ob_server_event_history_table_operator.h"
+#endif
 
 namespace oceanbase
 {
@@ -4280,6 +4283,15 @@ int ObSSMacroCacheMgr::update_ls_info_()
     for (; OB_SUCC(ret) && iter != tmp_ls_info_map.end(); ++iter) {
       if (OB_FAIL(ls_info_map_.set_refactored(iter->first, iter->second, true/*overwrite*/))) {
         LOG_WARN("fail to set refactored ls info map", KR(ret), K(iter->first), K(iter->second));
+#ifdef ERRSIM
+      } else {
+        SERVER_EVENT_ADD("storage_ha", "macro_cache_ls_info_published",
+                         "tenant_id", MTL_ID(),
+                         "ls_id", iter->first.id(),
+                         "valid_size", iter->second.get_valid_size(),
+                         "valid_blocks", iter->second.get_valid_block_count(),
+                         "refresh_start_us", start_us);
+#endif
       }
     }
   }
