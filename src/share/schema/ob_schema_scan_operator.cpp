@@ -156,6 +156,12 @@ int ObSchemaScanOperator::check_spec_(const ObSchemaScanSpec &spec)
   if (OB_UNLIKELY(OB_INVALID_TENANT_ID == spec.tenant_id_)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid tenant_id", KR(ret), K(spec));
+  } else if (OB_UNLIKELY(PARTITION_LEVEL_MAX != spec.part_level_
+             && (PARTITION_LEVEL_ZERO != spec.part_level_
+                 && PARTITION_LEVEL_ONE != spec.part_level_
+                 && PARTITION_LEVEL_TWO != spec.part_level_))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid part_level filter", KR(ret), K(spec));
   } else {
     switch (spec.kind_) {
       case ObSchemaScanKind::BY_TABLE_TYPE:
@@ -300,6 +306,34 @@ int ObSchemaScanOperator::build_uint_in_list_(const ObIArray<uint64_t> &values, 
   return ret;
 }
 
+int ObSchemaScanOperator::append_part_level_predicate(const ObSchemaScanSpec &spec,
+                                                      const char *table_alias,
+                                                      ObSqlString &where_sql)
+{
+  int ret = OB_SUCCESS;
+  if (PARTITION_LEVEL_MAX == spec.part_level_) {
+    // no part_level predicate
+  } else {
+    const bool with_alias = OB_NOT_NULL(table_alias) && '\0' != table_alias[0];
+    const char *a = with_alias ? table_alias : "";
+    const char *d = with_alias ? "." : "";
+    // compare the normalized part_level, same expression as build_select_list_ and
+    // ObSimpleTableSchemaV2::get_part_level(): one partition hash table is level zero
+    if (OB_FAIL(where_sql.append_fmt(
+            " AND (CASE WHEN %s%spart_level = %d AND %s%spart_num = 1 "
+            "AND %s%spart_func_type = %d AND (%s%spart_func_expr IS NULL OR %s%spart_func_expr = '') "
+            "THEN %d ELSE %s%spart_level END) = %ld",
+            a, d, static_cast<int>(PARTITION_LEVEL_ONE),
+            a, d, a, d, static_cast<int>(PARTITION_FUNC_TYPE_HASH),
+            a, d, a, d,
+            static_cast<int>(PARTITION_LEVEL_ZERO),
+            a, d, static_cast<int64_t>(spec.part_level_)))) {
+      LOG_WARN("fail to append part_level predicate", KR(ret), K(spec));
+    }
+  }
+  return ret;
+}
+
 int ObSchemaScanOperator::build_where_clause_(const ObSchemaScanSpec &spec, ObSqlString &where_sql)
 {
   int ret = OB_SUCCESS;
@@ -374,6 +408,10 @@ int ObSchemaScanOperator::build_where_clause_(const ObSchemaScanSpec &spec, ObSq
         ret = OB_INVALID_ARGUMENT;
         LOG_WARN("unknown kind", KR(ret), K(spec));
         break;
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(append_part_level_predicate(spec, NULL, where_sql))) {
+      LOG_WARN("fail to append part_level predicate", KR(ret), K(spec));
     }
   }
   return ret;
@@ -668,12 +706,17 @@ int ObSchemaScanOperator::scan_table_ids(ObISQLClient &sql_client,
       record_scan_stat_(spec, OB_SUCCESS, 0, ObTimeUtility::current_time() - start_ts);
     } else {
       ObSqlString in_list;
+      ObSqlString where_sql;
       ObSqlString sql;
       if (OB_FAIL(build_uint_in_list_(tablespace_ids, in_list))) {
         LOG_WARN("fail to build tablespace in list", KR(ret));
-      } else if (OB_FAIL(sql.assign_fmt(
-              "SELECT table_id FROM %s WHERE tenant_id = 0 AND tablespace_id IN %s",
-              OB_ALL_TABLE_TNAME, in_list.ptr()))) {
+      } else if (OB_FAIL(where_sql.assign_fmt("tenant_id = 0 AND tablespace_id IN %s",
+              in_list.ptr()))) {
+        LOG_WARN("fail to assign encrypted where", KR(ret));
+      } else if (OB_FAIL(append_part_level_predicate(spec, NULL, where_sql))) {
+        LOG_WARN("fail to append part_level predicate", KR(ret), K(spec));
+      } else if (OB_FAIL(sql.assign_fmt("SELECT table_id FROM %s WHERE %s",
+              OB_ALL_TABLE_TNAME, where_sql.ptr()))) {
         LOG_WARN("fail to assign sql", KR(ret));
       } else if (OB_FAIL(execute_table_sql_(sql_client, spec, sql, true/*only_ids*/, &table_ids, NULL))) {
         LOG_WARN("fail to execute table sql", KR(ret), K(sql));

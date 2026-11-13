@@ -166,6 +166,7 @@ struct ObSchemaScanSpec
       filter_id_(common::OB_INVALID_ID),
       enum_values_(NULL),
       select_flags_(OB_SCHEMA_SCAN_SELECT_TABLE_ID),
+      part_level_(PARTITION_LEVEL_MAX),
       caller_tag_(NULL)
   {}
 
@@ -176,11 +177,12 @@ struct ObSchemaScanSpec
     filter_id_ = common::OB_INVALID_ID;
     enum_values_ = NULL;
     select_flags_ = OB_SCHEMA_SCAN_SELECT_TABLE_ID;
+    part_level_ = PARTITION_LEVEL_MAX;
     caller_tag_ = NULL;
   }
 
   TO_STRING_KV(K_(tenant_id), "kind", static_cast<int64_t>(kind_), K_(filter_id),
-               K_(select_flags), K_(caller_tag));
+               K_(select_flags), K_(part_level), K_(caller_tag));
 
   uint64_t tenant_id_;
   ObSchemaScanKind kind_;
@@ -189,6 +191,8 @@ struct ObSchemaScanSpec
   // table_type IN (...) / index_type IN (...); owned by caller
   common::ObIArray<int64_t> *enum_values_;
   uint64_t select_flags_;
+  // optional part_level predicate (appended as part_level = N); PARTITION_LEVEL_MAX means no filter
+  ObPartitionLevel part_level_;
   const char *caller_tag_;
 };
 
@@ -233,6 +237,10 @@ public:
   { return build_select_list_(select_flags, select_list); }
   static int build_where_clause(const ObSchemaScanSpec &spec, common::ObSqlString &where_sql)
   { return build_where_clause_(spec, where_sql); }
+  // Append "AND [alias.]part_level = N" when spec.part_level_ is set; shared by all SQL builders.
+  static int append_part_level_predicate(const ObSchemaScanSpec &spec,
+                                         const char *table_alias,
+                                         common::ObSqlString &where_sql);
   static int build_uint_in_list(const common::ObIArray<uint64_t> &values, common::ObSqlString &in_list)
   { return build_uint_in_list_(values, in_list); }
   // str_allocator required when NEED_STR_ALLOCATOR flags are set.
@@ -280,4 +288,4 @@ private:
 } // namespace schema
 } // namespace share
 } // namespace oceanbase
-#endif // OCEANBASE_SHARE_SCHEMA_OB_SCHEMA_SCAN_OPERATOR_H_
+#endif // OCEANBASE_SHARE_SCHEMA_OB_SCHEMA_SCAN_OP

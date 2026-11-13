@@ -289,6 +289,11 @@ bool ObSchemaLiteTableIterator::match_scan_pred_(const ObSimpleTableSchemaV2 &sc
       matched = false;
       break;
   }
+  // optional part_level predicate, keep Original path consistent with the SQL paths
+  if (matched && PARTITION_LEVEL_MAX != ts.part_level_
+      && schema.get_part_level() != ts.part_level_) {
+    matched = false;
+  }
   return matched;
 }
 
@@ -651,6 +656,13 @@ int ObSchemaLiteTableIterator::build_count_table_where_(ObSqlString &where_sql,
       }
     }
   }
+  // optional part_level predicate; the unprefixed path above already gets it from build_where_clause
+  if (OB_FAIL(ret)) {
+  } else if ((with_alias || ObSchemaScanKind::BY_ENCRYPTED_TABLESPACE == spec_.table_spec_.kind_)
+      && OB_FAIL(ObSchemaScanOperator::append_part_level_predicate(
+          spec_.table_spec_, with_alias ? table_alias : NULL, where_sql))) {
+    LOG_WARN("fail to append part_level predicate", KR(ret), K_(spec));
+  }
   return ret;
 }
 
@@ -820,11 +832,17 @@ int ObSchemaLiteTableIterator::build_table_sql_(ObSqlString &sql)
       }
     } else if (OB_FAIL(ObSchemaScanOperator::build_uint_in_list(tablespace_ids, in_list))) {
       LOG_WARN("fail to build tablespace in list", KR(ret));
-    } else if (OB_FAIL(sql.assign_fmt(
-            "SELECT %s FROM %s WHERE tenant_id = 0 AND tablespace_id IN %s "
-            "ORDER BY table_id ASC",
-            select_list.ptr(), OB_ALL_TABLE_TNAME, in_list.ptr()))) {
-      LOG_WARN("fail to assign encrypted table sql", KR(ret));
+    } else {
+      ObSqlString where_sql;
+      if (OB_FAIL(where_sql.assign_fmt("tenant_id = 0 AND tablespace_id IN %s", in_list.ptr()))) {
+        LOG_WARN("fail to assign encrypted where", KR(ret));
+      } else if (OB_FAIL(ObSchemaScanOperator::append_part_level_predicate(
+              spec_.table_spec_, NULL, where_sql))) {
+        LOG_WARN("fail to append part_level predicate", KR(ret), K_(spec));
+      } else if (OB_FAIL(sql.assign_fmt("SELECT %s FROM %s WHERE %s ORDER BY table_id ASC",
+              select_list.ptr(), OB_ALL_TABLE_TNAME, where_sql.ptr()))) {
+        LOG_WARN("fail to assign encrypted table sql", KR(ret));
+      }
     }
   } else if (OB_FAIL(ObSchemaScanOperator::build_where_clause(spec_.table_spec_, where_sql))) {
     LOG_WARN("fail to build where", KR(ret), K_(spec));
