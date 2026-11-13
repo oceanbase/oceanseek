@@ -1177,6 +1177,64 @@ TEST_F(TestAsyncIndexMergePolicy, align_empty_inputs_does_not_fabricate_segments
   EXPECT_TRUE(output.empty());
 }
 
+TEST_F(TestAsyncIndexMergePolicy, align_many_incremental_inputs_into_two_groups)
+{
+  ObSEArray<ObSEArray<ObAsyncIndexSSTableMergeInfo, 8>, 4> inputs;
+  ObSEArray<ObAsyncIndexSSTableMergeInfo, 8> index;
+  ObSEArray<ObAsyncIndexSSTableMergeInfo, 8> output;
+  MergeInfoSpec a[49] = {{0, 100, 1000000}};
+  for (int64_t i = 0; i < 48; ++i) {
+    a[i + 1] = {100 + i, 101 + i, 1};
+  }
+  const MergeInfoSpec b[] = {{0, 147, 1000000}, {147, 148, 1}};
+  ASSERT_EQ(OB_SUCCESS, build_merge_infos(a, ARRAYSIZEOF(a), index));
+  ASSERT_EQ(OB_SUCCESS, inputs.push_back(index));
+  ASSERT_EQ(OB_SUCCESS, build_merge_infos(b, ARRAYSIZEOF(b), index));
+  ASSERT_EQ(OB_SUCCESS, inputs.push_back(index));
+  ASSERT_EQ(49, inputs.at(0).count());
+  ASSERT_EQ(2, inputs.at(1).count());
+
+  // B's major joins A's major and 47 incremental inputs into one group.
+  // The aligned group count does not represent the actual incremental input count.
+  int64_t snapshot = 148;
+  ASSERT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicyHelper::align_merge_infos(inputs, snapshot, output));
+  EXPECT_EQ(148, snapshot);
+  ASSERT_EQ(2, output.count());
+  EXPECT_EQ(0, output.at(0).start_snapshot_version_);
+  EXPECT_EQ(147, output.at(0).end_snapshot_version_);
+  EXPECT_EQ(2000047, output.at(0).seg_size_);
+  EXPECT_EQ(147, output.at(1).start_snapshot_version_);
+  EXPECT_EQ(148, output.at(1).end_snapshot_version_);
+  EXPECT_EQ(2, output.at(1).seg_size_);
+}
+
+TEST_F(TestAsyncIndexMergePolicy, align_many_incremental_inputs_into_single_group)
+{
+  ObSEArray<ObSEArray<ObAsyncIndexSSTableMergeInfo, 8>, 4> inputs;
+  ObSEArray<ObAsyncIndexSSTableMergeInfo, 8> index;
+  ObSEArray<ObAsyncIndexSSTableMergeInfo, 8> output;
+  MergeInfoSpec a[49] = {{0, 100, 1000000}};
+  for (int64_t i = 0; i < 48; ++i) {
+    a[i + 1] = {100 + i, 101 + i, 1};
+  }
+  const MergeInfoSpec b[] = {{0, 148, 1000000}};
+  ASSERT_EQ(OB_SUCCESS, build_merge_infos(a, ARRAYSIZEOF(a), index));
+  ASSERT_EQ(OB_SUCCESS, inputs.push_back(index));
+  ASSERT_EQ(OB_SUCCESS, build_merge_infos(b, ARRAYSIZEOF(b), index));
+  ASSERT_EQ(OB_SUCCESS, inputs.push_back(index));
+  ASSERT_EQ(49, inputs.at(0).count());
+  ASSERT_EQ(1, inputs.at(1).count());
+
+  // One aligned group can contain all 48 incremental inputs from A.
+  int64_t snapshot = 148;
+  ASSERT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicyHelper::align_merge_infos(inputs, snapshot, output));
+  EXPECT_EQ(148, snapshot);
+  ASSERT_EQ(1, output.count());
+  EXPECT_EQ(0, output.at(0).start_snapshot_version_);
+  EXPECT_EQ(148, output.at(0).end_snapshot_version_);
+  EXPECT_EQ(2000048, output.at(0).seg_size_);
+}
+
 TEST_F(TestAsyncIndexMergePolicy, align_sparse_adjacent_boundaries_remain_independent)
 {
   ObSEArray<ObSEArray<ObAsyncIndexSSTableMergeInfo, 8>, 4> inputs;

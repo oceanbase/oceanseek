@@ -826,6 +826,10 @@ int ObAsyncIndexMergePolicy::choose_async_index_merge_range(
     } else {
       final_merge_info_cnt = final_merge_infos.count();
     }
+    int64_t sstable_cnt = final_merge_info_cnt;
+    for (int64_t i = 0; OB_SUCC(ret) && i < all_merge_infos.count(); ++i) {
+      sstable_cnt = MAX(sstable_cnt, all_merge_infos.at(i).count());
+    }
     if (OB_FAIL(ret)) {
     } else if (final_merge_info_cnt > 2
 #ifdef ERRSIM
@@ -840,14 +844,16 @@ int ObAsyncIndexMergePolicy::choose_async_index_merge_range(
       }
       merge_version_range.snapshot_version_ = schedule_snapshot_version;
       LOG_INFO("async index inc merge by errsim", K(merge_version_range), K(schedule_snapshot_version), K(merge_reason));
-    } else if (final_merge_info_cnt < async_index_params.merge_segment_threshold_) {
+    } else if (final_merge_info_cnt <= 0
+        || sstable_cnt < async_index_params.merge_segment_threshold_) {
       ret = OB_NO_NEED_MERGE;
-      LOG_INFO("sstable info count is less than merge segment threshold, skip merge", KR(ret), K(final_merge_info_cnt), K(async_index_params));
+      LOG_INFO("skip async index merge for insufficient inputs", KR(ret),
+          K(final_merge_info_cnt), K(sstable_cnt), K(async_index_params));
     } else if (ERRSIM_DISABLE_ASYNC_INDEX_INC_MERGE != OB_SUCCESS) {
       merge_version_range.base_version_ = 0;
       merge_version_range.snapshot_version_ = schedule_snapshot_version;
       LOG_INFO("async index medium merge by errsim", KR(ret), K(merge_version_range), K(schedule_snapshot_version), K(merge_reason));
-    } else if (final_merge_info_cnt > MAX_INC_MAJOR_SSTABLE_CNT / 2) {
+    } else if (sstable_cnt > MAX_INC_MAJOR_SSTABLE_CNT / 2) {
       // inc sstable 太多了, 不需要通过策略选表, 直接合并所有表
       // 但是为了避免基线过多, 导致合并代价过大, 需要检查基线占比, 小于50%才合并基线, 以保证基线一定是最大的sstable
       int64_t total_size = 0;
@@ -856,15 +862,25 @@ int ObAsyncIndexMergePolicy::choose_async_index_merge_range(
       }
       int64_t base_size = 0;
       int64_t first_merge_idx = 0;
-      if (final_merge_infos.at(0).start_snapshot_version_ == 0) {
+      if (final_merge_info_cnt > 1 && final_merge_infos.at(0).start_snapshot_version_ == 0) {
         base_size = final_merge_infos.at(0).seg_size_;
         if (base_size > 0 && total_size - base_size < base_size) {
           first_merge_idx = 1;
+          // Skip only when each index contributes at most one table to the first group.
+          for (int64_t i = 0; OB_SUCC(ret) && first_merge_idx > 0
+              && i < all_merge_infos.count(); ++i) {
+            const ObIArray<ObAsyncIndexSSTableMergeInfo> &infos = all_merge_infos.at(i);
+            if (infos.count() > 1 && infos.at(1).start_snapshot_version_
+                < final_merge_infos.at(0).end_snapshot_version_) {
+              first_merge_idx = 0;
+            }
+          }
         }
       }
       merge_version_range.base_version_ = final_merge_infos.at(first_merge_idx).start_snapshot_version_;
       merge_version_range.snapshot_version_ = schedule_snapshot_version;
-      LOG_INFO("async index medium merge by too many inc sstable", KR(ret), K(merge_version_range), K(schedule_snapshot_version), K(merge_reason));
+      LOG_INFO("async index medium merge by too many inc sstable", KR(ret),
+          K(merge_version_range), K(schedule_snapshot_version), K(merge_reason), K(sstable_cnt));
     } else if (OB_FAIL(merge_policy.init(async_index_params.merge_segment_threshold_))) {
       LOG_WARN("failed to init async index merge policy", KR(ret));
     } else if (OB_FAIL(merge_policy.find_merges(final_merge_infos, merge_version_range))) {

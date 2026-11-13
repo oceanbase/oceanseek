@@ -1515,6 +1515,8 @@ public:
       MultiAsyncIndexTabletCtx &ctx,
       const int64_t expected_last_major_snapshot);
   void run_multi_major_async_index_compaction_schedule(MultiAsyncIndexTabletCtx &ctx);
+  void run_choose_merge_range_at_incremental_capacity(const bool single_group);
+  void run_choose_merge_range_capacity_without_first_group(const bool interleaved);
   void assert_major_sstable_cnt_at_least(
       const ObLSID &ls_id, const ObTabletID &tablet_id, const int64_t expect_min);
   void verify_empty_fts_inv_major_on_tablet(
@@ -1597,7 +1599,8 @@ public:
       ObSSTable *&sstable,
       const bool committed = true,
       const bool is_delete_index = false,
-      const ObScnRange *physical_range = nullptr);
+      const ObScnRange *physical_range = nullptr,
+      const int64_t trans_id = 100);
   int mock_major_sstable(
       const ObTabletID &tablet_id,
       const int64_t snapshot_version,
@@ -1646,7 +1649,8 @@ public:
       const int64_t snapshot_version,
       const int64_t occupy_size,
       const bool committed = true,
-      const bool as_inc_major_merge_result = false);
+      const bool as_inc_major_merge_result = false,
+      const int64_t trans_id = 100);
   int fill_inc_major_segments(
       ObLSHandle &ls_handle,
       const ObTabletID &tablet_id,
@@ -2475,7 +2479,8 @@ int ObAsyncIndexCompactionTest::mock_inc_major_sstable(
     ObSSTable *&sstable,
     const bool committed,
     const bool is_delete_index,
-    const ObScnRange *physical_range)
+    const ObScnRange *physical_range,
+    const int64_t trans_id)
 {
   int ret = OB_SUCCESS;
   void *buf = nullptr;
@@ -2546,7 +2551,7 @@ int ObAsyncIndexCompactionTest::mock_inc_major_sstable(
   param.is_co_table_without_cgs_ = false;
   param.co_base_snapshot_version_ = 0;
   param.column_cnt_ = param.rowkey_column_cnt_;
-  compaction::ObUncommitTxDesc tx_desc(100, 200);
+  compaction::ObUncommitTxDesc tx_desc(trans_id, 200);
   param.uncommit_tx_info_.push_back(tx_desc);
   param.uncommit_tx_info_.set_info_status_record_seq();
   ObSSTableMergeRes::fill_column_checksum_for_empty_major(param.column_cnt_, param.column_checksums_);
@@ -2798,7 +2803,8 @@ int ObAsyncIndexCompactionTest::add_inc_major_to_tablet(
     const int64_t snapshot_version,
     const int64_t occupy_size,
     const bool committed,
-    const bool as_inc_major_merge_result)
+    const bool as_inc_major_merge_result,
+    const int64_t trans_id)
 {
   int ret = OB_SUCCESS;
   ObTabletHandle tablet_handle;
@@ -2813,7 +2819,8 @@ int ObAsyncIndexCompactionTest::add_inc_major_to_tablet(
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(ls->get_tablet(tablet_id, tablet_handle))) {
     LOG_WARN("failed to get tablet", KR(ret), K(tablet_id));
-  } else if (OB_FAIL(mock_inc_major_sstable(tablet_id, base_version, snapshot_version, occupy_size, sstable, committed))) {
+  } else if (OB_FAIL(mock_inc_major_sstable(tablet_id, base_version, snapshot_version,
+      occupy_size, sstable, committed, false /*is_delete_index*/, nullptr, trans_id))) {
     LOG_WARN("failed to mock inc major sstable", KR(ret), K(tablet_id));
   } else if (OB_FAIL(tablet_handle.get_obj()->load_storage_schema(allocator_, storage_schema))) {
     LOG_WARN("failed to load storage schema", KR(ret), K(tablet_id));

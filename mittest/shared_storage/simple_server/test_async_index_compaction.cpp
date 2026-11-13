@@ -7,7 +7,7 @@
  * 基础组用例目录（按源码定义顺序；搜索完整用例名可定位实现）
  * 范围：DDL/schema、合并选表/选范围、元数据和 medium info 构造/提交。
  * 真实 DAG 执行、refresh/DML 配合及破坏性 GC 场景放在 integration 文件。
- * 共 39 个测试定义，参数展开后 52 个启用 case。
+ * 共 44 个测试定义，参数展开后 57 个启用 case。
  * 默认 fixture 为 ObAsyncIndexCompactionTest；特殊参数化 fixture 如下：
  *   多索引：ObMultiAsyncIndexCompactionTest，/0、/1、/2 分别为 2、3、5 个全文索引。
  *   分区：ObPartitionAsyncIndexCompactionTest，/0=HASH 4 分区，/1=RANGE 3 分区，
@@ -92,8 +92,19 @@
  *     同时检查全文索引和删除索引：物理 SCN 空洞/空区间、逻辑空洞、缺少前后缀或无增量时仍可选择现有合法输入。
  * 39. unpublished_delete_baseline_limits_group_merge
  *     共享删除索引尚未发布时以已安装Major约束组目标，选范围不改变逻辑/查询发布水位。
+ * 40. missing_baseline_skips_group_merge
+ *     任一参与索引缺少基线时跳过整组调度。
+ * 41. choose_merge_range_at_capacity_with_two_groups
+ *     旧索引的 48 个增量与后建索引的新基线对齐成两组，验证普通策略能够选择释放容量的区间。
+ * 42. choose_merge_range_at_capacity_with_single_group
+ *     后建索引基线覆盖旧索引的全部增量，验证仅一组时也能释放容量。
+ * 43. choose_merge_range_capacity_skips_single_table_first_group
+ *     首组每个索引仅一张基线时，容量兜底仍跳过大基线，第二张表恰从首组终点开始。
+ * 44. choose_merge_range_capacity_preserves_aligned_group_count
+ *     两索引各 18 张候选交错成 35 组，验证容量判断保留组数作为计数下限。
  */
 #include "test_async_index_compaction_common.h"
+#include "storage/ddl/ob_ddl_inc_task.h"
 
 const char *get_per_file_test_name()
 {
@@ -980,6 +991,197 @@ void ObAsyncIndexCompactionTest::run_choose_merge_range_multi_index_varying_cnts
   }
 }
 
+void ObAsyncIndexCompactionTest::run_choose_merge_range_at_incremental_capacity(
+    const bool single_group)
+{
+  exe_prepare_sql();
+  const char *table_name = single_group
+      ? "t_async_capacity_single_group" : "t_async_capacity_two_groups";
+  ASSERT_NO_FATAL_FAILURE(create_async_fts_table_with_index_cnt(table_name, 2));
+  MultiAsyncIndexTabletCtx ctx;
+  ASSERT_NO_FATAL_FAILURE(resolve_multi_async_index_tablet_ctx(table_name, ctx));
+  ASSERT_EQ(2, ctx.fts_index_tablet_ids_.count());
+  ObLSHandle ls_handle;
+  ASSERT_EQ(OB_SUCCESS, get_ls_handle(ctx.ls_id_, ls_handle));
+  const int64_t inc_count = ObDDLIncLoadUtil::MAX_INC_MAJOR_DIRECT_LOAD_CNT;
+  const int64_t old_major = get_mock_major_snapshot(ctx);
+  const int64_t target = old_major + inc_count * DEFAULT_INC_MAJOR_STEP;
+  const int64_t new_major = single_group ? target : target - DEFAULT_INC_MAJOR_STEP;
+  ASSERT_GT(old_major, 0);
+
+  // Each old-index segment occupies a different transaction slot. Reusing the
+  // default mock transaction would create 48 files but only one capacity slot.
+  for (int64_t i = 0; i < ctx.fts_index_tablet_ids_.count(); ++i) {
+    const ObTabletID &tablet_id = ctx.fts_index_tablet_ids_.at(i);
+    const int64_t major = 0 == i ? old_major : new_major;
+    const int64_t count = 0 == i ? inc_count : (single_group ? 0 : 1);
+    ASSERT_EQ(OB_SUCCESS, add_major_to_tablet(ls_handle, tablet_id, major,
+        100 /*row_count*/, INDEX_TYPE_ASYNC_FTS_INDEX_LOCAL, 1000000 /*occupy_size*/));
+    for (int64_t j = 0; j < count; ++j) {
+      const int64_t base = major + j * DEFAULT_INC_MAJOR_STEP;
+      ASSERT_EQ(OB_SUCCESS, add_inc_major_to_tablet(ls_handle, tablet_id,
+          base, base + DEFAULT_INC_MAJOR_STEP, 1 /*occupy_size*/,
+          true /*committed*/, false /*as_inc_major_merge_result*/, 1000 + i * 100 + j));
+    }
+    ASSERT_EQ(OB_SUCCESS, publish_async_index_version(ls_handle, tablet_id, target));
+    ASSERT_NO_FATAL_FAILURE(verify_inc_major_cnt(ctx.ls_id_, tablet_id, count));
+  }
+  ASSERT_EQ(OB_SUCCESS, add_empty_data_major_to_tablet(
+      ls_handle, ctx.delete_index_tablet_id_, target));
+  ASSERT_EQ(OB_SUCCESS, publish_async_index_version(
+      ls_handle, ctx.delete_index_tablet_id_, target));
+
+  ObTabletHandle data_handle;
+  ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, ctx.data_tablet_id_, data_handle));
+  ObSEArray<ObTabletID, 4> index_ids;
+  ObTabletID delete_id;
+  ObAsyncIndexParams params;
+  ASSERT_EQ(OB_SUCCESS, ObMediumCompactionScheduleFunc::get_async_index_tablet_ids(
+      *data_handle.get_obj(), index_ids, delete_id, params));
+  ASSERT_EQ(2, index_ids.count());
+  ASSERT_EQ(ctx.delete_index_tablet_id_, delete_id);
+  int64_t common_snapshot = 0;
+  ASSERT_EQ(OB_SUCCESS, calc_common_published_snapshot(
+      *ls_handle.get_ls(), index_ids, delete_id, common_snapshot));
+  ASSERT_EQ(target, common_snapshot);
+
+  ObSEArray<ObSEArray<ObAsyncIndexSSTableMergeInfo, 8>, 4> inputs;
+  for (int64_t i = 0; i < ctx.fts_index_tablet_ids_.count(); ++i) {
+    ObTabletHandle index_handle;
+    ObSEArray<ObAsyncIndexSSTableMergeInfo, 8> infos;
+    ASSERT_EQ(OB_SUCCESS, get_tablet_handle(
+        ctx.ls_id_, ctx.fts_index_tablet_ids_.at(i), index_handle));
+    ASSERT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicyHelper::collect_merge_infos(
+        *ls_handle.get_ls(), *index_handle.get_obj(), target, infos));
+    ASSERT_EQ(0 == i ? inc_count + 1 : (single_group ? 1 : 2), infos.count());
+    ASSERT_EQ(OB_SUCCESS, inputs.push_back(infos));
+    if (0 == i) {
+      ObTabletMemberWrapper<ObTabletTableStore> store;
+      ASSERT_EQ(OB_SUCCESS, index_handle.get_obj()->fetch_table_store(store));
+      ASSERT_NE(nullptr, store.get_member());
+      hash::ObHashSet<transaction::ObTransID> trans_ids;
+      ASSERT_EQ(OB_SUCCESS, trans_ids.create(inc_count,
+          ObMemAttr(MTL_ID(), "AsyncCapTest")));
+      DEFER(trans_ids.destroy());
+      bool is_prepared = true;
+      ASSERT_EQ(OB_SUCCESS, ObDDLIncLoadUtil::search_inc_major_sstables(
+          store.get_member()->get_inc_major_sstables(), trans_ids, is_prepared));
+      ASSERT_EQ(inc_count, trans_ids.size());
+      ASSERT_FALSE(is_prepared);
+    }
+  }
+  ObSEArray<ObAsyncIndexSSTableMergeInfo, 8> groups;
+  ASSERT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicyHelper::align_merge_infos(
+      inputs, common_snapshot, groups));
+  ASSERT_EQ(single_group ? 1 : 2, groups.count());
+  ASSERT_EQ(target, common_snapshot);
+  ASSERT_EQ(0, groups.at(0).start_snapshot_version_);
+  ASSERT_EQ(new_major, groups.at(0).end_snapshot_version_);
+  LOG_INFO("async index capacity reproduction", K(single_group), K(inc_count),
+      K(inputs), K(groups), K(common_snapshot));
+
+  // Use the adaptive path: a forced/tenant major would bypass the bad threshold
+  // and conceal the capacity stall. A valid result must include the first group,
+  // where the old index's accumulated increments overlap the newer baseline.
+  ObNewVersionRange range;
+  ASSERT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicy::choose_async_index_merge_range(
+      *ls_handle.get_ls(), *data_handle.get_obj(), index_ids, delete_id,
+      ObAdaptiveMergePolicy::NONE, params, range));
+  ASSERT_TRUE(range.is_valid());
+  ASSERT_EQ(0, range.base_version_);
+  ASSERT_GE(range.snapshot_version_, new_major);
+  ASSERT_LE(range.snapshot_version_, target);
+}
+
+void ObAsyncIndexCompactionTest::run_choose_merge_range_capacity_without_first_group(
+    const bool interleaved)
+{
+  exe_prepare_sql();
+  const char *table_name = interleaved
+      ? "t_async_capacity_interleaved" : "t_async_capacity_skip_base";
+  ASSERT_NO_FATAL_FAILURE(create_async_fts_table_with_index_cnt(table_name, 2));
+  MultiAsyncIndexTabletCtx ctx;
+  ASSERT_NO_FATAL_FAILURE(resolve_multi_async_index_tablet_ctx(table_name, ctx));
+  ASSERT_EQ(2, ctx.fts_index_tablet_ids_.count());
+  ObLSHandle ls_handle;
+  ASSERT_EQ(OB_SUCCESS, get_ls_handle(ctx.ls_id_, ls_handle));
+  const int64_t major = get_mock_major_snapshot(ctx);
+  const int64_t inc_count = interleaved ? 17 : 39;
+  const int64_t target = major + inc_count * (interleaved ? 2 : 1) * DEFAULT_INC_MAJOR_STEP;
+  const int64_t base_size = 1000000;
+  ASSERT_GT(major, 0);
+
+  for (int64_t i = 0; i < ctx.fts_index_tablet_ids_.count(); ++i) {
+    const ObTabletID &tablet_id = ctx.fts_index_tablet_ids_.at(i);
+    ASSERT_EQ(OB_SUCCESS, add_major_to_tablet(ls_handle, tablet_id, major,
+        100 /*row_count*/, INDEX_TYPE_ASYNC_FTS_INDEX_LOCAL, base_size));
+    for (int64_t j = 0; j < inc_count; ++j) {
+      // Missing alternating checkpoints represent empty refreshes, not wider SSTables.
+      const int64_t checkpoint_idx = interleaved ? 2 * j + i : j;
+      const int64_t base = major + checkpoint_idx * DEFAULT_INC_MAJOR_STEP;
+      ASSERT_EQ(OB_SUCCESS, add_inc_major_to_tablet(ls_handle, tablet_id,
+          base, base + DEFAULT_INC_MAJOR_STEP, 1 /*occupy_size*/,
+          true /*committed*/, false /*as_inc_major_merge_result*/, 1000 + i * 100 + j));
+    }
+    ASSERT_EQ(OB_SUCCESS, publish_async_index_version(ls_handle, tablet_id, target));
+    ASSERT_NO_FATAL_FAILURE(verify_inc_major_cnt(ctx.ls_id_, tablet_id, inc_count));
+  }
+  ASSERT_EQ(OB_SUCCESS, add_empty_data_major_to_tablet(
+      ls_handle, ctx.delete_index_tablet_id_, target));
+  ASSERT_EQ(OB_SUCCESS, publish_async_index_version(
+      ls_handle, ctx.delete_index_tablet_id_, target));
+
+  ObTabletHandle data_handle;
+  ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, ctx.data_tablet_id_, data_handle));
+  ObSEArray<ObTabletID, 4> index_ids;
+  ObTabletID delete_id;
+  ObAsyncIndexParams params;
+  ASSERT_EQ(OB_SUCCESS, ObMediumCompactionScheduleFunc::get_async_index_tablet_ids(
+      *data_handle.get_obj(), index_ids, delete_id, params));
+  ASSERT_EQ(2, index_ids.count());
+  ASSERT_EQ(ctx.delete_index_tablet_id_, delete_id);
+  if (interleaved) {
+    // Raw per-index counts are below this threshold; only the 35 aligned groups pass it.
+    params.merge_segment_threshold_ = 32;
+    ASSERT_LT(inc_count + 1, params.merge_segment_threshold_);
+  }
+  int64_t common_snapshot = 0;
+  ASSERT_EQ(OB_SUCCESS, calc_common_published_snapshot(
+      *ls_handle.get_ls(), index_ids, delete_id, common_snapshot));
+  ASSERT_EQ(target, common_snapshot);
+
+  ObSEArray<ObSEArray<ObAsyncIndexSSTableMergeInfo, 8>, 4> inputs;
+  for (int64_t i = 0; i < ctx.fts_index_tablet_ids_.count(); ++i) {
+    ObTabletHandle index_handle;
+    ObSEArray<ObAsyncIndexSSTableMergeInfo, 8> infos;
+    ASSERT_EQ(OB_SUCCESS, get_tablet_handle(
+        ctx.ls_id_, ctx.fts_index_tablet_ids_.at(i), index_handle));
+    ASSERT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicyHelper::collect_merge_infos(
+        *ls_handle.get_ls(), *index_handle.get_obj(), target, infos));
+    ASSERT_EQ(inc_count + 1, infos.count());
+    ASSERT_EQ(major + (interleaved ? i : 0) * DEFAULT_INC_MAJOR_STEP,
+        infos.at(1).start_snapshot_version_);
+    ASSERT_EQ(OB_SUCCESS, inputs.push_back(infos));
+  }
+  ObSEArray<ObAsyncIndexSSTableMergeInfo, 8> groups;
+  ASSERT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicyHelper::align_merge_infos(
+      inputs, common_snapshot, groups));
+  ASSERT_EQ(1 + inc_count * (interleaved ? 2 : 1), groups.count());
+  ASSERT_EQ(target, common_snapshot);
+  ASSERT_EQ(0, groups.at(0).start_snapshot_version_);
+  ASSERT_EQ(major, groups.at(0).end_snapshot_version_);
+  ASSERT_EQ(2 * base_size, groups.at(0).seg_size_);
+  ASSERT_GT(groups.at(0).seg_size_, 2 * inc_count);
+
+  ObNewVersionRange range;
+  ASSERT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicy::choose_async_index_merge_range(
+      *ls_handle.get_ls(), *data_handle.get_obj(), index_ids, delete_id,
+      ObAdaptiveMergePolicy::NONE, params, range));
+  ASSERT_TRUE(range.is_valid());
+  ASSERT_EQ(major, range.base_version_);
+  ASSERT_EQ(target, range.snapshot_version_);
+}
+
 void ObAsyncIndexCompactionTest::run_choose_merge_range_multi_index_min_snapshot(const int64_t fts_index_cnt)
 {
   static const int64_t INC_MAJOR_CNTS[] = {12, 14, 14};
@@ -1164,7 +1366,12 @@ void ObAsyncIndexCompactionTest::run_async_index_inc_major_merge_base_version(
   ASSERT_EQ(OB_SUCCESS, ObMediumCompactionScheduleFunc::get_async_index_tablet_ids(
       *data_handle.get_obj(), index_tablet_ids, delete_index_tablet_id, async_index_params));
 
+  const int64_t published_snapshot = calc_schedule_snapshot_version(major_snapshot);
+  ASSERT_EQ(OB_SUCCESS, publish_async_index_version(
+      ls_handle, fts_tablet_id, published_snapshot));
   ASSERT_NO_FATAL_FAILURE(prepare_delete_index_publish_for_merge(ctx, ls_handle));
+  ASSERT_EQ(OB_SUCCESS, publish_async_index_version(
+      ls_handle, delete_index_tablet_id, published_snapshot));
 
   ObNewVersionRange merge_version_range;
   ASSERT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicy::choose_async_index_merge_range(
@@ -1261,7 +1468,12 @@ void ObAsyncIndexCompactionTest::run_async_index_suffix_first_prefix_orphan_bloc
   ASSERT_EQ(OB_SUCCESS, ObMediumCompactionScheduleFunc::get_async_index_tablet_ids(
       *data_handle.get_obj(), index_tablet_ids, delete_index_tablet_id, async_index_params));
 
+  const int64_t published_snapshot = calc_schedule_snapshot_version(major_snapshot);
+  ASSERT_EQ(OB_SUCCESS, publish_async_index_version(
+      ls_handle, fts_tablet_id, published_snapshot));
   ASSERT_NO_FATAL_FAILURE(prepare_delete_index_publish_for_merge(ctx, ls_handle));
+  ASSERT_EQ(OB_SUCCESS, publish_async_index_version(
+      ls_handle, delete_index_tablet_id, published_snapshot));
 
   ObNewVersionRange suffix_merge_range;
   ASSERT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicy::choose_async_index_merge_range(
@@ -2503,6 +2715,34 @@ TEST_F(ObAsyncIndexCompactionTest, choose_merge_range_multi_index_min_snapshot)
   OK(tguard.switch_to(run_ctx_.tenant_id_));
   exe_prepare_sql();
   run_choose_merge_range_multi_index_min_snapshot(3);
+}
+
+TEST_F(ObAsyncIndexCompactionTest, choose_merge_range_at_capacity_with_two_groups)
+{
+  share::ObTenantSwitchGuard tguard;
+  OK(tguard.switch_to(run_ctx_.tenant_id_));
+  ASSERT_NO_FATAL_FAILURE(run_choose_merge_range_at_incremental_capacity(false));
+}
+
+TEST_F(ObAsyncIndexCompactionTest, choose_merge_range_at_capacity_with_single_group)
+{
+  share::ObTenantSwitchGuard tguard;
+  OK(tguard.switch_to(run_ctx_.tenant_id_));
+  ASSERT_NO_FATAL_FAILURE(run_choose_merge_range_at_incremental_capacity(true));
+}
+
+TEST_F(ObAsyncIndexCompactionTest, choose_merge_range_capacity_skips_single_table_first_group)
+{
+  share::ObTenantSwitchGuard tguard;
+  OK(tguard.switch_to(run_ctx_.tenant_id_));
+  ASSERT_NO_FATAL_FAILURE(run_choose_merge_range_capacity_without_first_group(false));
+}
+
+TEST_F(ObAsyncIndexCompactionTest, choose_merge_range_capacity_preserves_aligned_group_count)
+{
+  share::ObTenantSwitchGuard tguard;
+  OK(tguard.switch_to(run_ctx_.tenant_id_));
+  ASSERT_NO_FATAL_FAILURE(run_choose_merge_range_capacity_without_first_group(true));
 }
 
 TEST_F(ObAsyncIndexCompactionTest, choose_merge_range_no_need_merge)
