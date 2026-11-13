@@ -15,6 +15,7 @@ namespace sql
 {
 struct FPContext;
 struct ObFastParserResult;
+struct ObRemoteSqlInfo;
 struct SqlInfo;
 class ObSQLSessionInfo;
 
@@ -96,6 +97,9 @@ public:
   static ObHybridDslRequestInfo *get_request(ObHybridDslRequestInfo *request);
   static ObHybridDslRequestInfo *get_request(const ObFastParserResult &result);
   static bool can_add_plan(const ObFastParserResult &result);
+  // Prepare the hybrid-specific remote payload.
+  static int prepare_remote_sql(ObPlanCacheCtx &ctx, ObRemoteSqlInfo &remote_sql_info);
+  static int get_remote_sql(ObPlanCacheCtx &ctx, common::ObString &sql);
 
   static int finish_fast_parse(common::ObIAllocator &allocator, const FPContext &fp_ctx,
       ObFastParserResult &fp_result, ObSQLSessionInfo *session);

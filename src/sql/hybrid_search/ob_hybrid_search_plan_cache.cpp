@@ -417,6 +417,73 @@ bool ObHybridSearchPlanCache::can_add_plan(const ObFastParserResult &result)
   return request != nullptr && request->params_bound();
 }
 
+int ObHybridSearchPlanCache::prepare_remote_sql(ObPlanCacheCtx &ctx, ObRemoteSqlInfo &remote_sql_info)
+{
+  int ret = OB_SUCCESS;
+  ObPhysicalPlanCtx *plan_ctx = ctx.exec_ctx_.get_physical_plan_ctx();
+  if (OB_ISNULL(plan_ctx)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("missing physical plan context for hybrid remote SQL", K(ret));
+  } else {
+    // Keep protocol and payload selection together for future remote PS support.
+    // Text forwarding must use this request's DSL values, including cache hits
+    // that switch between literal and user-variable carriers.
+    remote_sql_info.use_ps_ = false;
+    remote_sql_info.ps_params_ = &plan_ctx->get_param_store_for_update();
+    OZ(get_remote_sql(ctx, remote_sql_info.remote_sql_));
+  }
+  return ret;
+}
+
+int ObHybridSearchPlanCache::get_remote_sql(ObPlanCacheCtx &ctx, ObString &sql)
+{
+  int ret = OB_SUCCESS;
+  const ObHybridDslRequestInfo *request = get_request(ctx.fp_result_);
+  const ObSQLSessionInfo *session = ctx.sql_ctx_.session_info_;
+  sql.reset();
+  if (OB_ISNULL(request)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("missing hybrid request for remote SQL", K(ret));
+  } else if (SOURCE_LITERAL == request->get_source().kind_) {
+    sql = ctx.raw_sql_;
+  } else if (SOURCE_USER_VARIABLE != request->get_source().kind_ || OB_ISNULL(session)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid hybrid remote SQL source", K(ret), K(request->get_source()), KP(session));
+  } else {
+    const ObHybridDslSource &source = request->get_source();
+    const ObString &snapshot = request->get_dsl_snapshot();
+    if (source.sql_offset_ < 0 || source.sql_offset_ > ctx.raw_sql_.length()
+        || source.sql_length_ <= 0
+        || source.sql_length_ > ctx.raw_sql_.length() - source.sql_offset_) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid hybrid remote SQL carrier offsets", K(ret), K(source));
+    } else {
+      // Literal and variable carriers share cached plans, including across variable
+      // names. Embed this request's snapshot instead of relying on cached plan vars.
+      ObSqlString text;
+      bool no_backslash_escapes = false;
+      IS_NO_BACKSLASH_ESCAPES(session->get_sql_mode(), no_backslash_escapes);
+      OZ(text.append(ctx.raw_sql_.ptr(), source.sql_offset_));
+      OZ(text.append("'"));
+      for (int64_t i = 0; OB_SUCC(ret) && i < snapshot.length(); ++i) {
+        const char ch = snapshot.ptr()[i];
+        if (ch == '\\' && !no_backslash_escapes) {
+          OZ(text.append("\\\\"));
+        } else if (ch == '\'') {
+          OZ(text.append("''"));
+        } else {
+          OZ(text.append(&ch, 1));
+        }
+      }
+      OZ(text.append("'"));
+      const int64_t end = source.sql_offset_ + source.sql_length_;
+      OZ(text.append(ctx.raw_sql_.ptr() + end, ctx.raw_sql_.length() - end));
+      OZ(ob_write_string(ctx.allocator_, text.string(), sql));
+    }
+  }
+  return ret;
+}
+
 int ObHybridDslRequestInfo::check_dsl_param_idx(const int64_t dsl_idx) const
 {
   int ret = OB_SUCCESS;

@@ -5225,12 +5225,20 @@ int ObSql::pc_add_plan(ObPlanCacheCtx &pc_ctx,
 //模板化后的SQL为:select * from t1 where a=_utf8?;这条SQL在parser中会报语法错误
 //而对于大多数参数化后的模板SQL可以直接用来在远端prepare，避免再对文本进行一次fast parser
 //因此这里对模板SQL进行一次parser，增加对模板SQL的检查，用来判该模板SQL是否可以在远端被prepare
+// 混搜参数化后的模板不支持远端 PS prepare，例如：
+// 原 SQL：SELECT id FROM HYBRID_SEARCH(TABLE t1, '{"query":{"term":{"a":1}}}');
+// 模板：  SELECT id FROM HYBRID_SEARCH(TABLE t1, '{"query":{"term":{"a":?}}}');
+// 模板中的 ? 位于 SQL 字符串内部，虽然外层模板可以通过 parser 检查，
+// 但远端 PS 无法把本次参数绑定到字符串内部；此类计划转发时使用
+// 包含实际 DSL 值的可执行文本，因此不需要标记为可 prepare。
 void ObSql::check_template_sql_can_be_prepare(ObPlanCacheCtx &pc_ctx, ObPhysicalPlan &plan)
 {
   int ret = OB_SUCCESS;
   const ObString &temp_sql = plan.get_constructed_sql();
   ObSQLSessionInfo *session = pc_ctx.sql_ctx_.session_info_;
-  if (plan.is_remote_plan() && !temp_sql.empty() && session != nullptr
+  if (ObHybridSearchPlanCache::get_request(pc_ctx.fp_result_) != nullptr) {
+    // Hybrid parameterized templates cannot be prepared remotely, so no prepare flag is set.
+  } else if (plan.is_remote_plan() && !temp_sql.empty() && session != nullptr
       && pc_ctx.select_item_param_infos_.empty()) {
     // select * from (select 1, 2, 3 from dual);这样的SQL也不能在远端被prepare，因为select子句会被参数化
     ParseResult parse_result;
@@ -5388,11 +5396,15 @@ int ObSql::after_get_plan(ObPlanCacheCtx &pc_ctx,
           pctx->get_remote_sql_info().ps_param_cnt_ = static_cast<int32_t>(param_store.count());
         } else {
           //没有进plan cache，并且是文本协议，在远端再走一次文本解析
-          pctx->get_remote_sql_info().use_ps_ = false;
-          pctx->get_remote_sql_info().is_batched_stmt_ =
-              pc_ctx.sql_ctx_.multi_stmt_item_.is_batched_multi_stmt();
-          pctx->get_remote_sql_info().remote_sql_ = pc_ctx.sql_ctx_.cur_sql_;
-          pctx->get_remote_sql_info().ps_params_ = &param_store;
+          if (ObHybridSearchPlanCache::get_request(pc_ctx.fp_result_) != nullptr) {
+            OZ(ObHybridSearchPlanCache::prepare_remote_sql(pc_ctx, pctx->get_remote_sql_info()));
+          } else {
+            pctx->get_remote_sql_info().use_ps_ = false;
+            pctx->get_remote_sql_info().is_batched_stmt_ =
+                pc_ctx.sql_ctx_.multi_stmt_item_.is_batched_multi_stmt();
+            pctx->get_remote_sql_info().remote_sql_ = pc_ctx.sql_ctx_.cur_sql_;
+            pctx->get_remote_sql_info().ps_params_ = &param_store;
+          }
         }
         if (GET_MIN_CLUSTER_VERSION() != min_cluster_version) {
           LOG_INFO("remote plan src diff cluster version",
