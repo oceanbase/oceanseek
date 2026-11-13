@@ -18,6 +18,13 @@ class ObSSGCDagBase : public share::ObIDag
 public:
   explicit ObSSGCDagBase(const share::ObDagType::ObDagTypeEnum dag_type);
   virtual ~ObSSGCDagBase() = default;
+#ifdef ERRSIM
+  // The scheduler installs this module on the worker executing each GC task.
+  common::ObErrsimModuleType::TYPE get_module_type() override
+  {
+    return common::ObErrsimModuleType::ERRSIM_MODULE_SS_GC;
+  }
+#endif
 
   int get_published_dag_ret() const;
   bool is_stop_requested();

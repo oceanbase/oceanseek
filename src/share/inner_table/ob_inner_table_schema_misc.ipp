@@ -9610,6 +9610,7 @@ case OB_ALL_USER_PROXY_ROLE_INFO_HISTORY_TID: {
     case OB_ALL_VIRTUAL_SHARED_DIAGNOSE_INFO_TID : schema_version = static_cast<int64_t>(ObHardCodeInnerTableSchemaVersion::OB_ALL_VIRTUAL_SHARED_DIAGNOSE_INFO_SCHEMA_VERSION); break;
     case OB_ALL_VIRTUAL_MDS_TABLE_TID : schema_version = static_cast<int64_t>(ObHardCodeInnerTableSchemaVersion::OB_ALL_VIRTUAL_MDS_TABLE_SCHEMA_VERSION); break;
     case OB_ALL_VIRTUAL_SHARED_TABLET_META_INFO_TID : schema_version = static_cast<int64_t>(ObHardCodeInnerTableSchemaVersion::OB_ALL_VIRTUAL_SHARED_TABLET_META_INFO_SCHEMA_VERSION); break;
+    case OB_ALL_VIRTUAL_TENANT_ERRSIM_EVENT_TID : schema_version = static_cast<int64_t>(ObHardCodeInnerTableSchemaVersion::OB_ALL_VIRTUAL_TENANT_ERRSIM_EVENT_SCHEMA_VERSION); break;
     case OB_SESSION_VARIABLES_TID : schema_version = static_cast<int64_t>(ObHardCodeInnerTableSchemaVersion::OB_SESSION_VARIABLES_SCHEMA_VERSION); break;
     case OB_GLOBAL_STATUS_TID : schema_version = static_cast<int64_t>(ObHardCodeInnerTableSchemaVersion::OB_GLOBAL_STATUS_SCHEMA_VERSION); break;
     case OB_SESSION_STATUS_TID : schema_version = static_cast<int64_t>(ObHardCodeInnerTableSchemaVersion::OB_SESSION_STATUS_SCHEMA_VERSION); break;

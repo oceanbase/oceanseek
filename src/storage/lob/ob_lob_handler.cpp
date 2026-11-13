@@ -7,6 +7,7 @@
 #include "storage/lob/store/ob_lob_store_common.h"
 #define USING_LOG_PREFIX STORAGE
 #include "lib/ob_errno.h"
+#include "lib/worker.h"
 #include "lib/utility/ob_macro_utils.h"
 #include "share/ob_tablet_autoincrement_service.h"
 #include "share/backup/ob_backup_struct.h"
@@ -394,6 +395,12 @@ int ObLobInserter::insert()
     ctx_->insert_lob_seq_no_ = dest_wrapper.get_seq_no();
     if (OB_FAIL(ObLobUtil::check_write_outtable(*ctx_, source_byte_len_, is_outtable))) {
       LOG_WARN("failed to check whether to write outtable lob", KR(ret), K(source_byte_len_));
+    }
+#ifdef ERRSIM
+    lib::ErrsimModuleGuard errsim_guard(is_outtable
+        ? ObErrsimModuleType::ERRSIM_MODULE_OUTTABLE_LOB : lib::Worker::get_module_type().type_);
+#endif
+    if (OB_FAIL(ret)) {
     } else if (is_outtable) {
       if (OB_FAIL(insert_outtable_piece_(query_iter, write_stats))) {
         LOG_WARN("failed to insert outtable lob pieces", KR(ret), KPC(this));

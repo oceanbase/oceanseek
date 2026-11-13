@@ -25,6 +25,7 @@ namespace obrpc
 {
 int ObCheckAtomicProtocolP::process()
 {
+  lib::ErrsimModuleGuard errsim_guard(common::ObErrsimModuleType::ERRSIM_MODULE_SS_GC);
   int ret = OB_SUCCESS;
   const storage::ObCheckAtomicProtocolArg &arg = arg_;
   bool dag_net_exist = false;

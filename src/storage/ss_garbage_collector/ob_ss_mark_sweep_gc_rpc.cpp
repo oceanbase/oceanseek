@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX STORAGE
 
+#include "lib/worker.h"
 #include "storage/ss_garbage_collector/ob_ss_mark_sweep_gc_rpc.h"
 #include "storage/ss_garbage_collector/ob_ss_gc_service.h"
 #include "storage/ss_garbage_collector/ob_ss_gc_util.h"
@@ -44,6 +45,7 @@ namespace obrpc
 {
 int ObSSMarkSweepGCStudyP::process()
 {
+  lib::ErrsimModuleGuard errsim_guard(common::ObErrsimModuleType::ERRSIM_MODULE_SS_GC);
   int ret = OB_SUCCESS;
   const storage::ObSSMarkSweepGCStudyReq &req = arg_;
   storage::ObSSMarkSweepGCStudyRes &res = result_;

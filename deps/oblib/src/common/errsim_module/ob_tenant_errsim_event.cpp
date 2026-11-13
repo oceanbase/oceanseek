@@ -14,38 +14,43 @@ namespace common
 {
 
 ObTenantErrsimEvent::ObTenantErrsimEvent()
-    : timestamp_(0),
+    : event_id_(0),
+      timestamp_(0),
       type_(),
       errsim_error_(OB_SUCCESS),
+      trace_id_(),
       backtrace_()
 {
 }
 
 void ObTenantErrsimEvent::reset()
 {
+  event_id_ = 0;
   timestamp_ = 0;
   type_.reset();
   errsim_error_ = OB_SUCCESS;
+  trace_id_.reset();
   backtrace_.reset();
 }
 
 bool ObTenantErrsimEvent::is_valid() const
 {
-  return timestamp_ > 0 && type_.is_valid() && !backtrace_.is_empty();
+  return timestamp_ > 0 && type_.is_valid()
+      && ObErrsimModuleType::ERRSIM_MODULE_NONE != type_.type_
+      && OB_SUCCESS != errsim_error_;
 }
 
-void ObTenantErrsimEvent::build_event(const int32_t result)
+void ObTenantErrsimEvent::build_event(const ObErrsimModuleType::TYPE type, const int32_t result)
 {
+  reset();
   timestamp_ = ObTimeUtil::current_time();
+  type_ = ObErrsimModuleType(type);
   errsim_error_ = result;
+  trace_id_ = *ObCurTraceId::get_trace_id();
+  // Capture synchronously on the injecting thread, before unwinding its business stack.
   lbt(backtrace_.ptr(), backtrace_.capacity());
-#ifdef ERRSIM
-  type_ = THIS_WORKER.get_module_type();
-#else
-  ObErrsimModuleType tmp_type(ObErrsimModuleType::ERRSIM_MODULE_NONE);
-  type_ = tmp_type;
-#endif
 }
+
 
 } //common
 } //oceanbase

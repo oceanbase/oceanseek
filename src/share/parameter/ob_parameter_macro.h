@@ -231,6 +231,9 @@ access_specifier:                                                               
 #define ERRSIM_DEF_STR_LIST(args...)                                                  \
   _DEF_PARAMETER_SCOPE_EASY(public, StrList, args)
 
+#define ERRSIM_DEF_STR_LIST_WITH_CHECKER(args...)                                     \
+  _DEF_PARAMETER_SCOPE_CHECKER_EASY(public, StrList, args)
+
 #define ERRSIM_DEF_LOG_ARCHIVE_OPTIONS_WITH_CHECKER(args...)                          \
   _DEF_PARAMETER_SCOPE_CHECKER_EASY(public, LogArchiveOptions, args)
 
@@ -255,6 +258,7 @@ access_specifier:                                                               
 #define ERRSIM_DEF_MOMENT(args...)
 #define ERRSIM_DEF_INT_LIST(args...)
 #define ERRSIM_DEF_STR_LIST(args...)
+#define ERRSIM_DEF_STR_LIST_WITH_CHECKER(args...)
 #define ERRSIM_DEF_LOG_ARCHIVE_OPTIONS_WITH_CHECKER(args...)
 #define ERRSIM_DEF_LOG_LEVEL(args...)
 #define ERRSIM_DEF_WORK_AREA_POLICY(args...)

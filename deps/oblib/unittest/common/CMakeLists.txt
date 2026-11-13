@@ -20,3 +20,7 @@ oblib_addtest(test_timeout_ctx.cpp)
 oblib_addtest(test_smart_var.cpp)
 oblib_addtest(test_smart_call.cpp)
 oblib_addtest(test_ob_sequence.cpp)
+
+if (OB_ERRSIM)
+  oblib_addtest(test_errsim_event_record.cpp)
+endif()

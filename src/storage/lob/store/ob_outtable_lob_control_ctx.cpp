@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX STORAGE
 #include "storage/lob/store/ob_outtable_lob_control_ctx.h"
 #include "lib/allocator/page_arena.h"
+#include "lib/worker.h"
 #include "observer/ob_inner_sql_connection_pool.h"
 #include "share/ob_server_struct.h"
 #include "sql/engine/ob_exec_context.h"
@@ -151,6 +152,10 @@ int64_t ObOuttableLobControlCtx::get_control_keys_serialize_size() const
 
 int ObOuttableLobControlCtx::complete(sql::ObExecContext &exec_ctx)
 {
+#ifdef ERRSIM
+  lib::ErrsimModuleGuard errsim_guard(empty()
+      ? lib::Worker::get_module_type().type_ : ObErrsimModuleType::ERRSIM_MODULE_OUTTABLE_LOB);
+#endif
   int ret = OB_SUCCESS;
   sql::ObSQLSessionInfo *session = exec_ctx.get_my_session();
   ObMySQLProxy *sql_proxy = exec_ctx.get_sql_proxy();

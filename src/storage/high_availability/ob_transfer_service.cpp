@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX STORAGE
 #include "ob_transfer_service.h"
+#include "lib/worker.h"
 #include "storage/meta_store/ob_server_storage_meta_service.h"
 #include "storage/high_availability/ob_tenant_startup_status.h"
 
@@ -116,10 +117,7 @@ void ObTransferService::run1()
 {
   int ret = OB_SUCCESS;
   lib::set_thread_name("TransferService");
-#ifdef ERRSIM
-  ObErrsimModuleType module_type(ObErrsimModuleType::ERRSIM_MODULE_TRANSFER);
-  THIS_WORKER.set_module_type(module_type);
-#endif
+  lib::ErrsimModuleGuard errsim_module_guard(ObErrsimModuleType::ERRSIM_MODULE_TRANSFER);
 
   while (!has_set_stop()) {
     DEBUG_SYNC(BEFORE_TRANSFER_SERVICE_RUNNING);

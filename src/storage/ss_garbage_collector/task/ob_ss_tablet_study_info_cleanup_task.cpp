@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX STORAGE
 
+#include "lib/worker.h"
 #include "storage/ss_garbage_collector/task/ob_ss_tablet_study_info_cleanup_task.h"
 #include "lib/time/ob_time_utility.h"
 #include "share/rc/ob_tenant_base.h"
@@ -59,6 +60,7 @@ void ObSSTabletStudyInfoCleanupTask::destroy()
 
 void ObSSTabletStudyInfoCleanupTask::runTimerTask()
 {
+  lib::ErrsimModuleGuard errsim_guard(common::ObErrsimModuleType::ERRSIM_MODULE_SS_GC);
   int ret = OB_SUCCESS;
   ObTimePiece time_piece;
   ObSSGCService *gc_service = nullptr;

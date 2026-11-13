@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX STORAGE
 
+#include "lib/worker.h"
 #include "storage/ss_garbage_collector/task/ob_ss_gc_dag_task_base.h"
 #include "storage/ss_garbage_collector/ob_ss_gc_util.h"
 #include "lib/profile/ob_trace_id.h"
@@ -81,6 +82,7 @@ void ObSSGCDagTaskBase::destroy()
 
 void ObSSGCDagTaskBase::runTimerTask()
 {
+  lib::ErrsimModuleGuard errsim_guard(common::ObErrsimModuleType::ERRSIM_MODULE_SS_GC);
   int ret = OB_SUCCESS;
   ObCurTraceId::init(GCONF.self_addr_);
   if (OB_FAIL(check_init_and_stop_())) {

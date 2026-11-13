@@ -8,6 +8,7 @@
 #define USING_LOG_PREFIX STORAGE
 #include "lib/allocator/page_arena.h"
 #include "lib/ob_errno.h"
+#include "lib/worker.h"
 #include "lib/string/ob_string.h"
 #include "lib/utility/ob_macro_utils.h"
 #include "storage/lob/common/ob_lob_seq.h"
@@ -192,6 +193,10 @@ int ObLobPersistentAppender::after_write_summary()
 
 int ObLobPersistentAppender::append()
 {
+#ifdef ERRSIM
+  lib::ErrsimModuleGuard errsim_guard(is_outtable()
+      ? ObErrsimModuleType::ERRSIM_MODULE_OUTTABLE_LOB : lib::Worker::get_module_type().type_);
+#endif
   int ret = OB_SUCCESS;
   uint64_t total_chunk_count = 0;
   if (IS_NOT_INIT) {

@@ -139,6 +139,7 @@
 #include "observer/virtual_table/ob_all_virtual_compaction_suggestion.h"
 #include "observer/virtual_table/ob_all_virtual_server_compaction_progress.h"
 #include "observer/virtual_table/ob_all_virtual_server_compaction_event_history.h"
+#include "observer/virtual_table/ob_all_virtual_tenant_errsim_event.h"
 #include "observer/virtual_table/ob_all_virtual_tablet_compaction_progress.h"
 #include "observer/virtual_table/ob_all_virtual_tablet_stat.h"
 #include "observer/virtual_table/ob_all_virtual_tablet_compaction_history.h"
@@ -2496,6 +2497,16 @@ int ObVTIterCreator::create_vt_iter(ObVTableScanParam &params,
               SERVER_LOG(WARN, "failed to init progress_mgr", K(ret));
             } else {
               vt_iter = static_cast<ObVirtualTableIterator *>(progress_mgr);
+            }
+            break;
+          }
+          case OB_ALL_VIRTUAL_TENANT_ERRSIM_EVENT_TID: {
+            ObAllVirtualTenantErrsimEvent *events = nullptr;
+            if (OB_FAIL(NEW_VIRTUAL_TABLE(ObAllVirtualTenantErrsimEvent, events))) {
+              SERVER_LOG(WARN, "failed to create errsim event iterator", K(ret));
+            } else {
+              events->set_addr(addr_);
+              vt_iter = events;
             }
             break;
           }

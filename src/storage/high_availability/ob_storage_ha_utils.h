@@ -111,8 +111,6 @@ public:
   static int kill_tx(const uint64_t tenant_id, const share::ObLSID &ls_id, const share::SCN &gts_scn);
   static int unblock_tx(const uint64_t tenant_id, const share::ObLSID &ls_id, const share::SCN &gts_scn);
   static int get_gts(const uint64_t tenant_id, share::SCN &gts);
-  static void set_transfer_module();
-  static void clear_transfer_module();
   static int get_need_check_member(
       const common::ObIArray<ObAddr> &total_member_addr_list,
       const common::ObIArray<ObAddr> &finished_member_addr_list,

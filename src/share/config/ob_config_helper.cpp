@@ -7,6 +7,9 @@
 #include "ob_config_helper.h"
 #include "share/catalog/ob_unified_catalog_config.h"
 #include "lib/allocator/page_arena.h"
+#ifdef ERRSIM
+#include "common/errsim_module/ob_errsim_module_type.h"
+#endif
 #include "share/ob_resource_limit.h"
 #include "share/vector_index/ob_vector_index_async_task_util.h"
 #include "src/observer/ob_server.h"
@@ -37,6 +40,33 @@ bool ObConfigUnifiedCatalogChecker::check(const ObConfigItem &t) const
   }
   return valid;
 }
+
+#ifdef ERRSIM
+bool ObConfigErrsimModuleTypesChecker::check(const ObConfigItem &t) const
+{
+  bool valid = true;
+  const char *begin = t.str();
+  // An empty list disables module injection. Empty entries in a list are invalid.
+  while (valid && '\0' != *begin) {
+    const char *end = STRCHR(begin, ';');
+    const int64_t length = (nullptr == end) ? STRLEN(begin) : end - begin;
+    char name[ObErrsimModuleTypeHelper::MAX_TYPE_NAME_LENGTH] = {};
+    if (length <= 0 || length >= sizeof(name)) {
+      valid = false;
+    } else {
+      MEMCPY(name, begin, length);
+      valid = ObErrsimModuleTypeHelper::is_valid(ObErrsimModuleTypeHelper::get_type(name));
+    }
+    if (nullptr == end) {
+      break;
+    } else {
+      begin = end + 1;
+      valid = valid && '\0' != *begin;
+    }
+  }
+  return valid;
+}
+#endif
 
 bool ObConfigIpChecker::check(const ObConfigItem &t) const
 {

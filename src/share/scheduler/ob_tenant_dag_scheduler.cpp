@@ -2253,6 +2253,11 @@ void ObTenantDagWorker::run1()
         COMMON_LOG(TRACE, "Mini compaction enter reserve mode", KPC(dag));
       }
 
+#ifdef ERRSIM
+      const ObErrsimModuleType::TYPE module_type =
+          (nullptr != dag) ? dag->get_module_type() : ObErrsimModuleType::ERRSIM_MODULE_NONE;
+      lib::ErrsimModuleGuard errsim_module_guard(module_type);
+#endif
       if (OB_SUCC(ret)) {
         ObDIActionGuard di_action_guard("DAG", dag->get_dag_module_str(dag->get_type()), dag->get_dag_type_str(dag->get_type()));
         CONSUMER_GROUP_ID_GUARD(dag->get_consumer_group_id());
@@ -2266,10 +2271,6 @@ void ObTenantDagWorker::run1()
           ret = OB_ERR_UNEXPECTED;
           COMMON_LOG(WARN, "invalid compat mode", K(ret), K(*dag));
         } else {
-#ifdef ERRSIM
-          const ObErrsimModuleType type(dag->get_module_type());
-          THIS_WORKER.set_module_type(type);
-#endif
           THIS_WORKER.set_compatibility_mode(compat_mode);
           if (is_compaction_dag(dag->get_type())) {
             THIS_WORKER.set_log_reduction_mode(LogReductionMode::REFINED);

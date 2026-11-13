@@ -87,6 +87,10 @@ inline int ObWorkerProcessor::process_one(rpc::ObRequest &req)
 int ObWorkerProcessor::process(rpc::ObRequest &req)
 {
   int ret = OB_SUCCESS;
+#ifdef ERRSIM
+  // Isolate each request from the calling thread's errsim module context.
+  lib::ErrsimModuleGuard errsim_module_guard(ObErrsimModuleType::ERRSIM_MODULE_NONE);
+#endif
 
   if (THE_TRACE != nullptr) {
     THE_TRACE->reset();

@@ -22,10 +22,15 @@ int build_tenant_errsim_moulde(
     const uint64_t tenant_id,
     const int64_t config_version,
     const common::ObArray<ObFixedLengthString<ObErrsimModuleTypeHelper::MAX_TYPE_NAME_LENGTH>> &module_array,
-    const int64_t percentage);
+    const double percentage);
 bool is_errsim_module(
     const uint64_t tenant_id,
     const ObErrsimModuleType::TYPE &type);
+// Called only after an injection hit. Recording errors must not replace the injected error.
+int record_tenant_errsim_event(
+    const uint64_t tenant_id,
+    const ObErrsimModuleType::TYPE type,
+    const int32_t error);
 int add_tenant_errsim_event(
     const uint64_t tenant_id,
     const ObTenantErrsimEvent &event);

@@ -2472,9 +2472,11 @@ DEF_INT(_enable_di_experimental_feature_flags, OB_CLUSTER_PARAMETER, "7", "[0, +
          "do not write 8/16/24, which clear bit0-bit2.",
          ObParameterAttr(Section::OBSERVER, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 
-// for set errsim module types, format like transfer;migration
-ERRSIM_DEF_STR_LIST(errsim_module_types, OB_TENANT_PARAMETER, "",
-             "set module list for errsim error",
+// Module names are case insensitive, for example transfer;migration.
+ERRSIM_DEF_STR_LIST_WITH_CHECKER(errsim_module_types, OB_TENANT_PARAMETER, "",
+             common::ObConfigErrsimModuleTypesChecker,
+             "semicolon-separated errsim modules: NONE, ALL, MIGRATION, TRANSFER, SS_GC, "
+             "OUTTABLE_LOB (case insensitive)",
              ObParameterAttr(Section::OBSERVER, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 ERRSIM_DEF_DBL(errsim_module_error_percentage, OB_TENANT_PARAMETER, "0", "[0,100]",
         "the percentage of the error happened to errsim module. "

@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX STORAGE
 
+#include "lib/worker.h"
 #include "ob_tenant_gc_task.h"
 #include "storage/meta_store/ob_server_storage_meta_service.h"
 #include "src/storage/shared_storage/ob_file_manager.h"
@@ -50,6 +51,7 @@ int ObTenantGCTask::init(const int tg_id)
 
 void ObTenantGCTask::runTimerTask()
 {
+  lib::ErrsimModuleGuard errsim_guard(common::ObErrsimModuleType::ERRSIM_MODULE_SS_GC);
   int ret = OB_SUCCESS;
   ObCurTraceId::init(GCONF.self_addr_);
   if (OB_UNLIKELY(!is_inited_)) {

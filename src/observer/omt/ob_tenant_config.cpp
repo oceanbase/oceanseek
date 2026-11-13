@@ -423,6 +423,11 @@ int ObTenantConfig::build_errsim_module_()
   ObTenantErrsimModuleMgr::ModuleArray module_array;
   ObTenantErrsimModuleMgr::ErrsimModuleString string;
 
+  if (!errsim_module_types.check() || !errsim_module_error_percentage.check()) {
+    ret = OB_INVALID_CONFIG;
+    LOG_WARN("invalid errsim module configuration", K(ret), K_(tenant_id),
+             K(errsim_module_types.str()), K(errsim_module_error_percentage.str()));
+  }
   for (int64_t i = 0; OB_SUCC(ret) && i < this->errsim_module_types.size(); ++i) {
     if (OB_FAIL(this->errsim_module_types.get(
         static_cast<int>(i), buf, sizeof(buf)))) {
@@ -435,7 +440,7 @@ int ObTenantConfig::build_errsim_module_()
   }
 
   if (OB_SUCC(ret)) {
-    const int64_t percentage = this->errsim_module_error_percentage;
+    const double percentage = this->errsim_module_error_percentage;
 
     if (OB_FAIL(build_tenant_errsim_moulde(tenant_id_, current_version_, module_array, percentage))) {
       LOG_WARN("failed to build tenant module", K(ret), K(tenant_id_));

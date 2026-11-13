@@ -977,26 +977,6 @@ int ObStorageHAUtils::check_log_status(
   return ret;
 }
 
-void ObTransferUtils::set_transfer_module()
-{
-#ifdef ERRSIM
-  if (ObErrsimModuleType::ERRSIM_MODULE_NONE == THIS_WORKER.get_module_type().type_) {
-    ObErrsimModuleType type(ObErrsimModuleType::ERRSIM_MODULE_TRANSFER);
-    THIS_WORKER.set_module_type(type);
-  }
-#endif
-}
-
-void ObTransferUtils::clear_transfer_module()
-{
-#ifdef ERRSIM
-  if (ObErrsimModuleType::ERRSIM_MODULE_TRANSFER == THIS_WORKER.get_module_type().type_) {
-    ObErrsimModuleType type(ObErrsimModuleType::ERRSIM_MODULE_NONE);
-    THIS_WORKER.set_module_type(type);
-  }
-#endif
-}
-
 int ObTransferUtils::get_need_check_member(
     const common::ObIArray<ObAddr> &total_member_addr_list,
     const common::ObIArray<ObAddr> &finished_member_addr_list,

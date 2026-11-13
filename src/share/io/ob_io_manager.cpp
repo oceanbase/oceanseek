@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX COMMON
 
+#include "common/errsim_module/ob_errsim_module_interface.h"
 #include "ob_io_manager.h"
 #include "share/errsim_module/ob_errsim_module_interface_imp.h"
 #include "observer/ob_server.h"
@@ -1227,6 +1228,8 @@ int ObIOManager::tenant_aio(const ObIOInfo &info, ObIOHandle &handle)
   const ObErrsimModuleType type = THIS_WORKER.get_module_type();
   if (is_errsim_module(info.tenant_id_, type.type_)) {
     ret = OB_IO_ERROR;
+    lib::ErrsimModuleGuard errsim_guard(ObErrsimModuleType::ERRSIM_MODULE_NONE);
+    (void)record_tenant_errsim_event(info.tenant_id_, type.type_, ret);
     LOG_ERROR("[ERRSIM MODULE] errsim IO error", K(ret), "tenant_id", info.tenant_id_);
     return ret;
   }

@@ -646,13 +646,21 @@ void ObTenantConfigMgr::TenantConfigUpdateTask::update_local_configs(const commo
 void ObTenantConfigMgr::TenantConfigUpdateTask::dump_and_publish_configs(const common::ObIArray<std::pair<uint64_t, ObTenantConfig*>> &configs, bool &need_retry)
 {
   int ret = OB_SUCCESS;
-  if (need_retry) {
-    //do nothing
-  } else {
+  // Failed loads restore their tenant's version; other tenants can still be published.
+  bool has_loaded_config = false;
+  for (int64_t i = 0; !has_loaded_config && i < configs.count(); ++i) {
+    const ObTenantConfig *config = configs.at(i).second;
+    has_loaded_config = config->current_version_ > config->last_version_;
+  }
+  if (has_loaded_config) {
     DRWLock::RDLockGuard guard(config_mgr_->rwlock_);
-    ObTenantConfig *config = nullptr;
     if (OB_FAIL(config_mgr_->dump2file_unsafe())) {
       LOG_WARN("fail to dump config to file", KR(ret));
+      // All loaded tenants depend on this shared dump and must retry if it fails.
+      for (int64_t i = 0; i < configs.count(); ++i) {
+        ObTenantConfig *config = configs.at(i).second;
+        config->current_version_ = config->last_version_;
+      }
       need_retry = true;
       ret = OB_SUCCESS;
     } else {
@@ -661,17 +669,26 @@ void ObTenantConfigMgr::TenantConfigUpdateTask::dump_and_publish_configs(const c
       for (int i = 0; i < configs.count(); ++i) {
         tenant_id = configs.at(i).first;
         config = configs.at(i).second;
-        if (OB_FAIL(config->publish_special_config_after_dump())) {
+        if (config->current_version_ <= config->last_version_) {
+          // Skip this tenant because its configuration was not loaded successfully.
+        } else if (OB_FAIL(config->publish_special_config_after_dump())) {
           LOG_WARN("publish special config after dump failed", K(tenant_id), K(ret));
+          config->current_version_ = config->last_version_;
           need_retry = true;
           ret = OB_SUCCESS;
         }
-  #ifdef ERRSIM
+#ifdef ERRSIM
         else if (OB_FAIL(config->build_errsim_module_())) {
           LOG_WARN("failed to build errsim module", K(ret), K(tenant_id));
+          // Invalid persisted values need a corrected configuration, not a busy retry.
+          // Transient errors must leave this version eligible for the next task.
+          if (OB_INVALID_CONFIG != ret) {
+            config->current_version_ = config->last_version_;
+            need_retry = true;
+          }
           ret = OB_SUCCESS;
         }
-  #endif
+#endif
       }
     }
   }

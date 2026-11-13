@@ -358,28 +358,36 @@ private:
 };
 
 
-#ifdef ERRSIM
-//set current errsim module in code snippet and set last errsim module when guard destructor
+// Save and restore the module, including NONE; nested guards restore the enclosing module.
+// Keep each guard in its creating execution context. This guard is a no-op without ERRSIM.
 class ErrsimModuleGuard final
 {
 public:
-  ErrsimModuleGuard(ObErrsimModuleType::TYPE type)
+  explicit ErrsimModuleGuard(ObErrsimModuleType::TYPE type)
+#ifdef ERRSIM
+      : last_type_(Worker::get_module_type().type_)
+#endif
   {
-    last_type_ = THIS_WORKER.get_module_type().type_;
-    ObErrsimModuleType curr_type(type);
-    THIS_WORKER.set_module_type(curr_type);
+#ifdef ERRSIM
+    Worker::set_module_type(ObErrsimModuleType(type));
+#else
+    UNUSED(type);
+#endif
   }
 
   ~ErrsimModuleGuard()
   {
-    ObErrsimModuleType curr_type(last_type_);
-    THIS_WORKER.set_module_type(curr_type);
+#ifdef ERRSIM
+    Worker::set_module_type(ObErrsimModuleType(last_type_));
+#endif
   }
 
 private:
+#ifdef ERRSIM
   ObErrsimModuleType::TYPE last_type_;
-};
 #endif
+  DISALLOW_COPY_AND_ASSIGN(ErrsimModuleGuard);
+};
 
 struct ObExtraRpcHeader {
   OB_UNIS_VERSION(1);

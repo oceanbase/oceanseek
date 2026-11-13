@@ -21,7 +21,7 @@ int build_tenant_errsim_moulde(
     const uint64_t tenant_id,
     const int64_t config_version,
     const common::ObArray<ObFixedLengthString<ObErrsimModuleTypeHelper::MAX_TYPE_NAME_LENGTH>> &module_array,
-    const int64_t percentage);
+    const double percentage);
 bool is_errsim_module(
     const uint64_t tenant_id,
     const ObErrsimModuleType::TYPE &type);

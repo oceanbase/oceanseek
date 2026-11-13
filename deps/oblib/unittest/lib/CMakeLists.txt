@@ -1,3 +1,4 @@
+oblib_addtest(test_errsim_module_guard.cpp)
 # oblib_addtest(alloc/alloc_trace.cpp)
 # oblib_addtest(allocator/test_buddy_allocator.cpp)
 # oblib_addtest(allocator/test_lf_fifo_allocator.cpp

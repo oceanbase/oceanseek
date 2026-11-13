@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX STORAGE
 
+#include "lib/worker.h"
 #include "storage/ss_garbage_collector/task/ob_ss_gc_history_cleanup_task.h"
 #include "lib/time/ob_time_utility.h"
 #include "observer/omt/ob_tenant_config_mgr.h"
@@ -58,6 +59,7 @@ void ObSSGCHistoryCleanupTask::destroy()
 
 void ObSSGCHistoryCleanupTask::runTimerTask()
 {
+  lib::ErrsimModuleGuard errsim_guard(common::ObErrsimModuleType::ERRSIM_MODULE_SS_GC);
   int ret = OB_SUCCESS;
   bool is_need = false;
   if (OB_FAIL(check_if_need_do_gc_work(is_need))) {

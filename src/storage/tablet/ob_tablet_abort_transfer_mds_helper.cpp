@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "lib/worker.h"
 #include "share/scn.h"
 #include "share/ob_ls_id.h"
 #include "share/transfer/ob_transfer_info.h"
@@ -42,7 +43,7 @@ int ObTabletAbortTransferHelper::on_register(
   ObTXTransferInAbortedInfo transfer_in_aborted_info;
   int64_t pos = 0;
   const bool for_replay = false;
-  ObTransferUtils::set_transfer_module();
+  lib::ErrsimModuleGuard errsim_module_guard(ObErrsimModuleType::ERRSIM_MODULE_TRANSFER);
 
   if (OB_ISNULL(buf) || len < 0) {
     ret = OB_INVALID_ARGUMENT;
@@ -55,7 +56,6 @@ int ObTabletAbortTransferHelper::on_register(
   } else if (CLICK_FAIL(on_register_success_(transfer_in_aborted_info, ctx))) {
     LOG_WARN("failed to on register", K(ret), K(transfer_in_aborted_info));
   }
-  ObTransferUtils::clear_transfer_module();
   return ret;
 }
 
@@ -152,7 +152,7 @@ int ObTabletAbortTransferHelper::on_replay(
   ObTXTransferInAbortedInfo transfer_in_aborted_info;
   int64_t pos = 0;
   const bool for_replay = true;
-  ObTransferUtils::set_transfer_module();
+  lib::ErrsimModuleGuard errsim_module_guard(ObErrsimModuleType::ERRSIM_MODULE_TRANSFER);
   ObLSHandle ls_handle;
   ObLSService *ls_service = nullptr;
   ObLS *ls = nullptr;
@@ -173,7 +173,6 @@ int ObTabletAbortTransferHelper::on_replay(
   } else if (CLICK_FAIL(on_replay_success_(scn, transfer_in_aborted_info, ctx))) {
     LOG_WARN("failed to on register_success_", K(ret), K(scn), K(transfer_in_aborted_info));
   }
-  ObTransferUtils::clear_transfer_module();
   return ret;
 }
 
@@ -229,7 +228,7 @@ bool ObTabletAbortTransferHelper::check_can_do_tx_end(
   int ret = OB_SUCCESS;
   ObTXTransferInAbortedInfo transfer_in_aborted_info;
   int64_t pos = 0;
-  ObTransferUtils::set_transfer_module();
+  lib::ErrsimModuleGuard errsim_module_guard(ObErrsimModuleType::ERRSIM_MODULE_TRANSFER);
 
   LOG_INFO("check can do abort transfer in tx end", K(is_willing_to_commit), K(for_replay), K(log_scn));
   if (OB_ISNULL(buf) || buf_len < 0 || (for_replay && !log_scn.is_valid())) {
@@ -270,7 +269,6 @@ bool ObTabletAbortTransferHelper::check_can_do_tx_end(
   } else {
     b_ret = true;
   }
-  ObTransferUtils::clear_transfer_module();
   return b_ret;
 }
 

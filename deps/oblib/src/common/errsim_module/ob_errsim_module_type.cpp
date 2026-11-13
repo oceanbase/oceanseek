@@ -18,6 +18,8 @@ static const char *OB_ERRSIM_MODULE_TYPES[] = {
     "ALL",
     "MIGRATION",
     "TRANSFER",
+    "SS_GC",
+    "OUTTABLE_LOB",
 };
 
 void ObErrsimModuleType::reset()
@@ -79,8 +81,8 @@ ObErrsimModuleType::TYPE ObErrsimModuleTypeHelper::get_type(const char *type_str
 
   const int64_t count = ARRAYSIZEOF(OB_ERRSIM_MODULE_TYPES);
   STATIC_ASSERT(static_cast<int64_t>(ObErrsimModuleType::ERRSIM_MODULE_MAX) == count, "type count mismatch");
-  for (int64_t i = 0; i < count; ++i) {
-    if (0 == strcmp(type_str, OB_ERRSIM_MODULE_TYPES[i])) {
+  for (int64_t i = 0; nullptr != type_str && i < count; ++i) {
+    if (0 == STRCASECMP(type_str, OB_ERRSIM_MODULE_TYPES[i])) {
       type = static_cast<ObErrsimModuleType::TYPE>(i);
       break;
     }

@@ -20,7 +20,7 @@ int build_tenant_errsim_moulde(
     const uint64_t tenant_id,
     const int64_t config_version,
     const common::ObArray<ObFixedLengthString<ObErrsimModuleTypeHelper::MAX_TYPE_NAME_LENGTH>> &module_array,
-    const int64_t percentage)
+    const double percentage)
 {
   int ret = OB_SUCCESS;
   const uint64_t tmp_tenant_id = is_virtual_tenant_id(tenant_id) ? MTL_ID() : tenant_id;
@@ -76,26 +76,26 @@ int add_tenant_errsim_event(
     const uint64_t tenant_id,
     const ObTenantErrsimEvent &event)
 {
-  bool b_ret = false;
   int ret = OB_SUCCESS;
+  lib::ErrsimModuleGuard guard(ObErrsimModuleType::ERRSIM_MODULE_NONE);
   const uint64_t tmp_tenant_id = is_virtual_tenant_id(tenant_id) ? MTL_ID() : tenant_id;
-  if (OB_INVALID_ID == tmp_tenant_id || !event.is_valid()) {
+  if (OB_INVALID_ID == tmp_tenant_id || OB_INVALID_TENANT_ID == tmp_tenant_id
+      || !event.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("is errsim module get invalid argument", K(ret), K(tmp_tenant_id), K(event));
-  } else if (is_virtual_tenant_id(tmp_tenant_id) || OB_INVALID_TENANT_ID == tmp_tenant_id) {
-    //do nothing
+  } else if (is_virtual_tenant_id(tmp_tenant_id)) {
+    ret = OB_TENANT_NOT_IN_SERVER;
   } else {
     MTL_SWITCH(tmp_tenant_id) {
-      ObTenantErrsimEventMgr *errsim_event_mgr = nullptr;
-      if (OB_ISNULL(errsim_event_mgr = MTL(ObTenantErrsimEventMgr *))) {
-        ret = OB_ERR_UNEXPECTED;
-        STORAGE_LOG(WARN, "errsim event mgr should not be NULL", K(ret), KP(errsim_event_mgr));
-      } else if (OB_FAIL(errsim_event_mgr->add_tenant_event(event))) {
-        LOG_WARN("failed to add tenant event", K(ret), K(event));
+      ObTenantErrsimEventMgr *errsim_event_mgr = MTL(ObTenantErrsimEventMgr *);
+      if (OB_ISNULL(errsim_event_mgr)) {
+        ret = OB_NOT_INIT;
+      } else {
+        ret = errsim_event_mgr->add_tenant_event(event);
       }
     }
   }
-  return b_ret;
+  // This may run inside the allocator. Do not allocate or log recording failures here.
+  return ret;
 }
 
 

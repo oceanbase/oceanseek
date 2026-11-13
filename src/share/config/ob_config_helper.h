@@ -59,6 +59,14 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObConfigAlwaysTrue);
 };
 
+#ifdef ERRSIM
+class ObConfigErrsimModuleTypesChecker : public ObConfigChecker
+{
+public:
+  bool check(const ObConfigItem &t) const override;
+};
+#endif
+
 class ObConfigIpChecker
   : public ObConfigChecker
 {

@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "lib/worker.h"
 #include "share/throttle/ob_throttle_unit.h"
 #include "share/allocator/ob_mds_allocator.h"
 
@@ -248,6 +249,7 @@ int ObTxReplayExecutor::replay_tx_log_(const ObTxLogType log_type)
     break;
   }
   case ObTxLogType::TX_LOB_OUTTABLE_DATA_LOG: {
+    lib::ErrsimModuleGuard errsim_guard(ObErrsimModuleType::ERRSIM_MODULE_OUTTABLE_LOB);
     ObTxLobOutTableDataLog::ReplayArg replay_arg;
     replay_arg.part_log_no_ = tx_part_log_no_;
     ObTxLobOutTableDataLog::ConstructArg construct_arg;

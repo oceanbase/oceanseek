@@ -850,6 +850,7 @@ public:
   static int all_virtual_shared_diagnose_info_schema(share::schema::ObTableSchema &table_schema);
   static int all_virtual_mds_table_schema(share::schema::ObTableSchema &table_schema);
   static int all_virtual_shared_tablet_meta_info_schema(share::schema::ObTableSchema &table_schema);
+  static int all_virtual_tenant_errsim_event_schema(share::schema::ObTableSchema &table_schema);
   static int session_variables_schema(share::schema::ObTableSchema &table_schema);
   static int global_status_schema(share::schema::ObTableSchema &table_schema);
   static int session_status_schema(share::schema::ObTableSchema &table_schema);
@@ -4451,6 +4452,7 @@ const schema_create_func virtual_table_schema_creators [] = {
   ObInnerTableSchema::all_virtual_shared_diagnose_info_schema,
   ObInnerTableSchema::all_virtual_mds_table_schema,
   ObInnerTableSchema::all_virtual_shared_tablet_meta_info_schema,
+  ObInnerTableSchema::all_virtual_tenant_errsim_event_schema,
   ObInnerTableSchema::session_variables_schema,
   ObInnerTableSchema::global_status_schema,
   ObInnerTableSchema::session_status_schema,
@@ -7217,6 +7219,7 @@ const uint64_t tenant_space_tables [] = {
   OB_ALL_VIRTUAL_SHARED_DIAGNOSE_INFO_TID,
   OB_ALL_VIRTUAL_MDS_TABLE_TID,
   OB_ALL_VIRTUAL_SHARED_TABLET_META_INFO_TID,
+  OB_ALL_VIRTUAL_TENANT_ERRSIM_EVENT_TID,
   OB_SESSION_VARIABLES_TID,
   OB_GLOBAL_STATUS_TID,
   OB_SESSION_STATUS_TID,
@@ -10678,6 +10681,7 @@ const char* const tenant_space_table_names [] = {
   OB_ALL_VIRTUAL_SHARED_DIAGNOSE_INFO_TNAME,
   OB_ALL_VIRTUAL_MDS_TABLE_TNAME,
   OB_ALL_VIRTUAL_SHARED_TABLET_META_INFO_TNAME,
+  OB_ALL_VIRTUAL_TENANT_ERRSIM_EVENT_TNAME,
   OB_SESSION_VARIABLES_TNAME,
   OB_GLOBAL_STATUS_TNAME,
   OB_SESSION_STATUS_TNAME,
@@ -13377,6 +13381,7 @@ const uint64_t tenant_distributed_vtables [] = {
   OB_ALL_VIRTUAL_LS_TABLET_REORGANIZATION_INFO_TID,
   OB_ALL_VIRTUAL_SHARED_DIAGNOSE_INFO_TID,
   OB_ALL_VIRTUAL_MDS_TABLE_TID,
+  OB_ALL_VIRTUAL_TENANT_ERRSIM_EVENT_TID,
   OB_ALL_VIRTUAL_LOCK_WAIT_STAT_TID,
   OB_ALL_VIRTUAL_TABLE_MGR_TID,
   OB_ALL_VIRTUAL_TABLE_MGR_ALL_VIRTUAL_TABLE_MGR_I1_TID,

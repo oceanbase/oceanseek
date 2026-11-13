@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX STORAGE
 
+#include "lib/worker.h"
 #include "storage/ss_garbage_collector/task/ob_ss_mark_sweep_diag_cleanup_task.h"
 #include "lib/allocator/page_arena.h"
 #include "lib/atomic/ob_atomic.h"
@@ -78,6 +79,7 @@ void ObSSMarkSweepDiagCleanupTask::destroy()
 
 void ObSSMarkSweepDiagCleanupTask::runTimerTask()
 {
+  lib::ErrsimModuleGuard errsim_guard(common::ObErrsimModuleType::ERRSIM_MODULE_SS_GC);
   int ret = OB_SUCCESS;
   bool is_need = false;
   if (OB_FAIL(check_if_need_do_gc_work(is_need))) {

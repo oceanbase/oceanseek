@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX STORAGE
 
+#include "lib/worker.h"
 #include "storage/ss_garbage_collector/task/ob_ss_fail_gc_exec_task.h"
 #include "observer/omt/ob_tenant_config_mgr.h"
 #include "storage/ss_garbage_collector/dag/ob_ss_gc_exec_dag.h"
@@ -69,6 +70,7 @@ void ObSSFailGCExecTask::get_gc_exec_interval_us_(int64_t &exec_interval_us) con
 
 void ObSSFailGCExecTask::runTimerTask()
 {
+  lib::ErrsimModuleGuard errsim_guard(common::ObErrsimModuleType::ERRSIM_MODULE_SS_GC);
   int ret = OB_SUCCESS;
   bool is_need = false;
   if (OB_FAIL(check_if_need_do_gc_work(is_need))) {

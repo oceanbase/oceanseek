@@ -81,6 +81,10 @@ void ObReqQueue::set_host(const ObAddr &host)
 int ObReqQueue::process_task(ObLink *task)
 {
   int ret = OB_SUCCESS;
+#ifdef ERRSIM
+  // Isolate each request from the calling thread's errsim module context.
+  lib::ErrsimModuleGuard errsim_module_guard(ObErrsimModuleType::ERRSIM_MODULE_NONE);
+#endif
   if (OB_ISNULL(task) || OB_ISNULL(qhandler_)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_ERROR("queue pop NULL task", K(task), K(ret), K(qhandler_));

@@ -1716,6 +1716,23 @@ meta_value	varchar(65536)	NO		NULL
 select /*+QUERY_TIMEOUT(60000000)*/ IF(count(*) >= 0, 1, 0) from oceanbase.__all_virtual_shared_tablet_meta_info;
 IF(count(*) >= 0, 1, 0)
 1
+desc oceanbase.__all_virtual_tenant_errsim_event;
+Field	Type	Null	Key	Default	Extra
+svr_ip	varchar(46)	NO		NULL	
+svr_port	bigint(20)	NO		NULL	
+tenant_id	bigint(20) unsigned	NO		NULL	
+event_id	bigint(20) unsigned	NO		NULL	
+event_timestamp	timestamp(6)	NO		NULL	
+module	varchar(16)	NO		NULL	
+error_code	bigint(20)	NO		NULL	
+trace_id	varchar(128)	NO		NULL	
+backtrace	varchar(1024)	NO		NULL	
+select /*+QUERY_TIMEOUT(60000000)*/ IF(count(*) >= 0, 1, 0) from oceanbase.__all_virtual_tenant_errsim_event;
+IF(count(*) >= 0, 1, 0)
+1
+"oceanbase.__all_virtual_tenant_errsim_event runs in single server"
+IF(count(*) >= 0, 1, 0)
+1
 desc information_schema.SESSION_VARIABLES;
 Field	Type	Null	Key	Default	Extra
 VARIABLE_NAME	varchar(128)	NO			

@@ -12762,6 +12762,29 @@ def_table_schema(
   vtable_route_policy = 'local',
 )
 
+def_table_schema(
+  owner = 'muwei.ym',
+  table_name = '__all_virtual_tenant_errsim_event',
+  table_id = '11133',
+  table_type = 'VIRTUAL_TABLE',
+  in_tenant_space = True,
+  gm_columns = [],
+  rowkey_columns = [],
+  normal_columns = [
+    ('svr_ip', 'varchar:MAX_IP_ADDR_LENGTH'),
+    ('svr_port', 'int'),
+    ('tenant_id', 'uint'),
+    ('event_id', 'uint'),
+    ('event_timestamp', 'timestamp'),
+    ('module', 'varchar:16'),
+    ('error_code', 'int'),
+    ('trace_id', 'varchar:128'),
+    ('backtrace', 'varchar:1024'),
+  ],
+  partition_columns = ['svr_ip', 'svr_port'],
+  vtable_route_policy = 'distributed',
+)
+
 ################################################################
 # INFORMATION SCHEMA
 ################################################################

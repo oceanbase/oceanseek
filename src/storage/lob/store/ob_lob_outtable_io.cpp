@@ -125,6 +125,7 @@ int ObLobOutTableIO::deserialize_macro_id(const ObString &buf, MacroBlockId &mac
 
 int ObLobOutTableIO::write(const MacroBlockId &macro_id, const ObString &data)
 {
+  lib::ErrsimModuleGuard errsim_guard(ObErrsimModuleType::ERRSIM_MODULE_OUTTABLE_LOB);
   int ret = OB_SUCCESS;
   ObStorageObjectHandle object_handle;
   if (OB_FAIL(async_write(macro_id, data, object_handle))) {
@@ -149,6 +150,7 @@ int ObLobOutTableIO::async_write(
     const int64_t timeout_ts_us,
     ObStorageObjectHandle &object_handle)
 {
+  lib::ErrsimModuleGuard errsim_guard(ObErrsimModuleType::ERRSIM_MODULE_OUTTABLE_LOB);
   int ret = OB_SUCCESS;
   object_handle.reset();
   ObStorageObjectWriteInfo write_info;
@@ -196,6 +198,7 @@ int ObLobOutTableIO::async_read(
     ObString &data,
     ObStorageObjectHandle &object_handle)
 {
+  lib::ErrsimModuleGuard errsim_guard(ObErrsimModuleType::ERRSIM_MODULE_OUTTABLE_LOB);
   int ret = OB_SUCCESS;
   ObStorageObjectReadInfo read_info;
   char *buf = nullptr;
@@ -307,6 +310,7 @@ int ObLobOutTableIO::write_clog(
     const common::ObIArray<ObLobMetaInfo> &metas,
     const bool is_logging)
 {
+  lib::ErrsimModuleGuard errsim_guard(ObErrsimModuleType::ERRSIM_MODULE_OUTTABLE_LOB);
   int ret = OB_SUCCESS;
   transaction::ObPartTransCtx *tx_ctx = nullptr;
   uint64_t lob_piece_table_id = OB_INVALID_ID;
@@ -687,6 +691,7 @@ int ObLobOutTableChunkReader::open(ObLobReadContext *read_ctx)
 
 int ObLobOutTableChunkReader::read(const ObLobMetaInfo &meta, ObString &data)
 {
+  lib::ErrsimModuleGuard errsim_guard(ObErrsimModuleType::ERRSIM_MODULE_OUTTABLE_LOB);
   int ret = OB_SUCCESS;
   MacroBlockId macro_id;
   ObStorageObjectHandle object_handle;

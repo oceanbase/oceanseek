@@ -5,6 +5,7 @@
 
 #include "rpc/obrpc/ob_poc_rpc_server.h"
 #include "rpc/obrpc/ob_net_keepalive.h"
+#include "lib/worker.h"
 #include "lib/utility/ob_tracepoint.h"
 
 #define rk_log_macro(level, ret, format, ...) _OB_LOG_RET(level, ret, "PNIO " format, ##__VA_ARGS__)
@@ -84,10 +85,6 @@ int ObPocServerHandleContext::create(int64_t resp_id, const ObRpcPacket &tmp_pkt
       timeguard.click(rpc_timeguard_str);
       ObRpcMemPool* pool = ObRpcMemPool::create(tenant_id, pcode_label, pool_size, ObRpcMemPool::RPC_CACHE_SIZE);
       void *temp = NULL;
-
-  #ifdef ERRSIM
-      THIS_WORKER.set_module_type(tmp_pkt.get_module_type());
-  #endif
 
       if (OB_ISNULL(pool)) {
         ret = common::OB_ALLOCATE_MEMORY_FAILED;
@@ -258,6 +255,7 @@ inline void ObPocServerHandleContext::set_trace_point(int32_t trace_point)
 int serve_cb(int grp, const char* b, int64_t sz, uint64_t resp_id)
 {
   int ret = OB_SUCCESS;
+  oceanbase::lib::ErrsimModuleGuard errsim_guard(ObErrsimModuleType::ERRSIM_MODULE_NONE);
   int tmp_ret = OB_SUCCESS;
   ObTimeGuard timeguard("rpc_serve_cb", 200 * 1000);
   if (NULL == b || sz <= easy_head_size) {
@@ -274,6 +272,9 @@ int serve_cb(int grp, const char* b, int64_t sz, uint64_t resp_id)
       RPC_LOG(ERROR, "decode packet fail");
     } else {
       ObCurTraceId::set(tmp_pkt.get_trace_id());
+#ifdef ERRSIM
+      THIS_WORKER.set_module_type(tmp_pkt.get_module_type());
+#endif
       bool is_stream = tmp_pkt.is_stream();
       bool is_ddl_rpc = (ORPR_DDL == tmp_pkt.get_priority());
       bool is_lease = (OB_RENEW_LEASE == tmp_pkt.get_pcode());

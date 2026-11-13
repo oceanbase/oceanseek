@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX STORAGE
 
+#include "lib/worker.h"
 #include "storage/ss_garbage_collector/task/ob_ss_mark_sweep_gc_gen_task.h"
 #include "observer/ob_server_event_history_table_operator.h"
 #include "lib/allocator/ob_allocator.h"
@@ -1548,6 +1549,7 @@ int ObSSMarkSweepGCGenTask::merge_tablet_meta_scns_from_ckpt_(
 
 void ObSSMarkSweepGCGenTask::runTimerTask()
 {
+  lib::ErrsimModuleGuard errsim_guard(common::ObErrsimModuleType::ERRSIM_MODULE_SS_GC);
   int ret = OB_SUCCESS;
   bool need_do_work = false;
   bool is_ls_ckpt_enabled = false;

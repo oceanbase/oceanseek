@@ -188,8 +188,9 @@ bool errsim_alloc(const ObMemAttr &attr)
 #ifdef ERRSIM
   const ObErrsimModuleType type = THIS_WORKER.get_module_type();
   if (is_errsim_module(attr.tenant_id_, type.type_)) {
-    //errsim alloc memory failed.
+    // Record the hit on this stack; diagnostics must not alter the allocation result.
     bret = true;
+    (void)record_tenant_errsim_event(attr.tenant_id_, type.type_, OB_ALLOCATE_MEMORY_FAILED);
   }
 #endif
   if (bret) {

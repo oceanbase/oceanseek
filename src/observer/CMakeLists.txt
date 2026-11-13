@@ -484,6 +484,7 @@ ob_set_subtarget(ob_server virtual_table
   virtual_table/ob_all_virtual_bad_block_table.cpp
   virtual_table/ob_all_virtual_compaction_diagnose_info.cpp
   virtual_table/ob_all_virtual_server_compaction_event_history.cpp
+  virtual_table/ob_all_virtual_tenant_errsim_event.cpp
   virtual_table/ob_all_virtual_compaction_suggestion.cpp
   virtual_table/ob_all_virtual_tablet_compaction_info.cpp
   virtual_table/ob_virtual_table_tablet_iter.cpp

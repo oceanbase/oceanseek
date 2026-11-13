@@ -6,6 +6,7 @@
 #include "ob_poc_rpc_proxy.h"
 #include "rpc/obrpc/ob_rpc_proxy.h"
 #include "rpc/obrpc/ob_net_keepalive.h"
+#include "lib/worker.h"
 extern "C" {
 #include "rpc/pnio/r0/futex.h"
 }
@@ -118,6 +119,7 @@ int ObAsyncRespCallback::create(ObRpcMemPool& pool, UAsyncCB* ucb, ObAsyncRespCa
 int ObAsyncRespCallback::handle_resp(int io_err, const char* buf, int64_t sz)
 {
   int ret = OB_SUCCESS;
+  lib::ErrsimModuleGuard errsim_guard(ObErrsimModuleType::ERRSIM_MODULE_NONE);
   const int64_t start_time = ObTimeUtility::current_time();
   int64_t after_decode_time = 0;
   int64_t after_process_time = 0;

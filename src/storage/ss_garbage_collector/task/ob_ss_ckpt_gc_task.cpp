@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX STORAGE
 
+#include "lib/worker.h"
 #include "storage/ss_garbage_collector/task/ob_ss_ckpt_gc_task.h"
 
 #include "lib/container/ob_se_array.h"
@@ -79,6 +80,7 @@ void ObSSCkptGCTask::destroy()
 
 void ObSSCkptGCTask::runTimerTask()
 {
+  lib::ErrsimModuleGuard errsim_guard(common::ObErrsimModuleType::ERRSIM_MODULE_SS_GC);
   int ret = OB_SUCCESS;
   bool is_need = false;
   bool is_enabled = false;
