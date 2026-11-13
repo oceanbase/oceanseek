@@ -4,6 +4,9 @@
  */
 
 #include "../test_sql_utils.h"
+#include "lib/oblog/ob_warning_buffer.h"
+#include "lib/utility/ob_defer.h"
+#include "plugin/legacy/sys/ob_plugin_mgr.h"
 #include "sql/plan_cache/ob_sql_parameterization.h"
 using namespace oceanbase::common;
 using namespace oceanbase::sql;
@@ -67,6 +70,434 @@ void TestParser::SetUp()
 
 void TestParser::TearDown()
 {
+}
+
+static const ParseNode *find_search_index_node(const ParseNode *node, ObItemType type)
+{
+  const ParseNode *found = NULL;
+  if (NULL != node) {
+    if (node->type_ == type) {
+      found = node;
+    } else {
+      for (int64_t i = 0; NULL == found && i < node->num_child_; ++i) {
+        found = find_search_index_node(node->children_[i], type);
+      }
+    }
+  }
+  return found;
+}
+
+TEST(SearchIndexParser, mode_blocks)
+{
+  const char *columns = R"SQL((
+    payload WITH (
+      FULLTEXT (
+        INCLUDE_PATHS = ('$.text1', '$.text2'), PARSER = 'ik',
+        PARSER_PROPERTIES = (ik_mode = 'max_word')
+      ),
+      FULLTEXT (
+        INCLUDE_PATHS = ('$.text3', '$.text4'), PARSER = 'ngram',
+        PARSER_PROPERTIES = (ngram_token_size = 2)
+      ),
+      VALUE (
+        INCLUDE_PATHS = ('$.title', '$.price'), INCLUDE_TYPES = (JSON_STRING)
+      )
+    )
+  ))SQL";
+  const char *prefixes[] = {
+    "CREATE TABLE docs (id BIGINT PRIMARY KEY, payload JSON, ASYNC SEARCH INDEX idx ",
+    "CREATE ASYNC SEARCH INDEX idx ON docs ",
+    "ALTER TABLE docs ADD ASYNC SEARCH INDEX idx ",
+    "CREATE TABLE docs (id BIGINT PRIMARY KEY, payload JSON, SEARCH INDEX idx ",
+    "CREATE SEARCH INDEX idx ON docs ",
+    "ALTER TABLE docs ADD SEARCH INDEX idx "
+  };
+  for (int64_t i = 0; i < ARRAYSIZEOF(prefixes); ++i) {
+    std::string query = std::string(prefixes[i]) + columns
+                      + (i % 3 == 0 ? ") ORGANIZATION = HEAP" : "");
+    SCOPED_TRACE(query);
+    ObArenaAllocator allocator(ObModIds::TEST);
+    ObParser parser(allocator, DEFAULT_MYSQL_MODE);
+    ParseResult result;
+    ASSERT_EQ(OB_SUCCESS, parser.parse(query.c_str(), result));
+    std::cout << "\nSQL:\n" << query << "\nParse result: OB_SUCCESS\nAST:\n"
+              << CSJ(ObParserResultTreePrintWrapper(*result.result_tree_)) << std::endl;
+    const ParseNode *modes = find_search_index_node(result.result_tree_, T_SEARCH_INDEX_MODE_LIST);
+    ASSERT_NE(nullptr, modes);
+    ASSERT_EQ(3, modes->num_child_);
+    EXPECT_EQ(T_SEARCH_INDEX_FULLTEXT, modes->children_[0]->type_);
+    EXPECT_EQ(T_SEARCH_INDEX_FULLTEXT, modes->children_[1]->type_);
+    EXPECT_EQ(T_SEARCH_INDEX_VALUE, modes->children_[2]->type_);
+    const char *parser_names[] = {"ik", "ngram", NULL};
+    for (int64_t j = 0; j < modes->num_child_; ++j) {
+      const ParseNode *name = find_search_index_node(modes->children_[j], T_PARSER_NAME);
+      if (NULL == parser_names[j]) {
+        EXPECT_EQ(nullptr, name);
+      } else {
+        ASSERT_NE(nullptr, name);
+        EXPECT_EQ(ObString(parser_names[j]),
+                  ObString(name->children_[0]->str_len_, name->children_[0]->str_value_));
+      }
+    }
+    parser.free_result(result);
+  }
+}
+
+TEST(SearchIndexParser, fixed_defaults_and_legacy_syntax)
+{
+  const char *queries[] = {
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH (FULLTEXT))",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH (FULLTEXT (FTS_INDEX_TYPE = MATCH)))",
+    "CREATE SEARCH INDEX idx ON docs (payload WITH (INCLUDE_PATHS = ('$.title'), "
+        "INCLUDE_TYPES = (JSON_STRING)))",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH (EXCLUDE_PATHS = ('$.private'), "
+        "NESTED_PATHS = ('$.items'))) LOCAL COMMENT 'legacy'",
+    "CREATE FULLTEXT INDEX idx ON docs (body) WITH PARSER ngram "
+        "PARSER_PROPERTIES = (ngram_token_size = 2) FTS_INDEX_TYPE = PHRASE_MATCH",
+    "CREATE VECTOR INDEX idx ON docs (embedding) WITH (distance = l2, type = hnsw)",
+    "CREATE TABLE text_value (text_value INT, INDEX text_value (text_value))"
+  };
+  for (const char *query : queries) {
+    SCOPED_TRACE(query);
+    ObArenaAllocator allocator(ObModIds::TEST);
+    ObParser parser(allocator, DEFAULT_MYSQL_MODE);
+    ParseResult result;
+    ASSERT_EQ(OB_SUCCESS, parser.parse(query, result));
+    parser.free_result(result);
+  }
+}
+
+TEST(SearchIndexParser, index_level_with_options)
+{
+  const char *prefixes[] = {
+    "CREATE TABLE docs (payload JSON, ASYNC SEARCH INDEX idx ",
+    "CREATE ASYNC SEARCH INDEX idx ON docs ",
+    "ALTER TABLE docs ADD ASYNC SEARCH INDEX idx ",
+    "CREATE TABLE docs (payload JSON, SEARCH INDEX idx ",
+    "CREATE SEARCH INDEX idx ON docs ",
+    "ALTER TABLE docs ADD SEARCH INDEX idx "
+  };
+  const char *columns[] = {"(payload)", "(payload WITH (FULLTEXT))"};
+  const struct {
+    const char *sql_;
+    int expected_;
+  } options[] = {
+    {" WITH (PARSER='space')", OB_ERR_PARSE_SQL},
+    {" WITH (INCLUDE_TYPES=(JSON_STRING))", OB_ERR_PARSE_SQL},
+    {" WITH (FTS_INDEX_TYPE=MATCH)", OB_ERR_PARSE_SQL},
+    {" WITH ()", OB_ERR_PARSE_SQL},
+    {" WITH (distance=l2, type=hnsw)", OB_SUCCESS}
+  };
+  for (int64_t i = 0; i < ARRAYSIZEOF(prefixes); ++i) {
+    for (const char *column : columns) {
+      for (const auto &option : options) {
+        const std::string query = std::string(prefixes[i]) + column + option.sql_
+            + (i % 3 == 0 ? ") ORGANIZATION=HEAP" : "");
+        SCOPED_TRACE(query);
+        ObArenaAllocator allocator(ObModIds::TEST);
+        ObParser parser(allocator, DEFAULT_MYSQL_MODE);
+        ParseResult result;
+        EXPECT_EQ(option.expected_, parser.parse(query.c_str(), result));
+        parser.free_result(result);
+      }
+    }
+  }
+}
+
+TEST(SearchIndexParser, bare_modes_and_mixed_blocks)
+{
+  const char *prefixes[] = {
+    "CREATE ASYNC SEARCH INDEX idx ON docs ",
+    "ALTER TABLE docs ADD ASYNC SEARCH INDEX idx ",
+    "CREATE TABLE docs (payload JSON, ASYNC SEARCH INDEX idx "
+  };
+  const char *configs[] = {
+    "FULLTEXT", "VALUE", "FULLTEXT, VALUE", "VALUE, FULLTEXT",
+    "FULLTEXT(PARSER='ngram'), VALUE, FULLTEXT",
+    "FULLTEXT(INCLUDE_PATHS=('$.title'), PARSER='ngram'), VALUE, "
+        "FULLTEXT(EXCLUDE_PATHS=('$.title'))",
+    "NESTED_PATHS=('$.items'), FULLTEXT, VALUE",
+    "FULLTEXT, NESTED_PATHS=('$.items'), VALUE",
+    "VALUE, FULLTEXT, NESTED_PATHS=('$.items')"
+  };
+  for (int64_t i = 0; i < ARRAYSIZEOF(prefixes); ++i) {
+    for (const char *config : configs) {
+      const std::string query = std::string(prefixes[i]) + "(payload WITH (" + config + "))"
+          + (i == 2 ? ") ORGANIZATION=HEAP" : "");
+      SCOPED_TRACE(query);
+      ObArenaAllocator allocator(ObModIds::TEST);
+      ObParser parser(allocator, DEFAULT_MYSQL_MODE);
+      ParseResult result;
+      ASSERT_EQ(OB_SUCCESS, parser.parse(query.c_str(), result));
+      parser.free_result(result);
+    }
+  }
+}
+
+TEST(SearchIndexParser, empty_mode_blocks_are_rejected)
+{
+  const char *prefixes[] = {
+    "CREATE ASYNC SEARCH INDEX idx ON docs ",
+    "ALTER TABLE docs ADD ASYNC SEARCH INDEX idx ",
+    "CREATE TABLE docs (payload JSON, ASYNC SEARCH INDEX idx "
+  };
+  const char *configs[] = {
+    "FULLTEXT()", "VALUE()", "FULLTEXT( /* empty */ )", "VALUE( /* empty */ )",
+    "FULLTEXT(PARSER='space'), VALUE()",
+    "VALUE(INCLUDE_TYPES=(JSON_STRING)), FULLTEXT()",
+    "NESTED_PATHS=('$.items'), FULLTEXT()"
+  };
+  for (int64_t i = 0; i < ARRAYSIZEOF(prefixes); ++i) {
+    for (const char *config : configs) {
+      const std::string query = std::string(prefixes[i]) + "(payload WITH (" + config + "))"
+          + (i == 2 ? ") ORGANIZATION=HEAP" : "");
+      SCOPED_TRACE(query);
+      ObArenaAllocator allocator(ObModIds::TEST);
+      ObParser parser(allocator, DEFAULT_MYSQL_MODE);
+      ParseResult result;
+      EXPECT_EQ(OB_ERR_PARSE_SQL, parser.parse(query.c_str(), result));
+      parser.free_result(result);
+    }
+  }
+}
+
+TEST(SearchIndexParser, malformed_mode_blocks)
+{
+  const char *queries[] = {
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH (FULLTEXT, PARSER='ngram', VALUE))",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH (FULLTEXT, INCLUDE_PATHS=('$.a'), VALUE))",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH (INCLUDE_TYPES=(JSON_STRING), VALUE))",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH (FULLTEXT WITH (PARSER = 'ik')))",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH (VALUE WITH ()))",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH (TEXT_VALUE ()))",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH (TEXT_VALUE WITH ()))",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH (TYPE = TEXT_VALUE))",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH (TYPE = VALUE, TYPE = VALUE))",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH (TYPE = FULLTEXT, TYPE = VALUE))",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH (FULLTEXT (TYPE = FULLTEXT)))",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH (TYPE = FULLTEXT, VALUE))",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH (FULLTEXT, TYPE = VALUE))",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH (VALUE(INCLUDE_PATHS=('$.a')), TYPE=VALUE))",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH (TYPE=FULLTEXT, FULLTEXT(PARSER='space')))",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH (NESTED_PATHS=('$.a'), TYPE=VALUE, VALUE))",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH (TYPE=VALUE, INCLUDE_PATHS=('$.a'), TYPE=VALUE))",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH ((TYPE = FULLTEXT), (TYPE = VALUE)))",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH (TYPE = FULLTEXT,))",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH ())",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH (FULLTEXT (PARSER 'ik')))",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH (FULLTEXT (INCLUDE_PATHS = '$.a')))",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH (FULLTEXT (FTS_INDEX_TYPE = invalid)))",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload WITH (FULLTEXT,))",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload) WITH (PARSER = 'ik',)",
+    "CREATE ASYNC SEARCH INDEX idx ON docs (payload) WITH (INCLUDE_PATHS = ('$.a'))",
+    "CREATE INDEX idx ON docs (payload) WITH (INCLUDE_TYPES = (JSON_STRING))"
+  };
+  for (const char *query : queries) {
+    SCOPED_TRACE(query);
+    ObArenaAllocator allocator(ObModIds::TEST);
+    ObParser parser(allocator, DEFAULT_MYSQL_MODE);
+    ParseResult result;
+    EXPECT_EQ(OB_ERR_PARSE_SQL, parser.parse(query, result));
+    parser.free_result(result);
+  }
+}
+
+TEST(SearchIndexParser, flat_options_in_all_ddl_entries)
+{
+  const char *prefixes[] = {
+    "CREATE TABLE docs (payload JSON, ASYNC SEARCH INDEX idx ",
+    "CREATE ASYNC SEARCH INDEX idx ON docs ",
+    "ALTER TABLE docs ADD ASYNC SEARCH INDEX idx "
+  };
+  const char *options[] = {
+    "TYPE=VALUE",
+    "TYPE=VALUE, INCLUDE_PATHS=('$.title'), INCLUDE_TYPES=(JSON_STRING)",
+    "TYPE=FULLTEXT",
+    "TYPE=FULLTEXT, PARSER='ngram', PARSER_PROPERTIES=(ngram_token_size=2)",
+    "INCLUDE_PATHS=('$.title'), TYPE=FULLTEXT, PARSER='ngram'",
+    "PARSER='ngram', INCLUDE_PATHS=('$.title'), TYPE=FULLTEXT",
+    "NESTED_PATHS=('$.items'), TYPE=VALUE, INCLUDE_TYPES=(JSON_STRING)",
+    "INCLUDE_PATHS=('$.title'), INCLUDE_TYPES=(JSON_STRING), TYPE=VALUE",
+    "INCLUDE_PATHS=('$.title'), INCLUDE_TYPES=(JSON_STRING)",
+    "NESTED_PATHS=('$.items')",
+    // Missing TYPE defaults to VALUE; fulltext-only options are rejected by the Resolver.
+    "PARSER='space'",
+    "FTS_INDEX_TYPE=MATCH"
+  };
+  for (int64_t i = 0; i < ARRAYSIZEOF(prefixes); ++i) {
+    for (const char *option : options) {
+      const std::string query = std::string(prefixes[i]) + "(payload WITH (" + option + "))"
+          + (i == 0 ? ") ORGANIZATION=HEAP" : "");
+      SCOPED_TRACE(query);
+      ObArenaAllocator allocator(ObModIds::TEST);
+      ObParser parser(allocator, DEFAULT_MYSQL_MODE);
+      ParseResult result;
+      ASSERT_EQ(OB_SUCCESS, parser.parse(query.c_str(), result));
+      const ParseNode *params = find_search_index_node(result.result_tree_, T_SEARCH_INDEX_COLUMN_PARAMS);
+      ASSERT_NE(nullptr, params);
+      ASSERT_EQ(1, params->num_child_);
+      ASSERT_NE(nullptr, params->children_[0]);
+      EXPECT_EQ(T_SEARCH_INDEX_OPTION_LIST, params->children_[0]->type_);
+      EXPECT_GE(params->children_[0]->num_child_, 1);
+      for (int64_t j = 0; j < params->children_[0]->num_child_; ++j) {
+        EXPECT_NE(T_LINK_NODE, params->children_[0]->children_[j]->type_);
+      }
+      EXPECT_EQ(nullptr, find_search_index_node(params, T_SEARCH_INDEX_MODE_LIST));
+      EXPECT_EQ(nullptr, find_search_index_node(params, T_SEARCH_INDEX_VALUE));
+      EXPECT_EQ(nullptr, find_search_index_node(params, T_SEARCH_INDEX_FULLTEXT));
+      const ParseNode *type = find_search_index_node(params, T_SEARCH_INDEX_TYPE);
+      if (nullptr == strstr(option, "TYPE=VALUE") && nullptr == strstr(option, "TYPE=FULLTEXT")) {
+        EXPECT_EQ(nullptr, type);
+      } else {
+        ASSERT_NE(nullptr, type);
+        EXPECT_EQ(nullptr != strstr(option, "TYPE=VALUE")
+            ? T_SEARCH_INDEX_VALUE : T_SEARCH_INDEX_FULLTEXT, type->value_);
+      }
+      parser.free_result(result);
+    }
+  }
+}
+
+TEST_F(TestParser, search_index_schema_only_ddl)
+{
+  const auto saved_startup_mode = GCTX.startup_mode_;
+  GCTX.startup_mode_ = oceanbase::share::ObServerMode::SHARED_STORAGE_MODE;
+  DEFER(GCTX.startup_mode_ = saved_startup_mode);
+  oceanbase::omt::ObTenantConfigGuard tenant_config(TENANT_CONF(sys_tenant_id_));
+  ASSERT_TRUE(tenant_config.is_valid());
+  const bool saved_async_index_enabled = tenant_config->_enable_async_index;
+  tenant_config->_enable_async_index = true;
+  DEFER(tenant_config->_enable_async_index = saved_async_index_enabled);
+  oceanbase::plugin::ObPluginMgr plugins;
+  ASSERT_EQ(OB_SUCCESS, plugins.init(ObString()));
+  ASSERT_EQ(OB_SUCCESS, plugins.load_builtin_plugins());
+  auto *saved_plugins = GCTX.plugin_mgr_;
+  GCTX.plugin_mgr_ = &plugins;
+  DEFER(GCTX.plugin_mgr_ = saved_plugins);
+  ObStmt *stmt = NULL;
+  ASSERT_NO_FATAL_FAILURE(do_load_sql(
+      "CREATE TABLE json_text_docs (id BIGINT PRIMARY KEY, payload JSON, other JSON) ORGANIZATION = HEAP", stmt));
+  const char *queries[] = {
+    "CREATE TABLE json_text_single (id BIGINT PRIMARY KEY, payload JSON, "
+        "ASYNC SEARCH INDEX idx (payload WITH (FULLTEXT (PARSER = 'ik')))) ORGANIZATION = HEAP",
+    "CREATE ASYNC SEARCH INDEX idx_text ON json_text_docs (payload WITH (FULLTEXT))",
+    "ALTER TABLE json_text_docs ADD ASYNC SEARCH INDEX idx_value (payload WITH (VALUE))",
+    "CREATE TABLE json_text_defaults (id BIGINT PRIMARY KEY, payload JSON, "
+        "ASYNC SEARCH INDEX idx (payload WITH (FULLTEXT))) ORGANIZATION = HEAP",
+    "CREATE ASYNC SEARCH INDEX idx_types ON json_text_docs (payload WITH (VALUE (INCLUDE_TYPES = (JSON_STRING))))",
+    "ALTER TABLE json_text_docs ADD ASYNC SEARCH INDEX idx_match (payload WITH (FULLTEXT (FTS_INDEX_TYPE = MATCH)))",
+    // Parser/path uniqueness and VALUE counts are scoped to each source column.
+    "CREATE ASYNC SEARCH INDEX idx_columns ON json_text_docs "
+        "(payload WITH (FULLTEXT, VALUE), other WITH (FULLTEXT, VALUE))"
+  };
+  const bool warn_log_on = ObWarningBuffer::is_warn_log_on();
+  DEFER(ObWarningBuffer::set_warn_log_on(warn_log_on));
+  ObWarningBuffer::set_warn_log_on(true);
+  for (int64_t i = 0; i < ARRAYSIZEOF(queries); ++i) {
+    SCOPED_TRACE(queries[i]);
+    ObWarningBufferIgnoreScope warning_scope;
+    stmt = NULL;
+    ASSERT_NO_FATAL_FAILURE(do_load_sql(queries[i], stmt));
+    ASSERT_NE(nullptr, stmt);
+  }
+  const char *prefixes[] = {
+    "CREATE TABLE json_text_new (id BIGINT PRIMARY KEY, payload JSON, ASYNC SEARCH INDEX idx ",
+    "CREATE ASYNC SEARCH INDEX idx ON json_text_docs ",
+    "ALTER TABLE json_text_docs ADD ASYNC SEARCH INDEX idx "
+  };
+  const char *example = "(payload WITH ("
+      "FULLTEXT (INCLUDE_PATHS=('$.text1', '$.text2'), PARSER='ik', PARSER_PROPERTIES=(ik_mode='max_word')), "
+      "FULLTEXT (INCLUDE_PATHS=('$.text3', '$.text4'), PARSER='ngram', PARSER_PROPERTIES=(ngram_token_size=2)), "
+      "VALUE (INCLUDE_PATHS=('$.title', '$.price'), INCLUDE_TYPES=(JSON_STRING))))";
+  const char *invalid_modes[] = {
+    "VALUE, VALUE",
+    "FULLTEXT(PARSER='ngram'), VALUE, FULLTEXT",
+    "VALUE (INCLUDE_PATHS=('$.a')), VALUE (INCLUDE_PATHS=('$.b'))",
+    "FULLTEXT (INCLUDE_PATHS=('$.a')), FULLTEXT (INCLUDE_PATHS=('$.b'), PARSER='SPACE')",
+    "FULLTEXT (INCLUDE_PATHS=('$.a')), FULLTEXT (EXCLUDE_PATHS=('$.b'), PARSER='ngram')"
+  };
+  for (int64_t i = 0; i < ARRAYSIZEOF(prefixes); ++i) {
+    const std::string suffix = i == 0 ? ") ORGANIZATION=HEAP" : "";
+    const std::string query = std::string(prefixes[i]) + example + suffix;
+    SCOPED_TRACE(query);
+    ObWarningBufferIgnoreScope warning_scope;
+    stmt = nullptr;
+    ASSERT_NO_FATAL_FAILURE(do_load_sql(query.c_str(), stmt));
+    ASSERT_NE(nullptr, stmt);
+    for (const char *modes : invalid_modes) {
+      const std::string invalid = std::string(prefixes[i]) + "(payload WITH (" + modes + "))" + suffix;
+      SCOPED_TRACE(invalid);
+      stmt = nullptr;
+      ASSERT_NO_FATAL_FAILURE(do_load_sql(invalid.c_str(), stmt, TREE_FORMAT, -OB_INVALID_ARGUMENT));
+    }
+  }
+  // Schema-only execution still validates every configuration before creating anything.
+  const char *invalid_configs[] = {
+    "CREATE TABLE json_text_new (id BIGINT PRIMARY KEY, payload JSON, "
+        "ASYNC SEARCH INDEX idx (payload WITH (FULLTEXT (INCLUDE_TYPES=(JSON_NUMBER))))) ORGANIZATION=HEAP",
+    "ALTER TABLE json_text_docs ADD ASYNC SEARCH INDEX idx "
+        "(payload WITH (FULLTEXT, FULLTEXT (PARSER='ngram', INCLUDE_PATHS=('$.a'))))",
+    "CREATE TABLE json_text_new (id BIGINT PRIMARY KEY, payload JSON, "
+        "ASYNC SEARCH INDEX idx (payload WITH (FULLTEXT (PARSER='analyzer')))) ORGANIZATION=HEAP",
+    "CREATE ASYNC SEARCH INDEX idx ON json_text_docs (payload WITH (FULLTEXT (PARSER='analyzer')))",
+    "ALTER TABLE json_text_docs ADD ASYNC SEARCH INDEX idx (payload WITH (FULLTEXT (PARSER='analyzer')))"
+  };
+  for (const char *sql : invalid_configs) {
+    SCOPED_TRACE(sql);
+    stmt = nullptr;
+    ASSERT_NO_FATAL_FAILURE(do_load_sql(sql, stmt, TREE_FORMAT, -OB_INVALID_ARGUMENT));
+  }
+  const char *same_column_nested_configs[] = {
+    "CREATE TABLE json_text_column_nested (id BIGINT PRIMARY KEY, payload JSON, "
+        "ASYNC SEARCH INDEX idx_column_inline (payload WITH (NESTED_PATHS=('$.items'), "
+        "VALUE, FULLTEXT))) ORGANIZATION=HEAP",
+    "CREATE ASYNC SEARCH INDEX idx_column_create ON json_text_docs "
+        "(payload WITH (FULLTEXT, NESTED_PATHS=('$.items'), VALUE))",
+    "ALTER TABLE json_text_docs ADD ASYNC SEARCH INDEX idx_column_alter "
+        "(payload WITH (FULLTEXT, NESTED_PATHS=('$.items')))"
+  };
+  for (const char *sql : same_column_nested_configs) {
+    SCOPED_TRACE(sql);
+    stmt = nullptr;
+    ASSERT_NO_FATAL_FAILURE(do_load_sql(sql, stmt, TREE_FORMAT, -OB_NOT_SUPPORTED));
+  }
+  const char *nested_configs[] = {
+    "CREATE TABLE json_text_nested (id BIGINT PRIMARY KEY, payload JSON, other JSON, "
+        "ASYNC SEARCH INDEX idx_nested_inline (payload WITH (FULLTEXT), "
+        "other WITH (NESTED_PATHS=('$.items')))) ORGANIZATION=HEAP",
+    "CREATE ASYNC SEARCH INDEX idx_nested_create ON json_text_docs (payload WITH (NESTED_PATHS=('$.items')), "
+        "other WITH (FULLTEXT))",
+    "ALTER TABLE json_text_docs ADD ASYNC SEARCH INDEX idx_nested_alter (payload WITH (FULLTEXT), "
+        "other WITH (NESTED_PATHS=('$.items')))"
+  };
+  for (const char *sql : nested_configs) {
+    SCOPED_TRACE(sql);
+    ObWarningBufferIgnoreScope warning_scope;
+    stmt = nullptr;
+    ASSERT_NO_FATAL_FAILURE(do_load_sql(sql, stmt));
+    ASSERT_NE(nullptr, stmt);
+  }
+  const char *nested_rejected[] = {
+    "VALUE(NESTED_PATHS=('$.items'))", "FULLTEXT(NESTED_PATHS=('$.items'))",
+    "TYPE=FULLTEXT, NESTED_PATHS=('$.items')"
+  };
+  for (int64_t i = 0; i < ARRAYSIZEOF(prefixes); ++i) {
+    for (const char *options : nested_rejected) {
+      const std::string query = std::string(prefixes[i]) + "(payload WITH (" + options + "))"
+          + (i == 0 ? ") ORGANIZATION=HEAP" : "");
+      SCOPED_TRACE(query);
+      stmt = nullptr;
+      ASSERT_NO_FATAL_FAILURE(do_load_sql(query.c_str(), stmt, TREE_FORMAT, -OB_NOT_SUPPORTED));
+    }
+  }
+  {
+    ObWarningBufferIgnoreScope warning_scope;
+    stmt = nullptr;
+    ASSERT_NO_FATAL_FAILURE(do_load_sql(
+        "CREATE SEARCH INDEX idx ON json_text_docs (payload WITH (FULLTEXT))",
+        stmt, TREE_FORMAT, -OB_NOT_SUPPORTED));
+    EXPECT_NE(std::string::npos, std::string(ob_get_tsi_warning_buffer()->get_err_msg()).find("synchronous search index"));
+  }
 }
 
 TEST_F(TestParser, direct_load_stream_insert_target)

@@ -20,14 +20,33 @@ class ObDDLService;
 
 namespace share
 {
+struct ObSearchIndexRequirements
+{
+  ObSearchIndexRequirements()
+    : has_data_(false), has_text_match_(false), has_text_match_phrase_(false), has_fulltext_(false), has_nested_(false) {}
+  bool has_data_;
+  bool has_text_match_;
+  bool has_text_match_phrase_;
+  bool has_fulltext_;
+  bool has_nested_;
+};
+
 class ObSearchIndexBuilderUtil
 {
 public:
+    // Resolve Search Def and auxiliary-table configurations; reject synchronous FULLTEXT.
+    static int resolve_search_index_args(const obrpc::ObCreateIndexArg &arg,
+                                        ObSearchIndexRequirements &requirements);
+    static int resolve_search_index_args(const obrpc::ObCreateIndexArg &arg);
+    // JSON FULLTEXT creation requires 4.6.3.1; VALUE keeps the existing Search Index gate.
+    static int check_fulltext_data_version(const obrpc::ObCreateIndexArg &arg,
+                                          const uint64_t tenant_data_version);
     static int generate_search_index_name(
         obrpc::ObCreateIndexArg &arg,
         ObIAllocator *allocator);
     static int append_search_index_arg(
         const obrpc::ObCreateIndexArg &index_arg,
+        const ObSearchIndexRequirements &requirements,
         ObIAllocator *allocator,
         ObIArray<obrpc::ObCreateIndexArg> &index_arg_list);
     static int set_search_index_table_columns(
@@ -65,6 +84,9 @@ private:
       const bool is_binary,
       const bool is_rowkey,
       int64_t &rowkey_pos);
+  static int set_search_text_table_columns(
+      const obrpc::ObCreateIndexArg &arg, const ObTableSchema &data_schema,
+      ObTableSchema &index_schema);
 };
 
 }//end namespace share

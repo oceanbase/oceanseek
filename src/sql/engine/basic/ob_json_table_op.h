@@ -58,7 +58,9 @@ typedef enum JtNodeType {
 typedef enum ResultType {
   NOT_DATUM,
   EMPTY_DATUM,
-  ERROR_DATUM
+  ERROR_DATUM,
+  // curr_ points to ObJsonWrapper* (non-datum result), parallel to NOT_DATUM for ObIJsonBase*.
+  NOT_DATUM_WRAPPER
 } ResultType;
 
 typedef enum ScanType{  // symbol of execute stage, scan node or col node
@@ -160,6 +162,7 @@ class ObJsonTableOp;
 struct JtScanCtx {
     JtScanCtx()
       : row_alloc_(),
+        mem_ctx_(nullptr),
         op_exec_alloc_(nullptr),
         context(nullptr),
         table_func_(nullptr),
@@ -226,6 +229,8 @@ public:
       is_evaled_(false),
       root_(nullptr),
       input_(nullptr),
+      input_wrapper_(),
+      enable_json_bin_view_(true),
       j_null_(),
       j_arr_(allocator_),
       j_obj_(allocator_),
@@ -282,6 +287,8 @@ private:
 
 public:
   void *input_;   // mul mode table
+  common::ObJsonWrapper input_wrapper_;
+  bool enable_json_bin_view_;
   void reset_columns();
 
 private:
@@ -299,107 +306,280 @@ private:
 
 class MulModeTableFunc {
 public:
-  MulModeTableFunc() {}
+  using InitCtxFunc = int (*)(ObRegCol &scan_node, JtScanCtx*& ctx);
+  using EvalDefaultValueFunc = int (*)(JtScanCtx*& ctx,
+                                       ObExpr*& default_expr,
+                                       void*& res,
+                                       bool need_datum);
+  using ContainerAtFunc = int (*)(void* in, void *&out, int32_t pos);
+  using EvalInputFunc = int (*)(ObJsonTableOp &jt, JtScanCtx& ctx, ObEvalCtx &eval_ctx);
+  using ResetPathIterFunc = int (*)(ObRegCol &scan_node,
+                                    void* in,
+                                    JtScanCtx*& ctx,
+                                    ScanType init_flag,
+                                    bool &is_null_value);
+  using GetIterValueFunc = int (*)(ObRegCol &col_node, JtScanCtx* ctx, bool &is_null_value);
+  using EvalSeekColFunc = int (*)(ObRegCol &col_node,
+                                  void* in,
+                                  JtScanCtx* ctx,
+                                  bool &is_null_value,
+                                  bool &need_cast_res);
+  using ColResTypeCheckFunc = int (*)(ObRegCol &col_node, JtScanCtx* ctx);
+  using CheckDefaultValueFunc = int (*)(JtScanCtx* ctx, ObRegCol &col_node, ObExpr* expr);
+  using SetOnEmptyFunc = int (*)(ObRegCol& col_node, JtScanCtx* ctx, bool &need_cast, bool& is_null);
+  using SetOnErrorFunc = int (*)(ObRegCol& col_node, JtScanCtx* ctx, int& ret);
+  using CastToResultFunc = int (*)(ObRegCol& col_node, JtScanCtx* ctx, bool enable_error, bool is_pack_result);
+  using SetExprExecParamFunc = int (*)(ObRegCol& col_node, JtScanCtx* ctx);
+  using ResetCtxFunc = int (*)(ObRegCol &scan_node, JtScanCtx*& ctx);
+
+  MulModeTableFunc()
+    : init_ctx_func_(nullptr),
+      eval_default_value_func_(nullptr),
+      container_at_func_(nullptr),
+      eval_input_func_(nullptr),
+      reset_path_iter_func_(nullptr),
+      get_iter_value_func_(nullptr),
+      eval_seek_col_func_(nullptr),
+      col_res_type_check_func_(nullptr),
+      check_default_value_func_(nullptr),
+      set_on_empty_func_(nullptr),
+      set_on_error_func_(nullptr),
+      cast_to_result_func_(nullptr),
+      set_expr_exec_param_func_(nullptr),
+      reset_ctx_func_(nullptr)
+  {}
   ~MulModeTableFunc() {}
 
-  virtual int init_ctx(ObRegCol &scan_node, JtScanCtx*& ctx) { return 0; } // init variable before seek value
-  virtual int eval_default_value(JtScanCtx*& ctx, ObExpr*& default_expr, void*& res, bool need_datum) { return 0; }  // eval default value in inner open
-  virtual int container_at(void* in, void *&out, int32_t pos) { return 0; }
-  virtual int eval_input(ObJsonTableOp &jt, JtScanCtx& ctx, ObEvalCtx &eval_ctx) { return 0; }  // get root input
-  virtual int reset_path_iter(ObRegCol &scan_node, void* in, JtScanCtx*& ctx, ScanType init_flag, bool &is_null_value) { return 0; }
-  virtual int get_iter_value(ObRegCol &col_node, JtScanCtx* ctx, bool &is_null_value) { return 0; };
-  virtual int eval_seek_col(ObRegCol &col_node, void* in, JtScanCtx* ctx, bool &is_null_value, bool &need_cast_res) { return 0; }
-  virtual int col_res_type_check(ObRegCol &col_node, JtScanCtx* ctx) { return 0; }
-  virtual int check_default_value(JtScanCtx* ctx, ObRegCol &col_node, ObExpr* expr) { return 0; }
-  virtual int set_on_empty(ObRegCol& col_node, JtScanCtx* ctx, bool &need_cast, bool& is_null) { return 0; }
-  virtual int set_on_error(ObRegCol& col_node, JtScanCtx* ctx, int& ret) { return 0; }
-  virtual int cast_to_result(ObRegCol& col_node, JtScanCtx* ctx, bool enable_error = false, bool is_pack_result = true) { return 0; }
-  virtual int set_expr_exec_param(ObRegCol& col_node, JtScanCtx* ctx) { return 0; }
-  virtual int reset_ctx(ObRegCol &scan_node, JtScanCtx*& ctx) { return 0; } // init variable before seek value
+  OB_INLINE int init_ctx(ObRegCol &scan_node, JtScanCtx*& ctx)
+  {
+    return OB_ISNULL(init_ctx_func_)
+             ? OB_SUCCESS : init_ctx_func_(scan_node, ctx);
+  }
+  OB_INLINE int eval_default_value(JtScanCtx*& ctx,
+                                   ObExpr*& default_expr,
+                                   void*& res,
+                                   bool need_datum)
+  {
+    return OB_ISNULL(eval_default_value_func_)
+             ? OB_SUCCESS : eval_default_value_func_(ctx, default_expr, res, need_datum);
+  }
+  OB_INLINE int container_at(void* in, void *&out, int32_t pos)
+  {
+    return OB_ISNULL(container_at_func_)
+             ? OB_SUCCESS : container_at_func_(in, out, pos);
+  }
+  OB_INLINE int eval_input(ObJsonTableOp &jt, JtScanCtx& ctx, ObEvalCtx &eval_ctx)
+  {
+    return OB_ISNULL(eval_input_func_)
+             ? OB_SUCCESS : eval_input_func_(jt, ctx, eval_ctx);
+  }
+  OB_INLINE int reset_path_iter(ObRegCol &scan_node,
+                                void* in,
+                                JtScanCtx*& ctx,
+                                ScanType init_flag,
+                                bool &is_null_value)
+  {
+    return OB_ISNULL(reset_path_iter_func_)
+             ? OB_SUCCESS : reset_path_iter_func_(scan_node, in, ctx, init_flag, is_null_value);
+  }
+  OB_INLINE int get_iter_value(ObRegCol &col_node, JtScanCtx* ctx, bool &is_null_value)
+  {
+    return OB_ISNULL(get_iter_value_func_)
+             ? OB_SUCCESS : get_iter_value_func_(col_node, ctx, is_null_value);
+  }
+  OB_INLINE int eval_seek_col(ObRegCol &col_node,
+                              void* in,
+                              JtScanCtx* ctx,
+                              bool &is_null_value,
+                              bool &need_cast_res)
+  {
+    return OB_ISNULL(eval_seek_col_func_)
+             ? OB_SUCCESS : eval_seek_col_func_(col_node, in, ctx, is_null_value, need_cast_res);
+  }
+  OB_INLINE int col_res_type_check(ObRegCol &col_node, JtScanCtx* ctx)
+  {
+    return OB_ISNULL(col_res_type_check_func_)
+             ? OB_SUCCESS : col_res_type_check_func_(col_node, ctx);
+  }
+  OB_INLINE int check_default_value(JtScanCtx* ctx, ObRegCol &col_node, ObExpr* expr)
+  {
+    return OB_ISNULL(check_default_value_func_)
+             ? OB_SUCCESS : check_default_value_func_(ctx, col_node, expr);
+  }
+  OB_INLINE int set_on_empty(ObRegCol& col_node, JtScanCtx* ctx, bool &need_cast, bool& is_null)
+  {
+    return OB_ISNULL(set_on_empty_func_)
+             ? OB_SUCCESS : set_on_empty_func_(col_node, ctx, need_cast, is_null);
+  }
+  OB_INLINE int set_on_error(ObRegCol& col_node, JtScanCtx* ctx, int& ret)
+  {
+    return OB_ISNULL(set_on_error_func_)
+             ? OB_SUCCESS : set_on_error_func_(col_node, ctx, ret);
+  }
+  OB_INLINE int cast_to_result(ObRegCol& col_node, JtScanCtx* ctx, bool enable_error = false, bool is_pack_result = true)
+  {
+    return OB_ISNULL(cast_to_result_func_)
+             ? OB_SUCCESS : cast_to_result_func_(col_node, ctx, enable_error, is_pack_result);
+  }
+  OB_INLINE int set_expr_exec_param(ObRegCol& col_node, JtScanCtx* ctx)
+  {
+    return OB_ISNULL(set_expr_exec_param_func_)
+             ? OB_SUCCESS : set_expr_exec_param_func_(col_node, ctx);
+  }
+  OB_INLINE int reset_ctx(ObRegCol &scan_node, JtScanCtx*& ctx)
+  {
+    return OB_ISNULL(reset_ctx_func_)
+             ? OB_SUCCESS : reset_ctx_func_(scan_node, ctx);
+  }
+
+protected:
+  InitCtxFunc init_ctx_func_;
+  EvalDefaultValueFunc eval_default_value_func_;
+  ContainerAtFunc container_at_func_;
+  EvalInputFunc eval_input_func_;
+  ResetPathIterFunc reset_path_iter_func_;
+  GetIterValueFunc get_iter_value_func_;
+  EvalSeekColFunc eval_seek_col_func_;
+  ColResTypeCheckFunc col_res_type_check_func_;
+  CheckDefaultValueFunc check_default_value_func_;
+  SetOnEmptyFunc set_on_empty_func_;
+  SetOnErrorFunc set_on_error_func_;
+  CastToResultFunc cast_to_result_func_;
+  SetExprExecParamFunc set_expr_exec_param_func_;
+  ResetCtxFunc reset_ctx_func_;
 };
 
 class JsonTableFunc : public MulModeTableFunc {
 public:
   JsonTableFunc()
-  : MulModeTableFunc() {}
+    : MulModeTableFunc()
+  {
+    init_ctx_func_ = &JsonTableFunc::init_ctx;
+    eval_default_value_func_ = &JsonTableFunc::eval_default_value;
+    container_at_func_ = &JsonTableFunc::container_at;
+    eval_input_func_ = &JsonTableFunc::eval_input;
+    reset_path_iter_func_ = &JsonTableFunc::reset_path_iter;
+    get_iter_value_func_ = &JsonTableFunc::get_iter_value;
+    eval_seek_col_func_ = &JsonTableFunc::eval_seek_col;
+    col_res_type_check_func_ = &JsonTableFunc::col_res_type_check;
+    check_default_value_func_ = &JsonTableFunc::check_default_value;
+    set_on_empty_func_ = &JsonTableFunc::set_on_empty;
+    set_on_error_func_ = &JsonTableFunc::set_on_error;
+    cast_to_result_func_ = &JsonTableFunc::cast_to_result;
+    set_expr_exec_param_func_ = &JsonTableFunc::set_expr_exec_param;
+  }
   ~JsonTableFunc() {}
 
-  int init_ctx(ObRegCol &scan_node, JtScanCtx*& ctx);
-  int eval_default_value(JtScanCtx*& ctx, ObExpr*& default_expr, void*& res, bool need_datum);
-  int container_at(void* in, void *&out, int32_t pos);
-  int eval_input(ObJsonTableOp &jt, JtScanCtx& ctx, ObEvalCtx &eval_ctx);
-  int reset_path_iter(ObRegCol &scan_node, void* in, JtScanCtx*& ctx, ScanType init_flag, bool &is_null_value);
-  int get_iter_value(ObRegCol &col_node, JtScanCtx* ctx, bool &is_null_value);
-  int eval_seek_col(ObRegCol &col_node, void* in, JtScanCtx* ctx, bool &is_null_value, bool &need_cast_res);
-  int col_res_type_check(ObRegCol &col_node, JtScanCtx* ctx);
-  int check_default_value(JtScanCtx* ctx, ObRegCol &col_node, ObExpr* expr);
-  int set_on_empty(ObRegCol& col_node, JtScanCtx* ctx, bool &need_cast, bool& is_null);
-  int set_on_error(ObRegCol& col_node, JtScanCtx* ctx, int& ret);
-  int cast_to_result(ObRegCol& col_node, JtScanCtx* ctx, bool enable_error = false, bool is_pack_result = true);
-  int set_expr_exec_param(ObRegCol& col_node, JtScanCtx* ctx);
-  int reset_ctx(ObRegCol &scan_node, JtScanCtx*& ctx) { return OB_SUCCESS; }  // reset variable if variable is not const
+  static int init_ctx(ObRegCol &scan_node, JtScanCtx*& ctx);
+  static int eval_default_value(JtScanCtx*& ctx, ObExpr*& default_expr, void*& res, bool need_datum);
+  static int container_at(void* in, void *&out, int32_t pos);
+  static int eval_input(ObJsonTableOp &jt, JtScanCtx& ctx, ObEvalCtx &eval_ctx);
+  static int reset_path_iter(ObRegCol &scan_node, void* in, JtScanCtx*& ctx, ScanType init_flag, bool &is_null_value);
+  static int get_iter_value(ObRegCol &col_node, JtScanCtx* ctx, bool &is_null_value);
+  static int eval_seek_col(ObRegCol &col_node, void* in, JtScanCtx* ctx, bool &is_null_value, bool &need_cast_res);
+  static int col_res_type_check(ObRegCol &col_node, JtScanCtx* ctx);
+  static int check_default_value(JtScanCtx* ctx, ObRegCol &col_node, ObExpr* expr);
+  static int set_on_empty(ObRegCol& col_node, JtScanCtx* ctx, bool &need_cast, bool& is_null);
+  static int set_on_error(ObRegCol& col_node, JtScanCtx* ctx, int& ret);
+  static int cast_to_result(ObRegCol& col_node, JtScanCtx* ctx, bool enable_error = false, bool is_pack_result = true);
+  static int set_expr_exec_param(ObRegCol& col_node, JtScanCtx* ctx);
 };
 
 class XmlTableFunc : public MulModeTableFunc {
 public:
   XmlTableFunc()
-  : MulModeTableFunc() {}
+    : MulModeTableFunc()
+  {
+    init_ctx_func_ = &XmlTableFunc::init_ctx;
+    eval_default_value_func_ = &XmlTableFunc::eval_default_value;
+    container_at_func_ = &XmlTableFunc::container_at;
+    eval_input_func_ = &XmlTableFunc::eval_input;
+    reset_path_iter_func_ = &XmlTableFunc::reset_path_iter;
+    get_iter_value_func_ = &XmlTableFunc::get_iter_value;
+    eval_seek_col_func_ = &XmlTableFunc::eval_seek_col;
+    col_res_type_check_func_ = &XmlTableFunc::col_res_type_check;
+    check_default_value_func_ = &XmlTableFunc::check_default_value;
+    set_on_empty_func_ = &XmlTableFunc::set_on_empty;
+    set_on_error_func_ = &XmlTableFunc::set_on_error;
+    cast_to_result_func_ = &XmlTableFunc::cast_to_result;
+    reset_ctx_func_ = &XmlTableFunc::reset_ctx;
+  }
   ~XmlTableFunc() {}
 
-  int init_ctx(ObRegCol &scan_node, JtScanCtx*& ctx);
-  int eval_default_value(JtScanCtx*& ctx, ObExpr*& default_expr, void*& res, bool need_datum);
-  int container_at(void* in, void *&out, int32_t pos);
-  int eval_input(ObJsonTableOp &jt, JtScanCtx& ctx, ObEvalCtx &eval_ctx);  // 获取跟节点输入 xml 解析namespace
-  int reset_path_iter(ObRegCol &scan_node, void* in, JtScanCtx*& ctx, ScanType init_flag, bool &is_null_value);
-  int get_iter_value(ObRegCol &col_node, JtScanCtx* ctx, bool &is_null_value);
-  int eval_seek_col(ObRegCol &col_node, void* in, JtScanCtx* ctx, bool &is_null_value, bool &need_cast_res);
-  int col_res_type_check(ObRegCol &col_node, JtScanCtx* ctx);
-  int check_default_value(JtScanCtx* ctx, ObRegCol &col_node, ObExpr* expr);
-  int set_on_empty(ObRegCol& col_node, JtScanCtx* ctx, bool &need_cast, bool& is_null);
-  int set_on_error(ObRegCol& col_node, JtScanCtx* ctx, int& ret);
-  int cast_to_result(ObRegCol& col_node, JtScanCtx* ctx, bool enable_error = false, bool is_pack_result = true);
-  int set_expr_exec_param(ObRegCol& col_node, JtScanCtx* ctx) { return 0; }
-  int reset_ctx(ObRegCol &scan_node, JtScanCtx*& ctx);  // reset variable if variable is not const
+  static int init_ctx(ObRegCol &scan_node, JtScanCtx*& ctx);
+  static int eval_default_value(JtScanCtx*& ctx, ObExpr*& default_expr, void*& res, bool need_datum);
+  static int container_at(void* in, void *&out, int32_t pos);
+  static int eval_input(ObJsonTableOp &jt, JtScanCtx& ctx, ObEvalCtx &eval_ctx);
+  static int reset_path_iter(ObRegCol &scan_node, void* in, JtScanCtx*& ctx, ScanType init_flag, bool &is_null_value);
+  static int get_iter_value(ObRegCol &col_node, JtScanCtx* ctx, bool &is_null_value);
+  static int eval_seek_col(ObRegCol &col_node, void* in, JtScanCtx* ctx, bool &is_null_value, bool &need_cast_res);
+  static int col_res_type_check(ObRegCol &col_node, JtScanCtx* ctx);
+  static int check_default_value(JtScanCtx* ctx, ObRegCol &col_node, ObExpr* expr);
+  static int set_on_empty(ObRegCol& col_node, JtScanCtx* ctx, bool &need_cast, bool& is_null);
+  static int set_on_error(ObRegCol& col_node, JtScanCtx* ctx, int& ret);
+  static int cast_to_result(ObRegCol& col_node, JtScanCtx* ctx, bool enable_error = false, bool is_pack_result = true);
+  static int reset_ctx(ObRegCol &scan_node, JtScanCtx*& ctx);  // reset variable if variable is not const
 };
 
 class RbIterateTableFunc : public MulModeTableFunc {
 public:
   RbIterateTableFunc()
-  : MulModeTableFunc() {}
+    : MulModeTableFunc()
+  {
+    init_ctx_func_ = &RbIterateTableFunc::init_ctx;
+    eval_input_func_ = &RbIterateTableFunc::eval_input;
+    reset_path_iter_func_ = &RbIterateTableFunc::reset_path_iter;
+    get_iter_value_func_ = &RbIterateTableFunc::get_iter_value;
+    reset_ctx_func_ = &RbIterateTableFunc::reset_ctx;
+  }
   ~RbIterateTableFunc() {}
 
-  int init_ctx(ObRegCol &scan_node, JtScanCtx*& ctx);
-  int eval_input(ObJsonTableOp &jt, JtScanCtx& ctx, ObEvalCtx &eval_ctx);
-  int reset_path_iter(ObRegCol &scan_node, void* in, JtScanCtx*& ctx, ScanType init_flag, bool &is_null_value);
-  int get_iter_value(ObRegCol &col_node, JtScanCtx* ctx, bool &is_null_value);
-  int reset_ctx(ObRegCol &scan_node, JtScanCtx*& ctx);
+  static int init_ctx(ObRegCol &scan_node, JtScanCtx*& ctx);
+  static int eval_input(ObJsonTableOp &jt, JtScanCtx& ctx, ObEvalCtx &eval_ctx);
+  static int reset_path_iter(ObRegCol &scan_node, void* in, JtScanCtx*& ctx, ScanType init_flag, bool &is_null_value);
+  static int get_iter_value(ObRegCol &col_node, JtScanCtx* ctx, bool &is_null_value);
+  static int reset_ctx(ObRegCol &scan_node, JtScanCtx*& ctx);
 };
 
 class UnnestTableFunc : public MulModeTableFunc {
 public:
   UnnestTableFunc()
-  : MulModeTableFunc() {}
+    : MulModeTableFunc()
+  {
+    init_ctx_func_ = &UnnestTableFunc::init_ctx;
+    eval_input_func_ = &UnnestTableFunc::eval_input;
+    reset_path_iter_func_ = &UnnestTableFunc::reset_path_iter;
+    get_iter_value_func_ = &UnnestTableFunc::get_iter_value;
+    reset_ctx_func_ = &UnnestTableFunc::reset_ctx;
+  }
   ~UnnestTableFunc() {}
 
-  int init_ctx(ObRegCol &scan_node, JtScanCtx*& ctx);
-  int eval_input(ObJsonTableOp &jt, JtScanCtx& ctx, ObEvalCtx &eval_ctx);
-  int reset_path_iter(ObRegCol &scan_node, void* in, JtScanCtx*& ctx, ScanType init_flag, bool &is_null_value);
-  int get_iter_value(ObRegCol &col_node, JtScanCtx* ctx, bool &is_null_value);
-  int reset_ctx(ObRegCol &scan_node, JtScanCtx*& ctx);
+  static int init_ctx(ObRegCol &scan_node, JtScanCtx*& ctx);
+  static int eval_input(ObJsonTableOp &jt, JtScanCtx& ctx, ObEvalCtx &eval_ctx);
+  static int reset_path_iter(ObRegCol &scan_node, void* in, JtScanCtx*& ctx, ScanType init_flag, bool &is_null_value);
+  static int get_iter_value(ObRegCol &col_node, JtScanCtx* ctx, bool &is_null_value);
+  static int reset_ctx(ObRegCol &scan_node, JtScanCtx*& ctx);
 };
 
 
 class AiSplitDocumentTableFunc : public MulModeTableFunc {
 public:
   AiSplitDocumentTableFunc()
-  : MulModeTableFunc() {}
+    : MulModeTableFunc()
+  {
+    init_ctx_func_ = &AiSplitDocumentTableFunc::init_ctx;
+    eval_input_func_ = &AiSplitDocumentTableFunc::eval_input;
+    reset_path_iter_func_ = &AiSplitDocumentTableFunc::reset_path_iter;
+    get_iter_value_func_ = &AiSplitDocumentTableFunc::get_iter_value;
+    reset_ctx_func_ = &AiSplitDocumentTableFunc::reset_ctx;
+  }
   ~AiSplitDocumentTableFunc() {}
 
-  int init_ctx(ObRegCol &scan_node, JtScanCtx*& ctx);
-  int eval_input(ObJsonTableOp &jt, JtScanCtx& ctx, ObEvalCtx &eval_ctx);
-  int reset_path_iter(ObRegCol &scan_node, void* in, JtScanCtx*& ctx, ScanType init_flag, bool &is_null_value);
-  int get_iter_value(ObRegCol &col_node, JtScanCtx* ctx, bool &is_null_value);
-  int reset_ctx(ObRegCol &scan_node, JtScanCtx*& ctx);
+  static int init_ctx(ObRegCol &scan_node, JtScanCtx*& ctx);
+  static int eval_input(ObJsonTableOp &jt, JtScanCtx& ctx, ObEvalCtx &eval_ctx);
+  static int reset_path_iter(ObRegCol &scan_node, void* in, JtScanCtx*& ctx, ScanType init_flag, bool &is_null_value);
+  static int get_iter_value(ObRegCol &col_node, JtScanCtx* ctx, bool &is_null_value);
+  static int reset_ctx(ObRegCol &scan_node, JtScanCtx*& ctx);
 };
 
 
@@ -452,6 +632,7 @@ public:
       is_err_evaled_(false),
       emp_val_(nullptr),
       err_val_(nullptr),
+      value_wrapper_(),
       res_flag_(NOT_DATUM),
       expr_param_() {
       new (&col_info_) ObJtColInfo(col_info);
@@ -481,7 +662,8 @@ public:
   bool is_err_evaled_;
   void *emp_val_;
   void *err_val_;
-  // data in curr_ is datum type, not json/xml ,0 is not datum, 1 is empty datum, 2 is error datum.
+  common::ObJsonWrapper value_wrapper_;
+  // curr_ 的显式值类型，避免把 wrapper、Datum 和 ObIJsonBase 相互误转。
   ResultType res_flag_; 
   MulModeTableType tab_type_; // distinct xml path or json path , due to not common root
   JtNodeType node_type_;  // distinct regcol in scan node or regcol
@@ -502,7 +684,8 @@ class ScanNode : public ObMultiModeTableNode
     : ObMultiModeTableNode(),
       reg_col_defs_(),
       child_idx_(),
-      seek_node_(col_info)
+      seek_node_(col_info),
+      row_hits_()
       {
         new (&seek_node_) ObRegCol(col_info);
         seek_node_.node_type_ = SCAN_TYPE;
@@ -528,6 +711,7 @@ class ScanNode : public ObMultiModeTableNode
   common::ObSEArray<ObRegCol*, 4, common::ModulePageAllocator, true> reg_col_defs_;
   common::ObSEArray<int64_t, 4, common::ModulePageAllocator, true> child_idx_;
   ObRegCol seek_node_;
+  common::ObSEArray<common::ObJsonWrapper, 8> row_hits_;
 };
 
 class UnionNode : public ObMultiModeTableNode

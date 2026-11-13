@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX SQL_ENG
 #include "ob_expr_json_unquote.h"
 #include "sql/engine/expr/ob_expr_json_func_helper.h"
+#include "lib/json_type/ob_json_wrapper.h"
 
 using namespace oceanbase::common;
 using namespace oceanbase::sql;
@@ -55,7 +56,6 @@ int ObExprJsonUnquote::calc(ObEvalCtx &ctx, const ObDatum &data, ObDatumMeta met
                             MultimodeAlloctor *allocator, ObJsonBuffer &j_buf, bool &is_null)
 {
   INIT_SUCC(ret);
-  ObIJsonBase *j_base = NULL;
   ObObjType type = meta.type_;
   ObCollationType cs_type = meta.cs_type_;
   if (type == ObIntType || type == ObDoubleType) {
@@ -75,10 +75,13 @@ int ObExprJsonUnquote::calc(ObEvalCtx &ctx, const ObDatum &data, ObDatumMeta met
   } else if (OB_FAIL(ObJsonExprHelper::ensure_collation(type, cs_type))) {
     LOG_WARN("fail to ensure collation", K(ret), K(type), K(cs_type));
   } else {
-    ObIJsonBase *j_base = NULL;
+    ObJsonWrapper wrapper;
     ObString j_str = data.get_string();
     ObJsonInType j_in_type = ObJsonExprHelper::get_json_internal_type(type);
-    if (OB_FAIL(ObTextStringHelper::read_real_string_data(*allocator, data, meta, j_str))) {
+    bool enable_json_bin_view = true;
+    int32_t max_depth = 0;
+    ObSQLSessionInfo *session = ctx.exec_ctx_.get_my_session();
+    if (OB_FAIL(ObTextStringHelper::read_real_string_data(*allocator, data, meta, j_str, &ctx.exec_ctx_))) {
       LOG_WARN("fail to get real data.", K(ret), K(j_str));
     } else if (OB_FALSE_IT(allocator->add_baseline_size(j_str.length()))) {
     } else if (ob_is_string_type(type) && (j_str.length() < 2 || j_str[0] != '"' || j_str[j_str.length() - 1] != '"')) {
@@ -87,17 +90,19 @@ int ObExprJsonUnquote::calc(ObEvalCtx &ctx, const ObDatum &data, ObDatumMeta met
       } else if (OB_FAIL(j_buf.append(j_str, 0))) {
         LOG_WARN("failed: copy original string", K(ret), K(j_str));
       }
-    } else if (OB_FAIL(ObJsonBaseFactory::get_json_base(allocator, j_str, j_in_type,
-                                                        j_in_type, j_base, 0, 
-                                                        ObJsonExprHelper::get_json_max_depth_config(ctx)))) {
-      LOG_WARN("failed: get json base", K(ret), K(type));
-      if (OB_ERR_INVALID_JSON_TEXT) {
+    } else if (OB_FALSE_IT(enable_json_bin_view = OB_NOT_NULL(session) ? session->is_enable_json_bin_view() : true)) {
+    } else if (OB_FALSE_IT(max_depth = ObJsonExprHelper::get_json_max_depth_config(ctx))) {
+    } else if (OB_FAIL(common::get_json_wrapper(j_str, j_in_type, *allocator, wrapper, 0,
+                                                 max_depth,
+                                                 enable_json_bin_view))) {
+      LOG_WARN("failed: get json wrapper", K(ret), K(type));
+      if (ret == OB_ERR_INVALID_JSON_TEXT) {
         ret = OB_ERR_INVALID_JSON_TEXT_IN_PARAM;
       }
       if (ret == OB_ERR_INVALID_JSON_TEXT_IN_PARAM) {
         LOG_USER_ERROR(OB_ERR_INVALID_JSON_TEXT_IN_PARAM);
       }
-    } else if (OB_FAIL(j_base->print(j_buf, false))) {
+    } else if (OB_FAIL(wrapper.print(j_buf, false, j_str.length()))) {
       LOG_WARN("failed: print json string", K(ret));
     }
   }
@@ -111,8 +116,7 @@ int ObExprJsonUnquote::eval_json_unquote(const ObExpr &expr, ObEvalCtx &ctx, ObD
   ObExpr *arg = expr.args_[0];
   ObDatum* json_datum = NULL;
   ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
-  uint64_t tenant_id = ObMultiModeExprHelper::get_tenant_id(ctx.exec_ctx_.get_my_session());
-  MultimodeAlloctor temp_allocator(tmp_alloc_g.get_allocator(), expr.type_, tenant_id, ret);
+  MultimodeAlloctor temp_allocator(tmp_alloc_g.get_allocator(), expr.type_, ret, ctx, "json_unquote");
   ObJsonBuffer j_buf(&temp_allocator);
   bool is_null = false;
 

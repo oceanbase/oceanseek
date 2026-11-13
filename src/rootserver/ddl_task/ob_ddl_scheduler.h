@@ -636,16 +636,9 @@ private:
       const obrpc::ObDropIndexArg *drop_index_arg,
       ObIAllocator &allocator,
       ObDDLTaskRecord &task_record);
-   int create_drop_search_index_task(
+  int create_drop_search_index_task(
       common::ObISQLClient &proxy,
-      const share::schema::ObTableSchema *index_schema,
-      const int64_t schema_version,
-      const int64_t consumer_group_id,
-      const share::schema::ObTableSchema *def_index_schema,
-      const share::schema::ObTableSchema *data_index_schema,
-      const share::schema::ObTableSchema *async_delete_schema,
-      const obrpc::ObDropIndexArg *drop_index_arg,
-      ObIAllocator &allocator,
+      const ObCreateDDLTaskParam &param,
       ObDDLTaskRecord &task_record);
 
   int create_drop_lob_task(

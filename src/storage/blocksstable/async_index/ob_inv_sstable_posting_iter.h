@@ -64,7 +64,7 @@ struct ObInvPostingScanParam
     allocator_ = nullptr;
     reusable_iter_ = nullptr;
     table_cache_ = nullptr;
-    has_relevance_params_ = false;
+    need_relevance_params_ = false;
     doc_freq_ = 0;
     total_doc_cnt_ = 0;
     avg_doc_length_ = 0.0;
@@ -72,9 +72,9 @@ struct ObInvPostingScanParam
     min_doc_id_ = 0;
     max_doc_id_ = UINT64_MAX;
   }
-  // BM25 corpus statistics (avg_doc_length_ / doc_freq_ / total_doc_cnt_) are only
-  // required when has_relevance_params_ is true. Indexes without relevance params
-  // (search index, or FTS without BM25) may leave them unset.
+  // need_relevance_params_ is a per-scan projection request, not a description of
+  // the physical SSTable. BM25 corpus statistics are required only when it is
+  // true. A Search Text hit-only scan leaves it false even though TF/DL are stored.
   bool is_valid() const
   {
     return nullptr != search_key_
@@ -83,10 +83,10 @@ struct ObInvPostingScanParam
         && doc_freq_ >= 0
         && total_doc_cnt_ >= 0
         && min_doc_id_ <= max_doc_id_
-        && (!has_relevance_params_ || avg_doc_length_ > 0.0);
+        && (!need_relevance_params_ || avg_doc_length_ > 0.0);
   }
   TO_STRING_KV(KP_(search_key), K_(tablet_id), K_(query_flag),
-      KP_(allocator), K_(has_relevance_params), K_(doc_freq), K_(total_doc_cnt),
+      KP_(allocator), K_(need_relevance_params), K_(doc_freq), K_(total_doc_cnt),
       K_(avg_doc_length),
       K_(need_posting_value), K_(min_doc_id), K_(max_doc_id));
 
@@ -97,7 +97,7 @@ struct ObInvPostingScanParam
   // Optional caller-owned iterator; scan_posting must not destroy or free it.
   ObInvSSTablePostingIter *reusable_iter_;
   ObInvPostingTableCache *table_cache_; // Borrowed from the query-local SearchCtx.
-  bool has_relevance_params_;
+  bool need_relevance_params_;
   uint64_t doc_freq_;
   uint64_t total_doc_cnt_;
   double avg_doc_length_;
@@ -247,7 +247,7 @@ public:
   bool can_probe_sorted_ids() const
   {
     return is_opened_ && !is_end_ && !in_shallow_status_
-        && nullptr != curr_id_ && has_relevance_params_;
+        && nullptr != curr_id_ && need_relevance_params_;
   }
   // Probe up to MAX_SORTED_PROBE_COUNT strictly increasing physical IDs. Copy relevance only for
   // matches; no block-owned pointers escape. EOF is successful with is_end().
@@ -291,7 +291,7 @@ public:
   int get_cur_nested_key_list(const common::ObDatum *&datum);
 
   TO_STRING_KV(K_(is_opened), K_(is_end), K_(in_shallow_status), K_(curr_block_loaded),
-               K_(has_relevance_params), KP_(curr_id), K_(curr_token_freq),
+               K_(need_relevance_params), KP_(curr_id), K_(curr_token_freq),
                K_(curr_doc_length), K_(curr_row_idx), K_(curr_relevance_materialized),
                K_(need_load_micro_block), K_(need_load_value_micro_block), K_(curr_meta));
 
@@ -375,10 +375,10 @@ private:
   // kernel as the SQL-layer document scoring.
   sql::ObBM25PrecomputedParams bm25_calc_params_;
   sql::BM25FrontierMaxKernels bm25_frontier_kernels_;
-  // Whether the bound SSTable carries BM25 relevance params (token_freq / doc_length).
-  // Copied from sstable.get_inv_meta().get_stats().has_relevance_params_ at open time. When false,
-  // BM25 scoring and block-max frontier computation are skipped (search index path).
-  bool has_relevance_params_;
+  // Per-scan projection switch.  Search Text always stores TF/DL, but hit-only
+  // scans leave this false and materialize doc_id only.  Existing async FTS
+  // callers keep passing true and therefore retain their current behavior.
+  bool need_relevance_params_;
   storage::ObTabletHandle tablet_handle_;
   storage::ObTableHandleV2 table_handle_;
   ObSSTablePostingScanner scanner_;

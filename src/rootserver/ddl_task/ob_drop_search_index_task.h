@@ -27,6 +27,8 @@ public:
       const ObFTSDDLChildTaskInfo &search_def_index,
       const ObFTSDDLChildTaskInfo &search_data_index,
       const ObFTSDDLChildTaskInfo &async_delete,
+      const ObFTSDDLChildTaskInfo &search_text_match_index,
+      const ObFTSDDLChildTaskInfo &search_text_match_phrase_index,
       const ObString &ddl_stmt_str,
       const int64_t schema_version,
       const int64_t consumer_group_id,
@@ -47,8 +49,11 @@ public:
   int update_task_message(common::ObISQLClient &proxy);
   OB_INLINE void set_drop_def_index_task_id(const int64_t task_id) { search_def_index_.task_id_ = task_id; }
   OB_INLINE void set_drop_data_index_task_id(const int64_t task_id) { search_data_index_.task_id_ = task_id; }
+  OB_INLINE void set_drop_text_match_index_task_id(const int64_t task_id) { search_text_match_index_.task_id_ = task_id; }
+  OB_INLINE void set_drop_text_match_phrase_index_task_id(const int64_t task_id) { search_text_match_phrase_index_.task_id_ = task_id; }
   OB_INLINE void set_drop_async_delete_task_id(const int64_t task_id) { async_delete_.task_id_ = task_id; }
-  INHERIT_TO_STRING_KV("ObDDLTask", ObDDLTask, K_(search_def_index), K_(search_data_index), K_(async_delete));
+  INHERIT_TO_STRING_KV("ObDDLTask", ObDDLTask, K_(search_def_index), K_(search_data_index), K_(async_delete),
+      K_(search_text_match_index), K_(search_text_match_phrase_index));
 
 private:
   int check_switch_succ();
@@ -89,13 +94,19 @@ private:
   // 同步 Search 删除沿用 v1；v2 仅用于携带 async_delete 的异步 Search 删除任务。
   static const int64_t OB_DROP_SEARCH_INDEX_TASK_VERSION = 1;
   static const int64_t OB_DROP_ASYNC_SEARCH_INDEX_TASK_VERSION = 2;
+  // v3 adds Match/Phrase child information and completion flags to the persisted async Search drop task.
+  static const int64_t OB_DROP_ASYNC_SEARCH_INDEX_TASK_VERSION_V3 = 3;
   ObRootService *root_service_;
   ObFTSDDLChildTaskInfo search_def_index_;
   ObFTSDDLChildTaskInfo search_data_index_;
   ObFTSDDLChildTaskInfo async_delete_;
+  ObFTSDDLChildTaskInfo search_text_match_index_;
+  ObFTSDDLChildTaskInfo search_text_match_phrase_index_;
   bool drop_def_index_finish_;
   bool drop_data_index_finish_;
   bool drop_async_delete_index_finish_;
+  bool drop_text_match_index_finish_;
+  bool drop_text_match_phrase_index_finish_;
 };
 
 } // end namespace rootserver

@@ -225,7 +225,8 @@ ObCreateDDLTaskParam::ObCreateDDLTaskParam()
     aux_doc_word_schema_(nullptr), async_delete_schema_(nullptr),
     vec_rowkey_vid_schema_(nullptr), vec_vid_rowkey_schema_(nullptr), vec_domain_index_schema_(nullptr), vec_index_id_schema_(nullptr), vec_snapshot_data_schema_(nullptr),
     vec_centroid_schema_(nullptr), vec_cid_vector_schema_(nullptr), vec_rowkey_cid_schema_(nullptr), vec_sq_meta_schema_(nullptr), vec_pq_centroid_schema_(nullptr), vec_pq_code_schema_(nullptr), 
-    hybrid_vec_embedded_schema_(nullptr), def_index_schema_(nullptr), data_index_schema_(nullptr), tenant_data_version_(0),
+    hybrid_vec_embedded_schema_(nullptr), def_index_schema_(nullptr), data_index_schema_(nullptr),
+    search_text_match_schema_(nullptr), search_text_match_phrase_schema_(nullptr), tenant_data_version_(0),
     ddl_need_retry_at_executor_(false), is_pre_split_(false), fork_progress_total_cnt_(0)
 {
 }
@@ -249,7 +250,8 @@ ObCreateDDLTaskParam::ObCreateDDLTaskParam(const uint64_t tenant_id,
     fts_index_aux_schema_(nullptr), aux_doc_word_schema_(nullptr), async_delete_schema_(nullptr),
     vec_rowkey_vid_schema_(nullptr), vec_vid_rowkey_schema_(nullptr), vec_domain_index_schema_(nullptr), vec_index_id_schema_(nullptr), vec_snapshot_data_schema_(nullptr), 
     vec_centroid_schema_(nullptr), vec_cid_vector_schema_(nullptr), vec_rowkey_cid_schema_(nullptr), vec_sq_meta_schema_(nullptr), vec_pq_centroid_schema_(nullptr), vec_pq_code_schema_(nullptr), 
-    hybrid_vec_embedded_schema_(nullptr), def_index_schema_(nullptr), data_index_schema_(nullptr), tenant_data_version_(0),
+    hybrid_vec_embedded_schema_(nullptr), def_index_schema_(nullptr), data_index_schema_(nullptr),
+    search_text_match_schema_(nullptr), search_text_match_phrase_schema_(nullptr), tenant_data_version_(0),
     ddl_need_retry_at_executor_(ddl_need_retry_at_executor), is_pre_split_(false), new_snapshot_version_(0),
     fork_progress_total_cnt_(0)
 {
@@ -3145,6 +3147,14 @@ int ObDDLTaskRecordOperator::update_parent_task_message(
             task.set_doc_rowkey_aux_table_id(target_table_id);
             task.set_doc_rowkey_aux_task_id(target_task_id);
             task.set_doc_rowkey_task_submitted(true);
+          } else if (index_schema.is_async_search_text_match_phrase_index()) {
+            task.set_search_text_match_phrase_aux_table_id(target_table_id);
+            task.set_search_text_match_phrase_aux_task_id(target_task_id);
+            task.set_search_text_match_phrase_task_submitted(true);
+          } else if (index_schema.is_async_search_text_match_index()) {
+            task.set_search_text_match_aux_table_id(target_table_id);
+            task.set_search_text_match_aux_task_id(target_task_id);
+            task.set_search_text_match_task_submitted(true);
           } else if (index_schema.is_fts_index_aux()
                      || index_schema.is_async_fts_index()
                      || index_schema.is_async_search_data_index()) {
@@ -3350,7 +3360,11 @@ int ObDDLTaskRecordOperator::update_parent_task_message(
         if (OB_FAIL(task.init(task_record))) {
           LOG_WARN("fail to initialize the drop fulltext index task", K(ret), K(task_record));
         } else if (UPDATE_DROP_INDEX_TASK_ID == update_type) {
-          if (index_schema.is_search_data_index()) {
+          if (index_schema.is_async_search_text_match_phrase_index()) {
+            task.set_drop_text_match_phrase_index_task_id(target_task_id);
+          } else if (index_schema.is_async_search_text_match_index()) {
+            task.set_drop_text_match_index_task_id(target_task_id);
+          } else if (index_schema.is_search_data_index()) {
             task.set_drop_data_index_task_id(target_task_id);
           } else if (index_schema.is_search_def_index()) {
             task.set_drop_def_index_task_id(target_task_id);

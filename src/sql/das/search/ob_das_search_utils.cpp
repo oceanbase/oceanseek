@@ -14,12 +14,158 @@
 #include "sql/das/search/ob_das_search_context.h"
 #include "sql/das/search/ob_das_token_op.h"
 #include "sql/das/search/ob_i_das_search_op.h"
+#include "storage/blocksstable/async_index/ob_inv_sstable_posting_iter.h"
 #include "storage/fts/ob_fts_tokenizer.h"
+#include "share/search_index/ob_search_index_encoder.h"
 
 namespace oceanbase
 {
 namespace sql
 {
+
+int ObDASSearchUtils::build_search_index_term_key(
+    const common::ObRowkey &key,
+    common::ObIAllocator &allocator,
+    blocksstable::ObDatumRowkey &term_key)
+{
+  int ret = OB_SUCCESS;
+  term_key.reset();
+  blocksstable::ObStorageDatum datums[share::SEARCH_INDEX_DOC_ID];
+  blocksstable::ObDatumRowkey source;
+  if (OB_UNLIKELY(!key.is_valid() || key.get_obj_cnt() != share::SEARCH_INDEX_DOC_ID)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid Search Index term key", K(ret), K(key));
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < key.get_obj_cnt(); ++i) {
+      if (OB_FAIL(datums[i].from_obj_enhance(key.get_obj_ptr()[i]))) {
+        LOG_WARN("failed to convert Search Index term component", K(ret), K(i));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(source.assign(datums, share::SEARCH_INDEX_DOC_ID))) {
+        LOG_WARN("failed to assign Search Index term key", K(ret));
+      } else if (OB_FAIL(source.deep_copy(term_key, allocator))) {
+        LOG_WARN("failed to copy Search Index term key", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDASSearchUtils::build_fulltext_term_key(
+    const ObDASSearchIndexTextInfo &search_text,
+    const common::ObString &query_token,
+    const common::ObObjMeta &query_meta,
+    common::ObIAllocator &allocator,
+    blocksstable::ObDatumRowkey &term_key)
+{
+  int ret = OB_SUCCESS;
+  term_key.reset();
+  share::ObEncParam enc_param;
+  common::ObString normalized_token = query_token;
+  common::ObString encoded_token;
+  if (OB_UNLIKELY(query_token.empty())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid Search Text term argument", K(ret), K(search_text), "token_len", query_token.length());
+  } else if (OB_FAIL(search_text.is_json_
+      ? share::ObSearchIndexValueEncoder::init_json_string_enc_param(enc_param)
+      : share::ObSearchIndexValueEncoder::init_string_enc_param(
+          common::ObVarcharType, query_meta.get_collation_type(), 0, true, true, enc_param))) {
+    LOG_WARN("failed to init Search Text token encoding", K(ret));
+  } else if (OB_FAIL(share::ObSearchIndexValueEncoder::normalize_string_for_encoding(
+      allocator, normalized_token, enc_param.cs_type_))) {
+    LOG_WARN("failed to normalize Search Text query token", K(ret));
+  } else if (OB_FAIL(share::ObSearchIndexValueEncoder::encode_string(
+      allocator, normalized_token, encoded_token, enc_param, false /* is_allow_truncate */))) {
+    LOG_WARN("failed to encode Search Text query token", K(ret));
+  } else {
+    common::ObObj objs[share::SEARCH_INDEX_DOC_ID];
+    objs[share::SEARCH_INDEX_COL_IDX].set_uint64(search_text.column_idx_);
+    objs[share::SEARCH_INDEX_PATH].set_varbinary(search_text.encoded_path_);
+    objs[share::SEARCH_INDEX_VALUE].set_varbinary(encoded_token);
+    if (OB_FAIL(build_search_index_term_key(
+        common::ObRowkey(objs, share::SEARCH_INDEX_DOC_ID), allocator, term_key))) {
+      LOG_WARN("failed to build Search Text term key", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObDASSearchUtils::resolve_nested_scope_id(
+    const ObDASBaseCtDef *ctdef, ObDASScopeId &scope_id)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<const ObDASBaseCtDef *, 8> pending;
+  uint64_t index_table_id = OB_INVALID_ID;
+  bool is_async = false;
+  scope_id = DAS_SCOPE_MAX;
+  if (OB_ISNULL(ctdef)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(pending.push_back(ctdef))) {
+    LOG_WARN("failed to collect nested scope root", K(ret));
+  }
+  while (OB_SUCC(ret) && !pending.empty()) {
+    const ObDASBaseCtDef *node = pending.at(pending.count() - 1);
+    pending.pop_back();
+    if (DAS_OP_NESTED_QUERY == node->op_type_) {
+      if (OB_FAIL(resolve_nested_index(node, index_table_id, is_async))) {
+        LOG_WARN("failed to resolve nested scope index", K(ret));
+      }
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < node->children_cnt_; ++i) {
+        if (OB_ISNULL(node->children_) || OB_ISNULL(node->children_[i])) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("unexpected null child while resolving nested scope", K(ret), K(i));
+        } else if (OB_FAIL(pending.push_back(node->children_[i]))) {
+          LOG_WARN("failed to collect nested scope child", K(ret), K(i));
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_INVALID_ID == index_table_id) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("nested scope has no nested index", K(ret));
+    } else {
+      scope_id = is_async ? DAS_SCOPE_NESTED_ASYNC : DAS_SCOPE_NESTED_SYNC;
+    }
+  }
+  return ret;
+}
+
+int ObDASSearchUtils::resolve_nested_index(
+    const ObDASBaseCtDef *ctdef, uint64_t &index_table_id, bool &is_async)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(ctdef)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (DAS_OP_SCALAR_QUERY == ctdef->op_type_) {
+    const auto *scalar = static_cast<const ObDASScalarCtDef *>(ctdef);
+    // The primary probe is an alternative plan, not an input of this subtree.
+    ret = resolve_nested_index(scalar->get_index_scan_ctdef(), index_table_id, is_async);
+  } else if (DAS_OP_SCALAR_SCAN_QUERY == ctdef->op_type_) {
+    const auto *scan = static_cast<const ObDASScalarScanCtDef *>(ctdef);
+    if (!scan->is_search_index_ || OB_INVALID_ID == scan->ref_table_id_) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_INVALID_ID == index_table_id) {
+      index_table_id = scan->ref_table_id_;
+      is_async = scan->is_async_index_;
+    } else if (is_async != scan->is_async_index_) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("nested scope has inconsistent rowid layouts", K(ret), K(is_async), KPC(scan));
+    }
+  } else if ((DAS_OP_NESTED_QUERY != ctdef->op_type_ && DAS_OP_BOOLEAN_QUERY != ctdef->op_type_)
+             || ctdef->children_cnt_ <= 0 || OB_ISNULL(ctdef->children_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < ctdef->children_cnt_; ++i) {
+      if (OB_FAIL(SMART_CALL(resolve_nested_index(ctdef->children_[i], index_table_id, is_async)))) {
+        LOG_WARN("failed to resolve nested index", K(ret), K(i));
+      }
+    }
+  }
+  return ret;
+}
 
 namespace
 {
@@ -76,21 +222,28 @@ int ObDASSearchUtils::eval_and_tokenize_query_text(
     ObEvalCtx &eval_ctx,
     const ObExpr &query_text_expr,
     const ObDASScalarScanCtDef &inv_idx_scan_ctdef,
-    common::ObIArray<common::ObString> &query_tokens)
+    common::ObIArray<common::ObString> &query_tokens,
+    const ObDASIRScanCtDef *ir_ctdef)
 {
   int ret = OB_SUCCESS;
   ObDatum *query_text_datum = nullptr;
+  const bool is_search_text = nullptr != ir_ctdef && ir_ctdef->search_index_fulltext_info_.has_search_index_fulltext();
   query_tokens.reuse();
   if (OB_FAIL(query_text_expr.eval(eval_ctx, query_text_datum))) {
     LOG_WARN("failed to evaluate query text", KR(ret));
-  } else if (OB_ISNULL(query_text_datum) || OB_UNLIKELY(query_text_datum->is_null())) {
+  } else if (OB_ISNULL(query_text_datum)
+      || OB_UNLIKELY(query_text_datum->is_null() && !is_search_text)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected null query text datum", KR(ret), KPC(query_text_datum));
+  } else if (query_text_datum->is_null()) {
+    // Native Search Text treats a NULL query as an empty token set.
   } else if (OB_FAIL(storage::ObFTSTokenizer::tokenize(
       allocator,
       query_text_datum->get_string(),
-      inv_idx_scan_ctdef.table_param_.get_parser_name(),
-      inv_idx_scan_ctdef.table_param_.get_parser_property(),
+      is_search_text ? ir_ctdef->search_index_fulltext_info_.parser_name_
+                     : inv_idx_scan_ctdef.table_param_.get_parser_name(),
+      is_search_text ? ir_ctdef->search_index_fulltext_info_.parser_properties_
+                     : inv_idx_scan_ctdef.table_param_.get_parser_property(),
       query_text_expr.obj_meta_,
       query_tokens))) {
     query_tokens.reuse();
@@ -105,22 +258,29 @@ int ObDASSearchUtils::eval_and_tokenize_query_text(
     const ObExpr &query_text_expr,
     const ObDASScalarScanCtDef &inv_idx_scan_ctdef,
     common::ObIArray<common::ObString> &query_tokens,
-    common::ObIArray<int64_t> &token_counts)
+    common::ObIArray<int64_t> &token_counts,
+    const ObDASIRScanCtDef *ir_ctdef)
 {
   int ret = OB_SUCCESS;
   ObDatum *query_text_datum = nullptr;
+  const bool is_search_text = nullptr != ir_ctdef && ir_ctdef->search_index_fulltext_info_.has_search_index_fulltext();
   query_tokens.reuse();
   token_counts.reuse();
   if (OB_FAIL(query_text_expr.eval(eval_ctx, query_text_datum))) {
     LOG_WARN("failed to evaluate query text", KR(ret));
-  } else if (OB_ISNULL(query_text_datum) || OB_UNLIKELY(query_text_datum->is_null())) {
+  } else if (OB_ISNULL(query_text_datum)
+      || OB_UNLIKELY(!is_search_text && query_text_datum->is_null())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected null query text datum", KR(ret), KPC(query_text_datum));
+  } else if (is_search_text && query_text_datum->is_null()) {
+    // Native Search Text treats a NULL query as an empty token set.
   } else if (OB_FAIL(storage::ObFTSTokenizer::tokenize(
       allocator,
       query_text_datum->get_string(),
-      inv_idx_scan_ctdef.table_param_.get_parser_name(),
-      inv_idx_scan_ctdef.table_param_.get_parser_property(),
+      is_search_text ? ir_ctdef->search_index_fulltext_info_.parser_name_
+                     : inv_idx_scan_ctdef.table_param_.get_parser_name(),
+      is_search_text ? ir_ctdef->search_index_fulltext_info_.parser_properties_
+                     : inv_idx_scan_ctdef.table_param_.get_parser_property(),
       query_text_expr.obj_meta_,
       query_tokens,
       token_counts))) {

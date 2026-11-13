@@ -10,6 +10,8 @@
 #define private public
 #define protected public
 #include "storage/compaction/ob_async_index_merge_policy.h"
+#include "storage/compaction/ob_async_index_merge_ctx.h"
+#include "storage/compaction/ob_tablet_merge_task.h"
 
 namespace oceanbase
 {
@@ -1238,6 +1240,23 @@ TEST_F(TestAsyncIndexMergePolicy, align_crossing_inputs_keeps_mergeable_prefix)
   EXPECT_EQ(100, snapshot);
   ASSERT_EQ(1, output.count());
   EXPECT_EQ(100, output.at(0).end_snapshot_version_);
+}
+
+TEST_F(TestAsyncIndexMergePolicy, s5_m07_inc_major_does_not_prepare_delete_bitmap)
+{
+  ObArenaAllocator allocator;
+  ObTabletMergeDagParam param;
+  param.merge_type_ = INC_MAJOR_MERGE;
+  ObAsyncIndexMergeCtx ctx(param, allocator);
+  ASSERT_TRUE(share::schema::is_async_inverted_storage_index(
+      share::schema::INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_INDEX_LOCAL));
+  ASSERT_TRUE(share::schema::is_async_inverted_storage_index(
+      share::schema::INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_PHRASE_INDEX_LOCAL));
+  // No LS/schema/tablet is installed: the IncMajor branch must return before
+  // any shared Delete lookup. Calling the real context proves this routing.
+  ASSERT_EQ(OB_SUCCESS, ctx.prepare_deletion_bitmap());
+  ASSERT_EQ(OB_INVALID_ID, ctx.delete_index_table_id_);
+  ASSERT_FALSE(ctx.delete_index_tablet_id_.is_valid());
 }
 
 } // namespace unittest

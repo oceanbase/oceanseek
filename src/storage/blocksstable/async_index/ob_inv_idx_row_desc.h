@@ -43,12 +43,20 @@ struct ObInvIdxRowDesc
       index_type_(INV_IDX_TYPE_INVALID)
   {}
 
-  // 从倒排索引表 schema 解析存储列位置。对于异步 FTS，data_schema 是用户表 schema，
-  // 用于提供 FTS 列标记；对于异步 Search Index，data_schema 是定义索引 schema，
-  // 用于提供各索引列的 NESTED_PATHS 配置。
+  // Resolve stored column positions from the inverted index table schema. For async FTS, data_schema is
+  // the user table schema, used to provide FTS column flags; for async Search Index, data_schema is the
+  // definition index schema,
+  // used to provide the NESTED_PATHS config of each index column; async Search Text only uses index_schema.
   int init(
       const share::schema::ObTableSchema &index_schema,
       const share::schema::ObTableSchema &data_schema);
+
+  // Search Text uses the shared fixed physical layout, without FTS column flags.
+  // MATCH has six logical columns; PHRASE has seven. Value positions include the
+  // multi-version rowkey suffix. Failure leaves this descriptor reset.
+  // Posting types are checked here; term comparison follows the schema. The writer
+  // rejects NULL/NOP business values and permits NOP multi-version columns and empty PATH.
+  int init_search_text(const share::schema::ObTableSchema &index_schema);
 
   // 初始化异步 Search Index 的固定存储布局；storage_column_cnt 与 posting encoder
   // 使用同一套多版本存储列序。

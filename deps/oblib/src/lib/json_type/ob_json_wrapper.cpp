@@ -349,6 +349,26 @@ int ObJsonWrapper::get_key(uint64_t index, ObString &key) const
   return ret;
 }
 
+int ObJsonWrapper::get_json_keys(ObSEArray<ObString, 8> &keys) const
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!is_valid())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("json wrapper is invalid", K(ret));
+  } else {
+    const uint64_t cnt = member_count();
+    for (uint64_t i = 0; OB_SUCC(ret) && i < cnt; ++i) {
+      ObString key;
+      if (OB_FAIL(get_key(i, key))) {
+        LOG_WARN("fail to get key from wrapper", K(ret), K(i));
+      } else if (OB_FAIL(keys.push_back(key))) {
+        LOG_WARN("fail to push key into keys array", K(ret), K(i));
+      }
+    }
+  }
+  return ret;
+}
+
 int ObJsonWrapper::get_key_value(uint64_t index, ObString &key, ObJsonWrapper &out) const
 {
   int ret = OB_SUCCESS;
@@ -537,6 +557,48 @@ int ObJsonWrapper::to_json_base(ObIAllocator &alloc, ObIJsonBase *&base) const
   return ret;
 }
 
+bool ObJsonWrapper::is_real_json_null() const
+{
+  bool is_null = false;
+  if (!is_valid()) {
+    is_null = false;
+  } else if (is_bin_) {
+    is_null = bin_.json_type() == ObJsonNodeType::J_NULL;
+  } else {
+    is_null = dom_->is_real_json_null(dom_);
+  }
+  return is_null;
+}
+
+int ObJsonWrapper::get_obtime(ObTime &t) const
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!is_valid())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("json wrapper is invalid", K(ret));
+  } else {
+    ret = is_bin_ ? bin_.get_obtime(t) : dom_->get_obtime(t);
+  }
+  return ret;
+}
+
+int ObJsonWrapper::to_number(ObIAllocator *allocator, number::ObNumber &number) const
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(allocator)) {
+    ret = OB_ERR_NULL_VALUE;
+    LOG_WARN("allocator is null", K(ret));
+  } else if (OB_UNLIKELY(!is_valid())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("json wrapper is invalid", K(ret));
+  } else if (is_bin_) {
+    ret = bin_.to_number(allocator, number);
+  } else {
+    ret = dom_->to_number(allocator, number);
+  }
+  return ret;
+}
+
 int ObJsonWrapper::parse_bin(const char *data, int64_t len)
 {
   int ret = OB_SUCCESS;
@@ -576,6 +638,26 @@ int get_json_wrapper(const ObString &data,
       LOG_WARN("get_json_base fail", K(ret), K(in_type));
     } else {
       wrapper = ObJsonWrapper(j_base);
+    }
+  }
+  return ret;
+}
+
+int ObJsonWrapper::print(ObJsonBuffer &j_buf, bool is_quoted,
+                         uint64_t reserve_len, bool is_pretty,
+                         uint64_t depth) const
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!is_valid())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("json wrapper is invalid", K(ret));
+  } else if (is_bin_) {
+    if (OB_FAIL(bin_.print(j_buf, is_quoted, reserve_len, is_pretty, depth))) {
+      LOG_WARN("bin view print fail", K(ret));
+    }
+  } else {
+    if (OB_FAIL(dom_->print(j_buf, is_quoted, reserve_len, is_pretty, depth))) {
+      LOG_WARN("dom print fail", K(ret));
     }
   }
   return ret;

@@ -39,9 +39,12 @@ enum class ObIndexRowAggType : uint8_t
 {
   UNSERIALIZED_ROW_AGG = 0,  // aggregated_row_ is valid; builder serializes via ObAggRowWriter
   SERIALIZED_ROW_AGG,        // serialized_agg_row_buf_ is valid; size read from ObAggRowHeader::length_
-  INVERTED_INDEX_AGG,        // ObInvIdxAggDataDesc (inverted_index_agg_) is valid; raw MEMCPY
+  INVERTED_INDEX_AGG,        // serialized inverted_index_agg_; node kind selects its codec
 };
 
+// Non-owning carrier for both leaf and inner inverted-index payloads. The producer
+// keeps the bytes alive until the row is copied and its statistics are consumed.
+// Leaf rows use ObInvIdxAggDataHeader; inner rows use ObInvIdxAggInfoSerializer.
 struct ObInvIdxAggDataDesc
 {
   const char *buf_;   // points to the inverted index agg payload

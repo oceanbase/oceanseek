@@ -114,6 +114,80 @@ TEST_F(JsonTypeExprTest, MysqlInvalidJsonText)
 // (-5412) fires for json_depth/json_length/json_extract. Both are confirmed
 // against the matching .result files (ERROR 22032 with different messages).
 
+// ============================================================================
+// _enable_json_bin_view switch comparison tests.
+//
+// JSON_TYPE calls wrapper.json_type() and wrapper.field_type().  When
+// _enable_json_bin_view is ON and the input is cast(... as json), the wrapper
+// holds an ObJsonBinView and type dispatch runs on the zero-copy bin path.
+// When OFF, the wrapper holds an ObJsonBin DOM.
+//
+// Note: _enable_json_bin_view is an OB_TENANT_PARAMETER, not a session
+// variable, so with_session_vars() cannot set it.  We use WITH_TENANT_CONFS
+// (TestParameterGuard RAII) which pushes into TestDefaultParameterConf TLS,
+// consumed by OpTestEngine::apply_tenant_config_overrides() during prepare().
+// ============================================================================
+
+// B1: switch ON — various types via cast(s as json).
+TEST_F(JsonTypeExprTest, BinViewSwitchOnVariousTypes)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "true"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256)")
+        .with_expr("json_type(cast(s as json))")
+        .with_data({
+            {R"({"a": 2})"},
+            {R"([1, 2, 3])"},
+            {R"("scalar string")"},
+            {R"(true)"},
+            {R"(123)"},
+            {R"(3.14)"},
+            {R"(null)"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({
+        {"OBJECT"},
+        {"ARRAY"},
+        {"STRING"},
+        {"BOOLEAN"},
+        {"INTEGER"},
+        {"DOUBLE"},
+        {"NULL"},
+    }));
+  }
+}
+
+// B2: switch OFF — same input as B1, expect identical results.
+TEST_F(JsonTypeExprTest, BinViewSwitchOffVariousTypes)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "false"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256)")
+        .with_expr("json_type(cast(s as json))")
+        .with_data({
+            {R"({"a": 2})"},
+            {R"([1, 2, 3])"},
+            {R"("scalar string")"},
+            {R"(true)"},
+            {R"(123)"},
+            {R"(3.14)"},
+            {R"(null)"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({
+        {"OBJECT"},
+        {"ARRAY"},
+        {"STRING"},
+        {"BOOLEAN"},
+        {"INTEGER"},
+        {"DOUBLE"},
+        {"NULL"},
+    }));
+  }
+}
+
 int main(int argc, char **argv)
 {
   ::testing::InitGoogleTest(&argc, argv);

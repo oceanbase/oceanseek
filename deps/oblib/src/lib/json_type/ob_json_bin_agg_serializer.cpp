@@ -14,6 +14,147 @@
 namespace oceanbase {
 namespace common {
 
+int calc_string_array(const ObIArray<ObString> &elements,
+                      ObJsonBinMeta &meta,
+                      uint64_t &obj_size)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t element_count = static_cast<uint64_t>(elements.count());
+  uint64_t total_value_bytes = 0;
+  uint8_t entry_var_type = static_cast<uint8_t>(JBLS_UINT8);
+  obj_size = 0;
+
+  for (int64_t i = 0; OB_SUCC(ret) && i < elements.count(); ++i) {
+    const ObString &value = elements.at(i);
+    if (OB_UNLIKELY(value.length() < 0
+                    || (nullptr == value.ptr() && value.length() > 0))) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("string array element is invalid", K(ret), K(i), K(value.length()));
+    } else {
+      const uint64_t value_size = OB_JSON_BIN_VALUE_TYPE_LEN
+                                  + serialization::encoded_length_vi64(
+                                      static_cast<int64_t>(value.length()))
+                                  + static_cast<uint64_t>(value.length());
+      if (OB_UNLIKELY(UINT64_MAX - total_value_bytes < value_size)) {
+        ret = OB_SIZE_OVERFLOW;
+        LOG_WARN("string array value size overflow", K(ret), K(i), K(total_value_bytes), K(value_size));
+      } else {
+        total_value_bytes += value_size;
+      }
+    }
+  }
+
+  const uint8_t count_var_type = ObJsonVar::get_var_type(element_count);
+  const uint64_t fixed_size = OB_JSON_BIN_OBJ_HEADER_LEN
+                              + ObJsonVar::get_var_size(count_var_type)
+                              + total_value_bytes;
+  bool found = false;
+  for (uint8_t candidate = static_cast<uint8_t>(JBLS_UINT8);
+       OB_SUCC(ret) && !found && candidate <= static_cast<uint8_t>(JBLS_UINT64);
+       ++candidate) {
+    const uint64_t entry_var_size = ObJsonVar::get_var_size(candidate);
+    const uint64_t total = fixed_size
+                          + entry_var_size
+                          + ObJsonBinMeta::calc_entry_array_size(false, element_count, candidate);
+    if (ObJsonVar::get_var_type(total) <= candidate) {
+      entry_var_type = candidate;
+      obj_size = total;
+      found = true;
+    }
+  }
+  if (OB_SUCC(ret) && OB_UNLIKELY(!found)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("failed to calculate string array layout", K(ret), K(element_count), K(total_value_bytes));
+  }
+  if (OB_SUCC(ret)) {
+    meta.set_type(ObJsonBin::get_array_vertype(), false);
+    meta.set_element_count(element_count);
+    meta.set_element_count_var_type(count_var_type);
+    meta.set_obj_size(obj_size);
+    meta.set_obj_size_var_type(entry_var_type);
+    meta.set_entry_var_type(entry_var_type);
+    meta.set_is_continuous(true);
+    if (OB_FAIL(meta.calc_entry_array())) {
+      LOG_WARN("calculate string array entry array fail", K(ret));
+    }
+  }
+  return ret;
+}
+
+int write_string_array(const ObIArray<ObString> &elements,
+                       ObJsonBinMeta &meta,
+                       char *buf,
+                       int64_t total_size)
+{
+  int ret = OB_SUCCESS;
+  const int64_t doc_header_size = sizeof(ObJsonBinDocHeader);
+  if (OB_ISNULL(buf) || OB_UNLIKELY(total_size != doc_header_size
+                                                  + static_cast<int64_t>(meta.obj_size()))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid string array output buffer", K(ret), KP(buf),
+             K(total_size), K(meta.obj_size()));
+  } else {
+    ObJsonBinDocHeader doc_header;
+    doc_header.extend_seg_offset_ = total_size;
+    MEMCPY(buf, &doc_header, sizeof(doc_header));
+  }
+
+  char *array_buf = OB_SUCC(ret) ? buf + doc_header_size : nullptr;
+  ObJsonBinHeader array_header;
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(meta.to_header(array_header))) {
+      LOG_WARN("build string array header fail", K(ret));
+    } else {
+      MEMCPY(array_buf, &array_header, sizeof(array_header));
+      if (OB_FAIL(ObJsonBinSerializer::set_element_count(
+                    meta, array_buf, static_cast<uint64_t>(elements.count())))) {
+        LOG_WARN("write string array element count fail", K(ret));
+      } else if (OB_FAIL(ObJsonBinSerializer::set_obj_size(meta, array_buf, meta.obj_size()))) {
+        LOG_WARN("write string array object size fail", K(ret));
+      }
+    }
+  }
+
+  int64_t pos = OB_SUCC(ret)
+                ? static_cast<int64_t>(meta.get_value_data_offset(0))
+                : 0;
+  const ObJBVerType string_vertype = ObJsonBin::get_string_vertype();
+  for (int64_t i = 0; OB_SUCC(ret) && i < elements.count(); ++i) {
+    const ObString &value = elements.at(i);
+    const int64_t str_len_size = serialization::encoded_length_vi64(value.length());
+    const int64_t need = OB_JSON_BIN_VALUE_TYPE_LEN + str_len_size + value.length();
+    if (OB_UNLIKELY(pos + need > static_cast<int64_t>(meta.obj_size()))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("string array output buffer overflow", K(ret), K(i), K(pos), K(need), K(meta.obj_size()));
+    } else if (OB_FAIL(ObJsonBinSerializer::set_value_entry(meta,
+                                                            array_buf,
+                                                            static_cast<int>(i),
+                                                            static_cast<uint64_t>(pos),
+                                                            static_cast<uint8_t>(string_vertype),
+                                                            true))) {
+      LOG_WARN("write string array value entry fail", K(ret), K(i), K(pos));
+    } else {
+      array_buf[pos++] = static_cast<char>(string_vertype);
+      if (OB_FAIL(serialization::encode_vi64(array_buf,
+                                             static_cast<int64_t>(meta.obj_size()),
+                                             pos,
+                                             value.length()))) {
+        LOG_WARN("write string array length fail", K(ret), K(i));
+      } else {
+        if (value.length() > 0) {
+          MEMCPY(array_buf + pos, value.ptr(), value.length());
+        }
+        pos += value.length();
+      }
+    }
+  }
+  if (OB_SUCC(ret) && OB_UNLIKELY(pos != static_cast<int64_t>(meta.obj_size()))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("string array result size mismatch", K(ret), K(pos), K(meta.obj_size()));
+  }
+  return ret;
+}
+
 bool ObJsonBinAggSerializer::EntryKeyLess::operator()(const Entry &a,
                                                       const Entry &b) const
 {
@@ -25,9 +166,11 @@ bool ObJsonBinAggSerializer::EntryKeyLess::operator()(const Entry &a,
   return a.key_.compare(b.key_) < 0;
 }
 
-ObJsonBinAggSerializer::ObJsonBinAggSerializer(ObIAllocator &alloc, ObJsonNodeType root_type)
+ObJsonBinAggSerializer::ObJsonBinAggSerializer(ObIAllocator &alloc, ObJsonNodeType root_type,
+                                             bool need_calc_depth)
     : alloc_(alloc),
       root_type_(root_type),
+      need_calc_depth_(need_calc_depth),
       entries_(OB_MALLOC_NORMAL_BLOCK_SIZE, ModulePageAllocator(alloc, "JsonBinaryAgg"))
 {
   // Only J_ARRAY/J_OBJECT make sense as standalone document roots. Scalars
@@ -42,6 +185,56 @@ ObJsonBinAggSerializer::ObJsonBinAggSerializer(ObIAllocator &alloc, ObJsonNodeTy
 
 ObJsonBinAggSerializer::~ObJsonBinAggSerializer()
 {
+}
+
+template <>
+int ObJsonBinAggSerializer::serialize<ObString>(
+    ObIAllocator &alloc,
+    const ObIArray<ObString> &elements,
+    ObString &out)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!out.empty())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("collection serialize requires empty output", K(ret), K(out.length()));
+  } else if (OB_FAIL(serialize_impl(alloc, elements, out))) {
+    LOG_WARN("serialize string array fail", K(ret));
+  }
+  return ret;
+}
+
+int ObJsonBinAggSerializer::serialize_impl(
+    ObIAllocator &alloc,
+    const ObIArray<ObString> &elements,
+    ObString &out)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t doc_hdr_size = sizeof(ObJsonBinDocHeader);
+  uint64_t obj_size = 0;
+  uint64_t total_size = 0;
+  ObJsonBinMeta meta;
+  char *buf_ptr = NULL;
+
+  if (OB_FAIL(calc_string_array(elements, meta, obj_size))) {
+    LOG_WARN("calculate string array fail", K(ret));
+  } else if (OB_UNLIKELY(UINT64_MAX - doc_hdr_size < obj_size
+                         || doc_hdr_size + obj_size > static_cast<uint64_t>(INT32_MAX))) {
+    ret = OB_SIZE_OVERFLOW;
+    LOG_WARN("string array result size overflow", K(ret), K(doc_hdr_size), K(obj_size));
+  } else if (FALSE_IT(total_size = doc_hdr_size + obj_size)) {
+  } else if (OB_ISNULL(buf_ptr = static_cast<char *>(alloc.alloc(total_size)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("allocate string array result fail", K(ret), K(total_size));
+  } else if (OB_FAIL(write_string_array(
+                 elements, meta, buf_ptr, static_cast<int64_t>(total_size)))) {
+    LOG_WARN("write string array fail", K(ret));
+  } else {
+    out.assign_ptr(buf_ptr, static_cast<int32_t>(total_size));
+  }
+  if (OB_UNLIKELY(OB_FAIL(ret)) && OB_NOT_NULL(buf_ptr)) {
+    alloc.free(buf_ptr);
+  }
+  return ret;
 }
 
 int ObJsonBinAggSerializer::append_value(const ObJsonWrapper &wrapper)
@@ -133,7 +326,7 @@ int ObJsonBinAggSerializer::append_entry_common(const ObString &key,
 {
   int ret = OB_SUCCESS;
   Entry entry;
-  const uint32_t depth = wrapper.depth();
+  const uint32_t depth = need_calc_depth_ ? wrapper.depth() : 0;
   entry.key_ = key;
 
   const ObJsonNodeType json_type = wrapper.json_type();
@@ -208,19 +401,26 @@ int ObJsonBinAggSerializer::unique()
 
 uint16_t ObJsonBinAggSerializer::depth() const
 {
-  uint16_t max_child = 0;
-  // An entry with depth_ == 0 means the caller did not supply a depth; treat
-  // it as a scalar (depth 1) so the container depth is still well-defined.
-  for (int64_t i = 0; i < entries_.count(); i++) {
-    uint16_t d = entries_.at(i).depth_;
-    if (d == 0) {
-      d = 1;
+  uint16_t result = UINT16_MAX;
+  if (OB_UNLIKELY(!need_calc_depth_)) {
+    int ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("json aggregate depth calculation is disabled", K(ret));
+  } else {
+    uint16_t max_child = 0;
+    // An entry with depth_ == 0 means the caller did not supply a depth; treat
+    // it as a scalar (depth 1) so the container depth is still well-defined.
+    for (int64_t i = 0; i < entries_.count(); i++) {
+      uint16_t d = entries_.at(i).depth_;
+      if (d == 0) {
+        d = 1;
+      }
+      if (d > max_child) {
+        max_child = d;
+      }
     }
-    if (d > max_child) {
-      max_child = d;
-    }
+    result = max_child + 1;
   }
-  return max_child + 1;
+  return result;
 }
 
 int ObJsonBinAggSerializer::serialize(ObStringBuffer &out)

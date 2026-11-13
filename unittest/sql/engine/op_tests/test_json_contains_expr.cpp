@@ -3,7 +3,8 @@
  * 本文件包含机密及专有信息，未经授权不得使用或披露。
  */
 
-// Expression-level tests for JSON_CONTAINS, ported from the mysqltest suite:
+// Expression-level tests for JSON_CONTAINS and JSON_CONTAINS_PATH.
+// JSON_CONTAINS cases were ported from the mysqltest suite:
 //   tools/deploy/mysql_test/test_suite/json/t/json_contains_mysql.test
 // with expected values taken verbatim from the matching file under
 //   tools/deploy/mysql_test/test_suite/json/r/  (and r/mysql/).
@@ -163,6 +164,199 @@ TEST_F(JsonContainsExprTest, MysqlWildcardPathNotAllowed)
       .with_data({{R"({"width":  "800","image":  800})", R"(800)"}})
       .run(engine_);
   EXPECT_EQ(common::OB_ERR_INVALID_JSON_PATH_WILDCARD, result.get_ret_code());
+}
+
+// Check the same inputs with BinView on and off.
+TEST_F(JsonContainsExprTest, BinViewSwitchOnArrayContains)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "true"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256), c varchar(64)")
+        .with_expr("json_contains(cast(s as json), cast(c as json))")
+        .with_data({
+            {R"([1, 2, 3, 4, 5])", "3"},
+            {R"([1, 2, 3, 4, 5])", "6"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"1"}, {"0"}}));
+  }
+}
+
+TEST_F(JsonContainsExprTest, BinViewSwitchOffArrayContains)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "false"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256), c varchar(64)")
+        .with_expr("json_contains(cast(s as json), cast(c as json))")
+        .with_data({
+            {R"([1, 2, 3, 4, 5])", "3"},
+            {R"([1, 2, 3, 4, 5])", "6"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"1"}, {"0"}}));
+  }
+}
+
+TEST_F(JsonContainsExprTest, BinViewSwitchOnObjectPathContains)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "true"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256), c varchar(64), p varchar(16)")
+        .with_expr("json_contains(cast(s as json), cast(c as json), p)")
+        .with_data({
+            {R"({"a": [1, 2, {"b": 3}], "c": {"d": 4}})", R"({"b": 3})", "$.a"},
+            {R"({"a": [1, 2, {"b": 3}], "c": {"d": 4}})", R"({"d": 4})", "$.a"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"1"}, {"0"}}));
+  }
+}
+
+TEST_F(JsonContainsExprTest, BinViewSwitchOffObjectPathContains)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "false"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256), c varchar(64), p varchar(16)")
+        .with_expr("json_contains(cast(s as json), cast(c as json), p)")
+        .with_data({
+            {R"({"a": [1, 2, {"b": 3}], "c": {"d": 4}})", R"({"b": 3})", "$.a"},
+            {R"({"a": [1, 2, {"b": 3}], "c": {"d": 4}})", R"({"d": 4})", "$.a"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"1"}, {"0"}}));
+  }
+}
+
+class JsonContainsPathExprTest : public OpTestKit {};
+
+// Reuse one execution context while changing the path at the same argument index.
+TEST_F(JsonContainsPathExprTest, DynamicPathChangesAcrossRows)
+{
+  auto result = expr_unit_test()
+      .columns("doc varchar(512), path varchar(32)")
+      .with_expr("json_contains_path(CAST(doc AS JSON), 'all', '$.A.a', '$.A.b', path)")
+      .with_data({
+          {R"({"A":{"a":1,"b":2,"c":3}})", "$.A.c"},
+          {R"({"A":{"a":1,"b":2,"c":3}})", "$.A.missing"},
+          {R"({"A":{"a":1,"b":2,"c":3}})", "$.A.c"},
+      })
+      .run(engine_);
+  EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+  EXPECT_TRUE(result.verify_ordered({{"1"}, {"0"}, {"1"}}));
+}
+
+TEST_F(JsonContainsPathExprTest, SharedPrefixAll)
+{
+  auto result = expr_unit_test()
+      .columns("doc varchar(512)")
+      .with_expr("json_contains_path(CAST(doc AS JSON), 'all', '$.A.a', '$.A.b', '$.A.c')")
+      .with_data({
+          {R"({"A":{"a":1,"b":2,"c":3}})"},
+          {R"({"A":{"a":1,"b":2}})"},
+          {R"({"A":1})"},
+          {R"({"A":null})"},
+          {R"({"A":{"a":1,"b":2,"c":3}})"},
+      })
+      .run(engine_);
+  EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+  EXPECT_TRUE(result.verify_ordered({{"1"}, {"0"}, {"0"}, {"0"}, {"1"}}));
+}
+
+TEST_F(JsonContainsPathExprTest, SharedPrefixOne)
+{
+  auto result = expr_unit_test()
+      .columns("doc varchar(512)")
+      .with_expr("json_contains_path(CAST(doc AS JSON), 'one', '$.A.m', '$.A.a', '$.A.g')")
+      .with_data({
+          {R"({"A":{}})"},
+          {R"({"A":{"g":1}})"},
+          {R"({"A":{"m":1}})"},
+          {R"({"B":{"a":1}})"},
+      })
+      .run(engine_);
+  EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+  EXPECT_TRUE(result.verify_ordered({{"0"}, {"1"}, {"1"}, {"0"}}));
+}
+
+TEST_F(JsonContainsPathExprTest, DuplicateAndTerminalPrefix)
+{
+  auto result = expr_unit_test()
+      .columns("doc varchar(512)")
+      .with_expr("json_contains_path(CAST(doc AS JSON), 'all', '$.A', '$.A.b', '$.A.b')")
+      .with_data({
+          {R"({"A":{"b":1}})"},
+          {R"({"A":{"b":1}})"},
+          {R"({"A":1})"},
+          {R"({"A":null})"},
+          {R"({"A":{"b":null}})"},
+      })
+      .run(engine_);
+  EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+  EXPECT_TRUE(result.verify_ordered({{"1"}, {"1"}, {"0"}, {"0"}, {"1"}}));
+}
+
+TEST_F(JsonContainsPathExprTest, HandlesTextOneAllArgument)
+{
+  auto result = expr_unit_test()
+      .columns("doc varchar(512), mode text")
+      .with_expr("json_contains_path(CAST(doc AS JSON), mode, '$.A.a', '$.A.b', '$.A.c')")
+      .with_data({
+          {R"({"A":{"a":1,"b":2,"c":3}})", "all"},
+          {R"({"A":{"a":1,"b":2,"c":3}})", "all"},
+          {R"({"A":{"a":1}})", "one"},
+          {R"({"A":{"a":1,"b":2}})", "all"},
+      })
+      .run(engine_);
+  EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+  EXPECT_TRUE(result.verify_ordered({{"1"}, {"1"}, {"1"}, {"0"}}));
+}
+
+TEST_F(JsonContainsPathExprTest, LaterNullKeepsLazyOneAllSemantics)
+{
+  auto one_result = expr_unit_test()
+      .columns("doc varchar(512), path varchar(32)")
+      .with_expr("json_contains_path(doc, 'one', '$.A', path)")
+      .with_data({
+          {R"({"A":1})", TestValue::null()},
+          {R"({"B":1})", TestValue::null()},
+      })
+      .run(engine_);
+  EXPECT_EQ(common::OB_SUCCESS, one_result.get_ret_code());
+  EXPECT_TRUE(one_result.verify_ordered({{"1"}, {TestValue::null()}}));
+
+  auto all_result = expr_unit_test()
+      .columns("doc varchar(512), path varchar(32)")
+      .with_expr("json_contains_path(doc, 'all', '$.missing', path)")
+      .with_data({
+          {R"({"A":1})", TestValue::null()},
+          {R"({"missing":1})", TestValue::null()},
+      })
+      .run(engine_);
+  EXPECT_EQ(common::OB_SUCCESS, all_result.get_ret_code());
+  EXPECT_TRUE(all_result.verify_ordered({{"0"}, {TestValue::null()}}));
+}
+
+TEST_F(JsonContainsPathExprTest, LaterInvalidPathKeepsLazyOneAllSemantics)
+{
+  auto skipped_result = expr_unit_test()
+      .columns("doc varchar(512)")
+      .with_expr("json_contains_path(CAST(doc AS JSON), 'one', '$.A', '$[', '$.B')")
+      .with_data({{R"({"A":1})"}})
+      .run(engine_);
+  EXPECT_EQ(common::OB_SUCCESS, skipped_result.get_ret_code());
+  EXPECT_TRUE(skipped_result.verify_ordered({{"1"}}));
+
+  auto reached_result = expr_unit_test()
+      .columns("doc varchar(512)")
+      .with_expr("json_contains_path(CAST(doc AS JSON), 'one', '$.A', '$[', '$.B')")
+      .expect_error(common::OB_ERR_INVALID_JSON_PATH)
+      .with_data({{R"({"B":1})"}})
+      .run(engine_);
+  EXPECT_EQ(common::OB_ERR_INVALID_JSON_PATH, reached_result.get_ret_code());
 }
 
 int main(int argc, char **argv)

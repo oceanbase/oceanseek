@@ -19,6 +19,7 @@
 #ifndef OBDEV_SRC_SQL_DAS_SEARCH_OPERATOR_OB_DAS_DISJUNCTION_FILTER_OP_H_
 #define OBDEV_SRC_SQL_DAS_SEARCH_OPERATOR_OB_DAS_DISJUNCTION_FILTER_OP_H_
 
+#include "sql/das/search/ob_das_nested_key.h"
 #include "sql/das/search/ob_i_das_search_op.h"
 
 namespace oceanbase
@@ -66,9 +67,12 @@ public:
   ObDASDisjunctionFilterOp(ObDASSearchCtx &search_ctx)
     : ObIDASSearchOp(search_ctx),
       iter_end_(false),
+      is_first_nk_(true),
       min_should_match_(0),
       lead_cost_(),
       cur_row_id_(),
+      curr_nk_(),
+      current_nk_buf_(nullptr),
       rowid_allocators_{
         common::ObMemAttr(MTL_ID(), "DASDisjRowID"),
         common::ObMemAttr(MTL_ID(), "DASDisjRowID")},
@@ -102,6 +106,7 @@ public:
   }
 
 protected:
+  int init_nested_key_cursor();
   int do_init(const ObIDASSearchOpParam &op_param) override;
   int do_open() override;
   int do_close() override;
@@ -109,6 +114,12 @@ protected:
   int do_rescan_segment(const common::ObNewVersionRange &range) override;
   int do_advance_to(const ObDASRowID &target, ObDASRowID &curr_id, double &score) override;
   int do_next_rowid(ObDASRowID &next_id, double &score) override;
+  int do_advance_to(const ObDASNestedKey &target, ObDASNestedKey &curr_nk, double &score) override;
+  int do_next_rowid(ObDASNestedKey &next_nk, double &score) override;
+  template <typename RowType>
+  int advance_impl(const RowType &target, RowType &curr_id, double &score);
+  template <typename RowType>
+  int next_impl(RowType &next_id, double &score);
   int do_drain_until(const ObDASRowID &boundary,
                      int64_t capacity,
                      uint64_t *out_ids,
@@ -180,16 +191,21 @@ private:
                           double &score);
 protected:
   bool iter_end_;
+  bool is_first_nk_;
 
 private:
   int64_t min_should_match_;
   ObDASSearchCost lead_cost_;
   ObDASRowID cur_row_id_;
+  ObDASNestedKey curr_nk_;
+  // Reused across NK calls; long keys need nesting_depth_ * 4 bytes.
+  char *current_nk_buf_;
   // Keep the emitted compact rowid stable while children advance and reuse
   // their output buffers. The current and next output use alternate arenas.
   common::ObArenaAllocator rowid_allocators_[2];
   int64_t rowid_allocator_idx_;
   ObArray<ObDASRowID> child_row_ids_;
+  ObArray<ObDASNestedKey> child_nested_keys_;
   common::ObArenaAllocator batch_allocator_;
   uint64_t *batch_ids_;
   // Number of uint64_t slots allocated in batch_ids_.

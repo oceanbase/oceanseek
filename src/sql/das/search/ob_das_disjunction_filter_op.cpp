@@ -71,6 +71,10 @@ int ObDASDisjunctionFilterOp::reset_merge_cursor()
       LOG_WARN("failed to resize disjunction child row ids", K(ret), K_(children_cnt));
     }
   }
+  if (OB_SUCC(ret) && is_async_nested_scope(scope_)
+      && OB_FAIL(child_nested_keys_.prepare_allocate(children_cnt_))) {
+    LOG_WARN("failed to initialize disjunction child nested keys", K(ret), K_(children_cnt));
+  }
   return ret;
 }
 
@@ -468,12 +472,19 @@ int ObDASDisjunctionFilterOp::do_open()
     // one merge mode for the whole operator lifetime, as segment merge does.
     // A candidate-relative child (for example minimum_should_match=0) cannot
     // be pre-materialized through drain_until(), so retain the probe path.
-    use_batch_merge_ = 1 == min_should_match_
+    use_batch_merge_ = !is_async_nested_scope(scope_)
+        && 1 == min_should_match_
         && DAS_ROWID_TYPE_UINT64 == get_rowid_type()
         && children_cnt_ > 0
         && can_batch_merge;
     if (OB_FAIL(reset_merge_cursor())) {
       LOG_WARN("failed to reset disjunction cursor on open", K(ret));
+    } else if (is_async_nested_scope(scope_) && nested_compare_bytes() > sizeof(uint64_t)
+        && OB_ISNULL(current_nk_buf_ = static_cast<char *>(ctx_allocator().alloc(nested_compare_bytes())))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate disjunction nested key buffer", KR(ret), K(nesting_depth_));
+    } else {
+      is_first_nk_ = true;
     }
   }
   return ret;
@@ -506,6 +517,8 @@ int ObDASDisjunctionFilterOp::do_rescan()
     LOG_WARN("failed to rescan disjunction children", K(ret));
   } else if (OB_FAIL(reset_merge_cursor())) {
     LOG_WARN("failed to reset disjunction cursor on rescan", K(ret));
+  } else {
+    is_first_nk_ = true;
   }
   return ret;
 }
@@ -521,6 +534,8 @@ int ObDASDisjunctionFilterOp::do_rescan_segment(
     LOG_WARN("failed to rescan disjunction children for async segment", K(ret), K(range));
   } else if (OB_FAIL(reset_merge_cursor())) {
     LOG_WARN("failed to reset disjunction cursor for async segment", K(ret));
+  } else {
+    is_first_nk_ = true;
   }
   return ret;
 }
@@ -533,6 +548,11 @@ int ObDASDisjunctionFilterOp::do_close()
   rowid_allocator_idx_ = 0;
   cur_row_id_.reset();
   child_row_ids_.reset();
+  child_nested_keys_.reset();
+  if (OB_NOT_NULL(current_nk_buf_)) {
+    ctx_allocator().free(current_nk_buf_);
+    current_nk_buf_ = nullptr;
+  }
   batch_allocator_.reset();
   batch_ids_ = nullptr;
   batch_row_capacity_ = 0;
@@ -542,94 +562,203 @@ int ObDASDisjunctionFilterOp::do_close()
   use_batch_merge_ = false;
   batch_cursor_primed_ = false;
   iter_end_ = false;
+  is_first_nk_ = true;
+  return ret;
+}
+
+int ObDASDisjunctionFilterOp::init_nested_key_cursor()
+{
+  int ret = OB_SUCCESS;
+  curr_nk_.set_min();
+  for (int64_t i = 0; OB_SUCC(ret) && i < children_cnt_; ++i) {
+    ObDASNestedKey &key = child_nested_keys_.at(i);
+    int cmp = 0;
+    if (OB_FAIL(compare_rowid(child_row_ids_.at(i), cur_row_id_, cmp))) {
+      LOG_WARN("failed to compare nested candidate documents", K(ret), K(i));
+    } else if (0 == cmp) {
+      key.set_min();
+    } else {
+      key.set_max();
+    }
+  }
+  if (OB_SUCC(ret)) {
+    is_first_nk_ = false;
+  }
   return ret;
 }
 
 int ObDASDisjunctionFilterOp::do_advance_to(const ObDASRowID &target, ObDASRowID &curr_id, double &score)
 {
   int ret = OB_SUCCESS;
-  if (use_batch_merge_) {
-    ret = advance_batch_rowid(target, curr_id, score);
+  const bool has_nested_cursor = !is_first_nk_ && cur_row_id_.is_normal();
+  int cmp = 0;
+  if (has_nested_cursor && OB_FAIL(compare_rowid(target, cur_row_id_, cmp))) {
+    LOG_WARN("failed to compare nested document target", KR(ret), K(target), K_(cur_row_id));
+  } else if (has_nested_cursor && cmp <= 0
+             && (min_should_match_ > 0 || 0 == cmp)) {
+    // Keep the current document and its partially consumed or exhausted NK cursor.
+    curr_id = cur_row_id_;
+    score = is_scoring_ ? match_score_ : 0.0;
   } else {
-    ObDASRowID candidate_target;
-    ObDASRowID next_possible_target = target;
-    ObDASRowID matched_row_id;
-    int cmp = 0;
-    bool enough_matched = false;
-    bool has_matched_row_id = false;
-    while (OB_SUCC(ret) && !enough_matched) {
-      ObDASRowID tmp_id;
-      double tmp_score = 0.0;
-      int64_t matched_count = 0;
-      enough_matched = false;
-      candidate_target = next_possible_target;
-      matched_row_id.reset();
-      has_matched_row_id = false;
-      next_possible_target.set_max();
-      for (int64_t i = 0; OB_SUCC(ret) && i < children_cnt_; ++i) {
-        ObIDASSearchOp *op = children_[i];
-        if (OB_ISNULL(op)) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("unexpected null child", KR(ret), K(i));
-        } else if (OB_FAIL(compare_rowid(child_row_ids_[i], candidate_target, cmp))) {
-          LOG_WARN("failed to compare rowids", KR(ret), K(i), K(candidate_target), K(child_row_ids_[i]));
-        } else if (cmp >= 0) {
-          // already advanced to the candidate_target in the previous iteration, do nothing
-        } else if (FALSE_IT(child_row_ids_[i].reset())) {
-        } else if (OB_FAIL(op->advance_to(candidate_target, tmp_id, tmp_score))) {
-          if (OB_LIKELY(OB_ITER_END == ret)) {
-            ret = OB_SUCCESS;
-            child_row_ids_[i].set_max();
+    // MSM=0 accepts a different caller-supplied candidate rather than the cached document.
+    is_first_nk_ = true;
+    if (use_batch_merge_) {
+      ret = advance_batch_rowid(target, curr_id, score);
+    } else {
+      ret = advance_impl<ObDASRowID>(target, curr_id, score);
+    }
+  }
+  return ret;
+}
+
+int ObDASDisjunctionFilterOp::do_advance_to(const ObDASNestedKey &target, ObDASNestedKey &curr_nk, double &score)
+{
+  int ret = OB_SUCCESS;
+  int cmp = 0;
+  score = 0.0;
+  if (!is_async_nested_scope(scope_)) {
+    ret = OB_NOT_IMPLEMENT;
+  } else if (is_first_nk_ && OB_FAIL(init_nested_key_cursor())) {
+    LOG_WARN("failed to initialize nested key cursor", KR(ret));
+  } else if (target.is_max()
+             || (curr_nk_.is_max() && (min_should_match_ > 0 || target.is_min()))) {
+    ret = OB_ITER_END;
+  } else if (OB_FAIL(compare_rowid(target, curr_nk_, cmp))) {
+    LOG_WARN("failed to compare nested key target", KR(ret));
+  } else if (curr_nk_.is_normal() && cmp <= 0) {
+    curr_nk = curr_nk_;
+  } else if (target.is_min() && curr_nk_.is_min()) {
+    ret = next_impl<ObDASNestedKey>(curr_nk, score);
+  } else {
+    ret = advance_impl<ObDASNestedKey>(target, curr_nk, score);
+  }
+  if (OB_SUCC(ret)) {
+    curr_nk_ = curr_nk;
+  } else if (OB_ITER_END == ret) {
+    curr_nk_.set_max();
+  }
+  return ret;
+}
+
+template <typename RowType>
+int ObDASDisjunctionFilterOp::advance_impl(const RowType &target, RowType &curr_id, double &score)
+{
+  int ret = OB_SUCCESS;
+  ObArray<RowType> *child_ids = nullptr;
+  if constexpr (std::is_same_v<RowType, ObDASNestedKey>) {
+    child_ids = &child_nested_keys_;
+  } else {
+    child_ids = &child_row_ids_;
+  }
+  RowType candidate_target;
+  RowType next_possible_target = target;
+  RowType matched_row_id;
+  int cmp = 0;
+  bool enough_matched = false;
+  bool has_matched_row_id = false;
+  while (OB_SUCC(ret) && !enough_matched) {
+    RowType tmp_id;
+    double tmp_score = 0.0;
+    int64_t matched_count = 0;
+    enough_matched = false;
+    candidate_target = next_possible_target;
+    matched_row_id.reset();
+    has_matched_row_id = false;
+    next_possible_target.set_max();
+    for (int64_t i = 0; OB_SUCC(ret) && i < children_cnt_; ++i) {
+      ObIDASSearchOp *op = children_[i];
+      RowType &child_id = child_ids->at(i);
+      if (OB_ISNULL(op)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected null child", KR(ret), K(i));
+      } else if (OB_FAIL(compare_rowid(candidate_target, child_id, cmp))) {
+        LOG_WARN("failed to compare rowids", KR(ret), K(i), K(candidate_target), K(child_id));
+      } else if (cmp <= 0) {
+        // already advanced to the candidate_target in the previous iteration, do nothing
+      } else if (FALSE_IT(child_id.reset())) {
+      } else if (OB_FAIL(op->advance_to(candidate_target, tmp_id, tmp_score))) {
+        if (OB_LIKELY(OB_ITER_END == ret)) {
+          ret = OB_SUCCESS;
+          child_id.set_max();
+        } else {
+          LOG_WARN("failed to advance to", KR(ret), K(candidate_target));
+        }
+      } else {
+        child_id = tmp_id;
+      }
+      if (OB_SUCC(ret)) {
+        bool is_seek_prefix = false;
+        if constexpr (std::is_same_v<RowType, ObDASNestedKey>) {
+          // A seek prefix is not yet a candidate at the children's common depth.
+          is_seek_prefix = candidate_target.is_normal() && child_id.is_normal()
+              && candidate_target.length() < child_id.length();
+        }
+        if (OB_FAIL(compare_rowid(candidate_target, child_id, cmp))) {
+          LOG_WARN("failed to compare rowids", KR(ret), K(i), K(child_id), K(candidate_target));
+        } else if (cmp != 0 || is_seek_prefix) {
+          if (cmp > 0) {
+            // result should not be less than the target
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("unexpected child_id < candidate_target", KR(ret), K(i), K(child_id), K(candidate_target));
           } else {
-            LOG_WARN("failed to advance to", KR(ret), K(candidate_target));
+            if (OB_FAIL(compare_rowid(next_possible_target, child_id, cmp))) {
+              LOG_WARN("failed to compare rowids", KR(ret), K(next_possible_target), K(child_id));
+            } else if (cmp > 0) {
+              next_possible_target = child_id;
+            }
           }
         } else {
-          child_row_ids_[i] = tmp_id;
-        }
-        if (OB_SUCC(ret)) {
-          if (OB_FAIL(compare_rowid(child_row_ids_[i], candidate_target, cmp))) {
-            LOG_WARN("failed to compare rowids", KR(ret), K(i), K(child_row_ids_[i]), K(candidate_target));
-          } else if (cmp != 0) {
-            if (cmp < 0) {
-              // result should not be less than the target
-              ret = OB_ERR_UNEXPECTED;
-              LOG_WARN("unexpected child_row_ids_[i] < candidate_target", KR(ret), K(i), K(child_row_ids_[i]), K(candidate_target));
-            } else {
-              if (OB_FAIL(compare_rowid(next_possible_target, child_row_ids_[i], cmp))) {
-                LOG_WARN("failed to compare rowids", KR(ret), K(next_possible_target), K(child_row_ids_[i]));
-              } else if (cmp > 0) {
-                next_possible_target = child_row_ids_[i];
-              }
-            }
-          } else {
-            if (0 == matched_count) {
-              matched_row_id = child_row_ids_[i];
-              has_matched_row_id = true;
-            }
-            matched_count++;
+          if (0 == matched_count) {
+            matched_row_id = child_id;
+            has_matched_row_id = true;
           }
+          matched_count++;
         }
-      }
-      if (OB_FAIL(ret)) {
-      } else if (matched_count >= min_should_match_) {
-        enough_matched = true;
-      } else if (next_possible_target.is_max()) {
-        ret = OB_ITER_END;
       }
     }
-    if (OB_SUCC(ret)) {
-      const ObDASRowID &source_row_id =
-          has_matched_row_id ? matched_row_id : candidate_target;
-      const int64_t next_allocator_idx = 1 - rowid_allocator_idx_;
-      ObDASRowID stable_row_id;
-      rowid_allocators_[next_allocator_idx].reuse();
-      if (OB_FAIL(deep_copy_rowid(
-          source_row_id, stable_row_id, rowid_allocators_[next_allocator_idx]))) {
-        LOG_WARN("failed to preserve disjunction output rowid", K(ret));
+    if (OB_FAIL(ret)) {
+    } else if (matched_count >= min_should_match_) {
+      enough_matched = true;
+    } else if (next_possible_target.is_max()) {
+      ret = OB_ITER_END;
+    }
+  }
+  if (OB_SUCC(ret)) {
+    const RowType &source_row_id =
+        has_matched_row_id ? matched_row_id : candidate_target;
+    if constexpr (std::is_same_v<RowType, ObDASNestedKey>) {
+      if (!has_matched_row_id && source_row_id.is_normal()
+          && source_row_id.length() > sizeof(uint64_t)) {
+        if (OB_UNLIKELY(source_row_id.length() > nested_compare_bytes())) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("nested key exceeds disjunction buffer length", KR(ret), K(source_row_id), K(nesting_depth_));
+        } else {
+          // An accepted zero-match target can borrow the caller's temporary buffer.
+          if (source_row_id.ptr() != current_nk_buf_) {
+            MEMCPY(current_nk_buf_, source_row_id.ptr(), source_row_id.length());
+          }
+          curr_id.assign(current_nk_buf_, source_row_id.length());
+        }
       } else {
-        rowid_allocators_[rowid_allocator_idx_].reuse();
-        rowid_allocator_idx_ = next_allocator_idx;
-        cur_row_id_ = stable_row_id;
+        curr_id = source_row_id;
+      }
+    } else {
+      if (DAS_ROWID_TYPE_UINT64 == get_rowid_type()) {
+        cur_row_id_ = source_row_id;
+      } else {
+        const int64_t next_allocator_idx = 1 - rowid_allocator_idx_;
+        ObDASRowID stable_row_id;
+        rowid_allocators_[next_allocator_idx].reuse();
+        if (OB_FAIL(deep_copy_rowid(
+            source_row_id, stable_row_id, rowid_allocators_[next_allocator_idx]))) {
+          LOG_WARN("failed to preserve disjunction output rowid", K(ret));
+        } else {
+          rowid_allocators_[rowid_allocator_idx_].reuse();
+          rowid_allocator_idx_ = next_allocator_idx;
+          cur_row_id_ = stable_row_id;
+        }
+      }
+      if (OB_SUCC(ret)) {
         curr_id = cur_row_id_;
         score = is_scoring_ ? match_score_ : 0.0;
       }
@@ -641,51 +770,109 @@ int ObDASDisjunctionFilterOp::do_advance_to(const ObDASRowID &target, ObDASRowID
 int ObDASDisjunctionFilterOp::do_next_rowid(ObDASRowID &next_id, double &score)
 {
   int ret = OB_SUCCESS;
+  is_first_nk_ = true;
   if (use_batch_merge_) {
     ret = next_batch_rowid(next_id, score, 1);
   } else {
-    ObDASRowID target_id;
-    target_id.set_max();
-    int cmp = 0;
-    for (int64_t i = 0; OB_SUCC(ret) && i < children_cnt_; ++i) {
-      ObIDASSearchOp *op = children_[i];
-      ObDASRowID tmp_id;
-      double tmp_score = 0.0;
-      if (OB_ISNULL(op)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unexpected null op", KR(ret), K(i));
-      } else if (OB_FAIL(compare_rowid(child_row_ids_[i], cur_row_id_, cmp))) {
-        LOG_WARN("failed to compare rowids", KR(ret), K(i), K(child_row_ids_[i]), K(cur_row_id_));
-      } else if (cmp == 0) {
-        child_row_ids_[i].reset();
-        if (OB_FAIL(op->next_rowid(tmp_id, tmp_score))) {
-          if (OB_LIKELY(OB_ITER_END == ret)) {
-            ret = OB_SUCCESS;
-            child_row_ids_[i].set_max();
-          } else {
-            LOG_WARN("failed to next rowid", KR(ret), K(i));
-          }
-        } else {
-          child_row_ids_[i] = tmp_id;
-        }
-      }
-      if (OB_SUCC(ret)) {
-        if (OB_FAIL(compare_rowid(target_id, child_row_ids_[i], cmp))) {
-          LOG_WARN("failed to compare rowids", KR(ret), K(target_id), K(child_row_ids_[i]));
-        } else if (cmp > 0) {
-          target_id = child_row_ids_[i];
-        }
-      }
-    }
-    if (OB_FAIL(ret)) {
-    } else if (target_id.is_max()) {
-      ret = OB_ITER_END;
-    } else if (OB_FAIL(do_advance_to(target_id, next_id, score))) {
-      LOG_WARN_IGNORE_ITER_END(ret, "failed to advance to", KR(ret), K(target_id));
-    }
+    ret = next_impl<ObDASRowID>(next_id, score);
   }
   return ret;
 }
+
+int ObDASDisjunctionFilterOp::do_next_rowid(ObDASNestedKey &next_nk, double &score)
+{
+  INIT_SUCC(ret);
+  score = 0.0;
+  if (!is_async_nested_scope(scope_)) {
+    ret = OB_NOT_IMPLEMENT;
+  } else if (is_first_nk_ && OB_FAIL(init_nested_key_cursor())) {
+    LOG_WARN("failed to initialize nested key cursor", KR(ret));
+  } else if (curr_nk_.is_max()) {
+    ret = OB_ITER_END;
+  } else if (OB_FAIL(next_impl<ObDASNestedKey>(next_nk, score))) {
+    if (OB_ITER_END != ret) {
+      LOG_WARN("failed to fetch next nested key", K(ret));
+    } else {
+      curr_nk_.set_max();
+    }
+  } else {
+    curr_nk_ = next_nk;
+  }
+  return ret;
+}
+
+template <typename RowType>
+int ObDASDisjunctionFilterOp::next_impl(RowType &next_id, double &score)
+{
+  int ret = OB_SUCCESS;
+  ObArray<RowType> *child_ids = nullptr;
+  RowType current;
+  if constexpr (std::is_same_v<RowType, ObDASNestedKey>) {
+    child_ids = &child_nested_keys_;
+    current = curr_nk_;
+    // Preserve the current key before its child can reuse the output buffer.
+    if (current.is_normal() && current.length() > sizeof(uint64_t)) {
+      if (OB_UNLIKELY(current.length() > nested_compare_bytes())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("nested key exceeds disjunction buffer length", KR(ret), K(current), K(nesting_depth_));
+      } else if (current.ptr() != current_nk_buf_) {
+        MEMCPY(current_nk_buf_, current.ptr(), current.length());
+        current.assign(current_nk_buf_, current.length());
+      }
+    }
+  } else {
+    child_ids = &child_row_ids_;
+    current = cur_row_id_;
+  }
+  RowType candidate;
+  candidate.set_max();
+  for (int64_t i = 0; OB_SUCC(ret) && i < children_cnt_; ++i) {
+    ObIDASSearchOp *op = children_[i];
+    RowType &head = child_ids->at(i);
+    RowType tmp_id;
+    double child_score = 0.0;
+    int cmp = 0;
+    if (OB_ISNULL(op)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null op", KR(ret), K(i));
+    } else if (OB_FAIL(compare_rowid(current, head, cmp))) {
+      LOG_WARN("failed to compare rowids", KR(ret), K(i), K(current), K(head));
+    } else if (0 == cmp) {
+      head.reset();
+      if (OB_FAIL(op->next_rowid(tmp_id, child_score))) {
+        if (OB_LIKELY(OB_ITER_END == ret)) {
+          ret = OB_SUCCESS;
+          head.set_max();
+        } else {
+          LOG_WARN("failed to next rowid", KR(ret), K(i));
+        }
+      } else {
+        head = tmp_id;
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(compare_rowid(head, candidate, cmp))) {
+        LOG_WARN("failed to compare next child", K(ret));
+      } else if (cmp < 0) {
+        candidate = head;
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (candidate.is_max()) {
+    ret = OB_ITER_END;
+  } else if (OB_FAIL(advance_impl(candidate, next_id, score))) {
+    LOG_WARN_IGNORE_ITER_END(ret, "failed to advance to", KR(ret), K(candidate));
+  }
+  return ret;
+}
+
+template int ObDASDisjunctionFilterOp::advance_impl<ObDASRowID>(
+    const ObDASRowID &, ObDASRowID &, double &);
+template int ObDASDisjunctionFilterOp::advance_impl<ObDASNestedKey>(
+    const ObDASNestedKey &, ObDASNestedKey &, double &);
+template int ObDASDisjunctionFilterOp::next_impl<ObDASRowID>(ObDASRowID &, double &);
+template int ObDASDisjunctionFilterOp::next_impl<ObDASNestedKey>(ObDASNestedKey &, double &);
 
 int ObDASDisjunctionFilterOp::do_drain_until(
     const ObDASRowID &boundary,
@@ -696,6 +883,7 @@ int ObDASDisjunctionFilterOp::do_drain_until(
     ObDASRowID &next_id_after,
     double &next_score_after)
 {
+  is_first_nk_ = true;
   int ret = OB_SUCCESS;
   const int64_t fetch_capacity = child_batch_size_ > 0
       ? MIN(child_batch_size_, MAX(1L, capacity)) : 1;

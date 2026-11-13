@@ -48,6 +48,8 @@ private:
   int do_rescan() override;
   int do_advance_to(const ObDASRowID &target, ObDASRowID &curr_id, double &score) override;
   int do_next_rowid(ObDASRowID &next_id, double &score) override;
+  int do_advance_to(const ObDASNestedKey &target, ObDASNestedKey &curr_nk, double &score) override;
+  int do_next_rowid(ObDASNestedKey &next_nk, double &score) override;
   int do_advance_shallow(
     const ObDASRowID &target,
     const bool inclusive,

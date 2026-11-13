@@ -5,6 +5,8 @@
 
 #define USING_LOG_PREFIX STORAGE
 
+#include "share/search_index/ob_search_index_lifecycle_util.h"
+
 #include "storage/async_index/ob_async_index_deps.h"
 #include "storage/async_index/ob_async_index_define.h"
 #include "lib/oblog/ob_log_module.h"
@@ -1070,6 +1072,51 @@ int ObAsyncIndexDepProvider::get_async_table_refresh_intervals(
   return ret;
 }
 
+// Collect physical async-index targets for refresh discovery.
+// Skip missing and deleting schemas; propagate expansion and lookup errors.
+static int collect_refresh_discovery_targets(
+    share::schema::ObSchemaGetterGuard &guard, const share::schema::ObTableSchema &base,
+    common::ObIArray<share::ObAsyncPhysicalTarget> &targets)
+{
+  int ret = OB_SUCCESS;
+  targets.reset();
+  const auto &infos = base.get_simple_index_infos();
+  for (int64_t i = 0; OB_SUCC(ret) && i < infos.count(); ++i) {
+    const auto &info = infos.at(i);
+    const share::schema::ObTableSchema *logical = nullptr;
+    common::ObSEArray<share::ObAsyncPhysicalTarget, 3> expanded;
+    if (!share::schema::is_async_index(info.index_type_)) {
+      continue;
+    } else if (OB_FAIL(guard.get_table_schema(base.get_tenant_id(), info.table_id_, logical))) {
+      LOG_WARN("failed to get logical async schema", K(ret), K(info));
+    } else if (OB_ISNULL(logical)) {
+      // Refresh discovery skips missing schemas.
+    } else if (OB_FAIL(share::ObSearchIndexLifecycleUtil::expand_async_index(
+        base, *logical, expanded))) {
+      LOG_WARN("failed to expand async index", K(ret), K(info));
+    } else {
+      for (int64_t j = 0; OB_SUCC(ret) && j < expanded.count(); ++j) {
+        const auto &target = expanded.at(j);
+        const share::schema::ObTableSchema *physical = nullptr;
+        if (OB_FAIL(share::ObSearchIndexLifecycleUtil::get_target_schema(
+            guard, base, target, physical))) {
+          LOG_WARN("failed to get async target", K(ret), K(target));
+        } else if (OB_ISNULL(physical)) {
+          // Refresh discovery skips missing schemas.
+        } else if (physical->is_in_deleting()) {
+          LOG_INFO("[ASYNC_INDEX] index is being deleted, skip", K(base.get_tenant_id()), K(physical->get_table_id()));
+        } else if (OB_FAIL(targets.push_back(target))) {
+          LOG_WARN("failed to append async target", K(ret), K(target));
+        }
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+    targets.reset();
+  }
+  return ret;
+}
+
 // Resolve only the requested tablet. No full-table tablet/name arrays are built.
 static int get_refresh_partition_(const ObTableSchema &schema,
                                   const ObTabletID &tablet_id,
@@ -1197,48 +1244,42 @@ static int build_data_table_info_from_schema_(
   // Fulltext index aux columns (word_segment, doc_id, …) are HIDDEN generated
   // columns; filtering is_hidden() would drop them, so we skip shadow columns only.
   // rowkey_columns: same rationale -- skip shadow columns only.
-  const ObIArray<ObAuxTableMetaInfo> &aux_infos = data_table_schema->get_simple_index_infos();
-  for (int64_t j = 0; OB_SUCC(ret) && !target_index_found && j < aux_infos.count(); ++j) {
-    const ObAuxTableMetaInfo &aux_info = aux_infos.at(j);
-    const bool is_async_search = is_async_search_def_index(aux_info.index_type_);
-    if (!is_async_index(aux_info.index_type_)) {
+  ObSEArray<share::ObAsyncPhysicalTarget, 8> targets;
+  if (OB_SUCC(ret) && OB_FAIL(collect_refresh_discovery_targets(
+      schema_guard, *data_table_schema, targets))) {
+    LOG_WARN("failed to collect async refresh targets", K(ret), K(data_table_id));
+  }
+  for (int64_t j = 0;
+       OB_SUCC(ret) && !target_index_found && j < targets.count(); ++j) {
+    const share::ObAsyncPhysicalTarget &target = targets.at(j);
+    const bool is_async_search = is_async_search_aux_index(target.index_type_);
+    const uint64_t index_table_id = target.table_id_;
+    if (OB_INVALID_ID != target_index_id && target_index_id != index_table_id) {
       continue;
     }
-    if (OB_INVALID_ID != target_index_id && !is_async_search
-        && target_index_id != aux_info.table_id_) {
-      continue;
-    }
-    uint64_t index_table_id = aux_info.table_id_;
     const ObTableSchema *search_def_schema = nullptr;
     const ObTableSchema *index_schema = nullptr;
     if (is_async_search
         && OB_FAIL(schema_guard.get_table_schema(
-               tenant_id, aux_info.table_id_, search_def_schema))) {
-      LOG_WARN("failed to get async search def schema", K(ret), K(tenant_id), K(aux_info.table_id_));
+               tenant_id, target.def_table_id_, search_def_schema))) {
+      LOG_WARN("failed to get async search def schema", K(ret), K(tenant_id), K(target));
       break;
     } else if (is_async_search && OB_ISNULL(search_def_schema)) {
-      LOG_WARN("async search def schema is null, skip", K(tenant_id), K(aux_info.table_id_));
+      LOG_WARN("async search def schema is null, skip", K(tenant_id), K(target));
       continue;
-    } else if (is_async_search
-               && OB_FAIL(search_def_schema->get_search_data_index_tid(index_table_id))) {
-      LOG_WARN("failed to resolve async search data table", K(ret), K(aux_info.table_id_));
-      break;
-    } else if (OB_INVALID_ID != target_index_id && target_index_id != index_table_id) {
+    } else if (is_async_search && search_def_schema->is_in_deleting()) {
       continue;
     } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id, index_table_id, index_schema))) {
       LOG_WARN("failed to get index table schema", K(ret), K(tenant_id), K(index_table_id));
       break;
     } else if (OB_ISNULL(index_schema)) {
-      LOG_WARN("index table schema is null, skip", K(tenant_id), K(index_table_id));
-      continue;
-    } else if (index_schema->is_in_deleting()) {
-      LOG_INFO("[ASYNC_INDEX] index is being deleted, skip", K(tenant_id), K(index_table_id));
+      LOG_WARN("async refresh target schema is null, skip", K(tenant_id), K(target));
       continue;
     }
 
     ObAsyncIndexInfo index_info(tenant_id);
     index_info.index_table_id_  = index_table_id;
-    index_info.def_index_table_id_ = is_async_search ? aux_info.table_id_ : OB_INVALID_ID;
+    index_info.def_index_table_id_ = target.def_table_id_;
     index_info.index_type_ = index_schema->get_index_type();
     index_info.is_delete_index_ = is_async_delete_index(index_info.index_type_);
     index_info.is_refresh_on_error_skip_ =
@@ -1271,9 +1312,9 @@ static int build_data_table_info_from_schema_(
       }
     }
 
-    // FTS/delete project the same columns into the target. Async Search Data is
+    // FTS/delete project the same columns into the target. Async Search children are
     // generated from the user columns stored on the Def schema, while its target
-    // columns are the canonical Data columns collected above.
+    // columns are the physical child columns collected above.
     if (OB_SUCC(ret) && is_async_search) {
       ObSEArray<ObString, 8> source_column_names;
       ObSEArray<ObString, 8> col_comments;
@@ -1282,7 +1323,7 @@ static int build_data_table_info_from_schema_(
       if (OB_FAIL(ObSearchIndexBuilderUtil::get_search_index_column_name(
           *data_table_schema, *search_def_schema, source_column_names, col_comments))) {
         LOG_WARN("failed to get async search source columns", K(ret),
-            K(data_table_id), K(aux_info.table_id_));
+            K(data_table_id), K(target.def_table_id_));
       }
       for (int64_t c = 0; OB_SUCC(ret) && c < source_column_names.count(); ++c) {
         ObString column_name;
@@ -1295,7 +1336,7 @@ static int build_data_table_info_from_schema_(
       if (OB_SUCC(ret) && OB_UNLIKELY(index_info.source_columns_.empty())) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("async search source columns are empty", K(ret),
-            K(data_table_id), K(aux_info.table_id_));
+            K(data_table_id), K(target.def_table_id_));
       }
     } else if (OB_SUCC(ret)
                && OB_FAIL(index_info.source_columns_.assign(index_info.select_columns_))) {
@@ -1594,6 +1635,9 @@ static int build_data_table_info_from_schema_(
       }
     }
   }
+  if (OB_FAIL(ret)) {
+    data_table_info.reset();
+  }
   return ret;
 }
 
@@ -1757,10 +1801,60 @@ int ObAsyncIndexDepProvider::get_single_table_refresh_info(
   return ret;
 }
 
+// Collect physical async-index targets for published-SCN lookup.
+// Skip missing, deleting and non-AVAILABLE schemas; propagate expansion and lookup errors.
+static int collect_published_targets(
+    share::schema::ObSchemaGetterGuard &guard, const share::schema::ObTableSchema &base,
+    common::ObIArray<share::ObAsyncPhysicalTarget> &targets)
+{
+  int ret = OB_SUCCESS;
+  targets.reset();
+  const auto &infos = base.get_simple_index_infos();
+  for (int64_t i = 0; OB_SUCC(ret) && i < infos.count(); ++i) {
+    const auto &info = infos.at(i);
+    const share::schema::ObTableSchema *logical = nullptr;
+    common::ObSEArray<share::ObAsyncPhysicalTarget, 3> expanded;
+    if (!share::schema::is_async_index(info.index_type_)) {
+      continue;
+    } else if (OB_FAIL(guard.get_table_schema(base.get_tenant_id(), info.table_id_, logical))) {
+      LOG_WARN("failed to get logical async schema", K(ret), K(info));
+    } else if (OB_ISNULL(logical)) {
+      // Refresh discovery skips missing schemas, as in the base implementation.
+    } else if (OB_FAIL(share::ObSearchIndexLifecycleUtil::expand_async_index(
+        base, *logical, expanded))) {
+      LOG_WARN("failed to expand async index", K(ret), K(info));
+    } else {
+      for (int64_t j = 0; OB_SUCC(ret) && j < expanded.count(); ++j) {
+        const auto &target = expanded.at(j);
+        const share::schema::ObTableSchema *physical = nullptr;
+        if (OB_FAIL(share::ObSearchIndexLifecycleUtil::get_target_schema(
+            guard, base, target, physical))) {
+          LOG_WARN("failed to get async target", K(ret), K(target));
+        } else if (OB_ISNULL(physical)) {
+          // Refresh discovery skips missing schemas, as in the base implementation.
+        } else if (physical->is_in_deleting()
+            || share::schema::INDEX_STATUS_AVAILABLE != physical->get_index_status()) {
+          // Preserve the refresh-discovery selection policy.
+        } else if (OB_FAIL(targets.push_back(target))) {
+          LOG_WARN("failed to append async target", K(ret), K(target));
+        }
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+    targets.reset();
+  }
+  return ret;
+}
+
 /**
  * Resolve all available async-index targets of one data partition and return
- * their minimum published SCN. The shared async-delete target is included in
- * the table refresh metadata and therefore participates in the minimum.
+ * their minimum published SCN. The lifecycle collector includes the shared
+ * async-delete target, which therefore participates in the minimum.
+ *
+ * Preserve the base refresh-discovery policy: skip missing schemas, but return
+ * OB_SCHEMA_EAGAIN for an existing Search Def with no registered children.
+ * Physical targets still follow the deleting/AVAILABLE selection policy.
  *
  * @param tenant_id Tenant owning the data and async-index tablets.
  * @param ls LS used to read each target tablet's published version.
@@ -1780,10 +1874,11 @@ int ObAsyncIndexDepProvider::get_partition_min_async_published_scn(
   int ret = OB_SUCCESS;
   has_async_index = false;
   min_published_scn.reset();
-  ObArenaAllocator allocator(ObMemAttr(tenant_id, "AsyncIdxSafe"));
-  ObAsyncIndexDataTableInfo data_table_info;
+  ObSEArray<share::ObAsyncPhysicalTarget, 8> targets;
   ObSchemaGetterGuard schema_guard;
-  int64_t partition_pos = -1;
+  const ObTableSchema *data_schema = nullptr;
+  int64_t part_idx = OB_INVALID_INDEX;
+  int64_t subpart_idx = OB_INVALID_INDEX;
   ObSEArray<ObTabletID, 8> index_tablet_ids;
   ObSEArray<SCN, 8> publish_scns;
   if (OB_UNLIKELY(OB_INVALID_TENANT_ID == tenant_id
@@ -1793,49 +1888,47 @@ int ObAsyncIndexDepProvider::get_partition_min_async_published_scn(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(tenant_id), KP(ls),
              K(data_table_id), K(data_tablet_id));
-  } else if (OB_FAIL(get_single_table_refresh_info(
-                 tenant_id, data_table_id, allocator, data_table_info))) {
-    LOG_WARN("failed to get async index refresh info", K(ret),
-             K(data_table_id), K(data_tablet_id));
-  } else if (OB_FAIL(GSCHEMASERVICE.get_tenant_schema_guard(
-                 tenant_id, schema_guard))) {
+  } else if (OB_FAIL(GSCHEMASERVICE.get_tenant_schema_guard(tenant_id, schema_guard))) {
     LOG_WARN("failed to get tenant schema guard", K(ret), K(tenant_id));
-  } else {
-    // All target tablet arrays use the data-table partition ordinal.
-    for (int64_t i = 0; i < data_table_info.data_tablet_infos_.count()
-                        && partition_pos < 0; ++i) {
-      if (data_table_info.data_tablet_infos_.at(i).data_tablet_id_
-          == data_tablet_id) {
-        partition_pos = i;
-      }
-    }
-    if (OB_UNLIKELY(partition_pos < 0)) {
+  } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id, data_table_id, data_schema))) {
+    LOG_WARN("failed to get base schema", K(ret), K(data_table_id));
+  } else if (OB_ISNULL(data_schema)) {
+    ret = OB_TABLE_NOT_EXIST;
+    LOG_WARN("base schema is not visible while collecting safety point", K(ret), K(data_table_id));
+  } else if (OB_FAIL(collect_published_targets(schema_guard, *data_schema, targets))) {
+    LOG_WARN("failed to collect async index safety-point targets", K(ret), K(data_table_id));
+  } else if (!data_schema->is_partitioned_table()
+      && data_schema->get_tablet_id() != data_tablet_id) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("data tablet does not belong to the nonpartitioned table", K(ret),
+        K(data_table_id), K(data_tablet_id), "expected_tablet_id", data_schema->get_tablet_id());
+  } else if (data_schema->is_partitioned_table()
+      && OB_FAIL(data_schema->get_part_idx_by_tablet(data_tablet_id, part_idx, subpart_idx))) {
+    if (OB_TABLET_NOT_EXIST == ret) {
+      // The old refresh-info lookup reported an unexpected tablet/table mismatch.
       ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("data tablet is missing from async index refresh info", K(ret),
-               K(data_table_id), K(data_tablet_id), K(data_table_info));
+      LOG_WARN("data tablet is missing from the table",
+          K(ret), K(data_table_id), K(data_tablet_id));
+    } else {
+      LOG_WARN("failed to get data partition index", K(ret), K(data_table_id), K(data_tablet_id));
     }
   }
-  for (int64_t i = 0;
-       OB_SUCC(ret) && i < data_table_info.index_infos_.count(); ++i) {
-    const ObAsyncIndexInfo &index_info = data_table_info.index_infos_.at(i);
+  for (int64_t i = 0; OB_SUCC(ret) && i < targets.count(); ++i) {
+    const share::ObAsyncPhysicalTarget &target = targets.at(i);
     const ObTableSchema *index_schema = nullptr;
-    if (OB_FAIL(schema_guard.get_table_schema(
-            tenant_id, index_info.index_table_id_, index_schema))) {
-      LOG_WARN("failed to get async index schema", K(ret), K(index_info));
+    ObTabletID index_tablet_id;
+    ObObjectID part_id = OB_INVALID_ID;
+    ObObjectID first_level_part_id = OB_INVALID_ID;
+    if (OB_FAIL(schema_guard.get_table_schema(tenant_id, target.table_id_, index_schema))) {
+      LOG_WARN("failed to get async index schema", K(ret), K(target));
     } else if (OB_ISNULL(index_schema)) {
       ret = OB_SCHEMA_EAGAIN;
-      LOG_WARN("async index schema disappeared while collecting safety point",
-               K(ret), K(index_info));
-    } else if (INDEX_STATUS_AVAILABLE != index_schema->get_index_status()) {
-      // Building or dropping targets cannot define the current query safety point.
-      LOG_DEBUG("skip unavailable async index target", K(index_info));
-    } else if (OB_UNLIKELY(partition_pos >= index_info.tablet_ids_.count())) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("async index tablet mapping is incomplete", K(ret), K(partition_pos),
-               K(index_info), K(data_table_id), K(data_tablet_id));
-    } else if (OB_FAIL(index_tablet_ids.push_back(
-                   index_info.tablet_ids_.at(partition_pos)))) {
-      LOG_WARN("failed to collect async index tablet", K(ret), K(index_info));
+      LOG_WARN("validated async index schema is missing while collecting safety point", K(ret), K(target));
+    } else if (OB_FAIL(index_schema->get_part_id_and_tablet_id_by_idx(
+                   part_idx, subpart_idx, part_id, first_level_part_id, index_tablet_id))) {
+      LOG_WARN("failed to map async index safety-point tablet", K(ret), K(target), K(data_tablet_id));
+    } else if (OB_FAIL(index_tablet_ids.push_back(index_tablet_id))) {
+      LOG_WARN("failed to collect async index tablet", K(ret), K(target));
     }
   }
   if (OB_SUCC(ret)) {
@@ -1875,6 +1968,10 @@ int ObAsyncIndexDepProvider::get_partition_min_async_published_scn(
     ret = OB_EAGAIN;
     LOG_WARN("failed to get valid async index safety point", K(ret),
              K(data_table_id), K(data_tablet_id), K(min_published_scn));
+  }
+  if (OB_FAIL(ret)) {
+    has_async_index = false;
+    min_published_scn.reset();
   }
   return ret;
 }

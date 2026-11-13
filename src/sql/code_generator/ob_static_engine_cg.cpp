@@ -10420,6 +10420,8 @@ int ObStaticEngineCG::generate_index_data_gen_table_spec(ObLogJsonTable &op, ObJ
     LOG_WARN("fail to init array", K(ret), K(op.get_data_table_col_ids().count()));
   } else if (OB_FAIL(spec.column_comments_.init(op.get_data_table_col_ids().count()))) {
     LOG_WARN("fail to init column_comments array", K(ret), K(op.get_data_table_col_ids().count()));
+  } else if (OB_FAIL(share::ObSearchIndexRowGenerator::get_target(*data_index_schema, spec.search_index_target_))) {
+    LOG_WARN("failed to get search index target", K(ret), K(data_index_id));
   } else {
     spec.inc_pk_proj_ = op.get_inc_pk_proj();
     spec.index_column_cnt_ = op.get_index_column_cnt();

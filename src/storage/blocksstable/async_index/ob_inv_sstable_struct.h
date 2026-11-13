@@ -8,6 +8,7 @@
 #include "lib/utility/ob_print_utils.h"
 #include "lib/utility/ob_unify_serialize.h"
 #include "share/datum/ob_datum.h"
+#include "storage/blocksstable/ob_storage_datum.h"
 
 namespace oceanbase
 {
@@ -41,6 +42,14 @@ enum ObInvIdxSearchTextLayout
   SEARCH_TEXT_COL_CNT_WITH_POS = 7,
 };
 
+// Current Search Text writers require TF/DL and do not support nested keys.
+// Keep this separate from persisted metadata validity: readers may understand more formats.
+OB_INLINE bool is_supported_search_text_write_layout(
+    const bool has_relevance_params, const bool has_nested_key)
+{
+  return has_relevance_params && !has_nested_key;
+}
+
 // =============================================================================
 // Shared inverted-index layout and statistics.
 //
@@ -72,6 +81,10 @@ struct ObInvIdxStatsMeta final
     max_doc_id_ = 0;
     total_doc_length_ = 0;
   }
+
+  // Derive an empty writable segment from an existing major's format.
+  // On failure leave this object unchanged, including when source aliases this object.
+  int init_empty_for_write(const ObInvIdxStatsMeta &source);
 
   int update(
       const uint64_t min_doc_id,
@@ -108,6 +121,7 @@ struct ObInvIdxStatsMeta final
     return min_doc_id_ <= max_doc_id_
         || (UINT64_MAX == min_doc_id_ && 0 == max_doc_id_ && 0 == total_doc_length_);
   }
+  // Search Text capability flags do not restrict readable layouts; write support is checked separately.
   OB_INLINE bool is_valid() const
   {
     return has_valid_range() && index_type_ > INV_IDX_TYPE_INVALID
@@ -115,9 +129,11 @@ struct ObInvIdxStatsMeta final
         && doc_id_obj_meta_.is_valid()
         && doc_id_obj_meta_.is_uint64()
         && ((INV_IDX_TYPE_FTS == index_type_ && has_relevance_params_)
-            || (INV_IDX_TYPE_SEARCH == index_type_ && !has_relevance_params_));
+            || (INV_IDX_TYPE_SEARCH == index_type_ && !has_relevance_params_)
+            || INV_IDX_TYPE_SEARCH_TEXT == index_type_);
   }
   OB_INLINE bool is_fts_index() const { return INV_IDX_TYPE_FTS == index_type_; }
+  OB_INLINE bool is_search_text_index() const { return INV_IDX_TYPE_SEARCH_TEXT == index_type_; }
 
   TO_STRING_KV(K_(index_type), K_(has_relevance_params),
                K_(has_position_list),
@@ -139,7 +155,8 @@ public:
   uint64_t max_doc_id_;
 
   // --- corpus statistics (for relevance scoring, e.g. BM25 avg doc length) ---
-  uint64_t total_doc_length_;      // sum(token_freq) across all documents
+  uint64_t total_doc_length_;      // sum(token_freq) across all documents; for search text it mixes
+                                   // all fields and is not a per-field doc length
 };
 
 class ObInvMacroMeta;
@@ -190,17 +207,21 @@ private:
   bool is_inited_;
 };
 
-// Aggregated BM25 corpus statistics over the set of inverted-index sstables
-// visible to one query snapshot. First version only carries total_doc_length_;
-// future fields (doc_count, per-segment stats, deletion corrections, ...) can be
-// added here without touching the aggregation call chain.
+// BM25 statistics over inverted-index SSTables visible to one query snapshot.
+// Each request resets the result and fills only the statistic selected by its entry point.
+// Total length is scoped to the whole index or one field; token count also depends on TOKEN.
 struct ObAsyncInvBM25Stats
 {
   ObAsyncInvBM25Stats() { reset(); }
-  void reset() { total_doc_length_ = 0; }
-  TO_STRING_KV(K_(total_doc_length));
+  void reset()
+  {
+    total_doc_length_.set_number(number::ObNumber::get_zero());
+    token_doc_cnt_ = 0;
+  }
+  TO_STRING_KV(K_(total_doc_length), K_(token_doc_cnt));
 
-  uint64_t total_doc_length_;
+  ObStorageDatum total_doc_length_; // Owns Number digits for the query snapshot.
+  uint64_t token_doc_cnt_;
 };
 
 } // namespace blocksstable

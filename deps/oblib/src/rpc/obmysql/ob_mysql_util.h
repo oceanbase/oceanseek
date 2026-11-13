@@ -427,7 +427,8 @@ public:
                              int64_t &pos);
   static int lob_locator_cell_str(char *buf, const int64_t len,
                                   const common::ObLobLocator &lob_locator, int64_t &pos);
-  static int json_cell_str(uint64_t tenant_id, char *buf, const int64_t len, const ObString &val, int64_t &pos);
+  static int json_cell_str(uint64_t tenant_id, char *buf, const int64_t len, const ObString &val, int64_t &pos,
+                           bool enable_json_bin_view = false);
   static int sql_utd_cell_str(uint64_t tenant_id, char *buf, const int64_t len, const ObString &val, int64_t &pos);
 
   static int decimalint_cell_str(char *buf, const int64_t len,

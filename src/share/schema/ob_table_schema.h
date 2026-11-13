@@ -1246,12 +1246,18 @@ public:
   inline bool is_search_index() const;
   inline bool is_search_def_index() const;
   inline bool is_search_data_index() const;
+  bool is_search_text_index() const { return share::schema::is_search_text_index(index_type_); }
+  bool is_async_search_text_match_index() const { return share::schema::is_async_search_text_match_index(index_type_); }
+  bool is_async_search_text_match_phrase_index() const { return share::schema::is_async_search_text_match_phrase_index(index_type_); }
+  bool is_search_aux_index() const { return share::schema::is_search_aux_index(index_type_); }
+  bool is_async_search_aux_index() const { return share::schema::is_async_search_aux_index(index_type_); }
   inline static bool is_search_index(const ObIndexType index_type);
   inline static bool is_search_def_index(const ObIndexType index_type);
   inline static bool is_search_data_index(const ObIndexType index_type);
   inline bool is_async_search_index() const;
   inline bool is_async_search_def_index() const;
   inline bool is_async_search_data_index() const;
+  inline bool is_async_search_text_index() const;
   inline static bool is_spatial_index(const ObIndexType index_type);
   inline bool is_vec_index() const;
   inline static bool is_vec_index(const ObIndexType index_type);
@@ -1404,7 +1410,7 @@ public:
     const bool vec_case = is_partitioned_table() && is_index_local_storage() && 
                           (is_vec_delta_buffer_type() || is_vec_index_id_type() || is_vec_index_snapshot_data_type() || is_vec_spiv_index_aux());
     const bool cluster_case = is_partitioned_table() && is_index_local_storage() && data_table_schema.is_table_with_clustering_key();
-    const bool search_case = is_partitioned_table() && is_index_local_storage() && is_search_data_index();
+    const bool search_case = is_partitioned_table() && is_index_local_storage() && is_search_aux_index();
     return heap_case || fts_case || vec_case || multivalue_case || cluster_case || search_case;
   }
   inline void set_with_dynamic_partition_policy(bool with_dynamic_partition_policy)
@@ -2420,7 +2426,11 @@ public:
   int check_support_interval_part() const;
   int check_identity_column_for_interval_part() const;
   int get_hidden_column_count(int64_t &hidden_column_count) const;
+  // Each auxiliary type identifies one table under the Search Def schema.
+  // Missing tables return OB_SCHEMA_EAGAIN.
+  int get_search_aux_index_tid(const ObIndexType type, uint64_t &tid) const;
   int get_search_data_index_tid(uint64_t &tid) const;
+  int get_search_aux_index_tids(common::ObIArray<uint64_t> &tids) const;
 
   DECLARE_VIRTUAL_TO_STRING;
 
@@ -2755,6 +2765,11 @@ inline bool ObSimpleTableSchemaV2::is_async_search_def_index() const
 inline bool ObSimpleTableSchemaV2::is_async_search_data_index() const
 {
   return share::schema::is_async_search_data_index(index_type_);
+}
+
+inline bool ObSimpleTableSchemaV2::is_async_search_text_index() const
+{
+  return share::schema::is_async_search_text_index(index_type_);
 }
 
 inline bool ObSimpleTableSchemaV2::is_search_index(const ObIndexType index_type)

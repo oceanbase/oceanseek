@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "ob_index_block_builder.h"
+#include "storage/blocksstable/async_index/ob_inv_idx_aggregator.h"
 #include "storage/blocksstable/ob_shared_macro_block_manager.h"
 #include "storage/ob_trans_version_skip_index_util.h"
 #include "share/compaction_ttl/ob_compaction_ttl_util.h"
@@ -2374,7 +2375,10 @@ int ObBaseIndexBlockBuilder::append_row(const ObIndexBlockRowDesc &row_desc)
     if (OB_UNLIKELY(OB_BUF_NOT_ENOUGH != ret)) {
       STORAGE_LOG(WARN, "fail to insert index row", K(ret), KPC(row_to_append));
     }
+  } else if (OB_FAIL(index_block_aggregator_.eval(row_desc))) {
+    STORAGE_LOG(WARN, "fail to aggregate index row", K(ret), K(row_desc));
   } else {
+    // Insertion may flush the previous block; aggregate this row before reusing its input bytes.
     last_rowkey_.reset();
     row_allocator_.reuse();
   }
@@ -2382,8 +2386,6 @@ int ObBaseIndexBlockBuilder::append_row(const ObIndexBlockRowDesc &row_desc)
   } else if (OB_FAIL(
                  row_desc.row_key_.deep_copy(last_rowkey_, row_allocator_))) {
     STORAGE_LOG(WARN, "fail to deep copy last rowkey", K(ret), K(row_desc));
-  } else if (OB_FAIL(index_block_aggregator_.eval(row_desc))) {
-    STORAGE_LOG(WARN, "fail to aggregate index row", K(ret), K(row_desc));
   } else {
     row_offset_ = row_desc.row_offset_; // row_offset is increasing
   }
@@ -2403,6 +2405,19 @@ int ObBaseIndexBlockBuilder::append_row(
   } else if (OB_FAIL(meta_to_row_desc(macro_meta, *index_store_desc_, clustered_micro_info, row_desc))) {
     LOG_WARN("fail to build row desc from macro meta and clustered micro info",
              K(ret), K(macro_meta), K(clustered_micro_info), KPC(data_store_desc_));
+  } else if (INV_IDX_ROW_STORE == macro_meta.val_.row_store_type_) {
+    ObInvMacroMeta inv_meta;
+    ObInvIdxAggInfo summary;
+    int64_t pos = 0;
+    if (OB_FAIL(inv_meta.deserialize(macro_meta.val_.agg_row_buf_, macro_meta.val_.agg_row_len_, pos))) {
+      LOG_WARN("failed to read inverted macro statistics", K(ret), K(macro_meta));
+    } else if (OB_FAIL(ObInvIdxAggregator::get_summary_from_macro(inv_meta, summary))) {
+      LOG_WARN("failed to get inverted macro summary", K(ret), K(inv_meta));
+    } else if (OB_FAIL(ObInvIdxAggregator::fill_row_desc(summary, row_desc, row_allocator_))) {
+      LOG_WARN("failed to prepare inverted macro row", K(ret), K(macro_meta));
+    }
+  }
+  if (OB_FAIL(ret)) {
   } else if (OB_FAIL(append_row(row_desc))) {
     LOG_WARN("fail to append row", K(ret), K(row_desc), K(macro_meta));
   }
@@ -2576,9 +2591,15 @@ int ObBaseIndexBlockBuilder::append_index_micro_block() {
 int ObBaseIndexBlockBuilder::get_aggregated_row(
     ObIndexBlockRowDesc &next_row_desc) {
   int ret = OB_SUCCESS;
+  const ObInvIdxAggregator *inverted_aggregator = index_block_aggregator_.get_inverted_aggregator();
+  // The next-level builder consumes this payload synchronously; only this level
+  // owns row_allocator_ and will reuse it after the parent has finished.
   if (OB_FAIL(index_block_aggregator_.get_index_agg_result(next_row_desc))) {
     STORAGE_LOG(WARN, "fail to get aggregated row", K(ret),
                 K_(index_block_aggregator));
+  } else if (nullptr != inverted_aggregator
+             && OB_FAIL(inverted_aggregator->fill_row_desc(next_row_desc, row_allocator_))) {
+    STORAGE_LOG(WARN, "failed to get inverted index statistics", K(ret));
   } else {
     next_row_desc.row_offset_ = row_offset_;
   }
@@ -2739,6 +2760,7 @@ int ObBaseIndexBlockBuilder::meta_to_row_desc(
     row_desc.is_first_row_first_flag_ = macro_meta.is_first_row_first_flag();
     if (INV_IDX_ROW_STORE == macro_meta.val_.row_store_type_) {
       // 倒排索引的 macro meta 存储了 extended meta，但是 index tree 的上层不需要存储该信息
+      // 上层另行编码统计汇总，不透传整个宏块 extended meta。
       row_desc.serialized_agg_row_buf_ = nullptr;
       row_desc.agg_type_ = ObIndexRowAggType::UNSERIALIZED_ROW_AGG;
     } else if (nullptr != macro_meta.val_.agg_row_buf_) {

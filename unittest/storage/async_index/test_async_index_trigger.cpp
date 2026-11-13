@@ -684,6 +684,46 @@ TEST_F(TestAsyncIndexTrigger, test_refresh_info_append_idempotent)
   ASSERT_EQ(make_scn(2000), decisions.at(0).target_refresh_scn_);
 }
 
+TEST_F(TestAsyncIndexTrigger, lagging_phrase_retains_checkpoint_until_all_physical_targets_catch_up)
+{
+  FakeDepProvider provider;
+  provider.snapshot_scn_ = make_scn(3000);
+  provider.sstable_count_ = 1;
+  provider.seed_refresh_target(make_scn(1000));
+  provider.seed_refresh_target(make_scn(2000));
+  provider.seed_refresh_target(make_scn(3000));
+  add_index(provider, ObTabletID(200001), make_scn(3000)); // Data
+  add_index(provider, ObTabletID(200002), make_scn(3000)); // Match
+  add_index(provider, ObTabletID(200003), make_scn(1000)); // Phrase failed to refresh
+  add_index(provider, ObTabletID(200004), make_scn(3000)); // Shared Delete
+  ObAsyncIndexDataTableInfo info;
+  build_data_table_info(provider, info);
+  info.index_infos_.at(0).index_type_ = schema::INDEX_TYPE_ASYNC_SEARCH_DATA_INDEX_LOCAL;
+  info.index_infos_.at(1).index_type_ = schema::INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_INDEX_LOCAL;
+  info.index_infos_.at(2).index_type_ = schema::INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_PHRASE_INDEX_LOCAL;
+  info.index_infos_.at(3).index_type_ = schema::INDEX_TYPE_ASYNC_DELETE_INDEX_LOCAL;
+  info.index_infos_.at(3).is_delete_index_ = true;
+  ObAsyncIndexTrigger trigger;
+  ASSERT_EQ(OB_SUCCESS, trigger.init(1001, &provider));
+  ObRefreshDecisionArray decisions;
+  ASSERT_EQ(OB_SUCCESS, trigger.check_and_generate_tasks(info, 0, nullptr, decisions));
+  ASSERT_EQ(1, decisions.count());
+  EXPECT_EQ(ObTabletID(200003), decisions.at(0).index_tablet_id_);
+  EXPECT_EQ(make_scn(2000), decisions.at(0).target_refresh_scn_);
+  ASSERT_EQ(3, provider.refresh_info_.get_refresh_snapshots().count());
+  EXPECT_EQ(async_index_scn_to_snapshot(make_scn(1000)),
+      provider.refresh_info_.get_refresh_snapshots().at(0));
+
+  // Once Phrase catches up, the common watermark may advance to 3000.
+  provider.index_publish_scns_.at(2) = make_scn(3000);
+  decisions.reset();
+  ASSERT_EQ(OB_SUCCESS, trigger.check_and_generate_tasks(info, 0, nullptr, decisions));
+  ASSERT_TRUE(decisions.empty());
+  ASSERT_EQ(1, provider.refresh_info_.get_refresh_snapshots().count());
+  EXPECT_EQ(async_index_scn_to_snapshot(make_scn(3000)),
+      provider.refresh_info_.get_refresh_snapshots().at(0));
+}
+
 TEST_F(TestAsyncIndexTrigger, test_calc_min_publish_scn_picks_minimum)
 {
   ObSEArray<SCN, 4> publish_scns;

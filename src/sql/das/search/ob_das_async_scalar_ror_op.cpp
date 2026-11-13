@@ -8,6 +8,7 @@
 #include <algorithm>
 #include "sql/das/search/ob_das_async_scalar_ror_op.h"
 #include "sql/das/search/ob_das_async_index_query_ctx.h"
+#include "sql/das/search/ob_das_search_utils.h"
 #include "storage/tx_storage/ob_access_service.h"
 
 namespace oceanbase
@@ -81,7 +82,8 @@ int ObDASAsyncScalarRorUnionOp::ensure_range_children()
     if (target_children_cnt > children_cnt_) {
       common::ObSEArray<ObIDASSearchOp *, 4> appended_ops;
       ObDASScopeId previous_scope = DAS_SCOPE_BASE;
-      search_ctx_.enter_scope_for_op_creating(scope_, previous_scope);
+      int32_t previous_depth = search_ctx_.get_op_creating_depth();
+      search_ctx_.enter_scope_for_op_creating(scope_, nesting_depth_, previous_scope);
       for (int64_t range_idx = children_cnt_;
            OB_SUCC(ret) && range_idx < target_children_cnt;
            ++range_idx) {
@@ -98,7 +100,7 @@ int ObDASAsyncScalarRorUnionOp::ensure_range_children()
           LOG_WARN("failed to collect an appended async scalar ror", K(ret), K(range_idx));
         }
       }
-      search_ctx_.exit_scope_after_op_created(previous_scope);
+      search_ctx_.exit_scope_after_op_created(previous_scope, previous_depth);
       if (OB_SUCC(ret) && OB_FAIL(append_range_children(appended_ops))) {
         LOG_WARN("failed to append async scalar ror children", K(ret),
             K(target_children_cnt));
@@ -254,6 +256,7 @@ int ObDASAsyncScalarRorUnionOp::do_direct_drain_rowids(
     ObDASRowIDBatchConsumer &consumer,
     ObDASRowID &next_id_after)
 {
+  is_first_nk_ = true;
   int ret = OB_SUCCESS;
   next_id_after.set_max();
   if (OB_UNLIKELY(!direct_drain_enabled_)) {
@@ -375,6 +378,7 @@ int ObDASAsyncScalarRorUnionOp::do_open()
       reset_direct_cursors();
     }
     refresh_single_child_fast_path();
+    is_first_nk_ = true;
   }
   return ret;
 }
@@ -394,6 +398,7 @@ int ObDASAsyncScalarRorUnionOp::do_rescan()
       reset_direct_cursors();
     }
     refresh_single_child_fast_path();
+    is_first_nk_ = true;
   }
   return ret;
 }
@@ -413,6 +418,7 @@ int ObDASAsyncScalarRorUnionOp::do_rescan_segment(
       LOG_WARN("failed to bind async scalar ror direct children", K(ret), K(range));
     } else {
       reset_direct_cursors();
+      is_first_nk_ = true;
     }
   } else if (OB_FAIL(ObDASDisjunctionFilterOp::do_rescan_segment(range))) {
     LOG_WARN("failed to rescan async scalar ror union segment", K(ret), K(range));
@@ -485,6 +491,7 @@ int ObDASAsyncScalarRorUnionOp::do_next_rowid(
     ObDASRowID &next_id,
     double &score)
 {
+  is_first_nk_ = true;
   int ret = OB_SUCCESS;
   if (direct_drain_enabled_) {
     ret = OB_NOT_SUPPORTED;
@@ -506,6 +513,31 @@ int ObDASAsyncScalarRorUnionOp::do_next_rowid(
   return ret;
 }
 
+int ObDASAsyncScalarRorUnionOp::do_advance_to(
+    const ObDASNestedKey &target,
+    ObDASNestedKey &curr_nk,
+    double &score)
+{
+  int ret = OB_SUCCESS;
+  if (use_single_child_fast_path_) {
+    ret = children_[0]->advance_to(target, curr_nk, score);
+  } else {
+    ret = ObDASDisjunctionFilterOp::do_advance_to(target, curr_nk, score);
+  }
+  return ret;
+}
+
+int ObDASAsyncScalarRorUnionOp::do_next_rowid(ObDASNestedKey &next_nk, double &score)
+{
+  int ret = OB_SUCCESS;
+  if (use_single_child_fast_path_) {
+    ret = children_[0]->next_rowid(next_nk, score);
+  } else {
+    ret = ObDASDisjunctionFilterOp::do_next_rowid(next_nk, score);
+  }
+  return ret;
+}
+
 int ObDASAsyncScalarRorUnionOp::do_drain_until(
     const ObDASRowID &boundary,
     int64_t capacity,
@@ -515,6 +547,7 @@ int ObDASAsyncScalarRorUnionOp::do_drain_until(
     ObDASRowID &next_id_after,
     double &next_score_after)
 {
+  is_first_nk_ = true;
   int ret = OB_SUCCESS;
   if (direct_drain_enabled_) {
     ret = OB_NOT_SUPPORTED;
@@ -587,8 +620,8 @@ int ObDASAsyncScalarRorOp::do_init(const ObIDASSearchOpParam &op_param)
         "group_slot", param.get_group_slot(),
         "direct_bind", param.get_direct_bind());
   } else if (OB_UNLIKELY(
-      (DAS_SCOPE_BASE == scope_ && DAS_ROWID_TYPE_UINT64 != get_rowid_type())
-      || (DAS_SCOPE_NESTED_SYNC == scope_ && DAS_ROWID_TYPE_COMPACT != get_rowid_type()))) {
+      (DAS_SCOPE_BASE != scope_ && DAS_SCOPE_NESTED_ASYNC != scope_)
+      || DAS_ROWID_TYPE_UINT64 != get_rowid_type())) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("async scalar op has unexpected rowid type for scope", K(ret),
         K_(scope), "rowid_type", get_rowid_type());
@@ -643,9 +676,7 @@ int ObDASAsyncScalarRorOp::init_term_key()
   const common::ObNewRange *range = nullptr;
   const common::ObObj *start_objs = nullptr;
   const common::ObObj *end_objs = nullptr;
-  void *datum_buf = nullptr;
   term_key_.reset();
-  term_datums_ = nullptr;
   arena_allocator_.reuse();
   is_empty_range_ = false;
   if (OB_ISNULL(scalar_ctdef_) || OB_ISNULL(scalar_rtdef_)) {
@@ -688,26 +719,10 @@ int ObDASAsyncScalarRorOp::init_term_key()
   }
 
   if (OB_SUCC(ret) && !is_empty_range_) {
-    const int64_t buf_size = sizeof(blocksstable::ObStorageDatum)
-                           * ASYNC_SEARCH_TERM_COLUMN_CNT;
-    if (OB_ISNULL(datum_buf = arena_allocator_.alloc(buf_size))) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
-      LOG_WARN("failed to allocate async scalar term datums", K(ret), K(buf_size));
-    } else {
-      term_datums_ = static_cast<blocksstable::ObStorageDatum *>(datum_buf);
-      for (int64_t i = 0; OB_SUCC(ret) && i < ASYNC_SEARCH_TERM_COLUMN_CNT; ++i) {
-        new (term_datums_ + i) blocksstable::ObStorageDatum();
-        blocksstable::ObStorageDatum tmp_datum;
-        if (OB_FAIL(tmp_datum.from_obj_enhance(start_objs[i]))) {
-          LOG_WARN("failed to convert async scalar term object", K(ret), K(i), K(start_objs[i]));
-        } else if (OB_FAIL(term_datums_[i].deep_copy(tmp_datum, arena_allocator_))) {
-          LOG_WARN("failed to deep copy async scalar term datum", K(ret), K(i), K(tmp_datum));
-        }
-      }
-      if (OB_SUCC(ret) && OB_FAIL(term_key_.assign(
-          term_datums_, ASYNC_SEARCH_TERM_COLUMN_CNT))) {
-        LOG_WARN("failed to assign async scalar term key", K(ret));
-      }
+    common::ObRowkey key = range->start_key_;
+    key.set_length(ASYNC_SEARCH_TERM_COLUMN_CNT);
+    if (OB_FAIL(ObDASSearchUtils::build_search_index_term_key(key, arena_allocator_, term_key_))) {
+      LOG_WARN("failed to build async scalar term key", K(ret));
     }
   }
   return ret;
@@ -732,7 +747,7 @@ int ObDASAsyncScalarRorOp::init_posting_scan_param()
   }
   // Nested scope reads the posting-value block paired with the current doc_id and expands its
   // nested_key_list.
-  posting_scan_param_.need_posting_value_ = (DAS_SCOPE_NESTED_SYNC == scope_);
+  posting_scan_param_.need_posting_value_ = (DAS_SCOPE_NESTED_ASYNC == scope_);
   // Scalar postings do not use BM25, but the shared posting reader validates
   // corpus statistics. A neutral average length keeps that contract satisfied.
   posting_scan_param_.avg_doc_length_ = 1.0;
@@ -790,17 +805,14 @@ void ObDASAsyncScalarRorOp::reset_leaf_runtime_state()
   posting_scan_param_.reset();
   version_range_.reset();
   term_key_.reset();
-  term_datums_ = nullptr;
   arena_allocator_.reuse();
-  rowid_allocators_[0].reuse();
-  rowid_allocators_[1].reuse();
-  rowid_allocator_idx_ = 0;
+  is_first_nk_ = true;
   is_empty_range_ = false;
   direct_cursor_pending_ = false;
   direct_pending_rowid_ = 0;
 }
 
-int ObDASAsyncScalarRorOp::position_nested_key(const ObDatum *target_nested_key)
+int ObDASAsyncScalarRorOp::init_nested_key_cursor()
 {
   int ret = OB_SUCCESS;
   const ObDatum *nested_key_list = nullptr;
@@ -815,103 +827,17 @@ int ObDASAsyncScalarRorOp::position_nested_key(const ObDatum *target_nested_key)
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected null nested key list datum", K(ret));
   } else if (nested_key_list->is_null()) {
-    // Top-level fields in a nested-enabled index use a NULL list and do not belong to nested scope.
-    ret = OB_ITER_END;
+    curr_nested_key_.set_max();
   } else if (OB_FAIL(nested_key_list_reader_.init(*nested_key_list))) {
     LOG_WARN("failed to init nested key list reader", K(ret), KPC(nested_key_list));
-  } else if (OB_ISNULL(target_nested_key)) {
-    if (OB_FAIL(nested_key_list_reader_.first(curr_nested_key_))) {
-      LOG_WARN("failed to get first nested key", K(ret));
-    }
-  } else if (OB_FAIL(nested_key_list_reader_.lower_bound(
-      *target_nested_key, curr_nested_key_))) {
-    if (OB_UNLIKELY(OB_ITER_END != ret)) {
-      LOG_WARN("failed to seek nested key list", K(ret), KPC(target_nested_key));
-    }
+  } else if (nested_key_list_reader_.get_key_length() % 4 != 0) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("nested key does not contain complete levels", K(ret));
+  } else if (nested_key_list_reader_.get_key_length() < nested_compare_bytes()) {
+    curr_nested_key_.set_max();
   }
-  return ret;
-}
-
-int ObDASAsyncScalarRorOp::advance_to_next_nested_posting()
-{
-  int ret = OB_SUCCESS;
-  bool positioned = false;
-  nested_key_list_reader_.reset();
-  curr_nested_key_.reset();
-  if (OB_ISNULL(posting_iter_)) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("async scalar posting iter is not opened", K(ret));
-  }
-  while (OB_SUCC(ret) && !positioned) {
-    if (OB_FAIL(posting_iter_->next())) {
-      if (OB_UNLIKELY(OB_ITER_END != ret)) {
-        LOG_WARN("failed to advance async scalar posting iter", K(ret));
-      }
-    } else if (OB_FAIL(position_nested_key(nullptr))) {
-      if (OB_ITER_END == ret) {
-        ret = OB_SUCCESS;
-      } else {
-        LOG_WARN("failed to position nested key", K(ret));
-      }
-    } else {
-      positioned = true;
-    }
-  }
-  return ret;
-}
-
-int ObDASAsyncScalarRorOp::advance_nested_to(
-    const ObDatum &target_doc_id,
-    const ObDatum &target_nested_key)
-{
-  int ret = OB_SUCCESS;
-  const ObDatum *current_doc_id = nullptr;
-  uint64_t target_doc_id_value = 0;
-  bool positioned = false;
-  if (OB_UNLIKELY(target_doc_id.is_null() || target_doc_id.is_nop()
-      || sizeof(uint64_t) != target_doc_id.len_
-      || target_nested_key.is_null() || target_nested_key.is_nop()
-      || 0 == target_nested_key.len_ || OB_ISNULL(target_nested_key.ptr_))) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid nested async scalar target", K(ret), K(target_doc_id), K(target_nested_key));
-  } else if (FALSE_IT(target_doc_id_value = target_doc_id.get_uint64())) {
-  } else if (nested_key_list_reader_.is_inited()) {
-    if (OB_FAIL(posting_iter_->get_cur_id(current_doc_id))) {
-      LOG_WARN("failed to get current nested posting doc id", K(ret));
-    } else if (OB_ISNULL(current_doc_id)
-        || OB_UNLIKELY(sizeof(uint64_t) != current_doc_id->len_)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("invalid current nested posting doc id", K(ret), KP(current_doc_id));
-    } else {
-      const uint64_t current_doc_id_value = current_doc_id->get_uint64();
-      positioned = current_doc_id_value > target_doc_id_value
-          || (current_doc_id_value == target_doc_id_value
-              && curr_nested_key_.get_string().compare(
-                  target_nested_key.get_string()) >= 0);
-    }
-  }
-  if (OB_SUCC(ret) && !positioned) {
-    if (OB_FAIL(posting_iter_->advance_to(target_doc_id))) {
-      if (OB_UNLIKELY(OB_ITER_END != ret)) {
-        LOG_WARN("failed to advance nested posting to target doc", K(ret), K(target_doc_id));
-      }
-    } else if (OB_FAIL(posting_iter_->get_cur_id(current_doc_id))) {
-      LOG_WARN("failed to get advanced nested posting doc id", K(ret));
-    } else if (OB_ISNULL(current_doc_id)
-        || OB_UNLIKELY(sizeof(uint64_t) != current_doc_id->len_)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("invalid advanced nested posting doc id", K(ret), KP(current_doc_id));
-    } else {
-      const ObDatum *nested_target = current_doc_id->get_uint64() == target_doc_id_value
-          ? &target_nested_key : nullptr;
-      if (OB_FAIL(position_nested_key(nested_target))) {
-        if (OB_ITER_END == ret) {
-          ret = advance_to_next_nested_posting();
-        } else {
-          LOG_WARN("failed to position nested posting", K(ret), K(target_doc_id), K(target_nested_key));
-        }
-      }
-    }
+  if (OB_SUCC(ret)) {
+    is_first_nk_ = false;
   }
   return ret;
 }
@@ -926,36 +852,12 @@ int ObDASAsyncScalarRorOp::fetch_curr(ObDASRowID &curr_id, double &score)
     LOG_WARN("async scalar posting iter is not opened", K(ret));
   } else if (OB_FAIL(posting_iter_->get_cur_id(id_datum))) {
     LOG_WARN("failed to get current id from async scalar posting iter", K(ret));
-  } else if (OB_ISNULL(id_datum)) {
+  } else if (OB_ISNULL(id_datum) || id_datum->is_null()
+      || OB_UNLIKELY(sizeof(uint64_t) != id_datum->len_)) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected null async scalar posting id", K(ret));
-  } else if (DAS_SCOPE_BASE == scope_) {
-    rowid_allocators_[0].reuse();
-    if (OB_FAIL(write_datum_to_rowid(*id_datum, curr_id, rowid_allocators_[0]))) {
-      LOG_WARN("failed to build base async scalar rowid", K(ret));
-    }
-  } else if (!nested_key_list_reader_.is_inited()
-      || curr_nested_key_.is_null()
-      || curr_nested_key_.is_nop()) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("nested key list is not positioned", K(ret),
-        K_(curr_nested_key), "reader_inited", nested_key_list_reader_.is_inited());
+    LOG_WARN("invalid current async scalar doc id", K(ret), KP(id_datum));
   } else {
-    common::ObSEArray<common::ObDatum, 2> datums;
-    ObArenaAllocator &rowid_allocator = rowid_allocators_[rowid_allocator_idx_];
-    rowid_allocator.reuse();
-    if (OB_FAIL(datums.push_back(*id_datum))) {
-      LOG_WARN("failed to append async scalar doc id datum", K(ret));
-    } else if (OB_FAIL(datums.push_back(curr_nested_key_))) {
-      LOG_WARN("failed to append async scalar nested key datum", K(ret));
-    } else if (OB_FAIL(search_ctx_.write_datums_to_rowid(
-        scope_, datums, curr_id, rowid_allocator))) {
-      LOG_WARN("failed to build nested async scalar rowid", K(ret), K_(scope));
-    } else {
-      rowid_allocator_idx_ = 1 - rowid_allocator_idx_;
-    }
-  }
-  if (OB_SUCC(ret)) {
+    curr_id.set_uint64(id_datum->get_uint64());
     score = is_scoring_ ? scalar_rtdef_->get_boost_weight() : 0.0;
   }
   return ret;
@@ -1020,6 +922,8 @@ int ObDASAsyncScalarRorOp::do_open()
   }
   if (OB_FAIL(ret)) {
     reset_leaf_runtime_state();
+  } else {
+    is_first_nk_ = true;
   }
   return ret;
 }
@@ -1028,32 +932,44 @@ int ObDASAsyncScalarRorOp::do_next_rowid(ObDASRowID &next_id, double &score)
 {
   int ret = OB_SUCCESS;
   score = 0.0;
+  is_first_nk_ = true;
   if (is_empty_range_) {
     ret = OB_ITER_END;
   } else if (OB_ISNULL(posting_iter_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("async scalar posting iter is not opened", K(ret));
-  } else if (DAS_SCOPE_BASE == scope_) {
-    if (OB_FAIL(posting_iter_->next())) {
-      if (OB_UNLIKELY(OB_ITER_END != ret)) {
-        LOG_WARN("failed to advance async scalar posting iter", K(ret));
-      }
-    }
-  } else if (nested_key_list_reader_.is_inited()) {
-    if (OB_FAIL(nested_key_list_reader_.next(curr_nested_key_))) {
-      if (OB_ITER_END == ret) {
-        ret = advance_to_next_nested_posting();
-      } else {
-        LOG_WARN("failed to get next nested key", K(ret));
-      }
-    }
-  } else if (OB_FAIL(advance_to_next_nested_posting())) {
+  } else if (OB_FAIL(posting_iter_->next())) {
     if (OB_UNLIKELY(OB_ITER_END != ret)) {
-      LOG_WARN("failed to position first nested posting", K(ret));
+      LOG_WARN("failed to advance async scalar posting iter", K(ret));
     }
+  } else if (OB_FAIL(fetch_curr(next_id, score))) {
+    LOG_WARN("failed to fetch async scalar doc", K(ret));
   }
-  if (OB_SUCC(ret) && OB_FAIL(fetch_curr(next_id, score))) {
-    LOG_WARN("failed to fetch async scalar posting row", K(ret));
+  return ret;
+}
+
+int ObDASAsyncScalarRorOp::do_next_rowid(ObDASNestedKey &next_nk, double &score)
+{
+  int ret = OB_SUCCESS;
+  score = 0.0;
+  if (!is_async_nested_scope(scope_)) {
+    ret = OB_NOT_IMPLEMENT;
+  } else if (is_first_nk_ && OB_FAIL(init_nested_key_cursor())) {
+    LOG_WARN("failed to initialize nested key cursor", K(ret));
+  } else if (curr_nested_key_.is_max()) {
+    ret = OB_ITER_END;
+  } else {
+    ObDatum key;
+    if (OB_FAIL(nested_key_list_reader_.next(key))) {
+      if (OB_ITER_END == ret) {
+        curr_nested_key_.set_max();
+      } else {
+        LOG_WARN("failed to read nested key list", K(ret));
+      }
+    } else {
+      curr_nested_key_.assign(key.ptr_, key.len_);
+      next_nk = curr_nested_key_;
+    }
   }
   return ret;
 }
@@ -1067,6 +983,7 @@ int ObDASAsyncScalarRorOp::do_drain_until(
     ObDASRowID &next_id_after,
     double &next_score_after)
 {
+  is_first_nk_ = true;
   int ret = OB_SUCCESS;
   count = 0;
   next_id_after.reset();
@@ -1239,31 +1156,80 @@ int ObDASAsyncScalarRorOp::do_advance_to(
     const ObDASRowID &target, ObDASRowID &curr_id, double &score)
 {
   int ret = OB_SUCCESS;
-  common::ObDatum target_datum;
-  common::ObDatum target_nested_key;
+  const uint64_t target_id = target.is_normal() ? target.get_uint64() : 0;
+  const ObDatum doc_target(reinterpret_cast<const char *>(&target_id), sizeof(target_id), false);
   score = 0.0;
-  if (is_empty_range_) {
+  if (is_empty_range_ || target.is_max()) {
     ret = OB_ITER_END;
   } else if (OB_ISNULL(posting_iter_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("async scalar posting iter is not opened", K(ret));
-  } else if (OB_FAIL(get_datum_from_rowid(target, target_datum, 0))) {
-    LOG_WARN("failed to convert async scalar target rowid", K(ret), K(target));
-  } else if (DAS_SCOPE_NESTED_SYNC == scope_
-      && OB_FAIL(get_datum_from_rowid(target, target_nested_key, 1))) {
-    LOG_WARN("failed to get async scalar target nested key", K(ret), K(target));
-  } else if (DAS_SCOPE_BASE == scope_ && OB_FAIL(posting_iter_->advance_to(target_datum))) {
-    if (OB_UNLIKELY(OB_ITER_END != ret)) {
-      LOG_WARN("failed to advance async scalar posting iter to target", K(ret), K(target));
+  } else {
+    ObDASRowID current_doc;
+    bool keep_nested_cursor = false;
+    if (is_async_nested_scope(scope_) && !is_first_nk_) {
+      if (OB_FAIL(fetch_curr(current_doc, score))) {
+        LOG_WARN_IGNORE_ITER_END(ret, "failed to fetch nested cursor document", K(ret));
+      } else {
+        keep_nested_cursor = target.is_min() || target_id <= current_doc.get_uint64();
+      }
     }
-  } else if (DAS_SCOPE_NESTED_SYNC == scope_
-      && OB_FAIL(advance_nested_to(target_datum, target_nested_key))) {
-    if (OB_UNLIKELY(OB_ITER_END != ret)) {
-      LOG_WARN("failed to advance nested async scalar posting", K(ret), K(target));
+    if (OB_FAIL(ret)) {
+    } else if (keep_nested_cursor) {
+      curr_id = current_doc;
+    } else {
+      is_first_nk_ = true;
+      if (OB_FAIL(posting_iter_->advance_to(doc_target))) {
+        if (OB_UNLIKELY(OB_ITER_END != ret)) {
+          LOG_WARN("failed to advance async scalar posting iter to target", K(ret), K(target));
+        }
+      } else if (OB_FAIL(fetch_curr(curr_id, score))) {
+        LOG_WARN("failed to fetch current async scalar posting row", K(ret));
+      }
     }
   }
-  if (OB_SUCC(ret) && OB_FAIL(fetch_curr(curr_id, score))) {
-    LOG_WARN("failed to fetch current async scalar posting row", K(ret));
+  return ret;
+}
+
+int ObDASAsyncScalarRorOp::do_advance_to(
+    const ObDASNestedKey &target, ObDASNestedKey &curr_nk, double &score)
+{
+  int ret = OB_SUCCESS;
+  score = 0.0;
+  if (!is_async_nested_scope(scope_)) {
+    ret = OB_NOT_IMPLEMENT;
+  } else if (is_first_nk_ && OB_FAIL(init_nested_key_cursor())) {
+    LOG_WARN("failed to initialize nested key cursor", K(ret));
+  } else if (curr_nested_key_.is_max() || target.is_max()) {
+    curr_nested_key_.set_max();
+    ret = OB_ITER_END;
+  } else if (curr_nested_key_.is_normal()
+      && (target.is_min() || curr_nested_key_.compare(target, target.length()) >= 0)) {
+    // A prefix seek must not rewind the reader within the current prefix.
+    curr_nk = curr_nested_key_;
+  } else if (target.is_min()) {
+    ret = do_next_rowid(curr_nk, score);
+  } else {
+    char target_buf[sizeof(uint64_t)];
+    const char *target_data = nullptr;
+    if (target.length() <= sizeof(uint64_t)) {
+      ObDASNestedKey::store(target_buf, target.value(), target.length());
+      target_data = target_buf;
+    } else {
+      target_data = target.ptr();
+    }
+    const ObDatum target_datum(target_data, target.length(), false);
+    ObDatum key;
+    if (OB_FAIL(nested_key_list_reader_.lower_bound(target_datum, key))) {
+      if (OB_ITER_END == ret) {
+        curr_nested_key_.set_max();
+      } else {
+        LOG_WARN("failed to read nested key list", K(ret));
+      }
+    } else {
+      curr_nested_key_.assign(key.ptr_, key.len_);
+      curr_nk = curr_nested_key_;
+    }
   }
   return ret;
 }
@@ -1329,6 +1295,8 @@ int ObDASAsyncScalarRorOp::do_rescan()
     }
     if (OB_FAIL(ret)) {
       reset_leaf_runtime_state();
+    } else {
+      is_first_nk_ = true;
     }
   }
   return ret;
@@ -1358,6 +1326,8 @@ int ObDASAsyncScalarRorOp::do_rescan_segment(const common::ObNewVersionRange &ra
     }
     if (OB_FAIL(ret)) {
       reset_leaf_runtime_state();
+    } else {
+      is_first_nk_ = true;
     }
   }
   return ret;
@@ -1376,14 +1346,12 @@ int ObDASAsyncScalarRorOp::do_close()
   group_slot_ = -1;
   direct_bind_ = false;
   arena_allocator_.reset();
-  rowid_allocators_[0].reset();
-  rowid_allocators_[1].reset();
-  rowid_allocator_idx_ = 0;
   scalar_ctdef_ = nullptr;
   scalar_rtdef_ = nullptr;
   range_idx_ = -1;
   is_empty_range_ = false;
   is_inited_ = false;
+  is_first_nk_ = true;
   return ret;
 }
 

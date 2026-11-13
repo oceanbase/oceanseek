@@ -428,10 +428,12 @@ int ObDASQueryStringRtDef::parse_query_string()
     LOG_WARN("unexpected null param", K(ret), KPC(query_text_datum));
   } else {
     const ObString &original_string = query_text_datum->get_string();
-    const ObString &parser_name = ctdef->get_ir_ctdef(0)->get_inv_idx_scan_scalar_ctdef()
-        ->table_param_.get_parser_name();
-    const ObString &parser_property = ctdef->get_ir_ctdef(0)->get_inv_idx_scan_scalar_ctdef()
-        ->table_param_.get_parser_property();
+    const ObDASIRScanCtDef &ir = *ctdef->get_ir_ctdef(0);
+    const ObDASSearchIndexTextInfo &info = ir.search_index_fulltext_info_;
+    const ObString &parser_name = info.has_search_index_fulltext()
+        ? info.parser_name_ : ir.get_inv_idx_scan_scalar_ctdef()->table_param_.get_parser_name();
+    const ObString &parser_property = info.has_search_index_fulltext()
+        ? info.parser_properties_ : ir.get_inv_idx_scan_scalar_ctdef()->table_param_.get_parser_property();
     const ObObjMeta &meta = ctdef->query_text_->obj_meta_;
     const ObCollationType src_coll = ctdef->query_text_->datum_meta_.cs_type_;
     const ObCollationType dst_coll = ObCollationType::CS_TYPE_UTF8MB4_GENERAL_CI;

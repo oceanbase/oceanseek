@@ -17,14 +17,16 @@ ObSMRow::ObSMRow(MYSQL_PROTOCOL_TYPE type,
                  const sql::ObSQLSessionInfo &session,
                  const common::ColumnsFieldIArray *fields,
                  ObSchemaGetterGuard *schema_guard,
-                 uint64_t tenant_id)
+                 uint64_t tenant_id,
+                 bool enable_json_bin_view)
     : ObMySQLRow(type),
       obrow_(obrow),
       dtc_params_(dtc_params),
       session_(session),
       fields_(fields),
       schema_guard_(schema_guard),
-      tenant_id_(tenant_id)
+      tenant_id_(tenant_id),
+      enable_json_bin_view_(enable_json_bin_view)
 {
 }
 
@@ -55,10 +57,10 @@ int ObSMRow::encode_cell(
 
     if (NULL == fields_) {
       ret = ObSMUtils::cell_str(
-          buf, len, *cell, type_, pos, idx, bitmap, dtc_params_, NULL, session_, NULL);
+          buf, len, *cell, type_, pos, idx, bitmap, dtc_params_, NULL, session_, NULL, OB_INVALID_ID, enable_json_bin_view_);
     } else {
       ret = ObSMUtils::cell_str(
-          buf, len, *cell, type_, pos, idx, bitmap, dtc_params_, &fields_->at(idx), session_, schema_guard_, tenant_id_);
+          buf, len, *cell, type_, pos, idx, bitmap, dtc_params_, &fields_->at(idx), session_, schema_guard_, tenant_id_, enable_json_bin_view_);
     }
   }
 

@@ -1,0 +1,7 @@
+ob_unittest(test_search_index_encoder)
+ob_unittest(test_search_index_generator)
+sql_unittest(test_search_index_config)
+sql_unittest(test_search_index_ddl)
+sql_unittest(test_search_index_scalar)
+storage_unittest(test_search_index_lifecycle_util)
+storage_unittest(test_search_index_lifecycle_schema)

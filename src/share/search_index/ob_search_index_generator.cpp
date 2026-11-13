@@ -6,12 +6,17 @@
 #define USING_LOG_PREFIX SHARE
 
 #include "share/search_index/ob_search_index_generator.h"
+#include "share/search_index/ob_search_index_config.h"
+#include "share/schema/ob_table_schema.h"
+#include "share/ob_fts_index_builder_util.h"
+#include "share/ob_fts_pos_list_codec.h"
+#include "storage/blocksstable/async_index/ob_inv_sstable_struct.h"
 #include "lib/charset/ob_charset.h"
 #include "lib/oblog/ob_log_module.h"
 #include "lib/json_type/ob_json_base.h"
+#include "lib/json_type/ob_json_wrapper.h"
 #include "lib/json_type/ob_json_tree.h"
 #include "lib/hash/ob_hashset.h"
-#include "lib/json_type/ob_json_bin.h"
 #include "lib/utility/ob_macro_utils.h"
 #include "lib/number/ob_number_v2.h"
 #include "share/vector/ob_fixed_length_base.h"
@@ -29,7 +34,7 @@ namespace share
 int ObSearchIndexRow::build_datum_row(ObIAllocator &allocator, blocksstable::ObDatumRow &datum_row)
 {
   int ret = OB_SUCCESS;
-  const int64_t col_cnt = has_nested_key_ ? SEARCH_INDEX_KEY_CNT_WITH_NK : SEARCH_INDEX_KEY_CNT;
+  const int64_t col_cnt = text_column_count_ > 0 ? text_column_count_ : has_nested_key_ ? SEARCH_INDEX_KEY_CNT_WITH_NK : SEARCH_INDEX_KEY_CNT;
   if (OB_FAIL(datum_row.init(allocator, col_cnt))) {
     LOG_WARN("fail to init datum row", K(ret));
   } else {
@@ -37,7 +42,13 @@ int ObSearchIndexRow::build_datum_row(ObIAllocator &allocator, blocksstable::ObD
     datum_row.storage_datums_[SEARCH_INDEX_PATH].shallow_copy_from_datum(path_);
     datum_row.storage_datums_[SEARCH_INDEX_VALUE].shallow_copy_from_datum(value_);
     datum_row.storage_datums_[SEARCH_INDEX_DOC_ID].set_uint(doc_id_);
-    if (has_nested_key_) {
+    if (text_column_count_ > 0) {
+      datum_row.storage_datums_[blocksstable::SEARCH_TEXT_TOKEN_FREQ].set_uint(token_freq_);
+      datum_row.storage_datums_[blocksstable::SEARCH_TEXT_DOC_LENGTH].set_uint(doc_length_);
+      if (text_column_count_ == blocksstable::SEARCH_TEXT_COL_CNT_WITH_POS) {
+        datum_row.storage_datums_[blocksstable::SEARCH_TEXT_POSITION_LIST].set_string(positions_);
+      }
+    } else if (has_nested_key_) {
       datum_row.storage_datums_[SEARCH_INDEX_NESTED_KEY].shallow_copy_from_datum(nested_key_);
     }
   }
@@ -46,7 +57,9 @@ int ObSearchIndexRow::build_datum_row(ObIAllocator &allocator, blocksstable::ObD
 
 int ObSearchIndexRowGenerator::Generator::init(const uint64_t column_idx, const ObObjMeta &obj_meta,
                                                const common::ObCollectionArrayType *arr_type,
-                                               const ObSearchIndexConfigFilter *config_filter)
+                                               const ObSearchIndexConfigFilter *config_filter,
+                                               const ObSearchIndexModeConfig &mode,
+                                               const bool is_ddl_mode)
 {
   int ret = OB_SUCCESS;
   column_idx_ = column_idx;
@@ -60,7 +73,8 @@ int ObSearchIndexRowGenerator::Generator::init(const uint64_t column_idx, const 
     ObObjType obj_type = ob_is_text_tc(col_type) ? ObVarcharType : obj_meta_.get_type();
     ObCollationType cs_type = obj_meta_.get_collation_type();
     ObCharsetType charset = ObCharset::charset_type_by_coll(cs_type);
-    if (CHARSET_UTF16 == charset || CHARSET_UTF16LE == charset) {
+    // FULLTEXT normalizes parser tokens in add_text_value(), rather than the source datum.
+    if (!mode.is_fulltext() && (CHARSET_UTF16 == charset || CHARSET_UTF16LE == charset)) {
       orig_cs_type_ = cs_type;
       need_normalize_encoding_ = true;
       cs_type = ObCharset::is_bin_sort(cs_type) ? CS_TYPE_UTF8MB4_BIN
@@ -77,6 +91,45 @@ int ObSearchIndexRowGenerator::Generator::init(const uint64_t column_idx, const 
   } else if (ObCollectionSQLType == col_type) {
     if (OB_FAIL(init_array_generator(arr_type))) {
       LOG_WARN("fail to init array generator", K(ret));
+    }
+  }
+
+  // init FULLTEXT phrase_
+  if (OB_FAIL(ret)) {
+  } else if (!mode.is_fulltext()) {
+    // pass
+  } else if (!ObSearchIndexConfig::supports_fulltext(obj_meta_)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("unsupported fulltext source type or collation", K(ret), K_(column_idx), K_(obj_meta), K(mode.mode_));
+  } else {
+    const ObCollationType source_cs = obj_meta_.get_collation_type();
+    const bool phrase = mode.mode_ == ObSearchIndexModeConfig::FULLTEXT_PHRASE;
+    ObString parser_name = mode.parser_name_;
+    ObString parser_properties = mode.parser_properties_;
+    if (OB_SUCC(ret) && !parser_properties.empty()
+        && !storage::ObFTParser::is_analyzer_parser_name(parser_name)) {
+        storage::ObFTParserJsonProps props;
+      if (OB_FAIL(props.init())) {
+        LOG_WARN("failed to initialize search index parser properties", K(ret));
+      } else if (OB_FAIL(props.parse_from_valid_str(parser_properties))) {
+        LOG_WARN("failed to parse search index parser properties", K(ret));
+      } else if (OB_FAIL(props.rebuild_props_for_ddl(parser_name, source_cs, false, MTL_ID()))) {
+        LOG_WARN("failed to fill search index parser defaults", K(ret));
+      } else if (OB_FAIL(props.to_format_json(inner_allocator_, parser_properties))) {
+        LOG_WARN("failed to serialize effective search index parser properties", K(ret));
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_ISNULL(parser_ = OB_NEWx(storage::ObFTParseHelper, &inner_allocator_))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate fulltext parser", K(ret), K_(column_idx));
+    } else if (OB_FAIL(parser_->init(&allocator_, parser_name, parser_properties,
+                                    phrase ? schema::OB_FTS_INDEX_TYPE_PHRASE_MATCH : schema::OB_FTS_INDEX_TYPE_MATCH,
+                                    is_ddl_mode))) {
+      LOG_WARN("failed to initialize fulltext parser", K(ret), K_(column_idx), K(mode.mode_), K(mode.parser_name_));
+    } else {
+      is_fulltext_ = true;
+      phrase_ = phrase;
     }
   }
 
@@ -126,8 +179,10 @@ int ObSearchIndexRowGenerator::Generator::init_array_generator(const common::ObC
             ret = OB_ALLOCATE_MEMORY_FAILED;
             LOG_WARN("fail to allocate memory for element generator", K(ret));
           } else {
-            elem_generator_ = new (elem_generator_ptr) Generator(allocator_, inner_allocator_, has_nested_key_);
-            if (OB_FAIL(elem_generator_->init(column_idx_, elem_meta, nullptr, nullptr /* config_filter */))) {
+            elem_generator_ = new (elem_generator_ptr) Generator(allocator_, inner_allocator_);
+            const ObSearchIndexModeConfig value_mode;
+            if (OB_FAIL(elem_generator_->init(column_idx_, elem_meta, nullptr, nullptr /* config_filter */,
+                                              value_mode, false /* is_ddl_mode: VALUE only */))) {
               LOG_WARN("fail to init element generator", K(ret));
             } else {
               elem_generator_->array_index_path_ = array_index_path_;
@@ -154,7 +209,11 @@ int ObSearchIndexRowGenerator::Generator::generate_rows(
 {
   int ret = OB_SUCCESS;
   const ObObjType obj_type = obj_meta_.get_type();
-  if (OB_UNLIKELY(datum.is_null())) {
+  if (is_fulltext_) {
+    if (OB_FAIL(generate_fulltext_rows(doc_id, datum, rows))) {
+      LOG_WARN("fail to generate fulltext rows", K(ret));
+    }
+  } else if (OB_UNLIKELY(datum.is_null())) {
     // datum null: column_idx, null, null, doc_id[, null nested_key]
     ObSearchIndexRow row(column_idx_, doc_id);
     if (OB_FAIL(push_back_row(rows, row))) {
@@ -292,30 +351,236 @@ int ObSearchIndexRowGenerator::Generator::generate_rows(const ObIVector &doc_id_
   return OB_NOT_IMPLEMENT;
 }
 
+int ObSearchIndexRowGenerator::Generator::generate_fulltext_rows(uint64_t doc_id,
+                                                             const ObDatum &datum,
+                                                             ObSearchIndexRows &rows)
+{
+  int ret = OB_SUCCESS;
+  if (!datum.is_null()) {
+    ObString data = datum.get_string();
+    ObJsonWrapper json;
+    ObSEArray<ObSearchIndexPathEncoder::JsonPathItem, 16> path;
+    ObSearchIndexTermMap terms;
+    ObSearchIndexTextPathMap paths;
+    if (OB_FAIL(terms.create(256, ObMemAttr(MTL_ID(), "SITextTerms")))) {
+      LOG_WARN("failed to create fulltext term map", K(ret), K_(column_idx));
+    } else if (OB_FAIL(paths.create(32, ObMemAttr(MTL_ID(), "SITextPaths")))) {
+      LOG_WARN("failed to create fulltext path map", K(ret), K_(column_idx));
+    } else if (OB_FAIL(sql::ObTextStringHelper::read_real_string_data(
+        &allocator_, obj_meta_.get_type(), obj_meta_.get_collation_type(), data))) {
+      LOG_WARN("fail to read real string data", K(ret));
+    } else if (obj_meta_.is_json()) {
+      if (OB_FAIL(common::get_json_wrapper(data, ObJsonInType::JSON_BIN, allocator_, json))) {
+        LOG_WARN("failed to get JSON wrapper", K(ret), K_(column_idx));
+      } else if (OB_FAIL(generate_fulltext_rows(json, path, terms, paths))) {
+        LOG_WARN("failed to generate fulltext terms", K(ret), K_(column_idx), K(doc_id));
+      }
+    } else if (!data.empty() && OB_FAIL(add_text_value(data, ObString(), terms, paths))) {
+      LOG_WARN("failed to generate string fulltext terms", K(ret), K_(column_idx), K(doc_id));
+    }
+    if (OB_SUCC(ret)) {
+      for (ObSearchIndexTermMap::iterator it = terms.begin(); OB_SUCC(ret) && it != terms.end(); ++it) {
+        TextPathStat stat;
+        ObString term_path = it->first.path_;
+        ObString token = it->first.value_;
+        ObSearchIndexRow row(column_idx_, term_path, token, doc_id);
+        if (OB_FAIL(paths.get_refactored(term_path, stat))) {
+          LOG_WARN("failed to get fulltext path statistics", K(ret), K_(column_idx), K(term_path));
+        } else {
+          row.text_column_count_ = phrase_ ? 7 : 6;
+          row.token_freq_ = it->second.count_;
+          row.doc_length_ = stat.doc_length_;
+          if (phrase_) {
+            ObFTSPositionListStore position_store;
+            char *buf = nullptr;
+            int64_t size = 0;
+            constexpr int64_t MAX_POSITION_LIST_SIZE = 16 * 1024;
+            if (OB_FAIL(position_store.encode_and_serialize(allocator_, *it->second.position_list_, buf, size))) {
+              LOG_WARN("failed to serialize fulltext positions", K(ret), K_(column_idx), K(doc_id), K(term_path));
+            } else if (size > MAX_POSITION_LIST_SIZE) {
+              ret = OB_SIZE_OVERFLOW;
+              LOG_WARN("fulltext position list exceeds size limit", K(ret), K_(column_idx), K(doc_id),
+                      K(size), K(MAX_POSITION_LIST_SIZE));
+            } else {
+              row.positions_.assign_ptr(buf, size);
+            }
+          }
+        }
+        if (OB_SUCC(ret) && OB_FAIL(rows.push_back(row))) {
+          LOG_WARN("failed to append fulltext index row", K(ret), K_(column_idx), K(doc_id), K(term_path));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObSearchIndexRowGenerator::Generator::generate_fulltext_rows(const ObJsonWrapper &json,
+                                                            ObIArray<ObSearchIndexPathEncoder::JsonPathItem> &path,
+                                                            ObSearchIndexTermMap &terms,
+                                                            ObSearchIndexTextPathMap &paths)
+{
+  int ret = OB_SUCCESS;
+  if (json.json_type() == ObJsonNodeType::J_OBJECT) {
+    for (uint64_t i = 0; OB_SUCC(ret) && i < json.member_count(); ++i) {
+      ObString key;
+      ObJsonWrapper elem;
+      if (OB_FAIL(json.get_key_value(i, key, elem))) {
+        LOG_WARN("failed to get JSON object member", K(ret), K_(column_idx));
+      } else if (OB_FAIL(path.push_back(ObSearchIndexPathEncoder::make_object_path(key)))) {
+        LOG_WARN("failed to append JSON object path", K(ret), K_(column_idx), K(key));
+      } else {
+        if (OB_FAIL(generate_fulltext_rows(elem, path, terms, paths))) {
+          LOG_WARN("failed to generate fulltext terms for JSON object member", K(ret), K_(column_idx), K(key));
+        }
+        path.pop_back();
+      }
+    }
+  } else if (json.json_type() == ObJsonNodeType::J_ARRAY) {
+    if (OB_FAIL(path.push_back(ObSearchIndexPathEncoder::make_array_path()))) {
+      LOG_WARN("failed to append JSON array path", K(ret), K_(column_idx));
+    }
+    for (uint64_t i = 0; OB_SUCC(ret) && i < json.element_count(); ++i) {
+      ObJsonWrapper elem;
+      if (OB_FAIL(json.element(i, elem))) {
+        LOG_WARN("failed to get JSON array element", K(ret), K_(column_idx), K(i));
+      } else if (OB_FAIL(generate_fulltext_rows(elem, path, terms, paths))) {
+        LOG_WARN("failed to generate fulltext terms for JSON array element", K(ret), K_(column_idx), K(i));
+      }
+    }
+    path.pop_back();
+  } else if (json.json_type() == ObJsonNodeType::J_STRING) {
+    bool passed = false;
+    ObString encoded_path;
+    const ObString text = json.get_string();
+    // Use VALUE's coverage rules on the actual leaf path: $.a also selects $.a[*],
+    // and terminal .* covers descendants (including arrays). Only strings are tokenized.
+    if (OB_FAIL(config_filter_->is_indexed(path, json.json_type(), passed))) {
+      LOG_WARN("failed to check fulltext path filter", K(ret), K_(column_idx));
+    } else if (passed && !text.empty()) {
+      if (OB_FAIL(ObSearchIndexPathEncoder::encode_text_path(allocator_, path, encoded_path))) {
+        LOG_WARN("failed to encode fulltext path", K(ret), K_(column_idx));
+      } else if (OB_FAIL(add_text_value(text, encoded_path, terms, paths))) {
+        LOG_WARN("failed to add fulltext value", K(ret), K_(column_idx), K(encoded_path));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObSearchIndexRowGenerator::Generator::add_text_value(const ObString &text,
+                                                         const ObString &path,
+                                                         ObSearchIndexTermMap &terms,
+                                                         ObSearchIndexTextPathMap &paths)
+{
+  int ret = OB_SUCCESS;
+  storage::ObFTTokenMap tokens;
+  ObObjMeta meta;
+  meta.set_varchar();
+  meta.set_collation_type(obj_meta_.get_collation_type());
+  int64_t length = 0;
+  int64_t last_position = -1;
+  if (OB_FAIL(tokens.create(64, ObMemAttr(MTL_ID(), "SITextTokens")))) {
+    LOG_WARN("failed to create fulltext token map", K(ret), K_(column_idx), K(path));
+  } else if (OB_FAIL(parser_->segment(meta, text.ptr(), text.length(), length, tokens,
+                                    phrase_ ? &last_position : nullptr))) {
+    LOG_WARN("failed to segment fulltext value", K(ret), K_(column_idx), K(path));
+  } else if (length > 0) {
+    TextPathStat stat;
+    constexpr int64_t POSITION_GAP = 100;
+    int64_t position_base;
+    if (OB_FAIL(paths.get_refactored(path, stat))) {
+      if (ret != OB_HASH_NOT_EXIST) {
+        LOG_WARN("failed to get fulltext path statistics", K(ret), K_(column_idx), K(path));
+      } else {
+        ret = OB_SUCCESS;
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FALSE_IT(position_base = stat.next_position_)) {
+    } else if (length > INT64_MAX - stat.doc_length_
+        || (phrase_ && last_position > INT64_MAX - POSITION_GAP - 1 - position_base)) {
+      ret = OB_SIZE_OVERFLOW;
+      LOG_WARN("fulltext document length or position overflow", K(ret), K_(column_idx), K(path),
+               K(length), K(stat.doc_length_), K(last_position), K(position_base), K_(phrase));
+    } else {
+      stat.doc_length_ += length;
+      if (phrase_) {
+        // Advance by the complete stream, including filtered and unrecorded positions.
+        stat.next_position_ = position_base + last_position + 1 + POSITION_GAP;
+      }
+      if (OB_FAIL(paths.set_refactored(path, stat, 1))) {
+        LOG_WARN("failed to update fulltext path statistics", K(ret), K_(column_idx), K(path));
+      }
+    }
+    for (storage::ObFTTokenMap::iterator it = tokens.begin(); OB_SUCC(ret) && it != tokens.end(); ++it) {
+      ObString raw_token = it->first.get_token().get_string();
+      ObEncParam token_enc_param = enc_param_;
+      ObString token;
+      if (OB_FAIL(ObSearchIndexValueEncoder::normalize_string_for_encoding(
+          allocator_, raw_token, token_enc_param.cs_type_))) {
+        LOG_WARN("failed to normalize fulltext token", K(ret), K_(column_idx), K(path));
+      } else if (OB_FAIL(ObSearchIndexValueEncoder::encode_string(
+          allocator_, raw_token, token, token_enc_param, false /* is_allow_truncate */))) {
+        LOG_WARN("failed to encode fulltext token", K(ret), K_(column_idx), K(path));
+      }
+      PathValueKey key{path, token, ObString()};
+      storage::ObFTTokenInfo term;
+      if (OB_SUCC(ret)) {
+        const int tmp_ret = terms.get_refactored(key, term);
+        if (tmp_ret != OB_SUCCESS && tmp_ret != OB_HASH_NOT_EXIST) {
+          ret = tmp_ret;
+          LOG_WARN("failed to get fulltext term statistics", K(ret), K_(column_idx), K(path));
+        }
+      }
+      if (OB_SUCC(ret)) {
+        const storage::ObFTTokenInfo &info = it->second;
+        if (info.count_ < 0 || info.count_ > INT64_MAX - term.count_) {
+          ret = OB_SIZE_OVERFLOW;
+          LOG_WARN("fulltext token frequency overflow", K(ret), K_(column_idx), K(path),
+                   K(info.count_), K(term.count_));
+        } else {
+          const int64_t total_count = term.count_ + info.count_;
+          if (phrase_) {
+            for (int64_t i = 0; OB_SUCC(ret) && i < info.position_list_->count()
+                && term.count_ < ObFTSConstants::MAX_POSITION_LIST_COUNT; ++i) {
+              if (OB_FAIL(term.update_one_position(allocator_, position_base + info.position_list_->at(i)))) {
+                LOG_WARN("failed to append fulltext token position", K(ret), K_(column_idx), K(path), K(i));
+              }
+            }
+          }
+          // Position retention is capped per term/path/document; TF and DL are not capped.
+          term.count_ = total_count;
+          if (OB_SUCC(ret) && OB_FAIL(terms.set_refactored(key, term, 1))) {
+            LOG_WARN("failed to update fulltext term statistics", K(ret), K_(column_idx), K(path));
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObSearchIndexRowGenerator::Generator::generate_json_rows(const int64_t doc_id,
                                                              const ObDatum& datum,
                                                              ObSearchIndexRows &rows)
 {
   int ret = OB_SUCCESS;
   ObString j_bin_str = datum.get_string();
-  ObIJsonBase *j_base = nullptr;
+  ObJsonWrapper json;
   ObSEArray<ObSearchIndexPathEncoder::JsonPathItem, 16> path_items;
   if (OB_FAIL(sql::ObTextStringHelper::read_real_string_data(
       &allocator_, ObJsonType, CS_TYPE_UTF8MB4_BIN, j_bin_str))) {
     LOG_WARN("fail to read real string data", K(ret));
-  } else if (OB_FAIL(common::ObJsonBaseFactory::get_json_base(
-                                                              &allocator_,
-                                                              j_bin_str,
-                                                              common::ObJsonInType::JSON_BIN,
-                                                              common::ObJsonInType::JSON_BIN,
-                                                              j_base))) {
-    LOG_WARN("fail to get json base", K(ret));
+  } else if (OB_FAIL(common::get_json_wrapper(j_bin_str, ObJsonInType::JSON_BIN,
+                                             allocator_, json))) {
+    LOG_WARN("fail to get json wrapper", K(ret));
   } else {
     // document-level (path, value) dedup to avoid duplicate key for nested array same values
     PathValueDedupSet path_value_dedup_set;
     if (OB_FAIL(path_value_dedup_set.create(256, ObMemAttr(MTL_ID(), "SeaIdxValDeDup")))) {
       LOG_WARN("fail to create path value dedup set", K(ret));
-    } else if (OB_FAIL(generate_rows(doc_id, j_base, path_items, rows, path_value_dedup_set))) {
+    } else if (OB_FAIL(generate_rows(doc_id, json, path_items, rows, path_value_dedup_set))) {
       LOG_WARN("failed to generate gin rows", K(ret));
     }
   }
@@ -323,32 +588,31 @@ int ObSearchIndexRowGenerator::Generator::generate_json_rows(const int64_t doc_i
 }
 
 int ObSearchIndexRowGenerator::Generator::generate_rows(
-    const int64_t doc_id, ObIJsonBase *j_base,
+    const int64_t doc_id, const ObJsonWrapper &json,
     ObIArray<ObSearchIndexPathEncoder::JsonPathItem> &path_items,
     ObSearchIndexRows &rows,
     PathValueDedupSet &path_value_dedup_set)
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(j_base)) {
+  if (OB_UNLIKELY(!json.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("json base is null", K(ret));
+    LOG_WARN("json wrapper is invalid", K(ret));
   } else {
-    ObJsonNodeType node_type = j_base->json_type();
-    const int64_t elem_cnt = j_base->element_count();
+    const ObJsonNodeType node_type = json.json_type();
+    const int64_t elem_cnt = json.element_count();
     const bool is_empty = (elem_cnt == 0);
     if (ObJsonNodeType::J_OBJECT == node_type && !is_empty) {
-      JsonObjectIterator iter(j_base);
-      while (OB_SUCC(ret) && !iter.end()) {
-        common::ObJsonObjPair elem;
-        if (OB_FAIL(iter.get_elem(elem))) {
+      for (uint64_t i = 0; OB_SUCC(ret) && i < elem_cnt; ++i) {
+        ObString key;
+        ObJsonWrapper elem;
+        if (OB_FAIL(json.get_key_value(i, key, elem))) {
           LOG_WARN("fail to get elem", K(ret));
-        } else if (OB_FAIL(path_items.push_back(ObSearchIndexPathEncoder::make_object_path(elem.first)))) {
+        } else if (OB_FAIL(path_items.push_back(ObSearchIndexPathEncoder::make_object_path(key)))) {
           LOG_WARN("fail to push path string", K(ret));
-        } else if (OB_FAIL(generate_rows(doc_id, elem.second, path_items, rows, path_value_dedup_set))) {
+        } else if (OB_FAIL(generate_rows(doc_id, elem, path_items, rows, path_value_dedup_set))) {
           LOG_WARN("fail to generate gin rows", K(ret));
         } else {
           path_items.pop_back();
-          iter.next();
         }
       }
     } else if (ObJsonNodeType::J_ARRAY == node_type && !is_empty) {
@@ -362,14 +626,14 @@ int ObSearchIndexRowGenerator::Generator::generate_rows(
         LOG_WARN("fail to push path string", K(ret));
       } else {
         for (uint64_t i = 0; OB_SUCC(ret) && i < elem_cnt; ++i) {
-          ObIJsonBase *elem = nullptr;
+          ObJsonWrapper elem;
           if (is_nested && OB_FAIL(nested_key_stack_.push_back(static_cast<uint32_t>(i)))) {
             LOG_WARN("failed to push nested key stack", K(ret), K(i));
           } else if (is_nested && OB_UNLIKELY(nested_key_stack_.count() > ObSearchIndexNestedKeyEncoder::MAX_DEPTH)) {
             ret = OB_SIZE_OVERFLOW;
             LOG_WARN("nested key depth exceeds MAX_DEPTH", K(ret), K(nested_key_stack_.count()),
               K(ObSearchIndexNestedKeyEncoder::MAX_DEPTH));
-          } else if (OB_FAIL(j_base->get_array_element(i, elem))) {
+          } else if (OB_FAIL(json.element(i, elem))) {
             LOG_WARN("fail to get array elem", K(ret), K(i), K(elem_cnt));
           } else if (OB_FAIL(generate_rows(doc_id, elem, path_items, rows, path_value_dedup_set))) {
             LOG_WARN("fail to generate gin rows for array elem", K(ret));
@@ -384,14 +648,14 @@ int ObSearchIndexRowGenerator::Generator::generate_rows(
       // scalar json node
       ObString path;
       ObString value;
-      const bool is_json_scalar = j_base->is_json_scalar(node_type);
+      const bool is_json_scalar = ObJsonWrapper::is_json_scalar(node_type);
       bool passed = true;
       if (OB_NOT_NULL(config_filter_) && OB_FAIL(config_filter_->is_indexed(path_items, node_type, passed))) {
         LOG_WARN("failed to check path filter", K(ret));
       } else if (!passed) {
         // do nothing
       } else if (is_json_scalar && OB_FAIL(ObSearchIndexValueEncoder::encode_json_scalar(allocator_,
-                                                                                         j_base,
+                                                                                         json,
                                                                                          value,
                                                                                          enc_param_))) {
         LOG_WARN("fail to encode json scalar", K(ret));
@@ -518,70 +782,89 @@ int ObSearchIndexRowGenerator::init(const common::ObIArray<int32_t> &included_ci
                                     const common::ObIArray<int64_t> &row_projector,
                                     const common::ObIArray<ObString> &column_comments,
                                     bool rowkey_only,
-                                    const common::ObIArray<common::ObCollectionArrayType*> *arr_types)
+                                    const common::ObIArray<common::ObCollectionArrayType*> *arr_types,
+                                    ObSearchIndexRowTarget target,
+                                    const bool is_ddl_mode)
 {
   int ret = OB_SUCCESS;
   UNUSED(rowkey_only);
+  reset();
   CK (included_cid_idxes.count() == included_obj_metas.count());
   CK (included_cid_idxes.count() == column_comments.count());
-  void *mem = nullptr;
-  bool has_nested_key = false;
-  if (OB_FAIL(ret)) {
-  } else if (OB_FAIL(config_filters_.prepare_allocate(column_comments.count()))) {
-    LOG_WARN("failed to prepare allocate search index config filters", K(ret), K(column_comments.count()));
-  } else {
-    for (int64_t i = 0; OB_SUCC(ret) && i < column_comments.count(); ++i) {
-      const ObString &comment = column_comments.at(i);
-      if (!comment.empty()) {
+  CK (row_projector.count() == included_cid_idxes.count() + 1);
+  CK (arr_types == nullptr || arr_types->count() == included_cid_idxes.count());
+  CK (target >= SEARCH_DATA && target <= SEARCH_TEXT_PHRASE);
+  for (int64_t comment_id = 0; OB_SUCC(ret) && comment_id < column_comments.count(); ++comment_id) {
+    ObSearchIndexConfig config;
+    if (OB_FAIL(config.decode(column_comments.at(comment_id)))) {
+      LOG_WARN("failed to decode search index configuration", K(ret), K(comment_id),
+                                                              K(included_cid_idxes.at(comment_id)),
+                                                              K(target));
+    }
+    for (int64_t mode_id = 0; OB_SUCC(ret) && mode_id < config.get_modes().count(); ++mode_id) {
+      const ObSearchIndexModeConfig &mode = config.get_modes().at(mode_id);
+      if ((target == SEARCH_DATA && mode.mode_ == ObSearchIndexModeConfig::VALUE) ||
+          (target == SEARCH_TEXT_MATCH && mode.mode_ == ObSearchIndexModeConfig::FULLTEXT_MATCH) ||
+          (target == SEARCH_TEXT_PHRASE && mode.mode_ == ObSearchIndexModeConfig::FULLTEXT_PHRASE)) {
         ObSearchIndexConfigFilter *filter = OB_NEWx(ObSearchIndexConfigFilter, &inner_allocator_, MTL_ID());
         if (OB_ISNULL(filter)) {
           ret = OB_ALLOCATE_MEMORY_FAILED;
-          LOG_WARN("failed to alloc search index json path filter", K(ret));
-        } else if (OB_FAIL(filter->init_from_comment(comment))) {
-          LOG_WARN("failed to init config filter from column comment", K(ret), K(comment));
+          LOG_WARN("failed to alloc search index json path filter", K(ret), K(comment_id), K(mode_id),
+                   K(target), K(mode.mode_), K(included_cid_idxes.at(comment_id)));
+        } else if (OB_FAIL(filter->init_from_comment(config.get_comment(), mode_id))) {
+          LOG_WARN("failed to initialize mode filter", K(ret), K(comment_id), K(mode_id),
+                   K(target), K(mode.mode_), K(included_cid_idxes.at(comment_id)));
+          filter->~ObSearchIndexConfigFilter();
+        } else if (OB_FAIL(config_filters_.push_back(filter))) {
+          LOG_WARN("failed to append search index mode filter", K(ret), K(comment_id), K(mode_id),
+                   K(target), K(mode.mode_), K(included_cid_idxes.at(comment_id)));
           filter->~ObSearchIndexConfigFilter();
         } else {
-          config_filters_[i] = filter;
-          if (filter->has_nested_paths()) {
-            has_nested_key = true;
+          has_nested_key_ |= filter->has_nested_paths();
+          const common::ObCollectionArrayType *arr_type = NULL;
+          Generator *generator = OB_NEWx(Generator, &inner_allocator_, row_allocator_, inner_allocator_);
+          if (OB_ISNULL(generator)) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+            LOG_WARN("failed to allocate search index generator", K(ret), K(comment_id), K(mode_id),
+                     K(target), K(mode.mode_), K(included_cid_idxes.at(comment_id)));
+          } else if (OB_FAIL(generators_.push_back(generator))) {
+            LOG_WARN("failed to append search index generator", K(ret), K(comment_id), K(mode_id),
+                     K(target), K(mode.mode_), K(included_cid_idxes.at(comment_id)));
+            generator->~Generator();
+          } else if (OB_FALSE_IT(arr_type = (nullptr != arr_types) ? arr_types->at(comment_id) : nullptr)) {
+          } else if (OB_FAIL(generator_sources_.push_back(comment_id))) {
+            LOG_WARN("failed to append generator source", K(ret), K(comment_id), K(mode_id), K(target));
+          } else if (OB_FAIL(generator->init(included_cid_idxes.at(comment_id),
+                                             included_obj_metas.at(comment_id),
+                                             arr_type, filter, mode, is_ddl_mode))) {
+            LOG_WARN("fail to init generator", K(ret), K(comment_id), K(mode_id),
+                      K(target), K(mode.mode_), K(included_cid_idxes.at(comment_id)));
           }
         }
-      } else {
-        config_filters_[i] = nullptr;
       }
     }
   }
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(row_projector_.assign(row_projector))) {
-    LOG_WARN("failed to assign row projector", K(ret));
-  } else if (OB_FAIL(generators_.prepare_allocate(included_cid_idxes.count()))) {
-    LOG_WARN("fail to init generators", K(ret));
-  } else if (OB_ISNULL(mem = inner_allocator_.alloc(sizeof(Generator) * included_cid_idxes.count()))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-    LOG_WARN("fail to allocate memory", K(ret));
-  } else if (OB_NOT_NULL(arr_types) && included_cid_idxes.count() != arr_types->count()) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("included cid idxes count mismatch with arr types count", K(ret),
-             K(included_cid_idxes.count()), K(arr_types->count()));
+    LOG_WARN("failed to assign row projector", K(ret), K(row_projector), K(target));
   } else {
-    for (int64_t i = 0; OB_SUCC(ret) && i < included_cid_idxes.count(); ++i) {
-      generators_.at(i) = new (static_cast<char*>(mem) + i * sizeof(Generator)) Generator(row_allocator_, inner_allocator_, has_nested_key);
-      const common::ObCollectionArrayType *arr_type = (nullptr != arr_types) ? arr_types->at(i) : nullptr;
-      if (OB_FAIL(generators_.at(i)->init(included_cid_idxes.at(i), included_obj_metas.at(i),
-                                          arr_type, config_filters_.at(i)))) {
-        LOG_WARN("fail to init generator", K(ret));
-      }
+    row_projector_ptr_ = &row_projector_;
+    for (int64_t i = 0; i < generators_.count(); ++i) {
+      generators_.at(i)->set_has_nested_key(has_nested_key_);
     }
-    if (OB_SUCC(ret)) {
-      row_projector_ptr_ = &row_projector_;
-      has_nested_key_ = has_nested_key;
-    }
+  }
+  if (OB_FAIL(ret)) {
+    reset();
   }
   return ret;
 }
 
 void ObSearchIndexRowGenerator::reset()
 {
+  for (int64_t i = 0; i < generators_.count(); ++i) {
+    generators_.at(i)->~Generator();
+  }
+  generator_sources_.reset();
   for (int64_t i = 0; i < config_filters_.count(); ++i) {
     ObSearchIndexConfigFilter *filter = config_filters_.at(i);
     if (OB_NOT_NULL(filter)) {
@@ -595,6 +878,23 @@ void ObSearchIndexRowGenerator::reset()
   row_allocator_.reset();
   row_projector_ptr_ = nullptr;
   has_nested_key_ = false;
+}
+
+int ObSearchIndexRowGenerator::get_target(const schema::ObTableSchema &schema,
+                                         ObSearchIndexRowTarget &target)
+{
+  int ret = OB_SUCCESS;
+  if (schema.is_search_data_index()) {
+    target = SEARCH_DATA;
+  } else if (schema.is_async_search_text_match_index()) {
+    target = SEARCH_TEXT_MATCH;
+  } else if (schema.is_async_search_text_match_phrase_index()) {
+    target = SEARCH_TEXT_PHRASE;
+  } else {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("unsupported search index target schema", K(ret), K(schema.get_table_id()), K(schema.get_index_type()));
+  }
+  return ret;
 }
 
 int ObSearchIndexRowGenerator::set_row_projector(const common::ObFixedArray<int64_t, ObIAllocator> *row_projector)
@@ -620,10 +920,10 @@ int ObSearchIndexRowGenerator::generate_rows(const sql::ObChunkDatumStore::Store
     // reuse row allocator for each generate_rows call
     row_allocator_.reuse();
     ObSearchIndexRows index_rows;
-    const int64_t doc_proj = row_projector_ptr_->at(generators_.count());
+    const int64_t doc_proj = row_projector_ptr_->at(row_projector_ptr_->count() - 1);
     const uint64_t doc_id = store_row->cells()[doc_proj].get_uint();
     for (int64_t i = 0; OB_SUCC(ret) && i < generators_.count(); ++i) {
-      const int64_t project_idx = row_projector_ptr_->at(i);
+      const int64_t project_idx = row_projector_ptr_->at(generator_sources_.at(i));
       if (OB_FAIL(generators_.at(i)->generate_rows(doc_id, store_row->cells()[project_idx], index_rows))) {
         LOG_WARN("fail to generate gin rows", K(ret));
       }
@@ -663,10 +963,10 @@ int ObSearchIndexRowGenerator::generate_rows(const blocksstable::ObDatumRow &sto
     // reuse row allocator for each generate_rows call
     row_allocator_.reuse();
     ObSearchIndexRows index_rows;
-    const int64_t doc_proj = row_projector_ptr_->at(generators_.count());
+    const int64_t doc_proj = row_projector_ptr_->at(row_projector_ptr_->count() - 1);
     const uint64_t doc_id = store_row.storage_datums_[doc_proj].get_uint();
     for (int64_t i = 0; OB_SUCC(ret) && i < generators_.count(); ++i) {
-      const int64_t project_idx = row_projector_ptr_->at(i);
+      const int64_t project_idx = row_projector_ptr_->at(generator_sources_.at(i));
       if (OB_FAIL(generators_.at(i)->generate_rows(doc_id, store_row.storage_datums_[project_idx], index_rows))) {
         LOG_WARN("fail to generate gin rows", K(ret));
       }

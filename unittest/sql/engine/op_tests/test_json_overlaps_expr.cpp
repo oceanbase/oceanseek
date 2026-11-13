@@ -209,6 +209,89 @@ TEST_F(JsonOverlapsExprTest, NullDocWithInvalidConstCandidateStillErrors)
   EXPECT_EQ(common::OB_ERR_INVALID_JSON_TEXT_IN_PARAM, result.get_ret_code());
 }
 
+// ============================================================================
+// _enable_json_bin_view switch comparison tests.
+//
+// JSON_OVERLAPS calls element_count()/element()/get_key()/lookup()/
+// json_type() on both wrappers.  When _enable_json_bin_view is ON and the
+// input is cast(... as json), the wrappers hold ObJsonBinView and all these
+// operations run on the zero-copy bin path.  When OFF, they hold ObJsonBin
+// DOM.
+//
+// Note: _enable_json_bin_view is an OB_TENANT_PARAMETER, not a session
+// variable, so with_session_vars() cannot set it.  We use WITH_TENANT_CONFS
+// (TestParameterGuard RAII) which pushes into TestDefaultParameterConf TLS,
+// consumed by OpTestEngine::apply_tenant_config_overrides() during prepare().
+// ============================================================================
+
+// B1: switch ON — array overlap via cast(s as json).
+TEST_F(JsonOverlapsExprTest, BinViewSwitchOnArrayOverlap)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "true"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256), c varchar(256)")
+        .with_expr("json_overlaps(cast(s as json), cast(c as json))")
+        .with_data({
+            {R"([1, 2, 3])", R"([3, 4, 5])"},
+            {R"([1, 2, 3])", R"([4, 5, 6])"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"1"}, {"0"}}));
+  }
+}
+
+// B2: switch OFF — same input as B1, expect identical results.
+TEST_F(JsonOverlapsExprTest, BinViewSwitchOffArrayOverlap)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "false"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256), c varchar(256)")
+        .with_expr("json_overlaps(cast(s as json), cast(c as json))")
+        .with_data({
+            {R"([1, 2, 3])", R"([3, 4, 5])"},
+            {R"([1, 2, 3])", R"([4, 5, 6])"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"1"}, {"0"}}));
+  }
+}
+
+// B3: switch ON — object overlap via cast(s as json).
+TEST_F(JsonOverlapsExprTest, BinViewSwitchOnObjectOverlap)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "true"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256), c varchar(256)")
+        .with_expr("json_overlaps(cast(s as json), cast(c as json))")
+        .with_data({
+            {R"({"a": 1, "b": 2})", R"({"b": 2, "c": 3})"},
+            {R"({"a": 1, "b": 2})", R"({"c": 3, "d": 4})"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"1"}, {"0"}}));
+  }
+}
+
+// B4: switch OFF — same input as B3, expect identical results.
+TEST_F(JsonOverlapsExprTest, BinViewSwitchOffObjectOverlap)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "false"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256), c varchar(256)")
+        .with_expr("json_overlaps(cast(s as json), cast(c as json))")
+        .with_data({
+            {R"({"a": 1, "b": 2})", R"({"b": 2, "c": 3})"},
+            {R"({"a": 1, "b": 2})", R"({"c": 3, "d": 4})"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"1"}, {"0"}}));
+  }
+}
+
 int main(int argc, char **argv)
 {
   ::testing::InitGoogleTest(&argc, argv);

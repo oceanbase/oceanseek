@@ -21,6 +21,7 @@
 #include "share/ob_vec_index_builder_util.h"
 #include "share/external_table/ob_hdfs_storage_info.h"
 #include "sql/resolver/ddl/ob_fts_parser_resolver.h"
+#include "sql/resolver/ddl/ob_search_index_config_resolver.h"
 #include "share/ob_dynamic_partition_manager.h"
 #include "share/compaction_ttl/ob_compaction_ttl_util.h"
 #include "share/ob_license_utils.h"
@@ -340,13 +341,17 @@ int ObDDLResolver::append_search_index_args(
     ObIAllocator *allocator)
 {
   int ret = OB_SUCCESS;
-  int64_t num_search_args = 2;
+  const int64_t original_count = index_arg_list.count();
+  ObSearchIndexRequirements requirements;
   if (OB_ISNULL(allocator)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("allocator is null", K(ret));
+  } else if (OB_FAIL(ObSearchIndexBuilderUtil::resolve_search_index_args(index_arg, requirements))) {
+    LOG_WARN("unsupported search index configuration", K(ret));
   } else if (OB_FAIL(ObSearchIndexBuilderUtil::append_search_index_arg(index_arg,
-                                                           allocator,
-                                                           index_arg_list))) {
+                                                                       requirements,
+                                                                       allocator,
+                                                                       index_arg_list))) {
     LOG_WARN("failed to append search_index arg", K(ret));
   } else if (OB_FAIL(index_arg_list.push_back(index_arg))) {
     LOG_WARN("fail to push back index_arg", K(ret));
@@ -357,11 +362,10 @@ int ObDDLResolver::append_search_index_args(
     if (OB_FAIL(append_async_delete_index_arg(index_arg, index_arg_list, allocator))) {
       LOG_WARN("failed to append async delete index arg", K(ret));
     } else {
-      ++num_search_args;
       async_delete_table_exist = true;
     }
   }
-  for (int64_t i = 0; OB_SUCC(ret) && i < num_search_args; ++i) {
+  for (int64_t i = 0; OB_SUCC(ret) && i < index_arg_list.count() - original_count; ++i) {
     if (OB_FAIL(resolve_results.push_back(resolve_result))) {
       LOG_WARN("fail to push back index_stmt_list", K(ret), K(resolve_result));
     }
@@ -384,17 +388,17 @@ int ObDDLResolver::resolve_search_index_column_comment(
   } else if (OB_ISNULL(col_schema)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("column schema is null when validating search index column params", K(ret), K(column_name));
-  } else if (!ob_is_json_tc(col_schema->get_data_type())) {
-    ret = OB_NOT_SUPPORTED;
-    LOG_WARN("search index column WITH(...) is only supported for JSON column", K(ret),
-             K(column_name), K(col_schema->get_data_type()));
-    LOG_USER_ERROR(OB_NOT_SUPPORTED, "search index column WITH(...) on non-JSON column is");
   } else {
     ObSqlString cfg;
-    if (OB_FAIL(share::ObSearchIndexConfigFilter::print_comment(search_with_node, cfg))) {
-      LOG_WARN("failed to build search index column config string", K(ret));
+    uint64_t tenant_data_version = 0;
+    if (OB_FAIL(GET_MIN_DATA_VERSION(session_info_->get_effective_tenant_id(), tenant_data_version))) {
+      LOG_WARN("failed to get tenant data version", K(ret));
+    } else if (OB_FAIL(ObSearchIndexConfigResolver::resolve(search_with_node, database_name_,
+            session_info_->get_effective_tenant_id(), tenant_data_version, schema_checker_, col_schema->get_meta_type(), cfg))) {
+      LOG_WARN("failed to resolve search index column config", K(ret), K(column_name));
     } else if (OB_FAIL(ob_write_string(*allocator, cfg.string(), column_comment))) {
       LOG_WARN("failed to copy column config", K(ret), K(cfg.string()));
+
     }
   }
   return ret;
@@ -15032,7 +15036,8 @@ int ObDDLResolver::formalize_part_str(ObIArray<ObRawExpr*> &part_exprs, ObString
 int ObDDLResolver::resolve_search_index_constraint(
     const share::schema::ObTableSchema &table_schema,
     const common::ObString &column_name,
-    const int64_t index_keyname_value)
+    const int64_t index_keyname_value,
+    const ObString &column_comment)
 {
   int ret = OB_SUCCESS;
   const ObColumnSchemaV2 *column_schema = NULL;
@@ -15055,7 +15060,7 @@ int ObDDLResolver::resolve_search_index_constraint(
              K(ret), K(table_schema));
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "synchronous search index on table with async DISK_BBQ index is");
   } else if (OB_FAIL(resolve_search_index_constraint(*column_schema,
-                                                     index_keyname_value))) {
+                                                     index_keyname_value, column_comment))) {
     LOG_WARN("resolve search index constraint fail", K(ret), K(index_keyname_value));
   }
   return ret;
@@ -15063,7 +15068,8 @@ int ObDDLResolver::resolve_search_index_constraint(
 
 int ObDDLResolver::resolve_search_index_constraint(
     const share::schema::ObColumnSchemaV2 &column_schema,
-    const int64_t index_keyname_value)
+    const int64_t index_keyname_value,
+    const ObString &column_comment)
 {
   int ret = OB_SUCCESS;
   if (!column_schema.is_valid()) {
@@ -15107,6 +15113,21 @@ int ObDDLResolver::resolve_search_index_constraint(
         LOG_USER_ERROR(OB_NOT_SUPPORTED, "search index on this column type is");
         LOG_WARN("search index on this column type is not supported",
                  K(ret), K(encode_type), K(column_schema));
+      }
+      if (OB_SUCC(ret)) {
+        ObSearchIndexConfig config;
+        if (OB_FAIL(config.decode(column_comment))) {
+          LOG_WARN("failed to decode search index column config", K(ret), K(column_comment));
+        } else {
+          for (int64_t i = 0; OB_SUCC(ret) && i < config.get_modes().count(); ++i) {
+            if (config.get_modes().at(i).is_fulltext()
+                && !ObSearchIndexConfig::supports_fulltext(column_schema.get_meta_type())) {
+              ret = OB_NOT_SUPPORTED;
+              LOG_USER_ERROR(OB_NOT_SUPPORTED, "search index FULLTEXT on this column type or collation is");
+              LOG_WARN("unsupported search fulltext source type or collation", K(ret), K(column_schema));
+            }
+          }
+        }
       }
     }
   }

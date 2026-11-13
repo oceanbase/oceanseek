@@ -221,6 +221,90 @@ TEST_F(JsonValueExprTest, MysqlInvalidJsonDocReturnsNull)
   EXPECT_TRUE(result.verify_ordered({{TestValue::null()}}));
 }
 
+// ============================================================================
+// _enable_json_bin_view switch comparison tests.
+//
+// JSON_VALUE calls ObJsonWrapper::seek via doc_do_seek.  When
+// _enable_json_bin_view is ON and the input is cast(... as json), the wrapper
+// holds an ObJsonBinView and seek runs on the zero-copy bin path.  When OFF,
+// the wrapper holds an ObJsonBin DOM and seek delegates to ObIJsonBase::seek.
+// These tests exercise both switch states and assert the results match
+// byte-for-byte.
+//
+// Note: _enable_json_bin_view is an OB_TENANT_PARAMETER, not a session
+// variable, so with_session_vars() cannot set it.  We use WITH_TENANT_CONFS
+// (TestParameterGuard RAII) which pushes into TestDefaultParameterConf TLS,
+// consumed by OpTestEngine::apply_tenant_config_overrides() during prepare().
+// ============================================================================
+
+// B1: switch ON — object member extraction via cast(s as json).
+TEST_F(JsonValueExprTest, BinViewSwitchOnObjectMember)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "true"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256)")
+        .with_expr("json_value(cast(s as json), '$.name')")
+        .with_data({
+            {R"({"name": "alice", "age": 30})"},
+            {R"({"name": "bob", "age": 25})"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"alice"}, {"bob"}}));
+  }
+}
+
+// B2: switch OFF — same input as B1, expect identical results.
+TEST_F(JsonValueExprTest, BinViewSwitchOffObjectMember)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "false"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256)")
+        .with_expr("json_value(cast(s as json), '$.name')")
+        .with_data({
+            {R"({"name": "alice", "age": 30})"},
+            {R"({"name": "bob", "age": 25})"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"alice"}, {"bob"}}));
+  }
+}
+
+// B3: switch ON — nested array index + absent path returns NULL.
+TEST_F(JsonValueExprTest, BinViewSwitchOnNestedAndAbsent)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "true"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256)")
+        .with_expr("json_value(cast(s as json), '$.arr[1].k')")
+        .with_data({
+            {R"({"arr": [{"k": "v1"}, {"k": "v2"}]})"},
+            {R"({"arr": [{"k": "v1"}, {"k": "v2"}]})"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"v2"}, {"v2"}}));
+  }
+}
+
+// B4: switch OFF — same input as B3, expect identical results.
+TEST_F(JsonValueExprTest, BinViewSwitchOffNestedAndAbsent)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "false"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256)")
+        .with_expr("json_value(cast(s as json), '$.arr[1].k')")
+        .with_data({
+            {R"({"arr": [{"k": "v1"}, {"k": "v2"}]})"},
+            {R"({"arr": [{"k": "v1"}, {"k": "v2"}]})"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"v2"}, {"v2"}}));
+  }
+}
+
 int main(int argc, char **argv)
 {
   ::testing::InitGoogleTest(&argc, argv);

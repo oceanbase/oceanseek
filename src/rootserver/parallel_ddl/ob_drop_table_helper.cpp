@@ -172,21 +172,25 @@ int ObDropTableHelper::lock_async_index_refresh_for_drop_()
         LOG_WARN("async index schema is null", KR(ret), K(index_info));
       } else {
         if (index_schema->is_async_search_def_index()) {
-          uint64_t search_data_table_id = OB_INVALID_ID;
-          if (OB_FAIL(index_schema->get_search_data_index_tid(search_data_table_id))) {
-            LOG_WARN("fail to resolve async search data index", KR(ret), KPC(index_schema));
-          } else if (OB_FAIL(schema_guard_wrapper_.get_table_schema(
-                         search_data_table_id, index_schema))) {
-            LOG_WARN("fail to get async search data index schema", KR(ret),
-                     K(search_data_table_id));
-          } else if (OB_ISNULL(index_schema)) {
-            ret = OB_ERR_UNEXPECTED;
-            LOG_WARN("async search data index schema is null", KR(ret),
-                     K(search_data_table_id));
+          ObSEArray<uint64_t, 3> search_aux_table_ids;
+          if (OB_FAIL(index_schema->get_search_aux_index_tids(search_aux_table_ids))) {
+            LOG_WARN("failed to collect search children for refresh fence", K(ret));
+          }
+          for (int64_t k = 0; OB_SUCC(ret) && k < search_aux_table_ids.count(); ++k) {
+            const uint64_t search_aux_table_id = search_aux_table_ids.at(k);
+            const ObTableSchema *aux_table_schema = nullptr;
+            if (OB_FAIL(schema_guard_wrapper_.get_table_schema(search_aux_table_id, aux_table_schema))) {
+              LOG_WARN("failed to get search child for refresh fence", K(ret), K(search_aux_table_id));
+            } else if (OB_ISNULL(aux_table_schema)) {
+              ret = OB_SCHEMA_EAGAIN;
+              LOG_WARN("search child schema is null", K(ret), K_(tenant_id), K(search_aux_table_id));
+            } else if (OB_FAIL(aux_table_schema->get_tablet_ids(index_tablet_ids))) {
+              LOG_WARN("failed to collect search child tablets", K(ret), K(search_aux_table_id));
+            }
           }
         }
         if (OB_SUCC(ret) && OB_FAIL(index_schema->get_tablet_ids(index_tablet_ids))) {
-          LOG_WARN("fail to get async index tablet ids", KR(ret), KPC(index_schema));
+          LOG_WARN("failed to collect async index tablets", K(ret));
         }
       }
     }

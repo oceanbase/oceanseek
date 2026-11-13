@@ -13,6 +13,22 @@ namespace blocksstable
 {
 using namespace common;
 
+int ObInvIdxStatsMeta::init_empty_for_write(const ObInvIdxStatsMeta &source)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!source.is_valid()
+      || (source.is_search_text_index()
+          && !is_supported_search_text_write_layout(
+              source.has_relevance_params_, source.has_nested_key_)))) {
+    ret = OB_ERR_UNEXPECTED;
+    STORAGE_LOG(WARN, "inverted index meta does not support empty write", K(ret), K(source));
+  } else {
+    *this = source;
+    reuse();
+  }
+  return ret;
+}
+
 OB_SERIALIZE_MEMBER(ObInvIdxStatsMeta,
     index_type_,
     has_relevance_params_,

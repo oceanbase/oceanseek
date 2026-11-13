@@ -3118,7 +3118,7 @@ T_FUN_SYS_SEARCH_INDEX_INNER_PATH = 1943,
   T_SUBMIT_JOB_OPTION = 5005,
   T_SUBMIT_JOB_OPTION_LIST = 5006,
   T_LOB_INTABLE_THRESHOLD = 5007,
-  // Reserved parse nodes for Search Index FULLTEXT configuration syntax.
+  // Parse nodes for Search Index FULLTEXT configuration syntax.
   T_SEARCH_INDEX_MODE_LIST = 5008,
   T_SEARCH_INDEX_FULLTEXT = 5009,
   T_SEARCH_INDEX_VALUE = 5010,

@@ -2166,7 +2166,7 @@ int ObDelUpdResolver::add_all_part_columns_to_stmt(const TableItem &table_item,
   } else if (NULL == data_index_schema) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get invalid table schema", K(table_item));
-  } else if (data_index_schema->is_search_data_index()
+  } else if (data_index_schema->is_search_aux_index()
     && OB_FAIL(schema_checker_->get_table_schema(params_.session_info_->get_effective_tenant_id(),
                                                  data_index_schema->get_data_table_id(),
                                                  def_index_schema,

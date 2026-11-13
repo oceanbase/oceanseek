@@ -11,6 +11,7 @@
 #include "sql/ob_eval_bound.h"
 #include "share/diagnosis/ob_profile_name_def.h"
 #include "share/vector/ob_fixed_length_base.h"
+#include <algorithm>
 
 namespace oceanbase
 {
@@ -360,8 +361,29 @@ int CompactRowIDStore::get_rowid(int64_t idx, ObDASRowID &rowid) const
   } else if (OB_ISNULL(rowids_[idx])) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected nullptr rowid", K(ret), K(idx));
+  } else if (is_async_nested_scope(scope_)) {
+    // SORT retains (doc_id, NK), but asynchronous RowIDs expose only doc_id.
+    rowid.set_uint64(rowids_[idx]->get_datum(store_.get_row_meta(), 0).get_uint64());
   } else {
     rowid.set_compact_row(rowids_[idx]);
+  }
+  return ret;
+}
+
+int CompactRowIDStore::get_datum(int64_t idx, int64_t col_idx, ObDatum &datum) const
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(rowids_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("rowids_ is null, store not initialized", KR(ret));
+  } else if (idx < 0 || idx >= count_ || col_idx < 0 || col_idx >= store_.get_row_meta().col_cnt_) {
+    ret = OB_INDEX_OUT_OF_RANGE;
+    LOG_WARN("row or column index out of range", K(ret), K(idx), K(col_idx), K(count_));
+  } else if (OB_ISNULL(rowids_[idx])) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected nullptr rowid", K(ret), K(idx));
+  } else {
+    datum = rowids_[idx]->get_datum(store_.get_row_meta(), col_idx);
   }
   return ret;
 }
@@ -384,9 +406,10 @@ int CompactRowIDStore::lower_bound(const ObDASRowID &target, const int64_t start
     while (OB_SUCC(ret) && lo < hi) {
       int64_t mid = lo + (hi - lo) / 2;
       ObDASRowID mid_rowid;
-      mid_rowid.set_compact_row(rowids_[mid]);
       int cmp = 0;
-      if (OB_FAIL(search_ctx_.compare_rowid(scope_, mid_rowid, target, cmp))) {
+      if (OB_FAIL(get_rowid(mid, mid_rowid))) {
+        LOG_WARN("failed to get rowid", K(ret), K(mid));
+      } else if (OB_FAIL(search_ctx_.compare_rowid(scope_, mid_rowid, target, cmp))) {
         LOG_WARN("failed to compare rowids", K(ret), K(mid), K(scope_));
       } else if (cmp < 0) {
         lo = mid + 1;
@@ -452,6 +475,11 @@ int ObIDASSearchOp::do_advance_shallow(
   return ret;
 }
 
+int ObIDASSearchOp::do_advance_to(const ObDASNestedKey &target, ObDASNestedKey &curr_nk, double &score)
+{
+  return OB_NOT_IMPLEMENT;
+}
+
 int ObIDASSearchOp::do_advance_to_id(const ObDASRowID &target, ObDASRowID &curr_id)
 {
   UNUSED(target);
@@ -463,6 +491,11 @@ int ObIDASSearchOp::do_load_curr_score(double &score)
 {
   UNUSED(score);
   return OB_NOT_SUPPORTED;
+}
+
+int ObIDASSearchOp::do_next_rowid(ObDASNestedKey &next_nk, double &score)
+{
+  return OB_NOT_IMPLEMENT;
 }
 
 int ObIDASSearchOp::do_next_rowids(int64_t capacity, int64_t &count)

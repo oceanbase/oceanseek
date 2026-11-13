@@ -206,24 +206,28 @@ int ObForkTableUtil::collect_table_ids_from_table(
           } else if (OB_FAIL(table_ids.push_back(index_table_id))) {
             LOG_WARN("fail to push back index table id", KR(ret), K(index_table_id));
           } else if (index_schema->is_search_def_index()) {
-            uint64_t search_data_table_id = OB_INVALID_ID;
+            ObSEArray<uint64_t, 3> search_aux_table_ids;
             const ObTableSchema *search_data_schema = nullptr;
-            // SEARCH_DATA 紧跟 SEARCH_DEF 收集，保证源、目标表按数组位置正确配对。
-            if (OB_FAIL(index_schema->get_search_data_index_tid(search_data_table_id))) {
-              LOG_WARN("fail to get search data index id", KR(ret), K(index_table_id));
-            } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id, search_data_table_id, search_data_schema))) {
-              LOG_WARN("fail to get search data index schema", KR(ret), K(tenant_id), K(search_data_table_id));
-            } else if (OB_ISNULL(search_data_schema)) {
-              ret = OB_SCHEMA_EAGAIN;
-              LOG_WARN("search data index schema is null", KR(ret), K(tenant_id), K(search_data_table_id));
-            } else if (OB_UNLIKELY(!search_data_schema->is_search_data_index()
-                                   || search_data_schema->get_data_table_id() != index_table_id
-                                   || search_data_schema->is_in_recyclebin()
-                                   || INDEX_STATUS_AVAILABLE != search_data_schema->get_index_status())) {
-              ret = OB_SCHEMA_EAGAIN;
-              LOG_WARN("search index schema topology is not ready", KR(ret), KPC(index_schema), KPC(search_data_schema));
-            } else if (OB_FAIL(table_ids.push_back(search_data_table_id))) {
-              LOG_WARN("fail to push back search data index table id", KR(ret), K(search_data_table_id));
+            // Data/Match/Phrase 物理子表紧跟 Search Def 收集，保证源、目标表按数组位置正确配对。
+            if (OB_FAIL(index_schema->get_search_aux_index_tids(search_aux_table_ids))) {
+              LOG_WARN("fail to get search auxiliary index ids", KR(ret), K(index_table_id));
+            }
+            for (int64_t j = 0; OB_SUCC(ret) && j < search_aux_table_ids.count(); ++j) {
+              const uint64_t search_data_table_id = search_aux_table_ids.at(j);
+              if (OB_FAIL(schema_guard.get_table_schema(tenant_id, search_data_table_id, search_data_schema))) {
+                LOG_WARN("fail to get search auxiliary index schema", KR(ret), K(tenant_id), K(search_data_table_id));
+              } else if (OB_ISNULL(search_data_schema)) {
+                ret = OB_SCHEMA_EAGAIN;
+                LOG_WARN("search auxiliary index schema is null", KR(ret), K(tenant_id), K(search_data_table_id));
+              } else if (OB_UNLIKELY(!search_data_schema->is_search_aux_index()
+                                     || search_data_schema->get_data_table_id() != index_table_id
+                                     || search_data_schema->is_in_recyclebin()
+                                     || INDEX_STATUS_AVAILABLE != search_data_schema->get_index_status())) {
+                ret = OB_SCHEMA_EAGAIN;
+                LOG_WARN("search index schema topology is not ready", KR(ret), KPC(index_schema), KPC(search_data_schema));
+              } else if (OB_FAIL(table_ids.push_back(search_data_table_id))) {
+                LOG_WARN("fail to push back search auxiliary index table id", KR(ret), K(search_data_table_id));
+              }
             }
           }
         }

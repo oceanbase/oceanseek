@@ -89,7 +89,7 @@ int ObTabletDrop::add_drop_tablets_of_table_arg(
             && !aux_table_schema->is_mlog_table()) {
           ret = OB_INVALID_ARGUMENT;
           LOG_WARN("aux_table_schema must be local index or aux lob table", KR(ret), K(schemas), KPC(aux_table_schema));
-        } else if ((aux_table_schema->is_aux_lob_table() || aux_table_schema->is_search_data_index())
+        } else if ((aux_table_schema->is_aux_lob_table() || aux_table_schema->is_search_aux_index())
                    && data_table_id != aux_table_schema->get_data_table_id()) {
           // A vec snapshot subtable's lob aux has data_table_id == the snapshot's
           // id (not the user table's). Accept it when its direct host is another

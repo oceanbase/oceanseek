@@ -8,6 +8,8 @@
 
 
 #include "ob_tablet.h"
+#include "storage/retrieval/ob_inv_bm25_stat_cache.h"
+#include "sql/engine/expr/ob_expr_util.h"
 #include "lib/utility/ob_log_brief.h"
 #include "share/schema/ob_tenant_schema_service.h"
 #include "storage/ob_sync_tablet_seq_clog.h"
@@ -7803,8 +7805,9 @@ int ObTablet::get_async_index_sstable(
   return ret;
 }
 
-int ObTablet::get_async_inv_bm25_stats(
+int ObTablet::get_async_inv_total_doc_length(
     const share::SCN &read_snapshot,
+    const blocksstable::ObDatumRowkey *field_prefix,
     blocksstable::ObAsyncInvBM25Stats &stats) const
 {
   int ret = OB_SUCCESS;
@@ -7813,7 +7816,12 @@ int ObTablet::get_async_inv_bm25_stats(
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("not inited", K(ret), K_(is_inited));
-  } else if (OB_UNLIKELY(!read_snapshot.is_valid())) {
+  } else if (OB_UNLIKELY(!read_snapshot.is_valid()
+             || (nullptr != field_prefix
+                 && (!field_prefix->is_valid()
+                     || field_prefix->get_datum_cnt() != blocksstable::SEARCH_TEXT_TOKEN
+                     || field_prefix->get_datum(blocksstable::SEARCH_TEXT_COL_IDX).get_uint()
+                        == ObInvBM25StatCacheKey::FULLTEXT_COLUMN_IDX)))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(read_snapshot));
   } else if (OB_UNLIKELY(!is_async_index_storage_tablet())) {
@@ -7825,9 +7833,40 @@ int ObTablet::get_async_inv_bm25_stats(
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid async index table store", K(ret), K(get_tablet_id()));
   } else if (OB_FAIL(aggregate_async_inv_bm25_stats_(
-      *table_store_wrapper.get_member(), table_store_wrapper.get_meta_handle(),
-      read_snapshot, stats))) {
-    LOG_WARN("failed to aggregate async inv bm25 stats", K(ret), K(get_tablet_id()));
+             *table_store_wrapper.get_member(), table_store_wrapper.get_meta_handle(), read_snapshot,
+             field_prefix, ObInvBM25StatKind::TOTAL_DOC_LENGTH, ObString(), stats.total_doc_length_))) {
+    LOG_WARN("failed to get async inverted total document length", K(ret), K(get_tablet_id()));
+  }
+  return ret;
+}
+
+int ObTablet::get_async_inv_token_doc_cnt(
+    const share::SCN &read_snapshot,
+    const blocksstable::ObDatumRowkey *field_prefix,
+    const common::ObString &token,
+    blocksstable::ObAsyncInvBM25Stats &stats) const
+{
+  int ret = OB_SUCCESS;
+  stats.reset();
+  blocksstable::ObStorageDatum value;
+  ObTabletMemberWrapper<ObTabletTableStore> table_store_wrapper;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("not inited", K(ret), K_(is_inited));
+  } else if (OB_UNLIKELY(!read_snapshot.is_valid() || !is_async_index_storage_tablet() || token.empty())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid async index statistics argument", K(ret), K(read_snapshot), K(get_tablet_id()));
+  } else if (OB_FAIL(fetch_table_store(table_store_wrapper))) {
+    LOG_WARN("failed to fetch async index table store", K(ret), K(get_tablet_id()));
+  } else if (OB_UNLIKELY(!table_store_wrapper.is_valid())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid async index table store", K(ret), K(get_tablet_id()));
+  } else if (OB_FAIL(aggregate_async_inv_bm25_stats_(
+             *table_store_wrapper.get_member(), table_store_wrapper.get_meta_handle(), read_snapshot,
+             field_prefix, ObInvBM25StatKind::TOKEN_DOC_CNT, token, value))) {
+    LOG_WARN("failed to aggregate async index statistics", K(ret), K(get_tablet_id()));
+  } else {
+    stats.token_doc_cnt_ = value.get_uint();
   }
   return ret;
 }
@@ -7836,12 +7875,25 @@ int ObTablet::aggregate_async_inv_bm25_stats_(
     const ObTabletTableStore &table_store,
     const ObStorageMetaHandle &table_store_handle,
     const share::SCN &read_snapshot,
-    blocksstable::ObAsyncInvBM25Stats &stats) const
+    const blocksstable::ObDatumRowkey *field_prefix,
+    const ObInvBM25StatKind kind,
+    const common::ObString &token,
+    blocksstable::ObStorageDatum &stat_value) const
 {
   int ret = OB_SUCCESS;
-  stats.reset();
+  if (ObInvBM25StatKind::TOTAL_DOC_LENGTH == kind) {
+    stat_value.set_number(number::ObNumber::get_zero());
+  } else if (ObInvBM25StatKind::TOKEN_DOC_CNT == kind) {
+    stat_value.set_uint(0);
+  } else {
+    stat_value.set_nop();
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("unsupported async inverted statistic kind", K(ret), K(kind));
+  }
+  blocksstable::ObStorageDatum sum = stat_value;
   common::ObSEArray<common::ObNewVersionRange, 64> version_ranges;
-  if (OB_UNLIKELY(!read_snapshot.is_valid())) {
+  if (OB_FAIL(ret)) {
+  } else if (OB_UNLIKELY(!read_snapshot.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid async index read snapshot", K(ret), K(read_snapshot));
   } else if (OB_FAIL(table_store.get_async_index_sstable_version_ranges(*this, version_ranges))) {
@@ -7869,23 +7921,36 @@ int ObTablet::aggregate_async_inv_bm25_stats_(
     } else if (OB_ISNULL(sstable) || OB_UNLIKELY(!sstable->is_inv_sstable())) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected non-inv sstable for bm25 stats", K(ret), KP(sstable), K(range));
-    } else {
-      const blocksstable::ObInvSSTable *inv_sstable =
-          static_cast<const blocksstable::ObInvSSTable *>(sstable);
-      const blocksstable::ObInvIdxStatsMeta &inv_meta = inv_sstable->get_inv_meta().get_stats();
-      if (OB_UNLIKELY(!inv_meta.is_valid())) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("invalid inv meta", K(ret), K(inv_meta), KPC(inv_sstable));
-      } else if (UINT64_MAX - stats.total_doc_length_ < inv_meta.total_doc_length_) {
-        ret = OB_SIZE_OVERFLOW;
-        LOG_WARN("total doc length overflow", K(ret), K(stats), K(inv_meta));
+    } else if (ObInvBM25StatKind::TOTAL_DOC_LENGTH == kind) {
+      blocksstable::ObStorageDatum value;
+      sql::ObNumStackAllocator<1> allocator;
+      number::ObNumber current(sum.get_number());
+      number::ObNumber next_sum;
+      if (OB_FAIL(OB_INV_BM25_STAT_CACHE.get_sstable_total_doc_length(
+          *static_cast<blocksstable::ObInvSSTable *>(sstable), get_rowkey_read_info(),
+          const_cast<ObTablet *>(this), field_prefix, value))) {
+        LOG_WARN("failed to get cached sstable document length", K(ret), K(range));
+      } else if (OB_FAIL(current.add_v3(value.get_number(), next_sum, allocator))) {
+        LOG_WARN("failed to add document lengths across sstables", K(ret), K(sum), K(value));
       } else {
-        stats.total_doc_length_ += inv_meta.total_doc_length_;
+        sum.set_number(next_sum);
+      }
+    } else {
+      uint64_t token_doc_cnt = 0;
+      if (OB_FAIL(OB_INV_BM25_STAT_CACHE.get_sstable_token_doc_cnt(
+          *static_cast<blocksstable::ObInvSSTable *>(sstable), get_rowkey_read_info(),
+          const_cast<ObTablet *>(this), field_prefix, token, token_doc_cnt))) {
+        LOG_WARN("failed to get cached sstable token document count", K(ret), K(range));
+      } else if (UINT64_MAX - sum.get_uint() < token_doc_cnt) {
+        ret = OB_SIZE_OVERFLOW;
+        LOG_WARN("statistic overflows across sstables", K(ret), K(sum), K(token_doc_cnt));
+      } else {
+        sum.set_uint(sum.get_uint() + token_doc_cnt);
       }
     }
   }
-  if (OB_FAIL(ret)) {
-    stats.reset();
+  if (OB_SUCC(ret)) {
+    stat_value = sum;
   }
   return ret;
 }

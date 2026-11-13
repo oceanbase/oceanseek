@@ -2482,6 +2482,13 @@ int ObSqlParameterization::mark_tree(TransformTreeCtx &ctx, ParseNode *tree ,Sql
         SQL_PC_LOG(WARN, "fail to mark substr arg", K(ret));
       }
     }
+  } else if (T_FUN_MATCH_AGAINST == tree->type_ && 3 == tree->num_child_) {
+    // Search FULLTEXT binds the JSON path as a literal; only the query is parameterized.
+    const int64_t ARGS_NUMBER_THREE = 3;
+    bool mark_arr[ARGS_NUMBER_THREE] = {0, 1, 0};
+    if (OB_FAIL(mark_args(tree, mark_arr, ARGS_NUMBER_THREE, sql_info))) {
+      SQL_PC_LOG(WARN, "failed to mark Search FULLTEXT path", K(ret));
+    }
   } else if(T_FUN_SYS_JSON_EXTRACT == tree->type_) {
     if (2 != tree->num_child_) {
       ret = OB_INVALID_ARGUMENT;

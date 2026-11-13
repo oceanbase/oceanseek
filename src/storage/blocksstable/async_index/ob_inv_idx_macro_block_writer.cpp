@@ -297,6 +297,14 @@ int ObInvIdxMacroBlockWriter::open(
     if (OB_FAIL(inv_idx_row_desc_.build_encoding_params(
         col_descs, posting_ctx_, posting_value_param_))) {
       STORAGE_LOG(WARN, "fail to build inverted index encoding params", K(ret), K(inv_idx_row_desc_));
+    } else if (INV_IDX_TYPE_SEARCH_TEXT == inv_idx_row_desc_.index_type_
+        && OB_UNLIKELY(!is_supported_search_text_write_layout(
+            posting_ctx_.has_token_freq() && posting_ctx_.has_doc_length(),
+            posting_value_param_.has_nested_key()))) {
+      // Search Text currently always writes a three-column posting; the value can only be POS.
+      ret = OB_INVALID_ARGUMENT;
+      STORAGE_LOG(WARN, "unexpected search text encoding layout", K(ret),
+          K(inv_idx_row_desc_), K(posting_ctx_), K(posting_value_param_));
     } else if (OB_UNLIKELY(!is_pre_alloc())) {
       ret = OB_NOT_SUPPORTED;
       STORAGE_LOG(WARN, "inverted index macro writer requires the pre-alloc path",
@@ -419,7 +427,10 @@ int ObInvIdxMacroBlockWriter::inner_append_row(const ObDatumRow &row)
   int ret = OB_SUCCESS;
   ObDatumRowkey term;
   int cmp_ret = 0;
-  if (OB_FAIL(extract_term(row, term))) {
+  if (INV_IDX_TYPE_SEARCH_TEXT == inv_idx_row_desc_.index_type_
+      && OB_FAIL(check_search_text_row(row))) {
+    STORAGE_LOG(WARN, "invalid search text row", K(ret), K(row));
+  } else if (OB_FAIL(extract_term(row, term))) {
     STORAGE_LOG(WARN, "fail to extract inverted index term", K(ret), K(row));
   } else if (OB_FAIL(check_term_order(term))) {
     STORAGE_LOG(WARN, "fail to check inverted index input order", K(ret), K(term));
@@ -473,6 +484,54 @@ int ObInvIdxMacroBlockWriter::append_batch(const ObBatchDatumRows &rows)
       } else if (OB_FAIL(inner_append_row(row))) {
         STORAGE_LOG(WARN, "fail to append converted inverted index batch row", K(ret), K(i), K(row));
       }
+    }
+  }
+  return ret;
+}
+
+// An encoded search text datum must not be NULL/NOP. PATH may be an empty string, while
+// TOKEN/POS must not be (integer datums are never empty).
+static int check_search_text_datum(const ObDatumRow &row, const int64_t col_idx)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(col_idx >= row.get_column_count())) {
+    ret = OB_INVALID_ARGUMENT;
+    STORAGE_LOG(WARN, "search text column index out of row", K(ret), K(col_idx), K(row));
+  } else {
+    const ObStorageDatum &datum = row.storage_datums_[col_idx];
+    const bool allow_empty = SEARCH_TEXT_PATH == col_idx;
+    if (OB_UNLIKELY(datum.is_null() || datum.is_nop() || (!allow_empty && 0 == datum.len_))) {
+      ret = OB_INVALID_ARGUMENT;
+      STORAGE_LOG(WARN, "search text row has null, nop or empty datum", K(ret), K(col_idx), K(row));
+    }
+  }
+  return ret;
+}
+
+int ObInvIdxMacroBlockWriter::check_search_text_row(const ObDatumRow &row) const
+{
+  int ret = OB_SUCCESS;
+  // Validate only the encoded columns: the term prefix and the posting columns. Multi-version
+  // columns are not stored by the inverted format and stay NOP in compaction rewrite rows
+  // (the logical block iterator leaves them NOP and the merge iterator only fills the term).
+  // Check before any append operation so an invalid row leaves no partial posting behind.
+  const int64_t posting_col_idxs[] = {
+      inv_idx_row_desc_.doc_id_col_idx_,
+      inv_idx_row_desc_.token_freq_col_idx_,
+      inv_idx_row_desc_.doc_length_col_idx_,
+      inv_idx_row_desc_.pos_list_col_idx_,  // -1 for MATCH tables
+  };
+  if (OB_UNLIKELY(!row.is_valid() || term_col_count_ <= 0
+      || row.get_column_count() < term_col_count_)) {
+    ret = OB_INVALID_ARGUMENT;
+    STORAGE_LOG(WARN, "invalid search text row", K(ret), K_(term_col_count), K(row));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < term_col_count_; ++i) {
+    ret = check_search_text_datum(row, i);
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < ARRAYSIZEOF(posting_col_idxs); ++i) {
+    if (posting_col_idxs[i] >= 0) {
+      ret = check_search_text_datum(row, posting_col_idxs[i]);
     }
   }
   return ret;

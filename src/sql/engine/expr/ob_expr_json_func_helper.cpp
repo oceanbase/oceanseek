@@ -3006,6 +3006,27 @@ bool ObJsonExprHelper::check_json_inner_same_as(const ObSysFunRawExpr *expr1,
   return bool_ret;
 }
 
+int ObJsonExprHelper::append_json_strings(ObIAllocator &allocator,
+                                        const ObIArray<ObString> &strings,
+                                        ObJsonArray &json_array)
+{
+  INIT_SUCC(ret);
+  for (int64_t index = 0; OB_SUCC(ret) && index < strings.count(); ++index) {
+    const ObString &value = strings.at(index);
+    void *buf = allocator.alloc(sizeof(ObJsonString));
+    if (OB_ISNULL(buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("allocate json string failed", K(ret), K(index));
+    } else {
+      ObJsonString *json_string = new (buf) ObJsonString(value.ptr(), value.length());
+      if (OB_FAIL(json_array.append(json_string))) {
+        LOG_WARN("append json string failed", K(ret), K(index));
+      }
+    }
+  }
+  return ret;
+}
+
 /********** ObJsonExprHelper for json partial update  ****************/
 int ObJsonExprHelper::pack_json_diff_res(
     const ObExpr &expr,

@@ -119,7 +119,9 @@ public:
       docid_range_hi_(),
       has_docid_range_(false),
       logical_table_ctx_(),
+      nested_scope_id_(DAS_SCOPE_MAX),
       op_creating_scope_(DAS_SCOPE_BASE),
+      op_creating_depth_(0),
       current_async_partition_(nullptr),
       async_group_mode_override_(ASYNC_GROUP_MODE_INHERIT),
       async_index_table_id_(common::OB_INVALID_ID),
@@ -149,9 +151,11 @@ public:
   */
   int get_related_tablet_id(const ObDASScalarScanCtDef *scalar_ctdef, common::ObTabletID &tablet_id);
 
-  // Populates scopes_[DAS_SCOPE_NESTED_SYNC]. Call once after init() when ctdef has NESTED_PATHS.
-  // nested_rowid_exprs must be non-null and non-empty (typically [doc_id_expr, nested_key_expr]).
-  int register_nested_scope(const sql::ExprFixedArray *nested_rowid_exprs);
+  // Register one nested mode before creating operators. The scope fixes its
+  // RowID layout: ASYNC uses doc_id; SYNC retains CompactRow (doc_id, NK).
+  int register_nested_scope(const sql::ExprFixedArray *nested_rowid_exprs,
+                            ObDASScopeId scope_id);
+  ObDASScopeId get_nested_scope_id() const { return nested_scope_id_; }
 
   // Fills scan_param metadata from ctdef/rtdef. Does not copy key_ranges_;
   // callers that table_scan the full domain must assign rtdef->key_ranges_
@@ -292,7 +296,7 @@ public:
       common::ObNewVersionRange &version_range,
       bool &is_empty) const;
   OB_INLINE bool has_nested_scope() const
-  { return nullptr != scopes_[DAS_SCOPE_NESTED_SYNC].rowid_exprs_; }
+  { return is_nested_scope(nested_scope_id_); }
   OB_INLINE void set_async_index_table_id(const uint64_t index_table_id)
   { async_index_table_id_ = index_table_id; }
   OB_INLINE uint64_t get_async_index_table_id() const { return async_index_table_id_; }
@@ -363,13 +367,16 @@ public:
   { return all_rowid_funcs_[scopes_[scope].rowid_type_].get_datum_(rowid, scopes_[scope].rowid_meta_, datum, col_idx); }
 
   OB_INLINE ObDASScopeId get_op_creating_scope() const { return op_creating_scope_; }
-  OB_INLINE void enter_scope_for_op_creating(ObDASScopeId new_scope, ObDASScopeId &backup_scope)
+  OB_INLINE int32_t get_op_creating_depth() const { return op_creating_depth_; }
+  OB_INLINE void enter_scope_for_op_creating(ObDASScopeId new_scope, int32_t depth, ObDASScopeId &backup_scope)
   {
     backup_scope = op_creating_scope_;
     op_creating_scope_ = new_scope;
+    op_creating_depth_ = depth;
   }
-  OB_INLINE void exit_scope_after_op_created(ObDASScopeId backup_scope) {
+  OB_INLINE void exit_scope_after_op_created(ObDASScopeId backup_scope, int32_t backup_depth) {
     op_creating_scope_ = backup_scope;
+    op_creating_depth_ = backup_depth;
   }
 
 public:
@@ -459,9 +466,11 @@ private:
   // hybrid_search has 1 IR ctdef and a small number of distinct filter sets.
   ObSEArray<ObLogicalFilteredBM25StatsProvider *, 4> logical_bm25_stats_providers_;
   ObDASRowIDScope scopes_[DAS_SCOPE_MAX];
+  ObDASScopeId nested_scope_id_; // MAX until one nested mode is registered.
   // only used for create op with specific scope
   // not used after das op tree is created
   ObDASScopeId op_creating_scope_;
+  int32_t op_creating_depth_;
   const ObAsyncIndexPartitionSegCtx *current_async_partition_; // worker-local cursor into shared catalog
   ObDASAsyncGroupModeOverride async_group_mode_override_; // Temporary subtree-local override during op tree build
   uint64_t async_index_table_id_; // Used only while building the largest async-index subtree

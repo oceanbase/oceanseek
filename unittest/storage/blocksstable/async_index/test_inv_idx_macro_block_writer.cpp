@@ -11,6 +11,15 @@
 
 #include <atomic>
 #include <gtest/gtest.h>
+#include "sql/engine/expr/ob_expr_lob_utils.h"
+#include "share/search_index/ob_search_index_generator.h"
+#include "share/search_index/ob_search_index_config.h"
+#include "unittest/share/search_index/search_index_config_test_util.h"
+#include "share/ob_fts_pos_list_codec.h"
+#include "plugin/legacy/sys/ob_plugin_mgr.h"
+#include "lib/json_type/ob_json_bin.h"
+#include "lib/json_type/ob_json_base.h"
+#include <algorithm>
 #include <thread>
 
 #define private public
@@ -28,7 +37,10 @@
 #include "storage/blocksstable/async_index/ob_inv_idx_macro_block_writer.h"
 #include "storage/blocksstable/async_index/ob_inv_idx_index_block_builder.h"
 #include "storage/blocksstable/async_index/ob_inv_idx_micro_block_reader.h"
+#include "storage/blocksstable/async_index/ob_inv_idx_micro_block_transformer.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable_merge_helper.h"
+#include "storage/blocksstable/async_index/ob_posting_block_decoder.h"
+#include "storage/blocksstable/ob_macro_block_reader.h"
 #include "storage/blocksstable/async_index/ob_posting_value_block_reader.h"
 #include "storage/async_index/ob_deletion_bitmap_provider.h"
 #include "storage/blocksstable/ob_sstable_private_object_cleaner.h"
@@ -372,6 +384,126 @@ static int make_search_idx_row(
 }
 
 // =============================================================================
+// Helper: build a search text index table schema.
+//
+// Logical column layout (storage rows add MVCC columns after the rowkey):
+//   col 0: COL_IDX  (uint64,    rowkey #1, term col)
+//   col 1: PATH     (VARBINARY, rowkey #2, term col)
+//   col 2: TOKEN    (VARBINARY, rowkey #3, term col)
+//   col 3: DOC_ID   (uint64,    rowkey #4)
+//   col 4: TOKEN_FREQ (uint64)
+//   col 5: DOC_LENGTH (uint64)
+//   col 6: POSITION_LIST (VARBINARY), PHRASE only
+// =============================================================================
+static void prepare_search_text_idx_schema(
+    share::schema::ObTableSchema &table_schema,
+    const bool has_pos_list,
+    const int64_t micro_block_size = 16 * 1024)
+{
+  const uint64_t table_id = 8888;
+  const int64_t rowkey_column_cnt = SEARCH_TEXT_ROWKEY_CNT;
+  const int64_t column_cnt = has_pos_list ? SEARCH_TEXT_COL_CNT_WITH_POS
+                                          : SEARCH_TEXT_COL_CNT_WITHOUT_POS;
+
+  table_schema.reset();
+  ASSERT_EQ(OB_SUCCESS, table_schema.set_table_name("test_search_text_idx"));
+  table_schema.set_tenant_id(1);
+  table_schema.set_tablegroup_id(1);
+  table_schema.set_database_id(1);
+  table_schema.set_table_id(table_id);
+  table_schema.set_index_type(has_pos_list
+      ? share::schema::INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_PHRASE_INDEX_LOCAL
+      : share::schema::INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_INDEX_LOCAL);
+  // index_type implies an index table; reset() leaves USER_TABLE which fails
+  // ObSimpleTableSchemaV2::is_valid() (table_type/index_type mismatch, then data_table_id).
+  table_schema.set_table_type(share::schema::USER_INDEX);
+  table_schema.set_data_table_id(9999);
+  table_schema.set_rowkey_column_num(rowkey_column_cnt);
+  table_schema.set_max_used_column_id(common::OB_APP_MIN_COLUMN_ID + column_cnt);
+  table_schema.set_block_size(micro_block_size);
+  table_schema.set_compress_func_name("none");
+  table_schema.set_row_store_type(FLAT_ROW_STORE);
+  table_schema.set_pctfree(10);
+
+  struct ColMeta { int64_t rowkey_pos_; ObObjType obj_type_; };
+  const ColMeta col_metas[SEARCH_TEXT_COL_CNT_WITH_POS] = {
+      {1, ObUInt64Type},    // COL_IDX
+      {2, ObVarcharType},   // PATH
+      {3, ObVarcharType},   // TOKEN
+      {4, ObUInt64Type},    // DOC_ID
+      {0, ObUInt64Type},    // TOKEN_FREQ
+      {0, ObUInt64Type},    // DOC_LENGTH
+      {0, ObVarcharType}};  // POSITION_LIST
+
+  char name[OB_MAX_FILE_NAME_LENGTH];
+  memset(name, 0, sizeof(name));
+  for (int64_t i = 0; i < column_cnt; ++i) {
+    share::schema::ObColumnSchemaV2 column;
+    column.reset();
+    column.set_table_id(table_id);
+    column.set_column_id(common::OB_APP_MIN_COLUMN_ID + i);
+    sprintf(name, "search_text%020ld", i);
+    ASSERT_EQ(OB_SUCCESS, column.set_column_name(name));
+    column.set_data_type(col_metas[i].obj_type_);
+    column.set_collation_type(CS_TYPE_BINARY);
+    if (i == SEARCH_TEXT_TOKEN) { column.set_charset_type(CHARSET_BINARY); }
+    column.set_data_length(64);
+    column.set_nullable(false);
+    column.set_rowkey_position(col_metas[i].rowkey_pos_);
+    share::schema::ObSkipIndexColumnAttr skip_idx_attr;
+    skip_idx_attr.set_min_max();
+    column.set_skip_index_attr(skip_idx_attr.get_packed_value());
+    ASSERT_EQ(OB_SUCCESS, table_schema.add_column(column));
+  }
+}
+
+// =============================================================================
+// Helper: build a search text ObDatumRow in the multi-version column layout.
+//
+// MV layout: COL_IDX, PATH, TOKEN, DOC_ID, trans_version, sql_sequence, TF, DL, [POS]
+// =============================================================================
+static int make_search_text_row(
+    ObDatumRow &row,
+    const ObInvIdxRowDesc &row_desc,
+    const int64_t mv_col_cnt,
+    const uint64_t col_idx,
+    const char *path_str,
+    const char *token_str,
+    const uint64_t doc_id,
+    const uint64_t token_freq,
+    const uint64_t doc_length,
+    const char *pos_list_str)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(mv_col_cnt <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    STORAGE_LOG(WARN, "invalid mv col cnt", K(ret), K(mv_col_cnt));
+  } else if (OB_UNLIKELY(!row.is_valid() || row.get_column_count() != mv_col_cnt)) {
+    row.reset();
+    if (OB_FAIL(row.init(mv_col_cnt))) {
+      STORAGE_LOG(WARN, "fail to init datum row", K(ret));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    row.count_ = static_cast<uint16_t>(mv_col_cnt);
+    for (int16_t i = 0; i < row.count_; ++i) {
+      row.storage_datums_[i].reuse();
+      row.storage_datums_[i].set_int(0);
+    }
+    row.storage_datums_[SEARCH_TEXT_COL_IDX].set_uint(col_idx);
+    row.storage_datums_[SEARCH_TEXT_PATH].set_string(ObString(path_str));
+    row.storage_datums_[SEARCH_TEXT_TOKEN].set_string(ObString(token_str));
+    row.storage_datums_[row_desc.doc_id_col_idx_].set_uint(doc_id);
+    row.storage_datums_[row_desc.token_freq_col_idx_].set_uint(token_freq);
+    row.storage_datums_[row_desc.doc_length_col_idx_].set_uint(doc_length);
+    if (row_desc.pos_list_col_idx_ >= 0) {
+      row.storage_datums_[row_desc.pos_list_col_idx_].set_string(ObString(pos_list_str));
+    }
+  }
+  return ret;
+}
+
+// =============================================================================
 // ObInvIdxMacroBlockWriterTest
 // =============================================================================
 class ObInvIdxMacroBlockWriterTest : public ::testing::Test
@@ -462,6 +594,13 @@ protected:
   // and nested_key_col_idx_ after init(), simulating a correctly filled row desc
   // (schema layer has no is_async_search_index / nested_key flag yet).
   int prepare_search_open_env(const char *compress_name = "none");
+  // Variant of prepare_open_env for search text index: builds the COL_IDX/PATH/TOKEN/DOC_ID
+  // rowkey schema with MATCH/PHRASE index types, so the row desc comes from the
+  // production init_search_text() path.
+  int prepare_search_text_open_env(const bool has_pos_list);
+  // Steps shared by every open env after the schema and row desc are ready: data store desc,
+  // sstable index builder and macro sequence param.
+  int prepare_store_env(const compaction::ObMergeType merge_type, const bool micro_index_clustered);
   // Open a writer against the env prepared by prepare_open_env(). Reused by the
   // append_row normal-path cases to avoid repeating the open() boilerplate.
   int open_writer(ObInvIdxMacroBlockWriter &writer, ObSSTablePrivateObjectCleaner &cleaner);
@@ -509,9 +648,36 @@ int ObInvIdxMacroBlockWriterTest::prepare_open_env(const bool has_pos_list, cons
         has_relevance ? INV_IDX_TYPE_FTS : INV_IDX_TYPE_SEARCH;
   }
 
-  // 2. Init ObStaticDataStoreDesc
   if (OB_FAIL(ret)) {
-  } else {
+  } else if (OB_FAIL(prepare_store_env(merge_type, micro_index_clustered))) {
+    STORAGE_LOG(WARN, "fail to prepare store env", K(ret));
+  }
+  return ret;
+}
+
+int ObInvIdxMacroBlockWriterTest::prepare_search_text_open_env(const bool has_pos_list)
+{
+  int ret = OB_SUCCESS;
+  prepare_search_text_idx_schema(table_schema_, has_pos_list);
+  if (OB_FAIL(prepare_inv_idx_row_desc(table_schema_, inv_idx_row_desc_))) {
+    STORAGE_LOG(WARN, "fail to prepare search text row desc", K(ret));
+  } else if (OB_UNLIKELY(INV_IDX_TYPE_SEARCH_TEXT != inv_idx_row_desc_.index_type_)) {
+    ret = OB_ERR_UNEXPECTED;
+    STORAGE_LOG(WARN, "unexpected search text row desc", K(ret), K(inv_idx_row_desc_));
+  } else if (OB_FAIL(prepare_store_env(compaction::MINI_MERGE, false /*micro_index_clustered*/))) {
+    STORAGE_LOG(WARN, "fail to prepare store env", K(ret));
+  }
+  return ret;
+}
+
+int ObInvIdxMacroBlockWriterTest::prepare_store_env(
+    const compaction::ObMergeType merge_type,
+    const bool micro_index_clustered)
+{
+  int ret = OB_SUCCESS;
+
+  // 2. Init ObStaticDataStoreDesc
+  {
     share::SCN end_scn;
     share::SCN reorganization_scn;
     const int64_t cluster_version = DATA_VERSION_4_6_0_0;
@@ -1984,6 +2150,869 @@ TEST_F(ObInvIdxMacroBlockWriterTest, search_index_inv_meta_type)
   writer.reset();
 }
 
+// 10.1.1 search_text_open_propagates_capabilities: open accepts the three-column
+// posting layout of a search text row desc and propagates its static capabilities.
+// The FTS fixture only provides the TF/DL/POS storage layout; no rows are appended.
+TEST_F(ObInvIdxMacroBlockWriterTest, search_text_open_propagates_capabilities)
+{
+  ObInvIdxMacroBlockWriter writer;
+  ObSSTablePrivateObjectCleaner cleaner;
+  ASSERT_EQ(OB_SUCCESS, prepare_open_env(true /*has_pos_list*/, true /*has_relevance*/));
+  inv_idx_row_desc_.index_type_ = INV_IDX_TYPE_SEARCH_TEXT;
+  ASSERT_EQ(OB_SUCCESS, open_writer(writer, cleaner));
+  ASSERT_TRUE(writer.is_opened());
+
+  EXPECT_EQ(INV_IDX_TYPE_SEARCH_TEXT, writer.current_micro_stats_.inv_meta_.get_stats().index_type_);
+  EXPECT_EQ(INV_IDX_TYPE_SEARCH_TEXT, writer.macro_stats_.inv_meta_.get_stats().index_type_);
+  EXPECT_EQ(INV_IDX_TYPE_SEARCH_TEXT, writer.seg_inv_meta_.get_stats().index_type_);
+  EXPECT_TRUE(writer.seg_inv_meta_.get_stats().has_relevance_params_);
+  EXPECT_TRUE(writer.seg_inv_meta_.get_stats().has_position_list_);
+  EXPECT_FALSE(writer.seg_inv_meta_.get_stats().has_nested_key_);
+  EXPECT_TRUE(writer.seg_inv_meta_.is_valid());
+  EXPECT_TRUE(writer.seg_inv_meta_.get_stats().is_empty_range());
+
+  ASSERT_EQ(OB_SUCCESS, writer.close());
+  writer.reset();
+}
+
+// 10.1.2 search_text_open_rejects_doc_id_only_layout: the current search text writer
+// only produces DOC_ID/TF/DL postings, so a DOC_ID-only layout is rejected at open.
+TEST_F(ObInvIdxMacroBlockWriterTest, search_text_open_rejects_doc_id_only_layout)
+{
+  ObInvIdxMacroBlockWriter writer;
+  ObSSTablePrivateObjectCleaner cleaner;
+  ASSERT_EQ(OB_SUCCESS, prepare_open_env(false /*has_pos_list*/, false /*has_relevance*/));
+  inv_idx_row_desc_.index_type_ = INV_IDX_TYPE_SEARCH_TEXT;
+  ASSERT_EQ(OB_INVALID_ARGUMENT, open_writer(writer, cleaner));
+  ASSERT_FALSE(writer.is_opened());
+}
+
+struct SearchTextTestRow
+{
+  int64_t col_idx_;
+  const char *path_;
+  const char *token_;
+  uint64_t doc_id_;
+  uint64_t token_freq_;
+  uint64_t doc_length_;
+  const char *pos_list_;
+};
+
+// Locate the posting micro block and, when present, the posting value micro block that
+// immediately follows it in the single in-memory data macro block.
+static void locate_search_text_micro_blocks(
+    ObInvIdxMacroBlockWriter &writer,
+    const bool has_pos_list,
+    const char *&posting_micro_block,
+    int64_t &posting_micro_block_size,
+    const char *&posting_value_micro_block,
+    int64_t &posting_value_micro_block_size)
+{
+  posting_value_micro_block = nullptr;
+  posting_value_micro_block_size = 0;
+  ASSERT_EQ(has_pos_list ? 2 : 1, writer.macro_block_.get_micro_block_count());
+  posting_micro_block = writer.macro_block_.get_micro_block_data_ptr();
+  const int64_t micro_block_data_size = writer.macro_block_.get_micro_block_data_size();
+  ObMicroBlockHeader posting_header;
+  int64_t header_pos = 0;
+  ASSERT_EQ(OB_SUCCESS,
+      posting_header.deserialize(posting_micro_block, micro_block_data_size, header_pos));
+  ASSERT_EQ(MICRO_BLOCK_INV_IDX_POSTING,
+      static_cast<ObMicroBlockInvertedIndexType>(posting_header.inverted_index_type_));
+  posting_micro_block_size = posting_header.header_size_ + posting_header.data_zlength_;
+  // The macro data region also carries the index/meta blocks appended by
+  // write_index_and_meta_blocks() after the data micro blocks, so the posting
+  // (and posting value) blocks only cover the data prefix, not the whole region.
+  if (!has_pos_list) {
+    ASSERT_LT(posting_micro_block_size, micro_block_data_size);
+  } else {
+    ASSERT_LT(posting_micro_block_size, micro_block_data_size);
+    posting_value_micro_block = posting_micro_block + posting_micro_block_size;
+    const int64_t remain_size = micro_block_data_size - posting_micro_block_size;
+    ObMicroBlockHeader posting_value_header;
+    header_pos = 0;
+    ASSERT_EQ(OB_SUCCESS,
+        posting_value_header.deserialize(posting_value_micro_block, remain_size, header_pos));
+    ASSERT_EQ(MICRO_BLOCK_INV_IDX_POSTING_VALUE,
+        static_cast<ObMicroBlockInvertedIndexType>(posting_value_header.inverted_index_type_));
+    posting_value_micro_block_size =
+        posting_value_header.header_size_ + posting_value_header.data_zlength_;
+    ASSERT_LT(posting_value_micro_block_size, remain_size);
+  }
+}
+
+TEST_F(ObInvIdxMacroBlockWriterTest, search_text_rejects_invalid_datum_before_mutation)
+{
+  ObInvIdxMacroBlockWriter writer;
+  ObSSTablePrivateObjectCleaner cleaner;
+  ASSERT_EQ(OB_SUCCESS, prepare_search_text_open_env(true /*has_pos_list*/));
+  ASSERT_EQ(OB_SUCCESS, open_writer(writer, cleaner));
+  ObDatumRow row;
+  // Reject NULL/NOP only in encoded columns; multi-version columns are not encoded.
+  for (int64_t i = 0; i < mv_col_cnt_; ++i) {
+    if (i >= SEARCH_TEXT_ROWKEY_CNT
+        && i < SEARCH_TEXT_ROWKEY_CNT + ObMultiVersionRowkeyHelpper::get_extra_rowkey_col_cnt()) {
+      continue;
+    }
+    for (int64_t nop = 0; nop < 2; ++nop) {
+      ASSERT_EQ(OB_SUCCESS, make_search_text_row(row, inv_idx_row_desc_, mv_col_cnt_,
+          1, "$.title", "database", 42, 1, 2, "pos"));
+      if (0 == nop) {
+        row.storage_datums_[i].set_null();
+      } else {
+        row.storage_datums_[i].set_nop();
+      }
+      ASSERT_EQ(OB_INVALID_ARGUMENT, writer.append_row(row));
+      EXPECT_FALSE(writer.has_pending_rows_);
+    }
+  }
+  // Allow empty PATH strings, but still reject empty TOKEN and POS strings.
+  const int64_t string_cols[] = {SEARCH_TEXT_TOKEN,
+      inv_idx_row_desc_.pos_list_col_idx_};
+  for (int64_t i = 0; i < ARRAYSIZEOF(string_cols); ++i) {
+    ASSERT_EQ(OB_SUCCESS, make_search_text_row(row, inv_idx_row_desc_, mv_col_cnt_,
+        1, "$.title", "database", 42, 1, 2, "pos"));
+    row.storage_datums_[string_cols[i]].set_string(ObString());
+    ASSERT_EQ(OB_INVALID_ARGUMENT, writer.append_row(row));
+    EXPECT_FALSE(writer.has_pending_rows_);
+  }
+  // A rejected row must not leave a partial posting or value behind.
+  ASSERT_EQ(OB_SUCCESS, make_search_text_row(row, inv_idx_row_desc_, mv_col_cnt_,
+      1, "$.title", "database", 42, 1, 2, "pos"));
+  ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+  ASSERT_EQ(OB_SUCCESS, writer.close());
+  EXPECT_EQ(1u, writer.get_seg_inv_meta().get_stats().total_doc_length_);
+  writer.reset();
+}
+
+TEST_F(ObInvIdxMacroBlockWriterTest, search_text_accepts_nop_mv_columns_and_empty_path_match)
+{
+  ObInvIdxMacroBlockWriter writer;
+  ObSSTablePrivateObjectCleaner cleaner;
+  ASSERT_EQ(OB_SUCCESS, prepare_search_text_open_env(false /*has_pos_list*/));
+  ASSERT_EQ(OB_SUCCESS, open_writer(writer, cleaner));
+  ObDatumRow row;
+  // Cover empty and non-empty PATH values with NOP multi-version columns, as produced by compaction.
+  const char *paths[] = {"", "$.title"};
+  for (int64_t i = 0; i < ARRAYSIZEOF(paths); ++i) {
+    ASSERT_EQ(OB_SUCCESS, make_search_text_row(row, inv_idx_row_desc_, mv_col_cnt_,
+        1, paths[i], "database", 42 + i, 1, 2, "pos"));
+    for (int64_t j = 0; j < ObMultiVersionRowkeyHelpper::get_extra_rowkey_col_cnt(); ++j) {
+      row.storage_datums_[SEARCH_TEXT_ROWKEY_CNT + j].set_nop();
+    }
+    ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+  }
+  ASSERT_EQ(OB_SUCCESS, writer.close());
+  EXPECT_EQ(2u, writer.get_seg_inv_meta().get_stats().total_doc_length_);
+  writer.reset();
+}
+
+TEST_F(ObInvIdxMacroBlockWriterTest, search_text_accepts_nop_mv_columns_and_empty_path_phrase)
+{
+  ObInvIdxMacroBlockWriter writer;
+  ObSSTablePrivateObjectCleaner cleaner;
+  ASSERT_EQ(OB_SUCCESS, prepare_search_text_open_env(true /*has_pos_list*/));
+  ASSERT_EQ(OB_SUCCESS, open_writer(writer, cleaner));
+  ObDatumRow row;
+  // Cover empty and non-empty PATH values with NOP multi-version columns, as produced by compaction.
+  const char *paths[] = {"", "$.title"};
+  for (int64_t i = 0; i < ARRAYSIZEOF(paths); ++i) {
+    ASSERT_EQ(OB_SUCCESS, make_search_text_row(row, inv_idx_row_desc_, mv_col_cnt_,
+        1, paths[i], "database", 42 + i, 1, 2, "pos"));
+    for (int64_t j = 0; j < ObMultiVersionRowkeyHelpper::get_extra_rowkey_col_cnt(); ++j) {
+      row.storage_datums_[SEARCH_TEXT_ROWKEY_CNT + j].set_nop();
+    }
+    ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+  }
+  ASSERT_EQ(OB_SUCCESS, writer.close());
+  EXPECT_EQ(2u, writer.get_seg_inv_meta().get_stats().total_doc_length_);
+  writer.reset();
+}
+
+// Write search text rows grouped by term, then read every logical block back through the
+// posting decoder (DOC_ID/TF/DL) and the posting value reader (POSITION_LIST).
+static void verify_search_text_write_round_trip(
+    ObInvIdxMacroBlockWriterTest &test,
+    const bool has_pos_list);
+
+// 10.1.3 search_text_write_round_trip_match / _phrase: three-column terms are written with
+// three-column postings, PHRASE adds the position list value block, and the segment
+// total_doc_length is ΣTF rather than ΣDL.
+TEST_F(ObInvIdxMacroBlockWriterTest, search_text_write_round_trip_match)
+{
+  verify_search_text_write_round_trip(*this, false /*has_pos_list*/);
+}
+
+TEST_F(ObInvIdxMacroBlockWriterTest, search_text_write_round_trip_phrase)
+{
+  verify_search_text_write_round_trip(*this, true /*has_pos_list*/);
+}
+
+static void verify_search_text_write_round_trip(
+    ObInvIdxMacroBlockWriterTest &test,
+    const bool has_pos_list)
+{
+  // Three terms: (1,$.title,database), (1,$.title,guide), (2,$.body,oceanbase).
+  // ΣTF = 7 and ΣDL = 18, so total_doc_length_ exposes which sum the writer used.
+  const SearchTextTestRow rows[] = {
+      {1, "$.title", "database", 42, 1, 2, "pos_a"},
+      {1, "$.title", "database", 43, 2, 3, "pos_b"},
+      {1, "$.title", "guide", 43, 1, 3, "pos_c"},
+      {2, "$.body", "oceanbase", 42, 3, 10, "pos_d"}};
+  const int64_t term_row_cnts[] = {2, 1, 1};
+  const int64_t row_cnt = ARRAYSIZEOF(rows);
+  const int64_t term_cnt = ARRAYSIZEOF(term_row_cnts);
+
+  ObSSTablePrivateObjectCleaner cleaner;
+  storage::ObAsyncIndexMacroWriterAdapter adapter;
+  ASSERT_EQ(OB_SUCCESS, test.prepare_search_text_open_env(has_pos_list));
+  ASSERT_EQ(has_pos_list, test.inv_idx_row_desc_.pos_list_col_idx_ >= 0);
+  adapter.inv_idx_row_desc_ = test.inv_idx_row_desc_;
+  ASSERT_EQ(OB_SUCCESS, test.open_writer(adapter.inv_writer_, cleaner));
+  adapter.is_inited_ = true;
+
+  ObDatumRow row;
+  for (int64_t i = 0; i < row_cnt; ++i) {
+    const SearchTextTestRow &r = rows[i];
+    ASSERT_EQ(OB_SUCCESS, make_search_text_row(row, test.inv_idx_row_desc_, test.mv_col_cnt_,
+        r.col_idx_, r.path_, r.token_, r.doc_id_, r.token_freq_, r.doc_length_, r.pos_list_));
+    ASSERT_EQ(OB_SUCCESS, adapter.append_row(row));
+  }
+  ObInvIdxMacroBlockWriter &writer = adapter.inv_writer_;
+  ASSERT_EQ(SEARCH_TEXT_ROWKEY_CNT - 1, writer.term_col_count_);
+  // The last finished term stays pending; earlier finished terms move to micro_term_groups_.
+  ASSERT_EQ(1, writer.micro_term_groups_.count());
+  const ObInvIdxLogicalBlockGroup &first_group = writer.micro_term_groups_.at(0);
+  ASSERT_EQ(SEARCH_TEXT_ROWKEY_CNT - 1, first_group.term_.get_datum_cnt());
+  EXPECT_EQ(1u, first_group.term_.datums_[SEARCH_TEXT_COL_IDX].get_uint());
+  EXPECT_EQ(ObString("$.title"), first_group.term_.datums_[SEARCH_TEXT_PATH].get_string());
+  EXPECT_EQ(ObString("database"), first_group.term_.datums_[SEARCH_TEXT_TOKEN].get_string());
+  EXPECT_EQ(2, first_group.doc_count_);
+  ASSERT_EQ(row_cnt, adapter.get_row_count());
+  ASSERT_EQ(OB_SUCCESS, adapter.close());
+
+  const ObInvIdxStatsMeta &seg_meta = writer.get_seg_inv_meta().get_stats();
+  EXPECT_EQ(INV_IDX_TYPE_SEARCH_TEXT, seg_meta.index_type_);
+  EXPECT_TRUE(seg_meta.has_relevance_params_);
+  EXPECT_EQ(has_pos_list, seg_meta.has_position_list_);
+  EXPECT_FALSE(seg_meta.has_nested_key_);
+  EXPECT_EQ(42u, seg_meta.min_doc_id_);
+  EXPECT_EQ(43u, seg_meta.max_doc_id_);
+  EXPECT_EQ(7u, seg_meta.total_doc_length_);
+  EXPECT_TRUE(seg_meta.is_valid());
+
+  const char *posting_micro_block = nullptr;
+  int64_t posting_micro_block_size = 0;
+  const char *posting_value_micro_block = nullptr;
+  int64_t posting_value_micro_block_size = 0;
+  locate_search_text_micro_blocks(writer, has_pos_list,
+      posting_micro_block, posting_micro_block_size,
+      posting_value_micro_block, posting_value_micro_block_size);
+  ASSERT_FALSE(::testing::Test::HasFatalFailure());
+
+  ObInvIdxMicroBlockReader posting_reader;
+  ASSERT_EQ(OB_SUCCESS, posting_reader.init(
+      posting_micro_block, posting_micro_block_size, false /*is_posting_value*/));
+  ASSERT_EQ(term_cnt, posting_reader.get_block_count());
+  ObInvIdxMicroBlockReader posting_value_reader;
+  if (has_pos_list) {
+    ASSERT_EQ(OB_SUCCESS, posting_value_reader.init(
+        posting_value_micro_block, posting_value_micro_block_size, true /*is_posting_value*/));
+    ASSERT_EQ(term_cnt, posting_value_reader.get_block_count());
+  }
+
+  common::ObArenaAllocator decode_alloc;
+  int64_t row_idx = 0;
+  for (int64_t b = 0; b < term_cnt; ++b) {
+    const char *block_buf = nullptr;
+    int64_t block_size = 0;
+    ObPostingBlockDecoder decoder;
+    ASSERT_EQ(OB_SUCCESS, posting_reader.get_payload(b, block_buf, block_size));
+    ASSERT_EQ(OB_SUCCESS, decoder.init(block_buf, block_size, decode_alloc));
+    ASSERT_TRUE(decoder.has_relevance_params());
+    ASSERT_EQ(term_row_cnts[b], decoder.get_row_count());
+    ObPostingValueBlockReader value_block_reader;
+    if (has_pos_list) {
+      ASSERT_EQ(OB_SUCCESS, posting_value_reader.get_payload(b, block_buf, block_size));
+      ASSERT_EQ(OB_SUCCESS, value_block_reader.init(block_buf, block_size));
+    }
+    for (int64_t r = 0; r < term_row_cnts[b]; ++r, ++row_idx) {
+      const SearchTextTestRow &expected = rows[row_idx];
+      uint64_t doc_id = 0;
+      uint64_t token_freq = 0;
+      uint64_t doc_length = 0;
+      ASSERT_EQ(OB_SUCCESS, decoder.get_doc_id(r, doc_id));
+      ASSERT_EQ(OB_SUCCESS, decoder.get_relevance_params(r, token_freq, doc_length));
+      EXPECT_EQ(expected.doc_id_, doc_id);
+      EXPECT_EQ(expected.token_freq_, token_freq);
+      EXPECT_EQ(expected.doc_length_, doc_length);
+      if (has_pos_list) {
+        ObDatum pos_list;
+        ASSERT_EQ(OB_SUCCESS, value_block_reader.get_position_list(r, pos_list));
+        EXPECT_EQ(ObString(expected.pos_list_), pos_list.get_string());
+      }
+    }
+  }
+  ASSERT_EQ(row_cnt, row_idx);
+  adapter.reset();
+}
+
+// Exercise the production SQL-row buffer and multi-version conversion with a real
+// inverted writer. Only schema-service/DDL callback setup is replaced by the fixture.
+class SearchTextSliceWriterForTest : public storage::ObCsSliceWriter
+{
+public:
+  ~SearchTextSliceWriterForTest() { storage_slice_writer_ = nullptr; }
+
+  int prepare(ObInvIdxMacroBlockWriterTest &test, storage::ObAsyncIndexMacroWriterAdapter &adapter)
+  {
+    int ret = OB_SUCCESS;
+    storage::ObWriteMacroParam &param = writer_param_;
+    param.ls_id_ = test.mock_ls_id_;
+    param.tablet_id_ = test.mock_tablet_id_;
+    param.tenant_data_version_ = DATA_VERSION_4_6_0_0;
+    param.schema_version_ = 1;
+    param.slice_idx_ = 0;
+    param.snapshot_version_ = 10000;
+    param.direct_load_type_ = storage::DIRECT_LOAD_DDL;
+    param.task_id_ = 1;
+    param.ddl_table_schema_.table_item_.is_index_table_ = true;
+    param.ddl_table_schema_.table_item_.rowkey_column_num_ = SEARCH_TEXT_ROWKEY_CNT;
+    param.ddl_table_schema_.table_item_.index_type_ = test.table_schema_.get_index_type();
+    const auto &columns = test.data_store_desc_.get_full_stored_col_descs();
+    for (int64_t i = 0; OB_SUCC(ret) && i < columns.count(); ++i) {
+      storage::ObColumnSchemaItem item;
+      item.is_valid_ = true;
+      item.col_type_ = columns.at(i).col_type_;
+      item.is_rowkey_column_ = i < SEARCH_TEXT_ROWKEY_CNT;
+      item.is_nullable_ = true;
+      const auto *column = test.table_schema_.get_column_schema(columns.at(i).col_id_);
+      if (nullptr != column) {
+        item.col_accuracy_ = column->get_accuracy();
+      }
+      if(OB_FAIL(param.ddl_table_schema_.column_items_.push_back(item))) {
+        LOG_WARN("fail to push back column item", K(ret), K(i));
+      }
+    }
+    rowkey_column_count_ = SEARCH_TEXT_ROWKEY_CNT;
+    sql_column_count_ = columns.count() - ObMultiVersionRowkeyHelpper::get_extra_rowkey_col_cnt();
+    param.tablet_param_.storage_schema_ = &storage_schema_;
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(storage_schema_.init(test.allocator_, test.table_schema_,
+                                          lib::Worker::CompatMode::MYSQL))) {
+    } else if (OB_FAIL(current_row_.init(columns.count()))) {
+    } else if (OB_FAIL(init_row_buffer())) {
+    } else {
+      storage_slice_writer_ = &adapter;
+      is_inited_ = true;
+    }
+    return ret;
+  }
+private:
+  storage::ObStorageSchema storage_schema_;
+};
+
+static void verify_search_text_generated_rows_round_trip(
+    ObInvIdxMacroBlockWriterTest &test,
+    const bool has_pos_list)
+{
+  share::ObSearchIndexModeConfig mode;
+  mode.mode_ = has_pos_list ? share::ObSearchIndexModeConfig::FULLTEXT_PHRASE
+                           : share::ObSearchIndexModeConfig::FULLTEXT_MATCH;
+  mode.filter_ = ObString("INCLUDE_TYPES=11json_string");
+  mode.parser_name_ = ObString("space.1");
+  mode.parser_properties_ = ObString("{\"min_token_size\":3,\"max_token_size\":84}");
+  share::ObSearchIndexConfig config;
+  ObSqlString comment;
+  ASSERT_EQ(OB_SUCCESS, oceanbase::unittest::append_search_index_mode(config, mode));
+  ASSERT_EQ(OB_SUCCESS, oceanbase::unittest::build_search_index_config_comment(config, comment));
+  ObSEArray<int32_t, 1> column_ids;
+  ObSEArray<ObObjMeta, 1> column_metas;
+  ObSEArray<int64_t, 2> projector;
+  ObSEArray<ObString, 1> comments;
+  ObObjMeta json_meta;
+  json_meta.set_json();
+  ASSERT_EQ(OB_SUCCESS, column_ids.push_back(3));
+  ASSERT_EQ(OB_SUCCESS, column_metas.push_back(json_meta));
+  ASSERT_EQ(OB_SUCCESS, projector.push_back(0));
+  ASSERT_EQ(OB_SUCCESS, projector.push_back(1));
+  ASSERT_EQ(OB_SUCCESS, comments.push_back(comment.string()));
+  share::ObSearchIndexRowGenerator generator;
+  ASSERT_EQ(OB_SUCCESS, generator.init(column_ids, column_metas, projector, comments,
+      false /*rowkey_only*/, nullptr, has_pos_list ? share::SEARCH_TEXT_PHRASE
+                                                 : share::SEARCH_TEXT_MATCH));
+
+  const char *documents[] = {
+      "{\"tags\":[\"alpha alpha\",\"beta\",\"alpha\"]}",
+      "{\"tags\":[\"beta alpha\",\"\",\"alpha beta\"]}",
+      "{\"tags\":[\"a\",\"\",null,true]}"};
+  const uint64_t doc_ids[] = {43, 42, 41}; // force a DOC_ID reorder within each term
+  const int64_t output_counts[] = {2, 2, 0};
+  const int64_t row_count = 4;
+  const int64_t column_count = has_pos_list ? SEARCH_TEXT_COL_CNT_WITH_POS
+                                           : SEARCH_TEXT_COL_CNT_WITHOUT_POS;
+  common::ObArenaAllocator input_allocator;
+  common::ObArenaAllocator held_allocator;
+  ObDatumRow input;
+  ObDatumRow held_rows[row_count];
+  ObDatumRow *sorted_rows[row_count];
+  ASSERT_EQ(OB_SUCCESS, input.init(input_allocator, 2));
+  int64_t held_count = 0;
+  for (int64_t d = 0; d < ARRAYSIZEOF(documents); ++d) {
+    ObIJsonBase *json = nullptr;
+    ObString binary;
+    ObDatum with_header;
+    ASSERT_EQ(OB_SUCCESS, ObJsonBaseFactory::get_json_base(&input_allocator,
+        ObString(documents[d]), ObJsonInType::JSON_TREE, ObJsonInType::JSON_BIN, json));
+    ASSERT_EQ(OB_SUCCESS, json->get_raw_binary(binary));
+    ASSERT_EQ(OB_SUCCESS, sql::ObTextStringHelper::string_to_templob_result(
+        ObJsonType, input_allocator, binary, with_header));
+    input.storage_datums_[0].shallow_copy_from_datum(with_header);
+    input.storage_datums_[1].set_uint(doc_ids[d]);
+    ObDatumRow *generated_rows = nullptr;
+    int64_t generated_count = 0;
+    ASSERT_EQ(OB_SUCCESS, generator.generate_rows(input, generated_rows, generated_count));
+    ASSERT_EQ(output_counts[d], generated_count);
+    if (0 == generated_count) {
+      EXPECT_EQ(nullptr, generated_rows);
+    } else {
+      ASSERT_NE(nullptr, generated_rows);
+    }
+    for (int64_t r = 0; r < generated_count; ++r, ++held_count) {
+      ASSERT_LT(held_count, row_count);
+      ASSERT_EQ(column_count, generated_rows[r].get_column_count());
+      // generate_rows() reuses its allocator on every call, including the no-token document.
+      ASSERT_EQ(OB_SUCCESS, held_rows[held_count].init(held_allocator, column_count));
+      ASSERT_EQ(OB_SUCCESS, held_rows[held_count].deep_copy(generated_rows[r], held_allocator));
+      sorted_rows[held_count] = &held_rows[held_count];
+    }
+  }
+  ASSERT_EQ(row_count, held_count);
+  generator.reset(); // all rows and variable-length fields must now be independently owned
+  EXPECT_EQ(43u, held_rows[0].storage_datums_[SEARCH_TEXT_DOC_ID].get_uint());
+  EXPECT_EQ(42u, held_rows[2].storage_datums_[SEARCH_TEXT_DOC_ID].get_uint());
+  std::sort(sorted_rows, sorted_rows + row_count, [](const ObDatumRow *left, const ObDatumRow *right) {
+    const ObStorageDatum *lhs = left->storage_datums_;
+    const ObStorageDatum *rhs = right->storage_datums_;
+    bool less = false;
+    if (lhs[SEARCH_TEXT_COL_IDX].get_uint() != rhs[SEARCH_TEXT_COL_IDX].get_uint()) {
+      less = lhs[SEARCH_TEXT_COL_IDX].get_uint() < rhs[SEARCH_TEXT_COL_IDX].get_uint();
+    } else {
+      int cmp = 0;
+      for (int64_t i = SEARCH_TEXT_PATH; 0 == cmp && i <= SEARCH_TEXT_TOKEN; ++i) {
+        cmp = lhs[i].get_string().compare(rhs[i].get_string());
+      }
+      less = 0 != cmp ? cmp < 0 : lhs[SEARCH_TEXT_DOC_ID].get_uint() < rhs[SEARCH_TEXT_DOC_ID].get_uint();
+    }
+    return less;
+  });
+
+  // Expected scalar values come from the source documents, not a prepared posting payload.
+  const uint64_t expected_doc_ids[] = {42, 43, 42, 43};
+  const uint64_t expected_token_freqs[] = {2, 3, 2, 1};
+  const int64_t expected_positions[][3] = {{1, 102, 0}, {0, 1, 203}, {0, 103, 0}, {102, 0, 0}};
+  // JSON string keys contain the token bytes followed by a two-byte terminator.
+  const ObString expected_tokens[] = {ObString(7, "alpha\0\0"), ObString(6, "beta\0\0")};
+
+  ObSSTablePrivateObjectCleaner cleaner;
+  storage::ObAsyncIndexMacroWriterAdapter adapter;
+  ASSERT_EQ(OB_SUCCESS, test.prepare_search_text_open_env(has_pos_list));
+  adapter.inv_idx_row_desc_ = test.inv_idx_row_desc_;
+  ASSERT_EQ(OB_SUCCESS, test.open_writer(adapter.inv_writer_, cleaner));
+  adapter.is_inited_ = true;
+  SearchTextSliceWriterForTest slice_writer;
+  ASSERT_EQ(OB_SUCCESS, slice_writer.prepare(test, adapter));
+  for (int64_t r = 0; r < row_count; ++r) {
+    const ObDatumRow &row = *sorted_rows[r];
+    EXPECT_EQ(3u, row.storage_datums_[SEARCH_TEXT_COL_IDX].get_uint());
+    EXPECT_EQ(expected_tokens[r / 2], row.storage_datums_[SEARCH_TEXT_TOKEN].get_string());
+    EXPECT_EQ(expected_doc_ids[r], row.storage_datums_[SEARCH_TEXT_DOC_ID].get_uint());
+    EXPECT_EQ(expected_token_freqs[r], row.storage_datums_[4].get_uint());
+    EXPECT_EQ(4u, row.storage_datums_[5].get_uint());
+    EXPECT_EQ(sorted_rows[0]->storage_datums_[SEARCH_TEXT_PATH].get_string(),
+        row.storage_datums_[SEARCH_TEXT_PATH].get_string());
+    ObSEArray<ObDatum *, SEARCH_TEXT_COL_CNT_WITH_POS> datums;
+    for (int64_t c = 0; c < column_count; ++c) {
+      ASSERT_EQ(OB_SUCCESS, datums.push_back(&sorted_rows[r]->storage_datums_[c]));
+    }
+    ASSERT_EQ(OB_SUCCESS, slice_writer.append_current_row(datums));
+  }
+  // Buffered rows must own their bytes before the upstream buffers are reused.
+  for (int64_t r = 0; r < row_count; ++r) {
+    held_rows[r].reset();
+  }
+  held_allocator.reset();
+  ASSERT_EQ(0, adapter.get_row_count());
+  int64_t buffered_count = 0;
+  ASSERT_EQ(OB_SUCCESS, slice_writer.get_row_count(buffered_count));
+  ASSERT_EQ(row_count, buffered_count);
+  ASSERT_EQ(OB_SUCCESS, slice_writer.close());
+  ASSERT_EQ(row_count, adapter.get_row_count());
+  ObInvIdxMacroBlockWriter &writer = adapter.inv_writer_;
+  EXPECT_EQ(42u, writer.get_seg_inv_meta().get_stats().min_doc_id_);
+  EXPECT_EQ(43u, writer.get_seg_inv_meta().get_stats().max_doc_id_);
+  EXPECT_EQ(8u, writer.get_seg_inv_meta().get_stats().total_doc_length_); // sum(TF), not sum(DL)
+  EXPECT_EQ(has_pos_list, writer.get_seg_inv_meta().get_stats().has_position_list_);
+
+  const char *posting_micro_block = nullptr;
+  int64_t posting_micro_block_size = 0;
+  const char *posting_value_micro_block = nullptr;
+  int64_t posting_value_micro_block_size = 0;
+  locate_search_text_micro_blocks(writer, has_pos_list,
+      posting_micro_block, posting_micro_block_size,
+      posting_value_micro_block, posting_value_micro_block_size);
+  ASSERT_FALSE(::testing::Test::HasFatalFailure());
+  ObInvIdxMicroBlockReader posting_reader;
+  ASSERT_EQ(OB_SUCCESS, posting_reader.init(
+      posting_micro_block, posting_micro_block_size, false /*is_posting_value*/));
+  ASSERT_EQ(2, posting_reader.get_block_count());
+  ObInvIdxMicroBlockReader posting_value_reader;
+  if (has_pos_list) {
+    ASSERT_EQ(OB_SUCCESS, posting_value_reader.init(
+        posting_value_micro_block, posting_value_micro_block_size, true /*is_posting_value*/));
+    ASSERT_EQ(2, posting_value_reader.get_block_count());
+  }
+  common::ObArenaAllocator decode_allocator;
+  for (int64_t b = 0; b < 2; ++b) {
+    const char *payload = nullptr;
+    int64_t payload_size = 0;
+    ObPostingBlockDecoder decoder;
+    ASSERT_EQ(OB_SUCCESS, posting_reader.get_payload(b, payload, payload_size));
+    ASSERT_EQ(OB_SUCCESS, decoder.init(payload, payload_size, decode_allocator));
+    ASSERT_TRUE(decoder.has_relevance_params());
+    ASSERT_EQ(2, decoder.get_row_count());
+    ObPostingValueBlockReader value_reader;
+    if (has_pos_list) {
+      ASSERT_EQ(OB_SUCCESS, posting_value_reader.get_payload(b, payload, payload_size));
+      ASSERT_EQ(OB_SUCCESS, value_reader.init(payload, payload_size));
+    }
+    for (int64_t r = 0; r < 2; ++r) {
+      const int64_t row_idx = b * 2 + r;
+      uint64_t doc_id = 0;
+      uint64_t token_freq = 0;
+      uint64_t doc_length = 0;
+      ASSERT_EQ(OB_SUCCESS, decoder.get_doc_id(r, doc_id));
+      ASSERT_EQ(OB_SUCCESS, decoder.get_relevance_params(r, token_freq, doc_length));
+      EXPECT_EQ(expected_doc_ids[row_idx], doc_id);
+      EXPECT_EQ(expected_token_freqs[row_idx], token_freq);
+      EXPECT_EQ(4u, doc_length);
+      if (has_pos_list) {
+        ObDatum positions;
+        ASSERT_EQ(OB_SUCCESS, value_reader.get_position_list(r, positions));
+        const ObString stored = positions.get_string();
+        // Decode persisted positions independently after the input buffers were released.
+        share::ObFTSPositionListStore position_store;
+        ObSEArray<int64_t, 8> decoded_positions;
+        ASSERT_EQ(OB_SUCCESS, position_store.deserialize_and_decode(
+            stored.ptr(), stored.length(), decoded_positions));
+        ASSERT_EQ(expected_token_freqs[row_idx], decoded_positions.count());
+        for (int64_t p = 0; p < decoded_positions.count(); ++p) {
+          EXPECT_EQ(expected_positions[row_idx][p], decoded_positions.at(p));
+        }
+      }
+    }
+  }
+  adapter.reset();
+}
+
+TEST_F(ObInvIdxMacroBlockWriterTest, search_text_generated_rows_round_trip_match)
+{
+  verify_search_text_generated_rows_round_trip(*this, false /*has_pos_list*/);
+}
+
+TEST_F(ObInvIdxMacroBlockWriterTest, search_text_generated_rows_round_trip_phrase)
+{
+  verify_search_text_generated_rows_round_trip(*this, true /*has_pos_list*/);
+}
+
+#ifndef OB_BUILD_PACKAGE
+static void verify_search_text_keyword_trailing_space(
+    ObInvIdxMacroBlockWriterTest &test, const bool has_pos_list)
+{
+  share::ObSearchIndexModeConfig mode;
+  mode.mode_ = has_pos_list ? share::ObSearchIndexModeConfig::FULLTEXT_PHRASE
+                           : share::ObSearchIndexModeConfig::FULLTEXT_MATCH;
+  mode.filter_ = ObString("INCLUDE_TYPES=11json_string");
+  mode.parser_name_ = ObString("analyzer.1");
+  mode.parser_properties_ = ObString(
+      R"({"analyzer":{"a":{"type":"custom","tokenizer":"keyword"}}})");
+  share::ObSearchIndexConfig config;
+  ObSqlString comment;
+  ASSERT_EQ(OB_SUCCESS, oceanbase::unittest::append_search_index_mode(config, mode));
+  ASSERT_EQ(OB_SUCCESS, oceanbase::unittest::build_search_index_config_comment(config, comment));
+  ObSEArray<int32_t, 1> column_ids;
+  ObSEArray<ObObjMeta, 1> column_metas;
+  ObSEArray<int64_t, 2> projector;
+  ObSEArray<ObString, 1> comments;
+  ObObjMeta json_meta;
+  json_meta.set_json();
+  ASSERT_EQ(OB_SUCCESS, column_ids.push_back(3));
+  ASSERT_EQ(OB_SUCCESS, column_metas.push_back(json_meta));
+  ASSERT_EQ(OB_SUCCESS, projector.push_back(0));
+  ASSERT_EQ(OB_SUCCESS, projector.push_back(1));
+  ASSERT_EQ(OB_SUCCESS, comments.push_back(comment.string()));
+  share::ObSearchIndexRowGenerator generator;
+  ASSERT_EQ(OB_SUCCESS, generator.init(column_ids, column_metas, projector, comments,
+      false /*rowkey_only*/, nullptr, has_pos_list ? share::SEARCH_TEXT_PHRASE
+                                                 : share::SEARCH_TEXT_MATCH));
+  ObSSTablePrivateObjectCleaner cleaner;
+  storage::ObAsyncIndexMacroWriterAdapter adapter;
+  ASSERT_EQ(OB_SUCCESS, test.prepare_search_text_open_env(has_pos_list));
+  adapter.inv_idx_row_desc_ = test.inv_idx_row_desc_;
+  ASSERT_EQ(OB_SUCCESS, test.open_writer(adapter.inv_writer_, cleaner));
+  adapter.is_inited_ = true;
+  SearchTextSliceWriterForTest slice_writer;
+  ASSERT_EQ(OB_SUCCESS, slice_writer.prepare(test, adapter));
+  common::ObArenaAllocator input_allocator;
+  ObDatumRow input;
+  ASSERT_EQ(OB_SUCCESS, input.init(input_allocator, 2));
+  const char *documents[] = {R"(["foo","foo ","foo  ","foo"])",
+                             R"(["foo  ","foo ","foo","foo"])"};
+  const ObString tokens[] = {ObString(5, "foo\0\0"), ObString(6, "foo \0\0"), ObString(7, "foo  \0\0")};
+  // Feed postings in storage key order: TOKEN, then DOC_ID.
+  for (int64_t t = 0; t < ARRAYSIZEOF(tokens); ++t) {
+    for (int64_t d = 0; d < ARRAYSIZEOF(documents); ++d) {
+      ObIJsonBase *json = nullptr;
+      ObString binary;
+      ObDatum with_header;
+      ASSERT_EQ(OB_SUCCESS, ObJsonBaseFactory::get_json_base(&input_allocator,
+          ObString(documents[d]), ObJsonInType::JSON_TREE, ObJsonInType::JSON_BIN, json));
+      ASSERT_EQ(OB_SUCCESS, json->get_raw_binary(binary));
+      ASSERT_EQ(OB_SUCCESS, sql::ObTextStringHelper::string_to_templob_result(
+          ObJsonType, input_allocator, binary, with_header));
+      input.storage_datums_[0].shallow_copy_from_datum(with_header);
+      input.storage_datums_[1].set_uint(42 + d);
+      ObDatumRow *rows = nullptr;
+      int64_t count = 0;
+      ASSERT_EQ(OB_SUCCESS, generator.generate_rows(input, rows, count));
+      ASSERT_EQ(3, count);
+      int64_t row_idx = -1;
+      for (int64_t i = 0; i < count; ++i) {
+        if (rows[i].storage_datums_[SEARCH_TEXT_TOKEN].get_string() == tokens[t]) {
+          row_idx = i;
+        }
+      }
+      ASSERT_GE(row_idx, 0);
+      EXPECT_EQ(t == 0 ? 2u : 1u, rows[row_idx].storage_datums_[4].get_uint());
+      EXPECT_EQ(4u, rows[row_idx].storage_datums_[5].get_uint());
+      ObSEArray<ObDatum *, SEARCH_TEXT_COL_CNT_WITH_POS> datums;
+      for (int64_t c = 0; c < rows[row_idx].get_column_count(); ++c) {
+        ASSERT_EQ(OB_SUCCESS, datums.push_back(&rows[row_idx].storage_datums_[c]));
+      }
+      ASSERT_EQ(OB_SUCCESS, slice_writer.append_current_row(datums));
+    }
+  }
+  generator.reset();
+  ASSERT_EQ(OB_SUCCESS, slice_writer.close());
+  ASSERT_EQ(6, adapter.get_row_count());
+  const ObDatumRowkey &stored_key = adapter.inv_writer_.index_block_builder_.macro_meta_.end_key_;
+  ASSERT_TRUE(stored_key.is_valid());
+  ASSERT_GT(stored_key.get_datum_cnt(), SEARCH_TEXT_TOKEN);
+  EXPECT_EQ(tokens[2], stored_key.get_datum(SEARCH_TEXT_TOKEN).get_string());
+  const char *posting_block = nullptr;
+  int64_t posting_size = 0;
+  const char *value_block = nullptr;
+  int64_t value_size = 0;
+  locate_search_text_micro_blocks(adapter.inv_writer_, has_pos_list,
+      posting_block, posting_size, value_block, value_size);
+  ASSERT_FALSE(::testing::Test::HasFatalFailure());
+  ObInvIdxMicroBlockReader posting_reader;
+  ASSERT_EQ(OB_SUCCESS, posting_reader.init(posting_block, posting_size, false));
+  ASSERT_EQ(3, posting_reader.get_block_count()); // Trailing spaces distinguish terms.
+  ObInvIdxMicroBlockReader value_reader;
+  if (has_pos_list) {
+    ASSERT_EQ(OB_SUCCESS, value_reader.init(value_block, value_size, true));
+    ASSERT_EQ(3, value_reader.get_block_count());
+  }
+  for (int64_t t = 0; t < ARRAYSIZEOF(tokens); ++t) {
+    const char *payload = nullptr;
+    int64_t payload_size = 0;
+    ASSERT_EQ(OB_SUCCESS, posting_reader.get_payload(t, payload, payload_size));
+    ObPostingBlockDecoder decoder;
+    ASSERT_EQ(OB_SUCCESS, decoder.init(payload, payload_size, input_allocator));
+    ASSERT_EQ(2, decoder.get_row_count());
+    ObPostingValueBlockReader positions_reader;
+    if (has_pos_list) {
+      ASSERT_EQ(OB_SUCCESS, value_reader.get_payload(t, payload, payload_size));
+      ASSERT_EQ(OB_SUCCESS, positions_reader.init(payload, payload_size));
+    }
+    for (int64_t d = 0; d < 2; ++d) {
+      uint64_t doc_id = 0;
+      uint64_t tf = 0;
+      uint64_t dl = 0;
+      ASSERT_EQ(OB_SUCCESS, decoder.get_doc_id(d, doc_id));
+      ASSERT_EQ(OB_SUCCESS, decoder.get_relevance_params(d, tf, dl));
+      EXPECT_EQ(42u + d, doc_id);
+      EXPECT_EQ(t == 0 ? 2u : 1u, tf);
+      EXPECT_EQ(4u, dl);
+      if (has_pos_list) {
+        ObDatum positions;
+        ASSERT_EQ(OB_SUCCESS, positions_reader.get_position_list(d, positions));
+        const ObString stored = positions.get_string();
+        share::ObFTSPositionListStore store;
+        ObSEArray<int64_t, 2> decoded;
+        ASSERT_EQ(OB_SUCCESS, store.deserialize_and_decode(stored.ptr(), stored.length(), decoded));
+        ASSERT_EQ(t == 0 ? 2 : 1, decoded.count());
+        EXPECT_EQ(101 * (d == 0 ? t : 2 - t), decoded.at(0));
+        if (t == 0) { EXPECT_EQ(303, decoded.at(1)); }
+      }
+    }
+  }
+  adapter.reset();
+}
+
+TEST_F(ObInvIdxMacroBlockWriterTest, search_text_keyword_trailing_space_match)
+{
+  verify_search_text_keyword_trailing_space(*this, false);
+}
+
+TEST_F(ObInvIdxMacroBlockWriterTest, search_text_keyword_trailing_space_phrase)
+{
+  verify_search_text_keyword_trailing_space(*this, true);
+}
+#endif
+
+// 10.1.4 search_text_logical_block_split: a change in COL_IDX alone or PATH alone starts a new
+// term group, a term longer than the logical block capacity is split at 256 docs, and every
+// field still lands in the same posting micro block (micro/macro blocks are not cut by field).
+TEST_F(ObInvIdxMacroBlockWriterTest, search_text_logical_block_split)
+{
+  ObInvIdxMacroBlockWriter writer;
+  ObSSTablePrivateObjectCleaner cleaner;
+  ASSERT_EQ(OB_SUCCESS, prepare_search_text_open_env(false /*has_pos_list*/));
+  ASSERT_EQ(OB_SUCCESS, open_writer(writer, cleaner));
+
+  ObDatumRow row;
+  // Same PATH/TOKEN, only COL_IDX changes between the first two terms; only PATH changes
+  // between the second and the third.
+  ASSERT_EQ(OB_SUCCESS, make_search_text_row(row, inv_idx_row_desc_, mv_col_cnt_,
+      1, "$.a", "db", 1, 1, 4, nullptr));
+  ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+  ASSERT_EQ(OB_SUCCESS, make_search_text_row(row, inv_idx_row_desc_, mv_col_cnt_,
+      2, "$.a", "db", 1, 1, 4, nullptr));
+  ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+  ASSERT_EQ(OB_SUCCESS, make_search_text_row(row, inv_idx_row_desc_, mv_col_cnt_,
+      2, "$.b", "db", 1, 1, 4, nullptr));
+  ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+  for (int64_t i = 1; i <= 300; ++i) {
+    ASSERT_EQ(OB_SUCCESS, make_search_text_row(row, inv_idx_row_desc_, mv_col_cnt_,
+        2, "$.b", "zz", static_cast<uint64_t>(i), 1, 4, nullptr));
+    ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+  }
+  ASSERT_EQ(OB_SUCCESS, make_search_text_row(row, inv_idx_row_desc_, mv_col_cnt_,
+      3, "$.c", "end", 1, 1, 4, nullptr));
+  ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+
+  struct ExpectedTerm { uint64_t col_idx_; const char *path_; const char *token_; };
+  const ExpectedTerm expected_terms[] = {{1, "$.a", "db"}, {2, "$.a", "db"}, {2, "$.b", "db"}};
+  ASSERT_EQ(ARRAYSIZEOF(expected_terms), writer.micro_term_groups_.count());
+  for (int64_t i = 0; i < ARRAYSIZEOF(expected_terms); ++i) {
+    const ObInvIdxLogicalBlockGroup &group = writer.micro_term_groups_.at(i);
+    ASSERT_EQ(SEARCH_TEXT_ROWKEY_CNT - 1, group.term_.get_datum_cnt());
+    EXPECT_EQ(expected_terms[i].col_idx_, group.term_.datums_[SEARCH_TEXT_COL_IDX].get_uint());
+    EXPECT_EQ(ObString(expected_terms[i].path_),
+        group.term_.datums_[SEARCH_TEXT_PATH].get_string());
+    EXPECT_EQ(ObString(expected_terms[i].token_),
+        group.term_.datums_[SEARCH_TEXT_TOKEN].get_string());
+    EXPECT_EQ(1, group.doc_count_);
+    EXPECT_EQ(1, group.logical_block_metas_.count());
+  }
+  const ObInvIdxLogicalBlockGroup &capacity_group = writer.pending_term_group_;
+  EXPECT_EQ(ObString("zz"), capacity_group.term_.datums_[SEARCH_TEXT_TOKEN].get_string());
+  ASSERT_EQ(2, capacity_group.logical_block_metas_.count());
+  EXPECT_EQ(300, capacity_group.doc_count_);
+  EXPECT_EQ(256, capacity_group.logical_block_metas_.at(0).doc_count_);
+  EXPECT_EQ(256ul, capacity_group.logical_block_metas_.at(0).max_doc_id_);
+  EXPECT_EQ(44, capacity_group.logical_block_metas_.at(1).doc_count_);
+  EXPECT_EQ(257ul, capacity_group.logical_block_metas_.at(1).min_doc_id_);
+
+  ASSERT_EQ(OB_SUCCESS, writer.close());
+  EXPECT_EQ(1, writer.index_block_builder_.index_tree_root_ctx_->data_write_ctx_->get_macro_block_count());
+  const char *posting_micro_block = nullptr;
+  int64_t posting_micro_block_size = 0;
+  const char *posting_value_micro_block = nullptr;
+  int64_t posting_value_micro_block_size = 0;
+  locate_search_text_micro_blocks(writer, false /*has_pos_list*/,
+      posting_micro_block, posting_micro_block_size,
+      posting_value_micro_block, posting_value_micro_block_size);
+  ASSERT_FALSE(HasFatalFailure());
+  ObInvIdxMicroBlockReader posting_reader;
+  ASSERT_EQ(OB_SUCCESS, posting_reader.init(
+      posting_micro_block, posting_micro_block_size, false /*is_posting_value*/));
+  // 3 single-doc terms + 2 capacity blocks + the trailing term.
+  EXPECT_EQ(6, posting_reader.get_block_count());
+  EXPECT_EQ(304u, writer.get_seg_inv_meta().get_stats().total_doc_length_);
+  writer.reset();
+}
+
+// 10.1.5 search_text_flat_cache_transform: the posting micro block written for search text is
+// transformed into the FlatCache layout and the cached view returns the persisted DOC_ID/TF/DL.
+TEST_F(ObInvIdxMacroBlockWriterTest, search_text_flat_cache_transform)
+{
+  const SearchTextTestRow rows[] = {
+      {1, "$.title", "database", 7, 2, 9, nullptr},
+      {1, "$.title", "database", 11, 5, 20, nullptr},
+      {2, "$.body", "oceanbase", 3, 1, 6, nullptr}};
+  const int64_t term_row_cnts[] = {2, 1};
+  ObInvIdxMacroBlockWriter writer;
+  ObSSTablePrivateObjectCleaner cleaner;
+  ASSERT_EQ(OB_SUCCESS, prepare_search_text_open_env(false /*has_pos_list*/));
+  ASSERT_EQ(OB_SUCCESS, open_writer(writer, cleaner));
+  ObDatumRow row;
+  for (int64_t i = 0; i < ARRAYSIZEOF(rows); ++i) {
+    const SearchTextTestRow &r = rows[i];
+    ASSERT_EQ(OB_SUCCESS, make_search_text_row(row, inv_idx_row_desc_, mv_col_cnt_,
+        r.col_idx_, r.path_, r.token_, r.doc_id_, r.token_freq_, r.doc_length_, r.pos_list_));
+    ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+  }
+  ASSERT_EQ(OB_SUCCESS, writer.close());
+
+  const char *posting_micro_block = nullptr;
+  int64_t posting_micro_block_size = 0;
+  const char *posting_value_micro_block = nullptr;
+  int64_t posting_value_micro_block_size = 0;
+  locate_search_text_micro_blocks(writer, false /*has_pos_list*/,
+      posting_micro_block, posting_micro_block_size,
+      posting_value_micro_block, posting_value_micro_block_size);
+  ASSERT_FALSE(HasFatalFailure());
+
+  ObMicroBlockHeader header;
+  int64_t header_pos = 0;
+  ASSERT_EQ(OB_SUCCESS, header.deserialize(posting_micro_block, posting_micro_block_size, header_pos));
+  ObInvIdxMicroBlockTransformer transformer;
+  ObMicroBlockDesMeta des_meta;
+  ObMacroBlockReader mb_reader;
+  int64_t transformed_size = 0;
+  ASSERT_EQ(OB_SUCCESS, transformer.init(header, posting_micro_block, posting_micro_block_size,
+      des_meta, mb_reader, allocator_));
+  ASSERT_EQ(OB_SUCCESS, transformer.get_buf_size(transformed_size));
+  char *transformed_buf = static_cast<char *>(allocator_.alloc(transformed_size));
+  ASSERT_NE(nullptr, transformed_buf);
+  ASSERT_EQ(OB_SUCCESS, transformer.transform(transformed_buf, transformed_size));
+
+  ObFlatCacheReader view_reader;
+  ASSERT_EQ(OB_SUCCESS, view_reader.init(transformed_buf, transformed_size));
+  ASSERT_EQ(ARRAYSIZEOF(term_row_cnts), view_reader.get_block_count());
+  int64_t row_idx = 0;
+  for (int64_t b = 0; b < ARRAYSIZEOF(term_row_cnts); ++b) {
+    ObPostingBlockData view;
+    ASSERT_EQ(OB_SUCCESS, view_reader.get_posting_block_data(b, view));
+    ASSERT_TRUE(view.has_relevance_params());
+    ASSERT_EQ(term_row_cnts[b], view.get_row_count());
+    for (int64_t r = 0; r < term_row_cnts[b]; ++r, ++row_idx) {
+      uint64_t doc_id = 0;
+      uint64_t token_freq = 0;
+      uint64_t doc_length = 0;
+      ASSERT_EQ(OB_SUCCESS, view.get_doc_id(r, doc_id));
+      ASSERT_EQ(OB_SUCCESS, view.get_relevance_params(r, token_freq, doc_length));
+      EXPECT_EQ(rows[row_idx].doc_id_, doc_id);
+      EXPECT_EQ(rows[row_idx].token_freq_, token_freq);
+      EXPECT_EQ(rows[row_idx].doc_length_, doc_length);
+    }
+  }
+  writer.reset();
+}
+
 // 10.2 search_index_append_row: append rows with multi-col term + nested_key,
 // verify the write path produces one macro block with correct term group layout.
 TEST_F(ObInvIdxMacroBlockWriterTest, search_index_append_row)
@@ -2315,9 +3344,9 @@ TEST_F(ObInvIdxMacroBlockWriterTest, append_row_after_reuse_restarts_macro_row_o
   EXPECT_NE(reused->get_macro_id(), res.data_block_ids_.at(0));
   EXPECT_EQ(reused->get_macro_id(), res.data_block_ids_.at(1));
   EXPECT_NE(reused->get_macro_id(), res.data_block_ids_.at(2));
-  EXPECT_EQ(1, writer.get_seg_inv_meta().get_stats().min_doc_id_);
-  EXPECT_EQ(21, writer.get_seg_inv_meta().get_stats().max_doc_id_);
-  EXPECT_EQ(2002, writer.get_seg_inv_meta().get_stats().total_doc_length_);
+  EXPECT_EQ(1ul, writer.get_seg_inv_meta().get_stats().min_doc_id_);
+  EXPECT_EQ(21ul, writer.get_seg_inv_meta().get_stats().max_doc_id_);
+  EXPECT_EQ(2002ul, writer.get_seg_inv_meta().get_stats().total_doc_length_);
 }
 
 TEST_F(ObInvIdxMacroBlockWriterTest, append_macro_block_requires_open_writer)
@@ -2597,11 +3626,19 @@ TEST_F(ObInvIdxMacroBlockWriterTest, sstable_index_builder_reset_clears_async_in
 
 int main(int argc, char **argv)
 {
+  int ret = 1;
   system("rm -f test_inv_idx_macro_block_writer.log*");
   // OB_LOGGER.set_file_name("test_inv_idx_macro_block_writer.log");
   // OB_LOGGER.set_log_level("INFO");
   testing::InitGoogleTest(&argc, argv);
   oceanbase::lib::set_memory_limit(40UL << 30);
   signal(49, SIG_IGN);
-  return RUN_ALL_TESTS();
+  oceanbase::plugin::ObPluginMgr plugins;
+  if (plugins.init(oceanbase::common::ObString()) == oceanbase::common::OB_SUCCESS
+      && plugins.load_builtin_plugins() == oceanbase::common::OB_SUCCESS) {
+    GCTX.plugin_mgr_ = &plugins;
+    ret = RUN_ALL_TESTS();
+    GCTX.plugin_mgr_ = nullptr;
+  }
+  return ret;
 }

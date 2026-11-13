@@ -10,6 +10,7 @@
 #include "lib/number/ob_number_v2.h" // for number::ObNumber
 #include "lib/timezone/ob_time_convert.h" // for ObTime
 #include "lib/timezone/ob_timezone_info.h"
+#include "rpc/obmysql/ob_mysql_global.h" // for EMySQLFieldType
 
 namespace oceanbase {
 namespace common {
@@ -418,7 +419,7 @@ public:
   virtual int get_obtime(ObTime &t) const = 0;
   bool is_json_number(ObJsonNodeType json_type) const;
   static bool is_json_number_type(ObJsonNodeType json_type);
-  bool is_json_scalar(ObJsonNodeType json_type) const;
+  static bool is_json_scalar(ObJsonNodeType json_type);
   bool is_json_string(ObJsonNodeType json_type) const;
   bool is_json_date(ObJsonNodeType json_type) const;
 
@@ -446,56 +447,6 @@ protected:
     }
   }
 private:
-  // Change json time to string.
-  //
-  // @param [in, out] j_buf  The dest buf.
-  // @param [in] is_quoted  Whether append double quotes or not.
-  // @return Returns OB_SUCCESS on success, error code otherwise.
-  int print_jtime(ObJsonBuffer &j_buf, bool is_quoted) const;
-
-  // Change json array to string.
-  //
-  // @param [in, out] j_buf      The dest buf.
-  // @param [in]      depth     The depth of json tree.
-  // @param [in]      is_pretty Whether is from json funcion JSON_PRETTY or not.
-  // @return Returns OB_SUCCESS on success, error code otherwise.
-  int print_array(ObJsonBuffer &j_buf, uint64_t depth, bool is_pretty) const;
-
-  // Change json object to string.
-  //
-  // @param [in, out] j_buf      The dest buf.
-  // @param [in]      depth     The depth of json tree.
-  // @param [in]      is_pretty Whether is from json funcion JSON_PRETTY or not.
-  // @return Returns OB_SUCCESS on success, error code otherwise.
-  int print_object(ObJsonBuffer &j_buf, uint64_t depth, bool is_pretty) const;
-  int pint_colon(ObJsonBuffer &j_buf, bool is_pretty) const;
-
-  // Change json decimal to string.
-  //
-  // @param [in, out] j_buf      The dest buf.
-  // @return Returns OB_SUCCESS on success, error code otherwise.
-  int print_decimal(ObJsonBuffer &j_buf) const;
-
-  // Change json double to string.
-  //
-  // @param [in, out] j_buf      The dest buf.
-  // @return Returns OB_SUCCESS on success, error code otherwise.
-  int print_double(ObJsonBuffer &j_buf) const;
-
-  // Change json float to string.
-  //
-  // @param [in, out] j_buf      The dest buf.
-  // @return Returns OB_SUCCESS on success, error code otherwise.
-  int print_float(ObJsonBuffer &j_buf) const;
-
-  // Change json opaque to string.
-  //
-  // @param [in, out] j_buf      The dest buf.
-  // @param [in]      depth     The depth of json tree.
-  // @param [in]      is_quoted Whether append double quotes or not.
-  // @return Returns OB_SUCCESS on success, error code otherwise.
-  int print_opaque(ObJsonBuffer &j_buf, uint64_t depth, bool is_quoted) const;
-
   // Check whether the search is complete.
   //
   // @param [in] res             The result.
@@ -1141,6 +1092,7 @@ public:
   // @return Returns OB_SUCCESS on success, error code otherwise.
   static int append_string(ObJsonBuffer &j_buf, bool is_quoted, const char *data, uint64_t length);
 
+  static const obmysql::EMySQLFieldType OPAQUE_OB_TYPE_TO_MYSQL_TYPE[ObMaxType];
   // Change double to number
   //
   // @param [in]  d     The double type.

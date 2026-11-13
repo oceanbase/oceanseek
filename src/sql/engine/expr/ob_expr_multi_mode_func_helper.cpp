@@ -102,7 +102,8 @@ MultimodeAlloctor::MultimodeAlloctor(ObArenaAllocator &arena, uint64_t type, int
     LOG_WARN("[Multi-mode ALARM] different tenants", K(ret), K(alloc_tenant), K(tenant_id));
   }
   if (OB_NOT_NULL(session)) {
-    check_level_ = session->get_cached_multimodel_memory_trace_level() > 2 ? 0 : session->get_cached_multimodel_memory_trace_level();
+    const int64_t trace_level = session->get_cached_multimodel_memory_trace_level();
+    check_level_ = trace_level > 2 ? 0 : trace_level;
   } else {
     omt::ObTenantConfigGuard tenant_config(TENANT_CONF(alloc_tenant));
     if (tenant_config.is_valid()) {

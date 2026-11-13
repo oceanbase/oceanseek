@@ -376,6 +376,55 @@ int cumulative_path_is_enclosing(
 }
 }  // anonymous namespace
 
+int ObSearchIndexQueryRangeUtils::build_json_path_items(
+    ObIAllocator &allocator,
+    ObJsonPath &json_path,
+    ObIArray<ObSearchIndexPathEncoder::JsonPathItem> &path_items,
+    bool &is_supported,
+    const ObIArray<ObString> *enclosing_nested_paths,
+    const share::ObSearchIndexConfigFilter *json_filter)
+{
+  int ret = OB_SUCCESS;
+  is_supported = true;
+  path_items.reuse();
+  for (JsonPathIterator it = json_path.begin();
+       OB_SUCC(ret) && is_supported && it != json_path.end(); ++it) {
+    ObJsonPathNode *node = *it;
+    if (OB_ISNULL(node)) {
+      is_supported = false;
+    } else if (node->get_node_type() == JPN_ROOT) {
+    } else if (node->get_node_type() != JPN_MEMBER) {
+      // A valid JSON selector may still be unsupported by the physical index.
+      is_supported = false;
+    } else {
+      const ObPathMember member = static_cast<ObJsonPathBasicNode *>(node)->get_object();
+      const ObString member_key(member.len_, member.object_name_);
+      // Use raw names so quoted members, embedded dots and case are preserved.
+      if (OB_FAIL(path_items.push_back(ObSearchIndexPathEncoder::make_object_path(member_key)))) {
+        LOG_WARN("failed to push path item", K(ret));
+      } else if (OB_NOT_NULL(enclosing_nested_paths) && !enclosing_nested_paths->empty()) {
+        bool is_boundary = false;
+        if (OB_FAIL(cumulative_path_is_enclosing(allocator, path_items,
+                                                *enclosing_nested_paths, is_boundary))) {
+          LOG_WARN("failed to check enclosing nested boundary", K(ret));
+        } else if (is_boundary) {
+          bool declared_nested = false;
+          // INCLUDE_PATHS alone does not provide nested-key correlation.
+          if (OB_NOT_NULL(json_filter)
+              && OB_FAIL(json_filter->is_nested_path(path_items, declared_nested))) {
+            LOG_WARN("failed to check declared nested path", K(ret), K(path_items));
+          } else if (OB_NOT_NULL(json_filter) && !declared_nested) {
+            is_supported = false;
+          } else if (OB_FAIL(path_items.push_back(ObSearchIndexPathEncoder::make_array_path()))) {
+            LOG_WARN("failed to push array path item", K(ret));
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObSearchIndexQueryRangeUtils::json_prefix_path_encode(ObIAllocator &allocator,
                                                           ObQueryRangeCtx &ctx,
                                                           const ObRawExpr &path_expr,
@@ -422,77 +471,15 @@ int ObSearchIndexQueryRangeUtils::json_prefix_path_encode(ObIAllocator &allocato
         ret = OB_SUCCESS;
         can_extract_range = false;
       } else {
-        // Check that all path nodes are JPN_MEMBER (only member access allowed, no array access)
-        // Only paths like $.a.b.c are allowed, reject array access like $.a[0] or $.a[*]
-        bool only_member_nodes = true;
-        // Set when this candidate index does not declare a NESTED_PATH covering a nested()
-        // boundary the query crosses; such an index cannot answer the nested query correctly.
-        bool nested_index_ineligible = false;
+        bool path_supported = false;
         ObSEArray<ObSearchIndexPathEncoder::JsonPathItem, 16> path_items;
-        for (JsonPathIterator it = json_path.begin(); it != json_path.end() && only_member_nodes && OB_SUCC(ret); ++it) {
-          ObJsonPathNode *node = *it;
-          if (OB_ISNULL(node)) {
-            only_member_nodes = false;
-          } else {
-            ObJsonPathNodeType node_type = node->get_node_type();
-            // Only allow JPN_ROOT and JPN_MEMBER, reject all array-related types
-            // JPN_ROOT is the first node ($), JPN_MEMBER is member access (.key)
-            // Reject: JPN_ARRAY_CELL, JPN_ARRAY_RANGE, JPN_ARRAY_CELL_WILDCARD, JPN_MULTIPLE_ARRAY
-            if (node_type == JPN_ROOT) {
-              continue;
-            } else if (node_type == JPN_MEMBER) {
-              // Use the raw object name (not node_to_string, which double-quotes keys that are not
-              // ECMAScript identifiers). The index stores raw JSON member names and the config
-              // filter's NESTED_PATHS trie is keyed by raw names too, so a quoted key like
-              // "comments.v2" would never match the stored raw key comments.v2.
-              if (OB_SUCC(ret)) {
-                ObJsonPathBasicNode *basic_node = static_cast<ObJsonPathBasicNode *>(node);
-                ObString member_key(basic_node->get_object().len_, basic_node->get_object().object_name_);
-                if (OB_FAIL(path_items.push_back(ObSearchIndexPathEncoder::make_object_path(member_key)))) {
-                  LOG_WARN("failed to push path item", K(ret));
-                } else if (OB_NOT_NULL(enclosing_nested_paths) && !enclosing_nested_paths->empty()) {
-                  // Insert an ARRAY marker only when the cumulative member path equals one of the
-                  // query's explicitly-opened nested() clause paths. Array-vs-object shape thus
-                  // follows the QUERY's nesting, not the index NESTED_PATHS declarations: a single
-                  // nested(path="$.a.b") treats `a` as an object and only `b` as the nested array,
-                  // whereas nested(a) > nested(a.b) marks both layers. A plain (non-nested)
-                  // predicate has no enclosing paths and never inserts a marker, so it keeps pure
-                  // object-path MySQL json_extract semantics.
-                  bool is_boundary = false;
-                  if (OB_FAIL(cumulative_path_is_enclosing(tmp_allocator, path_items,
-                                                           *enclosing_nested_paths, is_boundary))) {
-                    LOG_WARN("failed to check enclosing nested boundary", K(ret));
-                  } else if (is_boundary) {
-                    // The candidate index must declare this boundary as a NESTED_PATH.  An index
-                    // that only lists the path under INCLUDE_PATHS stores array-descendant scalars
-                    // without nested-key correlation and would answer the nested() query
-                    // incorrectly.  Mark such an index ineligible so the optimizer picks an index
-                    // whose NESTED_PATHS cover the query's nesting.
-                    bool declared_nested = false;
-                    if (OB_NOT_NULL(json_filter)
-                        && OB_FAIL(json_filter->is_nested_path(path_items, declared_nested))) {
-                      LOG_WARN("failed to check declared nested path", K(ret), K(path_items));
-                    } else if (OB_NOT_NULL(json_filter) && !declared_nested) {
-                      nested_index_ineligible = true;
-                      break;
-                    } else if (OB_FAIL(path_items.push_back(ObSearchIndexPathEncoder::make_array_path()))) {
-                      LOG_WARN("failed to push array path item", K(ret));
-                    } else {
-                      LOG_TRACE("[NESTED-DBG] search index nested query path items", K(path_items));
-                    }
-                  }
-                }
-              }
-            } else {
-              only_member_nodes = false;
-              LOG_DEBUG("JSON path contains non-member node, cannot extract range",
-                       K(path_str), K(node_type));
-            }
-          }
+        if (OB_FAIL(build_json_path_items(tmp_allocator, json_path, path_items,
+                                         path_supported, enclosing_nested_paths, json_filter))) {
+          LOG_WARN("failed to build search index path", K(ret), K(path_str));
         }
         // Check path filter if json_filter is configured
         bool filter_passed = true;
-        if (OB_SUCC(ret) && only_member_nodes && !nested_index_ineligible && OB_NOT_NULL(json_filter)) {
+        if (OB_SUCC(ret) && path_supported && OB_NOT_NULL(json_filter)) {
           if (OB_FAIL(json_filter->is_indexed(path_items, pick_type, filter_passed, index_sub_path))) {
             LOG_WARN("failed to check path filter", K(ret));
           }
@@ -510,7 +497,7 @@ int ObSearchIndexQueryRangeUtils::json_prefix_path_encode(ObIAllocator &allocato
             path_items.pop_back();
           }
         }
-        can_extract_range = only_member_nodes && filter_passed && !nested_index_ineligible;
+        can_extract_range = OB_SUCC(ret) && path_supported && filter_passed;
         if (OB_SUCC(ret) && can_extract_range) {
           if (path_items.empty()) {
             // empty path, such as $

@@ -1,6 +1,6 @@
 /**
- * Copyright (C) 2026 OceanBase
- * 本文件包含机密及专有信息，未经授权不得使用或披露。
+ * Copyright (c) 2026 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #define USING_LOG_PREFIX SQL_DAS
@@ -12,6 +12,7 @@
 #include "sql/das/search/ob_das_sparse_candidate_buffer.h"
 #include "sql/das/search/ob_das_async_segment_merge_op.h"
 #include "sql/das/search/ob_das_scalar_define.h"
+#include "sql/das/search/ob_das_search_utils.h"
 #include "storage/tx_storage/ob_access_service.h"
 
 namespace oceanbase
@@ -90,10 +91,18 @@ int ObDASAsyncTokenOp::do_init(const ObIDASSearchOpParam &op_param)
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("async token op only supports uint64 rowid", K(ret),
         "rowid_type", search_ctx_.get_rowid_type());
-  } else if (OB_FAIL(init_term_key(param.query_token_))) {
+  } else if (FALSE_IT(ir_ctdef_ = param.ir_ctdef_)) {
+  } else if (is_search_text() && OB_ISNULL(ir_ctdef_->search_text_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null Search Text expression", K(ret));
+  } else if (is_search_text() && OB_FAIL(ObDASSearchUtils::build_fulltext_term_key(
+                 ir_ctdef_->search_index_fulltext_info_, param.query_token_, ir_ctdef_->search_text_->obj_meta_,
+                 arena_allocator_, term_key_))) {
+    LOG_WARN("failed to init term key", K(ret), "token_len", param.query_token_.length());
+  } else if (!is_search_text() && OB_FAIL(init_term_key(param.query_token_))) {
     LOG_WARN("failed to init term key", K(ret), "token_len", param.query_token_.length());
   } else {
-    ir_ctdef_ = param.ir_ctdef_;
+    query_token_ = term_key_.get_datum(term_key_.get_datum_cnt() - 1).get_string();
     ir_rtdef_ = param.ir_rtdef_;
     version_range_ = param.version_range_;
     index_table_id_ = param.index_table_id_;
@@ -211,7 +220,8 @@ int ObDASAsyncTokenOp::estimate_work_row_count()
               KR(ret), "token_len", query_token_.length());
   } else if (OB_FAIL(estimator.init(
                  search_ctx_, *ir_ctdef_, *ir_rtdef_, estimate_tablet_id,
-                 query_token_))) {
+                 is_search_text(), ir_ctdef_->search_index_fulltext_info_.column_idx_,
+                 ir_ctdef_->search_index_fulltext_info_.encoded_path_, query_token_))) {
     LOG_TRACE("failed to init async token work estimator",
               KR(ret), K(estimate_tablet_id), "token_len", query_token_.length());
   } else if (OB_FAIL(estimator.get_bm25_params(
@@ -292,7 +302,7 @@ int ObDASAsyncTokenOp::init_posting_scan_param()
 int ObDASAsyncTokenOp::fill_async_bm25_param(blocksstable::ObInvPostingScanParam &param)
 {
   int ret = OB_SUCCESS;
-  param.has_relevance_params_ = true;
+  param.need_relevance_params_ = true;
   if (OB_FAIL(param_estimator_.get_bm25_params(param.total_doc_cnt_, param.avg_doc_length_, param.doc_freq_))) {
     LOG_WARN("failed to get bm25 params", K(ret));
   }
@@ -306,7 +316,9 @@ int ObDASAsyncTokenOp::init_bm25_param_estimator()
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected null ir ctdef/rtdef", K(ret));
   } else if (OB_FAIL(param_estimator_.init(search_ctx_, *ir_ctdef_, *ir_rtdef_,
-                                           inv_idx_tablet_id_, query_token_))) {
+                                           inv_idx_tablet_id_, is_search_text(),
+                                           ir_ctdef_->search_index_fulltext_info_.column_idx_,
+                                           ir_ctdef_->search_index_fulltext_info_.encoded_path_, query_token_))) {
     LOG_WARN("failed to init bm25 param estimator", K(ret));
   }
   return ret;

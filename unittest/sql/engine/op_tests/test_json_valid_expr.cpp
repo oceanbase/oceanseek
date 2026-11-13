@@ -110,6 +110,60 @@ TEST_F(JsonValidExprTest, MysqlNonStringTypeReturnsZero)
   EXPECT_TRUE(result.verify_ordered({{"0"}}));
 }
 
+// ============================================================================
+// _enable_json_bin_view switch comparison tests.
+//
+// JSON_VALID with a JSON type input (cast(s as json)) calls
+// common::get_json_wrapper with ObJsonInType::JSON_BIN, constructing either
+// an ObJsonBinView (switch ON) or ObJsonBin DOM (switch OFF).  If
+// construction succeeds, json_valid returns 1.  The cast already validates
+// the JSON text, so these tests focus on verifying the wrapper construction
+// path is consistent between bin_view and DOM.
+//
+// Note: _enable_json_bin_view is an OB_TENANT_PARAMETER, not a session
+// variable, so with_session_vars() cannot set it.  We use WITH_TENANT_CONFS
+// (TestParameterGuard RAII) which pushes into TestDefaultParameterConf TLS,
+// consumed by OpTestEngine::apply_tenant_config_overrides() during prepare().
+// ============================================================================
+
+// B1: switch ON — validate JSON binary via cast(s as json).
+TEST_F(JsonValidExprTest, BinViewSwitchOnJsonBinary)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "true"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256)")
+        .with_expr("json_valid(cast(s as json))")
+        .with_data({
+            {R"({"a": 1, "b": [2, 3]})"},
+            {R"([1, 2, 3])"},
+            {R"("hello")"},
+            {R"(42)"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"1"}, {"1"}, {"1"}, {"1"}}));
+  }
+}
+
+// B2: switch OFF — same input as B1, expect identical results.
+TEST_F(JsonValidExprTest, BinViewSwitchOffJsonBinary)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "false"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256)")
+        .with_expr("json_valid(cast(s as json))")
+        .with_data({
+            {R"({"a": 1, "b": [2, 3]})"},
+            {R"([1, 2, 3])"},
+            {R"("hello")"},
+            {R"(42)"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"1"}, {"1"}, {"1"}, {"1"}}));
+  }
+}
+
 int main(int argc, char **argv)
 {
   ::testing::InitGoogleTest(&argc, argv);

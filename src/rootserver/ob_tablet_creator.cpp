@@ -215,7 +215,7 @@ int ObBatchCreateTabletHelper::add_table_schema_(
             table_schema, data_table_schema, tenant_data_version, split_src_tablet_id, split_can_reuse_macro_block))) {
       LOG_WARN("failed to get split src tablet id", K(ret), K(table_schema));
     } else if (OB_FAIL(create_tablet_extr_info.init(tenant_data_version, 
-                                                    need_create_empty_major, 
+                                                    need_create_empty_major,
                                                     table_schema.get_micro_index_clustered(),
                                                     split_src_tablet_id,
                                                     split_can_reuse_macro_block))) {

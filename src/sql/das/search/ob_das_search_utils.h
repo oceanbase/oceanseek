@@ -12,6 +12,10 @@
 
 namespace oceanbase
 {
+namespace blocksstable
+{
+struct ObDatumRowkey;
+}
 namespace storage
 {
 struct ObBlockMaxScoreIterParam;
@@ -33,10 +37,30 @@ struct ObIDASSearchRtDef;
 struct ObDASIRScanCtDef;
 struct ObDASIRScanRtDef;
 struct ObDASScalarScanCtDef;
+struct ObDASSearchIndexTextInfo;
 
 class ObDASSearchUtils
 {
 public:
+  // Own the already-encoded (column, path, value/token) key in allocator.
+  // Value and Text keep their encoding rules, but share the storage key layout.
+  static int build_search_index_term_key(
+      const common::ObRowkey &key,
+      common::ObIAllocator &allocator,
+      blocksstable::ObDatumRowkey &term_key);
+  // Encode raw tokens and build the (column, path, token) key for a bound Search Text field.
+  static int build_fulltext_term_key(
+      const ObDASSearchIndexTextInfo &search_text,
+      const common::ObString &query_token,
+      const common::ObObjMeta &query_meta,
+      common::ObIAllocator &allocator,
+      blocksstable::ObDatumRowkey &term_key);
+  // Resolve the shared nested mode from nested clauses before creating operators.
+  // Other search branches in the fusion tree do not participate in this decision.
+  static int resolve_nested_scope_id(const ObDASBaseCtDef *ctdef, ObDASScopeId &scope_id);
+  // Validate the selected index scans inside a nested query subtree.
+  static int resolve_nested_index(const ObDASBaseCtDef *ctdef,
+                                 uint64_t &index_table_id, bool &is_async);
   // Owns the storage scan range and its rowkey objects for an async scalar SQL range.
   // range_ references the arrays in this object, so this object must outlive every use of range_.
   struct AsyncScalarTermRange
@@ -54,7 +78,8 @@ public:
       ObEvalCtx &eval_ctx,
       const ObExpr &query_text_expr,
       const ObDASScalarScanCtDef &inv_idx_scan_ctdef,
-      common::ObIArray<common::ObString> &query_tokens);
+      common::ObIArray<common::ObString> &query_tokens,
+      const ObDASIRScanCtDef *ir_ctdef);
   // Deduplicated variant: each unique token appears once in query_tokens, and
   // token_counts records its occurrence count in the query text.
   static int eval_and_tokenize_query_text(
@@ -63,7 +88,8 @@ public:
       const ObExpr &query_text_expr,
       const ObDASScalarScanCtDef &inv_idx_scan_ctdef,
       common::ObIArray<common::ObString> &query_tokens,
-      common::ObIArray<int64_t> &token_counts);
+      common::ObIArray<int64_t> &token_counts,
+      const ObDASIRScanCtDef *ir_ctdef);
   static int project_async_scalar_term_range(
       const common::ObNewRange &range,
       AsyncScalarTermRange &term_range);

@@ -60,8 +60,11 @@ public:
     sort_cmp_funcs_(ctx_allocator()),
     sort_memctx_(),
     nk_truncate_depth_(0),
-    boost_weight_(0.0)
-  { }
+    boost_weight_(0.0),
+    is_first_nk_(true),
+    nested_input_end_(false),
+    curr_nk_buf_(nullptr)
+  { curr_doc_id_.set_min(); }
   virtual ~ObDASSortOp() {}
 
 private:
@@ -72,11 +75,18 @@ private:
   int do_rescan_segment(const common::ObNewVersionRange &range) override;
   int do_advance_to(const ObDASRowID &target, ObDASRowID &curr_id, double &score) override;
   int do_next_rowid(ObDASRowID &next_id, double &score) override;
+  int do_advance_to(const ObDASNestedKey &target, ObDASNestedKey &curr_nk, double &score) override;
+  int do_next_rowid(ObDASNestedKey &next_nk, double &score) override;
+  int next_impl(ObDASNestedKey &next_nk, double &score);
   int do_advance_shallow(const ObDASRowID &target, const bool inclusive, const MaxScoreTuple *&max_score_tuple) override;
   int do_calc_max_score(double &threshold) override;
 
 private:
   int do_sort();
+  int next_sorted_rowid(ObDASRowID &next_id, double &score);
+  int advance_sorted_rowid(const ObDASRowID &target, ObDASRowID &curr_id, double &score);
+  void reset_rowid_cursor();
+  int copy_nested_key(ObDASNestedKey &key);
   // Sort must read the vectors written by its scalar child. They are normally
   // identical to this op's scoped RowID exprs, except for BASE DOC_ID_ONLY where
   // the child writes search-index doc_id while the outer fusion BASE expr
@@ -104,6 +114,11 @@ private:
   // current depth's identity, ensuring ObUniqueSortImpl deduplicates correctly.
   int64_t nk_truncate_depth_;
   double boost_weight_;
+  bool is_first_nk_;
+  ObDASNestedKey curr_nk_;
+  ObDASRowID curr_doc_id_;
+  bool nested_input_end_;
+  char *curr_nk_buf_;
 };
 
 } // namespace sql

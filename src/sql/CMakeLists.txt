@@ -1707,6 +1707,7 @@ ob_set_subtarget(ob_sql resolver_ddl
   resolver/ddl/ob_alter_rls_policy_resolver.cpp
   resolver/ddl/ob_rls_policy_resolver_helper.cpp
   resolver/ddl/ob_fts_parser_resolver.cpp
+  resolver/ddl/ob_search_index_config_resolver.cpp
   resolver/ddl/ob_storage_cache_ddl_util.cpp
   resolver/ddl/ob_catalog_resolver.cpp
   resolver/ddl/ob_catalog_stmt.cpp

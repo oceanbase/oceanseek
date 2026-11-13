@@ -1888,9 +1888,32 @@ int ObAlterTableResolver::resolve_index_column_list(const ParseNode &node,
             ret = OB_KEY_PART_0;
             LOG_USER_ERROR(OB_KEY_PART_0, sort_item.column_name_.length(), sort_item.column_name_.ptr());
             SQL_RESV_LOG(WARN, "Key part length cannot be 0", K(sort_item), K(ret));
+          } else if (INDEX_KEYNAME::SEARCH_KEY == index_keyname_
+                     || INDEX_KEYNAME::ASYNC_SEARCH_KEY == index_keyname_) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_WARN("prefix length for search index is not supported", K(ret), K(sort_item.prefix_len_));
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "prefix length for search index is");
           }
         } else {
           sort_item.prefix_len_ = 0;
+        }
+        // SEARCH INDEX: handle column-level WITH(...) config from children_[4]
+        if (OB_SUCC(ret)
+            && (index_keyname_ == INDEX_KEYNAME::SEARCH_KEY
+                || index_keyname_ == INDEX_KEYNAME::ASYNC_SEARCH_KEY)
+            && sort_column_node->num_child_ >= 5
+            && OB_NOT_NULL(sort_column_node->children_[4])
+            && sort_column_node->children_[4]->type_ == T_SEARCH_INDEX_COLUMN_PARAMS) {
+          const ParseNode *search_with_node = sort_column_node->children_[4];
+          const ObColumnSchemaV2 *col_schema = table_schema_->get_column_schema(sort_item.column_name_);
+          if (OB_ISNULL(col_schema)) {
+            ret = OB_ERR_KEY_COLUMN_DOES_NOT_EXITS;
+            LOG_USER_ERROR(OB_ERR_KEY_COLUMN_DOES_NOT_EXITS,
+                           sort_item.column_name_.length(), sort_item.column_name_.ptr());
+          } else if (OB_FAIL(ObDDLResolver::resolve_search_index_column_comment(
+                  search_with_node, col_schema, sort_item.column_name_, allocator_, sort_item.column_comment_))) {
+            LOG_WARN("failed to resolve search index column config", K(ret), K(sort_item.column_name_));
+          }
         }
         if (OB_SUCC(ret)) {
           const ObColumnSchemaV2 *column_schema = NULL;
@@ -1917,7 +1940,8 @@ int ObAlterTableResolver::resolve_index_column_list(const ParseNode &node,
             if (OB_FAIL(ret)) {
             } else if (OB_FAIL(resolve_search_index_constraint(*table_schema_,
                                                                sort_item.column_name_,
-                                                               index_name_value))) {
+                                                               index_name_value,
+                                                               sort_item.column_comment_))) {
               SQL_RESV_LOG(WARN, "check search index constraint fail", K(ret), K(sort_item.column_name_));
             }
           }
@@ -2004,25 +2028,6 @@ int ObAlterTableResolver::resolve_index_column_list(const ParseNode &node,
         } else {
           //兼容mysql5.7, 降序索引不生效且不报错
           sort_item.order_type_ = common::ObOrderType::ASC;
-        }
-
-        // SEARCH INDEX: handle column-level WITH(...) config from children_[4]
-        if (OB_SUCC(ret)
-            && (index_keyname_ == INDEX_KEYNAME::SEARCH_KEY
-                || index_keyname_ == INDEX_KEYNAME::ASYNC_SEARCH_KEY)
-            && sort_column_node->num_child_ >= 5
-            && OB_NOT_NULL(sort_column_node->children_[4])
-            && sort_column_node->children_[4]->type_ == T_SEARCH_INDEX_COLUMN_PARAMS) {
-          const ParseNode *search_with_node = sort_column_node->children_[4];
-          const ObColumnSchemaV2 *col_schema = table_schema_->get_column_schema(sort_item.column_name_);
-          if (OB_ISNULL(col_schema)) {
-            ret = OB_ERR_KEY_COLUMN_DOES_NOT_EXITS;
-            LOG_USER_ERROR(OB_ERR_KEY_COLUMN_DOES_NOT_EXITS,
-                           sort_item.column_name_.length(), sort_item.column_name_.ptr());
-          } else if (OB_FAIL(ObDDLResolver::resolve_search_index_column_comment(
-                  search_with_node, col_schema, sort_item.column_name_, allocator_, sort_item.column_comment_))) {
-            LOG_WARN("failed to resolve search index column config", K(ret), K(sort_item.column_name_));
-          }
         }
 
         if (OB_SUCC(ret)) {
@@ -2375,6 +2380,9 @@ int ObAlterTableResolver::resolve_add_index(const ParseNode &node)
             if (OB_SUCC(ret)) {
               if (OB_FAIL(generate_index_arg(*create_index_arg, is_unique_key))) {
                 SQL_RESV_LOG(WARN, "failed to generate index arg!", K(ret));
+              } else if (is_search_def_index(create_index_arg->index_type_)
+                         && OB_FAIL(ObSearchIndexBuilderUtil::resolve_search_index_args(*create_index_arg))) {
+                LOG_WARN("unsupported search index configuration", K(ret));
               } else if (table_schema_->is_partitioned_table()
                          && INDEX_TYPE_SPATIAL_GLOBAL == create_index_arg->index_type_) {
                 ret = OB_NOT_SUPPORTED;

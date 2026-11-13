@@ -178,6 +178,7 @@ int ObQueryDriver::response_query_result(ObResultSet &result,
   FLTSpanGuard(response_result);
   can_retry = true;
   bool is_first_row = true;
+  const bool enable_json_bin_view = session_.is_enable_json_bin_view();
   const ObNewRow *result_row = NULL;
   bool is_cac_found_rows =  result.is_calc_found_rows();
   int64_t row_num = 0;
@@ -294,7 +295,8 @@ int ObQueryDriver::response_query_result(ObResultSet &result,
                          session_,  
                          result.get_field_columns(),
                          ctx_.schema_guard_,
-                         session_.get_effective_tenant_id());
+                         session_.get_effective_tenant_id(),
+                         enable_json_bin_view);
       sm.set_packed(is_packed);
       OMPKRow rp(sm);
       rp.set_is_packed(is_packed);

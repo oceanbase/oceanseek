@@ -308,6 +308,122 @@ TEST_F(JsonExtractExprTest, MysqlInvalidJsonPath)
   EXPECT_EQ(common::OB_ERR_INVALID_JSON_PATH, result.get_ret_code());
 }
 
+// ============================================================================
+// _enable_json_bin_view switch comparison tests.
+//
+// JSON_EXTRACT calls ObJsonWrapper::seek.  When _enable_json_bin_view is ON
+// and the input is cast(... as json) (ObJsonType → JSON_BIN), the wrapper
+// holds an ObJsonBinView and seek runs on the zero-copy bin path.  When OFF,
+// the wrapper holds an ObJsonBin DOM and seek delegates to ObIJsonBase::seek.
+// These tests exercise both switch states and assert the results match
+// byte-for-byte.
+//
+// Note: _enable_json_bin_view is an OB_TENANT_PARAMETER, not a session
+// variable, so with_session_vars() cannot set it.  We use WITH_TENANT_CONFS
+// (TestParameterGuard RAII) which pushes into TestDefaultParameterConf TLS,
+// consumed by OpTestEngine::apply_tenant_config_overrides() during prepare().
+// ============================================================================
+
+// B1: switch ON — object member path on cast(s as json).
+TEST_F(JsonExtractExprTest, BinViewSwitchOnObjectPath)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "true"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256), p varchar(16)")
+        .with_expr("json_extract(cast(s as json), p)")
+        .with_data({
+            {R"({"a": 1, "b": [10, 20, 30]})", "$.a"},
+            {R"({"a": 1, "b": [10, 20, 30]})", "$.b[1]"},
+            {R"({"a": 1, "b": [10, 20, 30]})", "$.b[*]"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"1"}, {"20"}, {R"([10, 20, 30])"}}));
+  }
+}
+
+// B2: switch OFF — same input as B1, expect identical results.
+TEST_F(JsonExtractExprTest, BinViewSwitchOffObjectPath)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "false"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256), p varchar(16)")
+        .with_expr("json_extract(cast(s as json), p)")
+        .with_data({
+            {R"({"a": 1, "b": [10, 20, 30]})", "$.a"},
+            {R"({"a": 1, "b": [10, 20, 30]})", "$.b[1]"},
+            {R"({"a": 1, "b": [10, 20, 30]})", "$.b[*]"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"1"}, {"20"}, {R"([10, 20, 30])"}}));
+  }
+}
+
+// B3: switch ON — nested array + wildcard path.
+TEST_F(JsonExtractExprTest, BinViewSwitchOnNestedWildcard)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "true"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256), p varchar(32)")
+        .with_expr("json_extract(cast(s as json), p)")
+        .with_data({
+            {R"({"x": [{"y": 1}, {"y": 2}, {"y": 3}]})", "$.x[*].y"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{R"([1, 2, 3])"}}));
+  }
+}
+
+// B4: switch OFF — same input as B3, expect identical results.
+TEST_F(JsonExtractExprTest, BinViewSwitchOffNestedWildcard)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "false"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256), p varchar(32)")
+        .with_expr("json_extract(cast(s as json), p)")
+        .with_data({
+            {R"({"x": [{"y": 1}, {"y": 2}, {"y": 3}]})", "$.x[*].y"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{R"([1, 2, 3])"}}));
+  }
+}
+
+// B5: switch ON — multiple paths on deeply nested document.
+TEST_F(JsonExtractExprTest, BinViewSwitchOnMultiplePaths)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "true"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256), p1 varchar(16), p2 varchar(16)")
+        .with_expr("json_extract(cast(s as json), p1, p2)")
+        .with_data({
+            {R"({"a": {"b": {"c": 42}}, "d": [1,2,3]})", "$.a.b.c", "$.d[0]"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{R"([42, 1])"}}));
+  }
+}
+
+// B6: switch OFF — same input as B5, expect identical results.
+TEST_F(JsonExtractExprTest, BinViewSwitchOffMultiplePaths)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "false"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256), p1 varchar(16), p2 varchar(16)")
+        .with_expr("json_extract(cast(s as json), p1, p2)")
+        .with_data({
+            {R"({"a": {"b": {"c": 42}}, "d": [1,2,3]})", "$.a.b.c", "$.d[0]"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{R"([42, 1])"}}));
+  }
+}
+
 int main(int argc, char **argv)
 {
   ::testing::InitGoogleTest(&argc, argv);

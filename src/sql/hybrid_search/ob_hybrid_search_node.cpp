@@ -11,6 +11,7 @@
 #include "share/ob_json_access_utils.h"
 #include "lib/udt/ob_array_type.h"
 #include "share/search_index/ob_search_index_config_filter.h"
+#include "share/search_index/ob_search_index_config.h"
 #include "share/vector_index/ob_vector_index_util.h"
 #include "share/ob_cluster_version.h"
 #include "sql/das/search/ob_das_msm_runtime_util.h"
@@ -258,6 +259,8 @@ int ObHybridSearchGenerator::deal_table_scan_filters(ObIndexMergeNode *hybrid_se
       } else if (has_force_index_merge_hint_ && 0 < index_scan_count) {
         ingore_normal_access_path = true;
       }
+    } else if (fusion_node->children_.at(0)->node_type_ == INDEX_MERGE_HYBRID_FTS_QUERY) {
+      ingore_normal_access_path = true;
     } else if (fusion_node->children_.at(0)->node_type_ != INDEX_MERGE_HYBRID_BOOLEAN_QUERY) {
       // do nothing
     } else {
@@ -997,7 +1000,8 @@ int ObHybridSearchGenerator::generate_fulltext_node(
   if (OB_ISNULL(fulltext_query)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), KPC(fulltext_query));
-  } else if (OB_FAIL(fulltext_query->produce_query_node(*table_schema_, *schema_guard_, *allocator_, fulltext_node))) {
+  } else if (OB_FAIL(fulltext_query->produce_query_node(
+      *table_schema_, *schema_guard_, valid_index_ids_, *allocator_, fulltext_node))) {
     LOG_WARN("failed to produce fulltext query node", K(ret));
   }
   return ret;
@@ -1066,10 +1070,17 @@ int ObHybridSearchGenerator::get_search_index_cons_encode_type(ObRawExpr *filter
           LOG_WARN("index column schema is null", K(ret), K(index_id), K(column_id));
         } else if (ob_is_json(index_column_schema->get_data_type())
                    && !index_column_schema->get_comment_str().empty()) {
+          common::ObSqlString value_comment;
+          bool has_value = false;
           share::ObSearchIndexConfigFilter json_filter(index_schema->get_tenant_id());
-          if (OB_FAIL(json_filter.init_from_comment(index_column_schema->get_comment_str()))) {
-            LOG_WARN("failed to parse json column filter", K(ret), K(index_id), K(column_id),
-                     K(index_column_schema->get_comment_str()));
+          if (OB_FAIL(share::ObSearchIndexConfig::get_value_mode_comment(
+              index_column_schema->get_comment_str(), value_comment, has_value))) {
+            LOG_WARN("failed to get search index VALUE comment", K(ret), K(index_id), K(column_id));
+          } else if (!has_value) {
+            // FULLTEXT-only indexes do not cover scalar VALUE predicates.
+            continue;
+          } else if (OB_FAIL(json_filter.init_from_comment(value_comment.string()))) {
+            LOG_WARN("failed to parse search VALUE filter", K(ret), K(index_id), K(column_id));
           } else {
             index_cons_encode_type = json_filter.get_type_mask();
           }

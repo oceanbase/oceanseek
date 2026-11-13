@@ -8821,7 +8821,7 @@ int ObRawExprResolverImpl::process_match_against(const ParseNode *node, ObRawExp
 {
   int ret = OB_SUCCESS;
   ObMatchFunRawExpr *match_against = NULL;
-  if (OB_ISNULL(node) || OB_ISNULL(node->children_) || node->num_child_ != 2 || OB_ISNULL(ctx_.match_exprs_)) {
+  if (OB_ISNULL(node) || OB_ISNULL(node->children_) || (node->num_child_ != 2 && node->num_child_ != 3) || OB_ISNULL(ctx_.match_exprs_)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument for match against", K(ret), K(node));
   } else if (OB_ISNULL(node->children_[0]) || node->children_[0]->type_ != T_MATCH_COLUMN_LIST) {
@@ -8849,13 +8849,15 @@ int ObRawExprResolverImpl::process_match_against(const ParseNode *node, ObRawExp
   }
 
   if (OB_SUCC(ret)) {
+    // JSON path precedes the query in the parse tree to preserve parameter order.
+    const int64_t query_idx = node->num_child_ == 3 ? 2 : 1;
     // resolve search query and mode
     ObRawExpr *search_keywords = nullptr;
     uint64_t data_version = 0;
-    if (OB_ISNULL(node->children_[1])) {
+    if (OB_ISNULL(node->children_[query_idx])) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("match against search keywords is unexpected");
-    } else if (OB_FAIL(SMART_CALL(recursive_resolve(node->children_[1], search_keywords)))) {
+    } else if (OB_FAIL(SMART_CALL(recursive_resolve(node->children_[query_idx], search_keywords)))) {
       LOG_WARN("recursive resolve search keywords failed", K(ret));
     } else if (OB_FAIL(search_keywords->extract_info())) {
       LOG_WARN("failed to extract info", K(ret));
@@ -8886,6 +8888,14 @@ int ObRawExprResolverImpl::process_match_against(const ParseNode *node, ObRawExp
       match_against->set_mode_flag(static_cast<ObMatchAgainstMode>(node->value_));
       expr = match_against;
       LOG_DEBUG("resolve match against expr finish", K(ret), KPC(expr));
+    }
+  }
+  if (OB_SUCC(ret) && node->num_child_ == 3) {
+    ObRawExpr *path_expr = nullptr;
+    if (OB_FAIL(SMART_CALL(recursive_resolve(node->children_[1], path_expr)))) {
+      LOG_WARN("failed to resolve Search Text JSON path", K(ret));
+    } else {
+      match_against->set_json_path_expr(path_expr);
     }
   }
   if (OB_SUCC(ret) && OB_FAIL(match_against->extract_info())) {

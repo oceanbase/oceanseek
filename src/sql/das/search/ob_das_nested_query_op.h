@@ -10,16 +10,18 @@
  *
  * Key Responsibilities
  * - Crosses the BASE↔NESTED scope boundary. The general inner subtree runs in
- *   DAS_SCOPE_NESTED_SYNC; a non-scoring direct scalar or pure should/MSM=1 subtree
+ *   the registered nested scope; a non-scoring direct scalar or pure should/MSM=1 subtree
  *   under a BASE/uint64 boundary can instead run in BASE DOC_ID_ONLY mode. Scope is
  *   selected when the inner ops are created by
  *   ObDASNestedQueryRtDef::generate_op(), not at runtime.
- * - do_next_rowid: pull (doc_id, nested_key) from inner_op, truncate nested_key by BYTES_PER_LEVEL bytes
+ * - Async nested aligns DocID candidates, then verifies borrowed NK rows.
+ *   NK outputs project to the parent depth; NK seek targets pass through unchanged.
+ * - Sync do_next_rowid: pull (doc_id, nested_key) from inner_op, truncate nested_key by BYTES_PER_LEVEL bytes
  *   (drop innermost level), deduplicate by the truncated rowid, emit to parent scope. At the outermost
  *   BASE boundary, the next call seeks directly to the following doc instead of draining duplicate
  *   nested-element matches. A multi-level NESTED boundary uses the same group-skip path for
  *   (doc_id, parent_prefix). DOC_ID_ONLY receives uint64 doc_id directly and only deduplicates it.
- * - do_advance_to: extend the target rowid with BYTES_PER_LEVEL bytes of 0x00 to form the inner target,
+ * - Sync do_advance_to: extend the target rowid with BYTES_PER_LEVEL bytes of 0x00 to form the inner target,
  *   then delegate to inner_op. DOC_ID_ONLY delegates the BASE target unchanged.
  */
 
@@ -117,17 +119,19 @@ public:
  *
  * Responsibilities:
  * - do_init: bind inner_op_, nesting_depth_, and the creation-time DOC_ID_ONLY decision.
- * - do_next_rowid: pull (doc_id, nested_key) from inner_op, truncate nested_key by BYTES_PER_LEVEL bytes
+ * - Async nested aligns DocID candidates, then verifies borrowed NK rows.
+ *   NK outputs project to the parent depth; NK seek targets pass through unchanged.
+ * - Sync do_next_rowid: pull (doc_id, nested_key) from inner_op, truncate nested_key by BYTES_PER_LEVEL bytes
  *   (drop innermost level), deduplicate by the truncated rowid, emit to parent scope.
  *   When parent scope is BASE, emit plain uint64 doc_id. When parent scope is NESTED
  *   (multi-layer nesting), emit COMPACT with the truncated nk. A BASE/uint64 boundary over a
  *   NESTED/COMPACT child seeks to (last_doc_id + 1, minimum nested key) on the next call.
  *   Multi-level boundaries reuse the same group state to seek past a parent prefix.
  *   DOC_ID_ONLY consumes a BASE/uint64 child directly and seeks with a BASE target.
- * - do_advance_to: extend the target rowid with BYTES_PER_LEVEL bytes of 0x00 to form the inner target,
+ * - Sync do_advance_to: extend the target rowid with BYTES_PER_LEVEL bytes of 0x00 to form the inner target,
  *   then delegate to inner_op.
- * - do_advance_shallow: falls back to base default (degrades to advance_to). Nested
- *   queries are filter-only with no score upper bound.
+ * - do_advance_shallow: exclusive BASE/uint64 seeks over async children start at
+ *   the target's successor. Other calls use the base default.
  */
 class ObDASNestedQueryOp final : public ObIDASSearchOp
 {
@@ -152,9 +156,15 @@ protected:
   int do_rescan() override;
   int do_advance_to(const ObDASRowID &target, ObDASRowID &curr_id, double &score) override;
   int do_next_rowid(ObDASRowID &next_id, double &score) override;
-  // do_advance_shallow inherits base default (falls back to advance_to).
+  int do_advance_to(const ObDASNestedKey &target, ObDASNestedKey &curr_nk, double &score) override;
+  int do_next_rowid(ObDASNestedKey &next_nk, double &score) override;
+  int do_advance_shallow(const ObDASRowID &target, const bool inclusive,
+                       const MaxScoreTuple *&max_score_tuple) override;
 
 private:
+  int project_nested_key(ObDASNestedKey &key) const;
+  // Check whether the current document has a matching NK without advancing DocID.
+  int check_current_doc_nk(bool &has_match);
   // Pack [doc_id, nested_key] into a NESTED/COMPACT RowID.
   int build_nested_rowid(const ObDatum &doc_id_datum,
                          const ObDatum &nested_key_datum,
@@ -211,14 +221,15 @@ private:
 
 private:
   ObIDASSearchOp *inner_op_;
-  int32_t nesting_depth_;
   bool is_doc_id_only_;
   // Cached at init from the immutable operator/RowID shape.
   bool enable_group_skip_;
   uint64_t pending_group_doc_id_;
   char pending_group_prefix_[MAX_GROUP_PREFIX_LEN];
+  // Sync streaming dedup, or the current verified document at an async BASE boundary.
   ObDASRowID last_emitted_rowid_;
   bool has_emitted_;
+  double last_emitted_score_;
   bool has_pending_group_skip_;
   // Ping-pong allocators: only the single live last_emitted_rowid_ buffer is retained at
   // any time. next_dedup_allocator() receives the new emit; on commit, current is reset and

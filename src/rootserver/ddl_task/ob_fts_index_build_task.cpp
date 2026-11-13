@@ -43,14 +43,20 @@ ObFtsIndexBuildTask::ObFtsIndexBuildTask()
     doc_rowkey_aux_table_id_(OB_INVALID_ID),
     domain_index_aux_table_id_(OB_INVALID_ID),
     fts_doc_word_aux_table_id_(OB_INVALID_ID),
+    search_text_match_aux_table_id_(OB_INVALID_ID),
+    search_text_match_phrase_aux_table_id_(OB_INVALID_ID),
     rowkey_doc_task_submitted_(false),
     doc_rowkey_task_submitted_(false),
     domain_index_aux_task_submitted_(false),
     fts_doc_word_task_submitted_(false),
+    search_text_match_task_submitted_(false),
+    search_text_match_phrase_task_submitted_(false),
     rowkey_doc_task_id_(0),
     doc_rowkey_task_id_(0),
     domain_index_aux_task_id_(0),
     fts_doc_word_task_id_(0),
+    search_text_match_task_id_(0),
+    search_text_match_phrase_task_id_(0),
     drop_index_task_id_(-1),
     drop_index_task_submitted_(false),
     root_service_(nullptr),
@@ -60,6 +66,8 @@ ObFtsIndexBuildTask::ObFtsIndexBuildTask()
     is_fts_doc_word_succ_(false),
     fts_index_aux_is_trans_end_(false),
     fts_doc_word_aux_is_trans_end_(false),
+    search_text_match_aux_is_trans_end_(false),
+    search_text_match_phrase_aux_is_trans_end_(false),
     create_index_arg_(),
     dependent_task_result_map_(),
     is_retryable_ddl_(true),
@@ -216,13 +224,13 @@ int ObFtsIndexBuildTask::init(const ObDDLTaskRecord &task_record)
   } else if (!task_record.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", K(ret), K(task_record));
+  } else if (OB_FALSE_IT(task_type_ = task_record.ddl_type_)) {
   } else if (OB_FAIL(deserialize_params_from_message(task_record.tenant_id_,
                                                      task_record.message_.ptr(),
                                                      task_record.message_.length(),
                                                      pos))) {
     LOG_WARN("deserialize params from message failed", K(ret));
   } else {
-    task_type_ = task_record.ddl_type_;
     tenant_id_ = task_record.tenant_id_;
     task_id_ = task_record.task_id_;
     schema_version_ = schema_version;
@@ -1038,9 +1046,8 @@ int ObFtsIndexBuildTask::prepare_domain_index_table()
 {
   int ret = OB_SUCCESS;
   bool state_finished = false;
-  const ObIndexType index_type = is_async_search_task()
-      ? ObIndexType::INDEX_TYPE_ASYNC_SEARCH_DATA_INDEX_LOCAL
-      : create_index_arg_.index_type_;
+  ObSearchIndexRequirements requirements;
+  const ObIndexType index_type = create_index_arg_.index_type_;
   DEBUG_SYNC(BEFOR_PREPARE_CREATE_TFS_INDEX_WORD_DOC);
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
@@ -1059,15 +1066,33 @@ int ObFtsIndexBuildTask::prepare_domain_index_table()
       LOG_WARN("fail to enable word doc aux index table",
           K(ret), K(tenant_id_), K(domain_index_aux_table_id_));
     }
-  } else if (OB_FAIL(prepare_aux_table(index_type,
+  } else if (!is_async_search_task()
+             && OB_FAIL(prepare_aux_table(index_type,
                                        domain_index_aux_task_submitted_,
                                        domain_index_aux_table_id_,
                                        domain_index_aux_task_id_))) {
     LOG_WARN("failed to prepare aux table", K(ret), K(index_type),
         K(domain_index_aux_task_submitted_), K(domain_index_aux_table_id_));
+  } else if (is_async_search_task()) {
+    if (OB_FAIL(ObSearchIndexBuilderUtil::resolve_search_index_args(create_index_arg_, requirements))) {
+      LOG_WARN("failed to resolve search index requirements", K(ret));
+    } else if (requirements.has_data_ && OB_FAIL(prepare_aux_table(INDEX_TYPE_ASYNC_SEARCH_DATA_INDEX_LOCAL,
+            domain_index_aux_task_submitted_, domain_index_aux_table_id_, domain_index_aux_task_id_))) {
+      LOG_WARN("failed to prepare search data child", K(ret));
+    } else if (requirements.has_text_match_ && OB_FAIL(prepare_aux_table(INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_INDEX_LOCAL,
+            search_text_match_task_submitted_, search_text_match_aux_table_id_, search_text_match_task_id_))) {
+      LOG_WARN("failed to prepare search text match child", K(ret));
+    } else if (requirements.has_text_match_phrase_ && OB_FAIL(prepare_aux_table(INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_PHRASE_INDEX_LOCAL,
+            search_text_match_phrase_task_submitted_, search_text_match_phrase_aux_table_id_, search_text_match_phrase_task_id_))) {
+      LOG_WARN("failed to prepare search text match phrase child", K(ret));
+    }
   }
-  if (OB_SUCC(ret) && domain_index_aux_task_submitted_) {
-    state_finished = true;
+  if (OB_SUCC(ret)) {
+    state_finished = is_async_search_task()
+        ? ((!requirements.has_data_ || domain_index_aux_task_submitted_)
+           && (!requirements.has_text_match_ || search_text_match_task_submitted_)
+           && (!requirements.has_text_match_phrase_ || search_text_match_phrase_task_submitted_))
+        : domain_index_aux_task_submitted_;
   }
   if (state_finished || OB_FAIL(ret)) {
     ObDDLTaskStatus next_status = task_status_;
@@ -1133,6 +1158,102 @@ int ObFtsIndexBuildTask::enable_word_doc_aux_index_table()
         }
       } else if (OB_FAIL(update_index_status_in_schema(*word_doc_aux_index_schema, INDEX_STATUS_AVAILABLE))) {
         LOG_WARN("fail to try notify word doc aux index take effect", K(ret), K(tenant_id_), K(domain_index_aux_table_id_));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObFtsIndexBuildTask::enable_search_text_match_aux_table()
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(GCTX.schema_service_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("there are invalid argument", K(ret), KP(GCTX.schema_service_));
+  } else {
+    ObMultiVersionSchemaService &schema_service = *GCTX.schema_service_;
+    ObSchemaGetterGuard schema_guard;
+    const ObTableSchema *search_text_match_schema = nullptr;
+    bool has_search_text_match_table = false;
+    bool is_standby = false;
+    if (OB_FAIL(ObShareUtil::table_check_if_tenant_role_is_standby(tenant_id_, is_standby))) {
+      LOG_WARN("fail to execute table check if tenant role is standby", K(ret), K(tenant_id_));
+    } else if (is_standby) {
+      ret = OB_OP_NOT_ALLOW;
+      LOG_WARN("create search text match index in standby tenant is not allowed", K(ret), K(search_text_match_aux_table_id_));
+    } else if (OB_FAIL(schema_service.get_tenant_schema_guard(tenant_id_, schema_guard))) {
+      LOG_WARN("fail to get schema guard", K(ret), K(tenant_id_));
+    } else if (OB_FAIL(schema_guard.check_table_exist(tenant_id_, search_text_match_aux_table_id_, has_search_text_match_table))) {
+      LOG_WARN("fail to check table exist", K(ret), K(tenant_id_), K(search_text_match_aux_table_id_));
+    } else if (!has_search_text_match_table) {
+      ret = OB_SCHEMA_ERROR;
+      LOG_WARN("search text match table does not exist", K(ret), K(tenant_id_), K(search_text_match_aux_table_id_));
+    } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id_, search_text_match_aux_table_id_, search_text_match_schema))) {
+      LOG_WARN("fail to get table schema", K(ret), K(tenant_id_), K(search_text_match_aux_table_id_));
+    } else if (OB_UNLIKELY(nullptr == search_text_match_schema)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("search text match index schema ptr is null", K(ret), K(tenant_id_), K(search_text_match_aux_table_id_));
+    } else {
+      ObIndexStatus index_status = search_text_match_schema->get_index_status();
+      if (INDEX_STATUS_AVAILABLE == index_status) {
+      } else if (INDEX_STATUS_UNAVAILABLE != index_status) {
+        if (INDEX_STATUS_UNUSABLE == index_status) {
+          ret = OB_TABLE_NOT_EXIST;
+          LOG_WARN("the search text match index status is unusable", K(ret), K(tenant_id_), K(search_text_match_aux_table_id_), K(index_status));
+        } else {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("search text match index status not match", K(ret), K(tenant_id_), K(search_text_match_aux_table_id_), K(index_status));
+        }
+      } else if (OB_FAIL(update_index_status_in_schema(*search_text_match_schema, INDEX_STATUS_AVAILABLE))) {
+        LOG_WARN("fail to try notify search text match index take effect", K(ret), K(tenant_id_), K(search_text_match_aux_table_id_));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObFtsIndexBuildTask::enable_search_text_match_phrase_aux_table()
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(GCTX.schema_service_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("there are invalid argument", K(ret), KP(GCTX.schema_service_));
+  } else {
+    ObMultiVersionSchemaService &schema_service = *GCTX.schema_service_;
+    ObSchemaGetterGuard schema_guard;
+    const ObTableSchema *search_text_match_phrase_schema = nullptr;
+    bool has_search_text_match_phrase_table = false;
+    bool is_standby = false;
+    if (OB_FAIL(ObShareUtil::table_check_if_tenant_role_is_standby(tenant_id_, is_standby))) {
+      LOG_WARN("fail to execute table check if tenant role is standby", K(ret), K(tenant_id_));
+    } else if (is_standby) {
+      ret = OB_OP_NOT_ALLOW;
+      LOG_WARN("create search text match phrase index in standby tenant is not allowed", K(ret), K(search_text_match_phrase_aux_table_id_));
+    } else if (OB_FAIL(schema_service.get_tenant_schema_guard(tenant_id_, schema_guard))) {
+      LOG_WARN("fail to get schema guard", K(ret), K(tenant_id_));
+    } else if (OB_FAIL(schema_guard.check_table_exist(tenant_id_, search_text_match_phrase_aux_table_id_, has_search_text_match_phrase_table))) {
+      LOG_WARN("fail to check table exist", K(ret), K(tenant_id_), K(search_text_match_phrase_aux_table_id_));
+    } else if (!has_search_text_match_phrase_table) {
+      ret = OB_SCHEMA_ERROR;
+      LOG_WARN("search text match phrase table does not exist", K(ret), K(tenant_id_), K(search_text_match_phrase_aux_table_id_));
+    } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id_, search_text_match_phrase_aux_table_id_, search_text_match_phrase_schema))) {
+      LOG_WARN("fail to get table schema", K(ret), K(tenant_id_), K(search_text_match_phrase_aux_table_id_));
+    } else if (OB_UNLIKELY(nullptr == search_text_match_phrase_schema)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("search text match phrase index schema ptr is null", K(ret), K(tenant_id_), K(search_text_match_phrase_aux_table_id_));
+    } else {
+      ObIndexStatus index_status = search_text_match_phrase_schema->get_index_status();
+      if (INDEX_STATUS_AVAILABLE == index_status) {
+      } else if (INDEX_STATUS_UNAVAILABLE != index_status) {
+        if (INDEX_STATUS_UNUSABLE == index_status) {
+          ret = OB_TABLE_NOT_EXIST;
+          LOG_WARN("the search text match phrase index status is unusable", K(ret), K(tenant_id_), K(search_text_match_phrase_aux_table_id_), K(index_status));
+        } else {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("search text match phrase index status not match", K(ret), K(tenant_id_), K(search_text_match_phrase_aux_table_id_), K(index_status));
+        }
+      } else if (OB_FAIL(update_index_status_in_schema(*search_text_match_phrase_schema, INDEX_STATUS_AVAILABLE))) {
+        LOG_WARN("fail to try notify search text match phrase index take effect", K(ret), K(tenant_id_), K(search_text_match_phrase_aux_table_id_));
       }
     }
   }
@@ -1290,6 +1411,14 @@ int ObFtsIndexBuildTask::construct_create_index_arg(
     if (OB_FAIL(construct_search_data_index_arg(arg, allocator))) {
       LOG_WARN("failed to construct search data arg", K(ret));
     }
+  } else if (share::schema::is_async_search_text_match_index(index_type)) {
+    if (OB_FAIL(construct_search_text_match_index_arg(arg, allocator))) {
+      LOG_WARN("failed to construct search text match arg", K(ret));
+    }
+  } else if (share::schema::is_async_search_text_match_phrase_index(index_type)) {
+    if (OB_FAIL(construct_search_text_match_phrase_index_arg(arg, allocator))) {
+      LOG_WARN("failed to construct search text match phrase arg", K(ret));
+    }
   } else if (share::schema::is_async_fts_index(index_type)) {
     if (OB_FAIL(construct_domain_index_aux_arg(arg, allocator))) {
       LOG_WARN("failed to construct async fts index arg", K(ret));
@@ -1397,6 +1526,38 @@ int ObFtsIndexBuildTask::construct_search_data_index_arg(
       : INDEX_TYPE_SEARCH_DATA_INDEX_LOCAL)) {
   } else if (OB_FAIL(ObSearchIndexBuilderUtil::generate_search_index_name(arg, &allocator))) {
     LOG_WARN("failed to generate search data index name", K(ret), K(arg));
+  } else {
+    arg.def_index_id_ = index_table_id_;
+  }
+  return ret;
+}
+
+int ObFtsIndexBuildTask::construct_search_text_match_index_arg(
+    obrpc::ObCreateIndexArg &arg,
+    common::ObIAllocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(deep_copy_index_arg(allocator, create_index_arg_, arg))) {
+    LOG_WARN("failed to deep copy index arg", K(ret));
+  } else if (FALSE_IT(arg.index_type_ = INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_INDEX_LOCAL)) {
+  } else if (OB_FAIL(ObSearchIndexBuilderUtil::generate_search_index_name(arg, &allocator))) {
+    LOG_WARN("failed to generate search text match index name", K(ret), K(arg));
+  } else {
+    arg.def_index_id_ = index_table_id_;
+  }
+  return ret;
+}
+
+int ObFtsIndexBuildTask::construct_search_text_match_phrase_index_arg(
+    obrpc::ObCreateIndexArg &arg,
+    common::ObIAllocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(deep_copy_index_arg(allocator, create_index_arg_, arg))) {
+    LOG_WARN("failed to deep copy index arg", K(ret));
+  } else if (FALSE_IT(arg.index_type_ = INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_PHRASE_INDEX_LOCAL)) {
+  } else if (OB_FAIL(ObSearchIndexBuilderUtil::generate_search_index_name(arg, &allocator))) {
+    LOG_WARN("failed to generate search text match phrase index name", K(ret), K(arg));
   } else {
     arg.def_index_id_ = index_table_id_;
   }
@@ -1668,10 +1829,13 @@ int ObFtsIndexBuildTask::trigger_async_index_refresh()
     LOG_WARN("[ASYNC_INDEX] fail to collect existing indexes before publish",
         K(ret), K_(tenant_id), K_(task_id), K_(object_id));
   } else {
-    // The new data index and the shared delete index may still be UNAVAILABLE,
+    // The new Data/Text indexes and the shared Delete index may still be UNAVAILABLE,
     // so schema-based collection cannot discover them. Add them explicitly and
     // publish the whole logical async index as one unit.
-    const uint64_t new_index_ids[] = {new_index_table_id, rowkey_doc_aux_table_id_};
+    const uint64_t new_index_ids[] = {
+        new_index_table_id, rowkey_doc_aux_table_id_,
+        is_async_search_task() ? search_text_match_aux_table_id_ : OB_INVALID_ID,
+        is_async_search_task() ? search_text_match_phrase_aux_table_id_ : OB_INVALID_ID};
     for (int64_t i = 0; OB_SUCC(ret) && i < ARRAYSIZEOF(new_index_ids); ++i) {
       bool found = false;
       if (OB_INVALID_ID == new_index_ids[i]) {
@@ -1926,6 +2090,8 @@ int ObFtsIndexBuildTask::serialize_params_to_message(
   int8_t doc_rowkey_submitted = static_cast<int8_t>(doc_rowkey_task_submitted_);
   int8_t fts_index_aux_submitted = static_cast<int8_t>(domain_index_aux_task_submitted_);
   int8_t fts_doc_word_submitted = static_cast<int8_t>(fts_doc_word_task_submitted_);
+  int8_t search_text_match_submitted = static_cast<int8_t>(search_text_match_task_submitted_);
+  int8_t search_text_match_phrase_submitted = static_cast<int8_t>(search_text_match_phrase_task_submitted_);
   int8_t drop_index_submitted = static_cast<int8_t>(drop_index_task_submitted_);
 
   int8_t is_rowkey_doc_succ = static_cast<int8_t>(is_rowkey_doc_succ_);
@@ -1962,6 +2128,12 @@ int ObFtsIndexBuildTask::serialize_params_to_message(
                                            pos,
                                            fts_doc_word_aux_table_id_))) {
     LOG_WARN("serialize fts doc word table id failed", K(ret));
+  } else if (OB_FAIL(serialization::encode(buf, buf_len, pos,
+                 search_text_match_aux_table_id_))) {
+    LOG_WARN("serialize search text match table id failed", K(ret));
+  } else if (OB_FAIL(serialization::encode(buf, buf_len, pos,
+                 search_text_match_phrase_aux_table_id_))) {
+    LOG_WARN("serialize search text match phrase table id failed", K(ret));
   } else if (OB_FAIL(serialization::encode_i8(buf,
                                               buf_len,
                                               pos,
@@ -1982,6 +2154,12 @@ int ObFtsIndexBuildTask::serialize_params_to_message(
                                               pos,
                                               fts_doc_word_submitted))) {
     LOG_WARN("serialize fts doc word task submitted failed", K(ret));
+  } else if (OB_FAIL(serialization::encode_i8(buf, buf_len, pos,
+                 search_text_match_submitted))) {
+    LOG_WARN("serialize search text match task submitted failed", K(ret));
+  } else if (OB_FAIL(serialization::encode_i8(buf, buf_len, pos,
+                 search_text_match_phrase_submitted))) {
+    LOG_WARN("serialize search text match phrase task submitted failed", K(ret));
   } else if (OB_FAIL(serialization::encode_i64(buf,
                                                buf_len,
                                                pos,
@@ -2002,6 +2180,12 @@ int ObFtsIndexBuildTask::serialize_params_to_message(
                                                pos,
                                                fts_doc_word_task_id_))) {
     LOG_WARN("serialize fts doc word task id failed", K(ret));
+  } else if (OB_FAIL(serialization::encode_i64(buf, buf_len, pos,
+                 search_text_match_task_id_))) {
+    LOG_WARN("serialize search text match task id failed", K(ret));
+  } else if (OB_FAIL(serialization::encode_i64(buf, buf_len, pos,
+                 search_text_match_phrase_task_id_))) {
+    LOG_WARN("serialize search text match phrase task id failed", K(ret));
   } else if (OB_FAIL(serialization::encode_i8(buf,
                                               buf_len,
                                               pos,
@@ -2078,6 +2262,8 @@ int ObFtsIndexBuildTask::deserialize_params_from_message(
   int8_t doc_rowkey_submitted = 0;
   int8_t fts_index_aux_submitted = 0;
   int8_t fts_doc_word_submitted = 0;
+  int8_t search_text_match_submitted = 0;
+  int8_t search_text_match_phrase_submitted = 0;
   int8_t drop_index_submitted = 0;
 
   int8_t is_rowkey_doc_succ = false;
@@ -2121,6 +2307,12 @@ int ObFtsIndexBuildTask::deserialize_params_from_message(
                                             pos,
                                             fts_doc_word_aux_table_id_))) {
       LOG_WARN("fail to deserialize fts doc word table id", K(ret));
+    } else if (OB_FAIL(serialization::decode(buf, data_len, pos,
+                   search_text_match_aux_table_id_))) {
+      LOG_WARN("deserialize search text match table id failed", K(ret));
+    } else if (OB_FAIL(serialization::decode(buf, data_len, pos,
+                   search_text_match_phrase_aux_table_id_))) {
+      LOG_WARN("deserialize search text match phrase table id failed", K(ret));
     } else if (OB_FAIL(serialization::decode_i8(buf,
                                                 data_len,
                                                 pos,
@@ -2141,6 +2333,12 @@ int ObFtsIndexBuildTask::deserialize_params_from_message(
                                                 pos,
                                                 &fts_doc_word_submitted))) {
       LOG_WARN("fail to deserialize fts doc word task submmitted", K(ret));
+    } else if (OB_FAIL(serialization::decode_i8(buf, data_len, pos,
+                   &search_text_match_submitted))) {
+      LOG_WARN("deserialize search text match task submitted failed", K(ret));
+    } else if (OB_FAIL(serialization::decode_i8(buf, data_len, pos,
+                   &search_text_match_phrase_submitted))) {
+      LOG_WARN("deserialize search text match phrase task submitted failed", K(ret));
     } else if (OB_FAIL(serialization::decode_i64(buf,
                                                 data_len,
                                                 pos,
@@ -2161,6 +2359,12 @@ int ObFtsIndexBuildTask::deserialize_params_from_message(
                                                 pos,
                                                 &fts_doc_word_task_id_))) {
       LOG_WARN("fail to deserialize fts doc word task id", K(ret));
+    } else if (OB_FAIL(serialization::decode_i64(buf, data_len, pos,
+                   &search_text_match_task_id_))) {
+      LOG_WARN("deserialize search text match task id failed", K(ret));
+    } else if (OB_FAIL(serialization::decode_i64(buf, data_len, pos,
+                   &search_text_match_phrase_task_id_))) {
+      LOG_WARN("deserialize search text match phrase task id failed", K(ret));
     } else if (OB_FAIL(serialization::decode_i8(buf,
                                                 data_len,
                                                 pos,
@@ -2267,7 +2471,7 @@ int ObFtsIndexBuildTask::deserialize_params_from_message(
         }
       }
       if (OB_FAIL(ret)) {
-      } else if (!is_fts_task() ) {
+      } else if (!is_fts_task()) {
         fts_doc_word_submitted = true;
       } else if (fts_doc_word_task_id_ > 0) {
         DependTaskStatus fts_doc_word_status;
@@ -2278,10 +2482,28 @@ int ObFtsIndexBuildTask::deserialize_params_from_message(
               K(fts_doc_word_status));
         }
       }
+      if (OB_SUCC(ret) && search_text_match_task_id_ > 0) {
+        DependTaskStatus search_text_match_status;
+        search_text_match_status.task_id_ = search_text_match_task_id_;
+        if (OB_FAIL(dependent_task_result_map_.set_refactored(search_text_match_aux_table_id_,
+                                                              search_text_match_status))) {
+          LOG_WARN("set search text match dependent task failed", K(ret), K(search_text_match_aux_table_id_));
+        }
+      }
+      if (OB_SUCC(ret) && search_text_match_phrase_task_id_ > 0) {
+        DependTaskStatus search_text_match_phrase_status;
+        search_text_match_phrase_status.task_id_ = search_text_match_phrase_task_id_;
+        if (OB_FAIL(dependent_task_result_map_.set_refactored(search_text_match_phrase_aux_table_id_,
+                                                              search_text_match_phrase_status))) {
+          LOG_WARN("set search text match phrase dependent task failed", K(ret), K(search_text_match_phrase_aux_table_id_));
+        }
+      }
       rowkey_doc_task_submitted_ = rowkey_doc_submitted;
       doc_rowkey_task_submitted_ = doc_rowkey_submitted;
       domain_index_aux_task_submitted_ = fts_index_aux_submitted;
       fts_doc_word_task_submitted_ = fts_doc_word_submitted;
+      search_text_match_task_submitted_ = search_text_match_submitted;
+      search_text_match_phrase_task_submitted_ = search_text_match_phrase_submitted;
       drop_index_task_submitted_ = drop_index_submitted;
       is_rowkey_doc_succ_ = is_rowkey_doc_succ;
       is_doc_rowkey_succ_ = is_doc_rowkey_succ;
@@ -2300,6 +2522,8 @@ int64_t ObFtsIndexBuildTask::get_serialize_param_size() const
   int8_t doc_rowkey_submitted = static_cast<int8_t>(doc_rowkey_task_submitted_);
   int8_t fts_index_aux_submitted = static_cast<int8_t>(domain_index_aux_task_submitted_);
   int8_t fts_doc_word_submitted = static_cast<int8_t>(fts_doc_word_task_submitted_);
+  int8_t search_text_match_submitted = static_cast<int8_t>(search_text_match_task_submitted_);
+  int8_t search_text_match_phrase_submitted = static_cast<int8_t>(search_text_match_phrase_task_submitted_);
   int8_t drop_index_submitted = static_cast<int8_t>(drop_index_task_submitted_);
 
   int8_t is_rowkey_doc_succ = static_cast<int8_t>(is_rowkey_doc_succ_);
@@ -2314,14 +2538,20 @@ int64_t ObFtsIndexBuildTask::get_serialize_param_size() const
       + serialization::encoded_length(doc_rowkey_aux_table_id_)
       + serialization::encoded_length(domain_index_aux_table_id_)
       + serialization::encoded_length(fts_doc_word_aux_table_id_)
+      + serialization::encoded_length(search_text_match_aux_table_id_)
+      + serialization::encoded_length(search_text_match_phrase_aux_table_id_)
       + serialization::encoded_length_i8(rowkey_doc_submitted)
       + serialization::encoded_length_i8(doc_rowkey_submitted)
       + serialization::encoded_length_i8(fts_index_aux_submitted)
       + serialization::encoded_length_i8(fts_doc_word_submitted)
+      + serialization::encoded_length_i8(search_text_match_submitted)
+      + serialization::encoded_length_i8(search_text_match_phrase_submitted)
       + serialization::encoded_length_i64(rowkey_doc_task_id_)
       + serialization::encoded_length_i64(doc_rowkey_task_id_)
       + serialization::encoded_length_i64(domain_index_aux_task_id_)
       + serialization::encoded_length_i64(fts_doc_word_task_id_)
+      + serialization::encoded_length_i64(search_text_match_task_id_)
+      + serialization::encoded_length_i64(search_text_match_phrase_task_id_)
       + serialization::encoded_length_i8(drop_index_submitted)
       + serialization::encoded_length_i64(drop_index_task_id_)
       + serialization::encoded_length_i8(is_rowkey_doc_succ)
@@ -2403,6 +2633,8 @@ int ObFtsIndexBuildTask::refresh_task_context(const share::ObDDLTaskStatus statu
             doc_rowkey_aux_table_id_ = task.get_doc_rowkey_aux_table_id();
             domain_index_aux_table_id_ = task.get_domain_index_aux_table_id();
             fts_doc_word_aux_table_id_ = task.get_fts_doc_word_aux_table_id();
+            search_text_match_aux_table_id_ = task.get_search_text_match_aux_table_id();
+            search_text_match_phrase_aux_table_id_ = task.get_search_text_match_phrase_aux_table_id();
           }
           break;
         }
@@ -2661,6 +2893,12 @@ int ObFtsIndexBuildTask::submit_drop_fts_index_task()
   } else if (OB_INVALID_ID != fts_doc_word_aux_table_id_ && 
              OB_FAIL(drop_index_arg.index_ids_.push_back(fts_doc_word_aux_table_id_))) {
     LOG_WARN("fail to push back fts_doc_word_aux_table_id_", K(ret), K(fts_doc_word_aux_table_id_));
+  } else if (OB_INVALID_ID != search_text_match_aux_table_id_
+             && OB_FAIL(drop_index_arg.index_ids_.push_back(search_text_match_aux_table_id_))) {
+    LOG_WARN("fail to push back search text match table id", K(ret), K(search_text_match_aux_table_id_));
+  } else if (OB_INVALID_ID != search_text_match_phrase_aux_table_id_
+             && OB_FAIL(drop_index_arg.index_ids_.push_back(search_text_match_phrase_aux_table_id_))) {
+    LOG_WARN("fail to push back search text match phrase table id", K(ret), K(search_text_match_phrase_aux_table_id_));
   } else if (drop_index_arg.index_ids_.count() <= 0) {
     LOG_INFO("no table need to be drop, skip", K(ret)); // no table exist, skip drop
   } else if (schema_guard.get_table_schema(tenant_id_, object_id_, data_table_schema)) {
@@ -3098,21 +3336,27 @@ int ObFtsIndexBuildTask::wait_schema_refresh_and_trans_end()
   } else if (is_async_index_task()) {
     ObSchemaGetterGuard schema_guard;
     ObMultiVersionSchemaService &schema_service = root_service_->get_schema_service();
-    // Refresh has completed while all newly built targets were UNAVAILABLE.
-    // Enable internal/shared targets first; the user-visible FTS index (or the
-    // search definition below) is enabled last.
+    // Enable auxiliary tables before waiting for their schema transactions.
+    // Every required Data/Text/Delete target has completed refresh before TAKE_EFFECT.
     if (OB_INVALID_ID != rowkey_doc_aux_table_id_
         && OB_FAIL(enable_async_delete_index_table())) {
       LOG_WARN("fail to enable published async delete index", K(ret), K(rowkey_doc_aux_table_id_));
     } else if (OB_INVALID_ID != domain_index_aux_table_id_
                && OB_FAIL(enable_word_doc_aux_index_table())) {
       LOG_WARN("fail to enable published async data index", K(ret), K(domain_index_aux_table_id_));
+    } else if (OB_INVALID_ID != search_text_match_aux_table_id_
+               && OB_FAIL(enable_search_text_match_aux_table())) {
+      LOG_WARN("failed to enable search text match table", K(ret), K(search_text_match_aux_table_id_));
+    } else if (OB_INVALID_ID != search_text_match_phrase_aux_table_id_
+               && OB_FAIL(enable_search_text_match_phrase_aux_table())) {
+      LOG_WARN("failed to enable search text match phrase table", K(ret), K(search_text_match_phrase_aux_table_id_));
     } else if (OB_FAIL(schema_service.get_tenant_schema_guard(tenant_id_, schema_guard))) {
       LOG_WARN("fail to get tenant schema guard", K(ret), K(tenant_id_));
-    } else if (!fts_index_aux_is_trans_end_ && OB_FAIL(check_schema_and_trans_end(task_id_,
-                                                                                  domain_index_aux_table_id_,
-                                                                                  schema_guard,
-                                                                                  fts_index_aux_is_trans_end_))) {
+    } else if (!fts_index_aux_is_trans_end_ && OB_INVALID_ID != domain_index_aux_table_id_
+               && OB_FAIL(check_schema_and_trans_end(task_id_,
+                                                    domain_index_aux_table_id_,
+                                                    schema_guard,
+                                                    fts_index_aux_is_trans_end_))) {
       LOG_WARN("fail to check async fts index schema and trans end", K(ret),
           K(domain_index_aux_table_id_));
     } else if (!fts_doc_word_aux_is_trans_end_ && OB_INVALID_ID != rowkey_doc_aux_table_id_
@@ -3122,8 +3366,24 @@ int ObFtsIndexBuildTask::wait_schema_refresh_and_trans_end()
                                                      fts_doc_word_aux_is_trans_end_))) {
       LOG_WARN("fail to check async delete index schema and trans end", K(ret),
           K(rowkey_doc_aux_table_id_));
-    } else if (fts_index_aux_is_trans_end_
-               && (fts_doc_word_aux_is_trans_end_ || OB_INVALID_ID == rowkey_doc_aux_table_id_)) {
+    } else if (!search_text_match_aux_is_trans_end_ && OB_INVALID_ID != search_text_match_aux_table_id_
+               && OB_FAIL(check_schema_and_trans_end(task_id_,
+                                                     search_text_match_aux_table_id_,
+                                                     schema_guard,
+                                                     search_text_match_aux_is_trans_end_))) {
+      LOG_WARN("failed to check search text match schema and trans end", K(ret),
+          K(search_text_match_aux_table_id_));
+    } else if (!search_text_match_phrase_aux_is_trans_end_ && OB_INVALID_ID != search_text_match_phrase_aux_table_id_
+               && OB_FAIL(check_schema_and_trans_end(task_id_,
+                                                     search_text_match_phrase_aux_table_id_,
+                                                     schema_guard,
+                                                     search_text_match_phrase_aux_is_trans_end_))) {
+      LOG_WARN("failed to check search text match phrase schema and trans end", K(ret),
+          K(search_text_match_phrase_aux_table_id_));
+    } else if ((fts_index_aux_is_trans_end_ || OB_INVALID_ID == domain_index_aux_table_id_)
+               && (fts_doc_word_aux_is_trans_end_ || OB_INVALID_ID == rowkey_doc_aux_table_id_)
+               && (search_text_match_aux_is_trans_end_ || OB_INVALID_ID == search_text_match_aux_table_id_)
+               && (search_text_match_phrase_aux_is_trans_end_ || OB_INVALID_ID == search_text_match_phrase_aux_table_id_)) {
       const ObTableSchema *search_def_schema = nullptr;
       if (is_async_search_task()
           && OB_FAIL(schema_guard.get_table_schema(tenant_id_, target_object_id_, search_def_schema))) {

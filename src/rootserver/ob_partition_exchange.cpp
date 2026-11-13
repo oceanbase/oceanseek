@@ -8,6 +8,7 @@
 #include "ob_root_service.h"
 #include "observer/ob_sql_client_decorator.h" // ObSQLClientRetryWeak
 #include "share/schema/ob_schema_service_sql_impl.h"
+#include "share/search_index/ob_search_index_config.h"
 #include "share/tablet/ob_tablet_to_table_history_operator.h" // ObTabletToTableHistoryOperator
 #include "share/tablet/ob_tablet_to_ls_operator.h"
 #include "sql/resolver/ddl/ob_ddl_resolver.h"
@@ -2613,6 +2614,7 @@ int ObPartitionExchange::check_search_index_definition_compatibility_(
     ObTableSchema::const_column_iterator inc_end = inc_table_schema.column_end();
     ObColumnSchemaV2 *base_column_schema = nullptr;
     ObColumnSchemaV2 *inc_column_schema = nullptr;
+    bool equal = false;
     while (OB_SUCC(ret)
            && OB_SUCC(get_next_pair_column_schema_(base_iter,
                                                    base_end,
@@ -2630,9 +2632,13 @@ int ObPartitionExchange::check_search_index_definition_compatibility_(
         ret = definition_mismatch_ret;
         LOG_WARN("search definition index column positions are different", K(ret),
             K(base_column_schema->get_index_position()), K(inc_column_schema->get_index_position()));
-      } else if (base_column_schema->get_index_position() > 0
-                 && OB_UNLIKELY(0 != base_column_schema->get_comment_str().compare(
-                                          inc_column_schema->get_comment_str()))) {
+      } else if (base_column_schema->get_index_position() <= 0) {
+      } else if (OB_FALSE_IT(equal = false)) {
+      } else if (OB_FAIL(ObSearchIndexConfig::is_equal(base_column_schema->get_comment_str(),
+                                                       inc_column_schema->get_comment_str(), equal))) {
+        LOG_WARN("failed to compare search definition index column configs", K(ret),
+          K(base_column_schema->get_column_name_str()));
+      } else if (OB_UNLIKELY(!equal)) {
         ret = definition_mismatch_ret;
         LOG_WARN("search definition index column configs are different", K(ret),
             K(base_column_schema->get_column_name_str()),
@@ -2695,10 +2701,9 @@ int ObPartitionExchange::generate_local_storage_index_table_mapping_in_mysql_mod
 {
   int ret = OB_SUCCESS;
   find_related_nt_schema = false;
-  // Search data index columns are generated posting-key columns owned by the
-  // search data table itself, rather than references to search definition
-  // table columns. The parent-column mapping check therefore does not apply.
-  const bool need_check_data_table_column_mapping = !base_table_schema.is_search_data_index();
+  // Search physical children (Data/Match/Phrase) own their physical columns;
+  // these do not reference columns of Search Def. Skip the parent-column mapping check.
+  const bool need_check_data_table_column_mapping = !base_table_schema.is_search_aux_index();
   if (OB_UNLIKELY(!base_table_schema.is_index_local_storage() || inc_table_schemas.count() != used_nt_schema_flag.count())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(base_table_schema), K(base_table_schema.is_index_local_storage()), K(inc_table_schemas.count()), K(used_nt_schema_flag.count()));
@@ -2746,10 +2751,9 @@ int ObPartitionExchange::generate_local_storage_index_table_mapping_in_oracle_mo
 {
   int ret = OB_SUCCESS;
   find_related_nt_schema = false;
-  // Search data index columns are generated posting-key columns owned by the
-  // search data table itself, rather than references to search definition
-  // table columns. The parent-column mapping check therefore does not apply.
-  const bool need_check_data_table_column_mapping = !base_table_schema.is_search_data_index();
+  // Search physical children (Data/Match/Phrase) own their physical columns;
+  // these do not reference columns of Search Def. Skip the parent-column mapping check.
+  const bool need_check_data_table_column_mapping = !base_table_schema.is_search_aux_index();
   if (OB_UNLIKELY(!base_table_schema.is_index_local_storage() || inc_table_schemas.count() != used_nt_schema_flag.count())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(base_table_schema), K(base_table_schema.is_index_local_storage()), K(inc_table_schemas.count()), K(used_nt_schema_flag.count()));

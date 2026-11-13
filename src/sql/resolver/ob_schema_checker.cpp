@@ -2958,7 +2958,7 @@ int ObSchemaChecker::get_search_index_data_table_schema(
   if (OB_FAIL(get_table_schema(tenant_id, table_id, index_data_schema))) {
     ret = OB_TABLE_NOT_EXIST;
     LOG_WARN("get table schema failed", K(table_id), K(ret));
-  } else if (index_data_schema->is_search_data_index()
+  } else if (index_data_schema->is_search_aux_index()
     && OB_FAIL(get_table_schema(tenant_id, index_data_schema->get_data_table_id(), index_def_schema))) {
       ret = OB_TABLE_NOT_EXIST;
       LOG_WARN("get table schema failed", K(index_data_schema->get_table_name_str()), K(ret));

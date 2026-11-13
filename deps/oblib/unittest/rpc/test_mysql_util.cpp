@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 #include <fstream>
+#include "lib/json_type/ob_json_bin.h"
 #include "rpc/obmysql/ob_mysql_util.h"
 
 using namespace oceanbase::common;
@@ -413,6 +414,116 @@ TEST_F(TestObMySQLUtil, serialize_test)
   ASSERT_TRUE(std::equal(it_result, std::istream_iterator<std::string>(), it_expected));
   std::remove(tmp_file);
   LOG_INFO("buf", K(ObString(buf)));
+}
+
+static int make_json_binary(const std::string &text, ObIAllocator &allocator, ObString &raw)
+{
+  ObIJsonBase *json = nullptr;
+  int ret = ObJsonBaseFactory::get_json_base(&allocator,
+      ObString(static_cast<int32_t>(text.size()), text.data()),
+      ObJsonInType::JSON_TREE, ObJsonInType::JSON_BIN, json);
+  if (OB_SUCC(ret)) {
+    ret = json->get_raw_binary(raw, &allocator);
+  }
+  return ret;
+}
+
+TEST_F(TestObMySQLUtil, json_cell_bin_view_matches_jsonbase)
+{
+  set_compat_mode(oceanbase::lib::Worker::CompatMode::MYSQL);
+  const std::string cases[] = {
+    "null", "true", "false", "7", "-7", "18446744073709551615", "1.25",
+    "\"\"", "\"hello\"", "\"a\\n\\\"b\\\\c\"", "\"中文\"", "[]", "{}",
+    "{\"a\":[1,2,\"x\"],\"b\":false}", "[{},[],null,true,-128,256]",
+    "\"" + std::string(70000, 'a') + "\""
+  };
+  for (const std::string &text : cases) {
+    ObArenaAllocator allocator;
+    ObString raw;
+    ASSERT_EQ(OB_SUCCESS, make_json_binary(text, allocator, raw));
+    ObJsonBin bin(raw.ptr(), raw.length(), &allocator);
+    bin.set_seek_flag(true);
+    ASSERT_EQ(OB_SUCCESS, bin.reset_iter());
+    ObJsonBuffer printed(&allocator);
+    ASSERT_EQ(OB_SUCCESS, bin.print(printed, true, raw.length()));
+    std::string expected(printed.length() + 16, '#');
+    int64_t expected_pos = 3;
+    ASSERT_EQ(OB_SUCCESS, ObMySQLUtil::store_length(&expected[0], expected.size(),
+                                                   printed.length(), expected_pos));
+    MEMCPY(&expected[expected_pos], printed.ptr(), printed.length());
+    expected_pos += printed.length();
+    for (bool enabled : {false, true}) {
+      std::string packet(expected.size(), '#');
+      int64_t pos = 3;
+      ASSERT_EQ(OB_SUCCESS, ObMySQLUtil::json_cell_str(OB_SERVER_TENANT_ID,
+          &packet[0], packet.size(), raw, pos, enabled));
+      EXPECT_EQ(expected_pos, pos);
+      EXPECT_EQ(expected, packet);
+    }
+    std::string packet(expected.size(), '#');
+    int64_t pos = 3;
+    ASSERT_EQ(OB_SUCCESS, ObMySQLUtil::json_cell_str(OB_SERVER_TENANT_ID,
+        &packet[0], packet.size(), raw, pos));
+    EXPECT_EQ(expected_pos, pos);
+    EXPECT_EQ(expected, packet);
+  }
+}
+
+TEST_F(TestObMySQLUtil, json_cell_bin_view_packet_limits_and_retry)
+{
+  set_compat_mode(oceanbase::lib::Worker::CompatMode::MYSQL);
+  for (int length : {0, 248, 249, 65533, 65534}) {
+    ObArenaAllocator allocator;
+    ObString raw;
+    ASSERT_EQ(OB_SUCCESS, make_json_binary("\"" + std::string(length, 'a') + "\"", allocator, raw));
+    const int64_t payload_length = length + 2;
+    const int64_t prefix_length = payload_length < 251 ? 1 : (payload_length < 65536 ? 3 : 4);
+    const int64_t start = 4;
+    const int64_t end = start + prefix_length + payload_length;
+    for (bool enabled : {false, true}) {
+      std::string packet(end + 1, '#');
+      int64_t pos = start;
+      EXPECT_EQ(OB_SIZE_OVERFLOW, ObMySQLUtil::json_cell_str(OB_SERVER_TENANT_ID,
+          &packet[0], end - 1, raw, pos, enabled));
+      EXPECT_EQ(start, pos);
+      EXPECT_EQ(std::string(start, '#'), packet.substr(0, start));
+      ASSERT_EQ(OB_SUCCESS, ObMySQLUtil::json_cell_str(OB_SERVER_TENANT_ID,
+          &packet[0], end, raw, pos, enabled));
+      EXPECT_EQ(end, pos);
+      EXPECT_EQ('"', packet[start + prefix_length]);
+      EXPECT_EQ('"', packet[end - 1]);
+      EXPECT_EQ('#', packet[end]);
+      const unsigned char marker = static_cast<unsigned char>(packet[start]);
+      EXPECT_EQ(prefix_length == 1 ? payload_length : (prefix_length == 3 ? 252 : 253), marker);
+    }
+  }
+}
+
+TEST_F(TestObMySQLUtil, json_cell_bin_view_empty_and_invalid_input)
+{
+  set_compat_mode(oceanbase::lib::Worker::CompatMode::MYSQL);
+  ObString empty;
+  for (bool enabled : {false, true}) {
+    char packet[16] = {};
+    int64_t pos = 2;
+    ASSERT_EQ(OB_SUCCESS, ObMySQLUtil::json_cell_str(OB_SERVER_TENANT_ID,
+        packet, sizeof(packet), empty, pos, enabled));
+    EXPECT_EQ(3, pos);
+    EXPECT_EQ(0xfb, static_cast<unsigned char>(packet[2]));
+    EXPECT_EQ(OB_INVALID_ARGUMENT, ObMySQLUtil::json_cell_str(OB_SERVER_TENANT_ID,
+        nullptr, sizeof(packet), empty, pos, enabled));
+    EXPECT_EQ(3, pos);
+  }
+  ObArenaAllocator allocator;
+  ObString raw;
+  ASSERT_EQ(OB_SUCCESS, make_json_binary("{\"k\":\"abc\"}", allocator, raw));
+  ASSERT_GT(raw.length(), 2);
+  ObString truncated(1, raw.ptr());
+  char packet[128] = {};
+  int64_t pos = 2;
+  EXPECT_NE(OB_SUCCESS, ObMySQLUtil::json_cell_str(OB_SERVER_TENANT_ID,
+      packet, sizeof(packet), truncated, pos, true));
+  EXPECT_EQ(2, pos);
 }
 
 int main(int argc, char *argv[])

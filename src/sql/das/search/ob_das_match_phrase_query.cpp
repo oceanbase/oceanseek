@@ -101,16 +101,24 @@ int ObDASMatchPhraseRtDef::prepare_query_tokens()
     LOG_WARN("match phrase query on logical table is not supported", KR(ret));
   } else {
     ObDatum *query_text_datum = nullptr;
+    const ObDASSearchIndexTextInfo &search_text = ctdef->get_ir_ctdef()->search_index_fulltext_info_;
     reset_cached_runtime_state();
+    bool is_search_index_fulltext = search_text.has_search_index_fulltext();
     if (OB_FAIL(ctdef->query_text_->eval(*eval_ctx_, query_text_datum))) {
       LOG_WARN("failed to eval query text", KR(ret));
-    } else if (OB_ISNULL(query_text_datum) || OB_UNLIKELY(query_text_datum->is_null())) {
+    } else if (OB_ISNULL(query_text_datum)
+        || OB_UNLIKELY(!is_search_index_fulltext && query_text_datum->is_null())) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected null datum", KR(ret), KPC(query_text_datum));
+    } else if (is_search_index_fulltext && query_text_datum->is_null()) {
+      // Native Search Text treats a NULL query as an empty token set.
+      query_tokens_prepared_ = true;
     } else if (OB_FAIL(ObFTSTokenizer::tokenize(
         allocator_, query_text_datum->get_string(),
-        inv_idx_scan_ctdef->table_param_.get_parser_name(),
-        inv_idx_scan_ctdef->table_param_.get_parser_property(),
+        is_search_index_fulltext ? search_text.parser_name_
+                               : inv_idx_scan_ctdef->table_param_.get_parser_name(),
+        is_search_index_fulltext ? search_text.parser_properties_
+                               : inv_idx_scan_ctdef->table_param_.get_parser_property(),
         ctdef->query_text_->obj_meta_, query_tokens_, token_ids_, token_offsets_,
         has_duplicate_tokens_))) {
       LOG_WARN("failed to tokenize query text", KR(ret));

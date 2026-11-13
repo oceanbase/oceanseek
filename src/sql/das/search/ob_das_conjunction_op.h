@@ -75,7 +75,9 @@ private:
   int do_rescan() override;
   int do_rescan_segment(const common::ObNewVersionRange &range) override;
   int do_advance_to(const ObDASRowID &target, ObDASRowID &curr_id, double &score) override;
+  int do_advance_to(const ObDASNestedKey &target, ObDASNestedKey &curr_nk, double &score) override;
   int do_next_rowid(ObDASRowID &next_id, double &score) override;
+  int do_next_rowid(ObDASNestedKey &next_nk, double &score) override;
   int do_advance_shallow(const ObDASRowID &target,
                          const bool inclusive,
                          const MaxScoreTuple *&max_score_tuple) override;
@@ -83,18 +85,26 @@ private:
   int do_calc_max_score(double &threshold) override;
 
 private:
-  int inner_advance_to(const ObDASRowID &target, ObDASRowID &curr_id, double &score);
+  template <typename RowType>
+  int do_advance_to_impl(const RowType &target, RowType &curr_id, double &score);
+  template <typename RowType>
+  int next_impl(RowType &next_id, double &score);
+  template <typename RowType>
+  int inner_advance_to(const RowType &target, RowType &curr_id, double &score);
+  template <typename RowType>
+  int advance_driver_ops_to(const RowType &target, RowType &curr_id, double &score);
   // Splits children into driver_ops_ and probe_ops_ based on is_probe_mode().
   // Called from do_open / do_rescan so the conjunction can coordinate probe-capable children.
   int classify_children();
   int init_fixed_score_bound();
   bool has_fixed_score_bound() const { return fixed_score_bound_ >= 0.0; }
-  int advance_driver_ops_to(const ObDASRowID &target, ObDASRowID &curr_id, double &score);
   int inner_advance_to_with_probe(const ObDASRowID &target, ObDASRowID &curr_id, double &score);
 
 private:
   static constexpr double INVALID_FIXED_SCORE_BOUND = -1.0;
   int64_t last_idx_ = 0;
+  int64_t nested_last_idx_ = 0;
+  bool is_first_nk_ = true;
   bool has_probe_child_ = false;
   // True only when nonnegative integer driver scores have an exact sum <= 2^53.
   bool is_fixed_score_ = false;

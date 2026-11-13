@@ -19,7 +19,8 @@ ObInvIdxParamCache::ObInvIdxParamCache()
   : avg_doc_token_cnt_map_(),
     total_doc_cnt_map_(),
     token_doc_cnt_map_(),
-    token_alloc_(common::ObMemAttr(MTL_ID(), "InvTokDocCnt")),
+    avg_doc_len_key_alloc_(common::ObMemAttr(MTL_ID(), "InvAvgDocLen")),
+    token_doc_cnt_key_alloc_(common::ObMemAttr(MTL_ID(), "InvTokDocCnt")),
     avg_doc_token_cnt_map_inited_(false),
     total_doc_cnt_map_inited_(false),
     token_doc_cnt_map_inited_(false)
@@ -42,7 +43,8 @@ void ObInvIdxParamCache::reset()
   if (token_doc_cnt_map_.created()) {
     token_doc_cnt_map_.destroy();
   }
-  token_alloc_.reset();
+  avg_doc_len_key_alloc_.reset();
+  token_doc_cnt_key_alloc_.reset();
   avg_doc_token_cnt_map_inited_ = false;
   total_doc_cnt_map_inited_ = false;
   token_doc_cnt_map_inited_ = false;
@@ -52,11 +54,21 @@ int ObInvIdxParamCache::get_avg_doc_token_cnt(
     const common::ObTabletID &tablet_id,
     double &avg_doc_token_cnt) const
 {
+  return get_avg_doc_token_cnt(tablet_id, OB_INVALID_ID, ObString(), avg_doc_token_cnt);
+}
+
+int ObInvIdxParamCache::get_avg_doc_token_cnt(
+    const common::ObTabletID &tablet_id,
+    const uint64_t column_idx,
+    const common::ObString &path,
+    double &avg_doc_token_cnt) const
+{
   int ret = OB_SUCCESS;
   avg_doc_token_cnt = 0.0;
+  const ObAvgDocLenKey key(tablet_id, column_idx, path);
   if (OB_UNLIKELY(!avg_doc_token_cnt_map_inited_)) {
     ret = OB_ENTRY_NOT_EXIST;
-  } else if (OB_FAIL(avg_doc_token_cnt_map_.get_refactored(tablet_id, avg_doc_token_cnt))) {
+  } else if (OB_FAIL(avg_doc_token_cnt_map_.get_refactored(key, avg_doc_token_cnt))) {
     if (OB_UNLIKELY(OB_HASH_NOT_EXIST != ret)) {
       LOG_WARN("failed to get avg doc token cnt", K(ret), K(tablet_id));
     }
@@ -68,6 +80,15 @@ int ObInvIdxParamCache::set_avg_doc_token_cnt(
     const common::ObTabletID &tablet_id,
     const double avg_doc_token_cnt)
 {
+  return set_avg_doc_token_cnt(tablet_id, OB_INVALID_ID, ObString(), avg_doc_token_cnt);
+}
+
+int ObInvIdxParamCache::set_avg_doc_token_cnt(
+    const common::ObTabletID &tablet_id,
+    const uint64_t column_idx,
+    const common::ObString &path,
+    const double avg_doc_token_cnt)
+{
   int ret = OB_SUCCESS;
   if (avg_doc_token_cnt_map_inited_) {
     // skip
@@ -75,8 +96,16 @@ int ObInvIdxParamCache::set_avg_doc_token_cnt(
     LOG_WARN("failed to init avg doc token cnt map", K(ret));
   }
 
-  if (FAILEDx(avg_doc_token_cnt_map_.set_refactored(tablet_id, avg_doc_token_cnt))) {
-    LOG_WARN("failed to set avg doc token cnt", K(ret), K(tablet_id), K(avg_doc_token_cnt));
+  if (OB_SUCC(ret)) {
+    ObString path_copy;
+    if (OB_FAIL(ob_write_string(avg_doc_len_key_alloc_, path, path_copy))) {
+      LOG_WARN("failed to deep copy avg doc length path", K(ret), K(path));
+    } else {
+      const ObAvgDocLenKey key(tablet_id, column_idx, path_copy);
+      if (OB_FAIL(avg_doc_token_cnt_map_.set_refactored(key, avg_doc_token_cnt))) {
+        LOG_WARN("failed to set avg doc token cnt", K(ret), K(key), K(avg_doc_token_cnt));
+      }
+    }
   }
   return ret;
 }
@@ -120,15 +149,25 @@ int ObInvIdxParamCache::get_token_doc_cnt(
     const common::ObString &token,
     uint64_t &token_doc_cnt) const
 {
+  return get_token_doc_cnt(tablet_id, OB_INVALID_ID, ObString(), token, token_doc_cnt);
+}
+
+int ObInvIdxParamCache::get_token_doc_cnt(
+    const common::ObTabletID &tablet_id,
+    const uint64_t column_idx,
+    const common::ObString &path,
+    const common::ObString &token,
+    uint64_t &token_doc_cnt) const
+{
   int ret = OB_SUCCESS;
   token_doc_cnt = 0;
   if (OB_UNLIKELY(!token_doc_cnt_map_inited_)) {
     ret = OB_ENTRY_NOT_EXIST;
   } else {
-    const ObTokenDocCntKey key(tablet_id, token);
+    const ObTokenDocCntKey key(tablet_id, column_idx, path, token);
     if (OB_FAIL(token_doc_cnt_map_.get_refactored(key, token_doc_cnt))) {
       if (OB_UNLIKELY(OB_HASH_NOT_EXIST != ret)) {
-        LOG_WARN("failed to get token doc cnt", K(ret), K(tablet_id), K(token));
+        LOG_WARN("failed to get token doc cnt", K(ret), K(tablet_id), "token_len", token.length());
       }
     }
   }
@@ -137,6 +176,16 @@ int ObInvIdxParamCache::get_token_doc_cnt(
 
 int ObInvIdxParamCache::set_token_doc_cnt(
     const common::ObTabletID &tablet_id,
+    const common::ObString &token,
+    const uint64_t token_doc_cnt)
+{
+  return set_token_doc_cnt(tablet_id, OB_INVALID_ID, ObString(), token, token_doc_cnt);
+}
+
+int ObInvIdxParamCache::set_token_doc_cnt(
+    const common::ObTabletID &tablet_id,
+    const uint64_t column_idx,
+    const common::ObString &path,
     const common::ObString &token,
     const uint64_t token_doc_cnt)
 {
@@ -149,13 +198,16 @@ int ObInvIdxParamCache::set_token_doc_cnt(
 
   if (OB_SUCC(ret)) {
     // deep copy the token bytes so the key stays valid for the cache lifetime
+    ObString path_copy;
     ObString token_copy;
-    if (OB_FAIL(ob_write_string(token_alloc_, token, token_copy))) {
-      LOG_WARN("failed to deep copy token", K(ret), K(token));
+    if (OB_FAIL(ob_write_string(token_doc_cnt_key_alloc_, path, path_copy))) {
+      LOG_WARN("failed to deep copy search text path", K(ret), K(path));
+    } else if (OB_FAIL(ob_write_string(token_doc_cnt_key_alloc_, token, token_copy))) {
+      LOG_WARN("failed to deep copy token", K(ret), "token_len", token.length());
     } else {
-      const ObTokenDocCntKey key(tablet_id, token_copy);
+      const ObTokenDocCntKey key(tablet_id, column_idx, path_copy, token_copy);
       if (OB_FAIL(token_doc_cnt_map_.set_refactored(key, token_doc_cnt, 1 /*overwrite*/))) {
-        LOG_WARN("failed to set token doc cnt", K(ret), K(tablet_id), K(token), K(token_doc_cnt));
+        LOG_WARN("failed to set token doc cnt", K(ret), K(tablet_id), "token_len", token.length(), K(token_doc_cnt));
       }
     }
   }
@@ -218,4 +270,3 @@ int ObInvIdxParamCache::init_total_doc_cnt_map()
 
 } // namespace storage
 } // namespace oceanbase
-

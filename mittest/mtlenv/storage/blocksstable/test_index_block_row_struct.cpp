@@ -11,6 +11,7 @@
 #define protected public
 #include "src/storage/ob_i_store.h"
 #include "mtlenv/mock_tenant_module_env.h"
+#include "storage/blocksstable/index_block/ob_index_block_builder.h"
 
 namespace oceanbase
 {
@@ -148,6 +149,100 @@ TEST_F(TestIndexBlockRowStruct, test_normal)
   ret = row_builder.build_row(row_desc, row);
   EXPECT_EQ(OB_SUCCESS, ret);
   row_builder.reset();
+}
+
+// Keep append_row, row encoding and aggregation real; replace only the insertion boundary.
+class AppendRowInsertProbe : public ObBaseIndexBlockBuilder
+{
+public:
+  int insert_ret_ = OB_SUCCESS;
+  int64_t row_count_at_insert_ = -1;
+protected:
+  int insert_and_update_index_tree(const ObDatumRow *row) override
+  {
+    EXPECT_NE(nullptr, row);
+    row_count_at_insert_ = index_block_aggregator_.get_row_count();
+    return insert_ret_;
+  }
+};
+
+TEST_F(TestIndexBlockRowStruct, append_row_aggregates_once_after_insert_before_reuse)
+{
+  for (const bool inverted : {false, true}) {
+    SCOPED_TRACE(inverted ? "inverted" : "ordinary");
+    AppendRowInsertProbe builder;
+    builder.index_store_desc_ = &desc_.get_desc();
+    ASSERT_EQ(OB_SUCCESS, builder.row_builder_.init(allocator_, data_desc_.get_desc(), desc_.get_desc()));
+    ASSERT_EQ(OB_SUCCESS, builder.index_block_aggregator_.init(data_desc_.get_desc(), allocator_));
+    ObStorageDatum key_datums[2];
+    key_datums[0].set_int(1);
+    key_datums[1].set_int(1);
+    ObIndexBlockRowDesc child(desc_.get_desc());
+    child.macro_id_ = MacroBlockId::mock_valid_macro_id();
+    child.row_count_ = 7;
+    child.row_offset_ = 7;
+    ASSERT_EQ(OB_SUCCESS, child.row_key_.assign(key_datums, 2));
+    ObInvIdxAggInfo input;
+    const void *payload = nullptr;
+    if (inverted) {
+      ASSERT_EQ(OB_SUCCESS, input.set(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, 53));
+      ASSERT_EQ(OB_SUCCESS, ObInvIdxAggregator::fill_row_desc(input, child, builder.row_allocator_));
+      payload = child.inverted_index_agg_.buf_;
+    }
+
+    builder.insert_ret_ = OB_BUF_NOT_ENOUGH;
+    ASSERT_EQ(OB_BUF_NOT_ENOUGH, builder.append_row(child));
+    EXPECT_EQ(0, builder.row_count_at_insert_);
+    EXPECT_EQ(0, builder.index_block_aggregator_.get_row_count());
+    EXPECT_FALSE(builder.index_block_aggregator_.inverted_aggregator_.has_rows());
+    EXPECT_FALSE(builder.last_rowkey_.is_valid());
+    EXPECT_EQ(-1, builder.row_offset_);
+
+    builder.insert_ret_ = OB_SUCCESS;
+    ASSERT_EQ(OB_SUCCESS, builder.append_row(child));
+    EXPECT_EQ(0, builder.row_count_at_insert_);
+    EXPECT_EQ(7, builder.index_block_aggregator_.get_row_count());
+    EXPECT_EQ(7, builder.row_offset_);
+    if (inverted) {
+      // This single-page arena reuses its first allocation for the key; late decoding would read key bytes.
+      EXPECT_EQ(payload, static_cast<const void *>(builder.last_rowkey_.get_datum_ptr()));
+      ObIndexBlockRowDesc summary_row;
+      ASSERT_EQ(OB_SUCCESS, builder.get_aggregated_row(summary_row));
+      ObInvIdxAggInfo summary;
+      int64_t pos = 0;
+      ASSERT_EQ(OB_SUCCESS, ObInvIdxAggInfoSerializer::deserialize(
+          summary_row.inverted_index_agg_.buf_, summary_row.inverted_index_agg_.size_, pos, summary));
+      uint64_t length = 0;
+      ASSERT_EQ(OB_SUCCESS, summary.get(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, length));
+      EXPECT_EQ(53, length);
+    }
+
+    key_datums[0].set_int(2);
+    child.row_count_ = 11;
+    child.row_offset_ = 18;
+    if (inverted) {
+      ASSERT_EQ(OB_SUCCESS, input.set(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, 71));
+      ASSERT_EQ(OB_SUCCESS, ObInvIdxAggregator::fill_row_desc(input, child, builder.row_allocator_));
+    }
+    ASSERT_EQ(OB_SUCCESS, builder.append_row(child));
+    EXPECT_EQ(7, builder.row_count_at_insert_);
+    EXPECT_EQ(18, builder.index_block_aggregator_.get_row_count());
+    EXPECT_EQ(18, builder.row_offset_);
+    ObIndexBlockRowDesc summary_row;
+    ASSERT_EQ(OB_SUCCESS, builder.get_aggregated_row(summary_row));
+    if (inverted) {
+      ObInvIdxAggInfo summary;
+      int64_t pos = 0;
+      ASSERT_EQ(OB_SUCCESS, ObInvIdxAggInfoSerializer::deserialize(
+          summary_row.inverted_index_agg_.buf_, summary_row.inverted_index_agg_.size_, pos, summary));
+      uint64_t length = 0;
+      ASSERT_EQ(OB_SUCCESS, summary.get(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, length));
+      EXPECT_EQ(124, length);
+    } else {
+      EXPECT_EQ(ObIndexRowAggType::UNSERIALIZED_ROW_AGG, summary_row.agg_type_);
+      EXPECT_EQ(nullptr, summary_row.aggregated_row_);
+    }
+  }
 }
 
 TEST_F(TestIndexBlockRowStruct, test_parser_normal)

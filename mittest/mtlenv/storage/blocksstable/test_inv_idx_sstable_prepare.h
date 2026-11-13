@@ -126,7 +126,90 @@ static void prepare_inv_idx_schema(
   }
 }
 
-// Resolve each FTS value column index from the multi-version column layout.
+// =============================================================================
+// Helper: build a search text inverted-index table schema.
+//
+// Column layout (matches storage_datums_ in ObDatumRow):
+//   col 0: COL_IDX  (uint64,    rowkey #1, term col)
+//   col 1: PATH     (VARBINARY, rowkey #2, term col)
+//   col 2: TOKEN    (VARBINARY, rowkey #3, term col)
+//   col 3: DOC_ID   (uint64,    rowkey #4, no role flag)
+//   col 4: TOKEN_FREQ (uint64, no role flag)
+//   col 5: DOC_LENGTH (uint64, no role flag)
+//   col 6: POSITION_LIST (VARBINARY, no role flag)  [only when has_pos_list]
+// =============================================================================
+static void prepare_search_text_idx_schema(
+    ObTableSchema &table_schema,
+    const bool has_pos_list,
+    const int64_t micro_block_size = 16 * 1024)
+{
+  const uint64_t table_id = 8888;
+  const int64_t column_cnt = has_pos_list ? SEARCH_TEXT_COL_CNT_WITH_POS
+                                          : SEARCH_TEXT_COL_CNT_WITHOUT_POS;
+
+  table_schema.reset();
+  ASSERT_EQ(OB_SUCCESS, table_schema.set_table_name("test_search_text_idx_sstable"));
+  table_schema.set_tenant_id(1);
+  table_schema.set_tablegroup_id(1);
+  table_schema.set_database_id(1);
+  table_schema.set_table_id(table_id);
+  table_schema.set_index_type(has_pos_list
+      ? INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_PHRASE_INDEX_LOCAL
+      : INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_INDEX_LOCAL);
+  // index_type implies an index table; reset() leaves USER_TABLE which fails
+  // ObSimpleTableSchemaV2::is_valid() (table_type/index_type mismatch, then data_table_id).
+  table_schema.set_table_type(USER_INDEX);
+  table_schema.set_data_table_id(9999);
+  table_schema.set_rowkey_column_num(SEARCH_TEXT_ROWKEY_CNT);
+  table_schema.set_max_used_column_id(common::OB_APP_MIN_COLUMN_ID + column_cnt);
+  table_schema.set_schema_version(10);
+  table_schema.set_block_size(micro_block_size);
+  table_schema.set_compress_func_name("none");
+  table_schema.set_row_store_type(FLAT_ROW_STORE);
+  table_schema.set_pctfree(10);
+
+  struct ColMeta
+  {
+    int64_t rowkey_pos_;   // 0 = non-rowkey, >=1 = rowkey position
+    ObObjType obj_type_;
+    int64_t flags_;
+  };
+  const ColMeta col_metas[] = {
+      {1, ObUInt64Type,  0},                                    // COL_IDX
+      {2, ObVarcharType, 0},                                    // PATH
+      {3, ObVarcharType, 0},                                    // TOKEN
+      {4, ObUInt64Type,  0},         // DOC_ID
+      {0, ObUInt64Type,  0}, // TOKEN_FREQ
+      {0, ObUInt64Type,  0}, // DOC_LENGTH
+      {0, ObVarcharType, 0},   // POSITION_LIST
+  };
+
+  char name[OB_MAX_FILE_NAME_LENGTH];
+  memset(name, 0, sizeof(name));
+  for (int64_t i = 0; i < column_cnt; ++i) {
+    ObColumnSchemaV2 column;
+    column.reset();
+    column.set_table_id(table_id);
+    column.set_column_id(common::OB_APP_MIN_COLUMN_ID + i);
+    sprintf(name, "search_text%020ld", i);
+    ASSERT_EQ(OB_SUCCESS, column.set_column_name(name));
+    column.set_data_type(col_metas[i].obj_type_);
+    column.set_collation_type(CS_TYPE_BINARY);
+    column.set_data_length(64);
+    column.set_nullable(false);
+    column.set_rowkey_position(col_metas[i].rowkey_pos_);
+    if (0 != col_metas[i].flags_) {
+      column.set_column_flags(col_metas[i].flags_);
+    }
+    ObSkipIndexColumnAttr skip_idx_attr;
+    skip_idx_attr.set_min_max();
+    column.set_skip_index_attr(skip_idx_attr.get_packed_value());
+    ASSERT_EQ(OB_SUCCESS, table_schema.add_column(column));
+  }
+}
+
+// Resolve each FTS value column index from the multi-version column layout. A search text schema
+// goes through the production init_search_text() resolution instead.
 static int prepare_inv_idx_row_desc(
     const ObTableSchema &table_schema,
     ObInvIdxRowDesc &row_desc)
@@ -134,7 +217,11 @@ static int prepare_inv_idx_row_desc(
   int ret = OB_SUCCESS;
   common::ObSEArray<ObColDesc, 8> col_descs;
   row_desc.reset();
-  if (OB_FAIL(table_schema.get_multi_version_column_descs(col_descs))) {
+  if (table_schema.is_async_search_text_index()) {
+    if (OB_FAIL(row_desc.init_search_text(table_schema))) {
+      STORAGE_LOG(WARN, "fail to init search text row desc", K(ret));
+    }
+  } else if (OB_FAIL(table_schema.get_multi_version_column_descs(col_descs))) {
     STORAGE_LOG(WARN, "fail to get multi version column descs", K(ret));
   } else {
     row_desc.index_type_ = INV_IDX_TYPE_FTS;
@@ -182,7 +269,11 @@ static void fill_inv_meta_from_schema(
   inv_meta.reset();
   // FTS index is identified by its doc_id column; pos_list presence by the
   // resolved pos_list column index. nested_key has no schema flag yet.
-  inv_meta.index_type_ = (row_desc.doc_id_col_idx_ >= 0) ? INV_IDX_TYPE_FTS : INV_IDX_TYPE_INVALID;
+  if (INV_IDX_TYPE_SEARCH_TEXT == row_desc.index_type_) {
+    inv_meta.index_type_ = INV_IDX_TYPE_SEARCH_TEXT;
+  } else {
+    inv_meta.index_type_ = (row_desc.doc_id_col_idx_ >= 0) ? INV_IDX_TYPE_FTS : INV_IDX_TYPE_INVALID;
+  }
   inv_meta.has_relevance_params_ =
       (row_desc.token_freq_col_idx_ >= 0 && row_desc.doc_length_col_idx_ >= 0);
   inv_meta.has_position_list_ = (row_desc.pos_list_col_idx_ >= 0);
@@ -247,6 +338,35 @@ static int make_inv_idx_row(
     if (row_desc.nested_key_col_idx_ >= 0) {
       row.storage_datums_[row_desc.nested_key_col_idx_].set_string(nested_key_str);
     }
+  }
+  return ret;
+}
+
+// Build a search text ObDatumRow in the multi-version column layout:
+// COL_IDX, PATH, TOKEN, DOC_ID, trans_version, sql_sequence, TF, DL, [POS].
+static int make_search_text_inv_idx_row(
+    ObDatumRow &row,
+    const ObInvIdxRowDesc &row_desc,
+    const int64_t mv_col_cnt,
+    const uint64_t col_idx,
+    const ObString &path_str,
+    const ObString &token_str,
+    const uint64_t doc_id,
+    const uint64_t token_freq,
+    const uint64_t doc_length,
+    const ObString &pos_list_str)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(make_inv_idx_row(row, row_desc, mv_col_cnt, token_str, doc_id,
+      token_freq, doc_length, pos_list_str))) {
+    STORAGE_LOG(WARN, "fail to make inv idx row", K(ret));
+  } else {
+    // set_uint writes through ptr_, which make_inv_idx_row pointed at the token buffer.
+    row.storage_datums_[SEARCH_TEXT_COL_IDX].reuse();
+    row.storage_datums_[SEARCH_TEXT_COL_IDX].set_uint(col_idx);
+    row.storage_datums_[SEARCH_TEXT_PATH].set_string(path_str);
+    row.storage_datums_[SEARCH_TEXT_TOKEN].set_string(token_str);
+    // Leave multi-version columns as NOP, matching compaction rows; the writer does not encode them.
   }
   return ret;
 }
@@ -368,8 +488,19 @@ public:
       const ObString pos_list = position_list_.empty()
           ? ObString(pos_list_len, pos_list_buf_)
           : position_list_;
-      if (OB_FAIL(make_inv_idx_row(row, row_desc_, mv_col_cnt_, term_str, doc_id_,
-          token_freq, doc_length, pos_list))) {
+      if (INV_IDX_TYPE_SEARCH_TEXT == row_desc_.index_type_) {
+        // Four consecutive term seqs share one COL_IDX, two share one PATH; the token keeps the
+        // term seq, so (COL_IDX, PATH, TOKEN) stays strictly increasing across term switches.
+        sprintf(path_buf_, "$.f%ld", (term_seq_ / 2) % 2);
+        ret = make_search_text_inv_idx_row(row, row_desc_, mv_col_cnt_,
+            static_cast<uint64_t>(1 + term_seq_ / 4),
+            ObString(static_cast<int32_t>(strlen(path_buf_)), path_buf_), term_str, doc_id_,
+            token_freq, doc_length, pos_list);
+      } else {
+        ret = make_inv_idx_row(row, row_desc_, mv_col_cnt_, term_str, doc_id_,
+            token_freq, doc_length, pos_list);
+      }
+      if (OB_FAIL(ret)) {
         STORAGE_LOG(WARN, "fail to make inv idx row", K(ret), K(i));
       } else if (OB_FAIL(writer.append_row(row))) {
         STORAGE_LOG(WARN, "fail to append inv idx row", K(ret), K(i), K_(doc_id), K(term_str));
@@ -415,6 +546,7 @@ private:
   bool vary_posting_payload_;
   common::ObRandom rng_;
   char term_buf_[32];
+  char path_buf_[32];
   char pos_list_buf_[128];
 };
 
@@ -436,7 +568,7 @@ public:
   static const uint64_t TABLET_ID = 200001;
 
   TestInvIdxSSTablePrepare()
-    : index_builder_(nullptr), mv_col_cnt_(0)
+    : index_builder_(nullptr), mv_col_cnt_(0), search_text_(false)
   {}
 
   static void SetUpTestCase()
@@ -456,6 +588,7 @@ public:
     inv_idx_row_desc_.reset();
     index_builder_ = nullptr;
     mv_col_cnt_ = 0;
+    search_text_ = false;
   }
   virtual void TearDown() override
   {
@@ -504,6 +637,8 @@ protected:
   ObSSTableIndexBuilder *index_builder_;
   ObMacroSeqParam seq_param_;
   int64_t mv_col_cnt_;
+  // build_inv_sstable() uses the search text schema instead of the FTS schema when set.
+  bool search_text_;
 };
 
 void TestInvIdxSSTablePrepare::prepare_desc(const ObRowStoreType force_row_store_type)
@@ -576,7 +711,12 @@ void TestInvIdxSSTablePrepare::build_inv_sstable(
   }
 
   // 1. schema + row desc + data store desc + index builder
-  prepare_inv_idx_schema(table_schema_, has_pos_list);
+  const ObInvIdxType expected_index_type = search_text_ ? INV_IDX_TYPE_SEARCH_TEXT : INV_IDX_TYPE_FTS;
+  if (search_text_) {
+    prepare_search_text_idx_schema(table_schema_, has_pos_list);
+  } else {
+    prepare_inv_idx_schema(table_schema_, has_pos_list);
+  }
   table_schema_.set_micro_index_clustered(micro_index_clustered);
   OK(prepare_inv_idx_row_desc(table_schema_, inv_idx_row_desc_));
   ASSERT_TRUE(inv_idx_row_desc_.is_valid());
@@ -627,7 +767,7 @@ void TestInvIdxSSTablePrepare::build_inv_sstable(
   ASSERT_EQ(OB_SUCCESS, res.inv_meta_.init(inv_meta_stats));
   ASSERT_TRUE(res.inv_meta_.is_valid());
 
-  // Build a storage schema from the FTS table schema; init_for_merge reads the
+  // Build a storage schema from the table schema; init_for_merge reads the
   // rowkey/mode/index-type/column counts from it.
   ObStorageSchema *storage_schema = nullptr;
   {
@@ -653,7 +793,8 @@ void TestInvIdxSSTablePrepare::build_inv_sstable(
   OK(param.init_for_merge(merge_ctx, res, nullptr /*cg_schema*/, 0 /*cg_idx*/));
   ASSERT_TRUE(param.table_key_.is_inv_sstable());
   ASSERT_TRUE(param.inv_meta_.is_valid());
-  ASSERT_TRUE(param.inv_meta_.get_stats().is_fts_index());
+  ASSERT_EQ(expected_index_type, param.inv_meta_.get_stats().index_type_);
+  ASSERT_TRUE(param.inv_meta_.get_stats().has_relevance_params_);
   ASSERT_EQ(has_pos_list, param.inv_meta_.get_stats().has_position_list_);
   ASSERT_FALSE(param.inv_meta_.get_stats().has_nested_key_);
   ASSERT_EQ(feeder.min_doc_id(), param.inv_meta_.get_stats().min_doc_id_);
@@ -667,8 +808,8 @@ void TestInvIdxSSTablePrepare::build_inv_sstable(
   // 8. assertions
   ASSERT_TRUE(inv_sstable.is_inv_sstable());
   ASSERT_TRUE(inv_sstable.is_valid());
-  ASSERT_TRUE(inv_sstable.get_inv_meta().get_stats().is_valid());
-  ASSERT_TRUE(inv_sstable.get_inv_meta().get_stats().is_fts_index());
+  ASSERT_TRUE(inv_sstable.get_inv_meta().is_valid());
+  ASSERT_EQ(expected_index_type, inv_sstable.get_inv_meta().get_stats().index_type_);
   ASSERT_EQ(has_pos_list, inv_sstable.get_inv_meta().get_stats().has_position_list_);
   ASSERT_FALSE(inv_sstable.get_inv_meta().get_stats().has_nested_key_);
   ASSERT_EQ(feeder.min_doc_id(), inv_sstable.get_inv_meta().get_stats().min_doc_id_);

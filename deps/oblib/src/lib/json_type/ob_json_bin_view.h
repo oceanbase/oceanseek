@@ -9,6 +9,7 @@
 #include "ob_json_common.h"
 #include "ob_json_bin.h"
 #include "ob_json_compare.h"
+#include "ob_json_parse.h"        // for JSON_DOCUMENT_MAX_DEPTH (print depth guard default)
 #include "lib/string/ob_string.h"
 #include "lib/container/ob_se_array.h"
 #include "lib/utility/serialization.h"
@@ -18,6 +19,7 @@ namespace common {
 
 class ObJsonPath;
 class ObJsonWrapper;
+class ObJsonPrint;
 
 // Template helper: read variable-length integer at compile-time known type.
 // Eliminates switch overhead in hot loops.
@@ -100,6 +102,7 @@ public:
   OB_INLINE bool get_boolean() const { return static_cast<bool>(uint_val_); }
   OB_INLINE float get_float() const { return float_val_; }
   int get_obtime(ObTime &t) const;
+  int to_number(ObIAllocator *allocator, number::ObNumber &number) const;
 
   // Get string data. For STRING and OPAQUE types only.
   // STRING: data_ points to type byte, skip type(1) + varint length prefix
@@ -116,9 +119,16 @@ public:
   // Opaque: read field_type from data_ + 1. Time types: derive from json_type().
   ObObjType field_type() const;
 
+  int print(ObJsonBuffer &j_buf, bool is_quoted,
+            uint64_t reserve_len = 0, bool is_pretty = false,
+            uint64_t depth = 0) const;
+
   // Get raw binary slice for current node (without doc header).
-  // Only returns slices that already include a type prefix (container/string/opaque).
-  // Scalars and decimal use get_raw_binary(), which prepends the type byte when needed.
+  // Only types whose binary form starts with a type byte at data_ (container/
+  // string/opaque, i.e. need_type_prefix) return a non-empty slice — including
+  // the type prefix. Scalars return an empty string: their type byte lives in
+  // the parent's value entry, so there is no self-contained slice. Use
+  // get_raw_binary() when a complete binary (with type byte) is needed.
   OB_INLINE ObString raw_binary() const
   {
     ObString res;
@@ -128,6 +138,12 @@ public:
     return res;
   }
 
+  // Get the raw value-area bytes at data_ unconditionally (never checks the
+  // type). For prefixed types (container/string/opaque) this includes the type
+  // byte; for non-inline scalars (e.g. decimal) it is the payload without the
+  // type byte; for inline scalars it is empty (length_ == 0, the value lives in
+  // the parent's value entry). Used by ObJsonWrapper::get_value_payload() for
+  // zero-copy embedding into a container.
   OB_INLINE ObString value_binary() const
   {
     ObString res;
@@ -185,6 +201,8 @@ public:
   OB_INLINE const void *node_identity() const { return data_; }
 
 private:
+  friend class ObJsonPrint;
+
   OB_INLINE bool is_inline() const
   {
     return OB_JSON_TYPE_IS_INLINE(type_);
@@ -256,25 +274,25 @@ private:
                        bool auto_wrap) const;
   int seek_complex_path(const ObJsonPath &path,
                         int64_t node_idx,
-                        bool auto_wrap, bool only_need_one,
+                        bool auto_wrap, bool only_need_one, bool need_dedup,
                         ObIArray<ObJsonWrapper> &hits) const;
   int seek_member(const ObJsonPath &path, int64_t node_idx,
-                  bool auto_wrap, bool only_need_one,
+                  bool auto_wrap, bool only_need_one, bool need_dedup,
                   ObIArray<ObJsonWrapper> &hits) const;
   int seek_member_wildcard(const ObJsonPath &path, int64_t node_idx,
-                           bool auto_wrap, bool only_need_one,
+                           bool auto_wrap, bool only_need_one, bool need_dedup,
                            ObIArray<ObJsonWrapper> &hits) const;
   int seek_array_cell(const ObJsonPath &path, int64_t node_idx,
-                      bool auto_wrap, bool only_need_one,
+                      bool auto_wrap, bool only_need_one, bool need_dedup,
                       ObIArray<ObJsonWrapper> &hits) const;
   int seek_array_range(const ObJsonPath &path, int64_t node_idx,
-                       bool auto_wrap, bool only_need_one,
+                       bool auto_wrap, bool only_need_one, bool need_dedup,
                        ObIArray<ObJsonWrapper> &hits) const;
   int seek_array_wildcard(const ObJsonPath &path, int64_t node_idx,
-                          bool auto_wrap, bool only_need_one,
+                          bool auto_wrap, bool only_need_one, bool need_dedup,
                           ObIArray<ObJsonWrapper> &hits) const;
   int seek_ellipsis(const ObJsonPath &path, int64_t node_idx,
-                    bool auto_wrap, bool only_need_one,
+                    bool auto_wrap, bool only_need_one, bool need_dedup,
                     ObIArray<ObJsonWrapper> &hits) const;
   bool is_same_view(const ObJsonBinView &other) const;
   static int push_unique_hit(const ObJsonBinView &view,
@@ -388,6 +406,13 @@ public:
 
   // Time - delegate to the underlying view, which decodes all time types.
   int get_obtime(ObTime &t) const override { return view_.get_obtime(t); }
+
+  // Zero-copy print: scalars and containers print directly off the bin view.
+  // Overriding here lets cast_to_string's j_base->print() stay zero-copy for
+  // containers without falling back to to_json_base().
+  int print(ObJsonBuffer &j_buf, bool is_quoted,
+            uint64_t reserve_len = 0, bool is_pretty = false,
+            uint64_t depth = 0) const override;
 
   // Container / parent navigation - not needed for scalar cast.
   int get_parent(ObIJsonBase *& /*parent*/) const override { return OB_NOT_SUPPORTED; }

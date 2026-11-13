@@ -1390,6 +1390,30 @@ TEST_F(TestPostingBlockCodec, extreme_relevance_bm25_pair_overflow)
       true, 256, row_cnt, doc_ids, token_freqs, doc_lengths, desc));
 }
 
+// The BM25 aggregator rejects TF above UINT32_MAX and a block holds at most
+// DEFAULT_POSTING_BLOCK_CAPACITY rows, so the block-level sum of TF cannot wrap.
+TEST_F(TestPostingBlockCodec, max_capacity_uint32_max_token_freq_total_doc_length_exact)
+{
+  const int64_t block_capacity = DEFAULT_POSTING_BLOCK_CAPACITY;
+  const uint64_t max_u32 = static_cast<uint64_t>(UINT32_MAX);
+  uint64_t doc_ids[DEFAULT_POSTING_BLOCK_CAPACITY];
+  uint64_t token_freqs[DEFAULT_POSTING_BLOCK_CAPACITY];
+  uint64_t doc_lengths[DEFAULT_POSTING_BLOCK_CAPACITY];
+  for (int64_t i = 0; i < block_capacity; ++i) {
+    doc_ids[i] = static_cast<uint64_t>(i + 1);
+    token_freqs[i] = max_u32;
+    doc_lengths[i] = max_u32;
+  }
+  ObPostingBlockDesc desc;
+
+  init_encoding_ctx(ctx_, col_descs_, true, block_capacity);
+  apply_packed_base_relevance_encoding(ctx_);
+  ASSERT_EQ(OK, encode_rows_with_ctx(encoder_, allocator_, ctx_, block_capacity,
+      doc_ids, token_freqs, doc_lengths, desc));
+  ASSERT_EQ(block_capacity, desc.doc_count_);
+  ASSERT_EQ(static_cast<uint64_t>(block_capacity) * max_u32, desc.total_doc_length_);
+}
+
 // =============================================================================
 // Negative paths — encoder error branches (L2/L3)
 // =============================================================================

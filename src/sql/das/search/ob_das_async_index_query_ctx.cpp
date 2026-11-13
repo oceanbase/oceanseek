@@ -1487,10 +1487,12 @@ int ObAsyncIndexPartitionSegCtx::get_segment_rowid_range(
           || meta.index_type_ >= blocksstable::INV_IDX_TYPE_MAX
           || !meta.doc_id_obj_meta_.is_valid()
           || meta.doc_id_obj_meta_.is_null()
-          || (blocksstable::INV_IDX_TYPE_FTS == meta.index_type_) != meta.has_relevance_params_)) {
+          || ((blocksstable::INV_IDX_TYPE_FTS == meta.index_type_
+              || blocksstable::INV_IDX_TYPE_SEARCH_TEXT == meta.index_type_)
+              != meta.has_relevance_params_))) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("invalid async segment range metadata", K(ret), K(version_range), "table_key", sstable->get_key());
-      } else if (!meta.doc_id_obj_meta_.is_uint64() || meta.has_nested_key_) {
+      } else if (!meta.doc_id_obj_meta_.is_uint64()) {
         // A valid but unsupported DocID layout cannot prove UINT64 output order; keep heap merge.
         LOG_TRACE("unsupported async segment range metadata", K(version_range), "table_key", sstable->get_key(), K(meta));
       } else if (OB_UNLIKELY(meta.is_empty_range()
@@ -1502,6 +1504,8 @@ int ObAsyncIndexPartitionSegCtx::get_segment_rowid_range(
         // An empty statistics sentinel alone cannot prove that posting rows can be omitted.
         LOG_WARN("unproven empty async segment range, keep heap merge", K(version_range), "table_key", sstable->get_key(), K(meta));
       } else {
+        // Nested keys live in posting-value blocks; the range still describes
+        // the UINT64 DocIDs in the paired posting blocks.
         available = true;
         min_rowid = meta.min_doc_id_;
         max_rowid = meta.max_doc_id_;

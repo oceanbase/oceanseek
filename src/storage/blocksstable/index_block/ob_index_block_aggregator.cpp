@@ -2044,6 +2044,7 @@ void ObIndexRowAggInfo::reset()
 ObIndexBlockAggregator::ObIndexBlockAggregator()
     : skip_index_aggregator_(),
       aggregate_info_(),
+      inverted_aggregator_(),
       need_data_aggregate_(false),
       has_reused_null_agg_in_this_micro_block_(false),
       is_inited_(false)
@@ -2054,6 +2055,7 @@ void ObIndexBlockAggregator::reset()
 {
   skip_index_aggregator_.reset();
   aggregate_info_.reset();
+  inverted_aggregator_.reset();
   need_data_aggregate_ = false;
   has_reused_null_agg_in_this_micro_block_ = false;
   is_inited_ = false;
@@ -2063,6 +2065,7 @@ void ObIndexBlockAggregator::reuse()
 {
   skip_index_aggregator_.reuse();
   aggregate_info_.reset();
+  inverted_aggregator_.reset();
   has_reused_null_agg_in_this_micro_block_ = false;
 }
 
@@ -2122,7 +2125,7 @@ int ObIndexBlockAggregator::eval(const ObIndexBlockRowDesc &row_desc)
   } else if (OB_UNLIKELY(!row_desc.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("Invalid index block row descriptor", K(ret));
-  } else if (need_data_aggregate()) {
+  } else if (need_data_aggregate() && ObIndexRowAggType::INVERTED_INDEX_AGG != row_desc.agg_type_) {
     if (OB_ISNULL(row_desc.aggregated_row_)) {
       // There is data that does not contain aggregate row, so we disable skip index aggregate, do nothing here.
       has_reused_null_agg_in_this_micro_block_ = true;
@@ -2139,6 +2142,13 @@ int ObIndexBlockAggregator::eval(const ObIndexBlockRowDesc &row_desc)
     } else if (OB_FAIL(skip_index_aggregator_.eval(*row_desc.aggregated_row_))) {
       LOG_WARN("Fail to aggregate on index row", K(ret));
     }
+  } else if (ObIndexRowAggType::INVERTED_INDEX_AGG == row_desc.agg_type_) {
+    if (OB_FAIL(inverted_aggregator_.eval(row_desc))) {
+      LOG_WARN("failed to aggregate inverted index statistics", K(ret), K(row_desc));
+    }
+  } else if (OB_ISNULL(row_desc.aggregated_row_)) {
+    // Missing child statistics also invalidate a parent without skip-index aggregation.
+    has_reused_null_agg_in_this_micro_block_ = true;
   }
 
   if (OB_SUCC(ret)) {

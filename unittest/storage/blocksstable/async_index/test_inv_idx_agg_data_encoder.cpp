@@ -10,6 +10,10 @@
 #include "lib/allocator/page_arena.h"
 #include "lib/container/ob_array.h"
 #include "storage/blocksstable/async_index/ob_inv_idx_agg_data_encoder.h"
+#include "storage/blocksstable/async_index/ob_inv_idx_agg_info.h"
+#include "storage/blocksstable/async_index/ob_inv_idx_aggregator.h"
+#include "storage/blocksstable/index_block/ob_index_block_builder.h"
+#include "storage/blocksstable/ob_macro_block_meta.h"
 #include "storage/blocksstable/async_index/ob_inv_idx_agg_data_decoder.h"
 
 #include <gtest/gtest.h>
@@ -188,6 +192,272 @@ protected:
   }
 };
 
+TEST_F(InvIdxAggDataEncoderTest, legacy_v1_bytes_remain_readable)
+{
+  // Fixed V1 bytes, independent of the new writer: one logical block, doc 7, L = 100.
+  const char legacy[] = {
+    1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 50, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
+    7, 0, 0, 0, 0, 0, 0, 0,
+    7, 0, 0, 0, 0, 0, 0, 0,
+    100, 0, 0, 0, 0, 0, 0, 0
+  };
+  uint64_t length = 0;
+  ASSERT_EQ(OB_SUCCESS, ObInvIdxAggDataDecoder::get_total_doc_length(legacy, sizeof(legacy), length));
+  ASSERT_EQ(100, length);
+  common::ObArray<ObInvIdxLogicalBlockMeta> metas;
+  int64_t offset = 0;
+  int64_t size = 0;
+  ASSERT_EQ(OB_SUCCESS, ObInvIdxAggDataDecoder::decode(legacy, sizeof(legacy), metas, offset, size));
+  ASSERT_EQ(1, metas.count());
+  ASSERT_EQ(7, metas.at(0).min_doc_id_);
+  ASSERT_EQ(100, metas.at(0).total_doc_length_);
+
+  // Sharing the RowDesc carrier must not change the leaf wire protocol.
+  common::ObArenaAllocator allocator;
+  char *encoded = nullptr;
+  int64_t encoded_size = 0;
+  ASSERT_EQ(OB_SUCCESS, ObInvIdxAggDataEncoder::build(allocator, offset, size, metas,
+      encoded, encoded_size));
+  ASSERT_EQ(sizeof(legacy), encoded_size);
+  ASSERT_EQ(0, MEMCMP(legacy, encoded, encoded_size));
+}
+
+TEST_F(InvIdxAggDataEncoderTest, subtree_stats_number_precision)
+{
+  ObInvIdxAggInfo stats;
+  uint64_t length = UINT64_MAX;
+
+  common::ObArenaAllocator allocator;
+  ObInvIdxAggInfo aggregate;
+  aggregate.init_aggregate();
+  ASSERT_EQ(OB_SUCCESS, stats.set(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, UINT64_MAX));
+  ASSERT_EQ(OB_SUCCESS, aggregate.merge(stats));
+  ASSERT_EQ(OB_SUCCESS, stats.set(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, 1));
+  ASSERT_EQ(OB_SUCCESS, aggregate.merge(stats));
+  ASSERT_EQ(OB_SIZE_OVERFLOW, aggregate.get(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, length));
+  common::number::ObNumber expected;
+  common::number::ObNumber value;
+  ASSERT_EQ(OB_SUCCESS, expected.from("18446744073709551616", allocator));
+  ASSERT_EQ(OB_SUCCESS, aggregate.get(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, value));
+  ASSERT_EQ(0, value.compare(expected));
+
+  ObInvIdxAggInfo copied;
+  ASSERT_EQ(OB_SUCCESS, copied.set(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, expected));
+  allocator.reuse();
+  ASSERT_EQ(OB_SUCCESS, aggregate.merge(copied));
+  ASSERT_EQ(OB_SUCCESS, expected.from("36893488147419103232", allocator));
+  ASSERT_EQ(OB_SUCCESS, aggregate.get(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, value));
+  ASSERT_EQ(0, value.compare(expected));
+}
+
+TEST_F(InvIdxAggDataEncoderTest, index_row_protocol_round_trip_and_owned_values)
+{
+  common::ObArenaAllocator allocator;
+  // Cover zero, ordinary values, and the Number boundary beyond uint64.
+  for (const char *input : {"0", "7", "18446744073709551615", "18446744073709551616"}) {
+    common::number::ObNumber expected;
+    ObInvIdxAggInfo stats;
+    ASSERT_EQ(OB_SUCCESS, expected.from(input, allocator));
+    ASSERT_EQ(OB_SUCCESS, stats.set(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, expected));
+    int64_t size = -1;
+    ASSERT_EQ(OB_SUCCESS, ObInvIdxAggInfoSerializer::get_serialize_size(stats, size));
+    const int64_t offset = 1; // Number digits at offset + 13 are not uint32-aligned.
+    std::vector<char> buf(offset + size + 2, 0x5a);
+    int64_t pos = offset;
+    ASSERT_EQ(OB_SUCCESS, ObInvIdxAggInfoSerializer::serialize(stats, buf.data(), offset + size, pos));
+    ASSERT_EQ(offset + size, pos);
+    EXPECT_EQ(0x5a, buf[0]);
+    EXPECT_EQ(0x5a, buf[offset + size]);
+    ObInvIdxAggInfo decoded;
+    ASSERT_EQ(OB_SUCCESS, decoded.set(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, 42));
+    int64_t read_pos = offset;
+    ASSERT_EQ(OB_SUCCESS, ObInvIdxAggInfoSerializer::deserialize(buf.data(), pos, read_pos, decoded));
+    ASSERT_EQ(pos, read_pos);
+    MEMSET(buf.data(), 0xa5, buf.size());
+    stats.reset();
+    common::number::ObNumber actual;
+    ASSERT_EQ(OB_SUCCESS, decoded.get(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, actual));
+    EXPECT_EQ(0, expected.compare(actual)) << input;
+  }
+}
+
+TEST_F(InvIdxAggDataEncoderTest, index_row_protocol_v1_fixture_and_concatenation)
+{
+  // A fixed V1 record for total length 7, independent of this writer:
+  // i8 version; big-endian i64 mask; ObNumber descriptor and native digit bytes.
+  const unsigned char v1[] = {1, 0, 0, 0, 0, 0, 0, 0, 1, 0xc0, 0, 0, 1, 7, 0, 0, 0};
+  ObInvIdxAggInfo stats;
+  int64_t pos = 0;
+  ASSERT_EQ(OB_SUCCESS, ObInvIdxAggInfoSerializer::deserialize(reinterpret_cast<const char *>(v1), sizeof(v1), pos, stats));
+  ASSERT_EQ(sizeof(v1), pos);
+  uint64_t value = 0;
+  ASSERT_EQ(OB_SUCCESS, stats.get(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, value));
+  ASSERT_EQ(7, value);
+  char buf[256];
+  pos = 0;
+  ASSERT_EQ(OB_SUCCESS, ObInvIdxAggInfoSerializer::serialize(stats, buf, sizeof(buf), pos));
+  ASSERT_EQ(sizeof(v1), pos);
+  ASSERT_EQ(0, MEMCMP(v1, buf, sizeof(v1)));
+  ASSERT_EQ(OB_SUCCESS, stats.set(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, 100));
+  ASSERT_EQ(OB_SUCCESS, ObInvIdxAggInfoSerializer::serialize(stats, buf, sizeof(buf), pos));
+  int64_t read_pos = 0;
+  for (const uint64_t expected : {7UL, 100UL}) {
+    ASSERT_EQ(OB_SUCCESS, ObInvIdxAggInfoSerializer::deserialize(buf, pos, read_pos, stats));
+    ASSERT_EQ(OB_SUCCESS, stats.get(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, value));
+    EXPECT_EQ(expected, value);
+  }
+  ASSERT_EQ(pos, read_pos);
+}
+
+TEST_F(InvIdxAggDataEncoderTest, index_row_protocol_truncation_preserves_outputs)
+{
+  ObInvIdxAggInfo stats;
+  ASSERT_EQ(OB_SUCCESS, stats.set(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, UINT64_MAX));
+  int64_t size = 0;
+  ASSERT_EQ(OB_SUCCESS, ObInvIdxAggInfoSerializer::get_serialize_size(stats, size));
+  char buf[256];
+  const int64_t offset = 3;
+  int64_t pos = offset;
+  ASSERT_EQ(OB_SUCCESS, ObInvIdxAggInfoSerializer::serialize(stats, buf, sizeof(buf), pos));
+  for (int64_t available = 0; available < size; ++available) {
+    SCOPED_TRACE(available);
+    ObInvIdxAggInfo decoded;
+    ASSERT_EQ(OB_SUCCESS, decoded.set(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, 42));
+    int64_t read_pos = offset;
+    EXPECT_EQ(OB_DESERIALIZE_ERROR, ObInvIdxAggInfoSerializer::deserialize(buf, offset + available, read_pos, decoded));
+    EXPECT_EQ(offset, read_pos);
+    uint64_t value = 0;
+    ASSERT_EQ(OB_SUCCESS, decoded.get(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, value));
+    EXPECT_EQ(42, value);
+    char small[256];
+    MEMSET(small, 0x5a, sizeof(small));
+    int64_t write_pos = offset;
+    EXPECT_EQ(OB_BUF_NOT_ENOUGH, ObInvIdxAggInfoSerializer::serialize(stats, small, offset + available, write_pos));
+    EXPECT_EQ(offset, write_pos);
+    for (const char byte : small) {
+      ASSERT_EQ(0x5a, byte);
+    }
+  }
+}
+
+TEST_F(InvIdxAggDataEncoderTest, index_row_protocol_rejects_malformed_numbers)
+{
+  // Every malformed record starts at a nonzero offset and must preserve the
+  // caller's value and cursor, including a corrupt length that fits the input.
+  const unsigned char v1[] = {1, 0, 0, 0, 0, 0, 0, 0, 1, 0xc0, 0, 0, 1, 7, 0, 0, 0};
+  for (int kind = 0; kind < 7; ++kind) {
+    SCOPED_TRACE(kind);
+    char buf[256] = {};
+    const int64_t offset = 3;
+    MEMCPY(buf + offset, v1, sizeof(v1));
+    int expected_ret = OB_DESERIALIZE_ERROR;
+    int64_t length = offset + sizeof(v1);
+    switch (kind) {
+      case 0: buf[offset] = 2; expected_ret = OB_VERSION_NOT_MATCH; break;
+      case 1: buf[offset + 8] = 2; break; // Unknown statistic bit.
+      case 2: buf[offset + 12] = common::number::ObNumber::MAX_STORE_LEN + 1;
+              length = sizeof(buf); break; // Digits would exceed the inline destination.
+      case 3: buf[offset + 11] = 1; break; // Reserved Number descriptor byte.
+      case 4: buf[offset + 9] = 0x40; break; // Negative Number.
+      case 5: buf[offset + 9] = 0xbf; break; // Fractional Number.
+      case 6: {
+        const uint32_t invalid_digit = common::number::ObNumber::BASE;
+        MEMCPY(buf + offset + 13, &invalid_digit, sizeof(invalid_digit));
+        break;
+      }
+    }
+    ObInvIdxAggInfo decoded;
+    ASSERT_EQ(OB_SUCCESS, decoded.set(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, 42));
+    int64_t pos = offset;
+    EXPECT_EQ(expected_ret, ObInvIdxAggInfoSerializer::deserialize(buf, length, pos, decoded));
+    EXPECT_EQ(offset, pos);
+    uint64_t value = 0;
+    ASSERT_EQ(OB_SUCCESS, decoded.get(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, value));
+    EXPECT_EQ(42, value);
+  }
+}
+
+TEST_F(InvIdxAggDataEncoderTest, index_row_protocol_invalid_arguments_and_values)
+{
+  ObInvIdxAggInfo stats;
+  ASSERT_EQ(OB_SUCCESS, stats.set(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, 7));
+  char buf[256];
+  MEMSET(buf, 0x5a, sizeof(buf));
+  for (const int64_t initial : {-1L, 257L, INT64_MAX}) {
+    int64_t pos = initial;
+    EXPECT_EQ(OB_INVALID_ARGUMENT, ObInvIdxAggInfoSerializer::deserialize(buf, sizeof(buf), pos, stats));
+    EXPECT_EQ(initial, pos);
+    EXPECT_EQ(OB_INVALID_ARGUMENT, ObInvIdxAggInfoSerializer::serialize(stats, buf, sizeof(buf), pos));
+    EXPECT_EQ(initial, pos);
+  }
+  int64_t pos = 0;
+  EXPECT_EQ(OB_INVALID_ARGUMENT, ObInvIdxAggInfoSerializer::deserialize(nullptr, 1, pos, stats));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, ObInvIdxAggInfoSerializer::serialize(stats, nullptr, 1, pos));
+  EXPECT_EQ(0, pos);
+  common::ObArenaAllocator allocator;
+  for (const char *input : {"-1", "0.5"}) {
+    common::number::ObNumber value;
+    ASSERT_EQ(OB_SUCCESS, value.from(input, allocator));
+    ASSERT_EQ(OB_SUCCESS, stats.set(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, value));
+    int64_t size = 42;
+    EXPECT_EQ(OB_INVALID_ARGUMENT, ObInvIdxAggInfoSerializer::get_serialize_size(stats, size));
+    EXPECT_EQ(42, size);
+    EXPECT_EQ(OB_INVALID_ARGUMENT, ObInvIdxAggInfoSerializer::serialize(stats, buf, sizeof(buf), pos));
+    EXPECT_EQ(0, pos);
+  }
+  for (const char byte : buf) {
+    EXPECT_EQ(0x5a, byte);
+  }
+}
+
+TEST_F(InvIdxAggDataEncoderTest, index_row_protocol_feeds_parent_aggregation)
+{
+  ObInvIdxAggregator aggregator;
+  const uint64_t lengths[] = {7, 100, 24};
+  for (const uint64_t length : lengths) {
+    ObInvIdxAggInfo info;
+    ASSERT_EQ(OB_SUCCESS, info.set(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, length));
+    char buf[128];
+    int64_t size = 0;
+    ASSERT_EQ(OB_SUCCESS, ObInvIdxAggInfoSerializer::serialize(info, buf, sizeof(buf), size));
+    ObIndexBlockRowDesc row;
+    row.agg_type_ = ObIndexRowAggType::INVERTED_INDEX_AGG;
+    row.is_data_block_ = false;
+    row.row_count_ = 1;
+    row.inverted_index_agg_ = {buf, size};
+    ASSERT_EQ(OB_SUCCESS, aggregator.eval(row));
+  }
+  common::ObArenaAllocator allocator;
+  ObIndexBlockRowDesc parent;
+  ASSERT_EQ(OB_SUCCESS, aggregator.fill_row_desc(parent, allocator));
+  ObInvIdxAggInfo summary;
+  int64_t pos = 0;
+  ASSERT_EQ(OB_SUCCESS, ObInvIdxAggInfoSerializer::deserialize(
+      parent.inverted_index_agg_.buf_, parent.inverted_index_agg_.size_, pos, summary));
+  uint64_t actual = 0;
+  ASSERT_EQ(OB_SUCCESS, summary.get(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, actual));
+  EXPECT_EQ(131, actual);
+}
+
+TEST_F(InvIdxAggDataEncoderTest, invalid_stat_id_preserves_values)
+{
+  ObInvIdxAggInfo stats;
+  uint64_t length = 42;
+  ASSERT_EQ(OB_ENTRY_NOT_EXIST, stats.get(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, length));
+  ASSERT_EQ(42, length);
+  ASSERT_EQ(OB_SUCCESS, stats.set(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, 100));
+  for (const auto stat : {ObInvIdxBM25Stat::MAX_STAT,
+                         static_cast<ObInvIdxBM25Stat>(64),
+                         static_cast<ObInvIdxBM25Stat>(255)}) {
+    ASSERT_EQ(OB_INVALID_ARGUMENT, stats.set(stat, 200));
+    ASSERT_EQ(OB_INVALID_ARGUMENT, stats.get(stat, length));
+    ASSERT_EQ(42, length);
+  }
+  ASSERT_EQ(OB_SUCCESS, stats.get(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, length));
+  ASSERT_EQ(100, length);
+}
+
 TEST_F(InvIdxAggDataEncoderTest, test_single_block)
 {
   common::ObArenaAllocator allocator(common::ObModIds::TEST);
@@ -360,6 +630,190 @@ TEST_F(InvIdxAggDataEncoderTest, test_total_size_overflow)
   set_meta(meta, 0, 1, 1, 2, 1, frontier_pairs);
   ASSERT_EQ(OB_SUCCESS, metas.push_back(meta));
   ASSERT_EQ(OB_SIZE_OVERFLOW, ObInvIdxAggDataEncoder::build(allocator, 64, 16, metas, buf, buf_size));
+}
+
+TEST_F(InvIdxAggDataEncoderTest, total_length_reads_fixed_entries_only)
+{
+  char buf[sizeof(ObInvIdxAggDataHeader) + 2 * sizeof(ObInvIdxAggDataEntry)] = {};
+  auto *header = reinterpret_cast<ObInvIdxAggDataHeader *>(buf);
+  header->version_ = ObInvIdxAggDataHeader::VERSION;
+  header->logical_block_count_ = 2;
+  header->total_size_ = sizeof(buf);
+  auto *entries = reinterpret_cast<ObInvIdxAggDataEntry *>(buf + sizeof(*header));
+  entries[0].total_doc_length_ = 11;
+  entries[1].total_doc_length_ = 19;
+  uint64_t length = 0;
+  ASSERT_EQ(OB_SUCCESS, ObInvIdxAggDataDecoder::get_total_doc_length(buf, sizeof(buf), length));
+  ASSERT_EQ(30, length);
+  entries[0].total_doc_length_ = UINT64_MAX;
+  ASSERT_EQ(OB_SIZE_OVERFLOW, ObInvIdxAggDataDecoder::get_total_doc_length(buf, sizeof(buf), length));
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ObInvIdxAggDataDecoder::get_total_doc_length(buf, sizeof(buf) - 1, length));
+  header->version_ = ObInvIdxAggDataHeader::VERSION + 1;
+  ASSERT_EQ(OB_VERSION_NOT_MATCH, ObInvIdxAggDataDecoder::get_total_doc_length(buf, sizeof(buf), length));
+}
+
+
+TEST_F(InvIdxAggDataEncoderTest, macro_summary_and_table_merge_have_separate_scopes)
+{
+  common::ObArenaAllocator allocator;
+  ObSSTableIndexBuilder builder(false /*use_double_write_buffer*/);
+  builder.set_is_async_index(true);
+  const uint64_t lengths[] = {20, 80};
+  for (int64_t i = 0; i < ARRAYSIZEOF(lengths); ++i) {
+    ObInvIdxStatsMeta stats;
+    stats.index_type_ = INV_IDX_TYPE_SEARCH_TEXT;
+    stats.has_relevance_params_ = true;
+    stats.doc_id_obj_meta_.set_uint64();
+    stats.min_doc_id_ = i + 1;
+    stats.max_doc_id_ = i + 1;
+    stats.total_doc_length_ = lengths[i];
+    ObInvMacroMeta macro;
+    ASSERT_EQ(OB_SUCCESS, macro.init(stats));
+    char buf[256];
+    int64_t pos = 0;
+    ASSERT_EQ(OB_SUCCESS, macro.serialize(buf, sizeof(buf), pos));
+    ASSERT_EQ(macro.get_serialize_size(), pos);
+    ObDataMacroBlockMeta macro_meta;
+    macro_meta.val_.row_store_type_ = INV_IDX_ROW_STORE;
+    macro_meta.val_.agg_row_buf_ = buf;
+    macro_meta.val_.agg_row_len_ = pos;
+    ObIndexBlockRowDesc row_desc;
+    ObInvMacroMeta decoded_macro;
+    int64_t macro_pos = 0;
+    ASSERT_EQ(OB_SUCCESS, decoded_macro.deserialize(
+        macro_meta.val_.agg_row_buf_, macro_meta.val_.agg_row_len_, macro_pos));
+    ObInvIdxAggInfo summary;
+    ASSERT_EQ(OB_SUCCESS, ObInvIdxAggregator::get_summary_from_macro(decoded_macro, summary));
+    ASSERT_EQ(OB_SUCCESS, ObInvIdxAggregator::fill_row_desc(summary, row_desc, allocator));
+    ASSERT_EQ(OB_SUCCESS, builder.merge_macro_inv_meta(decoded_macro));
+    ASSERT_EQ(ObIndexRowAggType::INVERTED_INDEX_AGG, row_desc.agg_type_);
+    ObInvIdxAggInfo decoded;
+    int64_t read_pos = 0;
+    ASSERT_EQ(OB_SUCCESS, ObInvIdxAggInfoSerializer::deserialize(row_desc.inverted_index_agg_.buf_,
+        row_desc.inverted_index_agg_.size_, read_pos, decoded));
+    ASSERT_EQ(row_desc.inverted_index_agg_.size_, read_pos);
+    uint64_t length = 0;
+    ASSERT_EQ(OB_SUCCESS, decoded.get(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, length));
+    EXPECT_EQ(lengths[i], length);
+
+    // Extracting this macro's summary must not merge it into the SSTable again.
+    ObIndexBlockRowDesc standalone;
+    ASSERT_EQ(OB_SUCCESS, ObInvIdxAggregator::get_summary_from_macro(decoded_macro, summary));
+    ASSERT_EQ(OB_SUCCESS, ObInvIdxAggregator::fill_row_desc(summary, standalone, allocator));
+    // Neither the output carrier nor its bytes may borrow the macro's wire buffer.
+    MEMSET(buf, 0xa5, sizeof(buf));
+    read_pos = 0;
+    ASSERT_EQ(OB_SUCCESS, ObInvIdxAggInfoSerializer::deserialize(standalone.inverted_index_agg_.buf_,
+        standalone.inverted_index_agg_.size_, read_pos, decoded));
+    ASSERT_EQ(standalone.inverted_index_agg_.size_, read_pos);
+    ASSERT_EQ(OB_SUCCESS, decoded.get(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, length));
+    EXPECT_EQ(lengths[i], length);
+  }
+  EXPECT_EQ(100u, builder.get_inv_meta().get_stats().total_doc_length_);
+  EXPECT_EQ(1u, builder.get_inv_meta().get_stats().min_doc_id_);
+  EXPECT_EQ(2u, builder.get_inv_meta().get_stats().max_doc_id_);
+}
+
+TEST_F(InvIdxAggDataEncoderTest, fts_macro_writes_number_summary)
+{
+  common::ObArenaAllocator allocator;
+  ObInvIdxStatsMeta stats;
+  stats.index_type_ = INV_IDX_TYPE_FTS;
+  stats.has_relevance_params_ = true;
+  stats.doc_id_obj_meta_.set_uint64();
+  stats.min_doc_id_ = stats.max_doc_id_ = 1;
+  stats.total_doc_length_ = 20;
+  ObInvMacroMeta macro;
+  ASSERT_EQ(OB_SUCCESS, macro.init(stats));
+  char buf[256];
+  int64_t pos = 0;
+  ASSERT_EQ(OB_SUCCESS, macro.serialize(buf, sizeof(buf), pos));
+  ObDataMacroBlockMeta macro_meta;
+  macro_meta.val_.row_store_type_ = INV_IDX_ROW_STORE;
+  macro_meta.val_.agg_row_buf_ = buf;
+  macro_meta.val_.agg_row_len_ = pos;
+  ObSSTableIndexBuilder builder(false /*use_double_write_buffer*/);
+  builder.set_is_async_index(true);
+  ObIndexBlockRowDesc row_desc;
+  ObInvMacroMeta decoded_macro;
+  int64_t macro_pos = 0;
+  ASSERT_EQ(OB_SUCCESS, decoded_macro.deserialize(
+      macro_meta.val_.agg_row_buf_, macro_meta.val_.agg_row_len_, macro_pos));
+  ObInvIdxAggInfo summary;
+  ASSERT_EQ(OB_SUCCESS, ObInvIdxAggregator::get_summary_from_macro(decoded_macro, summary));
+  ASSERT_EQ(OB_SUCCESS, ObInvIdxAggregator::fill_row_desc(summary, row_desc, allocator));
+  ASSERT_EQ(OB_SUCCESS, builder.merge_macro_inv_meta(decoded_macro));
+  EXPECT_EQ(ObIndexRowAggType::INVERTED_INDEX_AGG, row_desc.agg_type_);
+  ObInvIdxAggInfo decoded_summary;
+  pos = 0;
+  ASSERT_EQ(OB_SUCCESS, ObInvIdxAggInfoSerializer::deserialize(
+      row_desc.inverted_index_agg_.buf_, row_desc.inverted_index_agg_.size_, pos, decoded_summary));
+  uint64_t length = 0;
+  ASSERT_EQ(OB_SUCCESS, decoded_summary.get(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, length));
+  EXPECT_EQ(20u, length);
+  EXPECT_EQ(20u, builder.get_inv_meta().get_stats().total_doc_length_);
+
+}
+
+TEST_F(InvIdxAggDataEncoderTest, both_index_types_preserve_number_summaries)
+{
+  common::ObArenaAllocator allocator;
+  for (const auto index_type : {INV_IDX_TYPE_FTS, INV_IDX_TYPE_SEARCH_TEXT}) {
+    SCOPED_TRACE(static_cast<int>(index_type));
+    ObInvIdxAggregator aggregator;
+    for (const uint64_t length : {UINT64_MAX, uint64_t(1)}) {
+      ObInvIdxStatsMeta stats;
+      stats.index_type_ = index_type;
+      stats.has_relevance_params_ = true;
+      stats.doc_id_obj_meta_.set_uint64();
+      stats.min_doc_id_ = stats.max_doc_id_ = 1;
+      stats.total_doc_length_ = length;
+      ObInvMacroMeta macro;
+      ASSERT_EQ(OB_SUCCESS, macro.init(stats));
+      ObInvIdxAggInfo summary;
+      ObIndexBlockRowDesc row;
+      ASSERT_EQ(OB_SUCCESS, ObInvIdxAggregator::get_summary_from_macro(macro, summary));
+      ASSERT_EQ(OB_SUCCESS, ObInvIdxAggregator::fill_row_desc(summary, row, allocator));
+      row.row_count_ = 1;
+      row.is_data_block_ = false;
+      ASSERT_EQ(OB_SUCCESS, aggregator.eval(row));
+    }
+    ObIndexBlockRowDesc parent;
+    ASSERT_EQ(OB_SUCCESS, aggregator.fill_row_desc(parent, allocator));
+    ObInvIdxAggInfo decoded;
+    int64_t pos = 0;
+    ASSERT_EQ(OB_SUCCESS, ObInvIdxAggInfoSerializer::deserialize(
+        parent.inverted_index_agg_.buf_, parent.inverted_index_agg_.size_, pos, decoded));
+    common::number::ObNumber length, expected;
+    ASSERT_EQ(OB_SUCCESS, decoded.get(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, length));
+    ASSERT_EQ(OB_SUCCESS, expected.from("18446744073709551616", allocator));
+    EXPECT_EQ(0, expected.compare(length));
+  }
+}
+
+TEST_F(InvIdxAggDataEncoderTest, stats_empty_write_preserves_format_and_failure_state)
+{
+  ObInvIdxStatsMeta stats;
+  stats.index_type_ = INV_IDX_TYPE_SEARCH_TEXT;
+  stats.has_relevance_params_ = true;
+  stats.has_position_list_ = true;
+  stats.doc_id_obj_meta_.set_uint64();
+  stats.min_doc_id_ = 1;
+  stats.max_doc_id_ = 2;
+  stats.total_doc_length_ = 20;
+  ObInvIdxStatsMeta meta = stats;
+  ASSERT_EQ(OB_SUCCESS, meta.init_empty_for_write(meta));
+  EXPECT_TRUE(meta.is_valid());
+  EXPECT_TRUE(meta.is_empty_range());
+  EXPECT_TRUE(meta.has_position_list_);
+  EXPECT_EQ(0u, meta.total_doc_length_);
+
+  stats.has_nested_key_ = true;
+  meta = stats;
+  EXPECT_EQ(OB_ERR_UNEXPECTED, meta.init_empty_for_write(meta));
+  EXPECT_EQ(1u, meta.min_doc_id_);
+  EXPECT_EQ(2u, meta.max_doc_id_);
+  EXPECT_EQ(20u, meta.total_doc_length_);
 }
 
 } // namespace blocksstable

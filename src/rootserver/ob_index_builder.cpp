@@ -542,7 +542,9 @@ int ObIndexBuilder::drop_index(const ObDropIndexArg &const_arg, obrpc::ObDropInd
                     && new_index_schemas.count() != search_index_schema_count)
                 || OB_UNLIKELY(!arg.is_inner_ && index_table_schema->is_async_search_def_index()
                     && new_index_schemas.count() != search_index_schema_count
-                    && new_index_schemas.count() != search_index_schema_count + 1)
+                    && new_index_schemas.count() != search_index_schema_count + 1
+                    && new_index_schemas.count() != search_index_schema_count + 2
+                    && new_index_schemas.count() != search_index_schema_count + 3)
                 || OB_UNLIKELY(!arg.is_inner_ && index_table_schema->is_vec_spiv_index_aux() && new_index_schemas.count() != spiv_aux_index_schema_count)) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("unexpected error, invalid new index schema count", K(ret),
@@ -1225,7 +1227,9 @@ int ObIndexBuilder::recognize_search_index_schemas(
       int64_t &index_ith,
       int64_t &def_index_ith,
       int64_t &data_index_ith,
-      int64_t &async_delete_ith)
+      int64_t &async_delete_ith,
+      int64_t &text_match_ith,
+      int64_t &text_match_phrase_ith)
 {
   int ret = OB_SUCCESS;
   UNUSED(is_parent_task_dropping_search_index);
@@ -1233,8 +1237,10 @@ int ObIndexBuilder::recognize_search_index_schemas(
   def_index_ith = -1;
   data_index_ith = -1;
   async_delete_ith = -1;
+  text_match_ith = -1;
+  text_match_phrase_ith = -1;
 
-  if (OB_UNLIKELY(index_schemas.count() < 1 || index_schemas.count() > 3)) {
+  if (OB_UNLIKELY(index_schemas.count() < 1 || index_schemas.count() > 5)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", K(ret), K(index_schemas));
   } else {
@@ -1253,6 +1259,20 @@ int ObIndexBuilder::recognize_search_index_schemas(
           LOG_WARN("unexpected error, there are multiple data search index tables", K(ret), K(index_schemas));
         } else {
           data_index_ith = i;
+        }
+      } else if (index_schemas.at(i).is_async_search_text_match_index()) {
+        if (OB_UNLIKELY(-1 != text_match_ith)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("unexpected error, there are multiple text match search index tables", K(ret), K(index_schemas));
+        } else {
+          text_match_ith = i;
+        }
+      } else if (index_schemas.at(i).is_async_search_text_match_phrase_index()) {
+        if (OB_UNLIKELY(-1 != text_match_phrase_ith)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("unexpected error, there are multiple text match phrase search index tables", K(ret), K(index_schemas));
+        } else {
+          text_match_phrase_ith = i;
         }
       } else if (index_schemas.at(i).is_async_delete_index()) {
         if (OB_UNLIKELY(-1 != async_delete_ith)) {
@@ -1441,6 +1461,8 @@ int ObIndexBuilder::submit_drop_index_task(ObMySQLTransaction &trans,
   int64_t def_index_ith = -1;
   int64_t data_index_ith = -1;
   int64_t async_delete_ith = -1;
+  int64_t text_match_ith = -1;
+  int64_t text_match_phrase_ith = -1;
 
   const int64_t NORMAL_INDEX_COUNT = 1;
   const int64_t FTS_INDEX_COUNT = 4;
@@ -1455,7 +1477,6 @@ int ObIndexBuilder::submit_drop_index_task(ObMySQLTransaction &trans,
   const int64_t VEC_SPIV_INDEX_COUNT = 3;
   const int64_t VEC_SPIV_INDEX_COUNT_WITHOUT_DOCID = 1;
   const int64_t SEARCH_INDEX_COUNT = 2;
-  const int64_t ASYNC_SEARCH_INDEX_COUNT = 3;
   const int64_t USER_ASYNC_INDEX_SCHEMA_COUNT = 2;
   const int64_t USER_ASYNC_INDEX_SCHEMA_COUNT_WITHOUT_SHARED_DELETE = 1;
   const bool should_recognize_search_index_schemas = arg.is_parent_task_dropping_search_index_
@@ -1472,8 +1493,8 @@ int ObIndexBuilder::submit_drop_index_task(ObMySQLTransaction &trans,
                   !arg.is_parent_task_dropping_multivalue_index_ && (index_schemas.count() != MULTIVALUE_INDEX_COUNT && 
                                                                      index_schemas.count() != MULTIVALUE_INDEX_COUNT_WITHOUT_DOCID) &&  
                   !arg.is_parent_task_dropping_spiv_index_ && (index_schemas.count() != SEARCH_INDEX_COUNT) &&
-                  !arg.is_parent_task_dropping_search_index_ && (index_schemas.count() != SEARCH_INDEX_COUNT
-                                                                  && index_schemas.count() != ASYNC_SEARCH_INDEX_COUNT) &&
+                  !arg.is_parent_task_dropping_search_index_ && !(should_recognize_search_index_schemas
+                      && index_schemas.count() >= 1 && index_schemas.count() <= 5) &&
                   !arg.is_parent_task_dropping_user_async_index_
                       && (index_schemas.count() != USER_ASYNC_INDEX_SCHEMA_COUNT
                           && index_schemas.count() != USER_ASYNC_INDEX_SCHEMA_COUNT_WITHOUT_SHARED_DELETE) &&
@@ -1498,7 +1519,8 @@ int ObIndexBuilder::submit_drop_index_task(ObMySQLTransaction &trans,
     LOG_WARN("fail to recognize index and aux table from schema array", K(ret));
   } else if (should_recognize_search_index_schemas
              && OB_FAIL(recognize_search_index_schemas(index_schemas, arg.is_parent_task_dropping_search_index_,
-                                                        index_ith, def_index_ith, data_index_ith, async_delete_ith))) {
+                                                        index_ith, def_index_ith, data_index_ith, async_delete_ith,
+                                                        text_match_ith, text_match_phrase_ith))) {
     LOG_WARN("fail to recognize search index from schema array", K(ret));
   } else if (should_recognize_user_async_index_schemas
              && OB_FAIL(recognize_user_async_index_schemas(index_schemas, index_ith, async_delete_ith))) {
@@ -1556,7 +1578,7 @@ int ObIndexBuilder::submit_drop_index_task(ObMySQLTransaction &trans,
     } else if (is_drop_search_index) {
       if (OB_FAIL(submit_drop_search_index_task_(arg, data_schema, index_schema, index_schemas,
               inc_data_tablet_ids, del_data_tablet_ids, allocator, trans, task_record,
-              def_index_ith, data_index_ith, async_delete_ith))) {
+              def_index_ith, data_index_ith, async_delete_ith, text_match_ith, text_match_phrase_ith))) {
         LOG_WARN("fail to submit drop search index task", K(ret));
       }
     } else {
@@ -1816,7 +1838,9 @@ int ObIndexBuilder::submit_drop_search_index_task_(
     ObDDLTaskRecord &task_record,
     const int64_t def_index_ith,
     const int64_t data_index_ith,
-    const int64_t async_delete_ith)
+    const int64_t async_delete_ith,
+    const int64_t text_match_ith,
+    const int64_t text_match_phrase_ith)
 {
   int ret = OB_SUCCESS;
   ObTableLockOwnerID owner_id;
@@ -1834,6 +1858,8 @@ int ObIndexBuilder::submit_drop_search_index_task_(
                              &arg);
   param.def_index_schema_ = (-1 == def_index_ith) ? nullptr : &(index_schemas.at(def_index_ith));
   param.data_index_schema_ = (-1 == data_index_ith) ? nullptr : &(index_schemas.at(data_index_ith));
+  param.search_text_match_schema_ = (-1 == text_match_ith) ? nullptr : &(index_schemas.at(text_match_ith));
+  param.search_text_match_phrase_schema_ = (-1 == text_match_phrase_ith) ? nullptr : &(index_schemas.at(text_match_phrase_ith));
   param.async_delete_schema_ = (-1 == async_delete_ith) ? nullptr : &(index_schemas.at(async_delete_ith));
   if (OB_FAIL(ObSysDDLSchedulerUtil::create_ddl_task(param, trans, task_record))) {
     LOG_WARN("fail to create drop fts index task", K(ret), K(param));
@@ -2498,6 +2524,8 @@ int ObIndexBuilder::generate_schema(
                    K(ret), K(data_schema));
           LOG_USER_ERROR(OB_NOT_SUPPORTED,
                          "async DISK_BBQ index on table with clustering key is");
+        } else if (OB_FAIL(ObSearchIndexBuilderUtil::check_fulltext_data_version(arg, tenant_data_version))) {
+          LOG_WARN("tenant data version does not support JSON FULLTEXT search index", K(ret));
         } else if (!data_schema.is_heap_organized_table()) {
           ret = OB_NOT_SUPPORTED;
           LOG_WARN("async index only supported on heap table", K(ret));

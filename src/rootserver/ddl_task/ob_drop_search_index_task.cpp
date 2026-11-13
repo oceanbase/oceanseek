@@ -23,9 +23,13 @@ ObDropSearchIndexTask::ObDropSearchIndexTask()
     search_def_index_(),
     search_data_index_(),
     async_delete_(),
+    search_text_match_index_(),
+    search_text_match_phrase_index_(),
     drop_def_index_finish_(false),
     drop_data_index_finish_(false),
-    drop_async_delete_index_finish_(false)
+    drop_async_delete_index_finish_(false),
+    drop_text_match_index_finish_(false),
+    drop_text_match_phrase_index_finish_(false)
 {
 }
 
@@ -41,6 +45,8 @@ int ObDropSearchIndexTask::init(
     const ObFTSDDLChildTaskInfo &search_def_index,
     const ObFTSDDLChildTaskInfo &search_data_index,
     const ObFTSDDLChildTaskInfo &async_delete,
+    const ObFTSDDLChildTaskInfo &search_text_match_index,
+    const ObFTSDDLChildTaskInfo &search_text_match_phrase_index,
     const ObString &ddl_stmt_str,
     const int64_t schema_version,
     const int64_t consumer_group_id,
@@ -63,6 +69,10 @@ int ObDropSearchIndexTask::init(
     LOG_WARN("fail to deep copy from other", K(ret), K(search_data_index));
   } else if (OB_FAIL(async_delete_.deep_copy_from_other(async_delete, allocator_))) {
     LOG_WARN("fail to deep copy async delete info", K(ret), K(async_delete));
+  } else if (OB_FAIL(search_text_match_index_.deep_copy_from_other(search_text_match_index, allocator_))) {
+    LOG_WARN("failed to copy search text match child", K(ret), K(search_text_match_index));
+  } else if (OB_FAIL(search_text_match_phrase_index_.deep_copy_from_other(search_text_match_phrase_index, allocator_))) {
+    LOG_WARN("failed to copy search text match phrase child", K(ret), K(search_text_match_phrase_index));
   } else if (OB_FAIL(set_ddl_stmt_str(ddl_stmt_str))) {
     LOG_WARN("fail to deep copy drop index arg", K(ret));
   } else {
@@ -75,9 +85,9 @@ int ObDropSearchIndexTask::init(
     task_id_ = task_id;
     parent_task_id_ = 0; // no parent task
     consumer_group_id_ = consumer_group_id;
-    task_version_ = is_async_search_task()
-        ? OB_DROP_ASYNC_SEARCH_INDEX_TASK_VERSION
-        : OB_DROP_SEARCH_INDEX_TASK_VERSION;
+    task_version_ = search_text_match_index_.is_valid() || search_text_match_phrase_index_.is_valid()
+        ? OB_DROP_ASYNC_SEARCH_INDEX_TASK_VERSION_V3
+        : (is_async_search_task() ? OB_DROP_ASYNC_SEARCH_INDEX_TASK_VERSION : OB_DROP_SEARCH_INDEX_TASK_VERSION);
     dst_tenant_id_ = tenant_id;
     dst_schema_version_ = schema_version;
     is_inited_ = true;
@@ -172,6 +182,8 @@ int ObDropSearchIndexTask::serialize_params_to_message(char *buf, const int64_t 
   int8_t drop_def_index_finish = static_cast<int8_t>(drop_def_index_finish_);
   int8_t drop_data_index_finish = static_cast<int8_t>(drop_data_index_finish_);
   int8_t drop_async_delete_index_finish = static_cast<int8_t>(drop_async_delete_index_finish_);
+  int8_t drop_text_match_index_finish = static_cast<int8_t>(drop_text_match_index_finish_);
+  int8_t drop_text_match_phrase_index_finish = static_cast<int8_t>(drop_text_match_phrase_index_finish_);
   if (OB_UNLIKELY(nullptr == buf || buf_size <= 0)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", K(ret), KP(buf), K(buf_size));
@@ -184,6 +196,12 @@ int ObDropSearchIndexTask::serialize_params_to_message(char *buf, const int64_t 
   } else if (task_version_ >= OB_DROP_ASYNC_SEARCH_INDEX_TASK_VERSION
              && OB_FAIL(async_delete_.serialize(buf, buf_size, pos))) {
     LOG_WARN("fail to serialize async delete table info", K(ret), K(async_delete_));
+  } else if (task_version_ >= OB_DROP_ASYNC_SEARCH_INDEX_TASK_VERSION_V3
+             && OB_FAIL(search_text_match_index_.serialize(buf, buf_size, pos))) {
+    LOG_WARN("failed to serialize search text match child", K(ret));
+  } else if (task_version_ >= OB_DROP_ASYNC_SEARCH_INDEX_TASK_VERSION_V3
+             && OB_FAIL(search_text_match_phrase_index_.serialize(buf, buf_size, pos))) {
+    LOG_WARN("failed to serialize search text match phrase child", K(ret));
   } else if (OB_FAIL(ddl_stmt_str_.serialize(buf, buf_size, pos))) {
     LOG_WARN("fail to serialize ddl stmt string", K(ret));
   } else if (OB_FAIL(serialization::encode_i8(buf,
@@ -202,6 +220,12 @@ int ObDropSearchIndexTask::serialize_params_to_message(char *buf, const int64_t 
                                               pos,
                                               drop_async_delete_index_finish))) {
     LOG_WARN("fail to serialize drop async delete index finish", K(ret));
+  } else if (task_version_ >= OB_DROP_ASYNC_SEARCH_INDEX_TASK_VERSION_V3
+             && OB_FAIL(serialization::encode_i8(buf, buf_size, pos, drop_text_match_index_finish))) {
+    LOG_WARN("fail to serialize drop text match index finish", K(ret));
+  } else if (task_version_ >= OB_DROP_ASYNC_SEARCH_INDEX_TASK_VERSION_V3
+             && OB_FAIL(serialization::encode_i8(buf, buf_size, pos, drop_text_match_phrase_index_finish))) {
+    LOG_WARN("fail to serialize drop text match phrase index finish", K(ret));
   }
   return ret;
 }
@@ -218,6 +242,8 @@ int ObDropSearchIndexTask::deserialize_params_from_message(
   int8_t drop_def_index_finish = 0;
   int8_t drop_data_index_finish = 0;
   int8_t drop_async_delete_index_finish = 0;
+  int8_t drop_text_match_index_finish = 0;
+  int8_t drop_text_match_phrase_index_finish = 0;
   if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id) || nullptr == buf || buf_size <= 0)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", K(ret), K(tenant_id), KP(buf), K(buf_size));
@@ -237,6 +263,18 @@ int ObDropSearchIndexTask::deserialize_params_from_message(
   } else if (task_version_ >= OB_DROP_ASYNC_SEARCH_INDEX_TASK_VERSION
              && OB_FAIL(async_delete_.deep_copy_from_other(tmp_info, allocator_))) {
     LOG_WARN("fail to deep copy async delete info", K(ret), K(tmp_info));
+  } else if (task_version_ >= OB_DROP_ASYNC_SEARCH_INDEX_TASK_VERSION_V3
+             && OB_FAIL(tmp_info.deserialize(buf, buf_size, pos))) {
+    LOG_WARN("failed to deserialize search text match child", K(ret));
+  } else if (task_version_ >= OB_DROP_ASYNC_SEARCH_INDEX_TASK_VERSION_V3
+             && OB_FAIL(search_text_match_index_.deep_copy_from_other(tmp_info, allocator_))) {
+    LOG_WARN("failed to restore search text match child", K(ret));
+  } else if (task_version_ >= OB_DROP_ASYNC_SEARCH_INDEX_TASK_VERSION_V3
+             && OB_FAIL(tmp_info.deserialize(buf, buf_size, pos))) {
+    LOG_WARN("failed to deserialize search text match phrase child", K(ret));
+  } else if (task_version_ >= OB_DROP_ASYNC_SEARCH_INDEX_TASK_VERSION_V3
+             && OB_FAIL(search_text_match_phrase_index_.deep_copy_from_other(tmp_info, allocator_))) {
+    LOG_WARN("failed to restore search text match phrase child", K(ret));
   } else if (OB_UNLIKELY(pos >= buf_size)) {
     // The end of the message has been reached. It is an old version message without drop index arg.
     // just skip.
@@ -263,10 +301,18 @@ int ObDropSearchIndexTask::deserialize_params_from_message(
                                               pos,
                                               &drop_async_delete_index_finish))) {
       LOG_WARN("fail to deserialize drop async delete index finish", K(ret));
+  } else if (task_version_ >= OB_DROP_ASYNC_SEARCH_INDEX_TASK_VERSION_V3
+             && OB_FAIL(serialization::decode_i8(buf, buf_size, pos, &drop_text_match_index_finish))) {
+    LOG_WARN("fail to deserialize drop text match index finish", K(ret));
+  } else if (task_version_ >= OB_DROP_ASYNC_SEARCH_INDEX_TASK_VERSION_V3
+             && OB_FAIL(serialization::decode_i8(buf, buf_size, pos, &drop_text_match_phrase_index_finish))) {
+    LOG_WARN("fail to deserialize drop text match phrase index finish", K(ret));
   } else {
     drop_def_index_finish_ = static_cast<bool>(drop_def_index_finish);
     drop_data_index_finish_ = static_cast<bool>(drop_data_index_finish);
     drop_async_delete_index_finish_ = static_cast<bool>(drop_async_delete_index_finish);
+    drop_text_match_index_finish_ = static_cast<bool>(drop_text_match_index_finish);
+    drop_text_match_phrase_index_finish_ = static_cast<bool>(drop_text_match_phrase_index_finish);
   }
   return ret;
 }
@@ -276,16 +322,23 @@ int64_t ObDropSearchIndexTask::get_serialize_param_size() const
   int8_t drop_def_index_finish = static_cast<int8_t>(drop_def_index_finish_);
   int8_t drop_data_index_finish = static_cast<int8_t>(drop_data_index_finish_);
   int8_t drop_async_delete_index_finish = static_cast<int8_t>(drop_async_delete_index_finish_);
+  int8_t drop_text_match_index_finish = static_cast<int8_t>(drop_text_match_index_finish_);
+  int8_t drop_text_match_phrase_index_finish = static_cast<int8_t>(drop_text_match_phrase_index_finish_);
   return ObDDLTask::get_serialize_param_size()
        + search_def_index_.get_serialize_size()
        + search_data_index_.get_serialize_size()
        + (task_version_ >= OB_DROP_ASYNC_SEARCH_INDEX_TASK_VERSION
           ? async_delete_.get_serialize_size() : 0)
+       + (task_version_ >= OB_DROP_ASYNC_SEARCH_INDEX_TASK_VERSION_V3
+          ? search_text_match_index_.get_serialize_size() + search_text_match_phrase_index_.get_serialize_size() : 0)
        + ddl_stmt_str_.get_serialize_size()
        + serialization::encoded_length_i8(drop_def_index_finish)
        + serialization::encoded_length_i8(drop_data_index_finish)
        + (task_version_ >= OB_DROP_ASYNC_SEARCH_INDEX_TASK_VERSION
-          ? serialization::encoded_length_i8(drop_async_delete_index_finish) : 0);
+          ? serialization::encoded_length_i8(drop_async_delete_index_finish) : 0)
+       + (task_version_ >= OB_DROP_ASYNC_SEARCH_INDEX_TASK_VERSION_V3
+          ? serialization::encoded_length_i8(drop_text_match_index_finish)
+            + serialization::encoded_length_i8(drop_text_match_phrase_index_finish) : 0);
 }
 
 int ObDropSearchIndexTask::update_task_message(common::ObISQLClient &proxy)
@@ -318,6 +371,8 @@ int ObDropSearchIndexTask::check_switch_succ()
   bool is_def_index_exist = false;
   bool is_data_index_exist = false;
   bool is_async_delete_exist = false;
+  bool is_text_match_index_exist = false;
+  bool is_text_match_phrase_index_exist = false;
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("hasn't initialized", K(ret));
@@ -341,13 +396,20 @@ int ObDropSearchIndexTask::check_switch_succ()
   } else if (search_data_index_.is_valid()
           && OB_FAIL(schema_guard.check_table_exist(tenant_id_, search_data_index_.table_id_, is_data_index_exist))) {
     LOG_WARN("fail to check table exist", K(ret), K(tenant_id_), K(search_data_index_));
+  } else if (search_text_match_index_.is_valid()
+          && OB_FAIL(schema_guard.check_table_exist(tenant_id_, search_text_match_index_.table_id_, is_text_match_index_exist))) {
+    LOG_WARN("fail to check table exist", K(ret), K(tenant_id_), K(search_text_match_index_));
+  } else if (search_text_match_phrase_index_.is_valid()
+          && OB_FAIL(schema_guard.check_table_exist(tenant_id_, search_text_match_phrase_index_.table_id_, is_text_match_phrase_index_exist))) {
+    LOG_WARN("fail to check table exist", K(ret), K(tenant_id_), K(search_text_match_phrase_index_));
   } else if (is_async_search_task() && !async_delete_.is_valid()) {
     // 共享表需要在当前 Def/Data 删除后进行第二阶段判断，未持久化该判断前不能提前成功。
     is_async_delete_exist = true;
   } else if (async_delete_.is_valid()
           && OB_FAIL(schema_guard.check_table_exist(tenant_id_, async_delete_.table_id_, is_async_delete_exist))) {
     LOG_WARN("fail to check async delete table exist", K(ret), K(tenant_id_), K(async_delete_));
-  } else if (!is_def_index_exist && !is_data_index_exist && !is_async_delete_exist) {
+  } else if (!is_def_index_exist && !is_data_index_exist && !is_async_delete_exist
+             && !is_text_match_index_exist && !is_text_match_phrase_index_exist) {
     task_status_ = ObDDLTaskStatus::SUCCESS;
   }
   return ret;
@@ -394,7 +456,15 @@ int ObDropSearchIndexTask::check_and_wait_finish(const share::ObDDLTaskStatus &n
     LOG_WARN("fail to get tenant schema guard", K(ret), K(tenant_id_));
   }
   if (OB_SUCC(ret)) {
-    if (!drop_data_index_finish_) {
+    if (!drop_text_match_index_finish_) {
+      if (OB_FAIL(send_and_wait_drop_index_task(search_text_match_index_, schema_guard, drop_text_match_index_finish_))) {
+        LOG_WARN("Failed to send and wait drop index task for search text match index", K(ret));
+      }
+    } else if (!drop_text_match_phrase_index_finish_) {
+      if (OB_FAIL(send_and_wait_drop_index_task(search_text_match_phrase_index_, schema_guard, drop_text_match_phrase_index_finish_))) {
+        LOG_WARN("Failed to send and wait drop index task for search text match phrase index", K(ret));
+      }
+    } else if (!drop_data_index_finish_) {
       if (OB_FAIL(send_and_wait_drop_index_task(search_data_index_, schema_guard, drop_data_index_finish_))) {
           LOG_WARN("Failed to send and wait drop index task for search data index", K(ret));
       }

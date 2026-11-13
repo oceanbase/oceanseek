@@ -12,6 +12,8 @@ namespace oceanbase
 namespace sql
 {
 
+
+
 int ObDASSortOpParam::get_children_ops(ObIArray<ObIDASSearchOp *> &children) const
 {
   int ret = OB_SUCCESS;
@@ -28,6 +30,7 @@ int ObDASSortOp::do_init(const ObIDASSearchOpParam &op_param)
   const ObDASScalarScanCtDef *scalar_ctdef = sort_op_param.get_scalar_ctdef();
   ObDASScalarScanRtDef *scalar_rtdef = sort_op_param.get_scalar_rtdef();
   unique_sort_ = sort_op_param.is_unique_sort();
+  const int64_t column_count = get_rowid_exprs().count();
   if (OB_ISNULL(sort_op_param.get_child())
              || OB_ISNULL(sort_op_param.get_scalar_ctdef())
              || OB_ISNULL(sort_op_param.get_scalar_rtdef())) {
@@ -47,23 +50,37 @@ int ObDASSortOp::do_init(const ObIDASSearchOpParam &op_param)
   }
   if (OB_FAIL(ret)) {
   } else if (OB_UNLIKELY(get_sort_rowid_exprs().count() < 1
-                         || get_sort_rowid_exprs().count() != get_rowid_exprs().count())) {
+                         || get_sort_rowid_exprs().count() != get_rowid_exprs().count()
+                         || (is_async_nested_scope(scope_)
+                             && (get_sort_rowid_exprs().count() != 2
+                                 || OB_ISNULL(get_sort_rowid_exprs().at(1)))))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected sort RowID output expression count", K(ret),
         "input_expr_count", get_sort_rowid_exprs().count(),
         "scope_expr_count", get_rowid_exprs().count());
-  } else if (OB_FAIL(create_rowid_store(max_batch_size(), rowid_store_))) {
-    LOG_WARN("failed to create rowid store", K(ret), K(max_batch_size()));
+  } else if (is_async_nested_scope(scope_)) {
+    if (OB_ISNULL(rowid_store_ = OB_NEWx(CompactRowIDStore, &ctx_allocator(), search_ctx_, scope_))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate sorted pair store", K(ret));
+    } else if (OB_FAIL(rowid_store_->init(max_batch_size()))) {
+      LOG_WARN("failed to initialize sorted pair store", K(ret));
+    }
+  } else {
+    if (OB_FAIL(create_rowid_store(max_batch_size(), rowid_store_))) {
+      LOG_WARN("failed to create rowid store", K(ret), K(max_batch_size()));
+    }
+  }
+  if (OB_FAIL(ret)) {
   } else if (OB_ISNULL(rowid_store_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected null rowid store", K(ret));
   } else if (FALSE_IT(rowid_store_iter_.init(rowid_store_))) {
-  } else if (OB_FAIL(sort_collations_.init(get_sort_rowid_exprs().count()))) {
+  } else if (OB_FAIL(sort_collations_.init(column_count))) {
     LOG_WARN("failed to init sort collations", K(ret));
-  } else if (OB_FAIL(sort_cmp_funcs_.init(get_sort_rowid_exprs().count()))) {
+  } else if (OB_FAIL(sort_cmp_funcs_.init(column_count))) {
     LOG_WARN("failed to init sort cmp funcs", K(ret));
   } else {
-    for (int64_t i = 0 ; OB_SUCC(ret) && i < get_sort_rowid_exprs().count(); ++i) {
+    for (int64_t i = 0 ; OB_SUCC(ret) && i < column_count; ++i) {
       ObExpr *expr = get_sort_rowid_exprs().at(i);
       if (OB_ISNULL(expr)) {
         ret = OB_ERR_UNEXPECTED;
@@ -96,11 +113,17 @@ int ObDASSortOp::do_init(const ObIDASSearchOpParam &op_param)
 int ObDASSortOp::do_open()
 {
   int ret = OB_SUCCESS;
+  reset_rowid_cursor();
   if (OB_ISNULL(input_op_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected scan op", K(ret));
   } else if (OB_FAIL(input_op_->open())) {
     LOG_WARN("failed to open sort input op", K(ret));
+  } else if (is_async_nested_scope(scope_) && nested_compare_bytes() > sizeof(uint64_t)
+      && OB_ISNULL(curr_nk_buf_ = static_cast<char *>(
+          ctx_allocator().alloc(nested_compare_bytes())))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate sorted nested key buffer", K(ret), K_(nesting_depth));
   } else {
     lib::ContextParam context_param;
     context_param.set_mem_attr(MTL_ID(), "DASSortOp", ObCtxIds::DEFAULT_CTX_ID).set_properties(lib::USE_TL_PAGE_OPTIONAL);
@@ -115,9 +138,7 @@ int ObDASSortOp::do_open()
       void *buf = nullptr;
       // For unique_sort_ (NESTED child-domain must_not required branch), use
       // ObUniqueSortImpl so that adjacent rows with equal sort key (= full rowid
-      // [doc_id, nested_key]) are collapsed inside the sort's get_next_batch. The
-      // virtual get_next_batch override dedups across batch boundaries via prev_row_,
-      // so the iteration layer no longer needs any hand-rolled dedup.
+      // [doc_id, nested_key]) are collapsed inside the sort's get_next_batch.
       const int64_t impl_size = unique_sort_ ? sizeof(ObUniqueSortImpl) : sizeof(ObSortOpImpl);
       if (OB_ISNULL(buf = allocator.alloc(impl_size))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -134,6 +155,8 @@ int ObDASSortOp::do_open()
                                           false,     // is local order
                                           false))) { // need rewind
         LOG_WARN("failed to init sort impl", K(ret));
+      } else {
+        is_first_nk_ = true;
       }
     }
   }
@@ -149,9 +172,8 @@ int ObDASSortOp::do_rescan()
   } else if (OB_FAIL(input_op_->rescan())) {
     LOG_WARN("failed to rescan sort input op", K(ret));
   } else {
-    // Reset sort_finished_ so do_sort() re-pulls the rescanned child on the next
-    // partition. Without this, the guard in do_next_rowid/do_advance_to skips
-    // do_sort(), the child scan is never pulled, and the partition yields 0 rows.
+    is_first_nk_ = true;
+    reset_rowid_cursor();
     sort_finished_ = false;
     sort_impl_->reuse();
     if (OB_NOT_NULL(rowid_store_)) {
@@ -173,6 +195,8 @@ int ObDASSortOp::do_rescan_segment(const common::ObNewVersionRange &range)
   } else if (OB_FAIL(input_op_->rescan_segment(range))) {
     LOG_WARN("failed to rescan sort child segment", K(ret), K(range));
   } else {
+    is_first_nk_ = true;
+    reset_rowid_cursor();
     sort_finished_ = false;
     sort_impl_->reuse();
     rowid_store_->reuse();
@@ -185,6 +209,11 @@ int ObDASSortOp::do_rescan_segment(const common::ObNewVersionRange &range)
 int ObDASSortOp::do_close()
 {
   int ret = OB_SUCCESS;
+  reset_rowid_cursor();
+  if (OB_NOT_NULL(curr_nk_buf_)) {
+    ctx_allocator().free(curr_nk_buf_);
+    curr_nk_buf_ = nullptr;
+  }
   if (OB_NOT_NULL(rowid_store_)) {
     rowid_store_->reset();
     rowid_store_iter_.reset();
@@ -200,10 +229,82 @@ int ObDASSortOp::do_close()
     DESTROY_CONTEXT(sort_memctx_);
     sort_memctx_ = nullptr;
   }
+  is_first_nk_ = true;
   return ret;
 }
 
 int ObDASSortOp::do_advance_to(const ObDASRowID &target, ObDASRowID &curr_id, double &score)
+{
+  int ret = OB_SUCCESS;
+  if (!is_async_nested_scope(scope_)) {
+    ret = advance_sorted_rowid(target, curr_id, score);
+  } else {
+    if (target.is_max() || curr_doc_id_.is_max()) {
+      ret = OB_ITER_END;
+    } else if (curr_doc_id_.is_normal()
+        && (target.is_min() || curr_doc_id_.get_uint64() >= target.get_uint64())) {
+      curr_id = curr_doc_id_;
+      score = is_scoring_ ? boost_weight_ : 0.0;
+    } else if (nested_input_end_) {
+      ret = OB_ITER_END;
+    } else if (OB_FAIL(advance_sorted_rowid(target, curr_id, score))) {
+    } else {
+      curr_doc_id_ = curr_id;
+      curr_nk_.set_min();
+      is_first_nk_ = true;
+    }
+    if (OB_ITER_END == ret) {
+      curr_doc_id_.set_max();
+      curr_nk_.set_max();
+    }
+  }
+  return ret;
+}
+
+int ObDASSortOp::do_advance_to(const ObDASNestedKey &target, ObDASNestedKey &curr_nk, double &score)
+{
+  int ret = OB_SUCCESS;
+  score = 0.0;
+  if (!is_async_nested_scope(scope_)) {
+    ret = OB_NOT_IMPLEMENT;
+  } else if (!curr_doc_id_.is_normal()) {
+    ret = OB_STATE_NOT_MATCH;
+  } else if (curr_nk_.is_max() || target.is_max()) {
+    ret = OB_ITER_END;
+  } else {
+    int cmp = 0;
+    if (OB_FAIL(compare_rowid(target, curr_nk_, cmp))) {
+      LOG_WARN("failed to compare nested keys", K(ret), K(target), K_(curr_nk));
+    } else if (curr_nk_.is_normal() && cmp <= 0) {
+      curr_nk = curr_nk_;
+    } else {
+      ObDASNestedKey candidate;
+      cmp = 1;
+      while (OB_SUCC(ret) && cmp > 0) {
+        if (OB_FAIL(next_impl(candidate, score))) {
+          LOG_WARN_IGNORE_ITER_END(ret, "failed to read sorted nested key", K(ret));
+        } else if (OB_FAIL(compare_rowid(target, candidate, cmp))) {
+          LOG_WARN("failed to compare nested keys", K(ret), K(target), K(candidate));
+        }
+      }
+      if (OB_SUCC(ret)) {
+        // Keep target valid until comparisons finish; it may borrow the previous output.
+        curr_nk = candidate;
+        if (candidate.length() > sizeof(uint64_t) && OB_FAIL(copy_nested_key(curr_nk))) {
+          LOG_WARN("failed to preserve sorted nested key", K(ret), K(candidate));
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    curr_nk_ = curr_nk;
+  } else if (OB_ITER_END == ret) {
+    curr_nk_.set_max();
+  }
+  return ret;
+}
+
+int ObDASSortOp::advance_sorted_rowid(const ObDASRowID &target, ObDASRowID &curr_id, double &score)
 {
   int ret = OB_SUCCESS;
   int64_t idx = -1;
@@ -278,7 +379,107 @@ int ObDASSortOp::do_advance_to(const ObDASRowID &target, ObDASRowID &curr_id, do
   return ret;
 }
 
+int ObDASSortOp::next_impl(ObDASNestedKey &key, double &score)
+{
+  int ret = OB_SUCCESS;
+  bool found = false;
+  while (OB_SUCC(ret) && !found) {
+    ObDASRowID doc;
+    ObDatum datum;
+    if (is_first_nk_) {
+      is_first_nk_ = false;
+      if (OB_FAIL(rowid_store_iter_.get_cur_rowid(doc))) {
+        LOG_WARN("failed to get current rowid", K(ret));
+      }
+    } else if (OB_FAIL(next_sorted_rowid(doc, score))) {
+      if (OB_ITER_END == ret) {
+        nested_input_end_ = true;
+      } else {
+        LOG_WARN("failed to get next sorted rowid", K(ret));
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (doc.get_uint64() != curr_doc_id_.get_uint64()) {
+      // Leave the next document's first pair for the DocID interface.
+      ret = OB_ITER_END;
+    } else if (OB_FAIL(static_cast<CompactRowIDStore *>(rowid_store_)->get_datum(
+            rowid_store_iter_.cur_idx(), 1, datum))) {
+      LOG_WARN("failed to read sorted nested key", K(ret));
+    } else if (!datum.is_null() && datum.len_ >= nested_compare_bytes()) {
+      key.assign(datum.ptr_, datum.len_);
+      found = true;
+    }
+  }
+  score = 0.0;
+  return ret;
+}
+
+int ObDASSortOp::do_next_rowid(ObDASNestedKey &next_nk, double &score)
+{
+  int ret = OB_SUCCESS;
+  score = 0.0;
+  if (!is_async_nested_scope(scope_)) {
+    ret = OB_NOT_IMPLEMENT;
+  } else if (!curr_doc_id_.is_normal()) {
+    ret = OB_STATE_NOT_MATCH;
+  } else if (curr_nk_.is_max()) {
+    ret = OB_ITER_END;
+  } else if (OB_FAIL(next_impl(next_nk, score))) {
+    LOG_WARN_IGNORE_ITER_END(ret, "failed to read sorted nested key", K(ret));
+  } else {
+    if (next_nk.length() > sizeof(uint64_t) && OB_FAIL(copy_nested_key(next_nk))) {
+      LOG_WARN("failed to preserve sorted nested key", K(ret), K(next_nk));
+    } else {
+      curr_nk_ = next_nk;
+    }
+  }
+  if (OB_ITER_END == ret) {
+    curr_nk_.set_max();
+  }
+  return ret;
+}
+
 int ObDASSortOp::do_next_rowid(ObDASRowID &next_id, double &score)
+{
+  int ret = OB_SUCCESS;
+  if (!is_async_nested_scope(scope_)) {
+    if (OB_FAIL(next_sorted_rowid(next_id, score))) {
+      LOG_WARN_IGNORE_ITER_END(ret, "failed to get next sorted rowid", K(ret));
+    }
+  } else {
+    if (curr_doc_id_.is_max() || nested_input_end_) {
+      ret = OB_ITER_END;
+    } else {
+      if (curr_doc_id_.is_normal()) {
+        if (OB_FAIL(rowid_store_iter_.get_cur_rowid(next_id))) {
+          LOG_WARN("failed to get current rowid", K(ret));
+        }
+      } else if (OB_FAIL(next_sorted_rowid(next_id, score))) {
+        LOG_WARN_IGNORE_ITER_END(ret, "failed to get next sorted rowid", K(ret));
+      }
+      // NK may have already stopped at the next document's first pair.
+      while (OB_SUCC(ret) && curr_doc_id_.is_normal()
+          && next_id.get_uint64() == curr_doc_id_.get_uint64()) {
+        if (OB_FAIL(next_sorted_rowid(next_id, score))) {
+          LOG_WARN_IGNORE_ITER_END(ret, "failed to get next sorted rowid", K(ret));
+        }
+      }
+      if (OB_SUCC(ret)) {
+        curr_doc_id_ = next_id;
+        curr_nk_.set_min();
+        is_first_nk_ = true;
+        score = is_scoring_ ? boost_weight_ : 0.0;
+      }
+    }
+    if (OB_ITER_END == ret) {
+      curr_doc_id_.set_max();
+      curr_nk_.set_max();
+    }
+  }
+  return ret;
+}
+
+int ObDASSortOp::next_sorted_rowid(ObDASRowID &next_id, double &score)
 {
   int ret = OB_SUCCESS;
   score = 0.0;
@@ -377,7 +578,7 @@ int ObDASSortOp::do_sort()
 
       if (OB_SUCCESS == ret || (OB_ITER_END == ret && count > 0)) {
         fake_skip->reset(max_batch_size());
-        if (DAS_SCOPE_NESTED_SYNC == scope_ && search_ctx_.has_docid_range()) {
+        if (is_nested_scope(scope_) && search_ctx_.has_docid_range()) {
           ObIVector *doc_id_vec = nullptr;
           ObExpr *doc_id_expr = get_sort_rowid_exprs().empty()
               ? nullptr : get_sort_rowid_exprs().at(0);
@@ -449,6 +650,26 @@ int ObDASSortOp::do_sort()
     }
   }
 
+  return ret;
+}
+
+void ObDASSortOp::reset_rowid_cursor()
+{
+  nested_input_end_ = false;
+  curr_doc_id_.set_min();
+  curr_nk_.set_min();
+}
+
+int ObDASSortOp::copy_nested_key(ObDASNestedKey &key)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(key.length() > nested_compare_bytes())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("nested key exceeds sort buffer length", K(ret), K(key), K_(nesting_depth));
+  } else {
+    MEMCPY(curr_nk_buf_, key.ptr(), key.length());
+    key.assign(curr_nk_buf_, key.length());
+  }
   return ret;
 }
 

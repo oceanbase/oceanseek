@@ -10,6 +10,7 @@
 #include "sql/resolver/dml/ob_default_value_utils.h"
 #include "common/sql_mode/ob_sql_mode.h"
 #include "share/schema/ob_part_mgr_util.h"
+#include "share/search_index/ob_search_index_config.h"
 #include "pl/ob_pl_package.h"
 #include "sql/optimizer/ob_opt_est_utils.h"
 #include "sql/rewrite/ob_transform_utils.h"
@@ -23340,11 +23341,26 @@ int ObDMLResolver::resolve_match_against_exprs(ObRawExpr *&expr,
       if (OB_FAIL(ret)) {
       } else if (OB_FAIL(stmt->get_match_expr_on_table(table_id, match_exprs_on_table))) {
         LOG_WARN("failed to get fulltext search expr on table", K(ret), K(table_id));
-      } else if (cur_match_expr->is_es_match() && OB_FAIL(resolve_es_match_expr(*cur_match_expr))) {
-        LOG_WARN("failed to resolve match expr", K(ret));
       } else if (!cur_match_expr->is_es_match() && OB_FAIL(resolve_match_against_expr(*cur_match_expr))) {
         LOG_WARN("failed to resolve match index", K(ret));
-      } else if (cur_match_expr->get_mode_flag() == ObMatchAgainstMode::MATCH_PHRASE_MODE &&
+      } else if (cur_match_expr->is_search_text()
+          && (scope != T_WHERE_SCOPE || get_stmt()->is_dml_write_stmt())) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "Search FULLTEXT outside SELECT WHERE predicates");
+      } else if (cur_match_expr->is_search_text()
+          && cur_match_expr->get_mode_flag() != NATURAL_LANGUAGE_MODE
+          && cur_match_expr->get_mode_flag() != MATCH_PHRASE_MODE) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "Search FULLTEXT SQL boolean search syntax");
+      } else if (nullptr != cur_match_expr->get_json_path_expr()
+          && (cur_match_expr->get_match_columns().count() != 1
+              || !cur_match_expr->get_match_columns().at(0)->get_result_type().is_json())) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "MATCH JSON path requires one JSON column");
+      } else if (cur_match_expr->is_es_match() && OB_FAIL(resolve_es_match_expr(*cur_match_expr))) {
+        LOG_WARN("failed to resolve match expr", K(ret));
+      } else if (!cur_match_expr->is_search_text()
+          && cur_match_expr->get_mode_flag() == ObMatchAgainstMode::MATCH_PHRASE_MODE &&
                  OB_FAIL(resolve_match_against_expr_with_match_phrase_mode(expr, cur_match_expr, scope))) {
         LOG_WARN("failed to resolve match index with match phrase mode", K(ret));
       } else {
@@ -23590,6 +23606,50 @@ int ObDMLResolver::resolve_match_against_expr_with_match_phrase_mode(ObRawExpr *
   return ret;
 }
 
+int ObDMLResolver::resolve_search_text_expr(ObMatchFunRawExpr &expr, const ObTableSchema &table)
+{
+  int ret = OB_SUCCESS;
+  if (!expr.is_es_match() && !expr.is_search_text() && expr.get_match_columns().count() == 1
+      && ObSearchIndexConfig::supports_fulltext(expr.get_match_columns().at(0)->get_result_type())) {
+    const ObColumnRefRawExpr *column = static_cast<const ObColumnRefRawExpr *>(expr.get_match_columns().at(0));
+    ObSEArray<ObAuxTableMetaInfo, 4> indexes;
+    if (OB_FAIL(table.get_simple_index_infos(indexes))) {
+      LOG_WARN("failed to get Search FULLTEXT definitions", K(ret));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && !expr.is_search_text() && i < indexes.count(); ++i) {
+      if (is_async_search_def_index(indexes.at(i).index_type_)) {
+        const ObTableSchema *def = nullptr;
+        const ObColumnSchemaV2 *source = nullptr;
+        ObSearchIndexConfig config;
+        if (OB_FAIL(schema_checker_->get_table_schema(session_info_->get_effective_tenant_id(),
+            indexes.at(i).table_id_, def))) {
+          LOG_WARN("failed to get Search FULLTEXT definition", K(ret));
+        } else if (OB_ISNULL(def)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("unexpected null Search FULLTEXT definition", K(ret),
+                   "def_table_id", indexes.at(i).table_id_, "main_table_id", table.get_table_id());
+        } else if (!def->can_read_index() || !def->is_index_visible()) {
+        } else if (nullptr == (source = def->get_column_schema(column->get_column_id()))
+            || source->get_index_position() <= 0) {
+        } else if (OB_FAIL(config.decode(source->get_comment_str()))) {
+          LOG_WARN("failed to decode Search FULLTEXT configuration", K(ret));
+        } else {
+          for (int64_t j = 0; j < config.get_modes().count(); ++j) {
+            if (config.get_modes().at(j).is_fulltext()) {
+              expr.set_search_text(true);
+            }
+          }
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret) && !expr.is_search_text()) {
+    ret = OB_ERR_FT_COLUMN_NOT_INDEXED;
+    LOG_WARN("no matched Search FULLTEXT definition exists", K(ret), "table_id", table.get_table_id());
+  }
+  return ret;
+}
+
 int ObDMLResolver::resolve_match_against_expr(ObMatchFunRawExpr &expr)
 {
   int ret = OB_SUCCESS;
@@ -23604,6 +23664,7 @@ int ObDMLResolver::resolve_match_against_expr(ObMatchFunRawExpr &expr)
     uint64_t table_id = OB_INVALID_ID;
     ColumnReferenceSet column_set;
     const ObColumnSchemaV2 *fulltext_col = NULL;
+    bool has_json_column = false;
 
     // get matched fulltext index
     for (int64_t i = 0; OB_SUCC(ret) && i < column_list.count(); ++i) {
@@ -23621,9 +23682,17 @@ int ObDMLResolver::resolve_match_against_expr(ObMatchFunRawExpr &expr)
         ret = OB_INVALID_ARGUMENT;
         LOG_USER_ERROR(OB_INVALID_ARGUMENT, "match against columns on different tables");
       }
+      if (OB_SUCC(ret)) {
+        has_json_column |= col_ref->get_result_type().is_json();
+      }
     }
     if (OB_FAIL(ret)) {
       //do nothing
+    } else if (has_json_column && column_list.count() != 1) {
+      // sql MATCH(...) AGAINST(...) not support multiple columns including JSON column
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "MATCH with multiple columns including JSON");
+      LOG_WARN("MATCH with multiple columns including JSON is not supported", K(ret), K(column_list.count()));
     } else if (OB_ISNULL(table_item = get_stmt()->get_table_item_by_id(table_id))) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("table item don't exist", K(table_id));
@@ -23637,9 +23706,19 @@ int ObDMLResolver::resolve_match_against_expr(ObMatchFunRawExpr &expr)
     } else if (OB_ISNULL(table_schema)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected nullptr to table schema", K(ret));
+    } else if (has_json_column || nullptr != expr.get_json_path_expr()) {
+      // JSON columns and explicit paths require Search FULLTEXT.
+      if (OB_FAIL(resolve_search_text_expr(expr, *table_schema))) {
+        LOG_WARN("failed to resolve Search FULLTEXT index", K(ret), K(table_id));
+      }
     } else if (OB_FAIL(resolve_match_index(column_set, *table_schema, expr))) {
-      LOG_WARN("failed to resolve fulltext index access exprs", K(ret));
-    } else if (OB_FAIL(expr.formalize(session_info_))) {
+      if (OB_ERR_FT_COLUMN_NOT_INDEXED != ret) {
+        LOG_WARN("failed to resolve fulltext index", K(ret), K(table_id));
+      } else if (OB_FAIL(resolve_search_text_expr(expr, *table_schema))) {
+        LOG_WARN("failed to resolve Search FULLTEXT fallback", K(ret), K(table_id));
+      }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(expr.formalize(session_info_))) {
       LOG_WARN("failed to formalize expr", K(ret));
     }
   }
@@ -24439,9 +24518,9 @@ int ObDMLResolver::resolve_index_data_gen_table_column_item(
   } else if (OB_ISNULL(data_index_schema)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("table not exist", K(index_table_id), K(ret));
-  } else if (!data_index_schema->is_search_data_index()) {
+  } else if (!data_index_schema->is_search_data_index() && !data_index_schema->is_async_search_text_index()) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("expect search data index", K(ret), K(data_index_schema->get_index_type()));
+    LOG_WARN("expect search data or text index", K(ret), K(data_index_schema->get_index_type()));
   } else if (OB_FAIL(schema_checker_->get_table_schema(session_info_->get_effective_tenant_id(),
                                                        data_index_schema->get_data_table_id(),
                                                        def_index_schema))) {

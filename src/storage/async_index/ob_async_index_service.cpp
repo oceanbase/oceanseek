@@ -756,8 +756,8 @@ int ObAsyncIndexService::trigger_incr_refresh(const ObAsyncIndexDirectRefreshPar
         sql_param.rowkey_columns_       = &index_info->rowkey_columns_;
         sql_param.order_columns_        = &index_info->order_columns_;
         sql_param.index_table_id_       = index_info->index_table_id_;
-        sql_param.is_search_data_       =
-            share::schema::is_async_search_data_index(index_info->index_type_);
+        sql_param.is_async_search_aux_index_ =
+            share::schema::is_async_search_aux_index(index_info->index_type_);
         sql_param.enable_newsort_       = index_info->enable_newsort_;
         sql_param.snapshot_scn_         = param.target_refresh_scn_;
         sql_param.last_refresh_scn_     = start_refresh_scn;
@@ -821,7 +821,7 @@ int ObAsyncIndexService::trigger_incr_refresh(const ObAsyncIndexDirectRefreshPar
         task_param.is_refresh_on_error_skip_ = index_info->is_refresh_on_error_skip_;
         task_param.is_ivf_index_        = share::schema::is_async_ivf_index(index_info->index_type_);
         task_param.is_search_index_     =
-            share::schema::is_async_search_data_index(index_info->index_type_);
+            share::schema::is_async_search_aux_index(index_info->index_type_);
         task_param.skip_dop_quota_      = true;
         task_param.sql_                 = &sql;
         task_param.ls_scheduler_        = nullptr;

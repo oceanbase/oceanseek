@@ -1252,11 +1252,11 @@ int ObDDLUtil::generate_build_replica_sql(
     ret = OB_TABLE_NOT_EXIST;
     LOG_WARN("fail to get table schema", K(ret), KP(source_table_schema), KP(dest_table_schema), 
       K(tenant_id), K(data_table_id), K(dest_table_id));
-  } else if (dest_table_schema->is_search_data_index()
+  } else if (dest_table_schema->is_search_aux_index()
     && OB_FAIL(schema_guard.get_table_schema(tenant_id, dest_table_schema->get_data_table_id(),
                                              def_index_schema))) {
     LOG_WARN("fail to get table schema", K(ret), K(tenant_id), K(dest_table_schema->get_data_table_id()));
-  } else if (dest_table_schema->is_search_data_index() && OB_ISNULL(def_index_schema)) {
+  } else if (dest_table_schema->is_search_aux_index() && OB_ISNULL(def_index_schema)) {
     ret = OB_TABLE_NOT_EXIST;
     LOG_WARN("fail to get table schema", K(ret), K(def_index_schema),
       K(dest_table_schema->get_data_table_id()), K(tenant_id));

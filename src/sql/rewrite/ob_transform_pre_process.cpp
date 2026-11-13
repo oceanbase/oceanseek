@@ -12408,7 +12408,9 @@ int ObTransformPreProcess::preserve_order_for_fulltext_search(ObDMLStmt *stmt, b
       }
     }
   }
-  if (OB_SUCC(ret) && nullptr != match_expr && !static_cast<ObMatchFunRawExpr*>(match_expr)->is_es_match()) {
+  if (OB_SUCC(ret) && nullptr != match_expr
+      && !static_cast<ObMatchFunRawExpr*>(match_expr)->is_es_match()
+      && !static_cast<ObMatchFunRawExpr*>(match_expr)->is_search_text()) {
     OrderItem item(match_expr, default_desc_direction());
     if (OB_FAIL(stmt->add_order_item(item))) {
       LOG_WARN("failed to add order item", K(ret), K(item));

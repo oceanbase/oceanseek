@@ -21,6 +21,41 @@ ObDASSearchIndexTextInfo::ObDASSearchIndexTextInfo(ObIAllocator *allocator)
   : column_idx_(-1), encoded_path_(), parser_name_(), parser_properties_(), is_json_(false), allocator_(allocator)
 {}
 
+int ObDASSearchIndexTextInfo::assign(
+    const ObColumnRefRawExpr &field, const ObSearchIndexTextInfo &info, ObIAllocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  *this = ObDASSearchIndexTextInfo(&allocator);
+  ObJsonPath parsed(info.path_, &allocator);
+  parsed.is_mysql_ = true;
+  ObSEArray<ObSearchIndexPathEncoder::JsonPathItem, 4> items;
+  ObString encoded_path;
+  bool path_supported = false;
+  if (OB_FAIL(parsed.parse_path())) {
+    if (ret != OB_ALLOCATE_MEMORY_FAILED) {
+      ret = OB_INVALID_ARGUMENT;
+    }
+    LOG_WARN("failed to parse Search Text execution path", K(ret), K(info.path_));
+  } else if (OB_FAIL(ObSearchIndexQueryRangeUtils::build_json_path_items(
+      allocator, parsed, items, path_supported))) {
+    LOG_WARN("failed to build Search Text path items", K(ret), K(info.path_));
+  } else if (OB_FAIL(ObSearchIndexPathEncoder::encode_text_path(allocator, items, encoded_path))) {
+    LOG_WARN("failed to encode Search Text execution path", K(ret), K(info.path_));
+  } else if (OB_FAIL(ob_write_string(allocator, info.parser_name_, parser_name_))) {
+    LOG_WARN("failed to copy Search Text parser name", K(ret));
+  } else if (OB_FAIL(ob_write_string(allocator, info.parser_properties_, parser_properties_))) {
+    LOG_WARN("failed to copy Search Text parser properties", K(ret));
+  } else {
+    column_idx_ = info.column_idx_;
+    encoded_path_ = encoded_path;
+    is_json_ = field.get_result_type().is_json();
+  }
+  if (OB_FAIL(ret)) {
+    *this = ObDASSearchIndexTextInfo(&allocator);
+  }
+  return ret;
+}
+
 int ObDASSearchIndexTextInfo::deep_copy_strings()
 {
   int ret = OB_SUCCESS;

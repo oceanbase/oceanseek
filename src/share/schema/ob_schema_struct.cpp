@@ -6766,7 +6766,7 @@ int ObPartitionUtils::check_param_valid_(
             } else if (OB_ISNULL(related_schema)) {
               ret = OB_TABLE_NOT_EXIST;
               LOG_WARN("data table schema not exist", KR(ret), K(tenant_id), K(related_tid));
-            } else if (related_schema->is_search_data_index()) {
+            } else if (related_schema->is_search_aux_index()) {
               related_tid = related_schema->get_data_table_id();
             }
           }

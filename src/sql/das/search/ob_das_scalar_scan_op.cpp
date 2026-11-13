@@ -91,7 +91,8 @@ int ObDASScalarScanOp::init_rowid_output_exprs(
         "rowid_type", get_rowid_type());
   } else {
     const int64_t output_expr_count = scope_exprs->count();
-    if (OB_UNLIKELY((DAS_ROWID_TYPE_UINT64 == get_rowid_type() && 1 != output_expr_count)
+    if (OB_UNLIKELY((DAS_ROWID_TYPE_UINT64 == get_rowid_type()
+                     && (is_async_nested_scope(scope_) ? 2 : 1) != output_expr_count)
                     || output_expr_count <= 0)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected scalar RowID output shape", K(ret), K_(scope),

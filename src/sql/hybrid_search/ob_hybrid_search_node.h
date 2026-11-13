@@ -468,6 +468,7 @@ private :
   ObSqlSchemaGuard *schema_guard_;
   const ObTableSchema *table_schema_;
   const ObIArray<uint64_t> &valid_index_ids_;
+  // Search Def candidates list only VALUE source columns; FULLTEXT-only candidates have empty lists.
   const ObIArray<ObSEArray<uint64_t, 4>> &valid_index_cols_;
   const ObIArray<bool> &index_can_ignore_prefix_;
   ObFusionNode *fusion_node_;

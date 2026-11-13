@@ -6,6 +6,9 @@
 #define USING_LOG_PREFIX SQL_ENG
 #include "ob_expr_json_keys.h"
 #include "ob_expr_json_func_helper.h"
+#include "lib/json_type/ob_json_bin_agg_serializer.h"
+#include "lib/json_type/ob_json_wrapper.h"
+#include "lib/container/ob_se_array.h"
 #include "share/ob_json_access_utils.h"
 using namespace oceanbase::common;
 using namespace oceanbase::sql;
@@ -54,35 +57,32 @@ int ObExprJsonKeys::calc_result_typeN(ObExprResType& type,
   return ret;
 }
 
-int ObExprJsonKeys::get_keys_from_wrapper(ObIJsonBase *json_doc, 
+int ObExprJsonKeys::get_keys_from_wrapper(const ObJsonWrapper &wrapper,
                                           ObIAllocator *allocator,
+                                          bool enable_json_bin_view,
                                           ObString &str)
 {
   INIT_SUCC(ret);
-  ObJsonArray res_array(allocator);
-  JsonObjectIterator iter = json_doc->object_iterator();
-  while (!iter.end() && OB_SUCC(ret)) {
-    ObString key;
-    if (OB_FAIL(iter.get_key(key))) {
-      LOG_WARN("fail to get key from iterator", K(ret));
-    } else {
-      void *node = allocator->alloc(sizeof(ObJsonString));
-      if (OB_ISNULL(node)){
-        ret = OB_ALLOCATE_MEMORY_FAILED;
-        LOG_WARN("json_keys alloc jsonString failed", K(ret), K(str.length()));
-      } else {
-        ObJsonString *jstr = new (node) ObJsonString(key.ptr(), key.length());
-        if (OB_FAIL(res_array.append(jstr))) {
-          LOG_WARN("json_keys array append failed", K(ret), K(str.length()));
-        }
-      }
+  ModulePageAllocator keys_allocator(ObModIds::OB_SE_ARRAY);
+  keys_allocator.set_allocator(allocator);
+  ObSEArray<ObString, 8> keys(OB_MALLOC_NORMAL_BLOCK_SIZE, keys_allocator);
+  if (OB_ISNULL(allocator)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("json_keys allocator is null", K(ret));
+  } else if (OB_FAIL(wrapper.get_json_keys(keys))) {
+    LOG_WARN("json_keys get keys from wrapper failed", K(ret));
+  } else if (enable_json_bin_view) {
+    // Reuse enable_json_bin_view to toggle this optimization and fall back to the old path when disabled.
+    if (OB_FAIL(ObJsonBinAggSerializer::serialize(*allocator, keys, str))) {
+      LOG_WARN("json_keys serialize result array failed", K(ret));
     }
-    iter.next();
-  }
-  
-  if (OB_FAIL(ret)) {
-  } else if (OB_FAIL(share::ObJsonAccessUtils::get_raw_binary(&res_array, str, allocator))) {
-    LOG_WARN("json_keys get result binary failed", K(ret));
+  } else {
+    ObJsonArray json_array(allocator);
+    if (OB_FAIL(ObJsonExprHelper::append_json_strings(*allocator, keys, json_array))) {
+      LOG_WARN("append json keys failed", K(ret));
+    } else if (OB_FAIL(share::ObJsonAccessUtils::get_raw_binary(&json_array, str, allocator))) {
+      LOG_WARN("json_keys get result binary failed", K(ret));
+    }
   }
   return ret;
 }
@@ -90,17 +90,16 @@ int ObExprJsonKeys::get_keys_from_wrapper(ObIJsonBase *json_doc,
 int ObExprJsonKeys::eval_json_keys(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res)
 {
   INIT_SUCC(ret);
-  ObIJsonBase *json_doc = NULL;
+  ObJsonWrapper wrapper;
   bool is_null_result = false;
   ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
-  uint64_t tenant_id = ObMultiModeExprHelper::get_tenant_id(ctx.exec_ctx_.get_my_session());
-  MultimodeAlloctor temp_allocator(tmp_alloc_g.get_allocator(), expr.type_, tenant_id, ret);
+  MultimodeAlloctor temp_allocator(tmp_alloc_g.get_allocator(), expr.type_, ret, ctx, "json_keys");
   if (expr.datum_meta_.cs_type_ != CS_TYPE_UTF8MB4_BIN) {
     ret = OB_ERR_INVALID_JSON_CHARSET;
     LOG_WARN("invalid out put charset", K(ret), K(expr.datum_meta_.cs_type_));
-  } else if (OB_FAIL(ObJsonExprHelper::get_json_doc(expr, ctx, temp_allocator, 0,
-                                                    json_doc, is_null_result, false))) {
-    LOG_WARN("get_json_doc failed", K(ret));
+  } else if (OB_FAIL(ObJsonExprHelper::get_json_doc_wrapper(expr, ctx, temp_allocator, 0,
+                                                            wrapper, is_null_result))) {
+    LOG_WARN("get_json_doc_wrapper failed", K(ret));
   }
 
   if (!is_null_result && OB_SUCC(ret) && expr.arg_cnt_ == 2) {
@@ -115,7 +114,7 @@ int ObExprJsonKeys::eval_json_keys(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &
     } else if (OB_FAIL(temp_allocator.eval_arg(expr.args_[1], ctx, path_data))) {
       LOG_WARN("eval json path datum failed", K(ret));
     } else {
-      ObJsonSeekResult sub_json_targets;
+      ObSEArray<ObJsonWrapper, 1> hits;
       ObJsonPath *json_path;
       ObString path_val = path_data->get_string();
       bool is_const = expr.args_[1]->is_static_const_expr();
@@ -123,20 +122,19 @@ int ObExprJsonKeys::eval_json_keys(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &
         LOG_WARN("fail to get real data.", K(ret), K(path_val));
       } else if (OB_FAIL(ObJsonExprHelper::find_and_add_cache(temp_allocator, path_cache, json_path, path_val, 1, false, is_const))) {
         LOG_WARN("json parse failed", K(path_data->get_string()), K(ret));
-      } else if (OB_FAIL(json_doc->seek(*json_path, json_path->path_node_cnt(),
-                                        false, true, sub_json_targets))) {
+      } else if (OB_FAIL(wrapper.seek(*json_path, temp_allocator, hits, false, true))) {
         LOG_WARN("json seek failed", K(path_data->get_string()), K(ret));
       } else {
-        if (sub_json_targets.size() != 1) {
+        if (hits.count() != 1) {
           is_null_result = true;
         } else {
-          json_doc = sub_json_targets[0];
+          wrapper = hits.at(0);
         }
       }
     }
   }
 
-  if (!is_null_result && OB_SUCC(ret) && !OB_ISNULL(json_doc) && json_doc->json_type() != ObJsonNodeType::J_OBJECT) {
+  if (!is_null_result && OB_SUCC(ret) && wrapper.json_type() != ObJsonNodeType::J_OBJECT) {
     is_null_result = true;
   }
 
@@ -147,7 +145,9 @@ int ObExprJsonKeys::eval_json_keys(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &
     res.set_null();
   } else {
     ObString str;
-    if (OB_FAIL(get_keys_from_wrapper(json_doc, &temp_allocator, str))) {
+    ObSQLSessionInfo *session = ctx.exec_ctx_.get_my_session();
+    bool enable_json_bin_view = OB_NOT_NULL(session) ? session->is_enable_json_bin_view() : true;
+    if (OB_FAIL(get_keys_from_wrapper(wrapper, &temp_allocator, enable_json_bin_view, str))) {
       LOG_WARN("get_keys_from_wrapper failed", K(ret));
     } else if (OB_FAIL(ObJsonExprHelper::pack_json_str_res(expr, ctx, res, str))) {
       LOG_WARN("fail to pack json result", K(ret));

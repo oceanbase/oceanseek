@@ -7,6 +7,7 @@
 #include "common/ob_timeout_ctx.h"
 #include "lib/thread/thread.h"
 #include "share/ob_async_index_refresh_util.h"
+#include "share/search_index/ob_search_index_lifecycle_util.h"
 #include "share/ob_define.h"
 #include "share/scn.h"
 #include "share/schema/ob_multi_version_schema_service.h"
@@ -204,6 +205,52 @@ bool ObAllVirtualAsyncIndexRefreshProgress::is_progress_scan_retryable_(
       || OB_TABLET_IS_SPLIT_SRC == ret;
 }
 
+// Caller-owned schema and status policy; expansion itself is policy-free.
+static int collect_async_progress_targets(
+    share::schema::ObSchemaGetterGuard &guard, const share::schema::ObTableSchema &base,
+    common::ObIArray<share::ObAsyncPhysicalTarget> &targets)
+{
+  int ret = OB_SUCCESS;
+  targets.reset();
+  const common::ObIArray<share::schema::ObAuxTableMetaInfo> &infos = base.get_simple_index_infos();
+  for (int64_t i = 0; OB_SUCC(ret) && i < infos.count(); ++i) {
+    const share::schema::ObAuxTableMetaInfo &info = infos.at(i);
+    const share::schema::ObTableSchema *logical = nullptr;
+    common::ObSEArray<share::ObAsyncPhysicalTarget, 3> expanded;
+    if (!share::schema::is_async_index(info.index_type_)) {
+      continue;
+    } else if (OB_FAIL(guard.get_table_schema(base.get_tenant_id(), info.table_id_, logical))) {
+      SERVER_LOG(WARN, "failed to get logical async schema", K(ret), K(info));
+    } else if (OB_ISNULL(logical)) {
+      ret = OB_ERR_UNEXPECTED;
+      SERVER_LOG(WARN, "async index schema is missing", K(ret), K(info));
+    } else if (OB_FAIL(share::ObSearchIndexLifecycleUtil::expand_async_index(
+        base, *logical, expanded))) {
+      SERVER_LOG(WARN, "failed to expand async index", K(ret), K(info));
+    } else {
+      for (int64_t j = 0; OB_SUCC(ret) && j < expanded.count(); ++j) {
+        const share::ObAsyncPhysicalTarget &target = expanded.at(j);
+        const share::schema::ObTableSchema *physical = nullptr;
+        if (OB_FAIL(share::ObSearchIndexLifecycleUtil::get_target_schema(
+            guard, base, target, physical))) {
+          SERVER_LOG(WARN, "failed to get async target", K(ret), K(target));
+        } else if (OB_ISNULL(physical)) {
+          ret = OB_ERR_UNEXPECTED;
+          SERVER_LOG(WARN, "physical async schema is missing", K(ret), K(target));
+        } else if (!physical->can_read_index()) {
+          SERVER_LOG(INFO, "cannot read index", K(base.get_tenant_id()), K(physical->get_table_id()));
+        } else if (OB_FAIL(targets.push_back(target))) {
+          SERVER_LOG(WARN, "failed to append async target", K(ret), K(target));
+        }
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+    targets.reset();
+  }
+  return ret;
+}
+
 int ObAllVirtualAsyncIndexRefreshProgress::aggregate_local_tenant_(
     ObSchemaGetterGuard &schema_guard)
 {
@@ -246,40 +293,21 @@ int ObAllVirtualAsyncIndexRefreshProgress::aggregate_local_tenant_(
           } else if (valid_data_tablets.empty() || !scn_valid) {
             // No local data tablet on this node has any recorded increment, skip this data table
           } else {
-            const ObIArray<ObAuxTableMetaInfo> &aux_infos = table_schema->get_simple_index_infos();
-            for (int64_t j = 0; OB_SUCC(ret) && j < aux_infos.count(); ++j) {
-              const ObAuxTableMetaInfo &aux_info = aux_infos.at(j);
-              if (is_async_index(aux_info.index_type_)) {
-                const bool is_async_search_def = is_async_search_def_index(aux_info.index_type_);
-                uint64_t index_table_id = aux_info.table_id_;
-                const ObTableSchema *index_schema = nullptr;
-                if (OB_FAIL(schema_guard.get_table_schema(tenant_id, index_table_id, index_schema))) {
-                  SERVER_LOG(WARN, "get index table schema failed", K(ret), K(tenant_id), K(index_table_id));
-                } else if (OB_ISNULL(index_schema)) {
-                  ret = OB_ERR_UNEXPECTED;
-                  SERVER_LOG(WARN, "index table schema is null", K(ret), K(tenant_id), K(index_table_id));
-                } else {
-                  const ObTableSchema *refresh_index_schema = index_schema;
-                  if (is_async_search_def) {
-                    if (OB_FAIL(index_schema->get_search_data_index_tid(index_table_id))) {
-                      SERVER_LOG(WARN, "get async search data table id failed", K(ret), K(tenant_id), KPC(index_schema));
-                    } else if (OB_FAIL(schema_guard.get_table_schema(
-                        tenant_id, index_table_id, refresh_index_schema))) {
-                      SERVER_LOG(WARN, "get async search data table schema failed", K(ret), K(tenant_id), K(index_table_id));
-                    } else if (OB_ISNULL(refresh_index_schema)) {
-                      ret = OB_ERR_UNEXPECTED;
-                      SERVER_LOG(WARN, "async search data table schema is null", K(ret), K(tenant_id), K(index_table_id));
-                    }
-                  }
-                  if (OB_FAIL(ret)) {
-                  } else if (!refresh_index_schema->can_read_index()) {
-                    SERVER_LOG(INFO, "cannot read index", K(ret), K(tenant_id), K(index_table_id));
-                  } else if (OB_FAIL(aggregate_one_index_table_(*table_schema, *refresh_index_schema,
-                                                                index_target_snapshot, tenant_enable_refresh,
-                                                                valid_data_tablets))) {
-                    SERVER_LOG(WARN, "aggregate one index table failed", K(ret), K(data_table_id), K(index_table_id));
-                  }
-                }
+            ObSEArray<ObAsyncPhysicalTarget, 8> targets;
+            if (OB_FAIL(collect_async_progress_targets(schema_guard, *table_schema, targets))) {
+              SERVER_LOG(WARN, "collect async progress targets failed", K(ret), K(data_table_id));
+            }
+            for (int64_t j = 0; OB_SUCC(ret) && j < targets.count(); ++j) {
+              const uint64_t index_table_id = targets.at(j).table_id_;
+              const ObTableSchema *index_schema = nullptr;
+              if (OB_FAIL(schema_guard.get_table_schema(tenant_id, index_table_id, index_schema))) {
+                SERVER_LOG(WARN, "get async progress target schema failed", K(ret), K(index_table_id));
+              } else if (OB_ISNULL(index_schema)) {
+                ret = OB_ERR_UNEXPECTED;
+                SERVER_LOG(WARN, "async progress target schema is missing", K(ret), K(index_table_id));
+              } else if (OB_FAIL(aggregate_one_index_table_(*table_schema, *index_schema,
+                  index_target_snapshot, tenant_enable_refresh, valid_data_tablets))) {
+                SERVER_LOG(WARN, "aggregate async progress target failed", K(ret), K(index_table_id));
               }
             }
           }

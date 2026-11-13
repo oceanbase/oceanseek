@@ -7,6 +7,7 @@
 #define OBDEV_SRC_SQL_DAS_SEARCH_OB_DAS_ASYNC_SEGMENT_MERGE_OP_H_
 
 #include "sql/das/search/ob_das_search_utils.h"
+#include "sql/das/search/ob_das_nested_key.h"
 #include "sql/das/search/ob_i_das_search_op.h"
 #include "common/ob_range.h"
 
@@ -120,6 +121,23 @@ private:
     bool source_in_shallow_status_;
   };
 
+  // Each phase owns its heap and the contributors removed for its last output.
+  template <typename RowType>
+  struct MergeCursor
+  {
+    MergeCursor(common::ObIArray<RowType> &heads,
+                common::ObIArray<int64_t> &heap,
+                common::ObIArray<int64_t> &pending,
+                const bool use_heap = true)
+      : heads_(heads), heap_(heap), pending_(pending), use_heap_(use_heap)
+    {}
+
+    common::ObIArray<RowType> &heads_;
+    common::ObIArray<int64_t> &heap_;
+    common::ObIArray<int64_t> &pending_;
+    bool use_heap_;
+  };
+
 public:
   ObDASAsyncSegmentMergeOp(ObDASSearchCtx &search_ctx)
     : ObIDASSearchOp(search_ctx),
@@ -131,6 +149,11 @@ public:
       child_opened_(),
       heap_child_indices_(),
       pending_child_indices_(),
+      nested_key_heads_(),
+      nested_heap_child_indices_(),
+      nested_pending_child_indices_(),
+      curr_nk_(),
+      is_first_nk_(true),
       ordered_child_indices_(),
       ordered_child_pos_(0),
       use_ordered_concat_(false),
@@ -188,6 +211,40 @@ public:
   }
 
 private:
+  int init_nested_key_cursor();
+  MergeCursor<ObDASRowID> rowid_merge_cursor()
+  { return {head_rowids_, heap_child_indices_, pending_child_indices_, !use_single_child_fast_path()}; }
+  MergeCursor<ObDASNestedKey> nested_merge_cursor()
+  { return {nested_key_heads_, nested_heap_child_indices_, nested_pending_child_indices_}; }
+  template <typename RowType>
+  int merge_next(MergeCursor<RowType> &cursor, const int64_t capacity,
+                 RowType &result, double &score);
+  template <typename RowType>
+  int merge_advance(MergeCursor<RowType> &cursor, const RowType &target,
+                    RowType &result, double &score);
+  // Ensure all child heads reach target by calling advance_to only for lagging children.
+  template <typename RowType>
+  int advance_merge_heads(MergeCursor<RowType> &cursor, const RowType &target);
+  template <typename RowType>
+  int emit_min_head(MergeCursor<RowType> &cursor, RowType &result, double &score);
+  template <typename RowType>
+  int heap_less(const MergeCursor<RowType> &cursor,
+                const int64_t left_child_idx, const int64_t right_child_idx, bool &less) const;
+  template <typename RowType>
+  int heap_push(MergeCursor<RowType> &cursor, const int64_t child_idx);
+  template <typename RowType>
+  int heap_sift_down(MergeCursor<RowType> &cursor, const int64_t start_pos);
+  template <typename RowType>
+  int heap_pop(MergeCursor<RowType> &cursor, int64_t &child_idx);
+  int fetch_next_head(const int64_t child_idx, const int64_t capacity, ObDASRowID &head);
+  int fetch_next_head(const int64_t child_idx, const int64_t capacity, ObDASNestedKey &head);
+  int seek_merge_head(const int64_t child_idx, const ObDASRowID &target, ObDASRowID &head);
+  int seek_merge_head(const int64_t child_idx, const ObDASNestedKey &target, ObDASNestedKey &head);
+  bool merge_head_in_range(const ObDASRowID &head) const;
+  bool merge_head_in_range(const ObDASNestedKey &) const { return true; }
+  double merge_head_score(const int64_t child_idx, const ObDASRowID &) const
+  { return head_scores_.at(child_idx); }
+  double merge_head_score(const int64_t, const ObDASNestedKey &) const { return 0.0; }
   int do_init(const ObIDASSearchOpParam &op_param) override;
   int do_open() override;
   int do_close() override;
@@ -199,6 +256,8 @@ private:
       const bool inclusive,
       const MaxScoreTuple *&max_score_tuple) override;
   int do_next_rowid(ObDASRowID &next_id, double &score) override;
+  int do_advance_to(const ObDASNestedKey &target, ObDASNestedKey &curr_nk, double &score) override;
+  int do_next_rowid(ObDASNestedKey &next_nk, double &score) override;
   int do_next_rowids(int64_t capacity, int64_t &count) override;
   int do_drain_until(const ObDASRowID &boundary,
                      int64_t capacity,
@@ -242,9 +301,11 @@ private:
       ObDASRowID &next_id_after,
       double &next_score_after);
   int fetch_next_head(const int64_t child_idx, const int64_t capacity);
+  // Call next_rowid for every pending child; batch DocIDs use the buffered next record.
+  template <typename RowType>
+  int advance_pending_children(MergeCursor<RowType> &cursor, const int64_t capacity);
   int advance_pending_children(const int64_t capacity);
   int advance_heads_to(const ObDASRowID &target);
-  int advance_heap_to(const ObDASRowID &target);
   int try_advance_single_live(const ObDASRowID &target,
                               ObDASRowID &rowid,
                               double &score,
@@ -254,10 +315,6 @@ private:
   int build_heap();
   int heap_push(const int64_t child_idx);
   int heap_pop(int64_t &child_idx);
-  int heap_sift_down(const int64_t start_pos);
-  int heap_less(const int64_t left_child_idx,
-                const int64_t right_child_idx,
-                bool &less) const;
   int ensure_batch_buffer();
   int refill_batch_child(const int64_t child_idx, const int64_t capacity);
   int fetch_next_batch_head(const int64_t child_idx, const int64_t capacity);
@@ -274,8 +331,13 @@ private:
   bool use_single_child_fast_path() const
   {
     return !force_merge_
-        && segment_domain_.group_slot_ >= 0
+        && (segment_domain_.group_slot_ >= 0 || is_async_nested_scope(scope_))
         && 1 == active_segment_cnt_;
+  }
+  bool current_doc_has_single_nk_source() const
+  {
+    return use_ordered_concat_
+        || (!force_merge_ && 1 == pending_child_indices_.count());
   }
   void reset_merge_state();
   void reset_direct_state();
@@ -300,6 +362,12 @@ private:
   common::ObSEArray<int64_t, 4> heap_child_indices_;
   // All children that contributed to the last deduplicated output are advanced together.
   common::ObSEArray<int64_t, 4> pending_child_indices_;
+  common::ObSEArray<ObDASNestedKey, 4> nested_key_heads_;
+  common::ObSEArray<int64_t, 4> nested_heap_child_indices_;
+  // NK contributors are distinct from the complete current-document contributors above.
+  common::ObSEArray<int64_t, 4> nested_pending_child_indices_;
+  ObDASNestedKey curr_nk_;
+  bool is_first_nk_;
   // Proven disjoint children use a separate cursor, never the heap/pending scheduler.
   common::ObSEArray<int64_t, 4> ordered_child_indices_;
   int64_t ordered_child_pos_;

@@ -1503,17 +1503,7 @@ int ObDDLScheduler::create_ddl_task(const ObCreateDDLTaskParam &param,
         break;
       case DDL_DROP_SEARCH_INDEX:
       case DDL_DROP_ASYNC_SEARCH_INDEX:
-        drop_index_arg = static_cast<const obrpc::ObDropIndexArg *>(param.ddl_arg_);
-        if (OB_FAIL(create_drop_search_index_task(proxy,
-                                                  param.src_table_schema_,
-                                                  param.schema_version_,
-                                                  param.consumer_group_id_,
-                                                  param.def_index_schema_,
-                                                  param.data_index_schema_,
-                                                  param.async_delete_schema_,
-                                                  drop_index_arg,
-                                                  *param.allocator_,
-                                                  task_record))) {
+        if (OB_FAIL(create_drop_search_index_task(proxy, param, task_record))) {
           LOG_WARN("fail to create drop search index task", K(ret));
         }
         break;
@@ -2969,31 +2959,33 @@ int ObDDLScheduler::create_drop_vec_ivf_index_task(
 
 int ObDDLScheduler::create_drop_search_index_task(
     common::ObISQLClient &proxy,
-    const share::schema::ObTableSchema *index_schema,
-    const int64_t schema_version,
-    const int64_t consumer_group_id,
-    const share::schema::ObTableSchema *def_index_schema,
-    const share::schema::ObTableSchema *data_index_schema,
-    const share::schema::ObTableSchema *async_delete_schema,
-    const obrpc::ObDropIndexArg *drop_index_arg,
-    ObIAllocator &allocator,
+    const ObCreateDDLTaskParam &param,
     ObDDLTaskRecord &task_record)
 {
   int ret = OB_SUCCESS;
   int64_t task_id = 0;
   ObDropSearchIndexTask index_task;
+  const ObTableSchema *index_schema = param.src_table_schema_;
+  const ObTableSchema *def_index_schema = param.def_index_schema_;
+  const ObTableSchema *data_index_schema = param.data_index_schema_;
+  const ObTableSchema *async_delete_schema = param.async_delete_schema_;
+  const ObTableSchema *search_text_match_schema = param.search_text_match_schema_;
+  const ObTableSchema *search_text_match_phrase_schema = param.search_text_match_phrase_schema_;
+  const obrpc::ObDropIndexArg *drop_index_arg = static_cast<const obrpc::ObDropIndexArg *>(param.ddl_arg_);
   common::ObString def_index_name;
   common::ObString data_index_name;
   common::ObString async_delete_name;
+  common::ObString search_text_match_name;
+  common::ObString search_text_match_phrase_name;
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", K(ret));
   } else if (OB_ISNULL(index_schema) || OB_ISNULL(drop_index_arg) || OB_ISNULL(GCTX.sql_proxy_)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), KP(index_schema), KP(drop_index_arg), KP(GCTX.sql_proxy_));
-  } else if (OB_UNLIKELY(schema_version <= 0)) {
+  } else if (OB_UNLIKELY(param.schema_version_ <= 0)) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument", K(ret), KP(index_schema), K(schema_version));
+    LOG_WARN("invalid argument", K(ret), KP(index_schema), K(param.schema_version_));
   } else if (OB_FAIL(ObDDLTask::fetch_new_task_id(*GCTX.sql_proxy_, index_schema->get_tenant_id(),
           task_id))) {
     LOG_WARN("fetch new task id failed", K(ret));
@@ -3009,6 +3001,14 @@ int ObDDLScheduler::create_drop_search_index_task(
     if (OB_FAIL(ret) || OB_ISNULL(async_delete_schema)) {
     } else if (OB_FAIL(async_delete_schema->get_index_name(async_delete_name))) {
       LOG_WARN("fail to get async delete index name", K(ret), KPC(async_delete_schema));
+    }
+    if (OB_FAIL(ret) || OB_ISNULL(search_text_match_schema)) {
+    } else if (OB_FAIL(search_text_match_schema->get_index_name(search_text_match_name))) {
+      LOG_WARN("failed to get search text match index name", K(ret));
+    }
+    if (OB_FAIL(ret) || OB_ISNULL(search_text_match_phrase_schema)) {
+    } else if (OB_FAIL(search_text_match_phrase_schema->get_index_name(search_text_match_phrase_name))) {
+      LOG_WARN("failed to get search text match phrase index name", K(ret));
     }
 
     int64_t target_object_id = drop_index_arg->index_table_id_;
@@ -3027,10 +3027,18 @@ int ObDDLScheduler::create_drop_search_index_task(
     uint64_t data_index_table_id = OB_ISNULL(data_index_schema) ? OB_INVALID_ID : data_index_schema->get_table_id();
     uint64_t async_delete_table_id = OB_ISNULL(async_delete_schema)
         ? OB_INVALID_ID : async_delete_schema->get_table_id();
-    
+    uint64_t search_text_match_table_id = OB_ISNULL(search_text_match_schema)
+        ? OB_INVALID_ID : search_text_match_schema->get_table_id();
+    uint64_t search_text_match_phrase_table_id = OB_ISNULL(search_text_match_phrase_schema)
+        ? OB_INVALID_ID : search_text_match_phrase_schema->get_table_id();
+
     const ObFTSDDLChildTaskInfo search_def_index(def_index_name, def_index_table_id, 0/*task_id*/);
     const ObFTSDDLChildTaskInfo search_data_index(data_index_name, data_index_table_id, 0/*task_id*/);
     const ObFTSDDLChildTaskInfo async_delete(async_delete_name, async_delete_table_id, 0/*task_id*/);
+    const ObFTSDDLChildTaskInfo search_text_match(search_text_match_name,
+        search_text_match_table_id, 0/*task_id*/);
+    const ObFTSDDLChildTaskInfo search_text_match_phrase(search_text_match_phrase_name,
+        search_text_match_phrase_table_id, 0/*task_id*/);
     const ObDDLType ddl_type = index_schema->is_async_search_def_index()
         ? DDL_DROP_ASYNC_SEARCH_INDEX : DDL_DROP_SEARCH_INDEX;
     if (OB_FAIL(ret)) {
@@ -3041,14 +3049,16 @@ int ObDDLScheduler::create_drop_search_index_task(
                                        search_def_index,
                                        search_data_index,
                                        async_delete,
+                                       search_text_match,
+                                       search_text_match_phrase,
                                        drop_index_arg->ddl_stmt_str_,
-                                       schema_version,
-                                       consumer_group_id,
+                                       param.schema_version_,
+                                       param.consumer_group_id_,
                                        target_object_id))) {
       LOG_WARN("init drop index task failed", K(ret), K(data_table_id), K(search_def_index));
     } else if (OB_FAIL(index_task.set_trace_id(*ObCurTraceId::get_trace_id()))) {
       LOG_WARN("set trace id failed", K(ret));
-    } else if (OB_FAIL(insert_task_record(proxy, index_task, allocator, task_record))) {
+    } else if (OB_FAIL(insert_task_record(proxy, index_task, *param.allocator_, task_record))) {
       LOG_WARN("fail to insert task record", K(ret));
     }
   }

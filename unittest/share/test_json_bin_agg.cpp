@@ -66,6 +66,36 @@ public:
   }
 };
 
+class CountingAllocator : public ObIAllocator
+{
+public:
+  CountingAllocator() : allocator_(ObModIds::TEST), alloc_count_(0) {}
+
+  void *alloc(const int64_t size) override
+  {
+    ++alloc_count_;
+    return allocator_.alloc(size);
+  }
+
+  void *alloc(const int64_t size, const ObMemAttr &attr) override
+  {
+    UNUSED(attr);
+    ++alloc_count_;
+    return allocator_.alloc(size);
+  }
+
+  void free(void *ptr) override
+  {
+    allocator_.free(ptr);
+  }
+
+  int64_t alloc_count() const { return alloc_count_; }
+
+private:
+  ObArenaAllocator allocator_;
+  int64_t alloc_count_;
+};
+
 class TestJsonBinaryAggregate : public ::testing::Test
 {
 public:
@@ -130,11 +160,12 @@ protected:
     EXPECT_EQ(0, MEMCMP(expected.ptr(), actual.ptr(), expected.length()));
   }
 
-  int serialize_container(const ObJsonWrapper &root, ObStringBuffer &out)
+  int serialize_container(const ObJsonWrapper &root, ObStringBuffer &out,
+                          bool need_calc_depth = true)
   {
     int ret = OB_SUCCESS;
     const ObJsonNodeType root_type = root.json_type();
-    ObJsonBinAggSerializer bin_agg(allocator_, root_type);
+    ObJsonBinAggSerializer bin_agg(allocator_, root_type, need_calc_depth);
     for (uint32_t i = 0; OB_SUCC(ret) && i < root.element_count(); ++i) {
       ObJsonWrapper value;
       if (root_type == ObJsonNodeType::J_ARRAY) {
@@ -228,6 +259,61 @@ TEST_F(TestJsonBinaryAggregate, StableSort_ObjectSortedByKey)
   ObJsonBuffer out(&allocator_);
   ASSERT_EQ(OB_SUCCESS, serialize_and_print(bin_agg, out));
   EXPECT_STREQ("{\"a\": 2, \"b\": 3, \"c\": 1}", out.string().ptr());
+}
+
+TEST_F(TestJsonBinaryAggregate, SerializeStringCollectionMatchesStreamBinary)
+{
+  ObSEArray<ObString, 8> empty_values;
+  ObJsonBinAggSerializer empty_stream_serializer(allocator_, ObJsonNodeType::J_ARRAY);
+  ObStringBuffer empty_expected(&allocator_);
+  ASSERT_EQ(OB_SUCCESS, empty_stream_serializer.serialize(empty_expected));
+  ObString empty_actual;
+  ASSERT_EQ(OB_SUCCESS, ObJsonBinAggSerializer::serialize(
+      allocator_, empty_values, empty_actual));
+  expect_binary_equal(empty_expected.string(), empty_actual);
+
+  ObSEArray<ObString, 8> values;
+  ASSERT_EQ(OB_SUCCESS, values.push_back(ObString("")));
+  ASSERT_EQ(OB_SUCCESS, values.push_back(ObString("plain")));
+  ASSERT_EQ(OB_SUCCESS, values.push_back(ObString("中文")));
+  std::string long_value(300, 'x');
+  ASSERT_EQ(OB_SUCCESS, values.push_back(ObString(
+      static_cast<int32_t>(long_value.length()), long_value.data())));
+
+  ObJsonBinAggSerializer stream_serializer(allocator_, ObJsonNodeType::J_ARRAY);
+  for (int64_t i = 0; i < values.count(); ++i) {
+    ASSERT_EQ(OB_SUCCESS, stream_serializer.append_value(values.at(i)));
+  }
+  ObStringBuffer expected(&allocator_);
+  ASSERT_EQ(OB_SUCCESS, stream_serializer.serialize(expected));
+
+  ObString actual;
+  ASSERT_EQ(OB_SUCCESS, ObJsonBinAggSerializer::serialize(allocator_, values, actual));
+  expect_binary_equal(expected.string(), actual);
+}
+
+TEST_F(TestJsonBinaryAggregate, SerializeStringCollectionAllocatesFinalBufferOnce)
+{
+  CountingAllocator counting_allocator;
+  ObSEArray<ObString, 8> values;
+  ASSERT_EQ(OB_SUCCESS, values.push_back(ObString("id")));
+  ASSERT_EQ(OB_SUCCESS, values.push_back(ObString("name")));
+  ASSERT_EQ(OB_SUCCESS, values.push_back(ObString("age")));
+
+  ObString out;
+  ASSERT_EQ(OB_SUCCESS, ObJsonBinAggSerializer::serialize(
+      counting_allocator, values, out));
+  EXPECT_EQ(1, counting_allocator.alloc_count());
+}
+
+TEST_F(TestJsonBinaryAggregate, SerializeStringCollectionRejectsNonEmptyOutput)
+{
+  ObSEArray<ObString, 8> values;
+  ASSERT_EQ(OB_SUCCESS, values.push_back(ObString("batch")));
+  ObString out("occupied");
+  EXPECT_EQ(OB_INVALID_ARGUMENT,
+            ObJsonBinAggSerializer::serialize(allocator_, values, out));
+  EXPECT_EQ(ObString("occupied"), out);
 }
 
 TEST_F(TestJsonBinaryAggregate, StableSort_ArrayIsNoOp)
@@ -370,6 +456,72 @@ TEST_F(TestJsonBinaryAggregate, Depth_DeepNest)
   // ObIJsonBase::depth() walks the DOM tree for the true depth.
   ASSERT_EQ(OB_SUCCESS, bin_agg.append_key_value("a", wrap(inner)));
   EXPECT_EQ(inner->depth() + 1, bin_agg.depth());
+}
+
+TEST_F(TestJsonBinaryAggregate, DepthDisabledDoesNotVisitValues)
+{
+  class CountingJsonInt : public ObJsonInt
+  {
+  public:
+    CountingJsonInt() : ObJsonInt(7), depth_calls_(0), reported_depth_(1) {}
+    uint32_t depth() const override
+    {
+      ++depth_calls_;
+      return reported_depth_;
+    }
+    mutable int64_t depth_calls_;
+    uint32_t reported_depth_;
+  } value;
+
+  ObJsonBinAggSerializer normal(allocator_, ObJsonNodeType::J_ARRAY);
+  ObJsonBinAggSerializer skipped(allocator_, ObJsonNodeType::J_ARRAY, false);
+  EXPECT_EQ(UINT16_MAX, skipped.depth());
+  ASSERT_EQ(OB_SUCCESS, normal.append_value(wrap(&value)));
+  EXPECT_EQ(1, value.depth_calls_);
+  EXPECT_EQ(2u, normal.depth());
+  ASSERT_EQ(OB_SUCCESS, skipped.append_value(wrap(&value)));
+  EXPECT_EQ(1, value.depth_calls_);
+  EXPECT_EQ(UINT16_MAX, skipped.depth());
+
+  ObStringBuffer normal_out(&allocator_);
+  ObStringBuffer skipped_out(&allocator_);
+  ASSERT_EQ(OB_SUCCESS, normal.serialize(normal_out));
+  ASSERT_EQ(OB_SUCCESS, skipped.serialize(skipped_out));
+  expect_binary_equal(normal_out.string(), skipped_out.string());
+
+  // The default path must retain its depth overflow check.
+  value.reported_depth_ = UINT16_MAX;
+  EXPECT_EQ(OB_SIZE_OVERFLOW, normal.append_value(wrap(&value)));
+  EXPECT_EQ(2, value.depth_calls_);
+  ASSERT_EQ(OB_SUCCESS, skipped.append_value(wrap(&value)));
+  EXPECT_EQ(2, value.depth_calls_);
+}
+
+TEST_F(TestJsonBinaryAggregate, DepthDisabledPreservesBinary)
+{
+  const char *fixtures[] = {
+    "[]",
+    "[null,true,-129,256,3.5,\"json\",[],{},[1,2],{\"a\":[{\"b\":false}]}]",
+    "{\"z\":null,\"a\":[1,2],\"nested\":{\"b\":[true]},\"s\":\"value\"}"
+  };
+  for (const char *text : fixtures) {
+    ObIJsonBase *dom = parse_dom(text);
+    ASSERT_NE(nullptr, dom);
+    ObString raw;
+    ASSERT_EQ(OB_SUCCESS, serialize_dom_binary(dom, raw));
+    ObIJsonBase *bin = parse_bin(raw);
+    ASSERT_NE(nullptr, bin);
+    ObJsonBinView view;
+    ASSERT_EQ(OB_SUCCESS, view.init(raw.ptr(), raw.length()));
+    ObJsonWrapper inputs[] = {wrap(dom), wrap(bin), ObJsonWrapper(view)};
+    for (const ObJsonWrapper &input : inputs) {
+      ObStringBuffer normal_out(&allocator_);
+      ObStringBuffer skipped_out(&allocator_);
+      ASSERT_EQ(OB_SUCCESS, serialize_container(input, normal_out));
+      ASSERT_EQ(OB_SUCCESS, serialize_container(input, skipped_out, false));
+      expect_binary_equal(normal_out.string(), skipped_out.string());
+    }
+  }
 }
 
 // ---- combined flow: stable_sort + unique + serialize ----

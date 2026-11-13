@@ -2679,7 +2679,7 @@ int ObTableSqlService::batch_create_table(ObIArray<ObTableSchema> &tables,
       if (OB_FAIL(ret)) {
       } else if (sync_schema_version_for_last_table && table_need_sync_schema_version(last_table)) {
         uint64_t data_table_id = last_table.get_data_table_id();
-        if (last_table.is_search_data_index()) {
+        if (last_table.is_search_aux_index()) {
           for (int64_t j = 0; j < tables.count(); j++) {
             if (data_table_id == tables.at(j).get_table_id()) {
               data_table_id = tables.at(j).get_data_table_id();

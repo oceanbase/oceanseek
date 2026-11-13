@@ -16,10 +16,8 @@
 #include "sql/das/search/ob_das_logical_bm25_stats.h"
 #include "ob_block_stat_iter.h"
 #include "ob_inv_idx_param_estimator.h"
-#include "storage/access/ob_table_scan_range.h"
 #include "storage/ob_storage_struct.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable_struct.h"
-#include "share/ob_simple_batch.h"
 
 
 namespace oceanbase
@@ -405,13 +403,13 @@ ObAsyncBM25ParamEstimator::ObAsyncBM25ParamEstimator()
     avg_doc_token_cnt_(0.0),
     search_ctx_(nullptr),
     ir_scan_ctdef_(nullptr),
-    ir_scan_rtdef_(nullptr),
     tablet_id_(),
     query_token_(),
+    search_text_column_idx_(0),
+    search_text_path_(),
     param_cache_(nullptr),
-    inv_scan_param_(),
+    is_search_text_(false),
     estimated_(false),
-    inv_scan_param_inited_(false),
     is_inited_(false)
 {
 }
@@ -423,13 +421,13 @@ void ObAsyncBM25ParamEstimator::reset()
   avg_doc_token_cnt_ = 0.0;
   search_ctx_ = nullptr;
   ir_scan_ctdef_ = nullptr;
-  ir_scan_rtdef_ = nullptr;
   tablet_id_.reset();
   query_token_.reset();
+  search_text_column_idx_ = 0;
+  search_text_path_.reset();
   param_cache_ = nullptr;
-  inv_scan_param_.destroy();
+  is_search_text_ = false;
   estimated_ = false;
-  inv_scan_param_inited_ = false;
   is_inited_ = false;
 }
 
@@ -440,23 +438,39 @@ int ObAsyncBM25ParamEstimator::init(
     const common::ObTabletID &inv_idx_tablet_id,
     const common::ObString &query_token)
 {
+  return init(search_ctx, ir_scan_ctdef, ir_scan_rtdef, inv_idx_tablet_id,
+              false /* is_search_text */, 0, common::ObString(), query_token);
+}
+
+int ObAsyncBM25ParamEstimator::init(
+    sql::ObDASSearchCtx &search_ctx,
+    const sql::ObDASIRScanCtDef &ir_scan_ctdef,
+    ObDASIRScanRtDef &ir_scan_rtdef,
+    const common::ObTabletID &inv_idx_tablet_id,
+    const bool is_search_text,
+    const uint64_t search_text_column_idx,
+    const common::ObString &search_text_path,
+    const common::ObString &query_token)
+{
   int ret = OB_SUCCESS;
   if (IS_INIT) {
     ret = OB_INIT_TWICE;
     LOG_WARN("init twice", K(ret));
   } else if (OB_UNLIKELY(query_token.empty())) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument", K(ret), K(query_token));
+    LOG_WARN("invalid query token", K(ret), "token_len", query_token.length());
   } else {
     total_doc_cnt_ = 0;
     token_doc_cnt_ = 0;
     avg_doc_token_cnt_ = 0.0;
     search_ctx_ = &search_ctx;
     ir_scan_ctdef_ = &ir_scan_ctdef;
-    ir_scan_rtdef_ = &ir_scan_rtdef;
     tablet_id_ = inv_idx_tablet_id;
     query_token_ = query_token;
+    search_text_column_idx_ = search_text_column_idx;
+    search_text_path_ = search_text_path;
     param_cache_ = &search_ctx.get_bm25_param_cache();
+    is_search_text_ = is_search_text;
     estimated_ = false;
     is_inited_ = true;
   }
@@ -471,7 +485,7 @@ int ObAsyncBM25ParamEstimator::switch_query_token(const common::ObString &query_
     LOG_WARN("not init", K(ret));
   } else if (OB_UNLIKELY(query_token.empty())) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument", K(ret), K(query_token));
+    LOG_WARN("invalid query token", K(ret), "token_len", query_token.length());
   } else {
     query_token_ = query_token;
     token_doc_cnt_ = 0;
@@ -509,58 +523,27 @@ int ObAsyncBM25ParamEstimator::get_bm25_params(
   return ret;
 }
 
-int ObAsyncBM25ParamEstimator::build_token_doc_cnt_scan_param(
-    common::ObObj (&range_objs)[4],
-    ObTableScanParam &est_param)
+int ObAsyncBM25ParamEstimator::get_pinned_statistics_tablet_(
+    const sql::ObAsyncIndexPartitionSegCtx *&partition,
+    const ObTabletHandle *&pinned_tablet_handle) const
 {
   int ret = OB_SUCCESS;
-  const sql::ObDASScalarScanCtDef *inv_scan_ctdef = ir_scan_ctdef_->get_inv_idx_scan_scalar_ctdef();
-  sql::ObDASScalarScanRtDef *inv_scan_rtdef = ir_scan_rtdef_->get_inv_idx_scan_scalar_rtdef();
-  if (OB_ISNULL(inv_scan_ctdef) || OB_ISNULL(inv_scan_rtdef) || OB_ISNULL(ir_scan_ctdef_->search_text_)) {
+  partition = nullptr;
+  pinned_tablet_handle = nullptr;
+  if (OB_ISNULL(search_ctx_)) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected null inv idx scan scalar def", K(ret));
-  } else if (OB_UNLIKELY(inv_scan_rtdef->get_ctdef() != inv_scan_ctdef)) {
+    LOG_WARN("unexpected null ptr", K(ret), KP_(search_ctx));
+  } else if (OB_ISNULL(partition = search_ctx_->get_current_async_partition())) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("inv idx scan ctdef and rtdef mismatch", K(ret),
-             KP(inv_scan_ctdef), KP(inv_scan_rtdef->get_ctdef()));
-  } else if (!inv_scan_param_inited_
-      && OB_FAIL(search_ctx_->init_scan_param(
-          tablet_id_, inv_scan_ctdef, inv_scan_rtdef, inv_scan_param_))) {
-    LOG_WARN("failed to init inv idx scan param", K(ret), K_(tablet_id));
-  } else {
-    inv_scan_param_inited_ = true;
-    // [<token>, MIN] .. [<token>, MAX] over the (term, doc_id) key (mirrors
-    // ObDASTokenOp::init_scan_range).
-    range_objs[0].set_common_value(query_token_);
-    range_objs[0].set_meta_type(ir_scan_ctdef_->search_text_->obj_meta_);
-    range_objs[1].set_min_value();
-    range_objs[2].set_common_value(query_token_);
-    range_objs[2].set_meta_type(ir_scan_ctdef_->search_text_->obj_meta_);
-    range_objs[3].set_max_value();
-    common::ObNewRange scan_range;
-    scan_range.table_id_ = inv_scan_ctdef->ref_table_id_;
-    scan_range.start_key_.assign(range_objs, 2);
-    scan_range.end_key_.assign(range_objs + 2, 2);
-    scan_range.border_flag_.set_inclusive_start();
-    scan_range.border_flag_.set_inclusive_end();
-    inv_scan_param_.key_ranges_.reuse();
-    if (OB_FAIL(inv_scan_param_.key_ranges_.push_back(scan_range))) {
-      LOG_WARN("failed to push back token scan range", K(ret), K(scan_range));
-    }
-  }
-
-  if (OB_FAIL(ret)) {
-  } else if (OB_UNLIKELY(inv_scan_param_.key_ranges_.empty())) {
+    LOG_WARN("unexpected null async index partition", K(ret));
+  } else if (OB_UNLIKELY(partition->ls_id_ != search_ctx_->get_ls_id())) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("inv scan param has no key range", K(ret));
-  } else {
-    est_param.index_id_ = inv_scan_param_.index_id_;
-    est_param.scan_flag_ = inv_scan_param_.scan_flag_;
-    est_param.tablet_id_ = inv_scan_param_.tablet_id_;
-    est_param.ls_id_ = inv_scan_param_.ls_id_;
-    est_param.tx_id_ = inv_scan_param_.tx_id_;
-    est_param.schema_version_ = inv_scan_param_.schema_version_;
-    est_param.frozen_version_ = GET_BATCH_ROWS_READ_SNAPSHOT_VERSION;
+    LOG_WARN("async index partition ls mismatch", K(ret), K(partition->ls_id_), "search_ls_id", search_ctx_->get_ls_id());
+  } else if (OB_FAIL(partition->get_pinned_index_tablet_handle(tablet_id_, pinned_tablet_handle))) {
+    LOG_WARN("failed to get pinned async index tablet handle", K(ret), K_(tablet_id));
+  } else if (OB_ISNULL(pinned_tablet_handle)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null pinned async index tablet handle", K(ret), K_(tablet_id));
   }
   return ret;
 }
@@ -572,42 +555,37 @@ int ObAsyncBM25ParamEstimator::get_token_doc_cnt(uint64_t &token_doc_cnt)
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", K(ret));
-  } else if (OB_FAIL(param_cache_->get_token_doc_cnt(tablet_id_, query_token_, token_doc_cnt))) {
+  } else if (OB_FAIL(is_search_text_
+             ? param_cache_->get_token_doc_cnt(tablet_id_, search_text_column_idx_, search_text_path_, query_token_, token_doc_cnt)
+             : param_cache_->get_token_doc_cnt(tablet_id_, query_token_, token_doc_cnt))) {
     if (OB_UNLIKELY(OB_ENTRY_NOT_EXIST != ret && OB_HASH_NOT_EXIST != ret)) {
-      LOG_WARN("failed to get token doc cnt from cache", K(ret), K_(tablet_id), K_(query_token));
+      LOG_WARN("failed to get token doc cnt from cache", K(ret), K_(tablet_id), "token_len", query_token_.length());
     } else {
-      // cache miss: estimate via estimate_row_count over the inv idx scan range.
-      int64_t logical_row_cnt = 0;
-      int64_t physical_row_cnt = 0;
-      ObSEArray<ObEstRowCountRecord, 1> est_records;
-      ObArenaAllocator allocator("InvTokDocEst", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
-      const int64_t timeout_us = THIS_WORKER.get_timeout_remain();
+      blocksstable::ObAsyncInvBM25Stats stats;
       ObAccessService *access_service = MTL(ObAccessService *);
-      storage::ObTableScanRange table_scan_range;
-      ObSimpleBatch batch;
-      // TODO: parameters of estimate row count could be simplified
-      common::ObObj range_objs[4];
-      ObTableScanParam est_param;
+      const sql::ObAsyncIndexPartitionSegCtx *partition = nullptr;
+      const ObTabletHandle *pinned_tablet_handle = nullptr;
+      blocksstable::ObStorageDatum datums[blocksstable::SEARCH_TEXT_TOKEN];
+      datums[blocksstable::SEARCH_TEXT_COL_IDX].set_uint(search_text_column_idx_);
+      datums[blocksstable::SEARCH_TEXT_PATH].set_string(search_text_path_);
+      const blocksstable::ObDatumRowkey field_prefix(datums, blocksstable::SEARCH_TEXT_TOKEN);
       if (OB_ISNULL(access_service)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("null access service", K(ret));
-      } else if (OB_FAIL(build_token_doc_cnt_scan_param(range_objs, est_param))) {
-        LOG_WARN("failed to build token doc cnt scan param", K(ret), K_(tablet_id), K_(query_token));
+      } else if (OB_FAIL(get_pinned_statistics_tablet_(partition, pinned_tablet_handle))) {
+        LOG_WARN("failed to get pinned statistics tablet", K(ret));
+      } else if (OB_FAIL(access_service->get_async_inv_token_doc_cnt(
+                 search_ctx_->get_ls_id(), tablet_id_, *pinned_tablet_handle,
+                 partition->get_read_snapshot(), is_search_text_ ? &field_prefix : nullptr,
+                 query_token_, stats))) {
+        LOG_WARN("failed to get cached token document count", K(ret), K_(tablet_id));
       } else {
-        batch.type_ = ObSimpleBatch::T_SCAN;
-        batch.range_ = &inv_scan_param_.key_ranges_.at(0);
-      }
-
-      if (FAILEDx(table_scan_range.init(inv_scan_param_, batch, allocator))) {
-        LOG_WARN("failed to init table scan range", K(ret), K(batch));
-      } else if (OB_FAIL(access_service->estimate_row_count(
-          est_param, table_scan_range, timeout_us, est_records,
-          logical_row_cnt, physical_row_cnt))) {
-        LOG_WARN("failed to estimate row count", K(ret), K(est_param));
-      } else {
-        token_doc_cnt = logical_row_cnt;
-        if (OB_FAIL(param_cache_->set_token_doc_cnt(tablet_id_, query_token_, token_doc_cnt))) {
-          LOG_WARN("failed to set token doc cnt to cache", K(ret), K_(tablet_id), K_(query_token));
+        token_doc_cnt = stats.token_doc_cnt_;
+        if (OB_FAIL(is_search_text_
+                    ? param_cache_->set_token_doc_cnt(
+                      tablet_id_, search_text_column_idx_, search_text_path_, query_token_, token_doc_cnt)
+                    : param_cache_->set_token_doc_cnt(tablet_id_, query_token_, token_doc_cnt))) {
+          LOG_WARN("failed to cache query token document count", K(ret), K_(tablet_id));
         }
       }
     }
@@ -646,52 +624,66 @@ int ObAsyncBM25ParamEstimator::do_total_doc_cnt_estimation_on_demand()
 int ObAsyncBM25ParamEstimator::do_avg_doc_token_cnt_estimation_on_demand()
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(param_cache_->get_avg_doc_token_cnt(tablet_id_, avg_doc_token_cnt_))) {
+  const uint64_t column_idx = is_search_text_ ? search_text_column_idx_ : OB_INVALID_ID;
+  const ObString path = is_search_text_ ? search_text_path_ : ObString();
+  if (OB_FAIL(param_cache_->get_avg_doc_token_cnt(tablet_id_, column_idx, path, avg_doc_token_cnt_))) {
     if (OB_UNLIKELY(OB_ENTRY_NOT_EXIST != ret && OB_HASH_NOT_EXIST != ret)) {
-      LOG_WARN("failed to get avg doc token cnt from cache", K(ret), K_(tablet_id));
+      LOG_WARN("failed to get avg doc token cnt from cache", K(ret), K_(tablet_id), K(column_idx), K(path));
     } else {
       ret = OB_SUCCESS;
       blocksstable::ObAsyncInvBM25Stats stats;
+      blocksstable::ObStorageDatum datums[2];
+      datums[0].set_uint(column_idx);
+      datums[1].set_string(path);
+      blocksstable::ObDatumRowkey field_prefix(datums, 2);
       ObAccessService *access_service = MTL(ObAccessService *);
       const sql::ObAsyncIndexPartitionSegCtx *partition = nullptr;
       const ObTabletHandle *pinned_tablet_handle = nullptr;
-      if (OB_ISNULL(access_service) || OB_ISNULL(search_ctx_)) {
+      if (OB_ISNULL(access_service)) {
         ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unexpected null ptr", K(ret), KP(access_service), KP_(search_ctx));
-      } else if (OB_ISNULL(partition = search_ctx_->get_current_async_partition())) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unexpected null async index partition", K(ret));
-      } else if (OB_UNLIKELY(partition->ls_id_ != search_ctx_->get_ls_id())) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("async index partition ls mismatch", K(ret), K(partition->ls_id_),
-            "search_ls_id", search_ctx_->get_ls_id());
-      } else if (OB_FAIL(partition->get_pinned_index_tablet_handle(
-          tablet_id_, pinned_tablet_handle))) {
-        LOG_WARN("failed to get pinned async index tablet handle", K(ret), K_(tablet_id));
-      } else if (OB_ISNULL(pinned_tablet_handle)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unexpected null pinned async index tablet handle", K(ret), K_(tablet_id));
+        LOG_WARN("null access service", K(ret));
+      } else if (OB_FAIL(get_pinned_statistics_tablet_(partition, pinned_tablet_handle))) {
+        LOG_WARN("failed to get pinned statistics tablet", K(ret));
       // Use the same pinned tablet and logical read boundary as posting scans.
-      } else if (OB_FAIL(access_service->get_async_inv_bm25_stats(
-          search_ctx_->get_ls_id(), tablet_id_, *pinned_tablet_handle,
-          partition->get_read_snapshot(), stats))) {
-        LOG_WARN("failed to get async inv bm25 stats", K(ret), K_(tablet_id),
-            "read_snapshot", partition->get_read_snapshot());
-      } else {
-        if (total_doc_cnt_ > 0 && stats.total_doc_length_ > 0) {
-          avg_doc_token_cnt_ = static_cast<double>(stats.total_doc_length_) /
-                               static_cast<double>(total_doc_cnt_);
-          // align with sync path: clamp avg doc len to DEFAULT_AVG_DOC_TOKEN_CNT lower bound
-          avg_doc_token_cnt_ = avg_doc_token_cnt_ > sql::ObExprBM25::DEFAULT_AVG_DOC_TOKEN_CNT
-              ? avg_doc_token_cnt_
-              : sql::ObExprBM25::DEFAULT_AVG_DOC_TOKEN_CNT;
-        } else {
-          avg_doc_token_cnt_ = sql::ObExprBM25::DEFAULT_AVG_DOC_TOKEN_CNT;
-        }
+      } else if (OB_FAIL(access_service->get_async_inv_total_doc_length(
+                 search_ctx_->get_ls_id(), tablet_id_, *pinned_tablet_handle,
+                 partition->get_read_snapshot(), is_search_text_ ? &field_prefix : nullptr, stats))) {
+        LOG_WARN("failed to get async inverted total document length", K(ret), K_(tablet_id),
+                 K(column_idx), K(path), "read_snapshot", partition->get_read_snapshot());
+      } else if (OB_FAIL(calc_avg_doc_length(stats.total_doc_length_.get_number(), total_doc_cnt_, avg_doc_token_cnt_))) {
+        LOG_WARN("failed to calculate async average document length", K(ret), K(stats));
       }
 
-      if (FAILEDx(param_cache_->set_avg_doc_token_cnt(tablet_id_, avg_doc_token_cnt_))) {
-        LOG_WARN("failed to set avg doc token cnt to cache", K(ret), K_(tablet_id), K_(avg_doc_token_cnt));
+      if (FAILEDx(param_cache_->set_avg_doc_token_cnt(tablet_id_, column_idx, path, avg_doc_token_cnt_))) {
+        LOG_WARN("failed to set avg doc token cnt to cache", K(ret), K_(tablet_id), K(column_idx), K(path), K_(avg_doc_token_cnt));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObAsyncBM25ParamEstimator::calc_avg_doc_length(const number::ObNumber &total_doc_length, const uint64_t total_doc_cnt, double &avg_doc_length)
+{
+  int ret = OB_SUCCESS;
+  avg_doc_length = sql::ObExprBM25::DEFAULT_AVG_DOC_TOKEN_CNT;
+  if (total_doc_cnt > 0 && !total_doc_length.is_zero()) {
+    sql::ObNumStackAllocator<2> allocator;
+    number::ObNumber count;
+    number::ObNumber average;
+    ObObj source, result;
+    ObCastCtx cast_ctx(&allocator, nullptr, CM_NONE, ObCharset::get_system_collation());
+    if (OB_FAIL(count.from(total_doc_cnt, allocator))) {
+      LOG_WARN("failed to convert document count to number", K(ret), K(total_doc_cnt));
+    } else if (OB_FAIL(total_doc_length.div_v3(count, average, allocator))) {
+      LOG_WARN("failed to divide document length by document count", K(ret), K(total_doc_length), K(count));
+    } else {
+      // Keep L as Number through division; only the final BM25 average becomes double.
+      source.set_number(average);
+      if (OB_FAIL(ObObjCaster::to_type(ObDoubleType, cast_ctx, source, result))) {
+        LOG_WARN("failed to cast average document length to double", K(ret), K(average));
+      } else {
+        // Ordinary full text and Search Text use the same lower bound as synchronous FTS.
+        avg_doc_length = MAX(result.get_double(), sql::ObExprBM25::DEFAULT_AVG_DOC_TOKEN_CNT);
       }
     }
   }

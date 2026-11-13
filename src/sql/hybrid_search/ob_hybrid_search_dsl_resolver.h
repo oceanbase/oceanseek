@@ -596,7 +596,6 @@ private :
   int build_json_extract_expr(ObRawExpr *col_expr, const ObString &json_path, ObRawExpr *&expr);
   int build_json_overlaps_array_expr(ObRawExpr *target_expr, const ObIArray<ObRawExpr*> &value_exprs, ObRawExpr *&expr);
   int check_fields_collation_types(const ObIArray<ObColumnRefRawExpr*> &fields, bool &compatible);
-  int check_fields_parsers(const ObIArray<ObColumnRefRawExpr*> &fields, bool &compatible);
   int collect_exprs();
   int construct_dist_expr(ObColumnRefRawExpr *field_expr, ObRawExpr *vector_expr, ObVectorIndexDistAlgorithm dist_algo, ObRawExpr *&distance_expr);
   int construct_required_params(const char *param_names[], uint32_t name_count, RequiredParamsSet &required_params);
@@ -614,9 +613,12 @@ private :
                          ObVectorIndexDistAlgorithm &algo_type,
                          bool &is_brute_force);
   int get_field_expr_and_path(const ObString &field_name, ObColumnRefRawExpr *&col_expr, ObString &path_str);
+  // col_name must be normalized with CS_TYPE_UTF8MB4_GENERAL_CI.
   int get_fulltext_index_schema(const ObString &col_name, const ObTableSchema *&index_schema);
   int get_json_string_from_node(const ParseNode *node, ObString &json_str);
   int get_user_column_expr(ObString &col_name, ObColumnRefRawExpr *&col_expr);
+  // On success, replace field_name with the normalized SQL column name; preserve JSON member spelling.
+  int resolve_field_expr_and_path(ObString &field_name, ObColumnRefRawExpr *&col_expr, ObString &path_str);
   int has_user_column_name(const ObString &col_name, bool &exists, ObColumnRefRawExpr **col_expr = nullptr);
   int check_aggs_bucket_name(const ObString &agg_name);
   static int trunc_json_float_to_int(ObIJsonBase &json_node, bool is_unsigned,
@@ -644,7 +646,7 @@ private :
   int resolve_const_to_int(ObIJsonBase &req_node, ObConstRawExpr *&const_expr);
   int resolve_const_to_uint(ObIJsonBase &req_node, ObConstRawExpr *&const_expr);
   int resolve_default_params(ObIJsonBase &req_node);
-  int resolve_field(ObIJsonBase &req_node, ObColumnRefRawExpr *&col_expr, ObConstRawExpr *&boost_expr);
+  int resolve_field(ObIJsonBase &req_node, ObColumnRefRawExpr *&col_expr, ObConstRawExpr *&boost_expr, ObString &col_path);
   int resolve_from(ObIJsonBase &req_node);
   int resolve_json_contains(ObIJsonBase &req_node, ObDSLQuery *&query, ObDSLQuery *parent_query, ObEsQueryItem outer_query_type);
   int resolve_json_expr(ObIJsonBase &req_node, ObDSLQuery *&query, ObDSLQuery *parent_query, ObEsQueryItem outer_query_type, ObEsQueryItem query_type);
@@ -674,7 +676,11 @@ private :
   int resolve_query(ObIJsonBase &req_node);
   int resolve_query_search_options(ObIJsonBase &req_node);
   int resolve_query_string(ObIJsonBase &req_node, ObDSLQuery *&query, ObDSLQuery *parent_query, ObEsQueryItem outer_query_type);
-  int resolve_query_string_fields(ObIJsonBase &req_node, ObIArray<ObColumnRefRawExpr*> &fields, ObIArray<ObConstRawExpr*> &field_boosts, bool &compatible);
+  int resolve_query_string_fields(ObIJsonBase &req_node,
+                                  ObIArray<ObColumnRefRawExpr*> &fields,
+                                  ObIArray<ObConstRawExpr*> &field_boosts,
+                                  ObIArray<ObString> &field_paths,
+                                  bool &compatible);
   int resolve_query_string_operator(ObIJsonBase &req_node, ObMatchOperator &opr);
   int resolve_query_string_query(ObIJsonBase &req_node, ObRawExpr *&query_expr,
       ObCollationType collation_type);

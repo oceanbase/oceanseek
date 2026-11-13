@@ -58,7 +58,7 @@ protected:
   int generate_and_push_lob_aux_for_host_(
       share::ObIDGenerator &id_generator,
       const int64_t host_pos);
-  int build_search_index_mapping_();
+  int build_search_index_mapping_(const common::ObIArray<obrpc::ObCreateIndexArg> &index_args);
   int create_sequences_();
   int deal_with_mock_fk_parent_tables_(
       const uint64_t replace_mock_fk_parent_table_id);

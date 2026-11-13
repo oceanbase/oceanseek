@@ -306,6 +306,8 @@ public:
   const ObTableSchema *hybrid_vec_embedded_schema_;
   const ObTableSchema *def_index_schema_;
   const ObTableSchema *data_index_schema_;
+  const ObTableSchema *search_text_match_schema_;
+  const ObTableSchema *search_text_match_phrase_schema_;
 
 
   uint64_t tenant_data_version_;

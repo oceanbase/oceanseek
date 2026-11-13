@@ -731,7 +731,7 @@ int ObDDLOperator::get_table_drop_phase_(ObSchemaGetterGuard &schema_guard,
   if (!table.is_aux_table() && !table.is_mlog_table()) {
     // main table, drop last
     phase = 0;
-  } else if (table.is_search_data_index()) {
+  } else if (table.is_search_aux_index()) {
     // references search_def_index via data_table_id, must drop before it
     phase = 2;
   } else if (table.is_aux_lob_table()) {
@@ -4890,9 +4890,9 @@ int ObDDLOperator::rename_table(const ObTableSchema &table_schema,
                   const uint64_t index_lob_meta_tid = new_aux_table_schema.get_aux_lob_meta_tid();
                   const uint64_t index_lob_piece_tid = new_aux_table_schema.get_aux_lob_piece_tid();
                   const bool is_search_def_index = new_aux_table_schema.is_search_def_index();
-                  uint64_t search_data_index_tid = OB_INVALID_ID;
+                  ObSEArray<uint64_t, 3> search_aux_table_ids;
                   if (is_search_def_index &&
-                      OB_FAIL(new_aux_table_schema.get_search_data_index_tid(search_data_index_tid))) {
+                      OB_FAIL(new_aux_table_schema.get_search_aux_index_tids(search_aux_table_ids))) {
                     RS_LOG(WARN, "fail to get search data index table id", K(ret),
                         "search_def_index_tid", new_aux_table_schema.get_table_id());
                   } else if (OB_FAIL(idx_schema_versions.push_back(
@@ -4928,7 +4928,8 @@ int ObDDLOperator::rename_table(const ObTableSchema &table_schema,
                           K(new_aux_table_schema.get_schema_version()));
                     }
                   }
-                  if (OB_SUCC(ret) && is_search_def_index) {
+                  for (int64_t j = 0; OB_SUCC(ret) && j < search_aux_table_ids.count(); ++j) {
+                    const uint64_t search_data_index_tid = search_aux_table_ids.at(j);
                     if (OB_FAIL(rename_aux_table(new_table_schema,
                                                 search_data_index_tid,
                                                 schema_guard,
@@ -10049,7 +10050,7 @@ int ObDDLOperator::drop_inner_generated_index_column(ObMySQLTransaction &trans,
   const ObColumnSchemaV2 *index_col = NULL;
   const uint64_t tenant_id = index_schema.get_tenant_id();
   uint64_t data_table_id = index_schema.get_data_table_id();
-  const bool is_search_data_index = index_schema.is_search_data_index();
+  const bool is_search_data_index = index_schema.is_search_aux_index();
   if (OB_FAIL(schema_guard.get_table_schema(tenant_id, data_table_id, data_table))) {
     LOG_WARN("get table schema failed", KR(ret), K(tenant_id), K(data_table_id));
   } else if (OB_ISNULL(data_table)) {

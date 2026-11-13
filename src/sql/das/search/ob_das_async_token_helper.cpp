@@ -8,6 +8,7 @@
 #include "sql/das/search/ob_das_async_index_query_ctx.h"
 #include "sql/das/search/ob_das_async_segment_merge_op.h"
 #include "sql/das/search/ob_das_scalar_define.h"
+#include "sql/das/search/ob_das_search_utils.h"
 #include "storage/tx_storage/ob_access_service.h"
 
 namespace oceanbase
@@ -66,14 +67,26 @@ int ObDASAsyncTokenHelper::init(const ObDASAsyncTokenHelperParam &param)
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("async token helper only supports uint64 rowid", K(ret),
              "rowid_type", search_ctx_.get_rowid_type());
-  } else if (OB_FAIL(init_term_key(param.query_token_))) {
+  } else if (FALSE_IT(ir_ctdef_ = param.ir_ctdef_)) {
+  } else if (is_search_text() && OB_ISNULL(ir_ctdef_->search_text_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null Search Text expression", K(ret));
+  } else if (is_search_text() && OB_FAIL(ObDASSearchUtils::build_fulltext_term_key(
+                 ir_ctdef_->search_index_fulltext_info_, param.query_token_, ir_ctdef_->search_text_->obj_meta_,
+                 arena_allocator_, term_key_))) {
+    LOG_WARN("failed to init term key", K(ret), "token_len", param.query_token_.length());
+    arena_allocator_.reset();
+    term_datums_ = nullptr;
+    term_key_.reset();
+    query_token_.reset();
+  } else if (!is_search_text() && OB_FAIL(init_term_key(param.query_token_))) {
     LOG_WARN("failed to init term key", K(ret), "token_len", param.query_token_.length());
     arena_allocator_.reset();
     term_datums_ = nullptr;
     term_key_.reset();
     query_token_.reset();
   } else {
-    ir_ctdef_ = param.ir_ctdef_;
+    query_token_ = term_key_.get_datum(term_key_.get_datum_cnt() - 1).get_string();
     ir_rtdef_ = param.ir_rtdef_;
     index_table_id_ = param.index_table_id_;
     group_slot_ = param.group_slot_;
@@ -155,6 +168,7 @@ int ObDASAsyncTokenHelper::init_posting_scan_param()
   posting_scan_param_.tablet_id_ = inv_idx_tablet_id_;
   posting_scan_param_.query_flag_ = query_flag_;
   posting_scan_param_.allocator_ = &posting_iter_allocator_;
+  posting_scan_param_.need_relevance_params_ = true;
   posting_scan_param_.need_posting_value_ = true;
   if (search_ctx_.has_docid_range()) {
     if (!search_ctx_.get_docid_range_lo().is_min_value()) {
@@ -174,7 +188,9 @@ int ObDASAsyncTokenHelper::init_bm25_param_estimator()
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected null ir ctdef/rtdef", K(ret));
   } else if (OB_FAIL(param_estimator_.init(search_ctx_, *ir_ctdef_, *ir_rtdef_,
-                                           inv_idx_tablet_id_, query_token_))) {
+                                           inv_idx_tablet_id_, is_search_text(),
+                                           ir_ctdef_->search_index_fulltext_info_.column_idx_,
+                                           ir_ctdef_->search_index_fulltext_info_.encoded_path_, query_token_))) {
     LOG_WARN("failed to init bm25 param estimator", K(ret));
   }
   return ret;
@@ -189,7 +205,9 @@ int ObDASAsyncTokenHelper::init_bm25_param_estimator(storage::ObAsyncBM25ParamEs
   } else if (OB_FAIL(init_inv_idx_scan_param())) {
     LOG_WARN("failed to init inv idx scan param for bm25 estimator", K(ret));
   } else if (OB_FAIL(estimator.init(search_ctx_, *ir_ctdef_, *ir_rtdef_,
-                                    inv_idx_tablet_id_, query_token_))) {
+                                    inv_idx_tablet_id_, is_search_text(),
+                                    ir_ctdef_->search_index_fulltext_info_.column_idx_,
+                                    ir_ctdef_->search_index_fulltext_info_.encoded_path_, query_token_))) {
     LOG_WARN("failed to init shared bm25 param estimator", K(ret));
   }
   return ret;

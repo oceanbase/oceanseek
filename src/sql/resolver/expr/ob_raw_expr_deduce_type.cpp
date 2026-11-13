@@ -3367,6 +3367,26 @@ int ObRawExprDeduceType::visit(ObMatchFunRawExpr &expr)
       LOG_WARN("add_implicit_cast failed", K(ret));
     }
   }
+  if (OB_SUCC(ret) && OB_NOT_NULL(expr.get_json_path_expr())) {
+    ObExprResType path_type = expr.get_json_path_expr()->get_result_type();
+    if (!path_type.is_null()
+        && (!ob_is_string_type(path_type.get_type())
+            || path_type.get_charset_type() != CHARSET_UTF8MB4)) {
+      // Apply the same path argument conversion as JSON_EXTRACT.
+      ObCastMode def_cast_mode = CM_NONE;
+      path_type.set_calc_meta(path_type.get_obj_meta());
+      if (!ob_is_string_type(path_type.get_type())) {
+        path_type.set_calc_type(ObLongTextType);
+      }
+      path_type.set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
+      if (OB_FAIL(ObSQLUtils::get_default_cast_mode(false, 0, my_session_, def_cast_mode))) {
+        LOG_WARN("get_default_cast_mode failed", K(ret));
+      } else if (OB_FAIL(try_add_cast_expr(expr, expr.get_search_key_idx() + 1,
+                                          path_type, def_cast_mode))) {
+        LOG_WARN("failed to add JSON path implicit cast", K(ret));
+      }
+    }
+  }
   if (OB_FAIL(ret)) {
   } else if (expr.is_es_match()) {
     for (int64_t i = 0; OB_SUCC(ret) && i < expr.get_columns_boosts().count(); ++i) {

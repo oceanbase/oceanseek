@@ -976,6 +976,7 @@ protected:
   int gen_values_table_column_items(const int64_t column_cnt,
                                     const ObIArray<ObRawExprResType> &res_types,
                                     TableItem &table_item);
+  int resolve_search_text_expr(ObMatchFunRawExpr &expr, const share::schema::ObTableSchema &table);
   int resolve_match_against_expr(ObMatchFunRawExpr &expr);
   int resolve_es_match_expr(ObMatchFunRawExpr &expr);
   int resolve_index_data_gen_table_column_item(const ParseNode &parse_tree,

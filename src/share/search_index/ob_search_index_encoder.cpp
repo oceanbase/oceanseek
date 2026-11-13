@@ -8,6 +8,7 @@
 #include "share/search_index/ob_search_index_encoder.h"
 #include "lib/oblog/ob_log_module.h"
 #include "lib/json_type/ob_json_base.h"
+#include "lib/json_type/ob_json_wrapper.h"
 #include "lib/json_type/ob_json_tree.h"
 #include "lib/utility/ob_macro_utils.h"
 #include "lib/utility/ob_print_utils.h"
@@ -111,7 +112,8 @@ static inline int64_t count_null_bytes(const ObString &str) {
   $.path[].subpath => 0x00 0x1c path 0x00 0x20 0x00 0x1c subpath 0x00 type
 */
 int64_t ObSearchIndexPathEncoder::calc_prefix_path_size(const ObIArray<JsonPathItem> &path_items,
-                                                        bool &has_escaped_null) {
+                                                        bool &has_escaped_null,
+                                                        const bool preserve_array_levels) {
   int64_t size = 0;
   const static int64_t ESCAPE_SIZE = 2; // escape marker + escape value
   int64_t null_bytes = 0;
@@ -120,7 +122,7 @@ int64_t ObSearchIndexPathEncoder::calc_prefix_path_size(const ObIArray<JsonPathI
     const JsonPathItem &item = path_items.at(i);
     if (item.is_array_path()) {
       ++continue_array_cnt;
-      if (continue_array_cnt <= 2) {
+      if (preserve_array_levels || continue_array_cnt <= 2) {
         // 0x00 0x20
         size += ESCAPE_SIZE;
       }
@@ -139,14 +141,15 @@ int64_t ObSearchIndexPathEncoder::calc_prefix_path_size(const ObIArray<JsonPathI
 
 int ObSearchIndexPathEncoder::encode_prefix_path(const ObIArray<JsonPathItem> &path_items,
                                                   const bool has_escaped_null,
-                                                  uint8_t *mem, int64_t &pos) {
+                                                  uint8_t *mem, int64_t &pos,
+                                                  const bool preserve_array_levels) {
   int ret = OB_SUCCESS;
   int64_t continue_array_cnt = 0;
   for (int64_t i = 0; OB_SUCC(ret) && i < path_items.count(); ++i) {
     const JsonPathItem &item = path_items.at(i);
     if (item.is_array_path()) {
       ++continue_array_cnt;
-      if (continue_array_cnt <= 2) {
+      if (preserve_array_levels || continue_array_cnt <= 2) {
         mem[pos++] = ESCAPE_MARKER;
         mem[pos++] = TYPE_ARRAY;
       }
@@ -228,6 +231,37 @@ int ObSearchIndexPathEncoder::encode_path(ObIAllocator &allocator,
         mem[pos++] = enc_type;
         path.assign_ptr(reinterpret_cast<char*>(mem), pos);
       }
+    }
+  }
+  return ret;
+}
+
+int ObSearchIndexPathEncoder::encode_text_path(ObIAllocator &allocator,
+    const ObIArray<ObSearchIndexPathEncoder::JsonPathItem> &path_items, ObString &path)
+{
+  int ret = OB_SUCCESS;
+  bool has_escaped_null = false;
+  // Unlike VALUE path normalization, retain every array level and omit the scalar type suffix.
+  const int64_t size = calc_prefix_path_size(path_items, has_escaped_null, true /* preserve_array_levels */);
+  if (OB_UNLIKELY(size > SEARCH_INDEX_PATH_LENGTH)) {
+    ret = OB_ERR_TOO_LONG_KEY_LENGTH;
+    LOG_WARN("path size over limit", K(ret), K(size), K(SEARCH_INDEX_PATH_LENGTH));
+  } else if (size == 0) {
+    path.reset(); // The JSON root path has no prefix or scalar type suffix.
+  } else {
+    int64_t pos = 0;
+    uint8_t *mem = static_cast<uint8_t*>(allocator.alloc(size));
+    if (OB_ISNULL(mem)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate memory", K(ret), K(size));
+    } else if (OB_FAIL(encode_prefix_path(path_items, has_escaped_null, mem, pos,
+                                        true /* preserve_array_levels */))) {
+      LOG_WARN("failed to encode prefix path", K(ret));
+    } else if (pos > size) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected size", K(ret), K(pos), K(size));
+    } else {
+      path.assign_ptr(reinterpret_cast<char*>(mem), pos);
     }
   }
   return ret;
@@ -535,23 +569,19 @@ int ObSearchIndexValueEncoder::encode_value(ObIAllocator &allocator,
     }
     case ObJsonType: {
       ObString j_bin_str = datum.get_string();
-      ObIJsonBase *j_base = nullptr;
+      ObJsonWrapper json;
       sql::ObDatumMeta datum_meta(obj_meta.get_type(), obj_meta.get_collation_type(),
                                   obj_meta.get_scale());
       if (OB_FAIL(sql::ObTextStringHelper::read_real_string_data(allocator, datum, datum_meta, j_bin_str))) {
         LOG_WARN("fail to get real data.", K(ret), K(j_bin_str));
-      } else if (OB_FAIL(common::ObJsonBaseFactory::get_json_base(&allocator,
-                                                                  j_bin_str,
-                                                                  ObJsonInType::JSON_BIN,
-                                                                  ObJsonInType::JSON_BIN,
-                                                                  j_base))) {
-        LOG_WARN("fail to get json base", K(ret));
+      } else if (OB_FAIL(common::get_json_wrapper(j_bin_str, ObJsonInType::JSON_BIN,
+                                                 allocator, json))) {
+        LOG_WARN("fail to get json wrapper", K(ret));
       } else {
         ObEncParam enc_param;
-        int64_t type = -1;
         if (OB_FAIL(init_json_string_enc_param(enc_param))) {
           LOG_WARN("fail to init json string enc param", K(ret));
-        } else if (OB_FAIL(encode_json_scalar(allocator, j_base, value, enc_param))) {
+        } else if (OB_FAIL(encode_json_scalar(allocator, json, value, enc_param))) {
           LOG_WARN("fail to encode json scalar", K(ret));
         }
       }
@@ -570,20 +600,30 @@ int ObSearchIndexValueEncoder::encode_json_scalar(ObIAllocator &allocator,
                                                   ObString &value,
                                                   ObEncParam &enc_param)
 {
+  // The wrapper borrows the legacy node; scalar encoding only reads it.
+  const ObJsonWrapper json(const_cast<ObIJsonBase *>(j_base));
+  return encode_json_scalar(allocator, json, value, enc_param);
+}
+
+int ObSearchIndexValueEncoder::encode_json_scalar(ObIAllocator &allocator,
+                                                  const ObJsonWrapper &json,
+                                                  ObString &value,
+                                                  ObEncParam &enc_param)
+{
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(j_base)) {
+  if (OB_UNLIKELY(!json.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("json base is null", K(ret));
-  } else if (OB_UNLIKELY(!is_json_scalar(j_base))) {
+    LOG_WARN("json wrapper is invalid", K(ret));
+  } else if (OB_UNLIKELY(!ObJsonWrapper::is_json_scalar(json.json_type()))) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("json base is not a scalar", K(ret));
+    LOG_WARN("json wrapper is not a scalar", K(ret));
   } else {
-    const ObJsonNodeType node_type = j_base->json_type();
+    const ObJsonNodeType node_type = json.json_type();
     switch (node_type) {
       case ObJsonNodeType::J_NULL: {
-        if (!j_base->is_real_json_null(j_base)) {
+        if (!json.is_real_json_null()) {
           ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("json base is not a real json null in mysql mode", K(ret));
+          LOG_WARN("json wrapper is not a real json null in mysql mode", K(ret));
         } else {
           uint8_t null_val = 0;
           if (OB_FAIL(encode_uint8(allocator, null_val, value))) {
@@ -597,22 +637,22 @@ int ObSearchIndexValueEncoder::encode_json_scalar(ObIAllocator &allocator,
       case ObJsonNodeType::J_UINT:
       case ObJsonNodeType::J_DOUBLE: {
         ObNumber number;
-        if (OB_FAIL(j_base->to_number(&allocator, number))) {
-          LOG_WARN("fail to convert json base to number", K(ret));
+        if (OB_FAIL(json.to_number(&allocator, number))) {
+          LOG_WARN("fail to convert json wrapper to number", K(ret));
         } else if (OB_FAIL(encode_number(allocator, number, value))) {
           LOG_WARN("fail to encode number", K(ret));
         }
         break;
       }
       case ObJsonNodeType::J_STRING: {
-        ObString string = ObString(j_base->get_data_length(), j_base->get_data());
+        ObString string = json.get_string();
         if (OB_FAIL(encode_string(allocator, string, value, enc_param))) {
           LOG_WARN("fail to encode string", K(ret));
         }
         break;
       }
       case ObJsonNodeType::J_BOOLEAN: {
-        uint8_t bool_val = j_base->get_boolean() ? 1 : 0;
+        uint8_t bool_val = json.get_boolean() ? 1 : 0;
         if (OB_FAIL(encode_uint8(allocator, bool_val, value))) {
           LOG_WARN("fail to encode boolean", K(ret), K(bool_val));
         }
@@ -620,7 +660,7 @@ int ObSearchIndexValueEncoder::encode_json_scalar(ObIAllocator &allocator,
       }
       case ObJsonNodeType::J_DATE: {
         ObTime ob_time;
-        if (OB_FAIL(j_base->get_obtime(ob_time))) {
+        if (OB_FAIL(json.get_obtime(ob_time))) {
           LOG_WARN("fail to get obtime from json", K(ret));
         } else {
           int32_t date_val = ObTimeConverter::ob_time_to_date(ob_time);
@@ -632,7 +672,7 @@ int ObSearchIndexValueEncoder::encode_json_scalar(ObIAllocator &allocator,
       }
       case ObJsonNodeType::J_TIME: {
         ObTime ob_time;
-        if (OB_FAIL(j_base->get_obtime(ob_time))) {
+        if (OB_FAIL(json.get_obtime(ob_time))) {
           LOG_WARN("fail to get obtime from json", K(ret));
         } else {
           int64_t time_val = ObTimeConverter::ob_time_to_time(ob_time);
@@ -647,7 +687,7 @@ int ObSearchIndexValueEncoder::encode_json_scalar(ObIAllocator &allocator,
         ObTime ob_time;
         ObTimeConvertCtx cvrt_ctx(NULL, false);
         int64_t datetime_val = 0;
-        if (OB_FAIL(j_base->get_obtime(ob_time))) {
+        if (OB_FAIL(json.get_obtime(ob_time))) {
           LOG_WARN("fail to get obtime from json", K(ret));
         } else if (OB_FAIL(ObTimeConverter::ob_time_to_datetime(ob_time, cvrt_ctx, datetime_val))) {
           LOG_WARN("fail to convert obtime to datetime", K(ret));
@@ -657,7 +697,7 @@ int ObSearchIndexValueEncoder::encode_json_scalar(ObIAllocator &allocator,
         break;
       }
       case ObJsonNodeType::J_OPAQUE: {
-        ObString opaque_data = ObString(j_base->get_data_length(), j_base->get_data());
+        ObString opaque_data = json.get_string();
         if (OB_FAIL(encode_string(allocator, opaque_data, value, enc_param))) {
           LOG_WARN("fail to encode opaque", K(ret));
         }
@@ -665,7 +705,7 @@ int ObSearchIndexValueEncoder::encode_json_scalar(ObIAllocator &allocator,
       }
       case ObJsonNodeType::J_MYSQL_DATE: {
         ObTime ob_time;
-        if (OB_FAIL(j_base->get_obtime(ob_time))) {
+        if (OB_FAIL(json.get_obtime(ob_time))) {
           LOG_WARN("fail to get obtime from json", K(ret));
         } else {
           int32_t date_val = ObTimeConverter::ob_time_to_mdate(ob_time).date_;
@@ -678,7 +718,7 @@ int ObSearchIndexValueEncoder::encode_json_scalar(ObIAllocator &allocator,
       case ObJsonNodeType::J_MYSQL_DATETIME: {
         ObTime ob_time;
         ObMySQLDateTime datetime_val = 0;
-        if (OB_FAIL(j_base->get_obtime(ob_time))) {
+        if (OB_FAIL(json.get_obtime(ob_time))) {
           LOG_WARN("fail to get obtime from json", K(ret));
         } else if (OB_FAIL(ObTimeConverter::ob_time_to_mdatetime(ob_time, datetime_val))) {
           LOG_WARN("fail to convert obtime to datetime", K(ret));
@@ -870,7 +910,8 @@ int ObSearchIndexValueEncoder::encode_uint8(ObIAllocator &allocator, uint8_t uin
 int ObSearchIndexValueEncoder::encode_string(ObIAllocator &allocator,
                                              const ObString &string_value,
                                              ObString &value,
-                                             ObEncParam &enc_param)
+                                             ObEncParam &enc_param,
+                                             const bool is_allow_truncate)
 {
   int ret = OB_SUCCESS;
   int64_t safty_buf_size = 20;
@@ -889,6 +930,10 @@ int ObSearchIndexValueEncoder::encode_string(ObIAllocator &allocator,
     // (e.g. when strnxfrm_varlen is NULL), which wraps to a negative int64_t.
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("encode_from_string_varlen returned negative length", K(ret), K(to_len), K(string_value));
+  } else if (!is_allow_truncate && to_len > SEARCH_INDEX_VALUE_LENGTH) {
+    ret = OB_SIZE_OVERFLOW;
+    LOG_WARN("encoded string exceeds search index value length limit", K(ret), K(to_len),
+             K(SEARCH_INDEX_VALUE_LENGTH));
   } else {
     // truncate encoded value length to SEARCH_INDEX_VALUE_LENGTH
     to_len = MIN(to_len, SEARCH_INDEX_VALUE_LENGTH);
@@ -917,21 +962,59 @@ int ObSearchIndexValueEncoder::encode_value(common::ObIAllocator &allocator,
                                             const common::ObIJsonBase *j_base,
                                             common::ObString &result)
 {
+  const ObJsonWrapper json(const_cast<ObIJsonBase *>(j_base));
+  return encode_value(allocator, json, result);
+}
+
+int ObSearchIndexValueEncoder::encode_value(common::ObIAllocator &allocator,
+                                            const common::ObJsonWrapper &json,
+                                            common::ObString &result)
+{
   int ret = OB_SUCCESS;
   result.reset();
   ObEncParam enc_param;
-  if (OB_ISNULL(j_base)) {
+  if (OB_UNLIKELY(!json.is_valid())) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("json base is null", K(ret));
-  } else if (!is_json_scalar(j_base)) {
+    LOG_WARN("json wrapper is invalid", K(ret));
+  } else if (!ObJsonWrapper::is_json_scalar(json.json_type())) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("json base is not a scalar", K(ret), K(j_base->json_type()));
+    LOG_WARN("json wrapper is not a scalar", K(ret), K(json.json_type()));
   } else if (OB_FAIL(init_json_string_enc_param(enc_param))) {
     LOG_WARN("fail to init json string enc param", K(ret));
-  } else if (OB_FAIL(encode_json_scalar(allocator, j_base, result, enc_param))) {
+  } else if (OB_FAIL(encode_json_scalar(allocator, json, result, enc_param))) {
     LOG_WARN("fail to encode json scalar", K(ret));
   }
   return ret;
+}
+
+bool ObSearchIndexValueEncoder::is_supported_search_index_collation(const ObCollationType cs_type)
+{
+  bool supported = false;
+  switch (cs_type) {
+    case CS_TYPE_UTF8MB4_BIN:
+    case CS_TYPE_UTF8MB4_GENERAL_CI:
+    case CS_TYPE_UTF8MB4_0900_BIN:
+    case CS_TYPE_UTF16_BIN:
+    case CS_TYPE_UTF16_GENERAL_CI:
+    case CS_TYPE_UTF16LE_BIN:
+    case CS_TYPE_UTF16LE_GENERAL_CI:
+    case CS_TYPE_GBK_BIN:
+    case CS_TYPE_GBK_CHINESE_CI:
+    case CS_TYPE_GB18030_BIN:
+    case CS_TYPE_GB18030_CHINESE_CI:
+    case CS_TYPE_GB18030_2022_BIN:
+    case CS_TYPE_GB18030_2022_PINYIN_CI:
+    case CS_TYPE_GB18030_2022_PINYIN_CS:
+    case CS_TYPE_GB18030_2022_RADICAL_CI:
+    case CS_TYPE_GB18030_2022_RADICAL_CS:
+    case CS_TYPE_GB18030_2022_STROKE_CI:
+    case CS_TYPE_GB18030_2022_STROKE_CS:
+      supported = true;
+      break;
+    default:
+      break;
+  }
+  return supported;
 }
 
 int ObSearchIndexValueEncoder::normalize_string_for_encoding(ObIAllocator &allocator,

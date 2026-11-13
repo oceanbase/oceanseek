@@ -72,10 +72,6 @@ public:
   ObDASAsyncScalarRorOp(ObDASSearchCtx &search_ctx)
     : ObIDASSearchOp(search_ctx),
       arena_allocator_(common::ObMemAttr(MTL_ID(), "DASAsyncScalar")),
-      rowid_allocators_{
-        common::ObMemAttr(MTL_ID(), "DASAScaRowID"),
-        common::ObMemAttr(MTL_ID(), "DASAScaRowID")},
-      rowid_allocator_idx_(0),
       posting_iter_allocator_(common::ObMemAttr(MTL_ID(), "DASAScaIter")),
       scalar_ctdef_(nullptr),
       scalar_rtdef_(nullptr),
@@ -93,8 +89,8 @@ public:
       posting_scan_param_(),
       nested_key_list_reader_(),
       curr_nested_key_(),
-      term_datums_(nullptr),
       term_key_(),
+      is_first_nk_(true),
       is_empty_range_(false),
       direct_cursor_pending_(false),
       direct_pending_rowid_(0),
@@ -126,6 +122,7 @@ public:
   }
 
 private:
+  int init_nested_key_cursor();
   int do_init(const ObIDASSearchOpParam &op_param) override;
   int do_open() override;
   int do_close() override;
@@ -133,6 +130,8 @@ private:
   int do_rescan_segment(const common::ObNewVersionRange &range) override;
   int do_advance_to(const ObDASRowID &target, ObDASRowID &curr_id, double &score) override;
   int do_next_rowid(ObDASRowID &next_id, double &score) override;
+  int do_advance_to(const ObDASNestedKey &target, ObDASNestedKey &curr_nk, double &score) override;
+  int do_next_rowid(ObDASNestedKey &next_nk, double &score) override;
   int do_drain_until(const ObDASRowID &boundary,
                      int64_t capacity,
                      uint64_t *out_ids,
@@ -156,11 +155,6 @@ private:
   int init_posting_scan_param();
   int open_posting_iter_from_tablet();
   void reset_leaf_runtime_state();
-  int position_nested_key(const common::ObDatum *target_nested_key);
-  int advance_to_next_nested_posting();
-  int advance_nested_to(
-      const common::ObDatum &target_doc_id,
-      const common::ObDatum &target_nested_key);
   int fetch_curr(ObDASRowID &curr_id, double &score);
   int fetch_direct_cursor();
   int position_direct_cursor(
@@ -170,10 +164,6 @@ private:
 
 private:
   ObArenaAllocator arena_allocator_;
-  // Compact rowids are shallow pointers. Alternate buffers so the previous
-  // result remains valid until the following next/advance call completes.
-  ObArenaAllocator rowid_allocators_[2];
-  int64_t rowid_allocator_idx_;
   ObArenaAllocator posting_iter_allocator_;
   const ObDASScalarScanCtDef *scalar_ctdef_;
   ObDASScalarScanRtDef *scalar_rtdef_;
@@ -190,9 +180,9 @@ private:
   blocksstable::ObInvPostingIterEntry *posting_entry_;
   blocksstable::ObInvPostingScanParam posting_scan_param_;
   share::ObSearchIndexNestedKeyListReader nested_key_list_reader_;
-  common::ObDatum curr_nested_key_;
-  blocksstable::ObStorageDatum *term_datums_;
+  ObDASNestedKey curr_nested_key_;
   blocksstable::ObDatumRowkey term_key_;
+  bool is_first_nk_;
   bool is_empty_range_;
   // The storage view is consumed synchronously. Only the scalar lookahead value
   // survives between direct-drain calls; no pointer into a posting block is retained.
@@ -288,6 +278,8 @@ private:
       ObDASRowID &curr_id,
       double &score) override;
   int do_next_rowid(ObDASRowID &next_id, double &score) override;
+  int do_advance_to(const ObDASNestedKey &target, ObDASNestedKey &curr_nk, double &score) override;
+  int do_next_rowid(ObDASNestedKey &next_nk, double &score) override;
   int do_drain_until(
       const ObDASRowID &boundary,
       int64_t capacity,

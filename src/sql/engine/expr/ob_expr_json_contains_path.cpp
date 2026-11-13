@@ -194,13 +194,14 @@ int ObExprJsonContainsPath::eval_json_contains_path_general_path(const ObExpr &e
 {
   // get json doc
   int ret = OB_SUCCESS;
-  ObIJsonBase *json_target = NULL;
+  ObJsonWrapper json_target;
   bool is_null_result = false;
   ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
-  uint64_t tenant_id = ObMultiModeExprHelper::get_tenant_id(ctx.exec_ctx_.get_my_session());
-  MultimodeAlloctor temp_allocator(tmp_alloc_g.get_allocator(), expr.type_, tenant_id, ret);
-  if (OB_FAIL(ObJsonExprHelper::get_json_doc(expr, ctx, temp_allocator, 0, json_target, is_null_result, false))) {
-    LOG_WARN("get_json_doc failed", K(ret));
+  MultimodeAlloctor temp_allocator(tmp_alloc_g.get_allocator(), expr.type_, ret,
+                                   ctx, "json_contains_path");
+  if (OB_FAIL(ObJsonExprHelper::get_json_doc_wrapper(expr, ctx, temp_allocator, 0,
+                                                     json_target, is_null_result))) {
+    LOG_WARN("get_json_doc_wrapper failed", K(ret));
   } else {
     // get one_or_all flag
     bool one_flag = true;
@@ -230,9 +231,10 @@ int ObExprJsonContainsPath::eval_json_contains_path_general_path(const ObExpr &e
       ObJsonPathCache ctx_cache(&temp_allocator);
       ObJsonPathCache* path_cache = ObJsonExprHelper::get_path_cache_ctx(expr.expr_ctx_id_, &ctx.exec_ctx_);
       path_cache = ((path_cache != NULL) ? path_cache : &ctx_cache);
+      ObSEArray<ObJsonWrapper, 1> hits;
 
       for (int64_t i = 2; OB_SUCC(ret) && i < expr.arg_cnt_ && !is_null_result; i++) {
-        ObJsonSeekResult hit;
+        hits.reuse();
         ObDatum *path_data = NULL;
         if (OB_FAIL(temp_allocator.eval_arg(expr.args_[i], ctx, path_data))) {
           LOG_WARN("eval json path datum failed", K(ret));
@@ -241,17 +243,16 @@ int ObExprJsonContainsPath::eval_json_contains_path_general_path(const ObExpr &e
         } else {
           ObString path_val = path_data->get_string();
           ObJsonPath *json_path = nullptr;
-          bool is_const = expr.args_[i]->is_static_const_expr();
+          const bool is_const = expr.args_[i]->is_static_const_expr();
           if (OB_FAIL(ObJsonExprHelper::get_json_or_str_data(expr.args_[i], ctx, temp_allocator, path_val, is_null_result))) {
             LOG_WARN("fail to get real data.", K(ret), K(path_val));
           } else if (OB_FAIL(ObJsonExprHelper::find_and_add_cache(temp_allocator, path_cache, json_path, path_val, i, true, is_const))) {
             LOG_WARN("failed: parse path", K(path_data->get_string()), K(ret));
-          } else if (OB_FAIL(json_target->seek(*json_path, json_path->path_node_cnt(),
-                                               true, false, hit))) {
+          } else if (OB_FAIL(json_target.seek(*json_path, temp_allocator, hits, true, true))) {
             LOG_WARN("json seek failed", K(path_data->get_string()), K(ret));
           }
 
-          if (hit.size() == 0) {
+          if (hits.empty()) {
             if (!one_flag) {
               is_contains = false;
               break;

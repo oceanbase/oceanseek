@@ -76,6 +76,7 @@
 #include "lib/stat/ob_diagnostic_info_container.h"
 #include "storage/fts/dict/ob_ft_cache.h"
 #include "storage/async_index/ob_deletion_bitmap_cache.h"
+#include "storage/retrieval/ob_inv_bm25_stat_cache.h"
 #include "common/ob_target_specific.h"
 #include "storage/fts/dict/ob_gen_dic_loader.h"
 #include "plugin/legacy/sys/ob_plugin_mgr.h"
@@ -440,6 +441,8 @@ int ObServer::init(const ObServerOptions &opts, const ObPLogWriterCfg &log_cfg)
       LOG_ERROR("init tmp page cache failed", KR(ret));
     } else if (OB_FAIL(OB_DELETION_BITMAP_CACHE.init("deletion_bitmap_cache", 1))) {
       LOG_ERROR("init deletion bitmap cache failed", KR(ret));
+    } else if (OB_FAIL(OB_INV_BM25_STAT_CACHE.init("inv_bm25_stat", 1))) {
+      LOG_ERROR("init inv bm25 stat cache failed", KR(ret));
     } else if (OB_FAIL(init_log_kv_cache())) {
       LOG_ERROR("init log kv cache failed", KR(ret));
     } else if (OB_FAIL(locality_manager_.init(self_addr_,
@@ -770,6 +773,9 @@ void ObServer::destroy()
     FLOG_INFO("begin to destroy deletion bitmap cache");
     OB_DELETION_BITMAP_CACHE.destroy();
     FLOG_INFO("deletion bitmap cache destroyed");
+
+    OB_INV_BM25_STAT_CACHE.destroy();
+    FLOG_INFO("inv bm25 stat cache destroyed");
 
     FLOG_INFO("begin to destroy log kv cache");
     OB_LOG_KV_CACHE.destroy();

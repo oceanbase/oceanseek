@@ -267,6 +267,24 @@ int ObTabletCreateSSTableParam::init_empty_inv_meta(
       stats.has_position_list_ = false;
       stats.has_nested_key_ = share::SEARCH_INDEX_KEY_CNT_WITH_NK == column_cnt;
     }
+  } else if (share::schema::is_async_search_text_index(storage_schema.get_index_type())) {
+    // column_cnt is the logical column count, excluding multi-version extra columns.
+    const int64_t column_cnt = storage_schema.get_column_count();
+    const bool has_pos_list = share::schema::is_async_search_text_match_phrase_index(storage_schema.get_index_type());
+    const int64_t expected_column_cnt = has_pos_list
+        ? SEARCH_TEXT_COL_CNT_WITH_POS : SEARCH_TEXT_COL_CNT_WITHOUT_POS;
+    if (OB_UNLIKELY(SEARCH_TEXT_ROWKEY_CNT != rowkey_col_descs.count()
+        || expected_column_cnt != column_cnt)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected async search text index storage layout", K(ret),
+          K(rowkey_col_descs), K(column_cnt), K(storage_schema));
+    } else {
+      doc_id_col_idx = SEARCH_TEXT_DOC_ID;
+      stats.index_type_ = INV_IDX_TYPE_SEARCH_TEXT;
+      stats.has_relevance_params_ = true;
+      stats.has_position_list_ = has_pos_list;
+      stats.has_nested_key_ = false;
+    }
   } else {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected async inverted index type", K(ret), K(storage_schema));

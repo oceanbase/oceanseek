@@ -503,8 +503,11 @@ END_P SET_VAR DELIMITER
 %type <node> opt_hint_list hint_option select_with_opt_hint update_with_opt_hint delete_with_opt_hint merge_with_opt_hint merge_table_with_opt_hint hint_list_with_end global_hint transform_hint optimize_hint
 %type <node> create_index_stmt index_name sort_column_list sort_column_key opt_index_option_list opt_fulltext_index_option_list index_option fulltext_index_option opt_sort_column_key_length opt_index_using_algorithm index_using_algorithm visibility_option opt_constraint_name constraint_name create_with_opt_hint index_expr alter_with_opt_hint
 %type <node> search_sort_column_list search_sort_column_key opt_search_column_with
-%type <node> search_index_with_opt_list search_index_with_opt
+%type <node> search_index_with_opt
 %type <node> search_index_path_list search_index_type_list search_index_type_item
+%type <node> search_index_mode_list search_index_mode_block
+%type <node> search_index_mode_options search_index_mode_option search_index_fulltext_option
+%type <node> search_index_column_option
 %type <node> opt_when check_state constraint_definition
 %type <node> create_mlog_stmt opt_mlog_option_list opt_mlog_options mlog_option opt_mlog_with mlog_with_values mlog_with_special_columns mlog_with_reference_columns mlog_with_special_column_list mlog_with_reference_column_list mlog_with_special_column mlog_with_reference_column opt_mlog_new_values mlog_including_or_excluding opt_mlog_purge mlog_purge_values mlog_purge_immediate_sync_or_async mlog_purge_start mlog_purge_next
 %type <node> drop_mlog_stmt
@@ -1994,6 +1997,20 @@ simple_expr collation %prec NEG
   merge_nodes(column_list_node, result, T_MATCH_COLUMN_LIST, $3);
   malloc_non_terminal_node($$, result->malloc_pool_, T_FUN_MATCH_AGAINST, 2, column_list_node, $7);
   $$->value_ = $8[0];
+}
+| MATCH '(' no_param_column_ref JSON_EXTRACT complex_string_literal ')' AGAINST '(' search_expr opt_mode_flag ')'
+{
+  ParseNode *column_list_node = NULL;
+  malloc_non_terminal_node(column_list_node, result->malloc_pool_, T_MATCH_COLUMN_LIST, 1, $3);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FUN_MATCH_AGAINST, 3, column_list_node, $5, $9);
+  $$->value_ = $10[0];
+}
+| MATCH '(' JSON_EXTRACT_FUNC '(' no_param_column_ref ',' complex_string_literal ')' ')' AGAINST '(' search_expr opt_mode_flag ')'
+{
+  ParseNode *column_list_node = NULL;
+  malloc_non_terminal_node(column_list_node, result->malloc_pool_, T_MATCH_COLUMN_LIST, 1, $5);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FUN_MATCH_AGAINST, 3, column_list_node, $7, $12);
+  $$->value_ = $13[0];
 }
 | MATCH '(' column_list_with_boost ',' search_expr es_sql_opt ')'
 {
@@ -6709,20 +6726,119 @@ opt_search_column_with:
 {
   $$ = NULL;
 }
-| WITH '(' search_index_with_opt_list ')'
+| WITH '(' search_index_mode_list ')'
 {
-  malloc_non_terminal_node($$, result->malloc_pool_, T_SEARCH_INDEX_COLUMN_PARAMS, 1, $3);
+  ParseNode *options = NULL;
+  merge_nodes(options, result, T_SEARCH_INDEX_OPTION_LIST, $3);
+  bool has_mode = false;
+  bool has_flat_option = false;
+  int type_count = 0;
+  for (int i = 0; i < options->num_child_; ++i) {
+    const int type = options->children_[i]->type_;
+    type_count += type == T_SEARCH_INDEX_TYPE;
+    has_mode |= type == T_SEARCH_INDEX_VALUE || type == T_SEARCH_INDEX_FULLTEXT;
+    has_flat_option |= type != T_SEARCH_INDEX_VALUE && type != T_SEARCH_INDEX_FULLTEXT
+                    && type != T_SEARCH_INDEX_NESTED_PATHS;
+  }
+  if (has_mode && has_flat_option) {
+    yyerror(&@3, result, "Flat search index options cannot be mixed with VALUE/FULLTEXT modes");
+    YYABORT_PARSE_SQL_ERROR;
+  } else if (type_count > 1) {
+    yyerror(&@3, result, "Duplicate TYPE in flat search index options");
+    YYABORT_PARSE_SQL_ERROR;
+  }
+  if (has_mode) {
+    options->type_ = T_SEARCH_INDEX_MODE_LIST;
+  }
+  malloc_non_terminal_node($$, result->malloc_pool_, T_SEARCH_INDEX_COLUMN_PARAMS, 1, options);
 }
 ;
 
-search_index_with_opt_list:
+search_index_mode_list:
+search_index_column_option
+{
+  $$ = $1;
+}
+| search_index_mode_list ',' search_index_column_option
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+search_index_column_option:
+search_index_mode_block
+{
+  $$ = $1;
+}
+| search_index_mode_option
+{
+  $$ = $1;
+}
+| TYPE COMP_EQ VALUE
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_SEARCH_INDEX_TYPE);
+  $$->value_ = T_SEARCH_INDEX_VALUE;
+}
+| TYPE COMP_EQ FULLTEXT
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_SEARCH_INDEX_TYPE);
+  $$->value_ = T_SEARCH_INDEX_FULLTEXT;
+}
+;
+
+search_index_mode_block:
+FULLTEXT
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_SEARCH_INDEX_FULLTEXT, 1, NULL);
+}
+| VALUE
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_SEARCH_INDEX_VALUE, 1, NULL);
+}
+| FULLTEXT '(' search_index_mode_options ')'
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_SEARCH_INDEX_FULLTEXT, 1, $3);
+}
+| VALUE '(' search_index_mode_options ')'
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_SEARCH_INDEX_VALUE, 1, $3);
+}
+;
+
+search_index_mode_options:
+search_index_mode_option
+{
+  $$ = $1;
+}
+| search_index_mode_options ',' search_index_mode_option
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+search_index_mode_option:
 search_index_with_opt
 {
   $$ = $1;
 }
-| search_index_with_opt_list ',' search_index_with_opt
+| search_index_fulltext_option
 {
-  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+  $$ = $1;
+}
+;
+
+search_index_fulltext_option:
+PARSER COMP_EQ STRING_VALUE
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_PARSER_NAME, 1, $3);
+}
+| PARSER_PROPERTIES COMP_EQ '(' fulltext_parser_properties_list ')'
+{
+  merge_nodes($$, result, T_PARSER_PROPERTIES, $4);
+}
+| FTS_INDEX_TYPE COMP_EQ fts_index_type_value
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FTS_INDEX_TYPE, 1, $3);
 }
 ;
 

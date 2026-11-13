@@ -149,13 +149,21 @@ int ObAsyncIndexExecutor::check_has_available_async_index(
         if (OB_SUCC(ret)) {
           bool available = share::schema::INDEX_STATUS_AVAILABLE == index_schema->get_index_status();
           if (available && is_search) {
-            uint64_t data_index_id = OB_INVALID_ID;
-            OZ(index_schema->get_search_data_index_tid(data_index_id));
-            OZ(schema_guard.get_table_schema(tenant_id_, data_index_id, index_schema));
-            OV(OB_NOT_NULL(index_schema), OB_SCHEMA_EAGAIN, data_index_id);
-            OX(available = available && share::schema::INDEX_STATUS_AVAILABLE == index_schema->get_index_status());
-          }
-          if (OB_SUCC(ret) && available) {
+            common::ObSEArray<uint64_t, 3> aux_table_ids;
+            OZ(index_schema->get_search_aux_index_tids(aux_table_ids));
+            OV(!aux_table_ids.empty(), OB_SCHEMA_EAGAIN, info);
+            for (int64_t j = 0; OB_SUCC(ret) && j < aux_table_ids.count(); ++j) {
+              const uint64_t aux_table_id = aux_table_ids.at(j);
+              const share::schema::ObTableSchema *aux_schema = nullptr;
+              OZ(schema_guard.get_table_schema(tenant_id_, aux_table_id, aux_schema));
+              OV(OB_NOT_NULL(aux_schema), OB_SCHEMA_EAGAIN, aux_table_id);
+              if (OB_SUCC(ret)
+                  && share::schema::INDEX_STATUS_AVAILABLE == aux_schema->get_index_status()) {
+                OZ(target_ids.push_back(aux_table_id));
+                OX(has_user_index = true);
+              }
+            }
+          } else if (available) {
             OZ(target_ids.push_back(index_schema->get_table_id()));
             OX(has_user_index = has_user_index || !is_delete);
           }

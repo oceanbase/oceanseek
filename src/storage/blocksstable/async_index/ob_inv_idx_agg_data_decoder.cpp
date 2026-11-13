@@ -13,6 +13,40 @@ namespace blocksstable
 {
 using namespace common;
 
+int ObInvIdxAggDataDecoder::get_total_doc_length(
+    const char *buf, const int64_t size, uint64_t &total_doc_length)
+{
+  int ret = OB_SUCCESS;
+  total_doc_length = 0;
+  if (OB_ISNULL(buf) || OB_UNLIKELY(size < HEADER_SIZE)) {
+    ret = OB_INVALID_ARGUMENT;
+    STORAGE_LOG(WARN, "invalid inverted length aggregate buffer", K(ret), KP(buf), K(size));
+  } else {
+    const ObInvIdxAggDataHeader *header = reinterpret_cast<const ObInvIdxAggDataHeader *>(buf);
+    const int64_t count = header->logical_block_count_;
+    if (OB_UNLIKELY(ObInvIdxAggDataHeader::VERSION != header->version_)) {
+      ret = OB_VERSION_NOT_MATCH;
+      STORAGE_LOG(WARN, "unexpected inverted aggregate version", K(ret), "version", header->version_);
+    } else if (OB_UNLIKELY(count <= 0 || count > (size - HEADER_SIZE) / ENTRY_SIZE
+               || header->total_size_ > size
+               || HEADER_SIZE + count * ENTRY_SIZE > header->total_size_)) {
+      ret = OB_INVALID_ARGUMENT;
+      STORAGE_LOG(WARN, "invalid inverted length descriptor bounds", K(ret), K(size), K(count));
+    } else {
+      const ObInvIdxAggDataEntry *entries = reinterpret_cast<const ObInvIdxAggDataEntry *>(buf + HEADER_SIZE);
+      for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+        if (OB_UNLIKELY(UINT64_MAX - total_doc_length < entries[i].total_doc_length_)) {
+          ret = OB_SIZE_OVERFLOW;
+          STORAGE_LOG(WARN, "inverted logical block length sum overflows", K(ret), K(total_doc_length), K(i));
+        } else {
+          total_doc_length += entries[i].total_doc_length_;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObInvIdxAggDataDecoder::decode(
     const char *buf,
     const int64_t size,

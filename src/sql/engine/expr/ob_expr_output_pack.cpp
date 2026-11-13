@@ -149,7 +149,7 @@ int ObExprOutputPack::eval_output_pack(const ObExpr &expr, ObEvalCtx &ctx, ObDat
   } else if (OB_FAIL(expr.eval_param_value(ctx))) {
     LOG_WARN("failed to eval output datum", K(ret));
   } else if (OB_FAIL(process_oneline(expr, ctx, session, alloc,
-                                     extra_info, schema_guard, expr_datum))) {
+                                     extra_info, schema_guard, expr_datum, session->is_enable_json_bin_view()))) {
     LOG_WARN("failed to process oneline", K(ret));
   }
   return ret;
@@ -176,6 +176,7 @@ int ObExprOutputPack::eval_output_pack_batch(const ObExpr &expr, ObEvalCtx &ctx,
   } else if (OB_FAIL(expr.eval_batch_param_value(ctx, skip, batch_size))) {
     LOG_WARN("failed to eval batch", K(ret));
   } else {
+    const bool enable_json_bin_view = session->is_enable_json_bin_view();
     ObEvalCtx::BatchInfoScopeGuard guard(ctx);
     for (int64_t i = 0; OB_SUCC(ret) && i < batch_size; ++i) {
       if (skip.at(i) || eval_flags.at(i)) {
@@ -183,7 +184,7 @@ int ObExprOutputPack::eval_output_pack_batch(const ObExpr &expr, ObEvalCtx &ctx,
       }
       guard.set_batch_idx(i);
       if (OB_FAIL(process_oneline(expr, ctx, session, alloc,
-                                  extra_info, schema_guard, result[i]))) {
+                                  extra_info, schema_guard, result[i], enable_json_bin_view))) {
         LOG_WARN("failed to process oneline", K(ret));
       }
     }
@@ -196,14 +197,14 @@ int ObExprOutputPack::encode_cell(const ObObj &cell, const common::ObIArray<ObFi
                                   char *buf, int64_t len, int64_t &pos, char *bitmap,
                                   int64_t column_num, ObSQLSessionInfo *session,
                                   share::schema::ObSchemaGetterGuard *schema_guard,
-                                  obmysql::MYSQL_PROTOCOL_TYPE encode_type)
+                                  obmysql::MYSQL_PROTOCOL_TYPE encode_type, bool enable_json_bin_view)
 {
   int ret = OB_SUCCESS;
   const ObDataTypeCastParams dtc_params = ObBasicSessionInfo::create_dtc_params(session);
   CK (OB_NOT_NULL(session));
   OZ (ObSMUtils::cell_str(buf, len, cell, encode_type, pos, column_num, bitmap,
                             dtc_params, &param_fields.at(column_num), *session, schema_guard,
-                            session->get_effective_tenant_id()));
+                            session->get_effective_tenant_id(), enable_json_bin_view));
   return ret;
 }
 
@@ -560,7 +561,7 @@ int ObExprOutputPack::try_encode_row(const ObExpr &expr, ObEvalCtx &ctx,
                                      ObOutputPackInfo *extra_info, char *buffer, char *bitmap,
                                      share::schema::ObSchemaGetterGuard *schema_guard,
                                      obmysql::MYSQL_PROTOCOL_TYPE encode_type,
-                                     const int64_t len, int64_t &pos)
+                                     const int64_t len, int64_t &pos, bool enable_json_bin_view)
 {
   int ret = OB_SUCCESS;
   for (int64_t column_idx = 1; OB_SUCC(ret) && column_idx < expr.arg_cnt_; ++column_idx) {
@@ -613,7 +614,7 @@ int ObExprOutputPack::try_encode_row(const ObExpr &expr, ObEvalCtx &ctx,
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(encode_cell(obj, extra_info->param_fields_, buffer, len,
                               pos, bitmap, column_idx - 1/*for encode type expr*/,
-                              session, schema_guard, encode_type))) {
+                              session, schema_guard, encode_type, enable_json_bin_view))) {
       if (OB_UNLIKELY(OB_SIZE_OVERFLOW != ret)) {
         LOG_WARN("failed to encode obj", K(ret), K(column_idx));
       }
@@ -625,7 +626,7 @@ int ObExprOutputPack::try_encode_row(const ObExpr &expr, ObEvalCtx &ctx,
 int ObExprOutputPack::process_oneline(const ObExpr &expr, ObEvalCtx &ctx, ObSQLSessionInfo *session,
                                       common::ObIAllocator &alloc, ObOutputPackInfo *extra_info,
                                       share::schema::ObSchemaGetterGuard *schema_guard,
-                                      ObDatum &expr_datum)
+                                      ObDatum &expr_datum, bool enable_json_bin_view)
 {
   int ret = OB_SUCCESS;
   char *buffer = nullptr;
@@ -650,7 +651,7 @@ int ObExprOutputPack::process_oneline(const ObExpr &expr, ObEvalCtx &ctx, ObSQLS
     }
     if (OB_SUCCESS == tmp_ret) {
       tmp_ret = try_encode_row(expr, ctx, session, alloc, extra_info,
-                              buffer, bitmap, schema_guard, encode_type, len, pos);
+                              buffer, bitmap, schema_guard, encode_type, len, pos, enable_json_bin_view);
     }
     if (OB_SUCCESS != tmp_ret) {
       if (OB_SIZE_OVERFLOW != tmp_ret && OB_BUF_NOT_ENOUGH != tmp_ret) {

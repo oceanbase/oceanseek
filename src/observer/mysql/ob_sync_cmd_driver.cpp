@@ -303,7 +303,7 @@ int ObSyncCmdDriver::response_query_result(ObMySQLResultSet &result)
 
     if (OB_SUCC(ret)) {
       MYSQL_PROTOCOL_TYPE protocol_type = result.is_ps_protocol() ? MYSQL_PROTOCOL_TYPE::BINARY : MYSQL_PROTOCOL_TYPE::TEXT;
-      const ObSQLSessionInfo *tmp_session = result.get_exec_context().get_my_session();
+      ObSQLSessionInfo *tmp_session = result.get_exec_context().get_my_session();
       const ObDataTypeCastParams dtc_params = ObBasicSessionInfo::create_dtc_params(tmp_session);
       ObSMRow sm_row(protocol_type,
                      *row,
@@ -311,7 +311,8 @@ int ObSyncCmdDriver::response_query_result(ObMySQLResultSet &result)
                      *tmp_session,
                      result.get_field_columns(),
                      ctx_.schema_guard_,
-                     tmp_session->get_effective_tenant_id());
+                     tmp_session->get_effective_tenant_id(),
+                     tmp_session->is_enable_json_bin_view());
       OMPKRow rp(sm_row);
       if (OB_FAIL(sender_.response_packet(rp, const_cast<ObSQLSessionInfo *>(tmp_session)))) {
         LOG_WARN("response packet fail", K(ret), KP(row));

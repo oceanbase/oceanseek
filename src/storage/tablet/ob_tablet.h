@@ -84,6 +84,7 @@ class ObAllVirtualMdsNodeStat;
 
 namespace storage
 {
+enum class ObInvBM25StatKind : uint8_t;
 class ObMdsTable;
 class ObIMemtable;
 class ObStoreCtx;
@@ -675,8 +676,15 @@ public:
       const ObITable::TableType table_type,
       const common::ObNewVersionRange &version_range,
       ObTableHandleV2 &handle) const;
-  int get_async_inv_bm25_stats(
+  // Each entry fills only the requested statistic: owned Number length or uint64 token count.
+  int get_async_inv_total_doc_length(
       const share::SCN &read_snapshot,
+      const blocksstable::ObDatumRowkey *field_prefix,
+      blocksstable::ObAsyncInvBM25Stats &stats) const;
+  int get_async_inv_token_doc_cnt(
+      const share::SCN &read_snapshot,
+      const blocksstable::ObDatumRowkey *field_prefix,
+      const common::ObString &token,
       blocksstable::ObAsyncInvBM25Stats &stats) const;
   int get_recycle_version(const int64_t multi_version_start, int64_t &recycle_version) const;
   int get_migration_sstable_size(int64_t &data_size);
@@ -719,7 +727,10 @@ private:
       const ObTabletTableStore &table_store,
       const ObStorageMetaHandle &table_store_handle,
       const share::SCN &read_snapshot,
-      blocksstable::ObAsyncInvBM25Stats &stats) const;
+      const blocksstable::ObDatumRowkey *field_prefix,
+      const ObInvBM25StatKind kind,
+      const common::ObString &token,
+      blocksstable::ObStorageDatum &stat_value) const;
   int inner_pre_process_cs_replica(
       const ObDirectLoadType direct_load_type,
       ObITable::TableKey &table_key,

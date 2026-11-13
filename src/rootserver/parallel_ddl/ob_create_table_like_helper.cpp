@@ -277,7 +277,7 @@ int ObCreateTableLikeHelper::generate_aux_table_schemas_()
     ObSArray<ObTableSchema> domain_schema_array;
     ObSArray<ObTableSchema> aux_schema_array;
     ObSArray<ObTableSchema> search_def_schema_array;
-    ObSArray<ObTableSchema> search_data_schema_array;
+    ObSArray<ObTableSchema> search_child_schema_array;
     bool has_async_logical_index = false;
     int64_t obj_cnt = 0;
     uint64_t new_table_id = OB_INVALID_ID;
@@ -327,9 +327,12 @@ int ObCreateTableLikeHelper::generate_aux_table_schemas_()
         ObString index_name;
         ObString new_index_table_name;
         uint64_t new_index_id = OB_INVALID_ID;
+        // TODO(search-index-fulltext): Integrate MR !2680's get_index_name fix below:
+        // use index_table_schema->get_data_table_id() instead of orig_table_id_.
+        // Search child names carry the Def ID; different ID digit counts corrupt the suffix.
         if (OB_FAIL(new_index_schema.assign(*index_table_schema))) {
           LOG_WARN("fail to assign schema", KR(ret));
-        } else if (OB_FAIL(ObTableSchema::get_index_name(allocator_, orig_table_id_,
+        } else if (OB_FAIL(ObTableSchema::get_index_name(allocator_, index_table_schema->get_data_table_id(),
                            index_table_schema->get_table_name_str(), index_name))) {
           LOG_WARN("fail to get index name", KR(ret), K(orig_table_id_), K(index_table_schema->get_table_name_str()));
         } else if (OB_FAIL(ObTableSchema::build_index_table_name(allocator_, new_table_id, index_name, new_index_table_name))) {
@@ -371,7 +374,7 @@ int ObCreateTableLikeHelper::generate_aux_table_schemas_()
             } else if (OB_FAIL(search_def_schema_array.push_back(new_index_schema))) {
               LOG_WARN("fail to add search def schema", KR(ret));
             }
-          } else if (new_index_schema.is_search_data_index()) {
+          } else if (new_index_schema.is_search_aux_index()) {
             const uint64_t old_def_id = index_table_schema->get_data_table_id();
             uint64_t new_def_index_id = OB_INVALID_ID;
             if (OB_FAIL(search_def_id_map.get_refactored(old_def_id, new_def_index_id))) {
@@ -380,7 +383,7 @@ int ObCreateTableLikeHelper::generate_aux_table_schemas_()
               LOG_WARN("fail to build new index table name", KR(ret), K(new_table_id), K(new_index_table_name));
             } else if (FALSE_IT(new_index_schema.set_data_table_id(new_def_index_id))) {
             } else if (FALSE_IT(new_index_schema.set_table_name(new_index_table_name))) {
-            } else if (OB_FAIL(search_data_schema_array.push_back(new_index_schema))) {
+            } else if (OB_FAIL(search_child_schema_array.push_back(new_index_schema))) {
               LOG_WARN("fail to add search def schema", KR(ret));
             }
           } else if (OB_FAIL(new_tables_.push_back(new_index_schema))) {
@@ -412,18 +415,30 @@ int ObCreateTableLikeHelper::generate_aux_table_schemas_()
         LOG_WARN("fail to retrieve complete index", K(ret));
       }
     }
-    if (OB_SUCC(ret) && (!search_def_schema_array.empty() || !search_data_schema_array.empty())) {
-      // the search data index must be pushed into the array first, followed by processing the 
-      // search def index. It is essential to ensure that the schema_version of the search def
-      // index is greater than that of the search data index.
-      if (search_def_schema_array.count() != search_data_schema_array.count()) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("the def index and the data index must correspond one-to-one", KR(ret),
-        K(search_def_schema_array.count()), K(search_data_schema_array.count()));
-      } else if (OB_FAIL(append(new_tables_, search_data_schema_array))) {
-        LOG_WARN("fail to append search data schema array", K(ret));
+    if (OB_SUCC(ret) && (!search_def_schema_array.empty() || !search_child_schema_array.empty())) {
+      // Persist all physical children before their Def so its schema version is newer.
+      // Synchronous Search still has one DATA; asynchronous Search may have DATA/TEXT.
+      for (int64_t i = 0; OB_SUCC(ret) && i < search_def_schema_array.count(); ++i) {
+        const ObTableSchema &def = search_def_schema_array.at(i);
+        int64_t child_count = 0;
+        for (int64_t j = 0; j < search_child_schema_array.count(); ++j) {
+          if (def.get_table_id() == search_child_schema_array.at(j).get_data_table_id()) {
+            ++child_count;
+          }
+        }
+        if (0 == child_count || child_count > 3
+            || (!def.is_async_search_def_index() && 1 != child_count)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("search def has an invalid child count", KR(ret), K(child_count),
+              "def_id", def.get_table_id());
+        }
+      }
+      if (OB_FAIL(ret)) {
+        // The child-count check above has logged the invalid relationship.
+      } else if (OB_FAIL(append(new_tables_, search_child_schema_array))) {
+        LOG_WARN("fail to append search auxiliary schema array", K(ret));
       } else if (OB_FAIL(append(new_tables_, search_def_schema_array))) {
-        LOG_WARN("fail to append search data schema array", K(ret));
+        LOG_WARN("fail to append search definition schema array", K(ret));
       }
     }
     if (OB_SUCC(ret)) {
@@ -615,9 +630,9 @@ int ObCreateTableLikeHelper::append_search_data_index_infos_(
         if ((!expect_async_data
              && INDEX_TYPE_SEARCH_DATA_INDEX_LOCAL != child_infos.at(j).index_type_)
             || (expect_async_data
-                && !share::schema::is_async_search_data_index(child_infos.at(j).index_type_))) {
+                && !share::schema::is_async_search_aux_index(child_infos.at(j).index_type_))) {
           ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("expect search data index", KR(ret), K(child_infos.at(j).index_type_));
+          LOG_WARN("expect physical search child", KR(ret), K(child_infos.at(j).index_type_));
         } else if (OB_FAIL(simple_index_infos.push_back(child_infos.at(j)))) {
           LOG_WARN("push back search data index info failed", KR(ret), K(child_infos.at(j).table_id_));
         }

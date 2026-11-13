@@ -84,10 +84,11 @@ void build_scan_param(
   param.doc_freq_ = 1000;
   param.total_doc_cnt_ = 1000000;
   param.avg_doc_length_ = 100.0;
+  param.need_relevance_params_ = true;
 }
 
-// Build a scan param for indexes without BM25 relevance params (search index / doc_id-only FTS).
-// has_relevance_params_ = false, so avg_doc_length_ is not validated.
+// Build a hit-only scan param that does not request BM25 relevance data.
+// need_relevance_params_ = false, so avg_doc_length_ is not validated.
 void build_scan_param_no_bm25(
     const ObDatumRowkey &query_key,
     const ObTabletID &tablet_id,
@@ -96,7 +97,20 @@ void build_scan_param_no_bm25(
     ObInvPostingScanParam &param)
 {
   build_scan_param(query_key, tablet_id, query_flag, allocator, param);
-  param.has_relevance_params_ = false;
+  param.need_relevance_params_ = false;
+}
+
+void build_search_text_term_rowkey(
+    const uint64_t column_idx,
+    const common::ObString &path,
+    const common::ObString &token,
+    ObStorageDatum (&term_datums)[SEARCH_TEXT_ROWKEY_CNT - 1],
+    ObDatumRowkey &term_key)
+{
+  term_datums[SEARCH_TEXT_COL_IDX].set_uint(column_idx);
+  term_datums[SEARCH_TEXT_PATH].set_string(path);
+  term_datums[SEARCH_TEXT_TOKEN].set_string(token);
+  OK(term_key.assign(term_datums, SEARCH_TEXT_ROWKEY_CNT - 1));
 }
 
 // Make a uint64 doc_id datum (backing storage held by the caller via `storage`).
@@ -432,6 +446,68 @@ public:
     STORAGE_LOG(INFO, "built no-bm25 single term inv sstable", K(inv_sstable));
   }
 };
+
+TEST_F(TestInvSSTablePostingIter, search_text_three_column_prefix_reads_relevance_and_position)
+{
+  search_text_ = true;
+  ObInvSSTable inv_sstable;
+  build_inv_sstable(true /*has_pos_list*/, 512, inv_sstable);
+  ASSERT_TRUE(inv_sstable.get_inv_meta().get_stats().is_search_text_index());
+  ASSERT_TRUE(inv_sstable.get_inv_meta().get_stats().has_relevance_params_);
+
+  ObTableReadInfo read_info;
+  build_rowkey_read_info(table_schema_, allocator_, read_info);
+  ObStorageDatum term_datums[SEARCH_TEXT_ROWKEY_CNT - 1];
+  ObDatumRowkey term_key;
+  build_search_text_term_rowkey(1, ObString("$.f0"), ObString("term0000000001"), term_datums, term_key);
+  ObQueryFlag query_flag;
+  query_flag.set_use_block_cache();
+  ObTabletID tablet_id(TABLET_ID);
+  ObInvPostingScanParam param;
+  build_scan_param(term_key, tablet_id, query_flag, allocator_, param);
+  param.need_posting_value_ = true;
+
+  ObInvSSTablePostingIter *iter = nullptr;
+  OK(inv_sstable.scan_posting(param, read_info, iter));
+  ASSERT_NE(nullptr, iter);
+  ASSERT_TRUE(iter->need_relevance_params_);
+  OK(iter->next());
+  const ObDatum *doc_id = nullptr;
+  OK(iter->get_cur_id(doc_id));
+  ASSERT_NE(nullptr, doc_id);
+  EXPECT_EQ(1, doc_id->get_uint64());
+  int64_t token_freq = 0;
+  int64_t doc_length = 0;
+  OK(iter->load_curr_bm25_param(token_freq, doc_length));
+  EXPECT_EQ(1, token_freq);
+  EXPECT_EQ(100, doc_length);
+  const ObDatum *position_list = nullptr;
+  OK(iter->get_cur_pos_list(position_list));
+  ASSERT_NE(nullptr, position_list);
+  EXPECT_EQ(8, position_list->len_);
+  EXPECT_EQ(0, MEMCMP("pppppppp", position_list->ptr_, position_list->len_));
+  free_iter(iter);
+
+  // A hit-only scan does not require BM25 statistics even though Search Text stores TF/DL.
+  build_scan_param_no_bm25(term_key, tablet_id, query_flag, allocator_, param);
+  OK(inv_sstable.scan_posting(param, read_info, iter));
+  ASSERT_NE(nullptr, iter);
+  OK(iter->next());
+  OK(iter->get_cur_id(doc_id));
+  ASSERT_NE(nullptr, doc_id);
+  EXPECT_EQ(1, doc_id->get_uint64());
+  EXPECT_EQ(OB_NOT_SUPPORTED, iter->load_curr_bm25_param(token_freq, doc_length));
+  free_iter(iter);
+
+  ObStorageDatum other_path_datums[SEARCH_TEXT_ROWKEY_CNT - 1];
+  ObDatumRowkey other_path_key;
+  build_search_text_term_rowkey(1, ObString("$.f1"), ObString("term0000000001"), other_path_datums, other_path_key);
+  build_scan_param(other_path_key, tablet_id, query_flag, allocator_, param);
+  OK(inv_sstable.scan_posting(param, read_info, iter));
+  ASSERT_NE(nullptr, iter);
+  EXPECT_EQ(OB_ITER_END, iter->next());
+  free_iter(iter);
+}
 
 // open() on an absent term leaves the iterator valid with is_end() == true and next()
 // returns OB_ITER_END.
@@ -927,7 +1003,7 @@ TEST_F(TestInvSSTablePostingIter, get_cur_nested_key_list_returns_blob)
   ObInvSSTablePostingIter *iter = nullptr;
   OK(inv_sstable.scan_posting(param, read_info, iter));
   ASSERT_NE(nullptr, iter);
-  ASSERT_FALSE(iter->has_relevance_params_);
+  ASSERT_FALSE(iter->need_relevance_params_);
   ASSERT_TRUE(inv_sstable.get_inv_meta().get_stats().has_nested_key_);
 
   OK(iter->next());
@@ -2413,6 +2489,65 @@ TEST_F(TestInvSSTablePostingIter, compact_typed_drain_and_legacy_compatibility)
   iter->reset();
   EXPECT_EQ(nullptr, iter->legacy_relevance_buf_);
   EXPECT_EQ(nullptr, iter->legacy_doc_ids_buf_);
+  // Reuse the same physical TF/DL index and iterator across projection modes.
+  // Hit-only scans must also suppress relevance on the typed and legacy batch paths.
+  const double scoring_avg_doc_length = param.avg_doc_length_;
+  const bool projection_modes[] = {false, true, false};
+  param.reusable_iter_ = iter;
+  for (const bool need_relevance : projection_modes) {
+    param.need_relevance_params_ = need_relevance;
+    param.avg_doc_length_ = need_relevance ? scoring_avg_doc_length : 0.0;
+    OK(inv_sstable.scan_posting(param, read_info, iter));
+    ASSERT_EQ(param.reusable_iter_, iter);
+    make_doc_id_datum(target_storage, expect_doc(10), target);
+    OK(iter->advance_to_id(target));
+    EXPECT_EQ(need_relevance, iter->can_probe_sorted_ids());
+
+    bool finished = false;
+    OK(iter->drain_until_typed_run(expect_doc(13), 4, typed_ids, relevance, n,
+        finished, true /*include_current*/));
+    ASSERT_EQ(4, n);
+    EXPECT_EQ(need_relevance, relevance.has_relevance_params());
+    for (int64_t i = 0; i < n; ++i) {
+      EXPECT_EQ(expect_doc(10 + i), typed_ids.at(i));
+      if (need_relevance) {
+        ASSERT_TRUE(relevance.is_uint32());
+        EXPECT_EQ(hetero_tf(10 + i), relevance.get_token_freqs32()[i]);
+        EXPECT_EQ(hetero_dl(10 + i), relevance.get_doc_lengths32()[i]);
+      }
+    }
+
+    // The terminal typed API may already have positioned its lookahead row.
+    make_doc_id_datum(target_storage, expect_doc(14), target);
+    OK(iter->advance_to_id(target));
+    OK(iter->drain_until_from_current(expect_doc(17), 4, pid, ptf, pdl, n));
+    ASSERT_EQ(4, n);
+    if (need_relevance) {
+      ASSERT_NE(nullptr, ptf);
+      ASSERT_NE(nullptr, pdl);
+    } else {
+      EXPECT_EQ(nullptr, ptf);
+      EXPECT_EQ(nullptr, pdl);
+      EXPECT_EQ(nullptr, iter->legacy_relevance_buf_);
+      EXPECT_EQ(OB_NOT_SUPPORTED, iter->load_curr_bm25_param(tf, dl));
+      uint64_t min_id = 0;
+      uint64_t max_id = 0;
+      double max_score = 0.0;
+      bool can_calc = true;
+      EXPECT_EQ(OB_NOT_SUPPORTED, iter->get_block_max_tuple(min_id, max_id, max_score));
+      EXPECT_EQ(OB_NOT_SUPPORTED, iter->get_curr_phrase_block_max_ranking(max_score));
+      OK(iter->get_range_max_score(expect_doc(17), true, expect_doc(21), max_score, can_calc));
+      EXPECT_FALSE(can_calc);
+    }
+    for (int64_t i = 0; i < n; ++i) {
+      EXPECT_EQ(expect_doc(14 + i), pid[i]);
+      if (need_relevance) {
+        EXPECT_EQ(hetero_tf(14 + i), ptf[i]);
+        EXPECT_EQ(hetero_dl(14 + i), pdl[i]);
+      }
+    }
+    iter->reset();
+  }
   free_iter(iter);
 }
 
@@ -3140,7 +3275,7 @@ TEST_F(TestInvSSTablePostingIter, get_range_max_score_without_relevance_is_conse
   ObInvSSTablePostingIter *iter = nullptr;
   OK(inv_sstable.scan_posting(param, read_info, iter));
   ASSERT_NE(nullptr, iter);
-  ASSERT_FALSE(iter->has_relevance_params_);
+  ASSERT_FALSE(iter->need_relevance_params_);
 
   const int64_t saved_read_idx = iter->scanner_.data_read_idx_;
   const int64_t saved_prefetch_idx = iter->scanner_.data_prefetch_idx_;
@@ -3333,7 +3468,7 @@ TEST_F(TestInvSSTablePostingIter, scan_posting_no_bm25_next_and_bm25_unsupported
   ObInvSSTablePostingIter *iter = nullptr;
   OK(inv_sstable.scan_posting(param, read_info, iter));
   ASSERT_NE(nullptr, iter);
-  ASSERT_FALSE(iter->has_relevance_params_);
+  ASSERT_FALSE(iter->need_relevance_params_);
 
   int64_t count = 0;
   int ret = OB_SUCCESS;

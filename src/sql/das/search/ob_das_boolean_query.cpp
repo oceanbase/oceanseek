@@ -513,8 +513,9 @@ int ObDASBooleanQueryRtDef::generate_op_impl(
       }
     } else if (must_clauses.count() == 0 && filter_clauses.count() == 0) {
       // full disjunction query
+      // Without required clauses, a candidate must come from a matching child.
       ObIDASSearchOp *opt_op = nullptr;
-      if (OB_FAIL(opt(should_clauses, bool_should_msm, ctdef->is_scoring(), lead_cost,
+      if (OB_FAIL(opt(should_clauses, MAX(1L, bool_should_msm), ctdef->is_scoring(), lead_cost,
                       ctdef->is_top_level_scoring(), search_ctx, opt_op))) {
         if (OB_NOT_NULL(bool_msm_snapshot)) {
           LOG_WARN("Boolean query failed to build optional should operator",

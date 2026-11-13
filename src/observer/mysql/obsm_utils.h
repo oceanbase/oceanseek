@@ -49,7 +49,8 @@ public:
       const ObField *field,
       const sql::ObSQLSessionInfo &session,
       share::schema::ObSchemaGetterGuard *schema_guard = NULL,
-      uint64_t tenant_id = common::OB_INVALID_ID);
+      uint64_t tenant_id = common::OB_INVALID_ID,
+      bool enable_json_bin_view = false);
 
   static bool update_from_bitmap(ObObj &param, const char *bitmap, int64_t field_index);
 

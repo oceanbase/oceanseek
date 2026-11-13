@@ -13,6 +13,16 @@
 //  [扩展元数据]
 //   - extended_meta_reset_sets_empty_sentinel: reset() 设空哨兵 (min=UINT64_MAX, max=0, is_empty_range)
 //
+//  [Search Text]
+//   - search_text_type_values_and_meta_validity: persisted enum values are unchanged; Text meta only requires a known type and a uint64 DOC_ID
+//   - init_empty_inv_meta_derives_search_text_formats: capabilities and empty sentinel of empty meta with a 4-key rowkey and 6/7 columns
+//   - init_empty_inv_meta_rejects_invalid_search_text_layout: errors out on an invalid rowkey/column count/DOC_ID type
+//   - search_text_meta_and_empty_phrase_sstable_round_trip: serialization and deep-copy round trip of meta and an empty PHRASE sstable
+//   - merge_inv_meta_keeps_search_text_static_formats: empty/non-empty partial merge; rejects MATCH/PHRASE and Text/Data mixing
+//   - empty_write_meta_checks_supported_search_text_formats: empty write accepts only Text formats with TF/DL and no nested key
+//   - empty_write_meta_keeps_fts_and_search_formats: empty write keeps FTS/Search formats and clears statistics
+//   - empty_write_meta_supports_self_alias: aliased source clears in place on success and stays unchanged on failure
+//
 //  [初始化]
 //   - init_accepts_only_inv_table_type: init 仅接受 INV 类型，拒绝 MAJOR 类型
 //   - init_with_inv_meta_in_param:      init 从 param 中提取 inv_meta
@@ -63,6 +73,7 @@
 #include "storage/blocksstable/async_index/ob_inv_sstable.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable_posting_iter.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable_range_iter.h"
+#include "storage/blocksstable/index_block/ob_index_block_builder.h"
 #include "storage/blocksstable/index_block/ob_index_block_macro_iterator.h"
 #include "storage/blocksstable/index_block/ob_sstable_index_scanner.h"
 #include "storage/schema_utils.h"
@@ -375,6 +386,41 @@ TEST_F(TestInvSSTable, extended_meta_reset_sets_empty_sentinel)
   ASSERT_EQ(ObNullType, meta.doc_id_obj_meta_.get_type());
 }
 
+TEST_F(TestInvSSTable, posting_iter_projects_relevance_only_when_requested)
+{
+  const uint64_t doc_ids[] = {17};
+  const uint64_t token_freqs[] = {3};
+  const uint64_t doc_lengths[] = {11};
+  ObInvSSTablePostingIter iter;
+  iter.is_opened_ = true;
+  iter.need_relevance_params_ = false;
+  iter.curr_block_loaded_ = true;
+  iter.curr_meta_.doc_count_ = 1;
+  ObPostingDocIdView doc_id_view;
+  doc_id_view.values_ = doc_ids;
+  doc_id_view.width_ = sizeof(uint64_t);
+  ObPostingRelevanceView relevance_view;
+  relevance_view.token_freqs_ = token_freqs;
+  relevance_view.doc_lengths_ = doc_lengths;
+  relevance_view.width_ = sizeof(uint64_t);
+  ASSERT_EQ(OB_SUCCESS, iter.posting_block_data_.assign(1, doc_id_view, relevance_view));
+
+  ASSERT_EQ(OB_SUCCESS, iter.materialize_row(0));
+  EXPECT_EQ(17, iter.curr_id_storage_);
+  EXPECT_FALSE(iter.curr_relevance_materialized_);
+  int64_t token_freq = 0;
+  int64_t doc_length = 0;
+  EXPECT_EQ(OB_NOT_SUPPORTED, iter.load_curr_bm25_param(token_freq, doc_length));
+
+  iter.need_relevance_params_ = true;
+  ASSERT_EQ(OB_SUCCESS, iter.materialize_row(0));
+  EXPECT_TRUE(iter.curr_relevance_materialized_);
+  EXPECT_EQ(3, iter.curr_token_freq_);
+  EXPECT_EQ(11, iter.curr_doc_length_);
+  EXPECT_EQ(OB_SUCCESS, iter.get_curr_bm25_param(token_freq, doc_length));
+  EXPECT_EQ(3, token_freq);
+  EXPECT_EQ(11, doc_length);
+}
 TEST_F(TestInvSSTable, init_empty_inv_meta_derives_all_static_formats)
 {
   ObStorageSchema storage_schema;
@@ -438,6 +484,397 @@ TEST_F(TestInvSSTable, init_empty_inv_meta_rejects_invalid_layout)
       share::schema::INDEX_TYPE_ASYNC_SEARCH_DATA_INDEX_LOCAL, 6, 4, storage_schema));
   ASSERT_EQ(OB_ERR_UNEXPECTED, ObTabletCreateSSTableParam::init_empty_inv_meta(
       storage_schema, inv_meta));
+}
+
+TEST_F(TestInvSSTable, search_text_type_values_and_meta_validity)
+{
+  ObInvIdxStatsMeta meta;
+
+  ASSERT_EQ(0, static_cast<int64_t>(INV_IDX_TYPE_INVALID));
+  ASSERT_EQ(1, static_cast<int64_t>(INV_IDX_TYPE_FTS));
+  ASSERT_EQ(2, static_cast<int64_t>(INV_IDX_TYPE_SEARCH));
+  ASSERT_EQ(3, static_cast<int64_t>(INV_IDX_TYPE_SEARCH_TEXT));
+  ASSERT_EQ(4, static_cast<int64_t>(INV_IDX_TYPE_MAX));
+
+  // MATCH and PHRASE capabilities.
+  meta.index_type_ = INV_IDX_TYPE_SEARCH_TEXT;
+  meta.has_relevance_params_ = true;
+  meta.doc_id_obj_meta_.set_uint64();
+  ASSERT_TRUE(meta.is_valid());
+  ASSERT_TRUE(meta.is_search_text_index());
+  ASSERT_FALSE(meta.is_fts_index());
+  meta.has_position_list_ = true;
+  ASSERT_TRUE(meta.is_valid());
+
+  // The generic check does not assume every block carries relevance params.
+  meta.has_relevance_params_ = false;
+  ASSERT_TRUE(meta.is_valid());
+
+  meta.doc_id_obj_meta_.set_int();
+  ASSERT_FALSE(meta.is_valid());
+  meta.doc_id_obj_meta_.reset();
+  ASSERT_FALSE(meta.is_valid());
+
+  meta.doc_id_obj_meta_.set_uint64();
+  meta.index_type_ = INV_IDX_TYPE_INVALID;
+  ASSERT_FALSE(meta.is_valid());
+  meta.index_type_ = INV_IDX_TYPE_MAX;
+  ASSERT_FALSE(meta.is_valid());
+  meta.index_type_ = static_cast<ObInvIdxType>(INV_IDX_TYPE_MAX + 1);
+  ASSERT_FALSE(meta.is_valid());
+}
+
+TEST_F(TestInvSSTable, init_empty_inv_meta_derives_search_text_formats)
+{
+  ObStorageSchema storage_schema;
+  ObInvSSTableMeta inv_meta;
+
+  ASSERT_EQ(OB_SUCCESS, build_async_storage_schema(
+      share::schema::INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_INDEX_LOCAL,
+      SEARCH_TEXT_COL_CNT_WITHOUT_POS, SEARCH_TEXT_ROWKEY_CNT, storage_schema));
+  ASSERT_EQ(OB_SUCCESS, ObTabletCreateSSTableParam::init_empty_inv_meta(
+      storage_schema, inv_meta));
+  ASSERT_TRUE(inv_meta.is_valid());
+  ASSERT_EQ(INV_IDX_TYPE_SEARCH_TEXT, inv_meta.get_stats().index_type_);
+  ASSERT_TRUE(inv_meta.get_stats().has_relevance_params_);
+  ASSERT_FALSE(inv_meta.get_stats().has_position_list_);
+  ASSERT_FALSE(inv_meta.get_stats().has_nested_key_);
+  ASSERT_EQ(ObUInt64Type, inv_meta.get_stats().doc_id_obj_meta_.get_type());
+  ASSERT_EQ(UINT64_MAX, inv_meta.get_stats().min_doc_id_);
+  ASSERT_EQ(0, inv_meta.get_stats().max_doc_id_);
+  ASSERT_EQ(0, inv_meta.get_stats().total_doc_length_);
+
+  ASSERT_EQ(OB_SUCCESS, build_async_storage_schema(
+      share::schema::INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_PHRASE_INDEX_LOCAL,
+      SEARCH_TEXT_COL_CNT_WITH_POS, SEARCH_TEXT_ROWKEY_CNT, storage_schema));
+  ASSERT_EQ(OB_SUCCESS, ObTabletCreateSSTableParam::init_empty_inv_meta(
+      storage_schema, inv_meta));
+  ASSERT_TRUE(inv_meta.is_valid());
+  ASSERT_EQ(INV_IDX_TYPE_SEARCH_TEXT, inv_meta.get_stats().index_type_);
+  ASSERT_TRUE(inv_meta.get_stats().has_relevance_params_);
+  ASSERT_TRUE(inv_meta.get_stats().has_position_list_);
+  ASSERT_FALSE(inv_meta.get_stats().has_nested_key_);
+  ASSERT_TRUE(inv_meta.get_stats().is_empty_range());
+  ASSERT_EQ(0, inv_meta.get_stats().total_doc_length_);
+}
+
+TEST_F(TestInvSSTable, init_empty_inv_meta_rejects_text_type_layout_mismatch)
+{
+  for (int64_t with_pos = 0; with_pos < 2; ++with_pos) {
+    ObStorageSchema storage_schema;
+    ObInvSSTableMeta inv_meta;
+    ASSERT_EQ(OB_SUCCESS, build_async_storage_schema(0 != with_pos
+        ? share::schema::INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_INDEX_LOCAL
+        : share::schema::INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_PHRASE_INDEX_LOCAL,
+        0 != with_pos ? SEARCH_TEXT_COL_CNT_WITH_POS : SEARCH_TEXT_COL_CNT_WITHOUT_POS,
+        SEARCH_TEXT_ROWKEY_CNT, storage_schema));
+    ASSERT_EQ(OB_ERR_UNEXPECTED, ObTabletCreateSSTableParam::init_empty_inv_meta(
+        storage_schema, inv_meta));
+    ASSERT_FALSE(inv_meta.is_valid());
+  }
+}
+
+TEST_F(TestInvSSTable, init_empty_inv_meta_rejects_invalid_search_text_layout)
+{
+  ObStorageSchema storage_schema;
+  ObInvSSTableMeta inv_meta;
+  const share::schema::ObIndexType text_type =
+      share::schema::INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_INDEX_LOCAL;
+
+  // 3 or 5 business keys.
+  ASSERT_EQ(OB_SUCCESS, build_async_storage_schema(text_type,
+      SEARCH_TEXT_COL_CNT_WITHOUT_POS, SEARCH_TEXT_ROWKEY_CNT - 1, storage_schema));
+  ASSERT_EQ(OB_ERR_UNEXPECTED, ObTabletCreateSSTableParam::init_empty_inv_meta(
+      storage_schema, inv_meta));
+  ASSERT_FALSE(inv_meta.is_valid());
+  ASSERT_EQ(OB_SUCCESS, build_async_storage_schema(text_type,
+      SEARCH_TEXT_COL_CNT_WITH_POS, SEARCH_TEXT_ROWKEY_CNT + 1, storage_schema));
+  ASSERT_EQ(OB_ERR_UNEXPECTED, ObTabletCreateSSTableParam::init_empty_inv_meta(
+      storage_schema, inv_meta));
+  ASSERT_FALSE(inv_meta.is_valid());
+
+  // 5 or 8 logical columns; 8 is the storage row width of MATCH, not its logical width.
+  ASSERT_EQ(OB_SUCCESS, build_async_storage_schema(text_type,
+      SEARCH_TEXT_COL_CNT_WITHOUT_POS - 1, SEARCH_TEXT_ROWKEY_CNT, storage_schema));
+  ASSERT_EQ(OB_ERR_UNEXPECTED, ObTabletCreateSSTableParam::init_empty_inv_meta(
+      storage_schema, inv_meta));
+  ASSERT_FALSE(inv_meta.is_valid());
+  ASSERT_EQ(OB_SUCCESS, build_async_storage_schema(text_type,
+      SEARCH_TEXT_COL_CNT_WITH_POS + 1, SEARCH_TEXT_ROWKEY_CNT, storage_schema));
+  ASSERT_EQ(OB_ERR_UNEXPECTED, ObTabletCreateSSTableParam::init_empty_inv_meta(
+      storage_schema, inv_meta));
+  ASSERT_FALSE(inv_meta.is_valid());
+
+  // DOC_ID must be uint64.
+  ASSERT_EQ(OB_SUCCESS, build_async_storage_schema(text_type,
+      SEARCH_TEXT_COL_CNT_WITHOUT_POS, SEARCH_TEXT_ROWKEY_CNT, storage_schema));
+  storage_schema.rowkey_array_.at(SEARCH_TEXT_DOC_ID).meta_type_.set_int();
+  ASSERT_EQ(OB_ERR_UNEXPECTED, ObTabletCreateSSTableParam::init_empty_inv_meta(
+      storage_schema, inv_meta));
+}
+
+TEST_F(TestInvSSTable, search_text_meta_and_empty_phrase_sstable_round_trip)
+{
+  ObStorageSchema text_schema;
+  ObInvIdxStatsMeta meta;
+  ObInvIdxStatsMeta decoded_meta;
+  char meta_buf[256];
+  int64_t pos = 0;
+
+  meta.index_type_ = INV_IDX_TYPE_SEARCH_TEXT;
+  meta.has_relevance_params_ = true;
+  meta.has_position_list_ = true;
+  meta.doc_id_obj_meta_.set_uint64();
+  meta.min_doc_id_ = 42;
+  meta.max_doc_id_ = 46;
+  meta.total_doc_length_ = 10;
+  ASSERT_EQ(OB_SUCCESS, meta.serialize(meta_buf, sizeof(meta_buf), pos));
+  ASSERT_EQ(meta.get_serialize_size(), pos);
+  pos = 0;
+  ASSERT_EQ(OB_SUCCESS, decoded_meta.deserialize(meta_buf, sizeof(meta_buf), pos));
+  ASSERT_EQ(meta.get_serialize_size(), pos);
+  ASSERT_TRUE(decoded_meta.is_valid());
+  ASSERT_EQ(INV_IDX_TYPE_SEARCH_TEXT, decoded_meta.index_type_);
+  ASSERT_TRUE(decoded_meta.has_relevance_params_);
+  ASSERT_TRUE(decoded_meta.has_position_list_);
+  ASSERT_FALSE(decoded_meta.has_nested_key_);
+  ASSERT_EQ(42, decoded_meta.min_doc_id_);
+  ASSERT_EQ(46, decoded_meta.max_doc_id_);
+  ASSERT_EQ(10, decoded_meta.total_doc_length_);
+
+  // An empty PHRASE segment keeps the position capability through sstable persistence.
+  ObTabletCreateSSTableParam param;
+  ObInvSSTable sstable;
+  ObInvSSTable decoded_sstable;
+  ObIStorageMetaObj *copied_obj = nullptr;
+  const uint64_t data_version = DATA_CURRENT_VERSION;
+  ObStorageSchema data_schema;
+  ASSERT_EQ(OB_SUCCESS, build_async_storage_schema(
+      share::schema::INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_PHRASE_INDEX_LOCAL,
+      SEARCH_TEXT_COL_CNT_WITH_POS, SEARCH_TEXT_ROWKEY_CNT, text_schema));
+  ASSERT_EQ(OB_SUCCESS, build_empty_sstable_param(
+      ObITable::TableType::INV_INDEX_SSTABLE, data_schema, param));
+  ASSERT_EQ(OB_SUCCESS, ObTabletCreateSSTableParam::init_empty_inv_meta(
+      text_schema, param.inv_meta_));
+  ASSERT_EQ(OB_SUCCESS, sstable.init(param, &allocator_));
+
+  const int64_t buf_len = sstable.get_serialize_size(data_version);
+  char *buf = static_cast<char *>(allocator_.alloc(buf_len));
+  ASSERT_NE(nullptr, buf);
+  pos = 0;
+  ASSERT_EQ(OB_SUCCESS, sstable.serialize(data_version, buf, buf_len, pos));
+  pos = 0;
+  ASSERT_EQ(OB_SUCCESS, decoded_sstable.deserialize(allocator_, buf, buf_len, pos));
+  const ObInvIdxStatsMeta &decoded_sstable_meta = decoded_sstable.get_inv_meta().get_stats();
+  ASSERT_TRUE(decoded_sstable_meta.is_valid());
+  ASSERT_EQ(INV_IDX_TYPE_SEARCH_TEXT, decoded_sstable_meta.index_type_);
+  ASSERT_TRUE(decoded_sstable_meta.has_relevance_params_);
+  ASSERT_TRUE(decoded_sstable_meta.has_position_list_);
+  ASSERT_TRUE(decoded_sstable_meta.is_empty_range());
+  ASSERT_EQ(0, decoded_sstable_meta.total_doc_length_);
+
+  const int64_t deep_copy_size = sstable.get_deep_copy_size();
+  char *copy_buf = static_cast<char *>(allocator_.alloc(deep_copy_size));
+  ASSERT_NE(nullptr, copy_buf);
+  ASSERT_EQ(OB_SUCCESS, sstable.deep_copy(copy_buf, deep_copy_size, copied_obj));
+  ASSERT_NE(nullptr, copied_obj);
+  const ObInvIdxStatsMeta &copied_meta = static_cast<ObInvSSTable *>(copied_obj)->get_inv_meta().get_stats();
+  ASSERT_EQ(INV_IDX_TYPE_SEARCH_TEXT, copied_meta.index_type_);
+  ASSERT_TRUE(copied_meta.has_position_list_);
+  ASSERT_TRUE(copied_meta.is_empty_range());
+}
+
+TEST_F(TestInvSSTable, empty_write_meta_checks_supported_search_text_formats)
+{
+  for (int64_t with_pos = 0; with_pos < 2; ++with_pos) {
+    for (int64_t relevance = 0; relevance < 2; ++relevance) {
+      for (int64_t nested = 0; nested < 2; ++nested) {
+        ObInvIdxStatsMeta major;
+        major.index_type_ = INV_IDX_TYPE_SEARCH_TEXT;
+        major.doc_id_obj_meta_.set_uint64();
+        major.has_position_list_ = 0 != with_pos;
+        major.has_relevance_params_ = 0 != relevance;
+        major.has_nested_key_ = 0 != nested;
+        major.min_doc_id_ = 42;
+        major.max_doc_id_ = 46;
+        major.total_doc_length_ = 10;
+        ASSERT_TRUE(major.is_valid());
+        ObInvIdxStatsMeta empty;
+        // Call the same production initializer used by the incremental major helper.
+        if (1 == relevance && 0 == nested) {
+          ASSERT_EQ(OB_SUCCESS, empty.init_empty_for_write(major));
+          EXPECT_TRUE(empty.is_empty_range());
+          EXPECT_EQ(0u, empty.total_doc_length_);
+          EXPECT_EQ(INV_IDX_TYPE_SEARCH_TEXT, empty.index_type_);
+          EXPECT_EQ(major.has_position_list_, empty.has_position_list_);
+          EXPECT_TRUE(empty.has_relevance_params_);
+          EXPECT_FALSE(empty.has_nested_key_);
+          EXPECT_EQ(10u, major.total_doc_length_);
+        } else {
+          empty = major;
+          ASSERT_EQ(OB_ERR_UNEXPECTED, empty.init_empty_for_write(major));
+          EXPECT_EQ(42u, empty.min_doc_id_);
+          EXPECT_EQ(46u, empty.max_doc_id_);
+          EXPECT_EQ(10u, empty.total_doc_length_);
+        }
+      }
+    }
+  }
+  ObInvIdxStatsMeta invalid;
+  ObInvIdxStatsMeta empty;
+  EXPECT_EQ(OB_ERR_UNEXPECTED, empty.init_empty_for_write(invalid));
+}
+
+// The incremental major helper derives empty metas through init_empty_for_write for every
+// inverted index type, so FTS and Search Index formats must still be preserved as-is.
+TEST_F(TestInvSSTable, empty_write_meta_keeps_fts_and_search_formats)
+{
+  struct Format
+  {
+    ObInvIdxType index_type_;
+    bool has_relevance_params_;
+    bool has_position_list_;
+    bool has_nested_key_;
+  };
+  const Format formats[] = {
+    {INV_IDX_TYPE_FTS, true, false, false},
+    {INV_IDX_TYPE_FTS, true, true, false},
+    {INV_IDX_TYPE_SEARCH, false, false, false},
+    {INV_IDX_TYPE_SEARCH, false, false, true},
+  };
+  for (int64_t i = 0; i < ARRAYSIZEOF(formats); ++i) {
+    ObInvIdxStatsMeta major;
+    major.index_type_ = formats[i].index_type_;
+    major.doc_id_obj_meta_.set_uint64();
+    major.has_relevance_params_ = formats[i].has_relevance_params_;
+    major.has_position_list_ = formats[i].has_position_list_;
+    major.has_nested_key_ = formats[i].has_nested_key_;
+    major.min_doc_id_ = 42;
+    major.max_doc_id_ = 46;
+    major.total_doc_length_ = 10;
+    ASSERT_TRUE(major.is_valid()) << "format index " << i;
+    ObInvIdxStatsMeta empty;
+    ASSERT_EQ(OB_SUCCESS, empty.init_empty_for_write(major)) << "format index " << i;
+    EXPECT_TRUE(empty.is_valid());
+    EXPECT_TRUE(empty.is_empty_range());
+    EXPECT_EQ(0u, empty.total_doc_length_);
+    EXPECT_EQ(major.index_type_, empty.index_type_);
+    EXPECT_EQ(major.has_relevance_params_, empty.has_relevance_params_);
+    EXPECT_EQ(major.has_position_list_, empty.has_position_list_);
+    EXPECT_EQ(major.has_nested_key_, empty.has_nested_key_);
+    EXPECT_TRUE(empty.doc_id_obj_meta_.is_uint64());
+    EXPECT_EQ(42u, major.min_doc_id_);
+    EXPECT_EQ(10u, major.total_doc_length_);
+  }
+  // FTS without relevance params and Search Index with them are invalid sources.
+  ObInvIdxStatsMeta bad_fts;
+  bad_fts.index_type_ = INV_IDX_TYPE_FTS;
+  bad_fts.doc_id_obj_meta_.set_uint64();
+  bad_fts.has_relevance_params_ = false;
+  ObInvIdxStatsMeta bad_search = bad_fts;
+  bad_search.index_type_ = INV_IDX_TYPE_SEARCH;
+  bad_search.has_relevance_params_ = true;
+  ObInvIdxStatsMeta empty;
+  EXPECT_EQ(OB_ERR_UNEXPECTED, empty.init_empty_for_write(bad_fts));
+  EXPECT_EQ(OB_ERR_UNEXPECTED, empty.init_empty_for_write(bad_search));
+}
+
+TEST_F(TestInvSSTable, empty_write_meta_supports_self_alias)
+{
+  ObInvIdxStatsMeta meta;
+  meta.index_type_ = INV_IDX_TYPE_SEARCH_TEXT;
+  meta.doc_id_obj_meta_.set_uint64();
+  meta.has_relevance_params_ = true;
+  meta.has_position_list_ = true;
+  meta.has_nested_key_ = false;
+  meta.min_doc_id_ = 42;
+  meta.max_doc_id_ = 46;
+  meta.total_doc_length_ = 10;
+  // Success: the format survives and the statistics are cleared in place.
+  ASSERT_EQ(OB_SUCCESS, meta.init_empty_for_write(meta));
+  EXPECT_TRUE(meta.is_valid());
+  EXPECT_TRUE(meta.is_empty_range());
+  EXPECT_EQ(0u, meta.total_doc_length_);
+  EXPECT_EQ(INV_IDX_TYPE_SEARCH_TEXT, meta.index_type_);
+  EXPECT_TRUE(meta.has_relevance_params_);
+  EXPECT_TRUE(meta.has_position_list_);
+  EXPECT_FALSE(meta.has_nested_key_);
+
+  // Failure: an unsupported search text write layout leaves the aliased object untouched.
+  ObInvIdxStatsMeta unsupported;
+  unsupported.index_type_ = INV_IDX_TYPE_SEARCH_TEXT;
+  unsupported.doc_id_obj_meta_.set_uint64();
+  unsupported.has_relevance_params_ = true;
+  unsupported.has_position_list_ = false;
+  unsupported.has_nested_key_ = true;
+  unsupported.min_doc_id_ = 42;
+  unsupported.max_doc_id_ = 46;
+  unsupported.total_doc_length_ = 10;
+  ASSERT_TRUE(unsupported.is_valid());
+  ASSERT_EQ(OB_ERR_UNEXPECTED, unsupported.init_empty_for_write(unsupported));
+  EXPECT_EQ(INV_IDX_TYPE_SEARCH_TEXT, unsupported.index_type_);
+  EXPECT_TRUE(unsupported.has_relevance_params_);
+  EXPECT_TRUE(unsupported.has_nested_key_);
+  EXPECT_EQ(42u, unsupported.min_doc_id_);
+  EXPECT_EQ(46u, unsupported.max_doc_id_);
+  EXPECT_EQ(10u, unsupported.total_doc_length_);
+}
+
+TEST_F(TestInvSSTable, merge_inv_meta_keeps_search_text_static_formats)
+{
+  ObInvIdxStatsMeta empty_match;
+  ObInvIdxStatsMeta match_partial;
+  ObInvIdxStatsMeta phrase_partial;
+  ObInvIdxStatsMeta search_partial;
+
+  empty_match.index_type_ = INV_IDX_TYPE_SEARCH_TEXT;
+  empty_match.has_relevance_params_ = true;
+  empty_match.doc_id_obj_meta_.set_uint64();
+  match_partial = empty_match;
+  match_partial.min_doc_id_ = 42;
+  match_partial.max_doc_id_ = 46;
+  match_partial.total_doc_length_ = 10;
+  phrase_partial = match_partial;
+  phrase_partial.has_position_list_ = true;
+  search_partial = match_partial;
+  search_partial.index_type_ = INV_IDX_TYPE_SEARCH;
+  search_partial.has_relevance_params_ = false;
+
+  ObInvSSTableMeta empty_match_meta;
+  ASSERT_EQ(OB_SUCCESS, empty_match_meta.init(empty_match));
+  ObInvSSTableMeta match_partial_meta;
+  ASSERT_EQ(OB_SUCCESS, match_partial_meta.init(match_partial));
+  ObInvSSTableMeta phrase_partial_meta;
+  ASSERT_EQ(OB_SUCCESS, phrase_partial_meta.init(phrase_partial));
+  ObInvSSTableMeta search_partial_meta;
+  ASSERT_EQ(OB_SUCCESS, search_partial_meta.init(search_partial));
+
+  // Empty seed, non-empty partial, then empty partial: statistics are added once.
+  {
+    ObSSTableIndexBuilder builder(false /*use_double_write_buffer*/);
+    builder.set_is_async_index(true);
+    ASSERT_EQ(OB_SUCCESS, builder.merge_inv_meta(empty_match_meta));
+    ASSERT_EQ(OB_SUCCESS, builder.merge_inv_meta(match_partial_meta));
+    ASSERT_EQ(OB_SUCCESS, builder.merge_inv_meta(empty_match_meta));
+    ASSERT_EQ(INV_IDX_TYPE_SEARCH_TEXT, builder.inv_meta_.get_stats().index_type_);
+    ASSERT_TRUE(builder.inv_meta_.get_stats().has_relevance_params_);
+    ASSERT_FALSE(builder.inv_meta_.get_stats().has_position_list_);
+    ASSERT_EQ(42, builder.inv_meta_.get_stats().min_doc_id_);
+    ASSERT_EQ(46, builder.inv_meta_.get_stats().max_doc_id_);
+    ASSERT_EQ(10, builder.inv_meta_.get_stats().total_doc_length_);
+  }
+
+  // MATCH and PHRASE partials, or Text and Data partials, never merge into one builder.
+  {
+    ObSSTableIndexBuilder builder(false /*use_double_write_buffer*/);
+    builder.set_is_async_index(true);
+    ASSERT_EQ(OB_SUCCESS, builder.merge_inv_meta(match_partial_meta));
+    ASSERT_EQ(OB_ERR_UNEXPECTED, builder.merge_inv_meta(phrase_partial_meta));
+    ASSERT_EQ(OB_ERR_UNEXPECTED, builder.merge_inv_meta(search_partial_meta));
+    ASSERT_FALSE(builder.inv_meta_.get_stats().has_position_list_);
+    ASSERT_EQ(INV_IDX_TYPE_SEARCH_TEXT, builder.inv_meta_.get_stats().index_type_);
+    ASSERT_EQ(10, builder.inv_meta_.get_stats().total_doc_length_);
+  }
 }
 
 TEST_F(TestInvSSTable, init_accepts_only_inv_table_type)

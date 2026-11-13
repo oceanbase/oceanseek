@@ -474,7 +474,7 @@ enum ObIndexType
   INDEX_TYPE_ASYNC_SEARCH_DEF_INDEX_LOCAL = 49,
   INDEX_TYPE_ASYNC_SEARCH_DATA_INDEX_LOCAL = 50,
   INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_INDEX_LOCAL = 51,
-  INDEX_TYPE_ASYNC_SEARCH_TEXT_PHRASE_INDEX_LOCAL = 52,
+  INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_PHRASE_INDEX_LOCAL = 52,
   // async ivf vector index
   INDEX_TYPE_ASYNC_IVF_INDEX_LOCAL = 53,
 
@@ -1119,12 +1119,36 @@ inline bool is_hybrid_vec_index(const ObIndexType index_type)
          || is_hybrid_vec_index_embedded_type(index_type);
 }
 
+inline bool is_async_search_text_match_index(const ObIndexType index_type)
+{
+  return INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_INDEX_LOCAL == index_type;
+}
+
+inline bool is_async_search_text_match_phrase_index(const ObIndexType index_type)
+{
+  return INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_PHRASE_INDEX_LOCAL == index_type;
+}
+
+// MATCH and PHRASE have separate schema types and share the Search Text storage format.
+inline bool is_async_search_text_index(const ObIndexType index_type)
+{
+  return is_async_search_text_match_index(index_type)
+      || is_async_search_text_match_phrase_index(index_type);
+}
+
+inline bool is_search_text_index(const ObIndexType index_type)
+{
+  return is_async_search_text_index(index_type);
+}
+
 inline bool is_search_index(const ObIndexType index_type)
 {
-  return index_type == INDEX_TYPE_SEARCH_DEF_INDEX_LOCAL
-      || index_type == INDEX_TYPE_SEARCH_DATA_INDEX_LOCAL
-      || index_type == INDEX_TYPE_ASYNC_SEARCH_DEF_INDEX_LOCAL
-      || index_type == INDEX_TYPE_ASYNC_SEARCH_DATA_INDEX_LOCAL;
+  return INDEX_TYPE_SEARCH_DEF_INDEX_LOCAL == index_type
+      || INDEX_TYPE_SEARCH_DATA_INDEX_LOCAL == index_type
+      || INDEX_TYPE_ASYNC_SEARCH_DEF_INDEX_LOCAL == index_type
+      || INDEX_TYPE_ASYNC_SEARCH_DATA_INDEX_LOCAL == index_type
+      || INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_INDEX_LOCAL == index_type
+      || INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_PHRASE_INDEX_LOCAL == index_type;
 }
 
 inline bool is_built_in_multivalue_index(const ObIndexType index_type)
@@ -1238,9 +1262,20 @@ inline bool is_async_search_data_index(const ObIndexType index_type)
   return index_type == INDEX_TYPE_ASYNC_SEARCH_DATA_INDEX_LOCAL;
 }
 
+// Physical children of a Search Def. Data-only callers must keep using is_search_data_index.
+inline bool is_search_aux_index(const ObIndexType index_type)
+{
+  return is_search_data_index(index_type) || is_search_text_index(index_type);
+}
+
+inline bool is_async_search_aux_index(const ObIndexType index_type)
+{
+  return is_async_search_data_index(index_type) || is_async_search_text_index(index_type);
+}
+
 inline bool is_async_search_index(const ObIndexType index_type)
 {
-  return is_async_search_def_index(index_type) || is_async_search_data_index(index_type);
+  return is_async_search_def_index(index_type) || is_async_search_aux_index(index_type);
 }
 
 inline bool is_async_fts_index(const ObIndexType index_type)
@@ -1303,13 +1338,16 @@ inline bool is_async_index_refresh_target(const ObIndexType index_type)
 {
   return is_async_fts_index(index_type)
       || is_async_search_data_index(index_type)
+      || is_async_search_text_index(index_type)
       || is_async_delete_index(index_type)
       || is_async_ivf_index(index_type);
 }
 
 inline bool is_async_inverted_storage_index(const ObIndexType index_type)
 {
-  return is_async_fts_index(index_type) || is_async_search_data_index(index_type);
+  return is_async_fts_index(index_type)
+      || is_async_search_data_index(index_type)
+      || is_async_search_text_index(index_type);
 }
 
 inline bool is_fts_or_async_fts_index(const ObIndexType index_type)

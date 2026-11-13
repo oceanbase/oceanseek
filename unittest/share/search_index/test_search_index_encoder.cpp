@@ -4,12 +4,19 @@
  */
 
 #include <gtest/gtest.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include "share/search_index/ob_search_index_config.h"
+#include "lib/json_type/ob_json_wrapper.h"
 #define private public
 #include "share/search_index/ob_search_index_encoder.h"
 #include "share/search_index/ob_search_index_generator.h"
+#include "share/search_index/ob_search_index_nested_key_list.h"
+#include "sql/das/search/ob_das_nested_key.h"
+#include "sql/das/search/ob_das_search_define.h"
 #include "lib/json_type/ob_json_parse.h"
 #include "lib/json_type/ob_json_base.h"
 #include "lib/json_type/ob_json_bin.h"
@@ -25,6 +32,119 @@ namespace share {
 
 // Typedef for test code simplicity
 typedef ObSearchIndexRow ObIndexRow;
+
+TEST(TestNestedKey, independent_key_and_rowid_states)
+{
+  sql::ObDASNestedKey position;
+  EXPECT_EQ(16, sizeof(sql::ObDASRowID));
+  EXPECT_EQ(16, sizeof(sql::ObDASNestedKey));
+  EXPECT_TRUE(position.is_min());
+  const char bytes[12] = {0, 0, 0, 1};
+  position.assign(bytes, sizeof(bytes));
+  EXPECT_TRUE(position.is_normal());
+  EXPECT_EQ(bytes, position.ptr());
+  EXPECT_EQ(12, position.length());
+  sql::ObDASNestedKey target;
+  target.assign(position, 4);
+  EXPECT_EQ(1ULL << 32, target.value());
+  EXPECT_EQ(4, target.length());
+  position.set_max();
+  EXPECT_TRUE(position.is_max());
+  position.set_min();
+  EXPECT_TRUE(position.is_min());
+  position.set_value(0, 8);
+  EXPECT_TRUE(position.is_normal());
+  position.set_value(UINT64_MAX, 8);
+  EXPECT_TRUE(position.is_normal());
+  sql::ObDASRowID document;
+  document.set_uint64(UINT64_MAX);
+  EXPECT_TRUE(document.is_normal());
+  EXPECT_EQ(UINT64_MAX, document.get_uint64());
+  position.assign(bytes, sizeof(bytes));
+  EXPECT_EQ(sizeof(bytes), position.length());
+  position.reset();
+  EXPECT_TRUE(position.is_min());
+  EXPECT_EQ(0, position.length());
+  EXPECT_EQ(UINT64_MAX, document.get_uint64());
+  document.reset();
+  EXPECT_TRUE(document.is_normal());
+  EXPECT_EQ(0, document.get_uint64());
+  document.set_uint64(UINT64_MAX);
+  EXPECT_EQ(UINT64_MAX, document.get_uint64());
+}
+
+TEST(TestNestedKey, inline_unsigned_order)
+{
+  // Both low-byte carry and the sign bit must preserve storage byte-string order.
+  const unsigned char keys[][8] = {
+    {0, 0, 0, 0, 0, 0, 0, 255},
+    {0, 0, 0, 0, 0, 0, 1, 0},
+    {0, 0, 0, 1, 0, 0, 0, 0},
+    {128, 0, 0, 0, 0, 0, 0, 0},
+    {255, 255, 255, 255, 255, 255, 255, 255}};
+  const uint64_t values[] = {255, 256, 1ULL << 32, 1ULL << 63, UINT64_MAX};
+  sql::ObDASNestedKey previous;
+  for (int64_t i = 0; i < 5; ++i) {
+    const char *key = reinterpret_cast<const char *>(keys[i]);
+    EXPECT_EQ(values[i], sql::ObDASNestedKey::load(key, 8));
+    char encoded[8];
+    sql::ObDASNestedKey::store(encoded, values[i], 8);
+    EXPECT_EQ(0, MEMCMP(encoded, key, 8));
+    sql::ObDASNestedKey row;
+    row.assign(key, 8);
+    EXPECT_TRUE(row.is_normal()); // UINT64_MAX is a valid key, distinct from EOF.
+    EXPECT_EQ(values[i], row.value());
+    EXPECT_LT(previous.compare(row, 8), 0);
+    previous = row;
+    row.set_max();
+    EXPECT_TRUE(row.is_max());
+  }
+  char prefix[4];
+  sql::ObDASNestedKey::store(prefix, 1ULL << 63, 4);
+  EXPECT_EQ(0, MEMCMP(prefix, keys[3], 4));
+  EXPECT_EQ(1ULL << 63, sql::ObDASNestedKey::load(prefix, 4));
+}
+
+TEST(TestNestedKey, short_targets_do_not_read_past_their_prefix)
+{
+  const char key[16] = {0, 0, 0, 1, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 1};
+  sql::ObDASNestedKey candidate;
+  candidate.assign(key, sizeof(key));
+  const long page_size = sysconf(_SC_PAGESIZE);
+  ASSERT_GT(page_size, 0);
+  void *pages = mmap(nullptr, 2 * page_size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  ASSERT_NE(MAP_FAILED, pages);
+  ASSERT_EQ(0, mprotect(static_cast<char *>(pages) + page_size, page_size, PROT_NONE));
+  for (int32_t bytes : {4, 8, 12}) {
+    // Any read beyond this prefix hits the inaccessible page, even without ASan.
+    char *target = static_cast<char *>(pages) + page_size - bytes;
+    MEMCPY(target, key, bytes);
+    sql::ObDASNestedKey seek_target;
+    seek_target.assign(target, bytes);
+    EXPECT_EQ(bytes, seek_target.length());
+    EXPECT_EQ(0, candidate.compare(seek_target, bytes));
+    EXPECT_EQ(16, candidate.length());
+  }
+  EXPECT_EQ(0, munmap(pages, 2 * page_size));
+}
+
+TEST(TestNestedKey, writer_rejects_invalid_order_and_reader_rejects_invalid_layout)
+{
+  const char bytes[] = {1, 0, 0, 0, 2, 4, 0, 0, 0, 2, 0, 0, 0, 1};
+  common::ObArenaAllocator allocator;
+  common::ObStringBuffer buffer(&allocator);
+  ObSearchIndexNestedKeyListWriter writer;
+  ASSERT_EQ(OB_SUCCESS, writer.init(buffer));
+  const common::ObDatum first_key(bytes + 6, 4, false);
+  const common::ObDatum smaller_key(bytes + 10, 4, false);
+  ASSERT_EQ(OB_SUCCESS, writer.append(first_key));
+  EXPECT_EQ(OB_ROWKEY_ORDER_ERROR, writer.append(smaller_key));
+  // The reader trusts the writer's ordering check and only validates the layout.
+  ObSearchIndexNestedKeyListReader reader;
+  common::ObDatum truncated(bytes, sizeof(bytes) - 1, false);
+  EXPECT_EQ(OB_INVALID_ARGUMENT, reader.init(truncated));
+}
 
 class TestSearchIndexEncoder : public ::testing::Test {
 public:
@@ -48,6 +168,205 @@ private:
   DISALLOW_COPY_AND_ASSIGN(TestSearchIndexEncoder);
 };
 
+static int make_binary_wrapper(ObIAllocator &allocator, ObIJsonBase &node, ObJsonWrapper &json)
+{
+  int ret = OB_SUCCESS;
+  ObIJsonBase *bin = nullptr;
+  ObString raw;
+  if (OB_FAIL(ObJsonBaseFactory::transform(&allocator, &node, ObJsonInType::JSON_BIN, bin))) {
+  } else if (OB_FAIL(bin->get_raw_binary(raw, &allocator))) {
+  } else {
+    ret = json.parse_bin(raw.ptr(), raw.length());
+  }
+  return ret;
+}
+
+TEST_F(TestSearchIndexEncoder, json_wrapper_number_conversion)
+{
+  ObArenaAllocator allocator(ObModIds::TEST);
+  ObNumber decimal;
+  ASSERT_EQ(OB_SUCCESS, decimal.from("12345678901234567890.123456789", allocator));
+  ObJsonDecimal j_decimal(decimal);
+  ObJsonInt j_int(INT64_MIN);
+  ObJsonUint j_uint(UINT64_MAX);
+  ObJsonDouble j_double(0.1);
+  ObJsonDouble j_large(-1e100);
+  ObJsonDouble j_zero(-0.0);
+  ObJsonInt j_inline(-7);
+  ObJsonString j_string(ObString("12.5"));
+  ObJsonBoolean j_bool(true);
+  ObJsonNode *nodes[] = {&j_decimal, &j_int, &j_uint, &j_double, &j_large,
+                         &j_zero, &j_inline, &j_string, &j_bool};
+  const char *expected[] = {"12345678901234567890.123456789", "-9223372036854775808",
+                            "18446744073709551615", "0.1", "-1e100", "0", "-7", "12.5", "1"};
+  ObJsonArray array(&allocator);
+  for (ObJsonNode *node : nodes) {
+    ASSERT_EQ(OB_SUCCESS, array.append(node));
+  }
+  ObJsonWrapper array_view;
+  ASSERT_EQ(OB_SUCCESS, make_binary_wrapper(allocator, array, array_view));
+  for (int64_t i = 0; i < ARRAYSIZEOF(nodes); ++i) {
+    SCOPED_TRACE(expected[i]);
+    ObNumber expected_number;
+    ASSERT_EQ(OB_SUCCESS, expected_number.from_sci_opt(expected[i], strlen(expected[i]), allocator));
+    ObJsonWrapper wrappers[3] = {ObJsonWrapper(nodes[i]), ObJsonWrapper(), ObJsonWrapper()};
+    ASSERT_EQ(OB_SUCCESS, make_binary_wrapper(allocator, *nodes[i], wrappers[1]));
+    ASSERT_EQ(OB_SUCCESS, array_view.element(i, wrappers[2]));
+    for (const ObJsonWrapper &json : wrappers) {
+      ObNumber actual;
+      ASSERT_EQ(OB_SUCCESS, json.to_number(&allocator, actual));
+      EXPECT_EQ(0, expected_number.compare(actual));
+      EXPECT_EQ(OB_ERR_NULL_VALUE, json.to_number(nullptr, actual));
+    }
+  }
+  ObNumber actual;
+  EXPECT_EQ(OB_OPERATE_OVERFLOW, array_view.to_number(&allocator, actual));
+  EXPECT_EQ(OB_OPERATE_OVERFLOW, ObJsonWrapper(&array).to_number(&allocator, actual));
+}
+
+TEST_F(TestSearchIndexEncoder, json_wrapper_null_and_invalid_encoding)
+{
+  ObArenaAllocator allocator(ObModIds::TEST);
+  ObJsonNull j_null;
+  ObJsonNull missing(true);
+  ObJsonWrapper bin_null;
+  ASSERT_EQ(OB_SUCCESS, make_binary_wrapper(allocator, j_null, bin_null));
+  const ObJsonWrapper wrappers[] = {ObJsonWrapper(&j_null), bin_null};
+  for (const ObJsonWrapper &json : wrappers) {
+    ObString value;
+    EXPECT_TRUE(json.is_real_json_null());
+    ASSERT_EQ(OB_SUCCESS, ObSearchIndexValueEncoder::encode_value(allocator, json, value));
+    ASSERT_EQ(1, value.length());
+    EXPECT_EQ('\0', value.ptr()[0]);
+  }
+  ObJsonWrapper invalid;
+  ObJsonWrapper missing_wrapper(&missing);
+  EXPECT_FALSE(invalid.is_real_json_null());
+  EXPECT_FALSE(missing_wrapper.is_real_json_null());
+  ObString value("stale");
+  EXPECT_EQ(OB_ERR_UNEXPECTED, ObSearchIndexValueEncoder::encode_value(allocator, invalid, value));
+  EXPECT_TRUE(value.empty());
+  EXPECT_EQ(OB_ERR_UNEXPECTED, ObSearchIndexValueEncoder::encode_value(allocator, missing_wrapper, value));
+  EXPECT_EQ(OB_ERR_UNEXPECTED, ObSearchIndexValueEncoder::encode_value(allocator, &missing, value));
+  EXPECT_EQ(OB_ERR_UNEXPECTED, ObSearchIndexValueEncoder::encode_value(allocator, nullptr, value));
+  EXPECT_TRUE(value.empty());
+  ObNumber number;
+  ObTime time;
+  EXPECT_EQ(OB_ERR_UNEXPECTED, invalid.to_number(&allocator, number));
+  EXPECT_EQ(OB_ERR_UNEXPECTED, invalid.get_obtime(time));
+  ObEncParam enc_param;
+  ASSERT_EQ(OB_SUCCESS, ObSearchIndexValueEncoder::init_json_string_enc_param(enc_param));
+  EXPECT_EQ(OB_INVALID_ARGUMENT,
+            ObSearchIndexValueEncoder::encode_json_scalar(allocator, invalid, value, enc_param));
+  EXPECT_EQ(OB_INVALID_ARGUMENT,
+            ObSearchIndexValueEncoder::encode_json_scalar(allocator, nullptr, value, enc_param));
+  ObJsonArray array(&allocator);
+  const ObJsonWrapper container(&array);
+  EXPECT_EQ(OB_ERR_UNEXPECTED, ObSearchIndexValueEncoder::encode_value(allocator, container, value));
+  EXPECT_EQ(OB_ERR_UNEXPECTED, ObSearchIndexValueEncoder::encode_value(allocator, &array, value));
+  EXPECT_EQ(OB_INVALID_ARGUMENT,
+            ObSearchIndexValueEncoder::encode_json_scalar(allocator, container, value, enc_param));
+  EXPECT_EQ(OB_INVALID_ARGUMENT,
+            ObSearchIndexValueEncoder::encode_json_scalar(allocator, &array, value, enc_param));
+}
+
+TEST_F(TestSearchIndexEncoder, json_scalar_encoding_bytes)
+{
+  ObArenaAllocator allocator(ObModIds::TEST);
+  ObNumber decimal;
+  ASSERT_EQ(OB_SUCCESS, decimal.from("12345678901234567890.123456789", allocator));
+  ObJsonDecimal j_decimal(decimal);
+  ObJsonInt j_int(INT64_MIN);
+  ObJsonUint j_uint(UINT64_MAX);
+  ObJsonDouble j_double(0.1);
+  ObJsonDouble j_large(-1e100);
+  ObJsonDouble j_zero(-0.0);
+  ObJsonInt j_inline(-7);
+  ObJsonString j_string(ObString(3, "a\0b"));
+  ObJsonBoolean j_bool(true);
+  ObJsonNull j_null;
+  ObTime date, time, datetime, mdate, mdatetime;
+  ASSERT_EQ(OB_SUCCESS, ObTimeConverter::date_to_ob_time(16540, date));
+  ASSERT_EQ(OB_SUCCESS, ObTimeConverter::time_to_ob_time(-1234567, time));
+  ASSERT_EQ(OB_SUCCESS, ObTimeConverter::datetime_to_ob_time(1429056000123456, nullptr, datetime));
+  mdate = date;
+  mdatetime = datetime;
+  ObJsonDatetime j_date(date, ObDateType);
+  ObJsonDatetime j_time(time, ObTimeType);
+  ObJsonDatetime j_datetime(datetime, ObDateTimeType);
+  ObJsonDatetime j_timestamp(datetime, ObTimestampType);
+  ObJsonDatetime j_mdate(mdate, ObMySQLDateType);
+  ObJsonDatetime j_mdatetime(mdatetime, ObMySQLDateTimeType);
+  ObJsonOpaque j_opaque(ObString(3, "A\0B"), ObBitType);
+  ObJsonNode *nodes[] = {&j_decimal, &j_int, &j_uint, &j_double, &j_large, &j_zero, &j_inline,
+    &j_string, &j_bool, &j_null, &j_date, &j_time, &j_datetime, &j_timestamp, &j_mdate, &j_mdatetime, &j_opaque};
+  ObJsonArray array(&allocator);
+  for (ObJsonNode *node : nodes) {
+    ASSERT_EQ(OB_SUCCESS, array.append(node));
+  }
+  ObJsonWrapper array_view;
+  ASSERT_EQ(OB_SUCCESS, make_binary_wrapper(allocator, array, array_view));
+  // Fixed bytes captured from the pre-wrapper encoder; query and write paths must agree.
+  const char *expected[] = {
+    "c20000000d149aa4360dfb38d3075bcd1600000000",
+    "3efffffff5f2af9cfacd0d27feffffffff",
+    "c2000000131aa0c60a2a4ae60000000000",
+    "bf05f5e10100000000",
+    "35fffffff4ffffffff",
+    "8000000000",
+    "40fffffff7ffffffff",
+    "610001620000",
+    "01",
+    "00",
+    "8000409c",
+    "800000000012d687",
+    "800513b807406240",
+    "800513b807406240",
+    "800fbe8f",
+    "9995de000001e240",
+    "410001420000"
+  };
+  for (int64_t i = 0; i < ARRAYSIZEOF(nodes); ++i) {
+    SCOPED_TRACE(i);
+    ObJsonWrapper wrappers[3] = {ObJsonWrapper(nodes[i]), ObJsonWrapper(), ObJsonWrapper()};
+    ASSERT_EQ(OB_SUCCESS, make_binary_wrapper(allocator, *nodes[i], wrappers[1]));
+    ASSERT_EQ(OB_SUCCESS, array_view.element(i, wrappers[2]));
+    for (const ObJsonWrapper &json : wrappers) {
+      ObString value;
+      ASSERT_EQ(OB_SUCCESS, ObSearchIndexValueEncoder::encode_value(allocator, json, value));
+      std::ostringstream hex;
+      for (int32_t j = 0; j < value.length(); ++j) {
+        hex << std::hex << std::setfill('0') << std::setw(2)
+            << static_cast<unsigned int>(static_cast<unsigned char>(value.ptr()[j]));
+      }
+      EXPECT_EQ(expected[i], hex.str());
+    }
+    ObString legacy_value, wrapper_value;
+    ASSERT_EQ(OB_SUCCESS, ObSearchIndexValueEncoder::encode_value(allocator, nodes[i], legacy_value));
+    ASSERT_EQ(OB_SUCCESS, ObSearchIndexValueEncoder::encode_value(allocator, wrappers[1], wrapper_value));
+    EXPECT_EQ(legacy_value, wrapper_value);
+    if (nodes[i] == &j_double) {
+      // Cover the Datum JSON entry with a LOB header using the verified bytes above.
+      ObString raw_binary;
+      ASSERT_EQ(OB_SUCCESS, wrappers[1].get_raw_binary(allocator, raw_binary));
+      ASSERT_EQ(OB_SUCCESS, ObLobManager::fill_lob_header(allocator, raw_binary, raw_binary));
+      ObDatum datum;
+      datum.set_string(raw_binary);
+      ObObjMeta json_meta;
+      json_meta.set_type(ObJsonType);
+      json_meta.set_collation_type(CS_TYPE_UTF8MB4_BIN);
+      ObString datum_value;
+      ASSERT_EQ(OB_SUCCESS, ObSearchIndexValueEncoder::encode_value(allocator, datum, json_meta, datum_value));
+      EXPECT_EQ(wrapper_value, datum_value);
+    }
+    ObEncParam enc_param;
+    ASSERT_EQ(OB_SUCCESS, ObSearchIndexValueEncoder::init_json_string_enc_param(enc_param));
+    ASSERT_EQ(OB_SUCCESS, ObSearchIndexValueEncoder::encode_json_scalar(
+        allocator, nodes[i], legacy_value, enc_param));
+    EXPECT_EQ(legacy_value, wrapper_value);
+  }
+}
+
 TEST_F(TestSearchIndexEncoder, test_char_column_and_query_value_encoding)
 {
   using Encoder = ObSearchIndexValueEncoder;
@@ -69,7 +388,7 @@ TEST_F(TestSearchIndexEncoder, test_char_column_and_query_value_encoding)
     ObObjMeta query_meta = column_meta;
     query_meta.set_type(ObVarcharType);
     ObSearchIndexRowGenerator::Generator generator(allocator, allocator);
-    ASSERT_EQ(OB_SUCCESS, generator.init(0, column_meta, nullptr));
+    ASSERT_EQ(OB_SUCCESS, generator.init(0, column_meta, nullptr, nullptr, ObSearchIndexModeConfig(), false /* is_ddl_mode */));
     for (const ObString &input : values) {
       ObDatum datum;
       datum.set_string(input);
@@ -84,6 +403,64 @@ TEST_F(TestSearchIndexEncoder, test_char_column_and_query_value_encoding)
       // A CHAR column is encodable, but a CHAR query input is not.
       ASSERT_EQ(OB_NOT_SUPPORTED, Encoder::encode_value(allocator, datum, column_meta, query_value));
     }
+  }
+}
+
+TEST_F(TestSearchIndexEncoder, string_encoding_preserves_binary_escaping)
+{
+  ObArenaAllocator allocator(ObModIds::TEST);
+  ObEncParam enc;
+  ASSERT_EQ(OB_SUCCESS, ObSearchIndexValueEncoder::init_json_string_enc_param(enc));
+  ObString output;
+  const ObString input(3, "a\0b");
+  const ObString expected(6, "a\0\1b\0\0");
+  ASSERT_EQ(OB_SUCCESS, ObSearchIndexValueEncoder::encode_string(allocator, input, output, enc));
+  EXPECT_EQ(expected, output);
+}
+
+TEST_F(TestSearchIndexEncoder, string_encoding_truncates_escaped_bytes)
+{
+  ObArenaAllocator allocator(ObModIds::TEST);
+  ObEncParam enc;
+  ASSERT_EQ(OB_SUCCESS, ObSearchIndexValueEncoder::init_json_string_enc_param(enc));
+  ObString output;
+  // Each NUL is escaped to two bytes, followed by a two-byte terminator.
+  std::string token(SEARCH_INDEX_VALUE_LENGTH / 2 - 1, '\0');
+  ASSERT_EQ(OB_SUCCESS, ObSearchIndexValueEncoder::encode_string(
+      allocator, ObString(token.size(), token.data()), output, enc));
+  EXPECT_EQ(SEARCH_INDEX_VALUE_LENGTH, output.length());
+  token += '\0';
+  ASSERT_EQ(OB_SUCCESS, ObSearchIndexValueEncoder::encode_string(
+      allocator, ObString(token.size(), token.data()), output, enc));
+  EXPECT_EQ(SEARCH_INDEX_VALUE_LENGTH, output.length());
+}
+
+TEST_F(TestSearchIndexEncoder, string_encoding_truncation_policy)
+{
+  ObArenaAllocator allocator(ObModIds::TEST);
+  ObEncParam enc;
+  ASSERT_EQ(OB_SUCCESS, ObSearchIndexValueEncoder::init_json_string_enc_param(enc));
+  for (char byte : {'a', '\0'}) {
+    SCOPED_TRACE(static_cast<int>(byte));
+    const int64_t bytes_per_char = byte == '\0' ? 2 : 1;
+    std::string token((SEARCH_INDEX_VALUE_LENGTH - 2) / bytes_per_char, byte);
+    for (bool is_allow_truncate : {false, true}) {
+      ObString output;
+      ASSERT_EQ(OB_SUCCESS, ObSearchIndexValueEncoder::encode_string(
+          allocator, ObString(token.size(), token.data()), output, enc, is_allow_truncate));
+      EXPECT_EQ(SEARCH_INDEX_VALUE_LENGTH, output.length());
+    }
+    token += 'a';
+    ObString output;
+    EXPECT_EQ(OB_SIZE_OVERFLOW, ObSearchIndexValueEncoder::encode_string(
+        allocator, ObString(token.size(), token.data()), output, enc, false));
+    EXPECT_TRUE(output.empty());
+    ASSERT_EQ(OB_SUCCESS, ObSearchIndexValueEncoder::encode_string(
+        allocator, ObString(token.size(), token.data()), output, enc, true));
+    EXPECT_EQ(SEARCH_INDEX_VALUE_LENGTH, output.length());
+    ASSERT_EQ(OB_SUCCESS, ObSearchIndexValueEncoder::encode_string(
+        allocator, ObString(token.size(), token.data()), output, enc));
+    EXPECT_EQ(SEARCH_INDEX_VALUE_LENGTH, output.length());
   }
 }
 
@@ -122,7 +499,8 @@ TEST_F(TestSearchIndexEncoder, test_array_string_encoding)
     ObObjMeta array_meta;
     array_meta.set_type(ObCollectionSQLType);
     ObSearchIndexRowGenerator::Generator generator(allocator, allocator);
-    ASSERT_EQ(OB_SUCCESS, generator.init(0, array_meta, arr_type));
+    ASSERT_EQ(OB_SUCCESS, generator.init(
+        0, array_meta, arr_type, nullptr, ObSearchIndexModeConfig(), false /* is_ddl_mode */));
     ObSearchIndexRows rows;
     ASSERT_EQ(OB_SUCCESS, generator.generate_rows_for_array_obj(42, arr, rows));
     ASSERT_EQ(ARRAYSIZEOF(inputs) + 1, rows.count());
@@ -506,7 +884,10 @@ static int init_nested_path_generator(ObArenaAllocator &allocator,
 {
   int ret = OB_SUCCESS;
   ObString column_comment(column_comment_str);
-  if (OB_FAIL(filter.init_from_comment(column_comment))) {
+  ObSearchIndexConfig config;
+  if (OB_FAIL(config.decode(column_comment))) {
+    COMMON_LOG(WARN, "failed to decode column comment", K(ret));
+  } else if (OB_FAIL(filter.init_from_comment(config.get_comment()))) {
     COMMON_LOG(WARN, "failed to init filter from comment", K(ret), K(column_comment_str));
   } else {
     has_nested_key = filter.has_nested_paths();
@@ -517,9 +898,11 @@ static int init_nested_path_generator(ObArenaAllocator &allocator,
     if (OB_ISNULL(mem)) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
     } else {
-      generator = new (mem) ObSearchIndexRowGenerator::Generator(allocator, allocator, has_nested_key);
-      if (OB_FAIL(generator->init(0, obj_meta, nullptr, &filter))) {
+      generator = new (mem) ObSearchIndexRowGenerator::Generator(allocator, allocator);
+      if (OB_FAIL(generator->init(0, obj_meta, nullptr, &filter, ObSearchIndexModeConfig(), false /* is_ddl_mode */))) {
         COMMON_LOG(WARN, "failed to init generator", K(ret));
+      } else {
+        generator->set_has_nested_key(has_nested_key);
       }
     }
   }
@@ -543,16 +926,19 @@ TEST_F(TestSearchIndexEncoder, test_json_row_generator_basic_nested)
 
   ObString column_comment;
   ObSearchIndexConfigFilter filter(MTL_ID());
-  ret = filter.init_from_comment(column_comment);
+  ObSearchIndexConfig config;
+  ASSERT_EQ(OB_SUCCESS, config.decode(column_comment));
+  ret = filter.init_from_comment(config.get_comment());
   ASSERT_EQ(OB_SUCCESS, ret);
   bool has_nested_key = false;
   if (filter.has_nested_paths()) {
     has_nested_key = true;
   }
 
-  ObSearchIndexRowGenerator::Generator generator(allocator, allocator, has_nested_key);
-  ret = generator.init(0, obj_meta, nullptr, &filter);
+  ObSearchIndexRowGenerator::Generator generator(allocator, allocator);
+  ret = generator.init(0, obj_meta, nullptr, &filter, ObSearchIndexModeConfig(), false /* is_ddl_mode */);
   ASSERT_EQ(OB_SUCCESS, ret);
+  generator.set_has_nested_key(has_nested_key);
 
   ObSEArray<ObIndexRow, 16> rows;
   ret = generator.generate_rows(0, datum, rows);
@@ -591,15 +977,18 @@ TEST_F(TestSearchIndexEncoder, test_json_row_generator_multiple_leaves)
 
   ObString column_comment;
   ObSearchIndexConfigFilter filter(MTL_ID());
-  ret = filter.init_from_comment(column_comment);
+  ObSearchIndexConfig config;
+  ASSERT_EQ(OB_SUCCESS, config.decode(column_comment));
+  ret = filter.init_from_comment(config.get_comment());
   ASSERT_EQ(OB_SUCCESS, ret);
   bool has_nested_key = false;
   if (filter.has_nested_paths()) {
     has_nested_key = true;
   }
-  ObSearchIndexRowGenerator::Generator generator(allocator, allocator, has_nested_key);
-  ret = generator.init(0, obj_meta, nullptr, &filter);
+  ObSearchIndexRowGenerator::Generator generator(allocator, allocator);
+  ret = generator.init(0, obj_meta, nullptr, &filter, ObSearchIndexModeConfig(), false /* is_ddl_mode */);
   ASSERT_EQ(OB_SUCCESS, ret);
+  generator.set_has_nested_key(has_nested_key);
 
   ObSEArray<ObIndexRow, 16> rows;
   ret = generator.generate_rows(0, datum, rows);
@@ -641,15 +1030,18 @@ TEST_F(TestSearchIndexEncoder, test_json_row_generator_array_scalars)
 
   ObString column_comment;
   ObSearchIndexConfigFilter filter(MTL_ID());
-  ret = filter.init_from_comment(column_comment);
+  ObSearchIndexConfig config;
+  ASSERT_EQ(OB_SUCCESS, config.decode(column_comment));
+  ret = filter.init_from_comment(config.get_comment());
   ASSERT_EQ(OB_SUCCESS, ret);
   bool has_nested_key = false;
   if (filter.has_nested_paths()) {
     has_nested_key = true;
   }
-  ObSearchIndexRowGenerator::Generator generator(allocator, allocator, has_nested_key);
-  ret = generator.init(0, obj_meta, nullptr, &filter);
+  ObSearchIndexRowGenerator::Generator generator(allocator, allocator);
+  ret = generator.init(0, obj_meta, nullptr, &filter, ObSearchIndexModeConfig(), false /* is_ddl_mode */);
   ASSERT_EQ(OB_SUCCESS, ret);
+  generator.set_has_nested_key(has_nested_key);
 
   ObSEArray<ObIndexRow, 16> rows;
   ret = generator.generate_rows(0, datum, rows);
@@ -690,16 +1082,19 @@ TEST_F(TestSearchIndexEncoder, test_json_row_generator_array_nested_objects)
 
   ObString column_comment;
   ObSearchIndexConfigFilter filter(MTL_ID());
-  ret = filter.init_from_comment(column_comment);
+  ObSearchIndexConfig config;
+  ASSERT_EQ(OB_SUCCESS, config.decode(column_comment));
+  ret = filter.init_from_comment(config.get_comment());
   ASSERT_EQ(OB_SUCCESS, ret);
   bool has_nested_key = false;
   if (filter.has_nested_paths()) {
     has_nested_key = true;
   }
 
-  ObSearchIndexRowGenerator::Generator generator(allocator, allocator, has_nested_key);
-  ret = generator.init(0, obj_meta, nullptr, &filter);
+  ObSearchIndexRowGenerator::Generator generator(allocator, allocator);
+  ret = generator.init(0, obj_meta, nullptr, &filter, ObSearchIndexModeConfig(), false /* is_ddl_mode */);
   ASSERT_EQ(OB_SUCCESS, ret);
+  generator.set_has_nested_key(has_nested_key);
 
   ObSEArray<ObIndexRow, 16> rows;
   ret = generator.generate_rows(0, datum, rows);
@@ -746,16 +1141,19 @@ TEST_F(TestSearchIndexEncoder, test_json_row_generator_deeply_nested)
 
   ObString column_comment;
   ObSearchIndexConfigFilter filter(MTL_ID());
-  ret = filter.init_from_comment(column_comment);
+  ObSearchIndexConfig config;
+  ASSERT_EQ(OB_SUCCESS, config.decode(column_comment));
+  ret = filter.init_from_comment(config.get_comment());
   ASSERT_EQ(OB_SUCCESS, ret);
   bool has_nested_key = false;
   if (filter.has_nested_paths()) {
     has_nested_key = true;
   }
 
-  ObSearchIndexRowGenerator::Generator generator(allocator, allocator, has_nested_key);
-  ret = generator.init(0, obj_meta, nullptr, &filter);
+  ObSearchIndexRowGenerator::Generator generator(allocator, allocator);
+  ret = generator.init(0, obj_meta, nullptr, &filter, ObSearchIndexModeConfig(), false /* is_ddl_mode */);
   ASSERT_EQ(OB_SUCCESS, ret);
+  generator.set_has_nested_key(has_nested_key);
 
   ObSEArray<ObIndexRow, 16> rows;
   ret = generator.generate_rows(0, datum, rows);
@@ -795,16 +1193,19 @@ TEST_F(TestSearchIndexEncoder, test_json_row_generator_empty_object)
 
   ObString column_comment;
   ObSearchIndexConfigFilter filter(MTL_ID());
-  ret = filter.init_from_comment(column_comment);
+  ObSearchIndexConfig config;
+  ASSERT_EQ(OB_SUCCESS, config.decode(column_comment));
+  ret = filter.init_from_comment(config.get_comment());
   ASSERT_EQ(OB_SUCCESS, ret);
   bool has_nested_key = false;
   if (filter.has_nested_paths()) {
     has_nested_key = true;
   }
 
-  ObSearchIndexRowGenerator::Generator generator(allocator, allocator, has_nested_key);
-  ret = generator.init(0, obj_meta, nullptr, &filter);
+  ObSearchIndexRowGenerator::Generator generator(allocator, allocator);
+  ret = generator.init(0, obj_meta, nullptr, &filter, ObSearchIndexModeConfig(), false /* is_ddl_mode */);
   ASSERT_EQ(OB_SUCCESS, ret);
+  generator.set_has_nested_key(has_nested_key);
 
   ObSEArray<ObIndexRow, 16> rows;
   ret = generator.generate_rows(0, datum, rows);
@@ -826,16 +1227,19 @@ TEST_F(TestSearchIndexEncoder, test_json_row_generator_null_datum)
 
   ObString column_comment;
   ObSearchIndexConfigFilter filter(MTL_ID());
-  int ret = filter.init_from_comment(column_comment);
+  ObSearchIndexConfig config;
+  ASSERT_EQ(OB_SUCCESS, config.decode(column_comment));
+  int ret = filter.init_from_comment(config.get_comment());
   ASSERT_EQ(OB_SUCCESS, ret);
   bool has_nested_key = false;
   if (filter.has_nested_paths()) {
     has_nested_key = true;
   }
 
-  ObSearchIndexRowGenerator::Generator generator(allocator, allocator, has_nested_key);
-  ret = generator.init(0, obj_meta, nullptr, &filter);
+  ObSearchIndexRowGenerator::Generator generator(allocator, allocator);
+  ret = generator.init(0, obj_meta, nullptr, &filter, ObSearchIndexModeConfig(), false /* is_ddl_mode */);
   ASSERT_EQ(OB_SUCCESS, ret);
+  generator.set_has_nested_key(has_nested_key);
 
   ObSEArray<ObIndexRow, 16> rows;
   ret = generator.generate_rows(0, datum, rows);
@@ -872,16 +1276,19 @@ TEST_F(TestSearchIndexEncoder, test_json_row_generator_complex_structure)
 
   ObString column_comment;
   ObSearchIndexConfigFilter filter(MTL_ID());
-  ret = filter.init_from_comment(column_comment);
+  ObSearchIndexConfig config;
+  ASSERT_EQ(OB_SUCCESS, config.decode(column_comment));
+  ret = filter.init_from_comment(config.get_comment());
   ASSERT_EQ(OB_SUCCESS, ret);
   bool has_nested_key = false;
   if (filter.has_nested_paths()) {
     has_nested_key = true;
   }
 
-  ObSearchIndexRowGenerator::Generator generator(allocator, allocator, has_nested_key);
-  ret = generator.init(0, obj_meta, nullptr, &filter);
+  ObSearchIndexRowGenerator::Generator generator(allocator, allocator);
+  ret = generator.init(0, obj_meta, nullptr, &filter, ObSearchIndexModeConfig(), false /* is_ddl_mode */);
   ASSERT_EQ(OB_SUCCESS, ret);
+  generator.set_has_nested_key(has_nested_key);
 
   ObSEArray<ObIndexRow, 16> rows;
   ret = generator.generate_rows(0, datum, rows);
@@ -1241,9 +1648,9 @@ TEST_F(TestSearchIndexEncoder, test_json_path_matcher_release_and_idempotent)
 {
   const uint64_t tid = MTL_ID();
   ObSearchIndexJsonPathMatcher matcher(tid);
-  int64_t pos = 0;
-  ObString spec = ObString::make_string("10$.comments");
-  ASSERT_EQ(OB_SUCCESS, matcher.init(spec, pos));
+  ObSEArray<ObString, 1> paths;
+  ASSERT_EQ(OB_SUCCESS, paths.push_back(ObString::make_string("$.comments")));
+  ASSERT_EQ(OB_SUCCESS, matcher.init(paths));
   ASSERT_TRUE(matcher.all_nodes_ != nullptr);
   ASSERT_GT(matcher.allocator_.used(), 0);
   ASSERT_GT(matcher.allocator_.total(), 0);
@@ -1265,4 +1672,3 @@ int main(int argc, char** argv)
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
-

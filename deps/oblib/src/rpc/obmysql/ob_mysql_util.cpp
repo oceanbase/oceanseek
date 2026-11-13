@@ -7,6 +7,7 @@
 
 #include "rpc/obmysql/ob_mysql_util.h"
 #include "lib/json_type/ob_json_bin.h"
+#include "lib/json_type/ob_json_wrapper.h"
 #include "lib/geo/ob_geo_bin.h"
 #include "lib/xml/ob_xml_util.h"
 using namespace oceanbase::common;
@@ -1140,15 +1141,16 @@ int ObMySQLUtil::sql_utd_cell_str(uint64_t tenant_id, char *buf, const int64_t l
   return ret;
 }
 
-int ObMySQLUtil::json_cell_str(uint64_t tenant_id, char *buf, const int64_t len, const ObString &val, int64_t &pos)
+int ObMySQLUtil::json_cell_str(uint64_t tenant_id, char *buf, const int64_t len, const ObString &val, int64_t &pos,
+                               bool enable_json_bin_view)
 {
   int ret = OB_SUCCESS;
   lib::ObMemAttr mem_attr(tenant_id, "JsonAlloc");
   ObArenaAllocator allocator(mem_attr);
   ObJsonBin j_bin(val.ptr(), val.length(), &allocator);
-  ObIJsonBase *j_base = &j_bin;
+  ObJsonWrapper wrapper(&j_bin);
   ObJsonBuffer jbuf(&allocator);
-  static_cast<ObJsonBin*>(j_base)->set_seek_flag(true);
+  j_bin.set_seek_flag(true);
   if (OB_ISNULL(buf)) {
     ret = OB_INVALID_ARGUMENT;
     OB_LOG(WARN, "invalid input args", K(ret), KP(buf));
@@ -1156,10 +1158,12 @@ int ObMySQLUtil::json_cell_str(uint64_t tenant_id, char *buf, const int64_t len,
     if (OB_FAIL(ObMySQLUtil::store_null(buf, len, pos))) {
       OB_LOG(WARN, "fail to set null string", K(pos), K(len));
     }
-  } else if (OB_FAIL(j_bin.reset_iter())) {
-    OB_LOG(WARN, "fail to reset json bin iter", K(ret), K(val));
-  } else if (OB_FAIL(j_base->print(jbuf, true, val.length()))) {
-    OB_LOG(WARN, "json binary to string failed in mysql mode", K(ret), K(val), K(*j_base));
+  } else if (OB_FAIL(enable_json_bin_view
+                     ? get_json_wrapper(val, ObJsonInType::JSON_BIN, allocator, wrapper)
+                     : j_bin.reset_iter())) {
+    OB_LOG(WARN, "fail to read json binary", K(ret), K(val));
+  } else if (OB_FAIL(wrapper.print(jbuf, true, val.length()))) {
+    OB_LOG(WARN, "json binary to string failed in mysql mode", K(ret), K(val));
   } else {
     int64_t new_length = jbuf.length();
     if (OB_LIKELY(new_length < len - pos)) {

@@ -90,7 +90,7 @@ int ObDASMultiMatchRtDef::prepare_query_tokens()
   const ObDASMultiMatchCtDef *ctdef = static_cast<const ObDASMultiMatchCtDef *>(ctdef_);
   const ObDASScalarScanCtDef *inv_idx_scan_ctdef = nullptr;
   if (query_tokens_prepared_) {
-    // Reuse tokens prepared while computing the async cost.
+    // Reuse tokens prepared during cost estimation or filter-pushdown checks.
   } else if (OB_ISNULL(ctdef) || OB_ISNULL(eval_ctx_) || OB_ISNULL(ctdef->query_text_)
       || ctdef->ir_ctdef_indices_.empty()) {
     ret = OB_ERR_UNEXPECTED;
@@ -105,7 +105,7 @@ int ObDASMultiMatchRtDef::prepare_query_tokens()
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "multi match query on logical table is not supported");
     LOG_WARN("multi match query on logical table is not supported", KR(ret));
   } else if (OB_FAIL(ObDASSearchUtils::eval_and_tokenize_query_text(
-      allocator_, *eval_ctx_, *ctdef->query_text_, *inv_idx_scan_ctdef, query_tokens_))) {
+      allocator_, *eval_ctx_, *ctdef->query_text_, *inv_idx_scan_ctdef, query_tokens_, ctdef->get_ir_ctdef(0)))) {
     LOG_WARN("failed to prepare multi-match query tokens", KR(ret));
   } else {
     query_tokens_prepared_ = true;
@@ -366,31 +366,14 @@ int ObDASMultiMatchRtDef::can_pushdown_filter_to_bmm(
         && ctdef->is_top_level_scoring()
         && is_supported_type;
     int64_t effective_msm = 0;
-    ObDatum *query_text_datum = nullptr;
-    ObSEArray<ObString, 16> query_tokens;
     if (!base_shape_supported) {
       // can_pushdown stays false
-    } else if (OB_FAIL(ctdef->query_text_->eval(*eval_ctx_, query_text_datum))) {
-      LOG_WARN("failed to eval query text for bmm pushdown", KR(ret));
-    } else if (OB_UNLIKELY(query_text_datum->is_null())) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected null query text for bmm pushdown", KR(ret));
-    } else if (OB_ISNULL(ctdef->get_ir_ctdef(0))
-        || OB_ISNULL(ctdef->get_ir_ctdef(0)->get_inv_idx_scan_scalar_ctdef())) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected nullptr ir ctdef for bmm pushdown", KR(ret));
-    } else if (OB_FAIL(ObFTSTokenizer::tokenize(
-        allocator_,
-        query_text_datum->get_string(),
-        ctdef->get_ir_ctdef(0)->get_inv_idx_scan_scalar_ctdef()->table_param_.get_parser_name(),
-        ctdef->get_ir_ctdef(0)->get_inv_idx_scan_scalar_ctdef()->table_param_.get_parser_property(),
-        ctdef->query_text_->obj_meta_,
-        query_tokens))) {
-      LOG_WARN("failed to tokenize query text for bmm pushdown", KR(ret));
-    } else if (query_tokens.empty()) {
+    } else if (OB_FAIL(prepare_query_tokens())) {
+      LOG_WARN("failed to prepare multi-match query tokens for bmm pushdown", KR(ret));
+    } else if (query_tokens_.empty()) {
       // can_pushdown stays false
     } else if (OB_FAIL(ObDASMSMRuntimeUtil::calc_multi_or_query_string_msm(
-        allocator_, query_tokens.count(), ctdef->is_msm_unresolved_expr_,
+        allocator_, query_tokens_.count(), ctdef->is_msm_unresolved_expr_,
         min_should_match_datum, effective_msm))) {
       LOG_WARN("failed to calc multi_match msm for bmm pushdown", KR(ret));
     } else {

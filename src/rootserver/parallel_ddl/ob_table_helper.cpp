@@ -23,6 +23,7 @@
 #include "share/schema/ob_sequence_sql_service.h"
 #include "share/schema/ob_multi_version_schema_service.h"
 #include "share/ob_index_builder_util.h"
+#include "share/search_index/ob_search_index_builder_util.h"
 #include "sql/resolver/ob_resolver_utils.h"
 
 using namespace oceanbase::lib;
@@ -332,10 +333,10 @@ int ObTableHelper::resolve_host_id_(const ObTableSchema &tbl, uint64_t &host_id)
 {
   int ret = OB_SUCCESS;
   host_id = tbl.get_data_table_id();
-  // search_data_index references its search_def, not the real data table.
+  // Search physical children reference their Def, not the real data table.
   // Resolve through the search_def to reach the ultimate host.
-  // search_data → search_def → data_table.
-  if (tbl.is_search_data_index()) {
+  // Search DATA/TEXT -> Search Def -> data table.
+  if (tbl.is_search_aux_index()) {
     bool find_host = false;
     const int64_t cnt = new_tables_.count();
     for (int64_t j = 0; OB_SUCC(ret) && !find_host && j < cnt; j++) {
@@ -1315,7 +1316,7 @@ int ObTableHelper::inner_generate_aux_table_schema_(const ObCreateTableArg &arg)
         }
       }
       if (OB_SUCC(ret) && has_index_def_table) {
-        if (OB_FAIL(build_search_index_mapping_())) {
+        if (OB_FAIL(build_search_index_mapping_(arg.index_arg_list_))) {
           LOG_WARN("failed to build search index mapping", KR(ret));
         }
       }
@@ -1326,7 +1327,7 @@ int ObTableHelper::inner_generate_aux_table_schema_(const ObCreateTableArg &arg)
   return ret;
 }
 
-int ObTableHelper::build_search_index_mapping_()
+int ObTableHelper::build_search_index_mapping_(const ObIArray<ObCreateIndexArg> &index_args)
 {
   int ret = OB_SUCCESS;
   if (new_tables_.count() <= 1) {
@@ -1340,21 +1341,42 @@ int ObTableHelper::build_search_index_mapping_()
       }
       const bool expect_async_data =
           share::schema::is_async_search_def_index(def_schema.get_index_type());
-      bool matched = false;
+      ObSearchIndexRequirements requirements;
+      bool found_definition = false;
+      for (int64_t j = 0; OB_SUCC(ret) && !found_definition && j < index_args.count(); ++j) {
+        const ObCreateIndexArg &index_arg = index_args.at(j);
+        if (index_arg.index_type_ == def_schema.get_index_type()
+            && index_arg.index_name_ == def_schema.get_origin_index_name_str()) {
+          found_definition = true;
+          if (OB_FAIL(ObSearchIndexBuilderUtil::resolve_search_index_args(index_arg, requirements))) {
+            LOG_WARN("failed to get search index requirements", KR(ret), K(index_arg));
+          }
+        }
+      }
+      if (OB_SUCC(ret) && !found_definition) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("search definition has no create argument", KR(ret), K(def_schema));
+      }
+      bool matched_data = false;
+      bool matched_text_match = false;
+      bool matched_text_match_phrase = false;
       const ObString &def_name = def_schema.get_table_name_str();
       const uint64_t def_table_id = def_schema.get_table_id();
-      // find its paired gin data table by name pattern: "<def_name>_gin_data"
+      // Match every physical child by the suffix assigned during argument expansion.
       for (int64_t j = 1; OB_SUCC(ret) && j < new_tables_.count(); ++j) {
         ObTableSchema &data_schema = new_tables_.at(j);
+        bool matched = false;
         if ((!expect_async_data
              && INDEX_TYPE_SEARCH_DATA_INDEX_LOCAL != data_schema.get_index_type())
             || (expect_async_data
-                && !share::schema::is_async_search_data_index(data_schema.get_index_type()))) {
+                && !share::schema::is_async_search_aux_index(data_schema.get_index_type()))) {
           continue;
         }
         const ObString &data_name = data_schema.get_table_name_str();
-        const char *suffix = "_search_data";
-        const int64_t suffix_len = STRLEN("_search_data");
+        const char *suffix = !data_schema.is_search_text_index() ? "_search_data"
+            : data_schema.is_async_search_text_match_index()
+                ? "_search_text_match" : "_search_text_match_phrase";
+        const int64_t suffix_len = STRLEN(suffix);
         if (data_name.length() == def_name.length() + suffix_len) {
           if (0 == STRNCMP(data_name.ptr(), def_name.ptr(), def_name.length())
               && 0 == STRNCMP(data_name.ptr() + def_name.length(), suffix, suffix_len)) {
@@ -1362,6 +1384,9 @@ int ObTableHelper::build_search_index_mapping_()
           }
         }
         if (matched) {
+          matched_data |= data_schema.is_search_data_index();
+          matched_text_match |= data_schema.is_async_search_text_match_index();
+          matched_text_match_phrase |= data_schema.is_async_search_text_match_phrase_index();
           data_schema.set_data_table_id(def_table_id);
           ObString index_table_name;
           if (OB_FAIL(ObTableSchema::build_index_table_name(
@@ -1370,12 +1395,14 @@ int ObTableHelper::build_search_index_mapping_()
           } else if (OB_FAIL(data_schema.set_table_name(index_table_name))) {
             LOG_WARN("set_table_name failed", K(index_table_name), K(ret));
           }
-          break;
         }
       }
-      if (OB_SUCC(ret) && !matched) {
+      if (OB_SUCC(ret) && ((requirements.has_data_ && !matched_data)
+          || (requirements.has_text_match_ && !matched_text_match)
+          || (requirements.has_text_match_phrase_ && !matched_text_match_phrase))) {
         ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("the index definition table and the index data table should correspond one-to-one", K(ret));
+        LOG_WARN("search definition is missing a required auxiliary table", K(ret), K(def_table_id),
+                 K(matched_data), K(matched_text_match), K(matched_text_match_phrase));
       }
     }
   }

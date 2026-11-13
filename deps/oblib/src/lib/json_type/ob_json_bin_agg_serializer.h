@@ -21,7 +21,8 @@ namespace common {
 class ObJsonBinAggSerializer
 {
 public:
-  ObJsonBinAggSerializer(ObIAllocator &alloc, ObJsonNodeType root_type);
+  ObJsonBinAggSerializer(ObIAllocator &alloc, ObJsonNodeType root_type,
+                        bool need_calc_depth = true);
   ~ObJsonBinAggSerializer();
 
   // Appends one array element. Both continuous binary value-areas and plain
@@ -29,7 +30,9 @@ public:
   // underlying data alive until serialize() returns. Other Tree DOM values are
   // serialized into allocator-owned stable storage during the append phase.
   //
-  // The JSON depth of the value is provided by ObJsonWrapper::depth().
+  // When need_calc_depth is enabled, the JSON depth of the value is provided
+  // by ObJsonWrapper::depth(). Disabling it only skips depth bookkeeping;
+  // value encoding and the input-lifetime requirements remain unchanged.
   int append_value(const ObJsonWrapper &wrapper);
 
   // Directly appends a string element, skipping the ObJsonString DOM
@@ -60,6 +63,8 @@ public:
   // Container depth: max(entry.depth_) + 1 (the +1 accounts for this container
   // itself). Returns 1 when entries_ is empty (a container with no children
   // has depth 1). Entries with depth_ == 0 are treated as depth 1 (scalar).
+  // Requires need_calc_depth. Otherwise logs an error and returns UINT16_MAX
+  // so callers cannot mistake an uncomputed depth for a valid shallow value.
   uint16_t depth() const;
 
   // Finalize and write the standalone binary into the caller-owned, empty
@@ -72,6 +77,17 @@ public:
   // is safe regardless of whether `out`'s allocator is an arena (no-op free)
   // or a real freeing allocator, as long as `out` itself stays alive.
   int serialize(ObStringBuffer &out);
+
+  // Serialize a complete collection without constructing the stream builder or
+  // staging Entry objects. Only ObString array elements are supported today;
+  // additional array/object forms can add an explicit specialization without
+  // changing this template entry. Object inputs must already be sorted and
+  // deduplicated. The returned ObString is a shallow view over storage owned by
+  // alloc.
+  template <typename ElementType>
+  static int serialize(ObIAllocator &alloc,
+                       const ObIArray<ElementType> &elements,
+                       ObString &out);
 
   OB_INLINE uint32_t element_count() const
   {
@@ -228,10 +244,22 @@ private:
   // pass is needed.
   int serialize_impl(ObStringBuffer &out);
 
+  // Serialize a complete string collection without staging Entry objects.
+  static int serialize_impl(ObIAllocator &alloc,
+                            const ObIArray<ObString> &elements,
+                            ObString &out);
+
   ObIAllocator &alloc_;
   ObJsonNodeType root_type_;        // J_ARRAY or J_OBJECT
+  const bool need_calc_depth_;
   ObArray<Entry> entries_;
 };
+
+template <>
+int ObJsonBinAggSerializer::serialize<ObString>(
+    ObIAllocator &alloc,
+    const ObIArray<ObString> &elements,
+    ObString &out);
 
 } // namespace common
 } // namespace oceanbase

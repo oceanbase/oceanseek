@@ -62,7 +62,7 @@ public:
   void build_search_param(ObAsyncIndexSqlParam &param)
   {
     build_basic_param(param);
-    param.is_search_data_ = true;
+    param.is_async_search_aux_index_ = true;
     param.index_table_id_ = 500123;
 
     select_cols_.reset();

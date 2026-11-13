@@ -43,6 +43,7 @@ int ObDASReqExclOp::do_open()
   // RowID type and child op type are finalized by init(). Keep one exclusion
   // mode for the whole operator lifetime, as the other batch merge ops do.
   use_deletion_bitmap_ = is_valid()
+      && DAS_SCOPE_BASE == scope_
       && DAS_ROWID_TYPE_UINT64 == get_rowid_type()
       && DAS_SEARCH_OP_DELETION == excluded_->get_op_type()
       && DAS_ROWID_TYPE_UINT64 == excluded_->get_rowid_type();
@@ -55,6 +56,8 @@ int ObDASReqExclOp::do_open()
     LOG_WARN("failed to open excluded op", KR(ret));
   } else if (use_deletion_bitmap_ && OB_FAIL(ensure_batch_buffer())) {
     LOG_WARN("failed to initialize required/excluded batch buffer", K(ret));
+  } else {
+    is_first_nk_ = true;
   }
   return ret;
 }
@@ -69,6 +72,8 @@ int ObDASReqExclOp::do_rescan()
     LOG_WARN("failed to rescan required op", KR(ret));
   } else if (OB_FAIL(excluded_->rescan())) {
     LOG_WARN("failed to rescan excluded op", KR(ret));
+  } else {
+    is_first_nk_ = true;
   }
   return ret;
 }
@@ -84,6 +89,7 @@ int ObDASReqExclOp::do_close()
     batch_ids_ = nullptr;
     batch_scores_ = nullptr;
     use_deletion_bitmap_ = false;
+    is_first_nk_ = true;
   }
 
   return ret;
@@ -122,6 +128,30 @@ int ObDASReqExclOp::ensure_batch_buffer()
   return ret;
 }
 
+int ObDASReqExclOp::init_nested_key_cursor()
+{
+  int ret = OB_SUCCESS;
+  ObDASRowID excluded_doc;
+  double score = 0.0;
+  int cmp = 0;
+  nested_excluded_matches_doc_ = false;
+  if (OB_FAIL(excluded_->advance_to(required_doc_id_, excluded_doc, score))) {
+    if (OB_ITER_END == ret) {
+      ret = OB_SUCCESS;
+    } else {
+      LOG_WARN("failed to position excluded document", K(ret));
+    }
+  } else if (OB_FAIL(compare_rowid(required_doc_id_, excluded_doc, cmp))) {
+    LOG_WARN("failed to compare excluded document", K(ret));
+  } else {
+    nested_excluded_matches_doc_ = 0 == cmp;
+  }
+  if (OB_SUCC(ret)) {
+    is_first_nk_ = false;
+  }
+  return ret;
+}
+
 int ObDASReqExclOp::check_excluded(const ObDASRowID &target_id, int &cmp)
 {
   int ret = OB_SUCCESS;
@@ -149,15 +179,44 @@ int ObDASReqExclOp::check_excluded(const ObDASRowID &target_id, int &cmp)
   return ret;
 }
 
+int ObDASReqExclOp::filter_nested_key(ObDASNestedKey &key, double &score)
+{
+  int ret = OB_SUCCESS;
+  int cmp = 0;
+  while (OB_SUCC(ret) && nested_excluded_matches_doc_ && 0 == cmp) {
+    ObDASNestedKey excluded;
+    double excluded_score = 0.0;
+    if (OB_FAIL(excluded_->advance_to(key, excluded, excluded_score))) {
+      if (OB_ITER_END == ret) {
+        ret = OB_SUCCESS;
+        nested_excluded_matches_doc_ = false;
+      } else {
+        LOG_WARN("failed to advance excluded nested key", KR(ret), K(key));
+      }
+    } else if (OB_FAIL(compare_rowid(key, excluded, cmp))) {
+      LOG_WARN("failed to compare excluded nested key", KR(ret), K(key), K(excluded));
+    } else if (OB_UNLIKELY(cmp > 0)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("excluded nested key is smaller than target", KR(ret), K(key), K(excluded));
+    } else if (0 == cmp && OB_FAIL(required_->next_rowid(key, score))) {
+      LOG_WARN_IGNORE_ITER_END(ret, "failed to next required nested key", KR(ret));
+    }
+  }
+  return ret;
+}
+
 int ObDASReqExclOp::do_advance_to(const ObDASRowID &target, ObDASRowID &curr_id, double &score)
 {
   int ret = OB_SUCCESS;
   int cmp = 0;
+  is_first_nk_ = true;
   if (OB_UNLIKELY(!is_valid())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("op is not valid", KR(ret));
   } else if (OB_FAIL(required_->advance_to(target, curr_id, score))) {
     LOG_WARN_IGNORE_ITER_END(ret, "failed to advance to required op", K(ret), K(target));
+  } else if (is_async_nested_scope(scope_)) {
+    required_doc_id_ = curr_id;
   } else if (use_deletion_bitmap_) {
     while (OB_SUCC(ret) && is_deleted(curr_id.get_uint64())) {
       if (OB_FAIL(required_->next_rowid(curr_id, score))) {
@@ -180,13 +239,31 @@ int ObDASReqExclOp::do_advance_to(const ObDASRowID &target, ObDASRowID &curr_id,
   return ret;
 }
 
+int ObDASReqExclOp::do_advance_to(const ObDASNestedKey &target, ObDASNestedKey &curr_nk, double &score)
+{
+  int ret = OB_SUCCESS;
+  score = 0.0;
+  if (!is_async_nested_scope(scope_)) {
+    ret = OB_NOT_IMPLEMENT;
+  } else if (is_first_nk_ && OB_FAIL(init_nested_key_cursor())) {
+    LOG_WARN("failed to initialize nested key cursor", KR(ret));
+  } else if (OB_FAIL(required_->advance_to(target, curr_nk, score))) {
+    LOG_WARN_IGNORE_ITER_END(ret, "failed to advance required nested key", KR(ret));
+  } else if (OB_FAIL(filter_nested_key(curr_nk, score))) {
+    LOG_WARN_IGNORE_ITER_END(ret, "failed to filter nested key", KR(ret));
+  }
+  return ret;
+}
+
 int ObDASReqExclOp::do_advance_shallow(
     const ObDASRowID &target,
     const bool inclusive,
     const MaxScoreTuple *&max_score_tuple)
 {
   int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(!is_valid())) {
+  if (is_async_nested_scope(scope_)) {
+    ret = ObIDASSearchOp::do_advance_shallow(target, inclusive, max_score_tuple);
+  } else if (OB_UNLIKELY(!is_valid())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("op is not valid", KR(ret));
   } else if (OB_FAIL(required_->advance_shallow(target, inclusive, max_score_tuple))) {
@@ -199,9 +276,16 @@ int ObDASReqExclOp::do_next_rowid(ObDASRowID &next_id, double &score)
 {
   int ret = OB_SUCCESS;
   int cmp = 0;
+  is_first_nk_ = true;
   if (OB_UNLIKELY(!is_valid())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("op is not valid", KR(ret));
+  } else if (is_async_nested_scope(scope_)) {
+    if (OB_FAIL(required_->next_rowid(next_id, score))) {
+      LOG_WARN_IGNORE_ITER_END(ret, "failed to next required document", KR(ret));
+    } else {
+      required_doc_id_ = next_id;
+    }
   } else if (use_deletion_bitmap_) {
     do {
       if (OB_FAIL(required_->next_rowid(next_id, score))) {
@@ -221,6 +305,22 @@ int ObDASReqExclOp::do_next_rowid(ObDASRowID &next_id, double &score)
   return ret;
 }
 
+int ObDASReqExclOp::do_next_rowid(ObDASNestedKey &next_nk, double &score)
+{
+  int ret = OB_SUCCESS;
+  score = 0.0;
+  if (!is_async_nested_scope(scope_)) {
+    ret = OB_NOT_IMPLEMENT;
+  } else if (is_first_nk_ && OB_FAIL(init_nested_key_cursor())) {
+    LOG_WARN("failed to initialize nested key cursor", KR(ret));
+  } else if (OB_FAIL(required_->next_rowid(next_nk, score))) {
+    LOG_WARN_IGNORE_ITER_END(ret, "failed to next required nested key", KR(ret));
+  } else if (OB_FAIL(filter_nested_key(next_nk, score))) {
+    LOG_WARN_IGNORE_ITER_END(ret, "failed to filter nested key", KR(ret));
+  }
+  return ret;
+}
+
 int ObDASReqExclOp::do_drain_until(
     const ObDASRowID &boundary,
     int64_t capacity,
@@ -230,6 +330,7 @@ int ObDASReqExclOp::do_drain_until(
     ObDASRowID &next_id_after,
     double &next_score_after)
 {
+  is_first_nk_ = true;
   int ret = OB_SUCCESS;
   count = 0;
   next_id_after.reset();

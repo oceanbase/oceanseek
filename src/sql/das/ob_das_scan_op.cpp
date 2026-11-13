@@ -14,6 +14,7 @@
 #include "sql/optimizer/ob_storage_estimator.h"
 #include "sql/engine/expr/ob_expr_local_dynamic_filter.h"
 #include "sql/das/search/ob_das_search_context.h"
+#include "sql/das/search/ob_das_search_utils.h"
 #include "sql/das/search/ob_i_das_search_op.h"
 #include "sql/das/search/ob_das_async_index_query_ctx.h"
 #include "sql/das/search/ob_das_boolean_query.h"
@@ -893,6 +894,7 @@ int ObDASScanOp::create_das_search_context()
   ObDASSearchCtx *search_ctx = nullptr;
   const ObDASBaseCtDef *ctdef = nullptr;
   const ObDASFusionCtDef *fusion_ctdef = nullptr;
+  ObDASScopeId nested_scope_id = DAS_SCOPE_MAX;
   if (OB_UNLIKELY(nullptr != search_ctx_) ||
       OB_ISNULL(scan_rtdef_) ||
       !scan_rtdef_->enable_rich_format()) {
@@ -916,7 +918,10 @@ int ObDASScanOp::create_das_search_context()
     LOG_WARN("failed to init search ctx", K(ret));
   } else if (FALSE_IT(search_ctx->set_fusion_ctdef(fusion_ctdef))) {
   } else if (fusion_ctdef->has_nested_paths() &&
-             OB_FAIL(search_ctx->register_nested_scope(&fusion_ctdef->nested_rowid_exprs_))) {
+             OB_FAIL(ObDASSearchUtils::resolve_nested_scope_id(fusion_ctdef, nested_scope_id))) {
+    LOG_WARN("failed to resolve nested scope", K(ret));
+  } else if (fusion_ctdef->has_nested_paths() &&
+             OB_FAIL(search_ctx->register_nested_scope(&fusion_ctdef->nested_rowid_exprs_, nested_scope_id))) {
     LOG_WARN("failed to register nested scope", K(ret));
   } else {
     search_ctx_ = search_ctx;

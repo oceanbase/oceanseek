@@ -214,13 +214,16 @@ public:
    * @param[in] fulltext_len, length of the fulltext
    * @param[out] doc_length, length of document by word count
    * @param[out] words, word lists after segment
+   * @param[out] last_position, optional final position of the complete analyzer token stream,
+   *             before position-list truncation; -1 when no tokens are emitted
    */
   int segment(
       const common::ObObjMeta &meta,
       const char *fulltext,
       const int64_t fulltext_len,
       int64_t &doc_length,
-      ObFTTokenMap &ft_token_map) const;
+      ObFTTokenMap &ft_token_map,
+      int64_t *last_position = nullptr) const;
   int check_is_the_same(
       const common::ObString &plugin_name,
       const common::ObString &plugin_properties,

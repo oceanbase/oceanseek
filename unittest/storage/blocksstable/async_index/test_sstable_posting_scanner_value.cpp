@@ -430,7 +430,7 @@ TEST_F(TestSSTablePostingScannerValue, cached_range_check_preserves_errors_and_f
   ASSERT_EQ(OB_SUCCESS, scanner.meta_row_scanner_.open(buf, size));
   ASSERT_EQ(OB_SUCCESS, scanner.get_cur_block_meta(posting.curr_meta_));
   posting.is_opened_ = true;
-  posting.has_relevance_params_ = true;
+  posting.need_relevance_params_ = true;
   posting.bm25_frontier_kernels_ = sql::get_bm25_frontier_max_kernels();
   ASSERT_EQ(OB_SUCCESS, sql::ObExprBM25::init_precomputed_params(
       1.0, 100.0, 1.0, posting.bm25_calc_params_));
@@ -556,7 +556,7 @@ TEST_F(TestSSTablePostingScannerValue, range_score_batches_cold_cache_and_reuses
       ASSERT_EQ(OB_SUCCESS, scanner.meta_row_scanner_.open(buf, size));
       ASSERT_EQ(OB_SUCCESS, scanner.get_cur_block_meta(posting.curr_meta_));
       posting.is_opened_ = true;
-      posting.has_relevance_params_ = true;
+      posting.need_relevance_params_ = true;
       posting.bm25_frontier_kernels_ = kernels;
       posting.bm25_frontier_kernels_.kernel_ = ObTestFrontierMaxRecorder::record;
       posting.curr_block_max_score_ = 777.0;
@@ -657,7 +657,7 @@ TEST_F(TestSSTablePostingScannerValue, frontier_range_span_matches_scalar_and_er
   ASSERT_EQ(OB_SUCCESS, scanner.meta_row_scanner_.open(buf, size));
   ASSERT_EQ(OB_SUCCESS, scanner.get_cur_block_meta(posting.curr_meta_));
   posting.is_opened_ = true;
-  posting.has_relevance_params_ = true;
+  posting.need_relevance_params_ = true;
   posting.bm25_frontier_kernels_ = sql::get_bm25_frontier_max_kernels();
   const double averages[] = {0.125, 3.0, 10.0, 987.12345,
       std::numeric_limits<double>::min(), std::numeric_limits<double>::denorm_min()};
@@ -806,7 +806,7 @@ TEST_F(TestSSTablePostingScannerValue, block_and_range_bounds_preserve_scalar_ro
   ASSERT_EQ(OB_SUCCESS, scanner.get_cur_block_meta(current_meta));
   posting.assign_current_block_meta(current_meta);
   posting.is_opened_ = true;
-  posting.has_relevance_params_ = true;
+  posting.need_relevance_params_ = true;
   posting.bm25_frontier_kernels_ = sql::get_bm25_frontier_max_kernels();
   ASSERT_EQ(OB_SUCCESS, sql::ObExprBM25::init_precomputed_params(
       1.0, 3.0, 1.0, posting.bm25_calc_params_));
@@ -912,7 +912,7 @@ TEST_F(TestSSTablePostingScannerValue, frontier_layout_error_discards_previous_r
   ASSERT_EQ(OB_SUCCESS, scanner.meta_row_scanner_.next_block());
   ASSERT_EQ(OB_SUCCESS, scanner.get_cur_block_meta(posting.curr_meta_));
   posting.is_opened_ = true;
-  posting.has_relevance_params_ = true;
+  posting.need_relevance_params_ = true;
   posting.bm25_frontier_kernels_ = sql::get_bm25_frontier_max_kernels();
   ASSERT_EQ(OB_SUCCESS, sql::ObExprBM25::init_precomputed_params(
       1.0, 100.0, 1.0, posting.bm25_calc_params_));
@@ -998,7 +998,7 @@ TEST_F(TestSSTablePostingScannerValue, frontier_layout_error_discards_previous_r
   ASSERT_EQ(OB_SUCCESS, posting.get_range_max_score(20, true, 59, actual, can_calc));
   EXPECT_FALSE(can_calc);
   EXPECT_DOUBLE_EQ(-99.0, actual);
-  posting.has_relevance_params_ = false;
+  posting.need_relevance_params_ = false;
   can_calc = true;
   ASSERT_EQ(OB_SUCCESS, posting.get_range_max_score(20, true, 59, actual, can_calc));
   EXPECT_FALSE(can_calc);

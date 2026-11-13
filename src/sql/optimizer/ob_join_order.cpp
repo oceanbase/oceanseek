@@ -35,13 +35,16 @@
 #include "sql/engine/expr/ob_expr_json_func_helper.h"
 #include "sql/engine/expr/ob_expr_json_utils.h"
 #include "sql/ob_sql_utils.h"
+#include "lib/json_type/ob_json_path.h"
 #include "sql/optimizer/ob_join_order_enum.h"
 #ifdef OB_BUILD_OBSERVER_FLIGHT_SQL
 #include "observer/flight_sql/ob_arrow_stream_catalog.h"
 #endif
 #include "sql/hybrid_search/ob_hybrid_search_node.h"
+#include "sql/hybrid_search/ob_fulltext_search_node.h"
 #include "sql/hybrid_search/ob_hybrid_search_dsl_resolver.h"
 #include "share/search_index/ob_search_index_builder_util.h"
+#include "share/search_index/ob_search_index_config.h"
 #include "share/search_index/ob_search_index_encoder.h"
 #include "sql/optimizer/ob_select_log_plan.h"
 #include "sql/engine/expr/ob_expr_json_func_helper.h"
@@ -4054,8 +4057,29 @@ int ObJoinOrder::get_valid_index_merge_indexes(const uint64_t table_id,
       // primary table, local normal index, local fts index, local multivalue index,
       // local search index and local async fts index in hybrid search are available
       // for index merge now
-      if (OB_FAIL(index_schema->get_rowkey_column_ids(index_column_ids))) {
+      if (index_schema->is_search_def_index()) {
+        // Only declared VALUE columns can match scalar predicates. Keep the Def candidate
+        // even when this list is empty so that FULLTEXT can still select its Text children.
+        const ObIndexInfo &index_info = index_schema->get_index_info();
+        for (int64_t j = 0; OB_SUCC(ret) && j < index_info.get_size(); ++j) {
+          uint64_t column_id = OB_INVALID_ID;
+          const ObColumnSchemaV2 *column = nullptr;
+          bool has_value = true;
+          if (OB_FAIL(index_info.get_column_id(j, column_id))) {
+            LOG_WARN("failed to get search index column id", K(ret), K(index_id), K(j));
+          } else if (OB_ISNULL(column = index_schema->get_column_schema(column_id))) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("search index column is null", K(ret), K(index_id), K(column_id));
+          } else if (OB_FAIL(ObSearchIndexConfig::has_value_mode(column->get_comment_str(), has_value))) {
+            LOG_WARN("failed to check search index VALUE mode", K(ret), K(index_id), K(column_id));
+          } else if (has_value && OB_FAIL(index_column_ids.push_back(column_id))) {
+            LOG_WARN("failed to push back search index column id", K(ret), K(index_id), K(column_id));
+          }
+        }
+      } else if (OB_FAIL(index_schema->get_rowkey_column_ids(index_column_ids))) {
         LOG_WARN("failed to get all column ids", K(ret));
+      }
+      if (OB_FAIL(ret)) {
       } else if (OB_FAIL(valid_index_ids.push_back(index_id))) {
         LOG_WARN("failed to push back index id", K(ret), K(index_id));
       } else if (OB_FAIL(valid_index_cols.push_back(index_column_ids))) {
@@ -5788,6 +5812,8 @@ int ObJoinOrder::create_one_index_merge_path(const uint64_t table_id,
     if (OB_ISNULL(cur_expr)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected null match expr", K(ret), K(i));
+    } else if (static_cast<ObMatchFunRawExpr *>(cur_expr)->is_search_text()) {
+      // Native JSON predicates are already represented by the hybrid FTS nodes.
     } else if (ObOptimizerUtil::find_item(match_exprs_in_index, cur_expr)) {
       // do nothing
     } else if (OB_FAIL(find_match_expr_info(helper.match_expr_infos_, cur_expr, match_expr_info))) {
@@ -23243,6 +23269,18 @@ int ObJoinOrder::process_index_for_match_expr(const uint64_t table_id,
     LOG_WARN("unexpected nullptr", K(ret));
   } else if (OB_FAIL(get_plan()->get_stmt()->get_match_expr_on_table(table_id, all_match_exprs))) {
     LOG_WARN("failed to get match exprs by table id", K(ret), K(table_id));
+  } else {
+    // Scalar followers of a native Search Text predicate use ordinary access
+    // paths. Their MATCH predicate is consumed by the separate hybrid FTS node.
+    for (int64_t i = all_match_exprs.count() - 1; OB_SUCC(ret) && i >= 0; --i) {
+      ObMatchFunRawExpr *match = static_cast<ObMatchFunRawExpr *>(all_match_exprs.at(i));
+      if (nullptr != match && match->is_search_text()
+          && OB_FAIL(all_match_exprs.remove(i))) {
+        LOG_WARN("failed to remove hybrid Search Text expression", K(ret));
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
   } else if (all_match_exprs.empty()) {
     // do nothing
   } else if (OB_FALSE_IT(access_path.domain_idx_info_.set_domain_idx_type(DomainIndexType::FTS_INDEX))) { 
@@ -23439,6 +23477,8 @@ int ObJoinOrder::init_basic_text_retrieval_info(uint64_t table_id,
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected null match expr", K(ret));
       } else if (OB_FALSE_IT(match_expr = static_cast<ObMatchFunRawExpr *>(match_exprs.at(i)))) {
+      } else if (match_expr->is_search_text()) {
+        // Def/Text selection and physical token prefixes belong to the hybrid path.
       } else if (match_expr->is_es_match() && i > 0 && !is_es_match) {
         ret = OB_NOT_SUPPORTED; // TODO: likely redundant, should have been checked in resolver stage
         LOG_WARN("match with match against is not supported", K(ret));
@@ -26105,7 +26145,6 @@ int ObJoinOrder::create_hybrid_search_node_path(const uint64_t table_id,
       }
     }
   } else if (node->node_type_ == INDEX_MERGE_HYBRID_FTS_QUERY) {
-    // TODO: index is already selected, only generate necessary info in access path.
     has_valid_path = true;
   } else if (node->node_type_ == INDEX_MERGE_HYBRID_KNN) {
     ObVecSearchNode *vec_node = static_cast<ObVecSearchNode *>(node);
@@ -26199,6 +26238,93 @@ int ObJoinOrder::create_hybrid_search_nodes_path(const uint64_t table_id,
   return ret;
 }
 
+int ObJoinOrder::convert_search_text_filter_to_dsl(ObMatchFunRawExpr &match,
+                                                 share::ObEsQueryItem outer_query_type,
+                                                 ObDSLQuery *parent_query,
+                                                 ObConstRawExpr *one_const_expr,
+                                                 ObDSLQuery *&dsl_query)
+{
+  int ret = OB_SUCCESS;
+  bool got_value = false;
+  ObString path("$");
+  const ObRawExpr *path_expr = match.get_json_path_expr();
+  ObRawExpr *query_expr = match.get_search_key();
+  ObDSLFullTextQuery *fulltext = nullptr;
+  if (OB_ISNULL(query_expr)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null Search Text query", K(ret));
+  } else if (!query_expr->is_static_const_expr()
+      || (!query_expr->get_result_type().is_null()
+          && !query_expr->get_result_type().is_string_type())) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "nonconstant Search FULLTEXT query");
+  }
+  // Evaluate implicit charset casts before normalizing the unparameterized path.
+  if (OB_FAIL(ret) || nullptr == path_expr) {
+  } else if (!path_expr->is_static_const_expr()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "Search FULLTEXT JSON path");
+  } else {
+    ObObj path_value;
+    if (OB_FAIL(ObSQLUtils::calc_const_or_calculable_expr(
+        OPT_CTX.get_exec_ctx(), path_expr, path_value, got_value, *allocator_, false /* ignore_failure */))) {
+      LOG_WARN("failed to evaluate Search Text JSON path", K(ret));
+    } else if (!got_value || !path_value.is_string_type()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "Search FULLTEXT JSON path");
+    } else {
+      ObJsonPath json_path(path_value.get_string(), allocator_);
+      ObJsonBuffer normalized_path(allocator_);
+      json_path.is_mysql_ = true;
+      if (OB_FAIL(json_path.parse_path())) {
+        LOG_WARN("failed to parse Search Text JSON path", K(ret), K(path_value));
+      } else if (OB_FAIL(json_path.to_string(normalized_path))) {
+        LOG_WARN("failed to normalize Search Text JSON path", K(ret));
+      } else if (OB_FAIL(ob_write_string(*allocator_,
+          ObString(normalized_path.length(), normalized_path.ptr()), path))) {
+        LOG_WARN("failed to copy normalized Search Text JSON path", K(ret));
+      }
+    }
+  }
+  // Preserve the query expression (including implicit casts), as ordinary
+  // FULLTEXT does, so a cached plan evaluates the current execution's parameters.
+  if (OB_FAIL(ret)) {
+  } else if (match.get_mode_flag() == MATCH_PHRASE_MODE) {
+    ObDSLMatchPhraseQuery *phrase = nullptr;
+    if (OB_FAIL(ObDSLMatchPhraseQuery::create(outer_query_type, parent_query, *allocator_, phrase))) {
+      LOG_WARN("failed to create native phrase query", K(ret));
+    } else if (OB_FAIL(ObRawExprUtils::build_const_int_expr(
+        OPT_CTX.get_expr_factory(), ObIntType, 0, phrase->slop_))) {
+      LOG_WARN("failed to build phrase slop", K(ret));
+    } else {
+      phrase->field_ = static_cast<ObColumnRefRawExpr *>(match.get_match_columns().at(0));
+      fulltext = phrase;
+    }
+  } else {
+    ObDSLMatchQuery *query = nullptr;
+    if (OB_FAIL(ObDSLMatchQuery::create(outer_query_type, parent_query, *allocator_, query))) {
+      LOG_WARN("failed to create native match query", K(ret));
+    } else if (OB_FAIL(ObRawExprUtils::build_const_int_expr(
+        OPT_CTX.get_expr_factory(), ObIntType, 1, query->minimum_should_match_))) {
+      LOG_WARN("failed to build minimum should match", K(ret));
+    } else if (OB_FAIL(ObRawExprUtils::build_const_int_expr(
+        OPT_CTX.get_expr_factory(), ObIntType, MATCH_OPERATOR_OR, query->operator_))) {
+      LOG_WARN("failed to build match operator", K(ret));
+    } else {
+      query->field_ = static_cast<ObColumnRefRawExpr *>(match.get_match_columns().at(0));
+      fulltext = query;
+    }
+  }
+  if (OB_SUCC(ret)) {
+    fulltext->query_ = query_expr;
+    fulltext->path_ = path;
+    fulltext->boost_ = one_const_expr;
+    fulltext->need_cal_score_ = false;
+    dsl_query = fulltext;
+  }
+  return ret;
+}
+
 int ObJoinOrder::convert_filter_to_dsl_query(ObRawExpr *filter,
                                               share::ObEsQueryItem outer_query_type,
                                               ObDSLQuery *parent_query,
@@ -26210,6 +26336,13 @@ int ObJoinOrder::convert_filter_to_dsl_query(ObRawExpr *filter,
   if (OB_ISNULL(filter) || OB_ISNULL(allocator_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected null", K(ret), KP(filter), KP(allocator_));
+  } else if (ObRawExprUtils::skip_inner_added_expr(filter)->is_match_against_expr()
+      && static_cast<ObMatchFunRawExpr *>(ObRawExprUtils::skip_inner_added_expr(filter))->is_search_text()) {
+    if (OB_FAIL(convert_search_text_filter_to_dsl(
+        *static_cast<ObMatchFunRawExpr *>(ObRawExprUtils::skip_inner_added_expr(filter)),
+        outer_query_type, parent_query, one_const_expr, dsl_query))) {
+      LOG_WARN("failed to convert native Search Text filter", K(ret));
+    }
   } else if (T_OP_AND == filter->get_expr_type()) {
     // AND expression: create BoolQuery with filter_ clause (AND semantics)
     ObDSLBoolQuery *bool_query = NULL;
@@ -26238,6 +26371,9 @@ int ObJoinOrder::convert_filter_to_dsl_query(ObRawExpr *filter,
         bool_query->origin_expr_ = filter;
       }
     }
+  } else if (T_OP_OR == filter->get_expr_type() && filter->has_flag(CNT_MATCH_EXPR)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "Search FULLTEXT SQL OR predicates");
   } else if (T_OP_OR == filter->get_expr_type()) {
     // OR expression: create BoolQuery with should_ clause (OR semantics)
     ObDSLBoolQuery *bool_query = NULL;
@@ -26266,6 +26402,9 @@ int ObJoinOrder::convert_filter_to_dsl_query(ObRawExpr *filter,
         bool_query->origin_expr_ = filter;
       }
     }
+  } else if (filter->has_flag(CNT_MATCH_EXPR)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "Search FULLTEXT numeric score predicates");
   } else {
     // Leaf expression: create ScalarQuery
     ObDSLScalarQuery *scalar_query = NULL;
@@ -26318,7 +26457,7 @@ int ObJoinOrder::set_search_index_access_info(AccessPath &ap, const QueryRangeIn
     LOG_WARN("index table schema is null", K(ret), K(search_index_id));
   } else if (OB_FAIL(index_table_schema->get_search_data_index_tid(search_data_index_id))) {
     LOG_WARN("failed to get search data index id", K(ret), K(search_index_id));
-  } else if (schema_guard->get_table_schema(search_data_index_id, index_table_schema)) {
+  } else if (OB_FAIL(schema_guard->get_table_schema(search_data_index_id, index_table_schema))) {
     LOG_WARN("failed to get search data index table schema", K(ret), K(search_data_index_id));
   } else if (OB_ISNULL(index_table_schema)) {
     ret = OB_ERR_UNEXPECTED;
@@ -26487,20 +26626,36 @@ int ObJoinOrder::init_dsl_query(const TableItem *table_item, const PathHelper &h
 {
   int ret = OB_SUCCESS;
   bool use_hs_index_merge = false;
+  bool has_search_text = false;
+  bool has_ordinary_fulltext = false;
+  if (OB_ISNULL(table_item) || OB_ISNULL(get_plan()) || OB_ISNULL(get_plan()->get_stmt())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null table item or plan", K(ret), KP(table_item), KP(get_plan()));
+  } else {
+    const ObIArray<ObMatchFunRawExpr *> &matches = get_plan()->get_stmt()->get_match_exprs();
+    for (int64_t i = 0; OB_SUCC(ret) && i < matches.count(); ++i) {
+      ObMatchFunRawExpr *match = matches.at(i);
+      uint64_t match_table_id = OB_INVALID_ID;
+      if (OB_ISNULL(match)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected null match expression", K(ret), K(i));
+      } else if (OB_FAIL(match->get_table_id(match_table_id))) {
+        LOG_WARN("failed to get match expression table id", K(ret), K(i));
+      } else if (match_table_id == table_item->table_id_) {
+        has_search_text |= match->is_search_text();
+        has_ordinary_fulltext |= !match->is_search_text();
+      }
+    }
+  }
   const LogTableHint *log_table_hint = NULL;
   dsl_query = NULL;
   ObSEArray<ObRawExpr *, 4> non_match_filters;
   ObSEArray<ObRawExpr *, 2> match_filters;
-  if (OB_ISNULL(table_item)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected null table item", K(ret));
-  } else if (OB_ISNULL(get_plan())) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected null plan", K(ret));
+  if (OB_FAIL(ret)) {
   } else if (table_item->dsl_query_ != NULL) {
     // use table item's dsl query resolved from DSL resolver
     dsl_query = table_item->dsl_query_;
-  } else if (!OPT_CTX.is_enable_search_index() &&
+  } else if (!has_search_text && !OPT_CTX.is_enable_search_index() &&
              (OB_ISNULL(log_table_hint =
                   get_plan()->get_log_plan_hint().get_log_table_hint(table_item->table_id_)) ||
               !log_table_hint->has_force_hybrid_search_index_merge_hint())) {
@@ -26511,7 +26666,14 @@ int ObJoinOrder::init_dsl_query(const TableItem *table_item, const PathHelper &h
                                                                    non_match_filters,
                                                                    match_filters))) {
     LOG_WARN("failed to extract match against filters", K(ret), K(helper.filters_));
-  } else if (use_hs_index_merge && (!match_filters.empty() || !helper.match_expr_infos_.empty())) {
+  } else if (has_search_text && has_ordinary_fulltext) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "mixing native Search FULLTEXT and ordinary FULLTEXT");
+  } else if (has_search_text && !use_hs_index_merge) {
+    ret = OB_ERR_FT_COLUMN_NOT_INDEXED;
+    LOG_WARN("no hybrid search index path for native Search FULLTEXT", K(ret), K(table_item->table_id_));
+  } else if (use_hs_index_merge && !has_search_text
+      && (!match_filters.empty() || !helper.match_expr_infos_.empty())) {
     // Keep SQL path when query contains fulltext MATCH AGAINST predicates.
     // Avoid routing to hybrid search path, which may still generate unsupported index merge plans.
     dsl_query = NULL;

@@ -777,6 +777,69 @@ TEST_F(TestTenantAsyncIndexRefresher, test_build_insert_new_sql_for_non_delete_i
   ASSERT_NE(nullptr, strstr(sql.ptr(), "ORDER BY `c1`"));
 }
 
+// Every physical Search child uses INDEX_DATA_GEN for both full and delta scans.
+// Text's TF/DL/positions are generated values, never source-table columns.
+TEST_F(TestTenantAsyncIndexRefresher, test_search_children_use_target_generator_and_partition_routing)
+{
+  ObTenantAsyncIndexRefresher refresher;
+  ObAsyncIndexDataTableInfo info;
+  info.data_table_id_ = 100001;
+  info.database_name_ = ObString("test_db");
+  info.data_table_name_ = ObString("documents");
+  info.schema_version_ = 7;
+  ObAsyncIndexDataTabletInfo dt;
+  dt.data_tablet_id_ = ObTabletID(100001);
+  dt.partition_name_ = ObString("p0");
+  ASSERT_EQ(OB_SUCCESS, info.data_tablet_infos_.push_back(dt));
+  const schema::ObIndexType types[] = {
+      schema::INDEX_TYPE_ASYNC_SEARCH_DATA_INDEX_LOCAL,
+      schema::INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_INDEX_LOCAL,
+      schema::INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_PHRASE_INDEX_LOCAL};
+  const char *columns[] = {"field_id", "path", "token", "doc_id", "tf", "dl", "positions"};
+  for (int64_t t = 0; t < 3; ++t) {
+    SCOPED_TRACE(t);
+    ObAsyncIndexInfo idx;
+    idx.index_type_ = types[t];
+    idx.index_table_id_ = 110001 + t;
+    idx.index_table_name_ = ObString("search_child");
+    idx.def_index_table_id_ = 110000;
+    const int64_t cnt = t == 0 ? 4 : (t == 1 ? 6 : 7);
+    for (int64_t c = 0; c < cnt; ++c) {
+      ASSERT_EQ(OB_SUCCESS, idx.select_columns_.push_back(ObString(columns[c])));
+      if (c < 4) {
+        ASSERT_EQ(OB_SUCCESS, idx.rowkey_columns_.push_back(ObString(columns[c])));
+        ASSERT_EQ(OB_SUCCESS, idx.order_columns_.push_back(ObString(columns[c])));
+      }
+    }
+    ASSERT_EQ(OB_SUCCESS, idx.select_columns_.push_back(ObString("route_key")));
+    ASSERT_EQ(OB_SUCCESS, idx.source_columns_.push_back(ObString("payload")));
+    ASSERT_EQ(OB_SUCCESS, idx.partition_key_columns_.push_back(ObString("route_key")));
+    ASSERT_EQ(OB_SUCCESS, idx.partition_names_.push_back(ObString("p0")));
+    ObRefreshDecision decision;
+    decision.index_tablet_id_ = ObTabletID(200001 + t);
+    decision.start_refresh_scn_ = make_scn(1000);
+    decision.target_refresh_scn_ = make_scn(2000);
+    decision.parallelism_ = 2;
+    for (int complete = 0; complete < 2; ++complete) {
+      ObSqlString sql;
+      ASSERT_EQ(OB_SUCCESS, refresher.build_refresh_sql_(info, 0, idx, decision,
+          complete ? ObTenantAsyncIndexRefresher::REFRESH_SQL_COMPLETE
+                   : ObTenantAsyncIndexRefresher::REFRESH_SQL_INSERT_NEW, 88002, sql));
+      ASSERT_NE(nullptr, sql.ptr());
+      EXPECT_NE(nullptr, strstr(sql.ptr(), "INDEX_DATA_GEN(COLUMNS(`payload`, `__pk_increment`)"));
+      EXPECT_NE(nullptr, strstr(sql.ptr(), "PARTITION KEY(`route_key`)"));
+      EXPECT_NE(nullptr, strstr(sql.ptr(), "DATA_GEN_TABLE.*, `route_key`"));
+      EXPECT_NE(nullptr, strstr(sql.ptr(), "ORDER BY 1, 2, 3, 4"));
+      ObSqlString target;
+      ASSERT_EQ(OB_SUCCESS, target.append_fmt(", %lu) DATA_GEN_TABLE", idx.index_table_id_));
+      EXPECT_NE(nullptr, strstr(sql.ptr(), target.ptr()));
+      EXPECT_EQ(complete != 0, nullptr == strstr(sql.ptr(), "`OLD_NEW$$` = 'N'"));
+      EXPECT_EQ(complete != 0, nullptr == strstr(sql.ptr(), "`ora_rowscn` >"));
+      if (t == 2) { EXPECT_NE(nullptr, strstr(sql.ptr(), "`positions`")); }
+    }
+  }
+}
+
 // Async IVF now follows the common INSERT...SELECT orchestration. Its projected
 // names are main-table generated columns (not fixed target-only placeholders),
 // and COMPLETE/INCREMENTAL differ only in the common SQL window semantics.

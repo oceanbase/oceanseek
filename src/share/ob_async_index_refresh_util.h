@@ -268,7 +268,9 @@ public:
   // Requested-DOP limit: 0 uses 25 percent of tenant max CPU.
   static int64_t get_async_index_refresh_dop_limit(const uint64_t tenant_id);
   // Collect physical async refresh target table IDs. Default: AVAILABLE only.
-  // allow_unavailable: also collect INDEX_STATUS_UNAVAILABLE.
+  // allow_unavailable: also collect INDEX_STATUS_UNAVAILABLE for initial DDL refresh.
+  // retry_on_missing_search_schema: return OB_SCHEMA_EAGAIN for missing Search schemas;
+  // otherwise skip. Missing non-Search schemas are skipped.
   static int collect_async_index_table_ids(
       const uint64_t tenant_id,
       const uint64_t data_table_id,

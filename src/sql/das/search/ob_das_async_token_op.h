@@ -146,6 +146,8 @@ private:
                                      const int64_t posting_count,
                                      const DocScoreAccumulator &accumulator, int64_t &scoring_count) const;
   int init_term_key(const common::ObString &query_token);
+  bool is_search_text() const
+  { return ir_ctdef_->search_index_fulltext_info_.has_search_index_fulltext(); }
   int init_posting_scan_param();
   int init_inv_idx_scan_param();
   // Init the lazy BM25 param estimator.

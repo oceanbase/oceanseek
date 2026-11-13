@@ -123,7 +123,7 @@ ObInvSSTablePostingIter::ObInvSSTablePostingIter()
     avg_doc_length_(0.0),
     bm25_calc_params_(),
     bm25_frontier_kernels_(),
-    has_relevance_params_(false),
+    need_relevance_params_(false),
     tablet_handle_(),
     table_handle_(),
     scanner_(),
@@ -194,7 +194,7 @@ void ObInvSSTablePostingIter::reset()
   avg_doc_length_ = 0.0;
   bm25_calc_params_.reset();
   bm25_frontier_kernels_ = {};
-  has_relevance_params_ = false;
+  need_relevance_params_ = false;
   invalidate_current_block_max_score();
   frontier_min_id_ = 0;
   min_doc_id_ = 0;
@@ -253,6 +253,9 @@ int ObInvSSTablePostingIter::open(
   } else if (OB_UNLIKELY(!sstable.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid inv sstable", K(ret));
+  } else if (OB_UNLIKELY(param.need_relevance_params_ && !sstable.get_inv_meta().get_stats().has_relevance_params_)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("posting scan requests relevance params absent from sstable", K(ret), K(param), "inv_meta", sstable.get_inv_meta());
   } else if (OB_FAIL(scanner_.open(
       rowkey_read_info,
       *param.search_key_,
@@ -268,14 +271,13 @@ int ObInvSSTablePostingIter::open(
     doc_freq_ = param.doc_freq_;
     total_doc_cnt_ = param.total_doc_cnt_;
     avg_doc_length_ = param.avg_doc_length_;
-    has_relevance_params_ = sstable.get_inv_meta().get_stats().has_relevance_params_;
+    need_relevance_params_ = param.need_relevance_params_;
     need_posting_value_ = param.need_posting_value_;
     min_doc_id_ = param.min_doc_id_;
     max_doc_id_ = param.max_doc_id_;
     // Block-max scoring uses score_multiplier = 1.0; precompute its constants before opening.
-    // Search indexes have no BM25 relevance params; skip precomputation to avoid the
-    // avg_doc_length_ > 0 requirement in init_precomputed_params().
-    if (has_relevance_params_) {
+    // Hit-only scans skip BM25 precomputation even when the SSTable stores TF/DL.
+    if (need_relevance_params_) {
       if (OB_FAIL(sql::ObExprBM25::init_precomputed_params(
           sql::ObExprBM25::query_token_weight(doc_freq_, total_doc_cnt_),
           avg_doc_length_, 1.0 /*score_multiplier*/, bm25_calc_params_))) {
@@ -661,7 +663,8 @@ int ObInvSSTablePostingIter::drain_until_impl(
       // Project direct pointers into the decoded block; no copy.
       if (OB_FAIL(posting_block_data_.get_doc_id_view(start_idx, doc_ids))) {
         LOG_WARN("failed to project typed doc IDs", K(ret), K(start_idx), K(take));
-      } else if (OB_FAIL(posting_block_data_.get_relevance_view(start_idx, relevance))) {
+      } else if (need_relevance_params_
+          && OB_FAIL(posting_block_data_.get_relevance_view(start_idx, relevance))) {
         LOG_WARN("failed to project typed relevance", K(ret), K(start_idx), K(take));
       } else {
         count = take;
@@ -1059,9 +1062,9 @@ int ObInvSSTablePostingIter::get_curr_bm25_param(
   } else if (OB_UNLIKELY(!curr_block_loaded_ || curr_row_idx_ < 0 || OB_ISNULL(curr_id_))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("no current row materialized", K(ret), K_(curr_block_loaded), K_(curr_row_idx));
-  } else if (OB_UNLIKELY(!posting_block_data_.has_relevance_params())) {
+  } else if (OB_UNLIKELY(!need_relevance_params_ || !posting_block_data_.has_relevance_params())) {
     ret = OB_NOT_SUPPORTED;
-    LOG_WARN("current posting block has no relevance params", K(ret));
+    LOG_WARN("current posting block has no relevance params or relevance params were not requested for this scan", K(ret), K_(need_relevance_params), K_(posting_block_data));
   } else if (OB_UNLIKELY(!curr_relevance_materialized_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("current relevance params not materialized", K(ret), K_(curr_row_idx));
@@ -1087,9 +1090,9 @@ int ObInvSSTablePostingIter::load_curr_bm25_param(
   } else if (OB_UNLIKELY(!curr_block_loaded_ || curr_row_idx_ < 0 || OB_ISNULL(curr_id_))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("no current row materialized", K(ret), K_(curr_block_loaded), K_(curr_row_idx));
-  } else if (OB_UNLIKELY(!posting_block_data_.has_relevance_params())) {
+  } else if (OB_UNLIKELY(!need_relevance_params_ || !posting_block_data_.has_relevance_params())) {
     ret = OB_NOT_SUPPORTED;
-    LOG_WARN("current posting block has no relevance params", K(ret));
+    LOG_WARN("current posting block has no relevance params or relevance params were not requested for this scan", K(ret), K_(need_relevance_params), K_(posting_block_data));
   } else if (OB_FAIL(materialize_curr_relevance())) {
     LOG_WARN("failed to materialize current relevance params", K(ret), K_(curr_row_idx));
   } else {
@@ -1108,6 +1111,9 @@ int ObInvSSTablePostingIter::get_curr_phrase_block_max_ranking(double &max_ranki
     LOG_WARN("posting iter not opened", K(ret));
   } else if (is_end_) {
     ret = OB_ITER_END;
+  } else if (OB_UNLIKELY(!need_relevance_params_)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("cannot get phrase block max ranking: relevance params were not requested for this scan", K(ret), K_(need_relevance_params));
   } else if (OB_UNLIKELY(!curr_meta_.is_valid())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("current posting block meta is invalid", K(ret), K_(curr_meta));
@@ -1139,6 +1145,9 @@ int ObInvSSTablePostingIter::get_block_max_tuple(
     LOG_WARN("posting iter not opened", K(ret));
   } else if (is_end_) {
     ret = OB_ITER_END;
+  } else if (OB_UNLIKELY(!need_relevance_params_)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("cannot get block max score: relevance params were not requested for this scan", K(ret), K_(need_relevance_params));
   } else if (OB_UNLIKELY(!curr_meta_.is_valid())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("current posting block meta is invalid", K(ret), K_(curr_meta));
@@ -1175,7 +1184,8 @@ int ObInvSSTablePostingIter::get_range_max_score(
   } else if (OB_UNLIKELY(end_id < start_id || (!start_inclusive && end_id == start_id))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid posting range", K(ret), K(start_id), K(start_inclusive), K(end_id));
-  } else if (OB_UNLIKELY(!has_relevance_params_)) {
+  } else if (OB_UNLIKELY(!need_relevance_params_)) {
+    // The caller did not request relevance data and uses its conservative bound.
   } else if (is_end_) {
     max_score = 0.0;
     can_calc = true;
@@ -1445,6 +1455,9 @@ int ObInvSSTablePostingIter::materialize_curr_relevance()
   if (OB_UNLIKELY(!curr_block_loaded_ || curr_row_idx_ < 0 || OB_ISNULL(curr_id_))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("no current row materialized", K(ret), K_(curr_block_loaded), K_(curr_row_idx));
+  } else if (!need_relevance_params_) {
+    // Hit-only scan: the physical block can carry TF/DL, but this scan does not
+    // project them into row state.
   } else if (curr_relevance_materialized_) {
     // Relevance params have already been decoded for the current row.
   } else if (!posting_block_data_.has_relevance_params()) {
@@ -1468,7 +1481,7 @@ int ObInvSSTablePostingIter::materialize_row(const int64_t row_idx)
   int ret = OB_SUCCESS;
   if (OB_FAIL(materialize_doc_id(row_idx))) {
     LOG_WARN("failed to materialize doc id", K(ret), K(row_idx));
-  } else if (OB_FAIL(materialize_curr_relevance())) {
+  } else if (need_relevance_params_ && OB_FAIL(materialize_curr_relevance())) {
     LOG_WARN("failed to materialize relevance params", K(ret), K(row_idx));
   }
   return ret;

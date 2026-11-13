@@ -291,11 +291,24 @@ public:
       ObTableScanParam &scan_param,
       ObIvfSSTableScanIter *&iter);
   int revert_async_index_iter(ObIAsyncIndexIter *iter);
-  virtual int get_async_inv_bm25_stats(
+  // A null field prefix selects ordinary full text; Search Text supplies (COL_IDX, PATH).
+  // Both statistics use the query's pinned tablet and async snapshot; output stays zero on failure.
+  // Total length is an owned Number datum, while token count remains uint64.
+  virtual int get_async_inv_total_doc_length(
       const share::ObLSID &ls_id,
       const common::ObTabletID &tablet_id,
       const ObTabletHandle &tablet_handle,
       const share::SCN &read_snapshot,
+      const blocksstable::ObDatumRowkey *field_prefix,
+      blocksstable::ObAsyncInvBM25Stats &stats);
+
+  virtual int get_async_inv_token_doc_cnt(
+      const share::ObLSID &ls_id,
+      const common::ObTabletID &tablet_id,
+      const ObTabletHandle &tablet_handle,
+      const share::SCN &read_snapshot,
+      const blocksstable::ObDatumRowkey *field_prefix,
+      const common::ObString &token,
       blocksstable::ObAsyncInvBM25Stats &stats);
 
 protected:

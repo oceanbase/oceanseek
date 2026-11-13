@@ -19,7 +19,7 @@
 #include "sql/resolver/ddl/ob_storage_cache_ddl_util.h"
 #include "lib/restore/ob_storage_info.h"
 #include "share/external_table/ob_external_table_utils.h"
-#include "share/search_index/ob_search_index_config_filter.h"
+#include "share/search_index/ob_search_index_config.h"
 
 namespace oceanbase
 {
@@ -1316,12 +1316,13 @@ int ObSchemaPrinter::print_index_column(const ObTableSchema &table_schema,
     SHARE_SCHEMA_LOG(WARN, "fail to generate new name with escape character", K(ret), K(column.get_column_name_str()));
   } else if (OB_FAIL(print_identifier(buf, buf_len, pos, new_col_name, is_oracle_mode))) {
     SHARE_SCHEMA_LOG(WARN, "fail to print column name", K(ret), K(column));
-  } else if (is_search_index && OB_NOT_NULL(index_col) &&
-      OB_FAIL(share::ObSearchIndexConfigFilter::print_schema(index_col->get_comment_str(), buf, buf_len, pos))) {
+  } else if (is_search_index && OB_NOT_NULL(index_col)
+             && OB_FAIL(share::ObSearchIndexConfig::print_schema(
+                 index_col->get_comment_str(), buf, buf_len, pos))) {
     SHARE_SCHEMA_LOG(WARN, "fail to print search index column config", K(ret), K(column));
   } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, is_last ? ")" : ", "))) {
     SHARE_SCHEMA_LOG(WARN, "fail to print column name", K(ret), K(column));
-  } else { /*do nothing*/ }
+  }
   return ret;
 }
 

@@ -465,6 +465,8 @@ ob_set_subtarget(ob_share common_mixed
   search_index/ob_search_index_generator.cpp
   search_index/ob_search_index_builder_util.cpp
   search_index/ob_search_index_config_filter.cpp
+  search_index/ob_search_index_lifecycle_util.cpp
+  search_index/ob_search_index_config.cpp
   search_index/ob_search_index_nested_key_list.cpp
 )
 

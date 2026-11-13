@@ -19,6 +19,7 @@ namespace oceanbase
 namespace common
 {
 class ObIJsonBase;
+class ObJsonWrapper;
 }
 
 namespace share
@@ -51,7 +52,7 @@ static const int64_t SEARCH_INDEX_PATH_LENGTH = 2 * 1024; // 2KB
 // Reserved in the generated search key budget whether or not a nested_key column is present.
 static const int64_t SEARCH_INDEX_NESTED_KEY_LENGTH = 80; // 20 * 4B
 //
-// Maximum length for the indexed value in search index.
+// Maximum length in bytes for the indexed value in search index.
 // This is the actual content extracted from JSON documents at the specified path.
 // If the value length exceeds this limit, the value will be silently truncated to fit within
 // the limit. No error will be reported in this case. 80B is reserved for the nested_key column
@@ -102,10 +103,12 @@ public:
 
 private:
   static int64_t calc_prefix_path_size(const ObIArray<JsonPathItem> &path_items,
-                                       bool &has_escaped_null);
+                                       bool &has_escaped_null,
+                                       const bool preserve_array_levels = false);
   static int encode_prefix_path(const ObIArray<JsonPathItem> &path_items,
                                 const bool has_escaped_null,
-                                uint8_t *mem, int64_t &pos);
+                                uint8_t *mem, int64_t &pos,
+                                const bool preserve_array_levels = false);
   static int build_path(ObIAllocator &allocator,
                         const ObString &prefix,
                         const ObString &suffix,
@@ -119,6 +122,9 @@ public:
                                 ObString &path);
   static int encode_path(ObIAllocator &allocator, const ObIArray<JsonPathItem> &path_items,
                          const ObJsonNodeType scalar_type, ObString &path);
+  // Fulltext path retains every array level and omits the scalar type suffix.
+  static int encode_text_path(ObIAllocator &allocator, const ObIArray<JsonPathItem> &path_items,
+                              ObString &path);
   static int encode_pick_path(const ObItemType pick_type, uint8_t &enc_type);
 
   // build path for query range.
@@ -171,13 +177,17 @@ public:
   static int encode_int32(ObIAllocator &allocator, int32_t int32_value, ObString &value);
   static int encode_uint8(ObIAllocator &allocator, uint8_t uint8_value, ObString &value);
   static int encode_string(ObIAllocator &allocator, const ObString &string_value,
-                           ObString &value, ObEncParam &enc_param);
+                           ObString &value, ObEncParam &enc_param,
+                           const bool is_allow_truncate = true);
   static int init_string_enc_param(const ObObjType obj_type,
                                    const ObCollationType cs_type,
                                    const ObSQLMode sql_mode,
                                    const bool is_null_first,
                                    const bool is_asc,
                                    ObEncParam &enc_param);
+  static int encode_json_scalar(ObIAllocator &allocator, const ObJsonWrapper &json,
+                                ObString &value, ObEncParam &enc_param);
+  // Compatibility entry for callers that still hold a legacy JSON node.
   static int encode_json_scalar(ObIAllocator &allocator, const ObIJsonBase *j_base,
                                 ObString &value, ObEncParam &enc_param);
   static bool is_json_scalar(const ObIJsonBase *j_base) {
@@ -196,13 +206,20 @@ public:
 
   // Encode search index value from JSON scalar
   static int encode_value(common::ObIAllocator &allocator,
+                          const common::ObJsonWrapper &json,
+                          common::ObString &value);
+  // Compatibility entry; delegates to the wrapper encoder.
+  static int encode_value(common::ObIAllocator &allocator,
                           const common::ObIJsonBase *j_base,
                           common::ObString &value);
 
-  // For UTF-16/UTF-16LE charsets whose strnxfrm_varlen is unimplemented, convert the
-  // string to UTF-8 and remap the collation to the corresponding UTF-8 equivalent.
-  // Safe because utf16_general_ci / utf8mb4_general_ci share the same UCA weight
-  // algorithm, and utf16_bin / utf8mb4_bin both sort by Unicode code point order.
+  // FULLTEXT grouping and encoded keys must agree on token equality. Only allow
+  // implemented encodings and the UTF16/UTF16LE general_ci/bin equivalents.
+  static bool is_supported_search_index_collation(const common::ObCollationType cs_type);
+
+  // Legacy VALUE normalization maps every non-binary UTF16 collation to general_ci.
+  // FULLTEXT support checks is_supported_search_index_collation(): UCA
+  // collations do not preserve their equality/order under this mapping.
   static int normalize_string_for_encoding(common::ObIAllocator &allocator,
                                            common::ObString &str_value,
                                            common::ObCollationType &cs_type);

@@ -170,6 +170,90 @@ TEST_F(JsonMemberOfExprTest, MysqlJsonArrayCandidateAgainstNestedArray)
   EXPECT_TRUE(result.verify_ordered({{"1"}}));
 }
 
+// ============================================================================
+// _enable_json_bin_view switch comparison tests.
+//
+// JSON_MEMBER_OF calls get_json_doc_wrapper on the target (arg1) and
+// get_json_candidate_wrapper on the candidate (arg0).  When
+// _enable_json_bin_view is ON and the target is cast(... as json), the
+// wrapper holds an ObJsonBinView and element_count()/element()/
+// ObJsonWrapper::compare run on the zero-copy bin path.  When OFF, the
+// wrapper holds an ObJsonBin DOM.
+//
+// Note: _enable_json_bin_view is an OB_TENANT_PARAMETER, not a session
+// variable, so with_session_vars() cannot set it.  We use WITH_TENANT_CONFS
+// (TestParameterGuard RAII) which pushes into TestDefaultParameterConf TLS,
+// consumed by OpTestEngine::apply_tenant_config_overrides() during prepare().
+// ============================================================================
+
+// B1: switch ON — scalar member of array via cast(arr as json).
+TEST_F(JsonMemberOfExprTest, BinViewSwitchOnScalarMember)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "true"}) {
+    auto result = expr_unit_test()
+        .columns("arr varchar(512)")
+        .with_expr("17 member of (cast(arr as json))")
+        .with_data({
+            {R"([23, "abc", 17, "ab", 10])"},
+            {R"([23, "abc", "17", "ab", 10])"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"1"}, {"0"}}));
+  }
+}
+
+// B2: switch OFF — same input as B1, expect identical results.
+TEST_F(JsonMemberOfExprTest, BinViewSwitchOffScalarMember)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "false"}) {
+    auto result = expr_unit_test()
+        .columns("arr varchar(512)")
+        .with_expr("17 member of (cast(arr as json))")
+        .with_data({
+            {R"([23, "abc", 17, "ab", 10])"},
+            {R"([23, "abc", "17", "ab", 10])"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"1"}, {"0"}}));
+  }
+}
+
+// B3: switch ON — JSON array candidate member of nested array.
+TEST_F(JsonMemberOfExprTest, BinViewSwitchOnJsonArrayCandidate)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "true"}) {
+    auto result = expr_unit_test()
+        .columns("arr varchar(512)")
+        .with_expr("cast('[4,5]' as json) member of (cast(arr as json))")
+        .with_data({
+            {R"([[3,4],[4,5]])"},
+            {R"([[3,4],[5,6]])"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"1"}, {"0"}}));
+  }
+}
+
+// B4: switch OFF — same input as B3, expect identical results.
+TEST_F(JsonMemberOfExprTest, BinViewSwitchOffJsonArrayCandidate)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "false"}) {
+    auto result = expr_unit_test()
+        .columns("arr varchar(512)")
+        .with_expr("cast('[4,5]' as json) member of (cast(arr as json))")
+        .with_data({
+            {R"([[3,4],[4,5]])"},
+            {R"([[3,4],[5,6]])"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"1"}, {"0"}}));
+  }
+}
+
 int main(int argc, char **argv)
 {
   ::testing::InitGoogleTest(&argc, argv);

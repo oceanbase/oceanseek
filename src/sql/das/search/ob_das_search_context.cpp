@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX SQL_DAS
 #include "ob_das_search_context.h"
 #include "sql/das/ob_das_utils.h"
+#include "lib/container/ob_array_helper.h"
 #include "sql/das/search/ob_das_logical_bm25_stats_provider.h"
 #include "sql/das/search/ob_das_scalar_define.h"
 #include "sql/das/search/ob_das_search_utils.h"
@@ -121,6 +122,9 @@ void ObDASSearchCtx::reset()
   async_group_slot_ = -1;
   async_direct_bind_ = false;
   generating_group_filter_domain_ = false;
+  op_creating_scope_ = DAS_SCOPE_BASE;
+  op_creating_depth_ = 0;
+  nested_scope_id_ = DAS_SCOPE_MAX;
   for (int i = 0; i < DAS_SCOPE_MAX; ++i) {
     scopes_[i] = ObDASRowIDScope();
   }
@@ -625,17 +629,33 @@ int ObDASSearchCtx::get_related_tablet_id(const ObDASBaseCtDef *ctdef, common::O
   return get_related_tablet_id(static_cast<const ObDASScalarScanCtDef *>(ctdef), tablet_id);
 }
 
-int ObDASSearchCtx::register_nested_scope(const sql::ExprFixedArray *nested_rowid_exprs)
+int ObDASSearchCtx::register_nested_scope(
+    const sql::ExprFixedArray *nested_rowid_exprs, ObDASScopeId scope_id)
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(nested_rowid_exprs) || nested_rowid_exprs->empty()) {
+  if (OB_ISNULL(nested_rowid_exprs) || nested_rowid_exprs->empty()
+      || !is_nested_scope(scope_id)) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("nested scope requires non-empty rowid_exprs", K(ret));
-  } else if (OB_FAIL(scopes_[DAS_SCOPE_NESTED_SYNC].rowid_meta_.init(*nested_rowid_exprs, 0))) {
-    LOG_WARN("failed to init nested rowid_meta", K(ret));
+    LOG_WARN("invalid nested scope", K(ret), K(scope_id));
+  } else if (has_nested_scope() && nested_scope_id_ != scope_id) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("conflicting nested scope registration", K(ret), K_(nested_scope_id), K(scope_id));
   } else {
-    scopes_[DAS_SCOPE_NESTED_SYNC].rowid_type_ = DAS_ROWID_TYPE_COMPACT;
-    scopes_[DAS_SCOPE_NESTED_SYNC].rowid_exprs_ = nested_rowid_exprs;
+    const ObDASRowIDType rowid_type = is_async_nested_scope(scope_id)
+        ? DAS_ROWID_TYPE_UINT64 : DAS_ROWID_TYPE_COMPACT;
+    // Keep the original expressions, including the NK column used by async Range/SORT.
+    // UINT64 RowMeta describes only the doc_id column.
+    const int64_t column_count = DAS_ROWID_TYPE_UINT64 == rowid_type
+        ? 1 : nested_rowid_exprs->count();
+    ObArrayHelper<ObExpr *> rowid_exprs(column_count, nested_rowid_exprs->get_data(), column_count);
+    ObDASRowIDScope &scope = scopes_[scope_id];
+    if (OB_FAIL(scope.rowid_meta_.init(rowid_exprs, 0))) {
+      LOG_WARN("failed to init nested rowid meta", K(ret), K(rowid_type));
+    } else {
+      scope.rowid_type_ = rowid_type;
+      scope.rowid_exprs_ = nested_rowid_exprs;
+      nested_scope_id_ = scope_id;
+    }
   }
   return ret;
 }
@@ -762,7 +782,9 @@ int ObDASSearchCtx::lower_bound_in_frame(ObDASScopeId scope,
   } else {
     idx = 0;
     int64_t search_right = count;
-    for (int64_t i = 0; OB_SUCC(ret) && idx < search_right && i < rowid_exprs->count(); ++i) {
+    const int64_t column_count = DAS_ROWID_TYPE_UINT64 == scopes_[scope].rowid_type_
+        ? MIN(1, rowid_exprs->count()) : rowid_exprs->count();
+    for (int64_t i = 0; OB_SUCC(ret) && idx < search_right && i < column_count; ++i) {
       ObDatum target_datum;
       ObIVector *vec = nullptr;
       ObExpr *expr = rowid_exprs->at(i);
@@ -970,9 +992,9 @@ int ObDASSearchCtx::uint64_rowid_to_expr(const ObDASRowID &rowid, const ExprFixe
 {
   UNUSED(rowid_meta);
   int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(rowid_exprs.count() != 1)) {
+  if (OB_UNLIKELY(rowid_exprs.empty()) || OB_ISNULL(rowid_exprs.at(0))) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("uint64 rowid should have exactly one expr", K(ret), K(rowid_exprs.count()));
+    LOG_WARN("uint64 rowid requires a doc id expr", K(ret), K(rowid_exprs.count()));
   } else {
     ObExpr *expr = rowid_exprs.at(0);
     ObIVector *vec = nullptr;
@@ -1014,12 +1036,11 @@ int ObDASSearchCtx::write_datum_to_uint64_rowid(const ObDatum &datum, const RowM
                                                 ObDASRowID &rowid, common::ObIAllocator &alloc)
 {
   UNUSED(meta);
-  UNUSED(rowid_exprs);
   UNUSED(alloc);
   int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(rowid_exprs.count() != 1)) {
+  if (OB_UNLIKELY(rowid_exprs.empty()) || OB_ISNULL(rowid_exprs.at(0))) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("rowid to write to should have exactly one expr", K(ret), K(rowid_exprs.count()));
+    LOG_WARN("uint64 rowid requires a doc id expr", K(ret), K(rowid_exprs.count()));
   } else {
     rowid.set_uint64(datum.get_uint());
   }
@@ -1097,21 +1118,24 @@ int ObDASSearchCtx::write_datums_to_rowid(ObDASScopeId scope,
   if (OB_ISNULL(s.rowid_exprs_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("scope rowid_exprs_ is null", K(ret), K(scope));
-  } else if (OB_UNLIKELY(datums.count() != s.rowid_exprs_->count())) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("datum count mismatch with scope rowid_exprs", K(ret),
-             K(datums.count()), K(s.rowid_exprs_->count()), K(scope));
   } else if (s.rowid_type_ == DAS_ROWID_TYPE_UINT64) {
-    // BASE scope: single uint64 column
+    // UINT64 RowIDs contain only doc_id, including in an asynchronous NESTED scope.
     if (OB_UNLIKELY(datums.count() != 1)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("uint64 scope expects exactly 1 datum", K(ret), K(datums.count()));
+    } else if (OB_UNLIKELY(s.rowid_exprs_->empty()) || OB_ISNULL(s.rowid_exprs_->at(0))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("uint64 scope requires a doc id expression", K(ret), K(scope));
     } else {
       rowid.set_uint64(datums.at(0).get_uint());
     }
   } else {
-    // NESTED (or any compact) scope: multi-column compact row
-    if (OB_FAIL(build_compact_rowid(datums, *s.rowid_exprs_, s.rowid_meta_, rowid, alloc))) {
+    // Compact RowIDs use the complete expression array.
+    if (OB_UNLIKELY(datums.count() != s.rowid_exprs_->count())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("datum count mismatch with scope rowid_exprs", K(ret),
+               K(datums.count()), K(s.rowid_exprs_->count()), K(scope));
+    } else if (OB_FAIL(build_compact_rowid(datums, *s.rowid_exprs_, s.rowid_meta_, rowid, alloc))) {
       LOG_WARN("failed to build compact rowid for scope", K(ret), K(scope));
     }
   }

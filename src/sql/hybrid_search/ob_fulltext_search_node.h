@@ -7,6 +7,7 @@
 #define _OB_SQL_HYBRID_SEARCH_OB_FULLTEXT_SEARCH_NODE_H_
 
 #include "sql/hybrid_search/ob_hybrid_search_node.h"
+#include "sql/hybrid_search/ob_fulltext_search_query.h"
 
 namespace oceanbase
 {
@@ -31,8 +32,21 @@ public:
       KPC_(related_doc_cnt), KPC_(total_doc_cnt), KPC_(doc_token_cnt), KPC_(avg_doc_token_cnt),
       K_(relevance_expr), KPC_(async_related_doc_cnt), KPC_(async_total_doc_cnt), K_(generated));
 private:
+  int generate_search_text_column_exprs(
+      const ObTableSchema &schema,
+      const TableItem &table_item,
+      ObRawExprFactory &expr_factory,
+      ObSQLSessionInfo &session_info);
   int generate_column_exprs(
       const uint64_t inv_idx_tid,
+      const bool doc_id_as_domain_id,
+      const TableItem &table_item,
+      ObRawExprFactory &expr_factory,
+      ObSQLSessionInfo &session_info,
+      ObSqlSchemaGuard &schema_guard,
+      ObQueryCtx *query_ctx);
+  int generate_fts_column_exprs(
+      const ObTableSchema *inv_idx_schema,
       const bool doc_id_as_domain_id,
       const TableItem &table_item,
       ObRawExprFactory &expr_factory,
@@ -76,6 +90,10 @@ public:
   virtual ~ObFullTextQueryNode() {}
   bool need_score() const { return nullptr != score_project_expr_; }
   bool need_pos_list() const { return OB_FULLTEXT_QUERY_TYPE_MATCH_PHRASE == query_type_; }
+  int resolve_index(const ObTableSchema &main_table_schema,
+                    const ObSqlSchemaGuard &schema_guard,
+                    const ObIArray<uint64_t> &valid_index_ids,
+                    ObIAllocator &allocator);
   virtual int generate_access_exprs(
       const TableItem &table_item,
       ObOptimizerContext &opt_ctx) override;
@@ -103,6 +121,7 @@ public:
   // async fulltext index members
   bool is_async_;
   ObAsyncIndexDeleteInfo async_delete_info_;
+  ObSearchIndexTextInfo search_index_fulltext_info_;
 };
 
 class ObMatchQueryNode final : public ObFullTextQueryNode
@@ -146,6 +165,7 @@ public:
       K_(index_infos), KPC_(minimum_should_match), KPC_(operator), KPC_(field_type));
 public:
   ObFixedArray<ObColumnRefRawExpr *, ObIAllocator> fields_;
+  ObFixedArray<ObSearchIndexTextInfo, ObIAllocator> search_index_fulltext_infos_;
   ObFixedArray<ObConstRawExpr *, ObIAllocator> field_boosts_;
   ObFixedArray<uint64_t, ObIAllocator> inv_idx_tids_;
   ObFixedArray<ObTextRetrievalIndexInfo, ObIAllocator> index_infos_;
@@ -194,6 +214,7 @@ public:
       K_(index_infos), KPC_(minimum_should_match), KPC_(default_operator), KPC_(field_type));
 public:
   ObFixedArray<ObColumnRefRawExpr *, ObIAllocator> fields_;
+  ObFixedArray<ObSearchIndexTextInfo, ObIAllocator> search_index_fulltext_infos_;
   ObFixedArray<ObConstRawExpr *, ObIAllocator> field_boosts_;
   ObFixedArray<uint64_t, ObIAllocator> inv_idx_tids_;
   ObFixedArray<ObTextRetrievalIndexInfo, ObIAllocator> index_infos_;

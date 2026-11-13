@@ -3498,6 +3498,11 @@ struct MergeKeyInfoHelper
                        const ObDSLQueryInfo *&dsl_query);
     int ignore_async_index_for_dml_stmt(bool &ignore_async_index);
     int use_hybrid_search_index_merge(const TableItem *table_item, bool &use_hs_index_merge);
+    int convert_search_text_filter_to_dsl(ObMatchFunRawExpr &match,
+                                        share::ObEsQueryItem outer_query_type,
+                                        ObDSLQuery *parent_query,
+                                        ObConstRawExpr *one_const_expr,
+                                        ObDSLQuery *&dsl_query);
     int convert_filter_to_dsl_query(ObRawExpr *filter,
                                     share::ObEsQueryItem outer_query_type,
                                     ObDSLQuery *parent_query,

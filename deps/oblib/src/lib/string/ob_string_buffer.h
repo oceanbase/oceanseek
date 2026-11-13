@@ -59,6 +59,47 @@ public:
   bool empty() const { return 0 == length(); }
   char *ptr() { return data_; }
   int set_length(const uint64_t len);
+  // Update the length now; add the '\0' later.
+  // Add the trailing '\0' when done, even on errors.
+  OB_INLINE int append_unterminated(const char *str, uint64_t size, int8_t flag = 0)
+  {
+    int ret = OB_SUCCESS;
+    if (OB_ISNULL(allocator_)) {
+      ret = OB_ERR_NULL_VALUE;
+    } else if (OB_UNLIKELY(size > INT64_MAX)) {
+      ret = OB_INVALID_ARGUMENT;
+    } else if (OB_NOT_NULL(str)) {
+      const uint64_t need_len = len_ + size;
+      const uint64_t reserve_size = flag == -1 ? need_len : size;
+      if (OB_UNLIKELY(need_len < len_)) {
+        ret = OB_SIZE_OVERFLOW;
+      } else if (OB_UNLIKELY(reserve_size > INT64_MAX - 8
+                            || len_ > INT64_MAX - 8 - reserve_size)) {
+        ret = OB_SIZE_OVERFLOW;
+      } else {
+        if (OB_UNLIKELY(len_ + reserve_size + 8 > cap_)) {
+          ret = reserve(reserve_size);
+        }
+        if (OB_SUCC(ret)) {
+          MEMCPY(data_ + len_, str, size);
+          len_ = need_len;
+        }
+      }
+    }
+    return ret;
+  }
+
+  OB_INLINE int set_length_unterminated(uint64_t size)
+  {
+    int ret = OB_SUCCESS;
+    if (OB_UNLIKELY(size > cap_ || (size == cap_ && size != 0))) {
+      ret = OB_BUF_NOT_ENOUGH;
+    } else {
+      len_ = size;
+    }
+    return ret;
+  }
+
   char back() { return data_[len_ - 1]; };
   const ObString string() const;
   int deep_copy(common::ObIAllocator *allocator, ObStringBuffer &input);

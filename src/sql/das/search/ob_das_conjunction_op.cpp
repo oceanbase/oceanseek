@@ -134,6 +134,8 @@ int ObDASConjunctionOp::do_open()
   if (OB_SUCC(ret)) {
     if (OB_FAIL(classify_children())) {
       LOG_WARN("failed to classify children", KR(ret));
+    } else {
+      is_first_nk_ = true;
     }
   }
   return ret;
@@ -154,6 +156,7 @@ int ObDASConjunctionOp::do_rescan_segment(const common::ObNewVersionRange &range
   }
   if (OB_SUCC(ret)) {
     last_idx_ = 0;
+    is_first_nk_ = true;
     if (OB_FAIL(init_fixed_score_bound())) {
       LOG_WARN("failed to refresh conjunction fixed score bound", KR(ret));
     }
@@ -178,6 +181,8 @@ int ObDASConjunctionOp::do_rescan()
   if (OB_SUCC(ret)) {
     if (OB_FAIL(classify_children())) {
       LOG_WARN("failed to classify children", KR(ret));
+    } else {
+      is_first_nk_ = true;
     }
   }
   return ret;
@@ -192,40 +197,68 @@ int ObDASConjunctionOp::do_close()
   fixed_score_bound_ = INVALID_FIXED_SCORE_BOUND;
   probe_ops_.reset();
   driver_ops_.reset();
+  is_first_nk_ = true;
   return ret;
 }
 
 int ObDASConjunctionOp::do_advance_to(const ObDASRowID &target, ObDASRowID &curr_id, double &score)
 {
+  is_first_nk_ = true;
+  return do_advance_to_impl<ObDASRowID>(target, curr_id, score);
+}
+
+int ObDASConjunctionOp::do_advance_to(const ObDASNestedKey &target, ObDASNestedKey &curr_nk, double &score)
+{
+  INIT_SUCC(ret);
+  if (!is_async_nested_scope(scope_)) {
+    ret = OB_NOT_IMPLEMENT;
+  } else {
+    if (is_first_nk_) {
+      nested_last_idx_ = 0;
+      is_first_nk_ = false;
+    }
+    ret = do_advance_to_impl<ObDASNestedKey>(target, curr_nk, score);
+  }
+  return ret;
+}
+
+template <typename RowType>
+int ObDASConjunctionOp::do_advance_to_impl(const RowType &target, RowType &curr_id, double &score)
+{
   int ret = OB_SUCCESS;
-  ObDASRowID init_target;
+  int64_t &last_idx = std::is_same_v<RowType, ObDASNestedKey> ? nested_last_idx_ : last_idx_;
+  RowType init_target;
   ObIDASSearchOp *op = nullptr;
   score = 0.0;
-  curr_id.reset();
-  if (OB_UNLIKELY(last_idx_ >= driver_ops_.count() || OB_ISNULL(op = driver_ops_.at(last_idx_)))) {
+  if (OB_UNLIKELY(last_idx >= driver_ops_.count() || OB_ISNULL(op = driver_ops_.at(last_idx)))) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected null op", KR(ret), K(last_idx_), K(driver_ops_.count()));
+    LOG_WARN("unexpected null op", KR(ret), K(last_idx), K(driver_ops_.count()));
   } else if (has_fixed_score_bound() && cannot_compete_with_score(fixed_score_bound_)) {
     curr_id.set_max();
     ret = OB_ITER_END;
   } else if (OB_FAIL(op->advance_to(target, init_target, score))) {
     LOG_WARN_IGNORE_ITER_END(ret, "failed to advance to", KR(ret));
-  } else if (OB_FAIL(inner_advance_to(init_target, curr_id, score))) {
+  } else if (OB_FAIL(inner_advance_to<RowType>(init_target, curr_id, score))) {
     LOG_WARN_IGNORE_ITER_END(ret, "failed to do advance to", KR(ret));
   }
   return ret;
 }
 
+template <typename RowType>
 int ObDASConjunctionOp::inner_advance_to(
-    const ObDASRowID &target,
-    ObDASRowID &curr_id,
+    const RowType &target,
+    RowType &curr_id,
     double &score)
 {
   int ret = OB_SUCCESS;
-  if (!has_probe_child_) {
-    ret = advance_driver_ops_to(target, curr_id, score);
+  if constexpr (std::is_same_v<RowType, ObDASNestedKey>) {
+    ret = advance_driver_ops_to<RowType>(target, curr_id, score);
   } else {
-    ret = inner_advance_to_with_probe(target, curr_id, score);
+    if (!has_probe_child_) {
+      ret = advance_driver_ops_to<RowType>(target, curr_id, score);
+    } else {
+      ret = inner_advance_to_with_probe(target, curr_id, score);
+    }
   }
   return ret;
 }
@@ -249,7 +282,7 @@ int ObDASConjunctionOp::inner_advance_to_with_probe(
   ObDASRowID candidate_curr_id = curr_id;
   double candidate_score = score;
   while (OB_SUCC(ret) && !got_result) {
-    if (OB_FAIL(advance_driver_ops_to(candidate_target, candidate_curr_id, candidate_score))) {
+    if (OB_FAIL(advance_driver_ops_to<ObDASRowID>(candidate_target, candidate_curr_id, candidate_score))) {
       LOG_WARN_IGNORE_ITER_END(ret, "failed to advance driver ops to", KR(ret), K(candidate_target));
     } else {
       bool all_hit = true;
@@ -299,23 +332,25 @@ int ObDASConjunctionOp::inner_advance_to_with_probe(
   return ret;
 }
 
+template <typename RowType>
 int ObDASConjunctionOp::advance_driver_ops_to(
-    const ObDASRowID &target,
-    ObDASRowID &curr_id,
+    const RowType &target,
+    RowType &curr_id,
     double &score)
 {
   int ret = OB_SUCCESS;
-  ObDASRowID candidate_target = target;
+  int64_t &last_idx = std::is_same_v<RowType, ObDASNestedKey> ? nested_last_idx_ : last_idx_;
+  RowType candidate_target = target;
   double candidate_score = score;
   bool all_advanced = false;
   while (OB_SUCC(ret) && !all_advanced) {
     bool target_changed = false;
     for (int i = 0; OB_SUCC(ret) && i < driver_ops_.count() && !target_changed; ++i) {
-      ObDASRowID tmp_id;
+      RowType tmp_id;
       double tmp_score = 0.0;
       int cmp = 0;
       ObIDASSearchOp *op = nullptr;
-      if (last_idx_ == i) {
+      if (last_idx == i) {
         // already advanced to the target
       } else if (OB_ISNULL(op = driver_ops_.at(i))) {
         ret = OB_ERR_UNEXPECTED;
@@ -333,7 +368,7 @@ int ObDASConjunctionOp::advance_driver_ops_to(
           // this child advanced to a greater target, we should start a new round of iteration
           candidate_target = tmp_id;
           candidate_score = tmp_score;
-          last_idx_ = i;
+          last_idx = i;
           target_changed = true;
         }
       } else {
@@ -354,20 +389,43 @@ int ObDASConjunctionOp::advance_driver_ops_to(
 
 int ObDASConjunctionOp::do_next_rowid(ObDASRowID &next_id, double &score)
 {
+  is_first_nk_ = true;
+  return next_impl<ObDASRowID>(next_id, score);
+}
+
+int ObDASConjunctionOp::do_next_rowid(ObDASNestedKey &next_nk, double &score)
+{
+  INIT_SUCC(ret);
+  if (!is_async_nested_scope(scope_)) {
+    ret = OB_NOT_IMPLEMENT;
+  } else {
+    if (is_first_nk_) {
+      nested_last_idx_ = 0;
+      is_first_nk_ = false;
+    }
+    ret = next_impl<ObDASNestedKey>(next_nk, score);
+  }
+  return ret;
+}
+
+template <typename RowType>
+int ObDASConjunctionOp::next_impl(RowType &next_id, double &score)
+{
   int ret = OB_SUCCESS;
-  ObDASRowID init_target;
+  int64_t &last_idx = std::is_same_v<RowType, ObDASNestedKey> ? nested_last_idx_ : last_idx_;
+  RowType init_target;
   ObIDASSearchOp *op = nullptr;
   score = 0.0;
   next_id.reset();
-  if (OB_UNLIKELY(last_idx_ >= driver_ops_.count() || OB_ISNULL(op = driver_ops_.at(last_idx_)))) {
+  if (OB_UNLIKELY(last_idx >= driver_ops_.count() || OB_ISNULL(op = driver_ops_.at(last_idx)))) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected null op", KR(ret), K(last_idx_));
+    LOG_WARN("unexpected null op", KR(ret), K(last_idx));
   } else if (has_fixed_score_bound() && cannot_compete_with_score(fixed_score_bound_)) {
     next_id.set_max();
     ret = OB_ITER_END;
   } else if (OB_FAIL(op->next_rowid(init_target, score))) {
-    LOG_WARN_IGNORE_ITER_END(ret, "failed to next rowid", KR(ret), K(last_idx_));
-  } else if (OB_FAIL(inner_advance_to(init_target, next_id, score))) {
+    LOG_WARN_IGNORE_ITER_END(ret, "failed to next rowid", KR(ret), K(last_idx));
+  } else if (OB_FAIL(inner_advance_to<RowType>(init_target, next_id, score))) {
     LOG_WARN_IGNORE_ITER_END(ret, "failed to do advance to", KR(ret), K(init_target));
   }
   return ret;

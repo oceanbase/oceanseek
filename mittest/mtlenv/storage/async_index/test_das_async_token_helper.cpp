@@ -641,18 +641,27 @@ TEST_F(TestDASAsyncTokenHelper, get_curr_bm25_param_after_next_row)
   sql::ObDASAsyncTokenHelper *helper = nullptr;
   create_helper(ctx, ctdef, rtdef, term, read_info, inv_sstable, helper);
   OK(helper->open());
+  ASSERT_TRUE(helper->posting_scan_param_.need_relevance_params_);
 
   common::ObNewVersionRange range;
   range.base_version_ = 0;
   range.snapshot_version_ = SNAPSHOT_VERSION;
-  OK(helper->rescan_segment(range));
-  OK(helper->get_next_row());
+  // Cover the initial scan, a segment switch and a query rescan.
+  for (int64_t scan_idx = 0; scan_idx < 3; ++scan_idx) {
+    if (2 == scan_idx) {
+      OK(helper->rescan());
+      ASSERT_TRUE(helper->posting_scan_param_.need_relevance_params_);
+    }
+    OK(helper->rescan_segment(range));
+    ASSERT_TRUE(helper->posting_scan_param_.need_relevance_params_);
+    OK(helper->get_next_row());
 
-  int64_t token_freq = 0;
-  int64_t doc_length = 0;
-  OK(helper->get_curr_bm25_param(token_freq, doc_length));
-  ASSERT_EQ(1, token_freq);
-  ASSERT_EQ(100, doc_length);
+    int64_t token_freq = 0;
+    int64_t doc_length = 0;
+    OK(helper->get_curr_bm25_param(token_freq, doc_length));
+    ASSERT_EQ(1, token_freq);
+    ASSERT_EQ(100, doc_length);
+  }
   OK(helper->close());
 }
 
@@ -688,8 +697,8 @@ TEST_F(TestDASAsyncTokenHelper, get_curr_phrase_block_max_with_relevance_params)
   OK(helper->close());
 }
 
-// Search-index postings without relevance params have no block-max frontier.
-TEST_F(TestDASAsyncTokenHelper, get_curr_phrase_block_max_without_metadata_not_supported)
+// The phrase helper requests TF/DL, so postings without them must fail at scan open.
+TEST_F(TestDASAsyncTokenHelper, rescan_segment_without_relevance_metadata_not_supported)
 {
   ObInvSSTable inv_sstable;
   const common::ObString term = common::ObString::make_string("alpha");
@@ -709,11 +718,8 @@ TEST_F(TestDASAsyncTokenHelper, get_curr_phrase_block_max_without_metadata_not_s
   common::ObNewVersionRange range;
   range.base_version_ = 0;
   range.snapshot_version_ = SNAPSHOT_VERSION;
-  OK(helper->rescan_segment(range));
-  OK(helper->get_next_row());
-
-  const storage::ObMaxScoreTuple *tuple = nullptr;
-  ASSERT_EQ(OB_NOT_SUPPORTED, helper->get_curr_phrase_block_max_info(tuple));
+  ASSERT_EQ(OB_NOT_SUPPORTED, helper->rescan_segment(range));
+  ASSERT_EQ(nullptr, helper->posting_iter_);
   OK(helper->close());
 }
 

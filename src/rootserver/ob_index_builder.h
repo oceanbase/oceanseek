@@ -181,7 +181,9 @@ private:
       ObDDLTaskRecord &task_record,
       const int64_t def_index_ith,
       const int64_t data_index_ith,
-      const int64_t async_delete_ith);
+      const int64_t async_delete_ith,
+      const int64_t text_match_ith,
+      const int64_t text_match_phrase_ith);
   int submit_drop_user_async_index_task_(
       const obrpc::ObDropIndexArg &arg,
       const share::schema::ObTableSchema &data_schema,
@@ -232,7 +234,9 @@ private:
       int64_t &index_ith,
       int64_t &def_index_ith,
       int64_t &data_index_ith,
-      int64_t &async_delete_ith);
+      int64_t &async_delete_ith,
+      int64_t &text_match_ith,
+      int64_t &text_match_phrase_ith);
   int recognize_user_async_index_schemas(
       const common::ObIArray<share::schema::ObTableSchema> &index_schemas,
       int64_t &index_ith,

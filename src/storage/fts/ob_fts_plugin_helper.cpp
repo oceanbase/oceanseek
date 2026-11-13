@@ -408,11 +408,13 @@ int ObFTParseHelper::segment(
     const char *fulltext,
     const int64_t fulltext_len,
     int64_t &doc_length,
-    ObFTTokenMap &ft_token_map) const
+    ObFTTokenMap &ft_token_map,
+    int64_t *last_position) const
 {
   int ret = OB_SUCCESS;
   ObCollationType type = meta.get_collation_type();
   doc_length = 0;
+  if (last_position != nullptr) { *last_position = -1; }
   ft_token_map.reuse();
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
@@ -466,6 +468,7 @@ int ObFTParseHelper::segment(
       }
       if (OB_ITER_END == ret) {
         doc_length = token_processor.get_non_stop_token_count();
+        if (last_position != nullptr) { *last_position = position; }
         ret = OB_SUCCESS;
       }
     }

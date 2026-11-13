@@ -19,6 +19,7 @@ namespace sql
 class ObExpr;
 class ObEvalCtx;
 class ObDASSearchCtx;
+struct ObAsyncIndexPartitionSegCtx;
 class ObDASScanIter;
 class ObLogicalFilteredBM25StatsProvider;
 }
@@ -85,17 +86,27 @@ public:
       ObDASIRScanRtDef &ir_scan_rtdef,
       const common::ObTabletID &inv_idx_tablet_id,
       const common::ObString &query_token);
+  int init(
+      sql::ObDASSearchCtx &search_ctx,
+      const sql::ObDASIRScanCtDef &ir_scan_ctdef,
+      ObDASIRScanRtDef &ir_scan_rtdef,
+      const common::ObTabletID &inv_idx_tablet_id,
+      const bool is_search_text,
+      const uint64_t search_text_column_idx,
+      const common::ObString &search_text_path,
+      const common::ObString &query_token);
   int switch_query_token(const common::ObString &query_token);
   void reset();
   int get_bm25_params(uint64_t &total_doc_cnt, double &avg_doc_token_cnt, uint64_t &token_doc_cnt);
   int get_token_doc_cnt(uint64_t &token_doc_cnt);
+  static int calc_avg_doc_length(const common::number::ObNumber &total_doc_length, const uint64_t total_doc_cnt, double &avg_doc_length);
   
 private:
-  int build_token_doc_cnt_scan_param(
-      common::ObObj (&range_objs)[4],
-      ObTableScanParam &est_param);
   int do_total_doc_cnt_estimation_on_demand();
   int do_avg_doc_token_cnt_estimation_on_demand();
+  int get_pinned_statistics_tablet_(
+      const sql::ObAsyncIndexPartitionSegCtx *&partition,
+      const ObTabletHandle *&pinned_tablet_handle) const;
 private:
   static constexpr uint64_t DEFAULT_TOTAL_DOC_CNT = 10000;
   uint64_t total_doc_cnt_;
@@ -103,13 +114,13 @@ private:
   double avg_doc_token_cnt_;
   sql::ObDASSearchCtx *search_ctx_;
   const sql::ObDASIRScanCtDef *ir_scan_ctdef_;
-  ObDASIRScanRtDef *ir_scan_rtdef_;
   common::ObTabletID tablet_id_;
   common::ObString query_token_;
+  uint64_t search_text_column_idx_;
+  common::ObString search_text_path_;
   ObInvIdxParamCache *param_cache_;
-  ObTableScanParam inv_scan_param_;
+  bool is_search_text_;
   bool estimated_;
-  bool inv_scan_param_inited_;
   bool is_inited_;
 };
 

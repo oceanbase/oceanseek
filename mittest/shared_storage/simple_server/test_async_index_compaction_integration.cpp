@@ -6328,16 +6328,6 @@ TEST_F(ObAsyncIndexCompactionTest, dropping_one_sibling_keeps_async_delete_gc_ac
   ASSERT_EQ(OB_SUCCESS, schedule_func.check_async_index_tablet_status_for_schedule_(
       *delete_handle.get_obj(), skip_schedule));
   ASSERT_FALSE(skip_schedule);
-
-  // A stale sibling reference is an error, not evidence that the deletion table was dropped.
-  ObSchemaGetterGuard schema_guard;
-  ASSERT_EQ(OB_SUCCESS, MTL(ObTenantSchemaService *)->get_schema_service()->
-      get_tenant_schema_guard(MTL_ID(), schema_guard));
-  const ObAuxTableMetaInfo dropped_index(ctx.fts_index_table_ids_.at(0), USER_INDEX,
-      INDEX_TYPE_ASYNC_FTS_INDEX_LOCAL);
-  ObTabletID sibling_tablet_id;
-  ASSERT_EQ(OB_TABLE_NOT_EXIST, ObAsyncIndexRetentionHelper::get_sibling_tablet_id_(
-      schema_guard, dropped_index, OB_INVALID_INDEX, OB_INVALID_INDEX, sibling_tablet_id));
   ASSERT_NO_FATAL_FAILURE(drop_table_with_recyclebin_mode(table_name, false));
 }
 

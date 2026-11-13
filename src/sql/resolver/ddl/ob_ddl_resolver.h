@@ -220,7 +220,7 @@ public:
       ObIAllocator *allocator);
   // Resolve search index column-level WITH(...) config from parse node
   // and validate it, then store the serialized config string in column_comment.
-  static int resolve_search_index_column_comment(
+  int resolve_search_index_column_comment(
       const ParseNode *search_with_node,
       const share::schema::ObColumnSchemaV2 *col_schema,
       const ObString &column_name,
@@ -610,10 +610,12 @@ public:
   int resolve_search_index_constraint(
       const share::schema::ObTableSchema &table_schema,
       const common::ObString &column_name,
-      const int64_t index_keyname_value);
+      const int64_t index_keyname_value,
+      const common::ObString &column_comment);
   int resolve_search_index_constraint(
       const share::schema::ObColumnSchemaV2 &column_schema,
-      const int64_t index_keyname_value);
+      const int64_t index_keyname_value,
+      const common::ObString &column_comment);
   static int get_partition_keys_by_part_func_expr(
       const ObString &part_func_expr_str,
       const bool is_oracle_mode,

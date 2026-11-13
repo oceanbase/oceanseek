@@ -177,6 +177,92 @@ TEST_F(JsonDepthExprTest, MysqlMalformedArray)
   EXPECT_EQ(common::OB_ERR_INVALID_JSON_TEXT_IN_PARAM, result.get_ret_code());
 }
 
+// ============================================================================
+// _enable_json_bin_view switch comparison tests.
+//
+// JSON_DEPTH calls wrapper.depth().  When _enable_json_bin_view is ON and the
+// input is cast(... as json), the wrapper holds an ObJsonBinView and depth
+// computation runs on the zero-copy bin path.  When OFF, the wrapper holds an
+// ObJsonBin DOM.
+//
+// Note: _enable_json_bin_view is an OB_TENANT_PARAMETER, not a session
+// variable, so with_session_vars() cannot set it.  We use WITH_TENANT_CONFS
+// (TestParameterGuard RAII) which pushes into TestDefaultParameterConf TLS,
+// consumed by OpTestEngine::apply_tenant_config_overrides() during prepare().
+// ============================================================================
+
+// B1: switch ON — nested object depth via cast(s as json).
+TEST_F(JsonDepthExprTest, BinViewSwitchOnNestedObject)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "true"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256)")
+        .with_expr("json_depth(cast(s as json))")
+        .with_data({
+            {R"({"a": {"b": {"c": 1}}})"},
+            {R"({"x": [1, 2, {"y": 3}]})"},
+            {R"(42)"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"4"}, {"4"}, {"1"}}));
+  }
+}
+
+// B2: switch OFF — same input as B1, expect identical results.
+TEST_F(JsonDepthExprTest, BinViewSwitchOffNestedObject)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "false"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256)")
+        .with_expr("json_depth(cast(s as json))")
+        .with_data({
+            {R"({"a": {"b": {"c": 1}}})"},
+            {R"({"x": [1, 2, {"y": 3}]})"},
+            {R"(42)"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"4"}, {"4"}, {"1"}}));
+  }
+}
+
+// B3: switch ON — nested array depth via cast(s as json).
+TEST_F(JsonDepthExprTest, BinViewSwitchOnNestedArray)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "true"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256)")
+        .with_expr("json_depth(cast(s as json))")
+        .with_data({
+            {R"([[1, 2], [3, [4, 5]]])"},
+            {R"([])"},
+            {R"([1, 2, 3])"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"4"}, {"1"}, {"2"}}));
+  }
+}
+
+// B4: switch OFF — same input as B3, expect identical results.
+TEST_F(JsonDepthExprTest, BinViewSwitchOffNestedArray)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "false"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256)")
+        .with_expr("json_depth(cast(s as json))")
+        .with_data({
+            {R"([[1, 2], [3, [4, 5]]])"},
+            {R"([])"},
+            {R"([1, 2, 3])"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"4"}, {"1"}, {"2"}}));
+  }
+}
+
 int main(int argc, char **argv)
 {
   ::testing::InitGoogleTest(&argc, argv);

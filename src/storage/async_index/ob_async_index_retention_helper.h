@@ -1,23 +1,23 @@
 /**
  * Copyright (C) 2026 OceanBase
- * This file contains confidential and proprietary information.
- * Unauthorized use or disclosure is prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #ifndef OCEANBASE_STORAGE_ASYNC_INDEX_RETENTION_HELPER_H_
 #define OCEANBASE_STORAGE_ASYNC_INDEX_RETENTION_HELPER_H_
 
 #include "common/ob_tablet_id.h"
+#include "lib/container/ob_iarray.h"
 
 namespace oceanbase
 {
 namespace share
 {
+struct ObAsyncPhysicalTarget;
 namespace schema
 {
 class ObSchemaGetterGuard;
 class ObTableSchema;
-struct ObAuxTableMetaInfo;
 }
 }
 namespace storage
@@ -38,18 +38,17 @@ public:
       int64_t &gc_scn);
 
 private:
+  // Missing registered consumers are errors; never return a partial GC target set.
+  static int collect_deletion_consumers_(
+      share::schema::ObSchemaGetterGuard &schema_guard,
+      const share::schema::ObTableSchema &base_schema,
+      common::ObIArray<share::ObAsyncPhysicalTarget> &targets);
   static int get_deletion_schemas_(
       const common::ObTabletID &deletion_tablet_id,
       const int64_t tablet_schema_version,
       share::schema::ObSchemaGetterGuard &schema_guard,
       const share::schema::ObTableSchema *&deletion_table_schema,
       const share::schema::ObTableSchema *&data_table_schema);
-  static int get_sibling_tablet_id_(
-      share::schema::ObSchemaGetterGuard &schema_guard,
-      const share::schema::ObAuxTableMetaInfo &index_info,
-      const int64_t part_idx,
-      const int64_t subpart_idx,
-      common::ObTabletID &index_tablet_id);
   static int get_sibling_gc_scn_(
       const ObTablet &index_tablet,
       int64_t &gc_scn);

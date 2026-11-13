@@ -9,6 +9,7 @@
 #include "lib/json_type/ob_json_parse.h"
 #include "lib/json_type/ob_json_diff.h"
 #undef private
+#include "lib/json_type/ob_json_wrapper.h"
 
  
 namespace oceanbase {
@@ -1279,6 +1280,106 @@ TEST_F(TestJsonBin, test_seek_ellipsis) {
     ASSERT_EQ(expect_value[i], hit[i]->get_uint());
   }
   std::cout<<"end test"<<std::endl;
+}
+
+TEST_F(TestJsonBin, test_bin_view_seek_dedup)
+{
+  set_compat_mode(lib::Worker::CompatMode::MYSQL);
+  struct SeekCase {
+    const char *json_;
+    const char *path_;
+    bool auto_wrap_;
+    int64_t count_;
+  };
+  const SeekCase cases[] = {
+    {"[10,10]", "$[*]", true, 2},
+    {"{\"a\":10,\"b\":10}", "$.*", true, 2},
+    {"[10,10,20]", "$[0 to last]", true, 3},
+    {"[[10,10],[20]]", "$[*][*]", true, 3},
+    {"[{\"a\":10},{\"a\":10}]", "$[*].a", true, 2},
+    {"{\"a\":[1,2],\"b\":[3]}", "$.*[0 to last]", true, 3},
+    {"[{\"a\":[1,2]},{\"a\":[3]}]", "$[*].a[0 to last]", true, 3},
+    {"[1,2]", "$[*][0]", true, 2},
+    {"[1,2]", "$[*][0]", false, 0},
+    {"[1,2]", "$[*][0 to 1]", true, 2},
+    {"[1,2]", "$[*][0 to 1]", false, 0},
+    {"[{},{}]", "$[*].missing", true, 0},
+    {"[]", "$[*]", true, 0},
+    // Recursive descent and autowrap can reach the same scalar twice.
+    {"[1]", "$**[0]", true, 1},
+    {"[1]", "$**[0]", false, 1},
+    {"{\"a\":{\"a\":{\"a\":1}}}", "$**.a**.a", true, 2},
+    {"{\"a\":{\"x\":[1,2]},\"x\":[3]}", "$**.x[*]", true, 3},
+    {"{\"a\":{\"a\":{\"a\":[1,2]}}}", "$**.a**.a[*]", true, 2},
+    {"{\"a\":{\"a\":{\"a\":[1,2]}}}", "$**.a**.a[0 to last]", false, 2},
+    {"{\"a\":{\"a\":{\"a\":[1,2]}}}", "$**.a**.a[0 to last]", true, 3},
+    {"{\"a\":{\"a\":{\"a\":{\"x\":1,\"y\":2}}}}", "$**.a**.a.*", true, 3},
+  };
+  for (const SeekCase &test_case : cases) {
+    SCOPED_TRACE(test_case.json_);
+    SCOPED_TRACE(test_case.path_);
+    ObArenaAllocator allocator(ObModIds::TEST);
+    ObIJsonBase *tree = nullptr;
+    ASSERT_EQ(OB_SUCCESS, ObJsonBaseFactory::get_json_base(&allocator,
+        ObString(test_case.json_), ObJsonInType::JSON_TREE, ObJsonInType::JSON_TREE, tree));
+    ObIJsonBase *bin = nullptr;
+    ASSERT_EQ(OB_SUCCESS, ObJsonBaseFactory::transform(&allocator, tree,
+        ObJsonInType::JSON_BIN, bin));
+    ObString raw;
+    ASSERT_EQ(OB_SUCCESS, bin->get_raw_binary(raw, &allocator));
+    ObJsonBinView view;
+    ASSERT_EQ(OB_SUCCESS, view.init(raw.ptr(), raw.length()));
+    ObJsonPath path(ObString(test_case.path_), &allocator);
+    ASSERT_EQ(OB_SUCCESS, path.parse_path());
+    ObSEArray<ObJsonWrapper, 4> tree_hits;
+    ASSERT_EQ(OB_SUCCESS, ObJsonWrapper(tree).seek(path, allocator, tree_hits,
+        test_case.auto_wrap_, false));
+    ASSERT_EQ(test_case.count_, tree_hits.count());
+    for (bool only_need_one : {false, true}) {
+      SCOPED_TRACE(only_need_one);
+      ObSEArray<ObJsonWrapper, 4> hits;
+      ASSERT_EQ(OB_SUCCESS, ObJsonWrapper(view).seek(path, allocator, hits,
+          test_case.auto_wrap_, only_need_one));
+      const int64_t expected_count = only_need_one && test_case.count_ > 0 ? 1 : test_case.count_;
+      ASSERT_EQ(expected_count, hits.count());
+      for (int64_t i = 0; i < hits.count(); ++i) {
+        int cmp = 0;
+        ASSERT_EQ(OB_SUCCESS, ObJsonWrapper::compare(hits.at(i), tree_hits.at(i), cmp));
+        ASSERT_EQ(0, cmp);
+      }
+    }
+  }
+}
+
+TEST_F(TestJsonBin, test_bin_view_seek_existing_hits)
+{
+  set_compat_mode(lib::Worker::CompatMode::MYSQL);
+  ObArenaAllocator allocator(ObModIds::TEST);
+  ObIJsonBase *bin = nullptr;
+  ASSERT_EQ(OB_SUCCESS, ObJsonBaseFactory::get_json_base(&allocator,
+      ObString("[10,11,10]"), ObJsonInType::JSON_TREE, ObJsonInType::JSON_BIN, bin));
+  ObString raw;
+  ASSERT_EQ(OB_SUCCESS, bin->get_raw_binary(raw, &allocator));
+  ObJsonBinView view;
+  ASSERT_EQ(OB_SUCCESS, view.init(raw.ptr(), raw.length()));
+  ObJsonBinView second;
+  ASSERT_EQ(OB_SUCCESS, view.element(1, second));
+  ObJsonPath path("$[*]", &allocator);
+  ASSERT_EQ(OB_SUCCESS, path.parse_path());
+  ObSEArray<ObJsonWrapper, 4> hits;
+  ASSERT_EQ(OB_SUCCESS, hits.push_back(ObJsonWrapper(second)));
+  ASSERT_EQ(OB_SUCCESS, view.seek(path, hits, true, true));
+  ASSERT_EQ(1, hits.count());
+  ASSERT_EQ(OB_SUCCESS, view.seek(path, hits, true, false));
+  ASSERT_EQ(3, hits.count());
+  const uint64_t expected_indices[] = {1, 0, 2};
+  for (int64_t i = 0; i < hits.count(); ++i) {
+    ObJsonBinView expected;
+    ASSERT_EQ(OB_SUCCESS, view.element(expected_indices[i], expected));
+    ASSERT_EQ(expected.get_uint(), hits.at(i).get_uint());
+  }
+  ASSERT_EQ(OB_SUCCESS, view.seek(path, hits, true, false));
+  ASSERT_EQ(3, hits.count());
 }
 
 TEST_F(TestJsonBin, test_bin_object_add)

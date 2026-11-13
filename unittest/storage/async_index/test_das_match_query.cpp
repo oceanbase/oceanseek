@@ -5,6 +5,7 @@
 #define USING_LOG_PREFIX SQL_DAS
 
 #include <gtest/gtest.h>
+#include <type_traits>
 #define private public
 #define protected public
 #include "share/rc/ob_tenant_base.h"
@@ -28,6 +29,8 @@
 #include "sql/das/search/ob_das_fts_cost_utils.h"
 #include "sql/das/search/ob_das_msm_runtime_util.h"
 #include "storage/retrieval/ob_inv_idx_param_estimator.h"
+#include "storage/retrieval/ob_inv_bm25_stat_cache.h"
+#include "storage/blocksstable/async_index/ob_inv_sstable_struct.h"
 #include "plugin/legacy/sys/ob_plugin_mgr.h"
 #include "lib/container/ob_heap.h"
 #undef private
@@ -39,6 +42,13 @@ using namespace oceanbase::common;
 
 namespace
 {
+
+static_assert(!std::is_default_constructible<storage::ObInvBM25StatCacheValue>::value,
+              "BM25 cache values require an explicit statistic type");
+static_assert(!std::is_constructible<storage::ObInvBM25StatCacheValue, const blocksstable::ObStorageDatum &>::value,
+              "BM25 cache values must not accept an untyped storage datum");
+static_assert(!std::is_constructible<storage::ObInvBM25StatCacheValue, const ObDatum &>::value,
+              "BM25 cache values must not accept an untyped datum");
 
 class ObDASMatchQueryTest : public ::testing::Test
 {
@@ -536,14 +546,334 @@ TEST_F(ObDASMatchQueryTest, test_async_estimator_switch_query_token)
       ObTabletID(1001), ObString::make_string("ocean")));
   estimator.token_doc_cnt_ = 100;
   estimator.estimated_ = true;
-  estimator.inv_scan_param_inited_ = true;
 
   ASSERT_EQ(OB_SUCCESS, estimator.switch_query_token(ObString::make_string("base")));
   EXPECT_EQ(ObString::make_string("base"), estimator.query_token_);
   EXPECT_EQ(0, estimator.token_doc_cnt_);
   EXPECT_FALSE(estimator.estimated_);
-  EXPECT_TRUE(estimator.inv_scan_param_inited_);
   EXPECT_EQ(OB_INVALID_ARGUMENT, estimator.switch_query_token(ObString()));
+}
+
+TEST_F(ObDASMatchQueryTest, test_async_estimator_accepts_search_text_field_identity)
+{
+  SearchCtxSetup ctx_setup(allocator_);
+  storage::ObAsyncBM25ParamEstimator estimator;
+  const ObString path = ObString::make_string("$.comments[*].doc[*]");
+  ASSERT_EQ(OB_SUCCESS, estimator.init(
+                        ctx_setup.search_ctx_, ir_scan_ctdef_, ir_scan_rtdef_,
+                        ObTabletID(1001), true /* is_search_text */, 2, path, ObString::make_string("ocean")));
+  EXPECT_TRUE(estimator.is_search_text_);
+  EXPECT_EQ(2, estimator.search_text_column_idx_);
+  EXPECT_EQ(path, estimator.search_text_path_);
+}
+
+TEST_F(ObDASMatchQueryTest, test_async_estimator_search_text_root_and_fulltext_cache)
+{
+  SearchCtxSetup ctx_setup(allocator_);
+  storage::ObAsyncBM25ParamEstimator estimator;
+  storage::ObInvIdxParamCache &cache = ctx_setup.search_ctx_.get_bm25_param_cache();
+  const ObTabletID tablet_id(1001);
+  const ObString token = ObString::make_string("ocean");
+  uint64_t doc_count = 0;
+  ASSERT_EQ(OB_SUCCESS, cache.set_token_doc_cnt(tablet_id, token, 11));
+  ASSERT_EQ(OB_SUCCESS, cache.set_token_doc_cnt(tablet_id, 0, ObString(), token, 7));
+
+  ASSERT_EQ(OB_SUCCESS, estimator.init(
+      ctx_setup.search_ctx_, ir_scan_ctdef_, ir_scan_rtdef_, tablet_id,
+      true /* is_search_text */, 0, ObString(), token));
+  EXPECT_TRUE(estimator.is_search_text_);
+  ASSERT_EQ(OB_SUCCESS, estimator.get_token_doc_cnt(doc_count));
+  EXPECT_EQ(7, doc_count);
+
+  estimator.reset();
+  ASSERT_EQ(OB_SUCCESS, estimator.init(
+      ctx_setup.search_ctx_, ir_scan_ctdef_, ir_scan_rtdef_, tablet_id, token));
+  EXPECT_FALSE(estimator.is_search_text_);
+  ASSERT_EQ(OB_SUCCESS, estimator.get_token_doc_cnt(doc_count));
+  EXPECT_EQ(11, doc_count);
+}
+
+TEST_F(ObDASMatchQueryTest, test_avg_doc_length_number)
+{
+  const char *lengths[] = {"12", "1", "30", "33", "0", "12", "18446744073709551616",
+                          "36893488147419103230", "368934881474191032300"};
+  const uint64_t counts[] = {3, 4, 3, 3, 3, 0, 2, UINT64_MAX, UINT64_MAX};
+  const double expected[] = {10.0, 10.0, 10.0, 11.0, 10.0, 10.0, 9223372036854775808.0, 10.0, 20.0};
+  for (int64_t i = 0; i < ARRAYSIZEOF(lengths); ++i) {
+    blocksstable::ObAsyncInvBM25Stats stats;
+    stats.token_doc_cnt_ = 7; // The independent token statistic must not become the avgDL divisor.
+    {
+      ObArenaAllocator allocator(lib::ObMemAttr(MTL_ID(), "BM25StatTst"));
+      number::ObNumber length;
+      ASSERT_EQ(OB_SUCCESS, length.from(lengths[i], allocator));
+      stats.total_doc_length_.set_number(length);
+    }
+    double average = 0;
+    ASSERT_EQ(OB_SUCCESS, ObAsyncBM25ParamEstimator::calc_avg_doc_length(
+        stats.total_doc_length_.get_number(), counts[i], average));
+    EXPECT_DOUBLE_EQ(expected[i], average);
+    stats.reset();
+    EXPECT_TRUE(stats.total_doc_length_.get_number().is_zero());
+    EXPECT_EQ(0U, stats.token_doc_cnt_);
+  }
+}
+
+TEST_F(ObDASMatchQueryTest, test_async_average_cache_isolated_by_field)
+{
+  SearchCtxSetup ctx_setup(allocator_);
+  const ObTabletID tablet_id(1001);
+  auto &cache = ctx_setup.search_ctx_.get_bm25_param_cache();
+  ASSERT_EQ(OB_SUCCESS, cache.set_avg_doc_token_cnt(tablet_id, 123.0));
+  ObAsyncBM25ParamEstimator estimator;
+  ASSERT_EQ(OB_SUCCESS, estimator.init(ctx_setup.search_ctx_, ir_scan_ctdef_, ir_scan_rtdef_,
+                                      tablet_id, false, 0, ObString(), ObString::make_string("ocean")));
+  ASSERT_EQ(OB_SUCCESS, estimator.do_avg_doc_token_cnt_estimation_on_demand());
+  EXPECT_DOUBLE_EQ(123.0, estimator.avg_doc_token_cnt_);
+  estimator.is_search_text_ = true;
+  estimator.avg_doc_token_cnt_ = 7.0;
+  // No pinned async partition exists in this fixture. A field request must reach that
+  // boundary and fail, rather than return the unrelated tablet-only cached average.
+  EXPECT_NE(OB_SUCCESS, estimator.do_avg_doc_token_cnt_estimation_on_demand());
+  EXPECT_DOUBLE_EQ(0.0, estimator.avg_doc_token_cnt_);
+  double average = 0;
+  EXPECT_EQ(OB_HASH_NOT_EXIST, cache.get_avg_doc_token_cnt(tablet_id, 0, ObString(), average));
+
+  const ObString title_path = ObString::make_string("$.title");
+  const ObString body_path = ObString::make_string("$.body");
+  ASSERT_EQ(OB_SUCCESS, cache.set_avg_doc_token_cnt(tablet_id, 0, ObString(), 12.0));
+  ASSERT_EQ(OB_SUCCESS, cache.set_avg_doc_token_cnt(tablet_id, 0, title_path, 27.0));
+  ASSERT_EQ(OB_SUCCESS, cache.set_avg_doc_token_cnt(tablet_id, 0, body_path, 45.0));
+  ASSERT_EQ(OB_SUCCESS, cache.set_avg_doc_token_cnt(tablet_id, 1, title_path, 67.0));
+  ASSERT_EQ(OB_SUCCESS, cache.set_avg_doc_token_cnt(ObTabletID(1002), 0, title_path, 89.0));
+  ASSERT_EQ(OB_SUCCESS, estimator.do_avg_doc_token_cnt_estimation_on_demand());
+  EXPECT_DOUBLE_EQ(12.0, estimator.avg_doc_token_cnt_);
+
+  estimator.search_text_path_ = title_path;
+  ASSERT_EQ(OB_SUCCESS, estimator.do_avg_doc_token_cnt_estimation_on_demand());
+  EXPECT_DOUBLE_EQ(27.0, estimator.avg_doc_token_cnt_);
+  ASSERT_EQ(OB_SUCCESS, estimator.switch_query_token(ObString::make_string("base")));
+  ASSERT_EQ(OB_SUCCESS, estimator.do_avg_doc_token_cnt_estimation_on_demand());
+  EXPECT_DOUBLE_EQ(27.0, estimator.avg_doc_token_cnt_);
+
+  estimator.search_text_path_ = body_path;
+  ASSERT_EQ(OB_SUCCESS, estimator.do_avg_doc_token_cnt_estimation_on_demand());
+  EXPECT_DOUBLE_EQ(45.0, estimator.avg_doc_token_cnt_);
+  estimator.search_text_column_idx_ = 1;
+  estimator.search_text_path_ = title_path;
+  ASSERT_EQ(OB_SUCCESS, estimator.do_avg_doc_token_cnt_estimation_on_demand());
+  EXPECT_DOUBLE_EQ(67.0, estimator.avg_doc_token_cnt_);
+  estimator.search_text_column_idx_ = 0;
+  estimator.tablet_id_ = ObTabletID(1002);
+  ASSERT_EQ(OB_SUCCESS, estimator.do_avg_doc_token_cnt_estimation_on_demand());
+  EXPECT_DOUBLE_EQ(89.0, estimator.avg_doc_token_cnt_);
+
+  estimator.tablet_id_ = tablet_id;
+  estimator.is_search_text_ = false;
+  ASSERT_EQ(OB_SUCCESS, estimator.do_avg_doc_token_cnt_estimation_on_demand());
+  EXPECT_DOUBLE_EQ(123.0, estimator.avg_doc_token_cnt_);
+}
+
+TEST_F(ObDASMatchQueryTest, test_avg_doc_length_cache_owns_path_and_resets)
+{
+  storage::ObInvIdxParamCache cache;
+  const ObTabletID tablet_id(1001);
+  char path[] = "$.title";
+  double average = 0;
+  ASSERT_EQ(OB_SUCCESS, cache.set_avg_doc_token_cnt(tablet_id, 0, ObString::make_string(path), 27.0));
+  path[2] = 'X';
+  ASSERT_EQ(OB_SUCCESS, cache.get_avg_doc_token_cnt(tablet_id, 0, ObString::make_string("$.title"), average));
+  EXPECT_DOUBLE_EQ(27.0, average);
+  EXPECT_EQ(OB_HASH_NOT_EXIST, cache.get_avg_doc_token_cnt(tablet_id, 0, ObString::make_string(path), average));
+  ASSERT_EQ(OB_SUCCESS, cache.set_avg_doc_token_cnt(tablet_id, 123.0));
+  cache.reset();
+  EXPECT_EQ(OB_ENTRY_NOT_EXIST, cache.get_avg_doc_token_cnt(tablet_id, average));
+  EXPECT_EQ(OB_ENTRY_NOT_EXIST, cache.get_avg_doc_token_cnt(tablet_id, 0, ObString::make_string("$.title"), average));
+  ASSERT_EQ(OB_SUCCESS, cache.set_avg_doc_token_cnt(tablet_id, 42.0));
+  ASSERT_EQ(OB_SUCCESS, cache.get_avg_doc_token_cnt(tablet_id, average));
+  EXPECT_DOUBLE_EQ(42.0, average);
+}
+
+TEST_F(ObDASMatchQueryTest, test_token_doc_count_cache_isolated_by_search_text_field)
+{
+  storage::ObInvIdxParamCache cache;
+  const ObTabletID tablet_id(1001);
+  const ObString token = ObString::make_string("ocean");
+  const ObString title_path = ObString::make_string("$.title");
+  const ObString body_path = ObString::make_string("$.body");
+  uint64_t doc_count = 0;
+
+  ASSERT_EQ(OB_SUCCESS, cache.set_token_doc_cnt(tablet_id, 0, title_path, token, 3));
+  ASSERT_EQ(OB_SUCCESS, cache.set_token_doc_cnt(tablet_id, 0, body_path, token, 7));
+  ASSERT_EQ(OB_SUCCESS, cache.get_token_doc_cnt(tablet_id, 0, title_path, token, doc_count));
+  EXPECT_EQ(3, doc_count);
+  ASSERT_EQ(OB_SUCCESS, cache.get_token_doc_cnt(tablet_id, 0, body_path, token, doc_count));
+  EXPECT_EQ(7, doc_count);
+  EXPECT_EQ(OB_HASH_NOT_EXIST, cache.get_token_doc_cnt(tablet_id, 1, title_path, token, doc_count));
+}
+TEST_F(ObDASMatchQueryTest, test_field_doc_length_cache_key_isolated_by_field_and_sstable)
+{
+  const uint64_t tenant_id = 500;
+  storage::ObITable::TableKey table_key;
+  table_key.table_type_ = storage::ObITable::INV_INDEX_SSTABLE;
+  table_key.tablet_id_ = ObTabletID(1001);
+  table_key.version_range_.base_version_ = 0;
+  table_key.version_range_.snapshot_version_ = 100;
+  storage::ObITable::TableKey other_table_key;
+  other_table_key = table_key;
+  other_table_key.version_range_.snapshot_version_ = 101;
+  char mutable_path[] = "$.title";
+  const ObInvBM25StatCacheKey key(tenant_id, 0, ObString::make_string(mutable_path), table_key);
+  const ObInvBM25StatCacheKey same_key(tenant_id, 0, ObString::make_string("$.title"), table_key);
+  const ObInvBM25StatCacheKey other_tenant(tenant_id + 1, 0, ObString::make_string("$.title"), table_key);
+  const ObInvBM25StatCacheKey other_column(tenant_id, 1, ObString::make_string("$.title"), table_key);
+  const ObInvBM25StatCacheKey other_path(tenant_id, 0, ObString::make_string("$.body"), table_key);
+  const ObInvBM25StatCacheKey other_table(tenant_id, 0, ObString::make_string("$.title"), other_table_key);
+  const ObInvBM25StatCacheKey root_path_key(tenant_id, 0, ObString(), table_key);
+  bool equal = false;
+
+  ASSERT_TRUE(key.is_valid());
+  ASSERT_EQ(OB_SUCCESS, key.equal(same_key, equal));
+  EXPECT_TRUE(equal);
+  ASSERT_EQ(OB_SUCCESS, key.equal(other_tenant, equal));
+  EXPECT_FALSE(equal);
+  ASSERT_EQ(OB_SUCCESS, key.equal(other_column, equal));
+  EXPECT_FALSE(equal);
+  ASSERT_EQ(OB_SUCCESS, key.equal(other_path, equal));
+  EXPECT_FALSE(equal);
+  ASSERT_EQ(OB_SUCCESS, key.equal(other_table, equal));
+  EXPECT_FALSE(equal);
+  EXPECT_TRUE(root_path_key.is_valid());
+  ASSERT_EQ(OB_SUCCESS, key.equal(root_path_key, equal));
+  EXPECT_FALSE(equal);
+
+  uint64_t key_hash = 0;
+  uint64_t same_key_hash = 0;
+  ASSERT_EQ(OB_SUCCESS, key.hash(key_hash));
+  ASSERT_EQ(OB_SUCCESS, same_key.hash(same_key_hash));
+  EXPECT_EQ(key_hash, same_key_hash);
+  EXPECT_EQ(0, key.size() % alignof(ObInvBM25StatCacheValue));
+
+  alignas(ObInvBM25StatCacheKey) char key_buf[256];
+  ObIKVCacheKey *copied_key = nullptr;
+  ASSERT_LE(key.size(), static_cast<int64_t>(sizeof(key_buf)));
+  ASSERT_EQ(OB_SUCCESS, key.deep_copy(key_buf, sizeof(key_buf), copied_key));
+  ASSERT_NE(nullptr, copied_key);
+  mutable_path[2] = 'x';
+  table_key.version_range_.snapshot_version_ = 999;
+  ASSERT_EQ(OB_SUCCESS, copied_key->equal(same_key, equal));
+  EXPECT_TRUE(equal);
+
+  const ObInvBM25StatCacheValue value(uint64_t(1234));
+  alignas(ObInvBM25StatCacheValue) char value_buf[128];
+  ObIKVCacheValue *copied_value = nullptr;
+  ASSERT_EQ(OB_SUCCESS, value.deep_copy(value_buf, sizeof(value_buf), copied_value));
+  ASSERT_NE(nullptr, copied_value);
+  EXPECT_EQ(1234, static_cast<ObInvBM25StatCacheValue *>(copied_value)->get_value().get_uint());
+}
+
+TEST_F(ObDASMatchQueryTest, test_length_cache_owns_number_beyond_uint64)
+{
+  number::ObNumber expected;
+  ASSERT_EQ(OB_SUCCESS, expected.from("36893488147419103230", allocator_));
+  alignas(ObInvBM25StatCacheValue) char buf[sizeof(ObInvBM25StatCacheValue)];
+  ObIKVCacheValue *copy = nullptr;
+  {
+    ObArenaAllocator source_allocator(lib::ObMemAttr(MTL_ID(), "BM25StatTst"));
+    number::ObNumber source;
+    ASSERT_EQ(OB_SUCCESS, source.from("36893488147419103230", source_allocator));
+    const ObInvBM25StatCacheValue value(source);
+    ASSERT_TRUE(value.get_value().is_local_buf());
+    ASSERT_EQ(OB_SUCCESS, value.deep_copy(buf, sizeof(buf), copy));
+    ASSERT_NE(nullptr, copy);
+    EXPECT_NE(value.get_value().ptr_, static_cast<const ObInvBM25StatCacheValue *>(copy)->get_value().ptr_);
+    // Mutating the original digits must not affect either owned copy.
+    source.get_digits()[0] ^= 1;
+    EXPECT_NE(0, expected.compare(source));
+    EXPECT_EQ(0, expected.compare(value.get_value().get_number()));
+  }
+  // Both the source allocator and the source cache value have left scope.
+  const auto *cached = static_cast<ObInvBM25StatCacheValue *>(copy);
+  EXPECT_TRUE(cached->get_value().is_local_buf());
+  EXPECT_EQ(0, expected.compare(cached->get_value().get_number()));
+  uint64_t narrow = 0;
+  EXPECT_FALSE(number::ObNumber(cached->get_value().get_number()).is_valid_uint64(narrow));
+}
+
+TEST_F(ObDASMatchQueryTest, test_stat_cache_rejects_value_kind_mismatch)
+{
+  ObITable::TableKey table;
+  table.table_type_ = ObITable::INV_INDEX_SSTABLE;
+  table.tablet_id_ = ObTabletID(1001);
+  table.version_range_.base_version_ = 0;
+  table.version_range_.snapshot_version_ = 100;
+  const uint64_t column_idx = ObInvBM25StatCacheKey::FULLTEXT_COLUMN_IDX;
+  const ObInvBM25StatCacheKey length_key(500, column_idx, ObString(), table);
+  const ObInvBM25StatCacheKey token_key(
+      500, column_idx, ObString(), table, ObInvBM25StatKind::TOKEN_DOC_CNT, ObString::make_string("ocean"));
+  const ObInvBM25StatCacheKey unknown_key(
+      500, column_idx, ObString(), table, static_cast<ObInvBM25StatKind>(UINT8_MAX));
+  ASSERT_TRUE(length_key.is_valid());
+  ASSERT_TRUE(token_key.is_valid());
+  ASSERT_FALSE(unknown_key.is_valid());
+  number::ObNumber length;
+  ASSERT_EQ(OB_SUCCESS, length.from(uint64_t(1234), allocator_));
+  // Type validation precedes the backing cache, which is deliberately uninitialized.
+  ObInvBM25StatCache cache;
+  EXPECT_EQ(OB_INVALID_ARGUMENT, cache.put_stat(length_key, uint64_t(7)));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, cache.put_stat(token_key, length));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, cache.put_stat(unknown_key, length));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, cache.put_stat(unknown_key, uint64_t(7)));
+  ObInvBM25StatCacheHandle handle;
+  EXPECT_EQ(OB_INVALID_ARGUMENT, cache.get_stat(unknown_key, handle));
+  EXPECT_FALSE(handle.is_valid());
+}
+
+TEST_F(ObDASMatchQueryTest, test_token_stat_cache_owns_token_and_separates_stat_kinds)
+{
+  ObITable::TableKey table;
+  table.table_type_ = ObITable::INV_INDEX_SSTABLE;
+  table.tablet_id_ = ObTabletID(1001);
+  table.version_range_.base_version_ = 0;
+  table.version_range_.snapshot_version_ = 100;
+  char path[] = "$.title";
+  char token[] = "ocean";
+  const auto kind = ObInvBM25StatKind::TOKEN_DOC_CNT;
+  const ObInvBM25StatCacheKey key(500, 0, ObString::make_string(path), table, kind, ObString::make_string(token));
+  const ObInvBM25StatCacheKey same(500, 0, ObString::make_string("$.title"), table, kind, ObString::make_string("ocean"));
+  const ObInvBM25StatCacheKey other_token(500, 0, ObString::make_string(path), table, kind, ObString::make_string("base"));
+  const ObInvBM25StatCacheKey field_length(500, 0, ObString::make_string(path), table);
+  const ObInvBM25StatCacheKey invalid_token(500, 0, ObString::make_string(path), table, kind);
+  const ObInvBM25StatCacheKey fulltext_token(500, ObInvBM25StatCacheKey::FULLTEXT_COLUMN_IDX, ObString(), table, kind, ObString::make_string(token));
+  const ObInvBM25StatCacheKey root_token(500, 0, ObString(), table, kind, ObString::make_string(token));
+  const ObInvBM25StatCacheKey fulltext_length(500, ObInvBM25StatCacheKey::FULLTEXT_COLUMN_IDX, ObString(), table);
+  const ObInvBM25StatCacheKey invalid_scope(500, ObInvBM25StatCacheKey::FULLTEXT_COLUMN_IDX, ObString::make_string(path), table);
+  ASSERT_TRUE(key.is_valid());
+  EXPECT_FALSE(invalid_token.is_valid());
+  EXPECT_TRUE(fulltext_token.is_valid());
+  EXPECT_TRUE(fulltext_length.is_valid());
+  EXPECT_FALSE(invalid_scope.is_valid());
+  bool equal = false;
+  ASSERT_EQ(OB_SUCCESS, fulltext_token.equal(root_token, equal));
+  EXPECT_FALSE(equal);
+  ASSERT_EQ(OB_SUCCESS, fulltext_token.equal(fulltext_length, equal));
+  EXPECT_FALSE(equal);
+  ASSERT_EQ(OB_SUCCESS, key.equal(other_token, equal));
+  EXPECT_FALSE(equal);
+  ASSERT_EQ(OB_SUCCESS, key.equal(field_length, equal));
+  EXPECT_FALSE(equal);
+  alignas(ObInvBM25StatCacheKey) char buffer[512];
+  ObIKVCacheKey *copy = nullptr;
+  ASSERT_EQ(OB_SUCCESS, key.deep_copy(buffer, sizeof(buffer), copy));
+  path[2] = 'x';
+  token[0] = 'x';
+  ASSERT_EQ(OB_SUCCESS, copy->equal(same, equal));
+  EXPECT_TRUE(equal);
+  uint64_t copied_hash = 0;
+  uint64_t same_hash = 0;
+  ASSERT_EQ(OB_SUCCESS, copy->hash(copied_hash));
+  ASSERT_EQ(OB_SUCCESS, same.hash(same_hash));
+  EXPECT_EQ(same_hash, copied_hash);
+  EXPECT_EQ(0, key.size() % alignof(ObInvBM25StatCacheValue));
 }
 
 // ============================================================================

@@ -198,6 +198,8 @@ void ObDASAsyncSegmentMergeOp::reset_merge_state()
   iter_end_ = false;
   heap_child_indices_.reset();
   pending_child_indices_.reset();
+  nested_heap_child_indices_.reuse();
+  nested_pending_child_indices_.reuse();
   for (int64_t i = 0; i < head_rowids_.count(); ++i) {
     head_rowids_.at(i).set_max();
   }
@@ -713,10 +715,9 @@ int ObDASAsyncSegmentMergeOp::advance_ordered_concat(const ObDASRowID &target)
       reached = true;
       concat_head_consumed_ = false;
     } else if (use_batch_merge_) {
-      if (OB_FAIL(advance_batch_head_to(child_idx, target))) {
-        LOG_WARN("failed to seek concat batch child", K(ret), K(child_idx));
-      }
+      ret = advance_batch_head_to(child_idx, target);
     } else {
+      is_first_nk_ = true;
       ret = children_[child_idx]->advance_to(
           target, head_rowids_.at(child_idx), head_scores_.at(child_idx));
       if (OB_ITER_END == ret) {
@@ -876,7 +877,14 @@ int ObDASAsyncSegmentMergeOp::reset_children_for_partition(const bool open_child
 int ObDASAsyncSegmentMergeOp::do_open()
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(record_mode_metric())) {
+  if (is_async_nested_scope(scope_)
+      && ObDASAsyncSegmentMergeMode::SORT_MERGE == mode_) {
+    if (OB_FAIL(nested_key_heads_.prepare_allocate(children_cnt_))) {
+      LOG_WARN("failed to allocate segment nested key heads", KR(ret), K_(children_cnt));
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(record_mode_metric())) {
     LOG_WARN("failed to record async segment merge mode metric", K(ret));
   } else if (ObDASAsyncSegmentMergeMode::DIRECT_MERGE == mode_) {
     if (OB_FAIL(reset_children_for_partition(true))) {
@@ -891,7 +899,8 @@ int ObDASAsyncSegmentMergeOp::do_open()
         + (is_scoring_ ? BATCH_SCORE_BLOCK_COUNT * sizeof(double) : 0);
     threshold_cached_ = false;
     cached_threshold_ = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE;
-    use_batch_merge_ = DAS_ROWID_TYPE_UINT64 == get_rowid_type()
+    use_batch_merge_ = !is_async_nested_scope(scope_)
+        && DAS_ROWID_TYPE_UINT64 == get_rowid_type()
         && children_cnt_ > 0
         && children_cnt_ <= BATCH_BUFFER_BYTE_BUDGET / child_batch_bytes;
     // Select the mode before binding the partition. DOCID_RANGE uses the same
@@ -899,6 +908,9 @@ int ObDASAsyncSegmentMergeOp::do_open()
     if (OB_FAIL(reset_children_for_partition(true))) {
       LOG_WARN("failed to open async segment merge", K(ret));
     }
+  }
+  if (OB_SUCC(ret)) {
+    is_first_nk_ = true;
   }
   return ret;
 }
@@ -914,6 +926,8 @@ int ObDASAsyncSegmentMergeOp::do_rescan()
   }
   if (OB_SUCC(ret) && OB_FAIL(reset_children_for_partition(false))) {
     LOG_WARN("failed to rescan async segment merge", K(ret));
+  } else {
+    is_first_nk_ = true;
   }
   return ret;
 }
@@ -921,6 +935,7 @@ int ObDASAsyncSegmentMergeOp::do_rescan()
 int ObDASAsyncSegmentMergeOp::do_rescan_segment(
     const ObNewVersionRange &range)
 {
+  is_first_nk_ = true;
   UNUSED(range);
   // SegmentMerge is a hard logical-index boundary; outer operators must not propagate
   // another per-Segment rescan into it.
@@ -937,6 +952,10 @@ int ObDASAsyncSegmentMergeOp::do_close()
   child_ended_.reset();
   child_opened_.reset();
   pending_child_indices_.reset();
+  nested_key_heads_.reset();
+  curr_nk_.set_min();
+  nested_heap_child_indices_.reset();
+  nested_pending_child_indices_.reset();
   batch_allocator_.reset();
   batch_ids_ = nullptr;
   batch_scores_ = nullptr;
@@ -952,24 +971,61 @@ int ObDASAsyncSegmentMergeOp::do_close()
   threshold_cached_ = false;
   cached_threshold_ = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE;
   use_batch_merge_ = false;
+  is_first_nk_ = true;
+  return ret;
+}
+
+int ObDASAsyncSegmentMergeOp::init_nested_key_cursor()
+{
+  int ret = OB_SUCCESS;
+  curr_nk_.set_min();
+  if (current_doc_has_single_nk_source()) {
+    // The document phase has already selected the sole source segment.
+    is_first_nk_ = false;
+  } else {
+    nested_heap_child_indices_.reuse();
+    nested_pending_child_indices_.reuse();
+    for (int64_t i = 0; i < children_cnt_; ++i) {
+      nested_key_heads_.at(i).set_max();
+    }
+    for (int64_t i = 0; i < pending_child_indices_.count(); ++i) {
+      nested_key_heads_.at(pending_child_indices_.at(i)).set_min();
+    }
+    // The first NK request reads all document contributors; later requests only
+    // advance the contributors of the last deduplicated NK.
+    if (OB_FAIL(nested_pending_child_indices_.assign(pending_child_indices_))) {
+      LOG_WARN("failed to initialize segment nested contributors", K(ret));
+    } else {
+      is_first_nk_ = false;
+    }
+  }
+  return ret;
+}
+
+// Call next_rowid for every pending child; batch DocIDs use the buffered next record.
+template <typename RowType>
+int ObDASAsyncSegmentMergeOp::advance_pending_children(
+    MergeCursor<RowType> &cursor, const int64_t capacity)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < cursor.pending_.count(); ++i) {
+    const int64_t child_idx = cursor.pending_.at(i);
+    RowType &head = cursor.heads_.at(child_idx);
+    if (OB_FAIL(fetch_next_head(child_idx, capacity, head))) {
+      LOG_WARN("failed to advance consumed async segment head", K(ret), K(child_idx));
+    } else if (!head.is_max() && cursor.use_heap_
+               && OB_FAIL(heap_push(cursor, child_idx))) {
+      LOG_WARN("failed to restore async segment child to heap", K(ret), K(child_idx));
+    }
+  }
+  cursor.pending_.reuse();
   return ret;
 }
 
 int ObDASAsyncSegmentMergeOp::advance_pending_children(const int64_t capacity)
 {
-  int ret = OB_SUCCESS;
-  for (int64_t i = 0; OB_SUCC(ret) && i < pending_child_indices_.count(); ++i) {
-    const int64_t child_idx = pending_child_indices_.at(i);
-    if (OB_FAIL(fetch_next_head(child_idx, capacity))) {
-      LOG_WARN("failed to advance consumed async segment head", K(ret), K(child_idx));
-    } else if (!child_ended_.at(child_idx)
-               && !use_single_child_fast_path()
-               && OB_FAIL(heap_push(child_idx))) {
-      LOG_WARN("failed to restore async segment child to heap", K(ret), K(child_idx));
-    }
-  }
-  pending_child_indices_.reuse();
-  return ret;
+  MergeCursor<ObDASRowID> cursor = rowid_merge_cursor();
+  return advance_pending_children(cursor, capacity);
 }
 
 int ObDASAsyncSegmentMergeOp::advance_heads_to(const ObDASRowID &target)
@@ -982,46 +1038,13 @@ int ObDASAsyncSegmentMergeOp::advance_heads_to(const ObDASRowID &target)
     } else if (OB_FAIL(compare_rowid(head_rowids_.at(i), target, cmp))) {
       LOG_WARN("failed to compare async segment head with target", K(ret), K(i));
     } else if (cmp < 0) {
-      if (use_batch_merge_) {
-        if (OB_FAIL(advance_batch_head_to(i, target))) {
-          LOG_WARN("failed to advance buffered async segment child", K(ret), K(i));
-        }
-      } else {
-        ret = children_[i]->advance_to(target, head_rowids_.at(i), head_scores_.at(i));
-        if (OB_ITER_END == ret) {
-          ret = OB_SUCCESS;
-          child_ended_.at(i) = true;
-          head_rowids_.at(i).set_max();
-          head_scores_.at(i) = 0.0;
-        } else if (OB_FAIL(ret)) {
-          LOG_WARN("failed to advance async segment child to target", K(ret), K(i));
-        }
+      if (OB_FAIL(seek_merge_head(i, target, head_rowids_.at(i)))) {
+        LOG_WARN("failed to advance async segment child to target", K(ret), K(i));
       }
     }
   }
   if (OB_SUCC(ret) && OB_FAIL(build_heap())) {
     LOG_WARN("failed to rebuild async segment merge heap", K(ret));
-  }
-  return ret;
-}
-
-int ObDASAsyncSegmentMergeOp::advance_heap_to(const ObDASRowID &target)
-{
-  int ret = OB_SUCCESS;
-  while (OB_SUCC(ret) && !heap_child_indices_.empty()) {
-    int cmp = 0;
-    int64_t child_idx = heap_child_indices_.at(0);
-    if (OB_FAIL(compare_rowid(head_rowids_.at(child_idx), target, cmp))) {
-      LOG_WARN("failed to compare async segment heap root with target", K(ret), K(child_idx));
-    } else if (cmp >= 0) {
-      break;
-    } else if (OB_FAIL(heap_pop(child_idx))) {
-      LOG_WARN("failed to pop lagging async segment heap root", K(ret), K(child_idx));
-    } else if (OB_FAIL(advance_batch_head_to(child_idx, target))) {
-      LOG_WARN("failed to advance lagging async segment heap root", K(ret), K(child_idx));
-    } else if (!child_ended_.at(child_idx) && OB_FAIL(heap_push(child_idx))) {
-      LOG_WARN("failed to restore advanced async segment heap root", K(ret), K(child_idx));
-    }
   }
   return ret;
 }
@@ -1035,8 +1058,8 @@ int ObDASAsyncSegmentMergeOp::try_advance_single_live(
   int ret = OB_SUCCESS;
   handled = false;
   if (!force_merge_
-      && use_batch_merge_
-      && segment_domain_.group_slot_ >= 0
+      && (use_batch_merge_ || is_async_nested_scope(scope_))
+      && (segment_domain_.group_slot_ >= 0 || is_async_nested_scope(scope_))
       && heap_child_indices_.empty()
       && 1 == pending_child_indices_.count()) {
     const int64_t child_idx = pending_child_indices_.at(0);
@@ -1050,9 +1073,15 @@ int ObDASAsyncSegmentMergeOp::try_advance_single_live(
       if (OB_FAIL(compare_rowid(head_rowids_.at(child_idx), target, cmp))) {
         LOG_WARN("failed to compare single live async segment head",
                  K(ret), K(child_idx), K(target));
-      } else if (cmp < 0 && OB_FAIL(advance_batch_head_to(child_idx, target))) {
-        LOG_WARN("failed to advance single live async segment child",
-                 K(ret), K(child_idx), K(target));
+      } else if (cmp < 0) {
+        // Keep NK position for a same-document seek; reload only after moving.
+        is_first_nk_ = true;
+        if (OB_FAIL(seek_merge_head(child_idx, target, head_rowids_.at(child_idx)))) {
+          LOG_WARN("failed to advance single live async segment child",
+                   K(ret), K(child_idx), K(target));
+        }
+      }
+      if (OB_FAIL(ret)) {
       } else if (child_ended_.at(child_idx)) {
         iter_end_ = true;
         ret = OB_ITER_END;
@@ -1071,7 +1100,158 @@ int ObDASAsyncSegmentMergeOp::try_advance_single_live(
   return ret;
 }
 
+int ObDASAsyncSegmentMergeOp::fetch_next_head(
+    const int64_t child_idx, const int64_t capacity, ObDASRowID &head)
+{
+  UNUSED(head);
+  return fetch_next_head(child_idx, capacity);
+}
+
+int ObDASAsyncSegmentMergeOp::fetch_next_head(
+    const int64_t child_idx, const int64_t capacity, ObDASNestedKey &head)
+{
+  UNUSED(capacity);
+  double score = 0.0;
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(children_[child_idx]->next_rowid(head, score))) {
+    if (OB_ITER_END == ret) {
+      ret = OB_SUCCESS;
+      head.set_max();
+    } else {
+      LOG_WARN("failed to fetch segment nested key", K(ret), K(child_idx));
+    }
+  }
+  return ret;
+}
+
+int ObDASAsyncSegmentMergeOp::seek_merge_head(
+    const int64_t child_idx, const ObDASRowID &target, ObDASRowID &head)
+{
+  int ret = OB_SUCCESS;
+  if (use_batch_merge_) {
+    ret = advance_batch_head_to(child_idx, target);
+  } else {
+    if (OB_FAIL(children_[child_idx]->advance_to(target, head, head_scores_.at(child_idx)))) {
+      if (OB_ITER_END == ret) {
+        ret = OB_SUCCESS;
+        child_ended_.at(child_idx) = true;
+        head.set_max();
+        head_scores_.at(child_idx) = 0.0;
+      } else {
+        LOG_WARN("failed to advance async segment child to target", K(ret), K(child_idx));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDASAsyncSegmentMergeOp::seek_merge_head(
+    const int64_t child_idx, const ObDASNestedKey &target, ObDASNestedKey &head)
+{
+  double score = 0.0;
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(children_[child_idx]->advance_to(target, head, score))) {
+    if (OB_ITER_END == ret) {
+      ret = OB_SUCCESS;
+      head.set_max();
+    } else {
+      LOG_WARN("failed to advance segment nested key", K(ret), K(child_idx));
+    }
+  }
+  return ret;
+}
+
+bool ObDASAsyncSegmentMergeOp::merge_head_in_range(const ObDASRowID &head) const
+{
+  return !search_ctx_.has_docid_range()
+      || search_ctx_.get_docid_range_hi().is_max_value()
+      || head.get_uint64() <= search_ctx_.get_docid_range_hi().get_uint64();
+}
+
+// Ensure all child heads reach target by calling advance_to only for lagging children.
+template <typename RowType>
+int ObDASAsyncSegmentMergeOp::advance_merge_heads(
+    MergeCursor<RowType> &cursor, const RowType &target)
+{
+  int ret = OB_SUCCESS;
+  // The target supplies the comparison length for a short NK seek prefix.
+  if (!cursor.use_heap_) {
+    RowType &head = cursor.heads_.at(0);
+    int cmp = 0;
+    if (head.is_max()) {
+      // The sole child is exhausted.
+    } else if (OB_FAIL(compare_rowid(target, head, cmp))) {
+      LOG_WARN("failed to compare single async segment head with target", K(ret));
+    } else if (!head.is_min() && cmp <= 0) {
+      // Keep the sole child at its qualifying head.
+    } else if (OB_FAIL(seek_merge_head(0, target, head))) {
+      LOG_WARN("failed to advance single async segment head", K(ret));
+    }
+  } else {
+    bool reached = false;
+    while (OB_SUCC(ret) && !reached && !cursor.heap_.empty()) {
+      int64_t child_idx = cursor.heap_.at(0);
+      RowType &head = cursor.heads_.at(child_idx);
+      int cmp = 0;
+      if (head.is_max()) {
+        reached = true;
+      } else if (OB_FAIL(compare_rowid(target, head, cmp))) {
+        LOG_WARN("failed to compare async segment heap root with target", K(ret), K(child_idx));
+      } else if (!head.is_min() && cmp <= 0) {
+        reached = true;
+      } else if (OB_FAIL(heap_pop(cursor, child_idx))) {
+        LOG_WARN("failed to pop lagging async segment heap root", K(ret), K(child_idx));
+      } else if (OB_FAIL(seek_merge_head(child_idx, target, head))) {
+        LOG_WARN("failed to advance lagging async segment head", K(ret), K(child_idx));
+      } else if (!head.is_max() && OB_FAIL(heap_push(cursor, child_idx))) {
+        LOG_WARN("failed to restore advanced async segment heap root", K(ret), K(child_idx));
+      }
+    }
+  }
+  return ret;
+}
+
+template <typename RowType>
+int ObDASAsyncSegmentMergeOp::merge_next(
+    MergeCursor<RowType> &cursor, const int64_t capacity,
+    RowType &result, double &score)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(advance_pending_children(cursor, capacity))) {
+    LOG_WARN("failed to advance pending async segment children", K(ret));
+  } else {
+    ret = emit_min_head(cursor, result, score);
+  }
+  return ret;
+}
+
+template <typename RowType>
+int ObDASAsyncSegmentMergeOp::merge_advance(
+    MergeCursor<RowType> &cursor, const RowType &target,
+    RowType &result, double &score)
+{
+  int ret = OB_SUCCESS;
+  // Restore the last output's contributors without moving qualifying child cursors.
+  for (int64_t i = 0; OB_SUCC(ret) && i < cursor.pending_.count(); ++i) {
+    const int64_t child_idx = cursor.pending_.at(i);
+    if (cursor.use_heap_ && OB_FAIL(heap_push(cursor, child_idx))) {
+      LOG_WARN("failed to restore pending async segment head", K(ret), K(child_idx));
+    }
+  }
+  cursor.pending_.reuse();
+  if (OB_FAIL(ret)) {
+    // pass
+  } else if (OB_FAIL(advance_merge_heads(cursor, target))) {
+    LOG_WARN("failed to advance async segment merge heads", K(ret));
+  } else {
+    ret = emit_min_head(cursor, result, score);
+  }
+  return ret;
+}
+
+template <typename RowType>
 int ObDASAsyncSegmentMergeOp::heap_less(
+    const MergeCursor<RowType> &cursor,
     const int64_t left_child_idx,
     const int64_t right_child_idx,
     bool &less) const
@@ -1085,7 +1265,7 @@ int ObDASAsyncSegmentMergeOp::heap_less(
     LOG_WARN("invalid async segment heap child index", K(ret),
              K(left_child_idx), K(right_child_idx), K_(active_segment_cnt));
   } else if (OB_FAIL(compare_rowid(
-                 head_rowids_.at(left_child_idx), head_rowids_.at(right_child_idx), cmp))) {
+                 cursor.heads_.at(left_child_idx), cursor.heads_.at(right_child_idx), cmp))) {
     LOG_WARN("failed to compare async segment heap heads", K(ret),
              K(left_child_idx), K(right_child_idx));
   } else {
@@ -1094,84 +1274,101 @@ int ObDASAsyncSegmentMergeOp::heap_less(
   return ret;
 }
 
-int ObDASAsyncSegmentMergeOp::heap_push(const int64_t child_idx)
+template <typename RowType>
+int ObDASAsyncSegmentMergeOp::heap_push(MergeCursor<RowType> &cursor, const int64_t child_idx)
 {
   int ret = OB_SUCCESS;
-  int64_t pos = heap_child_indices_.count();
+  int64_t pos = cursor.heap_.count();
   if (OB_UNLIKELY(child_idx < 0 || child_idx >= active_segment_cnt_)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid child to push into async segment heap", K(ret), K(child_idx));
-  } else if (OB_FAIL(heap_child_indices_.push_back(child_idx))) {
+  } else if (OB_FAIL(cursor.heap_.push_back(child_idx))) {
     LOG_WARN("failed to append async segment heap child", K(ret), K(child_idx));
   }
   while (OB_SUCC(ret) && pos > 0) {
     const int64_t parent_pos = (pos - 1) / 2;
     bool less = false;
-    if (OB_FAIL(heap_less(heap_child_indices_.at(pos),
-                          heap_child_indices_.at(parent_pos), less))) {
+    if (OB_FAIL(heap_less(cursor, cursor.heap_.at(pos),
+                          cursor.heap_.at(parent_pos), less))) {
       LOG_WARN("failed to compare async segment heap nodes", K(ret), K(pos), K(parent_pos));
     } else if (!less) {
       break;
     } else {
-      const int64_t tmp = heap_child_indices_.at(pos);
-      heap_child_indices_.at(pos) = heap_child_indices_.at(parent_pos);
-      heap_child_indices_.at(parent_pos) = tmp;
+      const int64_t tmp = cursor.heap_.at(pos);
+      cursor.heap_.at(pos) = cursor.heap_.at(parent_pos);
+      cursor.heap_.at(parent_pos) = tmp;
       pos = parent_pos;
     }
   }
   return ret;
 }
 
-int ObDASAsyncSegmentMergeOp::heap_sift_down(const int64_t start_pos)
+template <typename RowType>
+int ObDASAsyncSegmentMergeOp::heap_sift_down(
+    MergeCursor<RowType> &cursor, const int64_t start_pos)
 {
   int ret = OB_SUCCESS;
   int64_t pos = start_pos;
-  if (OB_UNLIKELY(start_pos < 0 || start_pos >= heap_child_indices_.count())) {
+  if (OB_UNLIKELY(start_pos < 0 || start_pos >= cursor.heap_.count())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid async segment heap position", K(ret), K(start_pos));
   }
-  while (OB_SUCC(ret) && 2 * pos + 1 < heap_child_indices_.count()) {
+  while (OB_SUCC(ret) && 2 * pos + 1 < cursor.heap_.count()) {
     int64_t min_pos = 2 * pos + 1;
     const int64_t right_pos = min_pos + 1;
     bool less = false;
-    if (right_pos < heap_child_indices_.count()
-        && OB_FAIL(heap_less(heap_child_indices_.at(right_pos),
-                             heap_child_indices_.at(min_pos), less))) {
+    if (right_pos < cursor.heap_.count()
+        && OB_FAIL(heap_less(cursor, cursor.heap_.at(right_pos),
+                                  cursor.heap_.at(min_pos), less))) {
       LOG_WARN("failed to compare async segment heap children", K(ret), K(pos));
-    } else if (right_pos < heap_child_indices_.count() && less) {
+    } else if (right_pos < cursor.heap_.count() && less) {
       min_pos = right_pos;
     }
     if (OB_SUCC(ret)
-        && OB_FAIL(heap_less(heap_child_indices_.at(min_pos),
-                             heap_child_indices_.at(pos), less))) {
+        && OB_FAIL(heap_less(cursor, cursor.heap_.at(min_pos),
+                                  cursor.heap_.at(pos), less))) {
       LOG_WARN("failed to compare async segment heap parent", K(ret), K(pos), K(min_pos));
     } else if (OB_SUCC(ret) && !less) {
       break;
     } else if (OB_SUCC(ret)) {
-      const int64_t tmp = heap_child_indices_.at(pos);
-      heap_child_indices_.at(pos) = heap_child_indices_.at(min_pos);
-      heap_child_indices_.at(min_pos) = tmp;
+      const int64_t tmp = cursor.heap_.at(pos);
+      cursor.heap_.at(pos) = cursor.heap_.at(min_pos);
+      cursor.heap_.at(min_pos) = tmp;
       pos = min_pos;
     }
   }
   return ret;
 }
 
-int ObDASAsyncSegmentMergeOp::heap_pop(int64_t &child_idx)
+template <typename RowType>
+int ObDASAsyncSegmentMergeOp::heap_pop(
+    MergeCursor<RowType> &cursor, int64_t &child_idx)
 {
   int ret = OB_SUCCESS;
   child_idx = -1;
-  if (heap_child_indices_.empty()) {
+  if (cursor.heap_.empty()) {
     ret = OB_ITER_END;
   } else {
-    child_idx = heap_child_indices_.at(0);
-    heap_child_indices_.at(0) = heap_child_indices_.at(heap_child_indices_.count() - 1);
-    heap_child_indices_.pop_back();
-    if (!heap_child_indices_.empty() && OB_FAIL(heap_sift_down(0))) {
+    child_idx = cursor.heap_.at(0);
+    cursor.heap_.at(0) = cursor.heap_.at(cursor.heap_.count() - 1);
+    cursor.heap_.pop_back();
+    if (!cursor.heap_.empty() && OB_FAIL(heap_sift_down(cursor, 0))) {
       LOG_WARN("failed to sift down async segment heap", K(ret));
     }
   }
   return ret;
+}
+
+int ObDASAsyncSegmentMergeOp::heap_push(const int64_t child_idx)
+{
+  MergeCursor<ObDASRowID> cursor = rowid_merge_cursor();
+  return heap_push(cursor, child_idx);
+}
+
+int ObDASAsyncSegmentMergeOp::heap_pop(int64_t &child_idx)
+{
+  MergeCursor<ObDASRowID> cursor = rowid_merge_cursor();
+  return heap_pop(cursor, child_idx);
 }
 
 int ObDASAsyncSegmentMergeOp::build_heap()
@@ -1188,59 +1385,53 @@ int ObDASAsyncSegmentMergeOp::build_heap()
   return ret;
 }
 
-int ObDASAsyncSegmentMergeOp::emit_min_head(ObDASRowID &rowid, double &score)
+template <typename RowType>
+int ObDASAsyncSegmentMergeOp::emit_min_head(
+    MergeCursor<RowType> &cursor, RowType &result, double &score)
 {
   int ret = OB_SUCCESS;
-  int64_t min_idx = -1;
-  pending_child_indices_.reuse();
-  if (use_single_child_fast_path()) {
-    min_idx = 0;
-    if (child_ended_.at(min_idx)) {
-      iter_end_ = true;
-      ret = OB_ITER_END;
-    } else if (search_ctx_.has_docid_range()
-               && !search_ctx_.get_docid_range_hi().is_max_value()
-               && head_rowids_.at(min_idx).get_uint64()
-                      > search_ctx_.get_docid_range_hi().get_uint64()) {
-      iter_end_ = true;
-      ret = OB_ITER_END;
-    } else if (OB_FAIL(pending_child_indices_.push_back(min_idx))) {
-      LOG_WARN("failed to save pending async segment child", K(ret), K(min_idx));
-    } else {
-      rowid = head_rowids_.at(min_idx);
-      score = head_scores_.at(min_idx);
-    }
-  } else if (heap_child_indices_.empty()) {
-    iter_end_ = true;
+  int64_t min_idx = cursor.use_heap_ && !cursor.heap_.empty() ? cursor.heap_.at(0) : 0;
+  cursor.pending_.reuse();
+  if ((cursor.use_heap_ && cursor.heap_.empty()) ||
+      cursor.heads_.at(min_idx).is_max() ||
+      !merge_head_in_range(cursor.heads_.at(min_idx))) {
     ret = OB_ITER_END;
-  } else if (search_ctx_.has_docid_range()
-             && !search_ctx_.get_docid_range_hi().is_max_value()
-             && head_rowids_.at(heap_child_indices_.at(0)).get_uint64()
-                    > search_ctx_.get_docid_range_hi().get_uint64()) {
-    iter_end_ = true;
-    ret = OB_ITER_END;
-  } else if (OB_FAIL(heap_pop(min_idx))) {
+  } else if (cursor.use_heap_ && OB_FAIL(heap_pop(cursor, min_idx))) {
     LOG_WARN("failed to pop minimum async segment head", K(ret));
-  } else if (OB_FAIL(pending_child_indices_.push_back(min_idx))) {
+  } else if (OB_FAIL(cursor.pending_.push_back(min_idx))) {
     LOG_WARN("failed to save pending async segment child", K(ret), K(min_idx));
   } else {
-    rowid = head_rowids_.at(min_idx);
-    score = head_scores_.at(min_idx);
+    result = cursor.heads_.at(min_idx);
+    score = merge_head_score(min_idx, result);
     bool duplicate = true;
-    while (OB_SUCC(ret) && duplicate && !heap_child_indices_.empty()) {
+    while (OB_SUCC(ret) && duplicate && cursor.use_heap_ && !cursor.heap_.empty()) {
       int cmp = 0;
-      const int64_t child_idx = heap_child_indices_.at(0);
-      if (OB_FAIL(compare_rowid(rowid, head_rowids_.at(child_idx), cmp))) {
+      const int64_t child_idx = cursor.heap_.at(0);
+      if (OB_FAIL(compare_rowid(result, cursor.heads_.at(child_idx), cmp))) {
         LOG_WARN("failed to compare duplicate async segment head", K(ret), K(child_idx));
       } else if (0 != cmp) {
         duplicate = false;
-      } else if (OB_FAIL(heap_pop(min_idx))) {
+      } else if (OB_FAIL(heap_pop(cursor, min_idx))) {
         LOG_WARN("failed to pop duplicate async segment head", K(ret), K(child_idx));
-      } else if (OB_FAIL(pending_child_indices_.push_back(min_idx))) {
+      } else if (OB_FAIL(cursor.pending_.push_back(min_idx))) {
         LOG_WARN("failed to save duplicate async segment child", K(ret), K(min_idx));
       } else {
-        score = MAX(score, head_scores_.at(min_idx));
+        score = MAX(score, merge_head_score(min_idx, result));
       }
+    }
+  }
+  return ret;
+}
+
+int ObDASAsyncSegmentMergeOp::emit_min_head(ObDASRowID &rowid, double &score)
+{
+  MergeCursor<ObDASRowID> cursor = rowid_merge_cursor();
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(emit_min_head(cursor, rowid, score))) {
+    if (OB_ITER_END == ret) {
+      iter_end_ = true;
+    } else {
+      LOG_WARN("failed to emit async segment head", K(ret));
     }
   }
   return ret;
@@ -1259,11 +1450,14 @@ int ObDASAsyncSegmentMergeOp::next_rowid_with_capacity(
     LOG_WARN("next rowid after async segment shallow advance is not supported", K(ret));
   } else if (use_ordered_concat_) {
     ret = next_ordered_concat(capacity, next_id, score);
-  } else if (OB_FAIL(advance_pending_children(capacity))) {
-    LOG_WARN("failed to advance pending async segment children", K(ret));
-  } else if (OB_FAIL(emit_min_head(next_id, score))) {
-    if (OB_ITER_END != ret) {
-      LOG_WARN("failed to emit next async segment row", K(ret));
+  } else {
+    MergeCursor<ObDASRowID> cursor = rowid_merge_cursor();
+    if (OB_FAIL(merge_next(cursor, capacity, next_id, score))) {
+      if (OB_ITER_END != ret) {
+        LOG_WARN("failed to emit next async segment row", K(ret));
+      } else {
+        iter_end_ = true;
+      }
     }
   }
   return ret;
@@ -1272,6 +1466,7 @@ int ObDASAsyncSegmentMergeOp::next_rowid_with_capacity(
 int ObDASAsyncSegmentMergeOp::do_next_rowid(ObDASRowID &next_id, double &score)
 {
   int ret = OB_SUCCESS;
+  is_first_nk_ = true;
   if (ObDASAsyncSegmentMergeMode::DIRECT_MERGE == mode_) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("ordered next rowid is unsupported by direct async segment merge",
@@ -1280,6 +1475,43 @@ int ObDASAsyncSegmentMergeOp::do_next_rowid(ObDASRowID &next_id, double &score)
     const int64_t fetch_capacity =
         use_batch_merge_ && segment_domain_.group_slot_ >= 0 ? CHILD_BATCH_SIZE : 1;
     ret = next_rowid_with_capacity(fetch_capacity, next_id, score);
+  }
+  return ret;
+}
+
+int ObDASAsyncSegmentMergeOp::do_next_rowid(ObDASNestedKey &next_nk, double &score)
+{
+  int ret = OB_SUCCESS;
+  score = 0.0;
+  if (!is_async_nested_scope(scope_)
+      || ObDASAsyncSegmentMergeMode::DIRECT_MERGE == mode_) {
+    ret = OB_NOT_IMPLEMENT;
+  } else if (is_first_nk_ && OB_FAIL(init_nested_key_cursor())) {
+    LOG_WARN("failed to initialize segment nested key cursor", KR(ret));
+  } else if (curr_nk_.is_max()) {
+    ret = OB_ITER_END;
+  } else if (current_doc_has_single_nk_source()) {
+    const int64_t child_idx = use_ordered_concat_
+        ? current_ordered_child_idx() : pending_child_indices_.at(0);
+    if (OB_FAIL(children_[child_idx]->next_rowid(next_nk, score))) {
+      if (OB_ITER_END == ret) {
+        curr_nk_.set_max();
+      } else {
+        LOG_WARN("failed to fetch next async segment nested key", K(ret));
+      }
+    }
+  } else {
+    MergeCursor<ObDASNestedKey> cursor = nested_merge_cursor();
+    if (OB_FAIL(merge_next(cursor, 1, next_nk, score))) {
+      if (OB_ITER_END == ret) {
+        curr_nk_.set_max();
+      } else {
+        LOG_WARN("failed to fetch next async segment nested key", K(ret));
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    curr_nk_ = next_nk;
   }
   return ret;
 }
@@ -1431,6 +1663,7 @@ bool ObDASAsyncSegmentMergeOp::can_forward_raw_doc_ids() const
 
 int ObDASAsyncSegmentMergeOp::do_next_rowids(int64_t capacity, int64_t &count)
 {
+  is_first_nk_ = true;
   int ret = OB_SUCCESS;
   count = 0;
   if (ObDASAsyncSegmentMergeMode::DIRECT_MERGE != mode_) {
@@ -1601,6 +1834,7 @@ int ObDASAsyncSegmentMergeOp::do_drain_until(
     ObDASRowID &next_id_after,
     double &next_score_after)
 {
+  is_first_nk_ = true;
   int ret = OB_SUCCESS;
   const int64_t fetch_capacity = MIN(CHILD_BATCH_SIZE, MAX(1L, capacity));
   count = 0;
@@ -1772,6 +2006,7 @@ int ObDASAsyncSegmentMergeOp::do_drain_until(
 int ObDASAsyncSegmentMergeOp::materialize_shallow_children(const ObDASRowID &target)
 {
   int ret = OB_SUCCESS;
+  is_first_nk_ = true;
   ObDASRowID effective_target = target;
   bool inclusive = true;
   if ((use_batch_merge_ || use_ordered_concat_) && !shallow_inclusive_
@@ -1923,32 +2158,90 @@ int ObDASAsyncSegmentMergeOp::do_advance_to(
           keep_pending_head = cmp >= 0;
         }
       }
-      if (OB_SUCC(ret) && keep_pending_head) {
-        // advance_to() is idempotent when the last emitted head already reaches
-        // the target. Put all deduplicated heads back before rebuilding the merge heap.
-        pending_child_indices_.reuse();
-      } else if (OB_SUCC(ret) && OB_FAIL(advance_pending_children(1))) {
-        LOG_WARN("failed to advance pending async segment children", K(ret));
-      }
-      const bool use_incremental_heap_advance =
-          !keep_pending_head && use_batch_merge_
-          && segment_domain_.group_slot_ >= 0
-          && !use_single_child_fast_path();
-      if (OB_SUCC(ret)) {
-        if (use_incremental_heap_advance) {
-          if (OB_FAIL(advance_heap_to(stable_target))) {
-            LOG_WARN("failed to incrementally advance async segment heap", K(ret));
-          }
-        } else if (OB_FAIL(advance_heads_to(stable_target))) {
-          LOG_WARN("failed to advance async segment heads to target", K(ret));
+      if (OB_SUCC(ret) && !keep_pending_head) {
+        is_first_nk_ = true;
+        if (OB_FAIL(advance_pending_children(1))) {
+          LOG_WARN("failed to advance pending async segment children", K(ret));
         }
-        if (OB_SUCC(ret) && OB_FAIL(emit_min_head(curr_id, score))) {
-          if (OB_ITER_END != ret) {
-            LOG_WARN("failed to emit advanced async segment row", K(ret));
+      }
+      if (OB_SUCC(ret)) {
+        MergeCursor<ObDASRowID> cursor = rowid_merge_cursor();
+        if (OB_FAIL(merge_advance(cursor, stable_target, curr_id, score))) {
+          if (OB_ITER_END == ret) {
+            iter_end_ = true;
+          } else {
+            LOG_WARN("failed to advance async segment merge", K(ret));
           }
         }
       }
     }
+  }
+  return ret;
+}
+
+int ObDASAsyncSegmentMergeOp::do_advance_to(
+    const ObDASNestedKey &target,
+    ObDASNestedKey &curr_nk,
+    double &score)
+{
+  int ret = OB_SUCCESS;
+  int cmp = 0;
+  score = 0.0;
+  if (!is_async_nested_scope(scope_)
+      || ObDASAsyncSegmentMergeMode::DIRECT_MERGE == mode_) {
+    ret = OB_NOT_IMPLEMENT;
+  } else if (is_first_nk_ && OB_FAIL(init_nested_key_cursor())) {
+    LOG_WARN("failed to initialize segment nested key cursor", KR(ret));
+  } else if (curr_nk_.is_max() || target.is_max()) {
+    ret = OB_ITER_END;
+  } else if (OB_FAIL(compare_rowid(target, curr_nk_, cmp))) {
+    LOG_WARN("failed to compare segment nested key target", KR(ret));
+  } else if (curr_nk_.is_normal() && cmp <= 0) {
+    curr_nk = curr_nk_;
+  } else if (target.is_min() && curr_nk_.is_min()) {
+    ret = do_next_rowid(curr_nk, score);
+  } else {
+    ObDASNestedKey stable_target = target;
+    target_allocator_.reuse();
+    if (target.is_normal() && target.length() > sizeof(uint64_t)) {
+      char *target_buf = static_cast<char *>(target_allocator_.alloc(target.length()));
+      if (OB_ISNULL(target_buf)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to preserve segment nested seek target", K(ret), K(target));
+      } else {
+        // A child can reuse the bytes backing the caller's long NK target.
+        MEMCPY(target_buf, target.ptr(), target.length());
+        stable_target.assign(target_buf, target.length());
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (current_doc_has_single_nk_source()) {
+        const int64_t child_idx = use_ordered_concat_
+            ? current_ordered_child_idx() : pending_child_indices_.at(0);
+        ret = children_[child_idx]->advance_to(stable_target, curr_nk, score);
+      } else if (!force_merge_ && nested_heap_child_indices_.empty()
+                 && 1 == nested_pending_child_indices_.count()) {
+        // Multiple segments contributed the document, but only this NK source
+        // remains. Keep it pending for the next NK call without rebuilding a heap.
+        const int64_t child_idx = nested_pending_child_indices_.at(0);
+        ObDASNestedKey &head = nested_key_heads_.at(child_idx);
+        if (OB_FAIL(seek_merge_head(child_idx, stable_target, head))) {
+          LOG_WARN("failed to advance sole live segment nested key", K(ret), K(child_idx));
+        } else if (head.is_max()) {
+          ret = OB_ITER_END;
+        } else {
+          curr_nk = head;
+        }
+      } else {
+        MergeCursor<ObDASNestedKey> cursor = nested_merge_cursor();
+        ret = merge_advance(cursor, stable_target, curr_nk, score);
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    curr_nk_ = curr_nk;
+  } else if (OB_ITER_END == ret) {
+    curr_nk_.set_max();
   }
   return ret;
 }

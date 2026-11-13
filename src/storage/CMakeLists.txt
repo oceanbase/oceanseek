@@ -70,6 +70,8 @@ ob_set_subtarget(ob_storage blocksstable
 ob_set_subtarget(ob_storage blocksstable_async_index
   blocksstable/async_index/ob_inv_idx_agg_data_decoder.cpp
   blocksstable/async_index/ob_inv_idx_agg_data_encoder.cpp
+  blocksstable/async_index/ob_inv_idx_agg_info.cpp
+  blocksstable/async_index/ob_inv_idx_aggregator.cpp
   blocksstable/async_index/ob_inv_idx_bm25_max_score_aggregator.cpp
   blocksstable/async_index/ob_inv_idx_micro_block_reader.cpp
   blocksstable/async_index/ob_inv_idx_micro_block_transformer.cpp
@@ -1317,6 +1319,8 @@ ob_set_subtarget(ob_storage retrieval
   retrieval/ob_block_max_iter.cpp
   retrieval/ob_block_stat_collector.cpp
   retrieval/ob_block_stat_iter.cpp
+  retrieval/ob_inv_idx_field_aggregator.cpp
+  retrieval/ob_inv_bm25_stat_cache.cpp
   retrieval/ob_sparse_bmm_iter.cpp
   retrieval/ob_inv_idx_param_estimator.cpp
   retrieval/ob_inv_idx_param_cache.cpp

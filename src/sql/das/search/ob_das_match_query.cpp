@@ -106,7 +106,7 @@ int ObDASMatchRtDef::prepare_query_tokens()
     LOG_WARN("pushdown must filter op ctdef is not supported", KR(ret));
   } else if (OB_FAIL(ObDASSearchUtils::eval_and_tokenize_query_text(
       allocator_, *eval_ctx_, *ctdef->query_text_, *inv_idx_scan_ctdef,
-      query_tokens_, token_counts_))) {
+      query_tokens_, token_counts_, ctdef->get_ir_ctdef()))) {
     LOG_WARN("failed to prepare match query tokens", KR(ret));
   } else {
     total_token_cnt_ = 0;
@@ -331,7 +331,6 @@ int ObDASMatchRtDef::can_pushdown_filter_to_bmm(
     const bool base_ok = ctdef->is_top_level_scoring()
         && ObMatchOperator::MATCH_OPERATOR_AND != match_operator_datum->get_int();
     int64_t effective_msm = 0;
-    ObDatum *query_text_datum = nullptr;
     ObSEArray<ObString, 16> query_tokens;
     ObSEArray<int64_t, 16> token_counts;
     if (!base_ok) {
@@ -346,19 +345,9 @@ int ObDASMatchRtDef::can_pushdown_filter_to_bmm(
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected null query definition for bmm pushdown",
                KR(ret), KP(ctdef->query_text_), KP(inv_ctdef));
-    } else if (OB_FAIL(ctdef->query_text_->eval(*eval_ctx_, query_text_datum))) {
-      LOG_WARN("expr evaluation failed for bmm pushdown", KR(ret));
-    } else if (OB_UNLIKELY(query_text_datum->is_null())) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected null query text for bmm pushdown", KR(ret));
-    } else if (OB_FAIL(ObFTSTokenizer::tokenize(
-                       allocator_,
-                       query_text_datum->get_string(),
-                       ctdef->get_ir_ctdef()->get_inv_idx_scan_scalar_ctdef()->table_param_.get_parser_name(),
-                       ctdef->get_ir_ctdef()->get_inv_idx_scan_scalar_ctdef()->table_param_.get_parser_property(),
-                       ctdef->query_text_->obj_meta_,
-                       query_tokens,
-                       token_counts))) {
+    } else if (OB_FAIL(ObDASSearchUtils::eval_and_tokenize_query_text(
+                       allocator_, *eval_ctx_, *ctdef->query_text_, *inv_ctdef,
+                       query_tokens, token_counts, ir_ctdef))) {
       LOG_WARN("failed to tokenize query text for bmm pushdown", KR(ret));
     } else if (0 == query_tokens.count()) {
       // can_pushdown stays false

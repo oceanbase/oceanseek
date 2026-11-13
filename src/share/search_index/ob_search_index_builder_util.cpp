@@ -7,7 +7,10 @@
 #include "share/search_index/ob_search_index_builder_util.h"
 #include "share/search_index/ob_search_index_encoder.h"
 #include "share/search_index/ob_search_index_config_filter.h"
+#include "share/search_index/ob_search_index_config.h"
+#include "storage/blocksstable/async_index/ob_inv_sstable_struct.h"
 #include "share/ob_index_builder_util.h"
+#include "common/ob_version_def.h"
 #include "share/ob_server_struct.h"
 #include "rootserver/ob_root_service.h"
 #include "lib/udt/ob_array_utils.h"
@@ -21,6 +24,66 @@ using namespace share::schema;
 namespace share
 {
 
+int ObSearchIndexBuilderUtil::resolve_search_index_args(
+    const ObCreateIndexArg &arg, ObSearchIndexRequirements &requirements)
+{
+  int ret = OB_SUCCESS;
+  requirements = ObSearchIndexRequirements();
+  for (int64_t i = 0; OB_SUCC(ret) && i < arg.index_columns_.count(); ++i) {
+    ObSearchIndexConfig config;
+    const ObString &comment = arg.index_columns_.at(i).column_comment_;
+    if (OB_FAIL(config.decode(comment))) {
+      LOG_WARN("failed to decode search column configuration", K(ret), K(i));
+    } else {
+      const ObIArray<ObSearchIndexModeConfig> &modes = config.get_modes();
+      for (int64_t j = 0; OB_SUCC(ret) && j < modes.count(); ++j) {
+        const ObSearchIndexModeConfig &mode = modes.at(j);
+        ObSearchIndexConfigFilter filter(OB_SERVER_TENANT_ID);
+        if (OB_FAIL(filter.init_from_comment(config.get_comment(), j))) {
+          LOG_WARN("failed to decode search mode filter", K(ret), K(i), K(j));
+        } else {
+          requirements.has_nested_ |= filter.has_nested_paths();
+          requirements.has_data_ |= mode.mode_ == ObSearchIndexModeConfig::VALUE;
+          requirements.has_fulltext_ |= mode.is_fulltext();
+          requirements.has_text_match_ |= mode.mode_ == ObSearchIndexModeConfig::FULLTEXT_MATCH;
+          requirements.has_text_match_phrase_ |= mode.mode_ == ObSearchIndexModeConfig::FULLTEXT_PHRASE;
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret) && requirements.has_fulltext_) {
+    if (!is_async_search_index(arg.index_type_)) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "synchronous search index FULLTEXT is");
+    }
+  }
+  return ret;
+}
+
+int ObSearchIndexBuilderUtil::resolve_search_index_args(const ObCreateIndexArg &arg)
+{
+  ObSearchIndexRequirements requirements;
+  return resolve_search_index_args(arg, requirements);
+}
+
+int ObSearchIndexBuilderUtil::check_fulltext_data_version(const ObCreateIndexArg &arg,
+                                                       const uint64_t tenant_data_version)
+{
+  int ret = OB_SUCCESS;
+  if (is_async_search_index(arg.index_type_) && tenant_data_version < DATA_VERSION_4_6_3_1) {
+    ObSearchIndexRequirements requirements;
+    if (OB_FAIL(resolve_search_index_args(arg, requirements))) {
+      LOG_WARN("failed to resolve search index configuration", K(ret));
+    } else if (requirements.has_fulltext_ || is_search_text_index(arg.index_type_)) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("JSON FULLTEXT search index not supported before 4.6.3.1",
+               K(ret), K(tenant_data_version), K(arg.index_type_));
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "JSON FULLTEXT search index before version 4.6.3.1");
+    }
+  }
+  return ret;
+}
+
 int ObSearchIndexBuilderUtil::generate_search_index_name(
     obrpc::ObCreateIndexArg &arg,
     ObIAllocator *allocator)
@@ -31,7 +94,7 @@ int ObSearchIndexBuilderUtil::generate_search_index_name(
   if (OB_ISNULL(allocator)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("allocator is nullptr", K(ret));
-  } else if (!is_search_data_index(type)) {
+  } else if (!is_search_aux_index(type)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(type));
   } else if (OB_ISNULL(name_buf = static_cast<char *>(allocator->alloc(OB_MAX_TABLE_NAME_LENGTH)))) {
@@ -41,9 +104,12 @@ int ObSearchIndexBuilderUtil::generate_search_index_name(
     MEMSET(name_buf, 0, OB_MAX_TABLE_NAME_LENGTH);
     int64_t pos = 0;
     if (OB_FAIL(databuff_printf(name_buf, OB_MAX_TABLE_NAME_LENGTH, pos,
-                                "%.*s_search_data",
+                                "%.*s_%s",
                                 arg.index_name_.length(),
-                                arg.index_name_.ptr()))) {
+                                arg.index_name_.ptr(),
+                                !is_search_text_index(type) ? "search_data"
+                                : is_async_search_text_match_index(type)
+                                    ? "search_text_match" : "search_text_match_phrase"))) {
       LOG_WARN("failed to format search data index name", K(ret));
     } else {
       arg.index_name_.assign_ptr(name_buf, static_cast<int32_t>(pos));
@@ -54,24 +120,37 @@ int ObSearchIndexBuilderUtil::generate_search_index_name(
 
 int ObSearchIndexBuilderUtil::append_search_index_arg(
     const ObCreateIndexArg &index_arg,
+    const ObSearchIndexRequirements &requirements,
     ObIAllocator *allocator,
     ObIArray<ObCreateIndexArg> &index_arg_list)
 {
   int ret = OB_SUCCESS;
-  ObCreateIndexArg search_index_arg;
   if (OB_ISNULL(allocator) || !is_search_def_index(index_arg.index_type_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("allocator is nullptr", K(ret), K(index_arg.index_type_));
-  } else if (OB_FAIL(search_index_arg.assign(index_arg))) {
-    LOG_WARN("failed to assign to search arg", K(ret));
-  } else if (FALSE_IT(search_index_arg.index_type_ =
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument for search index expansion", K(ret), KP(allocator), K(index_arg.index_type_));
+  } else {
+    const ObIndexType types[] = {
       is_async_search_def_index(index_arg.index_type_)
-          ? INDEX_TYPE_ASYNC_SEARCH_DATA_INDEX_LOCAL
-          : INDEX_TYPE_SEARCH_DATA_INDEX_LOCAL)) {
-  } else if (OB_FAIL(generate_search_index_name(search_index_arg, allocator))) {
-    LOG_WARN("failed to generate search index name", K(ret));
-  } else if (OB_FAIL(index_arg_list.push_back(search_index_arg))) {
-    LOG_WARN("failed to push back search arg", K(ret));
+          ? INDEX_TYPE_ASYNC_SEARCH_DATA_INDEX_LOCAL : INDEX_TYPE_SEARCH_DATA_INDEX_LOCAL,
+      INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_INDEX_LOCAL, INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_PHRASE_INDEX_LOCAL
+    };
+    for (int64_t i = 0; OB_SUCC(ret) && i < ARRAYSIZEOF(types); ++i) {
+      if ((i == 0 && !requirements.has_data_)
+          || (i == 1 && !requirements.has_text_match_) || (i == 2 && !requirements.has_text_match_phrase_)) {
+        continue;
+      }
+      ObCreateIndexArg child;
+      if (OB_FAIL(child.assign(index_arg))) {
+        LOG_WARN("failed to copy search definition", K(ret));
+      } else {
+        child.index_type_ = types[i];
+        if (OB_FAIL(generate_search_index_name(child, allocator))) {
+          LOG_WARN("failed to generate search auxiliary name", K(ret), K(types[i]));
+        } else if (OB_FAIL(index_arg_list.push_back(child))) {
+          LOG_WARN("failed to append search auxiliary argument", K(ret), K(types[i]));
+        }
+      }
+    }
   }
   return ret;
 }
@@ -82,9 +161,13 @@ int ObSearchIndexBuilderUtil::set_search_index_table_columns(
     ObTableSchema &index_schema)
 {
   int ret = OB_SUCCESS;
-  if (!data_schema.is_valid() || !share::schema::is_search_data_index(arg.index_type_)) {
+  if (!data_schema.is_valid() || !share::schema::is_search_aux_index(arg.index_type_)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument for search index", K(ret), K(data_schema), K(arg.index_type_));
+  } else if (is_search_text_index(arg.index_type_)) {
+    if (OB_FAIL(set_search_text_table_columns(arg, data_schema, index_schema))) {
+      LOG_WARN("failed to set search text table columns", K(ret));
+    }
   } else {
     int64_t rowkey_pos = 0;
     const int64_t tenant_id = data_schema.get_tenant_id();
@@ -93,18 +176,11 @@ int ObSearchIndexBuilderUtil::set_search_index_table_columns(
     // Pre-detect NESTED_PATHS to decide whether to add the nested_key rowkey column.
     // VALUE length already reserves nested_key space unconditionally (see SEARCH_INDEX_VALUE_LENGTH),
     // so no per-index value-length adjustment is needed here.
-    bool has_nested_paths = false;
-    for (int64_t i = 0; i < arg.index_columns_.count() && !has_nested_paths && OB_SUCC(ret); ++i) {
-      const ObString &comment = arg.index_columns_.at(i).column_comment_;
-      if (!comment.empty()) {
-        ObSearchIndexConfigFilter filter(OB_SERVER_TENANT_ID);
-        if (OB_FAIL(filter.init_from_comment(comment))) {
-          LOG_WARN("failed to init config filter from column comment", K(ret), K(comment));
-        } else {
-          has_nested_paths = filter.has_nested_paths();
-        }
-      }
+    ObSearchIndexRequirements requirements;
+    if (OB_FAIL(resolve_search_index_args(arg, requirements))) {
+      LOG_WARN("invalid search index configuration", K(ret));
     }
+    const bool has_nested_paths = requirements.has_nested_;
     const int64_t value_len = SEARCH_INDEX_VALUE_LENGTH;
 
     struct ColumnDef {
@@ -173,6 +249,62 @@ int ObSearchIndexBuilderUtil::set_search_index_table_columns(
       index_schema.set_index_column_num(rowkey_pos);
       if (OB_FAIL(index_schema.sort_column_array_by_column_id())) {
         LOG_WARN("failed to sort columns", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObSearchIndexBuilderUtil::set_search_text_table_columns(
+    const ObCreateIndexArg &arg, const ObTableSchema &data_schema, ObTableSchema &index_schema)
+{
+  int ret = OB_SUCCESS;
+  ObSearchIndexRequirements requirements;
+  const bool phrase = is_async_search_text_match_phrase_index(arg.index_type_);
+  if (OB_FAIL(resolve_search_index_args(arg, requirements))) {
+    LOG_WARN("invalid search text configuration", K(ret));
+  } else if (!(phrase ? requirements.has_text_match_phrase_ : requirements.has_text_match_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("search text table is not required by the definition", K(ret), K(arg.index_type_));
+  } else {
+    // Column IDs and roles belong to the physical Text schema, not the source JSON columns.
+    // Keep key capacity within the existing Search Data rowkey limit.
+    // TOKEN stores the encoded term key with binary comparison, like Search Data VALUE.
+    const struct {
+      const char *name_;
+      ObObjType type_;
+      int64_t length_;
+    } columns[] = {
+      {"COL_IDX", ObUInt64Type, 0},
+      {"PATH", ObVarcharType, SEARCH_INDEX_PATH_LENGTH},
+      {"TOKEN", ObVarcharType, SEARCH_INDEX_VALUE_LENGTH},
+      {"DOC_ID", ObUInt64Type, 0},
+      {"TOKEN_FREQ", ObUInt64Type, 0},
+      {"DOC_LENGTH", ObUInt64Type, 0},
+      {"POSITION_LIST", ObVarcharType, 16 * 1024}
+    };
+    static_assert(ARRAYSIZEOF(columns) == blocksstable::SEARCH_TEXT_COL_CNT_WITH_POS,
+        "Search Text schema must match the shared column layout");
+    const int64_t column_count = phrase ? blocksstable::SEARCH_TEXT_COL_CNT_WITH_POS
+                                       : blocksstable::SEARCH_TEXT_COL_CNT_WITHOUT_POS;
+    int64_t rowkey_pos = 0;
+    const int64_t suffix = ObTimeUtility::current_time();
+    for (int64_t i = 0; OB_SUCC(ret) && i < column_count; ++i) {
+      char name[OB_MAX_COLUMN_NAME_LENGTH] = {};
+      int64_t pos = 0;
+      if (OB_FAIL(databuff_printf(name, sizeof(name), pos, "__%s_%ld", columns[i].name_, suffix))) {
+        LOG_WARN("failed to format search text column name", K(ret));
+      } else if (OB_FAIL(add_search_index_column(data_schema, index_schema, data_schema.get_tenant_id(),
+          name, columns[i].type_, columns[i].length_, true,
+          i < blocksstable::SEARCH_TEXT_ROWKEY_CNT, rowkey_pos))) {
+        LOG_WARN("failed to add search text column", K(ret), K(i));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      index_schema.set_rowkey_column_num(rowkey_pos);
+      index_schema.set_index_column_num(rowkey_pos);
+      if (OB_FAIL(index_schema.sort_column_array_by_column_id())) {
+        LOG_WARN("failed to sort search text columns", K(ret));
       }
     }
   }
@@ -271,9 +403,9 @@ int ObSearchIndexBuilderUtil::get_dropping_search_data_index_invisiable_index_sc
       if ((!index_table_schema.is_async_search_def_index()
            && INDEX_TYPE_SEARCH_DATA_INDEX_LOCAL != info.index_type_)
           || (index_table_schema.is_async_search_def_index()
-              && !share::schema::is_async_search_data_index(info.index_type_))) {
+              && !share::schema::is_async_search_aux_index(info.index_type_))) {
         ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("expect data search index", KR(ret), K(info.index_type_));
+        LOG_WARN("expect search child index", KR(ret), K(info.index_type_));
       } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id,
                                                        info.table_id_,
                                                        data_index_schema))) {

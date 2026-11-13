@@ -1739,13 +1739,13 @@ TEST_F(TestDASAsyncTokenOp, range_max_real_sstable_contract)
   op->is_scoring_ = true;
 
   // An unavailable storage bound must not publish or transform a partial score.
-  op->posting_iter_->has_relevance_params_ = false;
+  op->posting_iter_->need_relevance_params_ = false;
   max_score = -123.0;
   can_calc = true;
   OK(op->calc_range_max_score(start, true /*start_inclusive*/, end, max_score, can_calc));
   ASSERT_FALSE(can_calc);
   ASSERT_DOUBLE_EQ(-123.0, max_score);
-  op->posting_iter_->has_relevance_params_ = true;
+  op->posting_iter_->need_relevance_params_ = true;
   OK(op->close());
 }
 

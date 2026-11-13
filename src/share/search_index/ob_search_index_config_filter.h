@@ -31,6 +31,8 @@ class ObIAllocator;
 namespace share
 {
 
+struct ObSearchIndexModeConfig;
+
 class ObSearchIndexJsonPathMatcher final
 {
 public:
@@ -39,8 +41,7 @@ public:
 
   void reset();
 
-  // Initialize from a single string spec.
-  int init(const ObString &spec, int64_t &idx);
+  int init(const common::ObIArray<common::ObString> &paths);
 
   // Segment-aware prefix match. Returns true if any include path is a prefix of target_path.
   int match(const common::ObIArray<ObSearchIndexPathEncoder::JsonPathItem> &path_items,
@@ -66,7 +67,6 @@ private:
   int new_node(Node *&node);
   int get_or_create_child(Node &node, const ObString &seg, Node *&child);
   int insert_path(const ObString &path);
-  int parse_and_insert(const ObString &spec, int64_t &pos);
 
 private:
   uint64_t tenant_id_;
@@ -88,10 +88,27 @@ public:
   static const uint8_t TYPE_MASK_STRING = (1 << 0);
   static const uint8_t TYPE_MASK_NUMBER = (1 << 1);
 
+  // Temporary views into one mode's filter string; the caller keeps that string alive.
+  struct ParsedFilter
+  {
+    ParsedFilter() : paths_(), nested_paths_(), has_include_paths_(false),
+        has_exclude_paths_(false), has_nested_paths_(false), type_mask_(0) {}
+    common::ObSEArray<common::ObString, 4> paths_;
+    common::ObSEArray<common::ObString, 4> nested_paths_;
+    bool has_include_paths_;
+    bool has_exclude_paths_;
+    bool has_nested_paths_;
+    uint8_t type_mask_;
+  };
+  // Strict mode requires nonempty lists, known types, and complete consumption.
+  // Legacy mode preserves the old reader's skipped text and unknown-type behavior.
+  static int parse_filter(const common::ObString &raw, ParsedFilter &parsed, bool strict = true);
+
   explicit ObSearchIndexConfigFilter(const uint64_t tenant_id);
 
-  // Initialize from a single string comment.
-  int init_from_comment(const ObString &raw);
+  // Consume a complete v1 comment produced by ObSearchIndexConfig::decode/init.
+  // VALUE uses column NESTED_PATHS; FULLTEXT uses only its own path/type filter.
+  int init_from_comment(const ObString &comment, const int64_t mode_idx = 0);
   void reset();
 
   // Combine path + type checks for JSON scalar nodes.
@@ -101,12 +118,21 @@ public:
                  const ObItemType pick_type, bool &passed, const bool index_sub_path) const;
   static bool is_type_indexed(const uint8_t type_mask, const common::ObJsonNodeType json_type);
 
-  // Build search index configuration string from parse node
-  static int print_comment(const ParseNode *param_node, common::ObSqlString &out);
-  // Print search index column config (INCLUDE_PATHS/EXCLUDE_PATHS/INCLUDE_TYPES) to buf for SHOW CREATE TABLE.
-  static int print_schema(const common::ObString &comment, char *buf, int64_t buf_len, int64_t &pos);
+  // Build a filter fragment from one option node, replacing the output.
+  static int print_filter_option(const ParseNode *option, common::ObSqlString &out);
+  // Print one complete VALUE/FULLTEXT block, including parser options for FULLTEXT.
+  static int print_schema(const ObSearchIndexModeConfig &mode, char *buf, int64_t buf_len, int64_t &pos);
+  // Print a normalized mode filter (paths and types), without WITH or mode wrappers.
+  // Separately supplied column NESTED_PATHS is printed between paths and types.
+  static int print_schema(const common::ObString &comment, char *buf, int64_t buf_len, int64_t &pos,
+                          bool print_types = true,
+                          const common::ObString &nested_paths_filter = common::ObString());
+  // Print only the column-level NESTED_PATHS option, without surrounding separators.
+  static int print_nested_paths(const common::ObString &nested_paths_filter,
+                                char *buf, int64_t buf_len, int64_t &pos);
   static bool is_valid_config_path(common::ObJsonPath *json_path);
   bool has_types() const { return type_mask_ != 0; }
+  bool has_paths() const { return has_include_paths_ || has_exclude_paths_ || has_nested_paths_; }
   uint8_t get_type_mask() const { return type_mask_; }
   bool has_nested_paths() const { return has_nested_paths_; }
 
@@ -124,7 +150,6 @@ public:
                                 common::ObIArray<common::ObString> &out);
   TO_STRING_KV(K_(has_include_paths), K_(has_exclude_paths), K_(has_nested_paths), K_(type_mask));
 private:
-  bool has_paths() const { return has_include_paths_ || has_exclude_paths_ || has_nested_paths_; }
   static common::ObJsonNodeType get_json_type(const ObItemType pick_type);
   int is_path_indexed(const common::ObIArray<ObSearchIndexPathEncoder::JsonPathItem> &path_items,
                       bool &passed, const bool index_sub_path = false) const;

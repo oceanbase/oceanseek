@@ -5417,7 +5417,9 @@ public:
       match_columns_(alloc),
       search_key_(NULL),
       columns_boosts_(alloc),
-      param_text_expr_(NULL)
+      param_text_expr_(NULL),
+      json_path_expr_(NULL),
+      search_text_(false)
   {
     set_expr_class(EXPR_MATCH_AGAINST);
   }
@@ -5459,6 +5461,10 @@ public:
   int get_table_id(uint64_t &table_id);
   int get_match_column_type(ObRawExprResType &result_type);
   inline int64_t get_search_key_idx() { return get_match_columns().count(); }
+  void set_json_path_expr(ObRawExpr *expr) { json_path_expr_ = expr; }
+  ObRawExpr *get_json_path_expr() const { return json_path_expr_; }
+  void set_search_text(bool search_text) { search_text_ = search_text; }
+  bool is_search_text() const { return search_text_; }
 
   int replace_param_expr(int64_t index, ObRawExpr *expr);
 
@@ -5482,6 +5488,8 @@ private:
 
   ObSqlArray<ObRawExpr*> columns_boosts_; // boost values for each column
   ObRawExpr *param_text_expr_; // param text expr for should_match_expr_
+  ObRawExpr *json_path_expr_; // Optional JSON path for native Search Text predicates.
+  bool search_text_; // Native MATCH resolved to Search FULLTEXT before scope/mode checks.
 };
 
 class ObUnpivotRawExpr : public ObRawExpr

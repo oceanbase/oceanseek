@@ -4679,6 +4679,10 @@ int ObRawExprPrinter::print(ObMatchFunRawExpr *expr)
         LOG_WARN("unexpected null", K(ret));
       } else {
         PRINT_EXPR(expr->get_match_columns().at(i));
+        if (OB_SUCC(ret) && nullptr != expr->get_json_path_expr()) {
+          DATA_PRINTF("->");
+          PRINT_EXPR(expr->get_json_path_expr());
+        }
         DATA_PRINTF(") AGAINST(");
         PRINT_EXPR(expr->get_search_key());
         switch (expr->get_mode_flag()) {

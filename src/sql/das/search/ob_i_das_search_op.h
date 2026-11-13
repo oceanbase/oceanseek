@@ -18,6 +18,7 @@
 #define OBDEV_SRC_SQL_DAS_SEARCH_OPERATOR_OB_I_DAS_SEARCH_OP_H_
 
 #include "sql/das/search/ob_das_search_define.h"
+#include "sql/das/search/ob_das_nested_key.h"
 #include "sql/das/search/ob_das_search_context.h"
 #include "common/ob_range.h"
 #include "sql/engine/basic/ob_temp_row_store.h"
@@ -300,6 +301,7 @@ public:
   void reset() override;
   void reuse() override;
   int64_t count() const override { return count_; }
+  int get_datum(int64_t idx, int64_t col_idx, common::ObDatum &datum) const;
 
   TO_STRING_KV(K_(count));
 
@@ -337,6 +339,7 @@ public:
       op_type_(DAS_SEARCH_OP_MAX),
       op_id_(OB_INVALID_ID),
       scope_(search_ctx.get_op_creating_scope()),
+      nesting_depth_(search_ctx.get_op_creating_depth()),
       max_score_tuple_(),
       children_(nullptr),
       children_cnt_(0),
@@ -348,7 +351,7 @@ public:
       has_last_profile_output_rowid_(false)
   { }
   virtual ~ObIDASSearchOp() {}
-  VIRTUAL_TO_STRING_KV(K_(op_id), K_(search_ctx));
+  VIRTUAL_TO_STRING_KV(K_(op_id), K_(scope), K_(search_ctx));
 
   OB_INLINE void set_op_id(const int64_t id) { op_id_ = id; }
   OB_INLINE int64_t get_op_id() const { return op_id_; }
@@ -397,9 +400,12 @@ public:
   void close_profile();
   void reset_profile();
 
-  // RowID utility methods forwarded from search_ctx_, dispatching by scope_
+  // Document positions and object positions have independent types and cursors.
   OB_INLINE int compare_rowid(const ObDASRowID &r1, const ObDASRowID &r2, int &cmp) const
   { return search_ctx_.compare_rowid(scope_, r1, r2, cmp); }
+  // The first key defines the comparison length.
+  OB_INLINE int compare_rowid(const ObDASNestedKey &r1, const ObDASNestedKey &r2, int &cmp) const
+  { cmp = r1.compare(r2, r1.length()); return OB_SUCCESS; }
   OB_INLINE int deep_copy_rowid(const ObDASRowID &src, ObDASRowID &dst, common::ObIAllocator &alloc) const
   { return search_ctx_.deep_copy_rowid(scope_, src, dst, alloc); }
   OB_INLINE int create_rowid_store(int64_t capacity, RowIDStore *&store)
@@ -454,6 +460,9 @@ public:
   */
   OB_INLINE int advance_to(const ObDASRowID &target, ObDASRowID &curr_id, double &score);
 
+  // Optional NK interfaces. Supporting operators own their cursor state.
+  OB_INLINE int advance_to(const ObDASNestedKey &target, ObDASNestedKey &curr_nk, double &score);
+
   /*
    * Advances to the next rowid that is greater than or equal to the target rowid,
    * without materializing the score of the current rowid.
@@ -476,6 +485,7 @@ public:
    * Ensures returned next_id lifetime is guaranteed until the next advance_to/next_rowid.
   */
   OB_INLINE int next_rowid(ObDASRowID &next_id, double &score);
+  OB_INLINE int next_rowid(ObDASNestedKey &next_nk, double &score);
 
   /*
    * Advances shallowly using block max information, does not actually advance the rowid.
@@ -655,6 +665,8 @@ public:
     return can_enumerate;
   }
   OB_INLINE int probe(const ObDASRowID &target, bool &hit);
+  int32_t nested_compare_bytes() const { return nesting_depth_ * 4; }
+
 // ---------------- core interfaces end ----------------
 
 protected:
@@ -666,8 +678,10 @@ protected:
   // Default: propagate rescan_segment to all children. Async leaves override to reopen posting iter.
   virtual int do_rescan_segment(const common::ObNewVersionRange &range);
   virtual int do_advance_to(const ObDASRowID &target, ObDASRowID &curr_id, double &score) = 0;
+  virtual int do_advance_to(const ObDASNestedKey &target, ObDASNestedKey &curr_nk, double &score);
   virtual int do_advance_to_id(const ObDASRowID &target, ObDASRowID &curr_id);
   virtual int do_next_rowid(ObDASRowID &next_id, double &score) = 0;
+  virtual int do_next_rowid(ObDASNestedKey &next_nk, double &score);
   virtual int do_load_curr_score(double &score);
   virtual int do_advance_shallow(const ObDASRowID &target, const bool inclusive, const MaxScoreTuple *&max_score_tuple);
   virtual int do_next_rowids(int64_t capacity, int64_t &count);
@@ -791,7 +805,8 @@ protected:
   ObDASSearchCtx &search_ctx_;
   ObDASSearchOpType op_type_;
   int64_t op_id_;
-  ObDASScopeId scope_;
+  ObDASScopeId scope_; // Output domain; NESTED may consume a different domain.
+  int32_t nesting_depth_;
   MaxScoreTuple max_score_tuple_;
   ObIDASSearchOp **children_;
   int64_t children_cnt_;
@@ -921,6 +936,29 @@ OB_INLINE int ObIDASSearchOp::advance_to(const ObDASRowID &target, ObDASRowID &c
   return ret;
 }
 
+// profile_ is null when runtime diagnosis is off. Skip switcher/timers/metric
+// bumps on that path: advance_to/advance_to_id/next_rowid and score loading are per-row hot loops.
+OB_INLINE int ObIDASSearchOp::advance_to(const ObDASNestedKey &target, ObDASNestedKey &curr_nk, double &score)
+{
+  int ret = OB_SUCCESS;
+  if (OB_LIKELY(nullptr == profile_)) {
+    ret = do_advance_to(target, curr_nk, score);
+  } else {
+    common::ObProfileSwitcher switcher(profile_);
+    common::ScopedTimer total_timer(common::ObMetricId::HS_TOTAL_TIME);
+    common::ScopedTimer timer(common::ObMetricId::HS_ADVANCE_TIME);
+    INC_METRIC_VAL(common::ObMetricId::HS_ADVANCE_COUNT, 1);
+    ret = do_advance_to(target, curr_nk, score);
+    INC_METRIC_VAL(common::ObMetricId::HS_OUTPUT_ROW_COUNT, 1);
+  }
+  if (OB_FAIL(ret)) {
+    LOG_WARN_IGNORE_ITER_END(ret, "failed to advance nested key", KR(ret));
+  } else if (!is_scoring_) {
+    score = 0.0;
+  }
+  return ret;
+}
+
 OB_INLINE int ObIDASSearchOp::advance_to_id(const ObDASRowID &target, ObDASRowID &curr_id)
 {
   int ret = OB_SUCCESS;
@@ -971,6 +1009,27 @@ OB_INLINE int ObIDASSearchOp::load_curr_score(double &score)
     if (OB_FAIL(ret)) {
       LOG_WARN("failed to load curr score", K(ret));
     }
+  }
+  return ret;
+}
+
+OB_INLINE int ObIDASSearchOp::next_rowid(ObDASNestedKey &next_nk, double &score)
+{
+  int ret = OB_SUCCESS;
+  if (OB_LIKELY(nullptr == profile_)) {
+    ret = do_next_rowid(next_nk, score);
+  } else {
+    common::ObProfileSwitcher switcher(profile_);
+    common::ScopedTimer total_timer(common::ObMetricId::HS_TOTAL_TIME);
+    common::ScopedTimer timer(common::ObMetricId::HS_NEXT_ROWID_TIME);
+    INC_METRIC_VAL(common::ObMetricId::HS_NEXT_ROWID_COUNT, 1);
+    ret = do_next_rowid(next_nk, score);
+    INC_METRIC_VAL(common::ObMetricId::HS_OUTPUT_ROW_COUNT, 1);
+  }
+  if (OB_FAIL(ret)) {
+    LOG_WARN_IGNORE_ITER_END(ret, "failed to fetch next nested key", KR(ret));
+  } else if (!is_scoring_) {
+    score = 0.0;
   }
   return ret;
 }

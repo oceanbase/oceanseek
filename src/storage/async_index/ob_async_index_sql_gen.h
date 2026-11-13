@@ -44,7 +44,7 @@ struct ObAsyncIndexSqlParam
     rowkey_columns_ = nullptr;
     order_columns_ = nullptr;
     index_table_id_ = OB_INVALID_ID;
-    is_search_data_ = false;
+    is_async_search_aux_index_ = false;
     snapshot_scn_.reset();
     last_refresh_scn_.reset();
     schema_version_ = 0;
@@ -74,7 +74,7 @@ struct ObAsyncIndexSqlParam
                KP_(rowkey_columns),
                KP_(order_columns),
                K_(index_table_id),
-               K_(is_search_data),
+               K_(is_async_search_aux_index),
                K_(snapshot_scn),
                K_(last_refresh_scn),
                K_(schema_version),
@@ -93,7 +93,7 @@ struct ObAsyncIndexSqlParam
   // Columns selected from the data table into the index table (INSERT-new path).
   const common::ObIArray<common::ObString> *select_columns_;
   // Async Search reads user columns from the main table, then INDEX_DATA_GEN
-  // expands them into select_columns_ (the physical Data target columns).
+  // expands them into select_columns_ (the physical Data/Text target columns).
   const common::ObIArray<common::ObString> *source_columns_;
   // Partition keys plus generated-column dependencies required by DDL routing.
   const common::ObIArray<common::ObString> *partition_key_columns_;
@@ -102,7 +102,8 @@ struct ObAsyncIndexSqlParam
   // INSERT/COMPLETE refresh 的排序列，可能包含非 rowkey 的聚合输入列。
   const common::ObIArray<common::ObString> *order_columns_;
   uint64_t index_table_id_;               // INDEX_DATA_GEN destination schema id
-  bool is_search_data_;
+  // Selects INDEX_DATA_GEN for DATA/MATCH/PHRASE.
+  bool is_async_search_aux_index_;
   share::SCN snapshot_scn_;               // AS OF SNAPSHOT point; the refresh target SCN
   share::SCN last_refresh_scn_;           // ora_rowscn lower bound; the previous refresh point
   int64_t schema_version_;                // schema version for ob_ddl_schema_version hint

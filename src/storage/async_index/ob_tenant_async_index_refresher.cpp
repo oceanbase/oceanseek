@@ -736,7 +736,7 @@ int ObTenantAsyncIndexRefresher::refresh_one_data_table_(
       base_param.is_refresh_on_error_skip_ = index_info.is_refresh_on_error_skip_;
       base_param.is_ivf_index_ = share::schema::is_async_ivf_index(index_info.index_type_);
       base_param.is_search_index_ =
-          share::schema::is_async_search_data_index(index_info.index_type_);
+          share::schema::is_async_search_aux_index(index_info.index_type_);
       base_param.ls_scheduler_ = ls_scheduler;
 
       // Select the op: COMPLETE for a no-baseline non-delete index; otherwise the
@@ -819,7 +819,7 @@ int ObTenantAsyncIndexRefresher::build_refresh_sql_(
   param.rowkey_columns_ = &index_info.rowkey_columns_;
   param.order_columns_ = &index_info.order_columns_;
   param.index_table_id_ = index_info.index_table_id_;
-  param.is_search_data_ = share::schema::is_async_search_data_index(index_info.index_type_);
+  param.is_async_search_aux_index_ = share::schema::is_async_search_aux_index(index_info.index_type_);
   param.enable_newsort_ = index_info.enable_newsort_;
   param.refresh_task_id_ = refresh_task_id;
   param.execution_id_ = 1;  // fixed value for now

@@ -225,6 +225,7 @@ ob_set_subtarget(oblib_lib common_mixed
   json_type/ob_json_bin_view.cpp
   json_type/ob_json_wrapper.cpp
   json_type/ob_json_compare.cpp
+  json_type/ob_json_print.cpp
   json_type/ob_json_bin_agg_serializer.cpp
   lds/ob_lds_define.cpp
   net/ob_addr.cpp

@@ -125,7 +125,8 @@ int ObSMUtils::cell_str(
     const ObField *field,
     const sql::ObSQLSessionInfo &session,
     ObSchemaGetterGuard *schema_guard,
-    uint64_t tenant_id)
+    uint64_t tenant_id,
+    bool enable_json_bin_view)
 {
   int ret = OB_SUCCESS;
 
@@ -194,7 +195,7 @@ int ObSMUtils::cell_str(
         break;
       }
       case ObJsonTC:{
-        ret = ObMySQLUtil::json_cell_str(MTL_ID(), buf, len, obj.get_string(), pos);
+        ret = ObMySQLUtil::json_cell_str(MTL_ID(), buf, len, obj.get_string(), pos, enable_json_bin_view);
         break;
       }
       case ObGeometryTC: {

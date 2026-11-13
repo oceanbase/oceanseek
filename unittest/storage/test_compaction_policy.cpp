@@ -15,6 +15,7 @@
 #include "storage/test_schema_prepare.h"
 #include "storage/test_tablet_helper.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable.h"
+#include "storage/retrieval/ob_inv_bm25_stat_cache.h"
 #include "storage/compaction/ob_async_index_merge_policy.h"
 #include "storage/compaction/ob_tablet_merge_ctx.h"
 #include "storage/ddl/ob_ddl_merge_helper.h"
@@ -1231,8 +1232,29 @@ TEST_F(TestCompactionPolicy, calculate_tx_data_recycle_scn_scans_same_window_ret
   }
 }
 
+namespace
+{
+void cache_test_document_length(const ObSSTable &table, const uint64_t length)
+{
+  ObArenaAllocator allocator(lib::ObMemAttr(MTL_ID(), "BM25StatTst"));
+  number::ObNumber number;
+  ASSERT_EQ(OB_SUCCESS, number.from(length, allocator));
+  const ObInvBM25StatCacheKey key(MTL_ID(), ObInvBM25StatCacheKey::FULLTEXT_COLUMN_IDX, ObString(), table.get_key());
+  ASSERT_EQ(OB_SUCCESS, OB_INV_BM25_STAT_CACHE.put_stat(key, number));
+}
+
+void expect_test_document_length(const uint64_t expected, const ObStorageDatum &actual)
+{
+  uint64_t value = 0;
+  ASSERT_TRUE(number::ObNumber(actual.get_number()).is_valid_uint64(value));
+  EXPECT_EQ(expected, value);
+}
+} // namespace
+
 TEST_F(TestCompactionPolicy, calculate_inc_major_read_tables_filters_abort_from_bm25)
 {
+  ASSERT_EQ(OB_SUCCESS, OB_INV_BM25_STAT_CACHE.init("test_bm25_table_selection", 1));
+  DEFER(OB_INV_BM25_STAT_CACHE.destroy());
   ObTabletHandle tablet_handle;
   ASSERT_EQ(OB_SUCCESS, mock_tablet(allocator_, 100, 100, false, tablet_handle));
   ASSERT_TRUE(tablet_handle.is_valid());
@@ -1295,6 +1317,7 @@ TEST_F(TestCompactionPolicy, calculate_inc_major_read_tables_filters_abort_from_
       static_cast<ObInvSSTable *>(committed_retry)->set_inv_meta(
           committed_inv_meta));
 
+  cache_test_document_length(*committed_retry, 200);
   for (int64_t pending_first = 0; pending_first < 2; ++pending_first) {
     ObSEArray<ObITable *, 2> inc_major_tables;
     ASSERT_EQ(OB_SUCCESS, inc_major_tables.push_back(
@@ -1316,20 +1339,23 @@ TEST_F(TestCompactionPolicy, calculate_inc_major_read_tables_filters_abort_from_
     ASSERT_NE(nullptr, read_table);
     EXPECT_EQ(committed_retry->get_key(), read_table->get_key());
 
-    ObAsyncInvBM25Stats stats;
+    ObStorageDatum total_doc_length;
     ObStorageMetaHandle table_store_handle;
     SCN read_snapshot;
     ASSERT_EQ(OB_SUCCESS, read_snapshot.convert_for_tx(150));
     table_store.is_inited_ = true;
     ASSERT_EQ(OB_SUCCESS,
         tablet_handle.get_obj()->aggregate_async_inv_bm25_stats_(
-            table_store, table_store_handle, read_snapshot, stats));
-    EXPECT_EQ(200, stats.total_doc_length_);
+            table_store, table_store_handle, read_snapshot, nullptr,
+            ObInvBM25StatKind::TOTAL_DOC_LENGTH, ObString(), total_doc_length));
+    expect_test_document_length(200, total_doc_length);
   }
 }
 
 TEST_F(TestCompactionPolicy, async_bm25_filters_uncommitted_and_future_logical_ranges)
 {
+  ASSERT_EQ(OB_SUCCESS, OB_INV_BM25_STAT_CACHE.init("test_bm25_table_selection", 1));
+  DEFER(OB_INV_BM25_STAT_CACHE.destroy());
   ObTabletHandle tablet_handle;
   ASSERT_EQ(OB_SUCCESS, mock_tablet(allocator_, 100, 100, false, tablet_handle));
   // Two committed retries cover (0, 100]; only the one with the largest end SCN counts.
@@ -1360,21 +1386,23 @@ TEST_F(TestCompactionPolicy, async_bm25_filters_uncommitted_and_future_logical_r
     ObInvSSTableMeta meta;
     ASSERT_EQ(OB_SUCCESS, meta.init(stats_meta));
     ASSERT_EQ(OB_SUCCESS, inv_sstable->set_inv_meta(meta));
+    cache_test_document_length(*sstable, doc_lengths[i]);
     ASSERT_EQ(OB_SUCCESS, increments.push_back(sstable));
   }
   ObTabletTableStore table_store;
   ASSERT_EQ(OB_SUCCESS, table_store.inc_major_tables_.init(allocator_, increments));
   table_store.is_inited_ = true;
   ObStorageMetaHandle table_store_handle;
-  ObAsyncInvBM25Stats stats;
+  ObStorageDatum total_doc_length;
   const int64_t snapshots[] = {99, 100, 150, 200};
   const uint64_t expected_lengths[] = {0, 200, 200, 500};
   for (int64_t i = 0; i < ARRAYSIZEOF(snapshots); ++i) {
     SCN read_snapshot;
     ASSERT_EQ(OB_SUCCESS, read_snapshot.convert_for_tx(snapshots[i]));
     ASSERT_EQ(OB_SUCCESS, tablet_handle.get_obj()->aggregate_async_inv_bm25_stats_(
-        table_store, table_store_handle, read_snapshot, stats));
-    EXPECT_EQ(expected_lengths[i], stats.total_doc_length_);
+        table_store, table_store_handle, read_snapshot, nullptr,
+        ObInvBM25StatKind::TOTAL_DOC_LENGTH, ObString(), total_doc_length));
+    expect_test_document_length(expected_lengths[i], total_doc_length);
   }
 
   // A Major replaces increments it already covers rather than adding to their statistics.
@@ -1389,27 +1417,48 @@ TEST_F(TestCompactionPolicy, async_bm25_filters_uncommitted_and_future_logical_r
   ObInvSSTableMeta major_meta;
   ASSERT_EQ(OB_SUCCESS, major_meta.init(major_stats));
   ASSERT_EQ(OB_SUCCESS, inv_major->set_inv_meta(major_meta));
+  cache_test_document_length(*inv_major, major_stats.total_doc_length_);
   ObSEArray<ObITable *, 1> majors;
   ASSERT_EQ(OB_SUCCESS, majors.push_back(major));
   ASSERT_EQ(OB_SUCCESS, table_store.major_tables_.init(allocator_, majors));
   SCN read_snapshot;
   ASSERT_EQ(OB_SUCCESS, read_snapshot.convert_for_tx(200));
   ASSERT_EQ(OB_SUCCESS, tablet_handle.get_obj()->aggregate_async_inv_bm25_stats_(
-      table_store, table_store_handle, read_snapshot, stats));
-  EXPECT_EQ(350, stats.total_doc_length_);
+      table_store, table_store_handle, read_snapshot, nullptr,
+      ObInvBM25StatKind::TOTAL_DOC_LENGTH, ObString(), total_doc_length));
+  expect_test_document_length(350, total_doc_length);
 
-  // A physically empty baseline with empty statistics contributes zero, while reset metadata is rejected.
+  // Cross-table total length remains Number even when the legacy uint64 sum would overflow.
+  // This test mutates a mock SSTable in place; evict its old statistic before reseeding.
+  const ObInvBM25StatCacheKey major_key(
+      MTL_ID(), ObInvBM25StatCacheKey::FULLTEXT_COLUMN_IDX, ObString(), major->get_key());
+  ASSERT_EQ(OB_SUCCESS, OB_INV_BM25_STAT_CACHE.erase(major_key));
   inv_major = static_cast<ObInvSSTable *>(table_store.major_tables_.at(0));
-  ASSERT_TRUE(inv_major->is_empty());
-  inv_major->inv_meta_.reuse();
-  ASSERT_EQ(OB_SUCCESS, read_snapshot.convert_for_tx(100));
-  ASSERT_EQ(OB_SUCCESS, tablet_handle.get_obj()->aggregate_async_inv_bm25_stats_(
-      table_store, table_store_handle, read_snapshot, stats));
-  EXPECT_EQ(0, stats.total_doc_length_);
+  major_stats.total_doc_length_ = UINT64_MAX;
+  major_meta.reset();
+  ASSERT_EQ(OB_SUCCESS, major_meta.init(major_stats));
+  ASSERT_EQ(OB_SUCCESS, inv_major->set_inv_meta(major_meta));
+  cache_test_document_length(*inv_major, major_stats.total_doc_length_);
+  EXPECT_EQ(OB_SUCCESS, tablet_handle.get_obj()->aggregate_async_inv_bm25_stats_(
+      table_store, table_store_handle, read_snapshot, nullptr,
+      ObInvBM25StatKind::TOTAL_DOC_LENGTH, ObString(), total_doc_length));
+  number::ObNumber expected_sum;
+  ASSERT_EQ(OB_SUCCESS, expected_sum.from("18446744073709551915", allocator_));
+  EXPECT_EQ(0, expected_sum.compare(total_doc_length.get_number()));
 
-  inv_major->inv_meta_.reset();
-  ASSERT_EQ(OB_ERR_UNEXPECTED, tablet_handle.get_obj()->aggregate_async_inv_bm25_stats_(
-      table_store, table_store_handle, read_snapshot, stats));
+  // No selected logical range publishes zero, not the previous successful sum.
+  ASSERT_EQ(OB_SUCCESS, read_snapshot.convert_for_tx(99));
+  ASSERT_EQ(OB_SUCCESS, tablet_handle.get_obj()->aggregate_async_inv_bm25_stats_(
+      table_store, table_store_handle, read_snapshot, nullptr,
+      ObInvBM25StatKind::TOTAL_DOC_LENGTH, ObString(), total_doc_length));
+  EXPECT_TRUE(total_doc_length.get_number().is_zero());
+
+  // An unknown kind must be rejected even when no SSTable matches the snapshot.
+  total_doc_length.set_uint(UINT64_MAX);
+  EXPECT_EQ(OB_INVALID_ARGUMENT, tablet_handle.get_obj()->aggregate_async_inv_bm25_stats_(
+      table_store, table_store_handle, read_snapshot, nullptr,
+      static_cast<ObInvBM25StatKind>(UINT8_MAX), ObString::make_string("ocean"), total_doc_length));
+  EXPECT_TRUE(total_doc_length.is_nop());
 }
 #endif
 

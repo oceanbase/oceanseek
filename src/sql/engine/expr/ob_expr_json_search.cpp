@@ -8,6 +8,8 @@
 #include "share/ob_json_access_utils.h"
 #include "ob_expr_json_func_helper.h"
 #include "sql/engine/ob_exec_context.h"
+#include "lib/container/ob_se_array.h"
+#include "lib/json_type/ob_json_bin_agg_serializer.h"
 #include "lib/json_type/ob_json_wrapper.h"
 using namespace oceanbase::common;
 using namespace oceanbase::sql;
@@ -542,6 +544,7 @@ int ObExprJsonSearch::eval_json_search(const ObExpr &expr, ObEvalCtx &ctx, ObDat
 
   // packed string to return
   ObIJsonBase *j_res = NULL;
+  ObString raw_bin;
   if (OB_UNLIKELY(OB_FAIL(ret))) {
     LOG_WARN("json_search failed", K(ret));
   } else if (hits.size() == 0) {
@@ -556,26 +559,34 @@ int ObExprJsonSearch::eval_json_search(const ObExpr &expr, ObEvalCtx &ctx, ObDat
       j_res = j_str;
     }
   } else {
-    void *buf = temp_allocator.alloc(sizeof(ObJsonArray));
-    if (OB_ISNULL(buf)) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
-      LOG_WARN("json_search alloc ObJsonArray failed", K(ret));
-    } else {
-      ObJsonArray *j_arr = new (buf) ObJsonArray(&temp_allocator);
-      for (int32_t i = 0; OB_SUCC(ret) && i < hits.size(); i++) {
-        buf = temp_allocator.alloc(sizeof(ObJsonString));
-        if (OB_ISNULL(buf)) {
-          ret = OB_ALLOCATE_MEMORY_FAILED;
-          LOG_WARN("json_search alloc jsonString failed", K(ret));
-        } else {
-          ObJsonString *j_str = new (buf) ObJsonString(hits[i]->ptr(), hits[i]->length());
-          if (OB_FAIL(j_arr->append(j_str))) {
-            LOG_WARN("failed to append path to array.", K(ret), K(i), K(*j_str));
-          }
-        }
+    ModulePageAllocator paths_allocator(ObModIds::OB_SE_ARRAY);
+    paths_allocator.set_allocator(&temp_allocator);
+    ObSEArray<ObString, 8> paths(OB_MALLOC_NORMAL_BLOCK_SIZE, paths_allocator);
+    for (int64_t index = 0; OB_SUCC(ret) && index < hits.size(); ++index) {
+      if (OB_FAIL(paths.push_back(hits[index]->string()))) {
+        LOG_WARN("collect json search path failed", K(ret), K(index));
       }
-      if (OB_SUCC(ret)) {
-        j_res = j_arr;
+    }
+    ObSQLSessionInfo *session = ctx.exec_ctx_.get_my_session();
+    bool enable_json_bin_view = OB_NOT_NULL(session) ? session->is_enable_json_bin_view() : true;
+    if (OB_FAIL(ret)) {
+    } else if (enable_json_bin_view) {
+      // Reuse enable_json_bin_view to toggle this optimization and fall back to the old path when disabled.
+      if (OB_FAIL(ObJsonBinAggSerializer::serialize(temp_allocator, paths, raw_bin))) {
+        LOG_WARN("serialize json search array failed", K(ret));
+      }
+    } else {
+      void *buf = temp_allocator.alloc(sizeof(ObJsonArray));
+      if (OB_ISNULL(buf)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("json_search alloc ObJsonArray failed", K(ret));
+      } else {
+        ObJsonArray *j_arr = new (buf) ObJsonArray(&temp_allocator);
+        if (OB_FAIL(ObJsonExprHelper::append_json_strings(temp_allocator, paths, *j_arr))) {
+          LOG_WARN("append search paths failed", K(ret));
+        } else {
+          j_res = j_arr;
+        }
       }
     }
   }
@@ -584,9 +595,9 @@ int ObExprJsonSearch::eval_json_search(const ObExpr &expr, ObEvalCtx &ctx, ObDat
     if (is_null) {
       res.set_null();
     } else {
-      ObString raw_bin;
-      if (OB_FAIL(share::ObJsonAccessUtils::get_raw_binary(j_res, raw_bin, &temp_allocator))) {
-        LOG_WARN("json_keys get result binary failed", K(ret));
+      if (OB_NOT_NULL(j_res)
+          && OB_FAIL(share::ObJsonAccessUtils::get_raw_binary(j_res, raw_bin, &temp_allocator))) {
+        LOG_WARN("json_search get result binary failed", K(ret));
       } else if (OB_FAIL(ObJsonExprHelper::pack_json_str_res(expr, ctx, res, raw_bin))) {
         LOG_WARN("fail to pack json result", K(ret));
       }

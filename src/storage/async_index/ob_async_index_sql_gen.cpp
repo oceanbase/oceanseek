@@ -26,7 +26,7 @@ bool ObAsyncIndexSqlParam::is_valid_for_insert() const
       && select_columns_->count() > 0
       && nullptr != order_columns_
       && order_columns_->count() > 0
-      && (!is_search_data_
+      && (!is_async_search_aux_index_
           || (OB_INVALID_ID != index_table_id_
               && nullptr != source_columns_
               && source_columns_->count() > 0))
@@ -60,7 +60,7 @@ bool ObAsyncIndexSqlParam::is_valid_for_complete() const
       && select_columns_->count() > 0
       && nullptr != order_columns_
       && order_columns_->count() > 0
-      && (!is_search_data_
+      && (!is_async_search_aux_index_
           || (OB_INVALID_ID != index_table_id_
               && nullptr != source_columns_
               && source_columns_->count() > 0))
@@ -325,7 +325,7 @@ int ObAsyncIndexSqlGenerator::generate_insert_new_rows_sql(const ObAsyncIndexSql
   // DDL build-replica SQL (ObDDLUtil::generate_build_replica_sql) does.
   } else if (OB_FAIL(append_insert_column_list_(*param.select_columns_, is_oracle, allocator, sql))) {
     LOG_WARN("failed to append insert column list", K(ret));
-  } else if (param.is_search_data_) {
+  } else if (param.is_async_search_aux_index_) {
     if (OB_FAIL(append_search_data_gen_select_(param, true, allocator, sql))) {
       LOG_WARN("failed to append async search insert select", K(ret));
     }
@@ -377,7 +377,7 @@ int ObAsyncIndexSqlGenerator::generate_complete_refresh_sql(const ObAsyncIndexSq
   // and break PDML partition routing with -4002).
   } else if (OB_FAIL(append_insert_column_list_(*param.select_columns_, is_oracle, allocator, sql))) {
     LOG_WARN("failed to append insert column list", K(ret));
-  } else if (param.is_search_data_) {
+  } else if (param.is_async_search_aux_index_) {
     if (OB_FAIL(append_search_data_gen_select_(param, false, allocator, sql))) {
       LOG_WARN("failed to append async search complete select", K(ret));
     }

@@ -35,7 +35,9 @@ public:
         batch_allocator_(common::ObMemAttr(MTL_ID(), "DASReqExclBatch")),
         batch_ids_(nullptr),
         batch_scores_(nullptr),
-        use_deletion_bitmap_(false)
+        use_deletion_bitmap_(false),
+        nested_excluded_matches_doc_(false),
+        is_first_nk_(true)
   { }
 
   bool can_enumerate_rowids() const override
@@ -45,12 +47,21 @@ public:
   }
 
 private:
+  int init_nested_key_cursor();
+  int filter_nested_key(ObDASNestedKey &key, double &score);
   int do_init(const ObIDASSearchOpParam &op_param) override;
   int do_open() override;
   int do_close() override;
   int do_rescan() override;
+  int do_rescan_segment(const common::ObNewVersionRange &range) override
+  {
+    is_first_nk_ = true;
+    return ObIDASSearchOp::do_rescan_segment(range);
+  }
   int do_advance_to(const ObDASRowID &target, ObDASRowID &curr_id, double &score) override;
   int do_next_rowid(ObDASRowID &next_id, double &score) override;
+  int do_advance_to(const ObDASNestedKey &target, ObDASNestedKey &curr_nk, double &score) override;
+  int do_next_rowid(ObDASNestedKey &next_nk, double &score) override;
   int do_drain_until(const ObDASRowID &boundary,
                      int64_t capacity,
                      uint64_t *out_ids,
@@ -85,6 +96,9 @@ private:
   double *batch_scores_;
   // Selected once at open from the fixed RowID and excluded-op types.
   bool use_deletion_bitmap_;
+  bool nested_excluded_matches_doc_;
+  bool is_first_nk_;
+  ObDASRowID required_doc_id_;
 };
 
 } // namespace sql

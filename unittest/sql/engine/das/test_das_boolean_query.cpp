@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <string>
 #include <gtest/gtest.h>
 #define private public
 #define protected public
@@ -37,6 +38,10 @@
 #include "sql/das/search/ob_das_search_define.h"
 #include "sql/das/search/ob_das_req_opt_op.h"
 #include "sql/das/search/ob_das_topk_collect_op.h"
+#include "share/search_index/ob_search_index_config.h"
+#include "share/schema/ob_schema_getter_guard.h"
+#include "sql/resolver/ob_schema_checker.h"
+#include "lib/json_type/ob_json_base.h"
 #undef private
 
 using namespace oceanbase;
@@ -6595,6 +6600,209 @@ TEST_F(ObHybridSearchPrimaryGetRatioDefaultTest, zero_tenant_value_keeps_default
   EXPECT_EQ(nullptr, knn_search_option);
 }
 
+
+class ObHybridSearchNestedFulltextTest : public ::testing::Test
+{
+public:
+  ObHybridSearchNestedFulltextTest()
+    : expr_factory_(allocator_), table_item_(allocator_), stmt_(stmt::T_SELECT, allocator_) {}
+
+protected:
+  void SetUp() override
+  {
+    params_.allocator_ = &allocator_;
+    params_.session_info_ = &session_;
+    params_.expr_factory_ = &expr_factory_;
+    params_.schema_checker_ = &schema_checker_;
+    session_.effective_tenant_id_ = OB_SYS_TENANT_ID;
+    table_item_.dsl_query_ = &dsl_info_;
+    sql_schema_guard_.set_schema_guard(&schema_guard_);
+    ASSERT_EQ(OB_SUCCESS, schema_checker_.init(sql_schema_guard_));
+    base_schema_.set_tenant_id(OB_SYS_TENANT_ID);
+    base_schema_.set_table_id(500001);
+    base_schema_.set_table_type(share::schema::USER_TABLE);
+    ASSERT_EQ(OB_SUCCESS, base_schema_.set_table_name("docs"));
+    share::schema::ObColumnSchemaV2 column;
+    column.set_tenant_id(OB_SYS_TENANT_ID);
+    column.set_table_id(base_schema_.get_table_id());
+    column.set_column_id(OB_APP_MIN_COLUMN_ID);
+    column.set_data_type(ObJsonType);
+    column.set_collation_type(CS_TYPE_UTF8MB4_BIN);
+    ASSERT_EQ(OB_SUCCESS, column.set_column_name("payload"));
+    ASSERT_EQ(OB_SUCCESS, base_schema_.add_column(column));
+    // Use the schema guard's existing in-memory schema registry; no schema service is needed.
+    init_index(index_schema_, OB_MIN_EXTERNAL_OBJECT_ID + 1, column);
+    ASSERT_FALSE(HasFatalFailure());
+    set_versioned_config();
+    ASSERT_FALSE(HasFatalFailure());
+  }
+
+  void init_index(share::schema::ObTableSchema &index, uint64_t id,
+                  const share::schema::ObColumnSchemaV2 &base_column)
+  {
+    share::schema::ObColumnSchemaV2 column;
+    ASSERT_EQ(OB_SUCCESS, column.assign(base_column));
+    index.set_tenant_id(OB_SYS_TENANT_ID);
+    index.set_table_id(id);
+    index.set_data_table_id(base_schema_.get_table_id());
+    index.set_table_type(share::schema::USER_INDEX);
+    index.set_index_type(share::schema::INDEX_TYPE_ASYNC_SEARCH_DEF_INDEX_LOCAL);
+    ASSERT_EQ(OB_SUCCESS, index.set_table_name("search_idx"));
+    column.set_table_id(id);
+    ASSERT_EQ(OB_SUCCESS, index.add_column(column));
+    ASSERT_EQ(OB_SUCCESS, base_schema_.add_simple_index_info(
+        share::schema::ObAuxTableMetaInfo(id, index.get_table_type(), index.get_index_type())));
+    ASSERT_EQ(OB_SUCCESS, sql_schema_guard_.get_mocked_table_schemas().push_back(&index));
+  }
+
+  void set_versioned_config(bool fulltext_only = false)
+  {
+    share::ObSearchIndexModeConfig mode;
+    if (fulltext_only) {
+      mode.mode_ = share::ObSearchIndexModeConfig::FULLTEXT_MATCH;
+      mode.filter_ = "INCLUDE_PATHS=7$.decoyINCLUDE_TYPES=11json_string";
+      mode.parser_name_ = "space.1";
+      mode.parser_properties_ = "{}";
+    }
+    share::ObSearchIndexConfig config;
+    ObSEArray<share::ObSearchIndexModeConfig, 1> modes;
+    ASSERT_EQ(OB_SUCCESS, modes.push_back(mode));
+    ASSERT_EQ(OB_SUCCESS, config.init(modes,
+        fulltext_only ? ObString() : ObString("NESTED_PATHS=7$.items16$.items.children")));
+    ObSqlString encoded;
+    ASSERT_EQ(OB_SUCCESS, config.encode(encoded));
+    ASSERT_EQ(OB_SUCCESS, index_schema_.get_column_schema(OB_APP_MIN_COLUMN_ID)->set_comment(encoded.string()));
+  }
+
+  int resolve(ObDSLResolver &resolver, const std::string &text, ObDSLQuery *&query)
+  {
+    int ret = OB_SUCCESS;
+    ObIJsonBase *json = nullptr;
+    const ObString input(text.size(), text.data());
+    if (OB_FAIL(ObJsonBaseFactory::get_json_base(&allocator_, input,
+        ObJsonInType::JSON_TREE, ObJsonInType::JSON_TREE, json))) {
+      LOG_WARN("failed to parse nested fulltext test query", K(ret), K(input));
+    } else {
+      query = nullptr;
+      if (OB_FAIL(resolver.resolve_single_term(*json, query, nullptr, QUERY_ITEM_QUERY))) {
+        LOG_WARN("failed to resolve nested fulltext test query", K(ret), K(input));
+      }
+    }
+    return ret;
+  }
+
+  std::string nested(const std::string &query, const char *path = "payload.items")
+  {
+    return std::string("{\"nested\":{\"path\":\"") + path + "\",\"query\":" + query + "}}";
+  }
+
+  ObArenaAllocator allocator_;
+  ObRawExprFactory expr_factory_;
+  ObSQLSessionInfo session_;
+  ObResolverParams params_;
+  ObDSLQueryInfo dsl_info_;
+  TableItem table_item_;
+  ObDMLStmt stmt_;
+  share::schema::ObSchemaGetterGuard schema_guard_;
+  ObSqlSchemaGuard sql_schema_guard_;
+  ObSchemaChecker schema_checker_;
+  share::schema::ObTableSchema base_schema_;
+  share::schema::ObTableSchema index_schema_;
+};
+
+TEST_F(ObHybridSearchNestedFulltextTest, versioned_value_paths_union_with_legacy_and_borrow_schema_strings)
+{
+  share::schema::ObTableSchema legacy_index;
+  init_index(legacy_index, OB_MIN_EXTERNAL_OBJECT_ID + 2,
+             *base_schema_.get_column_schema(OB_APP_MIN_COLUMN_ID));
+  ASSERT_FALSE(HasFatalFailure());
+  ASSERT_EQ(OB_SUCCESS, legacy_index.get_column_schema(OB_APP_MIN_COLUMN_ID)->set_comment(
+      ObString("NESTED_PATHS=7$.items8$.legacy")));
+  ObDSLResolver resolver(params_, &base_schema_, &stmt_, table_item_);
+  ASSERT_EQ(OB_SUCCESS, resolver.init_col_schema_map());
+  ObSEArray<ObString, 4> paths;
+  ASSERT_EQ(OB_SUCCESS, resolver.get_declared_nested_paths_for_column(ObString("payload"), paths));
+  ASSERT_EQ(3, paths.count());
+  EXPECT_EQ(ObString("$.items"), paths.at(0));
+  EXPECT_EQ(ObString("$.items.children"), paths.at(1));
+  EXPECT_EQ(ObString("$.legacy"), paths.at(2));
+  // Returned paths borrow the schema comments, which outlive the resolver call.
+  const ObString legacy_comment = legacy_index.get_column_schema(OB_APP_MIN_COLUMN_ID)->get_comment_str();
+  EXPECT_EQ(legacy_comment.ptr() + legacy_comment.length() - paths.at(2).length(), paths.at(2).ptr());
+}
+
+TEST_F(ObHybridSearchNestedFulltextTest, fulltext_only_column_has_no_declared_nested_paths)
+{
+  set_versioned_config(true);
+  ASSERT_FALSE(HasFatalFailure());
+  ObDSLResolver resolver(params_, &base_schema_, &stmt_, table_item_);
+  ASSERT_EQ(OB_SUCCESS, resolver.init_col_schema_map());
+  ObSEArray<ObString, 4> paths;
+  ASSERT_EQ(OB_SUCCESS, resolver.get_declared_nested_paths_for_column(ObString("payload"), paths));
+  EXPECT_TRUE(paths.empty());
+  ObDSLQuery *query = nullptr;
+  EXPECT_EQ(OB_INVALID_ARGUMENT, resolve(resolver, nested(R"({"match":{"payload":"hello"}})"), query));
+  EXPECT_EQ(nullptr, query);
+  EXPECT_TRUE(resolver.enclosing_nested_paths_.empty());
+  EXPECT_TRUE(resolver.nested_col_.empty());
+}
+
+TEST_F(ObHybridSearchNestedFulltextTest, all_fulltext_types_are_rejected_inside_nested)
+{
+  ObDSLResolver resolver(params_, &base_schema_, &stmt_, table_item_);
+  ASSERT_EQ(OB_SUCCESS, resolver.init_col_schema_map());
+  const char *queries[] = {
+    R"({"match":{"payload":"hello"}})",
+    R"({"MATCH":{"payload":"hello"}})",
+    R"({"match_phrase":{"payload":"hello world"}})",
+    R"({"MATCH_PHRASE":{"payload":"hello world"}})",
+    R"({"multi_match":{"fields":["payload"],"query":"hello"}})",
+    R"({"MULTI_MATCH":{"fields":["payload"],"query":"hello"}})",
+    R"({"query_string":{"fields":["payload"],"query":"hello"}})",
+    R"({"QUERY_STRING":{"fields":["payload"],"query":"hello"}})"
+  };
+  const char *clauses[] = {"must", "should", "filter", "must_not"};
+  for (const char *text : queries) {
+    SCOPED_TRACE(text);
+    ObDSLQuery *query = nullptr;
+    EXPECT_EQ(OB_NOT_SUPPORTED, resolve(resolver, nested(text), query));
+    EXPECT_EQ(nullptr, query);
+    EXPECT_TRUE(resolver.enclosing_nested_paths_.empty());
+    EXPECT_TRUE(resolver.nested_col_.empty());
+    for (const char *clause : clauses) {
+      SCOPED_TRACE(clause);
+      const std::string boolean = std::string("{\"bool\":{\"") + clause + "\":[" + text + "]}}";
+      EXPECT_EQ(OB_NOT_SUPPORTED, resolve(resolver, nested(boolean), query));
+      EXPECT_TRUE(resolver.enclosing_nested_paths_.empty());
+      EXPECT_TRUE(resolver.nested_col_.empty());
+    }
+  }
+}
+
+TEST_F(ObHybridSearchNestedFulltextTest, recursive_nested_restores_scope_before_following_query)
+{
+  ObDSLResolver resolver(params_, &base_schema_, &stmt_, table_item_);
+  ASSERT_EQ(OB_SUCCESS, resolver.init_col_schema_map());
+  ObDSLQuery *query = nullptr;
+  const std::string inner = nested(R"({"bool":{"must_not":[{"match":{"payload":"hello"}}]}})",
+                                  "payload.items.children");
+  EXPECT_EQ(OB_NOT_SUPPORTED, resolve(resolver, nested(inner), query));
+  EXPECT_TRUE(resolver.enclosing_nested_paths_.empty());
+  EXPECT_TRUE(resolver.nested_col_.empty());
+  // Outside nested scope the ordinary fulltext argument checks must still run.
+  const char *invalid_fulltext[] = {
+    R"({"match":0})", R"({"match_phrase":0})",
+    R"({"multi_match":0})", R"({"query_string":0})"
+  };
+  for (const char *text : invalid_fulltext) {
+    SCOPED_TRACE(text);
+    EXPECT_EQ(OB_INVALID_ARGUMENT, resolve(resolver, text, query));
+  }
+  EXPECT_EQ(OB_INVALID_ARGUMENT, resolve(resolver,
+      nested(R"({"term":{}})"), query));
+  EXPECT_TRUE(resolver.enclosing_nested_paths_.empty());
+  EXPECT_TRUE(resolver.nested_col_.empty());
+}
 
 int main(int argc, char **argv)
 {

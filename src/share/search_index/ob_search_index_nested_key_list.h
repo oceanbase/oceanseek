@@ -70,6 +70,7 @@ public:
   int lower_bound(const common::ObDatum &target, common::ObDatum &nested_key);
   void reset();
 
+  OB_INLINE int32_t get_key_length() const { return key_length_; }
   OB_INLINE uint32_t get_count() const { return key_count_; }
   OB_INLINE bool is_inited() const { return is_inited_; }
 

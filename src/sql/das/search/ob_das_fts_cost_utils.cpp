@@ -9,6 +9,8 @@
 #include "ob_das_scalar_define.h"
 #include "ob_das_search_context.h"
 #include "ob_das_search_define.h"
+#include "ob_das_search_utils.h"
+#include "storage/blocksstable/ob_datum_rowkey.h"
 #include "lib/container/ob_heap.h"
 #include "storage/retrieval/ob_inv_idx_param_estimator.h"
 
@@ -26,25 +28,39 @@ int ObDASFtsCostUtils::estimate_async_token_doc_cnts(
 {
   int ret = OB_SUCCESS;
   const ObDASScalarScanCtDef *inv_idx_scan_ctdef = ir_ctdef.get_inv_idx_scan_scalar_ctdef();
+  const bool is_search_index_fulltext = ir_ctdef.search_index_fulltext_info_.has_search_index_fulltext();
   common::ObTabletID inv_idx_tablet_id;
+  common::ObArenaAllocator term_allocator(common::ObMemAttr(MTL_ID(), "FtsCostTerm"));
   storage::ObAsyncBM25ParamEstimator estimator;
   token_doc_cnts.reuse();
   if (query_tokens.empty()) {
     // no token needs estimation
+  } else if (is_search_index_fulltext && OB_ISNULL(ir_ctdef.search_text_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null Search Text expression", KR(ret));
   } else if (OB_ISNULL(inv_idx_scan_ctdef)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected null inverted index scan ctdef", KR(ret));
   } else if (OB_FAIL(search_ctx.get_related_tablet_id(inv_idx_scan_ctdef, inv_idx_tablet_id))) {
     LOG_WARN("failed to get inverted index tablet id", KR(ret), KPC(inv_idx_scan_ctdef));
   } else if (OB_FAIL(estimator.init(
-      search_ctx, ir_ctdef, ir_rtdef, inv_idx_tablet_id, query_tokens.at(0)))) {
+      search_ctx, ir_ctdef, ir_rtdef, inv_idx_tablet_id,
+      is_search_index_fulltext, ir_ctdef.search_index_fulltext_info_.column_idx_,
+      ir_ctdef.search_index_fulltext_info_.encoded_path_, query_tokens.at(0)))) {
     LOG_WARN("failed to init async bm25 param estimator",
         KR(ret), K(inv_idx_tablet_id), K(query_tokens.at(0)));
   }
 
   for (int64_t i = 0; OB_SUCC(ret) && i < query_tokens.count(); ++i) {
     uint64_t token_doc_cnt = 0;
-    if (i > 0 && OB_FAIL(estimator.switch_query_token(query_tokens.at(i)))) {
+    common::ObString token = query_tokens.at(i);
+    blocksstable::ObDatumRowkey term_key;
+    if (is_search_index_fulltext && OB_FAIL(ObDASSearchUtils::build_fulltext_term_key(
+        ir_ctdef.search_index_fulltext_info_, token, ir_ctdef.search_text_->obj_meta_, term_allocator, term_key))) {
+      LOG_WARN("failed to build async cost estimation term key", KR(ret), K(i));
+    } else if (is_search_index_fulltext && FALSE_IT(
+        token = term_key.get_datum(term_key.get_datum_cnt() - 1).get_string())) {
+    } else if (OB_FAIL(estimator.switch_query_token(token))) {
       LOG_WARN("failed to switch async bm25 estimator token",
           KR(ret), K(i), K(query_tokens.at(i)));
     } else if (OB_FAIL(estimator.get_token_doc_cnt(token_doc_cnt))) {

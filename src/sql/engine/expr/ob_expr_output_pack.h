@@ -42,13 +42,13 @@ private:
                          char *buf, int64_t len, int64_t &pos, char *bitmap, int64_t column_num,
                          ObSQLSessionInfo *session,
                          share::schema::ObSchemaGetterGuard *schema_guard,
-                         obmysql::MYSQL_PROTOCOL_TYPE encode_type);
+                         obmysql::MYSQL_PROTOCOL_TYPE encode_type, bool enable_json_bin_view);
   static int try_encode_row(const ObExpr &expr, ObEvalCtx &ctx, ObSQLSessionInfo *session,
                             common::ObIAllocator &alloc, ObOutputPackInfo *extra_info,
                             char *buffer, char *bitmap,
                             share::schema::ObSchemaGetterGuard *schema_guard,
                             obmysql::MYSQL_PROTOCOL_TYPE encode_type,
-                            const int64_t len, int64_t &pos);
+                            const int64_t len, int64_t &pos, bool enable_json_bin_view);
   static int reset_bitmap(char *result_buffer, const int64_t len,
                           const int64_t column_num, int64_t &pos, char *&bitmap);
   static int convert_string_value_charset(common::ObObj &value,
@@ -75,7 +75,8 @@ private:
                                     char *buf, int32_t buf_len, uint32_t &result_len);
   static int process_oneline(const ObExpr &expr, ObEvalCtx &ctx, ObSQLSessionInfo *session,
                              common::ObIAllocator &alloc, ObOutputPackInfo *extra_info,
-                             share::schema::ObSchemaGetterGuard *schema_guard, ObDatum &expr_datum);
+                             share::schema::ObSchemaGetterGuard *schema_guard, ObDatum &expr_datum,
+                             bool enable_json_bin_view);
   DISALLOW_COPY_AND_ASSIGN(ObExprOutputPack);
 };
 

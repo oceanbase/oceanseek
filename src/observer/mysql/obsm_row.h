@@ -35,7 +35,8 @@ public:
           const sql::ObSQLSessionInfo &session,
           const ColumnsFieldIArray *fields = NULL,
           share::schema::ObSchemaGetterGuard *schema_guard = NULL,
-          uint64_t tenant = common::OB_INVALID_ID);
+          uint64_t tenant = common::OB_INVALID_ID,
+          bool enable_json_bin_view = false);
 
   virtual ~ObSMRow() {}
 
@@ -57,6 +58,7 @@ private:
   const ColumnsFieldIArray *fields_;
   share::schema::ObSchemaGetterGuard *schema_guard_;
   uint64_t tenant_id_;
+  bool enable_json_bin_view_;
 
   DISALLOW_COPY_AND_ASSIGN(ObSMRow);
 }; // end of class OBMP

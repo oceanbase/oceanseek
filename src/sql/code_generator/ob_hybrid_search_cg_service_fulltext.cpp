@@ -126,6 +126,8 @@ int ObHybridSearchCgService::generate_fulltext_query_ctdef(ObLogTableScan &op,
       op,
       match_node->index_info_,
       *match_node,
+      *match_node->field_,
+      match_node->search_index_fulltext_info_,
       !op.is_logical_table(), /* is_topk_query: false for logical table (no BM25 topk) */
       match_node->inv_idx_tid_,
       doc_id_idx_tid,
@@ -183,6 +185,8 @@ int ObHybridSearchCgService::generate_match_phrase_query_ctdef(
       op,
       match_phrase_node->index_info_,
       *match_phrase_node,
+      *match_phrase_node->field_,
+      match_phrase_node->search_index_fulltext_info_,
       !op.is_logical_table(), /* is_topk_query: false for logical table (no BM25 topk) */
       match_phrase_node->inv_idx_tid_,
       doc_id_idx_tid,
@@ -258,6 +262,8 @@ int ObHybridSearchCgService::generate_multi_match_query_ctdef(
         op,
         multi_match_node->index_infos_[i],
         *multi_match_node,
+        *multi_match_node->fields_[i],
+        multi_match_node->search_index_fulltext_infos_[i],
         !op.is_logical_table(), /* is_topk_query: false for logical table (no BM25 topk) */
         multi_match_node->inv_idx_tids_[i],
         doc_id_idx_tid,
@@ -346,6 +352,8 @@ int ObHybridSearchCgService::generate_query_string_query_ctdef(
         op,
         query_string_node->index_infos_[i],
         *query_string_node,
+        *query_string_node->fields_[i],
+        query_string_node->search_index_fulltext_infos_[i],
         !op.is_logical_table(), /* is_topk_query: false for logical table (no BM25 topk) */
         query_string_node->inv_idx_tids_[i],
         doc_id_idx_tid,
@@ -389,6 +397,8 @@ int ObHybridSearchCgService::generate_query_string_query_ctdef(
 int ObHybridSearchCgService::generate_text_ir_ctdef(ObLogTableScan &op,
                                                     const ObTextRetrievalIndexInfo &index_info,
                                                     const ObFullTextQueryNode &fulltext_node,
+                                                    const ObColumnRefRawExpr &field,
+                                                    const ObSearchIndexTextInfo &info,
                                                     const bool is_topk_query,
                                                     const uint64_t inv_idx_tid,
                                                     const uint64_t doc_id_idx_tid,
@@ -416,6 +426,9 @@ int ObHybridSearchCgService::generate_text_ir_ctdef(ObLogTableScan &op,
   } else if (OB_ISNULL(ir_scan_ctdef)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ir scan ctdef is null", K(ret));
+  } else if (info.has_search_index_fulltext()
+      && OB_FAIL(ir_scan_ctdef->search_index_fulltext_info_.assign(field, info, allocator))) {
+    LOG_WARN("failed to copy Search Text binding to the physical plan", K(ret), K(info));
   } else if (OB_FAIL(generate_text_ir_sub_scan_ctdef(
       op, index_info, ObTSCIRScanType::OB_IR_INV_IDX_SCAN, need_score, need_pos_list,
       inv_idx_tid, doc_id_idx_tid, inv_idx_scan_ctdef))) {

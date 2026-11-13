@@ -306,3 +306,21 @@ sql_unittest(test_json_object_expr
   ob_op_test_engine.cpp
   ob_op_test_data_source.cpp
 )
+# JSON_PRETTY expression tests (mysqltest-ported, eval-stage).
+sql_unittest(test_json_pretty_expr
+  test_json_pretty_expr.cpp
+  ob_op_test_engine.cpp
+  ob_op_test_data_source.cpp
+)
+# JSON_QUOTE expression tests (mysqltest-ported, eval-stage).
+sql_unittest(test_json_quote_expr
+  test_json_quote_expr.cpp
+  ob_op_test_engine.cpp
+  ob_op_test_data_source.cpp
+)
+# JSON_UNQUOTE expression tests (mysqltest-ported, eval-stage).
+sql_unittest(test_json_unquote_expr
+  test_json_unquote_expr.cpp
+  ob_op_test_engine.cpp
+  ob_op_test_data_source.cpp
+)

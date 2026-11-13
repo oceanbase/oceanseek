@@ -10,6 +10,7 @@
 #include "search_index/ob_search_index_builder_util.h"
 #include "vector_index/ob_vector_index_util.h"
 #include "lib/utility/ob_tracepoint.h"
+#include "search_index/ob_search_index_config.h"
 
 #include "sql/resolver/ddl/ob_ddl_resolver.h"
 #include "sql/resolver/expr/ob_raw_expr_util.h"
@@ -530,6 +531,7 @@ int ObIndexBuilderUtil::set_index_table_columns(
 {
   int ret = OB_SUCCESS;
   bool use_mysql_errno = true; //use mysql errno for functional index
+  uint64_t tenant_data_version = 0;
   if (check_data_schema && !data_schema.is_valid()) {
     // some items in arg may be invalid, don't check arg
     ret = OB_INVALID_ARGUMENT;
@@ -541,6 +543,10 @@ int ObIndexBuilderUtil::set_index_table_columns(
     } else {
       use_mysql_errno = !is_oracle_mode;
     }
+  }
+  if (OB_SUCC(ret) && arg.is_search_def_index()
+      && OB_FAIL(GET_MIN_DATA_VERSION(data_schema.get_tenant_id(), tenant_data_version))) {
+    LOG_WARN("failed to get tenant data version for search index comment", K(ret));
   }
   // no matter what index col of data table is, columns of 4 aux fts table is fixed
   if (OB_FAIL(ret)) {
@@ -584,7 +590,7 @@ int ObIndexBuilderUtil::set_index_table_columns(
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("fts arg index type not expected", K(ret));
     }
-  } else if (share::schema::is_search_data_index(arg.index_type_)) {
+  } else if (share::schema::is_search_aux_index(arg.index_type_)) {
     if (OB_FAIL(ObSearchIndexBuilderUtil::set_search_index_table_columns(arg, data_schema, index_schema))) {
       LOG_WARN("failed to set search index table columns", K(ret));
     }
@@ -695,16 +701,18 @@ int ObIndexBuilderUtil::set_index_table_columns(
                 K(is_rowkey), "rowkey_order_type", arg.index_columns_.at(i).order_type_,
                 K(row_desc), K(ret));
         } else if (arg.is_search_def_index()) {
-          // The index-def column inherits the base column's comment via add_column().
-          // For search index, this comment slot is repurposed to hold the search config
-          // (built from WITH(...)). Always overwrite it with sort_item.column_comment_ so
-          // that an inherited user comment never leaks through: an empty config clears the
-          // inherited comment, a non-empty config replaces it.
+          // Keep legacy comments until the tenant reaches 4.6.3.1, including default VALUE columns.
           ObColumnSchemaV2 *index_column = index_schema.get_column_schema(data_column->get_column_name());
+          ObSearchIndexConfig config;
+          ObSqlString comment;
           if (OB_ISNULL(index_column)) {
             ret = OB_ERR_UNEXPECTED;
             LOG_WARN("failed to get column schema just added", K(ret), K(data_column->get_column_name()));
-          } else if (OB_FAIL(index_column->set_comment(sort_item.column_comment_))) {
+          } else if (OB_FAIL(config.decode(sort_item.column_comment_))) {
+            LOG_WARN("failed to decode search index column configuration", K(ret), K(sort_item.column_name_));
+          } else if (OB_FAIL(config.encode(comment, tenant_data_version))) {
+            LOG_WARN("failed to encode search index column configuration", K(ret), K(sort_item.column_name_));
+          } else if (OB_FAIL(index_column->set_comment(comment.string()))) {
             LOG_WARN("failed to set column comment", K(ret), K(sort_item.column_comment_));
           }
         }

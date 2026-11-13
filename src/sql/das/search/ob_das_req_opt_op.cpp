@@ -107,21 +107,37 @@ int ObDASReqOptOp::do_advance_to(const ObDASRowID &target, ObDASRowID &curr_id, 
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", K(ret));
-  } else if (iter_end_) {
-    ret = OB_ITER_END;
-    LOG_WARN("iter end", K(ret));
-  } else if (OB_FAIL(required_->advance_to(target, req_id, req_score))) {
-    if (OB_UNLIKELY(OB_ITER_END != ret)) {
-      LOG_WARN("failed to advance to required op", K(ret));
-    } else {
-      iter_end_ = true;
+  } else if (is_async_nested_scope(scope_)) {
+    ret = required_->advance_to(target, curr_id, score);
+  } else {
+    if (iter_end_) {
+      ret = OB_ITER_END;
+      LOG_WARN("iter end", K(ret));
+    } else if (OB_FAIL(required_->advance_to(target, req_id, req_score))) {
+      if (OB_UNLIKELY(OB_ITER_END != ret)) {
+        LOG_WARN("failed to advance to required op", K(ret));
+      } else {
+        iter_end_ = true;
+      }
+    } else if (OB_FAIL(inner_get_next_row(req_id, req_score, curr_id, score))) {
+      if (OB_UNLIKELY(OB_ITER_END != ret)) {
+        LOG_WARN("failed to get next row", K(ret));
+      } else {
+        iter_end_ = true;
+      }
     }
-  } else if (OB_FAIL(inner_get_next_row(req_id, req_score, curr_id, score))) {
-    if (OB_UNLIKELY(OB_ITER_END != ret)) {
-      LOG_WARN("failed to get next row", K(ret));
-    } else {
-      iter_end_ = true;
-    }
+  }
+  return ret;
+}
+
+int ObDASReqOptOp::do_advance_to(const ObDASNestedKey &target, ObDASNestedKey &curr_nk, double &score)
+{
+  int ret = OB_SUCCESS;
+  if (!is_async_nested_scope(scope_)) {
+    ret = OB_NOT_IMPLEMENT;
+  } else {
+    // Optional clauses do not filter nested objects when MSM is zero.
+    ret = required_->advance_to(target, curr_nk, score);
   }
   return ret;
 }
@@ -181,20 +197,35 @@ int ObDASReqOptOp::do_next_rowid(ObDASRowID &next_id, double &score)
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", K(ret));
-  } else if (iter_end_) {
-    ret = OB_ITER_END;
-  } else if (OB_FAIL(required_->next_rowid(req_id, req_score))) {
-    if (OB_UNLIKELY(OB_ITER_END != ret)) {
-      LOG_WARN("failed to next rowid required op", K(ret));
-    } else {
-      iter_end_ = true;
+  } else if (is_async_nested_scope(scope_)) {
+    ret = required_->next_rowid(next_id, score);
+  } else {
+    if (iter_end_) {
+      ret = OB_ITER_END;
+    } else if (OB_FAIL(required_->next_rowid(req_id, req_score))) {
+      if (OB_UNLIKELY(OB_ITER_END != ret)) {
+        LOG_WARN("failed to next rowid required op", K(ret));
+      } else {
+        iter_end_ = true;
+      }
+    } else if (OB_FAIL(inner_get_next_row(req_id, req_score, next_id, score))) {
+      if (OB_UNLIKELY(OB_ITER_END != ret)) {
+        LOG_WARN("failed to get next row", K(ret));
+      } else {
+        iter_end_ = true;
+      }
     }
-  } else if (OB_FAIL(inner_get_next_row(req_id, req_score, next_id, score))) {
-    if (OB_UNLIKELY(OB_ITER_END != ret)) {
-      LOG_WARN("failed to get next row", K(ret));
-    } else {
-      iter_end_ = true;
-    }
+  }
+  return ret;
+}
+
+int ObDASReqOptOp::do_next_rowid(ObDASNestedKey &next_nk, double &score)
+{
+  int ret = OB_SUCCESS;
+  if (!is_async_nested_scope(scope_)) {
+    ret = OB_NOT_IMPLEMENT;
+  } else {
+    ret = required_->next_rowid(next_nk, score);
   }
   return ret;
 }

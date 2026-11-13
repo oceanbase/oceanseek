@@ -1944,7 +1944,6 @@ int ObAccessService::async_index_range_scan(
   return ret;
 }
 
-
 int ObAccessService::async_index_ivf_scan(
     const share::ObLSID &ls_id,
     const ObTabletHandle *pinned_tablet_handle,
@@ -2013,11 +2012,12 @@ int ObAccessService::async_index_ivf_scan(
   return ret;
 }
 
-int ObAccessService::get_async_inv_bm25_stats(
+int ObAccessService::get_async_inv_total_doc_length(
     const share::ObLSID &ls_id,
     const common::ObTabletID &tablet_id,
     const ObTabletHandle &tablet_handle,
     const share::SCN &read_snapshot,
+    const blocksstable::ObDatumRowkey *field_prefix,
     blocksstable::ObAsyncInvBM25Stats &stats)
 {
   int ret = OB_SUCCESS;
@@ -2030,9 +2030,34 @@ int ObAccessService::get_async_inv_bm25_stats(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid pinned async index tablet argument", K(ret), K(ls_id), K(tablet_id),
         K(tablet_handle));
-  } else if (OB_FAIL(tablet_handle.get_obj()->get_async_inv_bm25_stats(read_snapshot, stats))) {
-    LOG_WARN("failed to get async inv bm25 stats", K(ret), K(ls_id),
-        K(tablet_id), K(read_snapshot));
+  } else if (OB_FAIL(tablet_handle.get_obj()->get_async_inv_total_doc_length(read_snapshot, field_prefix, stats))) {
+    LOG_WARN("failed to get async inverted total document length", K(ret), K(ls_id), K(tablet_id), K(read_snapshot));
+  }
+  return ret;
+}
+
+int ObAccessService::get_async_inv_token_doc_cnt(
+    const share::ObLSID &ls_id,
+    const common::ObTabletID &tablet_id,
+    const ObTabletHandle &tablet_handle,
+    const share::SCN &read_snapshot,
+    const blocksstable::ObDatumRowkey *field_prefix,
+    const common::ObString &token,
+    blocksstable::ObAsyncInvBM25Stats &stats)
+{
+  int ret = OB_SUCCESS;
+  stats.reset();
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("ob access service is not running", K(ret));
+  } else if (OB_UNLIKELY(!ls_id.is_valid() || !tablet_id.is_valid()
+             || !tablet_handle.is_valid() || tablet_handle.get_obj()->get_tablet_id() != tablet_id
+             || token.empty())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid pinned async token statistics argument", K(ret), K(ls_id), K(tablet_id), KPC(field_prefix));
+  } else if (OB_FAIL(tablet_handle.get_obj()->get_async_inv_token_doc_cnt(
+             read_snapshot, field_prefix, token, stats))) {
+    LOG_WARN("failed to get async token document count", K(ret), K(tablet_id), K(read_snapshot));
   }
   return ret;
 }

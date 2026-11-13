@@ -848,7 +848,8 @@ int ObDASFusionTaskExecEnv::create_fusion_child_search_ctx(common::ObIAllocator 
     child_search_ctx->logical_table_ctx_ = src_search_ctx_->logical_table_ctx_;
     if (src_search_ctx_->has_nested_scope()
         && OB_FAIL(child_search_ctx->register_nested_scope(
-            src_search_ctx_->get_scope(DAS_SCOPE_NESTED_SYNC).rowid_exprs_))) {
+            src_search_ctx_->get_scope(src_search_ctx_->get_nested_scope_id()).rowid_exprs_,
+            src_search_ctx_->get_nested_scope_id()))) {
       LOG_WARN("failed to register nested scope for fusion child search ctx",
                KR(ret), K(path_idx_));
       child_search_ctx->~ObDASSearchCtx();

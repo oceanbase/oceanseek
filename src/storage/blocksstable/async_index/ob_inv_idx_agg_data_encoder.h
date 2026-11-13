@@ -22,8 +22,8 @@ namespace blocksstable
 // Agg data byte layout for one (micro block M, term T) index row.
 //
 // The agg data is carried through the standard index row builder as a raw serialized payload.
-// ObInvIdxAggDataHeader::total_size_ records the whole payload size, so the standard index row
-// parser can determine the payload boundary without interpreting it as an ObAggRowHeader.
+// ObInvIdxAggDataHeader::total_size_ records the whole leaf payload size for its decoder.
+// The standard index row parser uses the enclosing row boundary to carry opaque payload bytes.
 //
 //   agg data
 //   - payload header (16B)
@@ -36,6 +36,9 @@ namespace blocksstable
 // header (block_offset_ / block_size_), not the agg data.
 
 // On-disk payload header, reinterpret_cast onto the agg data buffer.
+// This header belongs to leaf (micro block, term) rows only. Inner-node BM25
+// summaries share ObInvIdxAggDataDesc, but use ObInvIdxAggInfoSerializer's own
+// version/mask/value encoding and do not reserve bytes for this header.
 struct ObInvIdxAggDataHeader
 {
   static const uint8_t VERSION = 1;

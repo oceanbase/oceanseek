@@ -17,10 +17,12 @@
 #ifndef OBDEV_SRC_SQL_DAS_SEARCH_OB_DAS_SEARCH_DEFINE_H_
 #define OBDEV_SRC_SQL_DAS_SEARCH_OB_DAS_SEARCH_DEFINE_H_
 
+#include <type_traits>
 #include <limits>
 #include "lib/container/ob_se_array.h"
 #include "share/datum/ob_datum.h"
 #include "sql/das/ob_das_attach_define.h"
+#include "sql/das/search/ob_das_nested_key.h"
 #include "sql/das/ob_das_scan_op.h"
 #include "share/hybrid_search/ob_query_parse.h"
 
@@ -58,10 +60,20 @@ enum ObDASRowIDType {
 
 enum ObDASScopeId {
   DAS_SCOPE_BASE = 0,
-  DAS_SCOPE_NESTED_SYNC = 1,
-  DAS_SCOPE_NESTED_ASYNC = 2, // Reserved for async nested-key execution.
+  DAS_SCOPE_NESTED_SYNC = 1,  // CompactRow (doc_id, NK), one nested object per row.
+  DAS_SCOPE_NESTED_ASYNC = 2, // DocID candidates, then per-document keys through the NK interfaces.
   DAS_SCOPE_MAX
 };
+
+inline bool is_nested_scope(const ObDASScopeId scope)
+{
+  return DAS_SCOPE_NESTED_SYNC == scope || DAS_SCOPE_NESTED_ASYNC == scope;
+}
+
+inline bool is_async_nested_scope(const ObDASScopeId scope)
+{
+  return DAS_SCOPE_NESTED_ASYNC == scope;
+}
 
 struct ObDASRowIDScope
 {
@@ -84,6 +96,7 @@ struct ObCompactRow;
  * - ObDASRowID is TYPE-AGNOSTIC, similar to ObDatum. The struct itself does not know
  *   whether it holds a uint64 or a compact row pointer; it simply stores raw bytes/pointer.
  * - The actual type is determined externally by ObDASSearchCtx::rowid_type_.
+ * - Per-document nested keys use the separate ObDASNestedKey type.
  *
  * Usage:
  * - Normally, DO NOT use set_uint64()/get_uint64()/set_compact_row()/get_compact_row() directly.
@@ -121,6 +134,7 @@ friend class ObDASAsyncIndexDeletionOp;
 friend class ObDASScalarLogicPrimaryROROp;
 friend class ObDASNestedQueryOp;
 friend class ObIDASSearchOp;
+friend class ObDASSortOp;
 template <typename DrainSinkT>
 friend int drain_search_op_rowids_until(
     ObIDASSearchOp &op,

@@ -6,9 +6,14 @@
 #define OCEANBASE_SQL_REWRITE_OB_SEARCH_INDEX_QUERY_RANGE_UTILS_H_
 
 #include "sql/rewrite/ob_query_range_define.h"
+#include "share/search_index/ob_search_index_encoder.h"
 
 namespace oceanbase
 {
+namespace common
+{
+class ObJsonPath;
+}
 
 namespace sql
 {
@@ -39,6 +44,16 @@ public:
   static int json_value_can_extract_range(const ObRawExpr *origin_expr,
                                           const ObRawExpr *json_expr,
                                           bool &can_extract);
+
+  // Member keys borrow storage from json_path. Unsupported selectors make the
+  // candidate ineligible; nested boundaries follow the query's explicit scope.
+  static int build_json_path_items(
+      ObIAllocator &allocator,
+      common::ObJsonPath &json_path,
+      ObIArray<share::ObSearchIndexPathEncoder::JsonPathItem> &path_items,
+      bool &is_supported,
+      const ObIArray<ObString> *enclosing_nested_paths = nullptr,
+      const share::ObSearchIndexConfigFilter *json_filter = nullptr);
 
   static int json_prefix_path_encode(ObIAllocator &allocator,
                                      ObQueryRangeCtx &ctx,

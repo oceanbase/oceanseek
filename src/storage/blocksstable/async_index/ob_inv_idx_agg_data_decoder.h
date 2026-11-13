@@ -23,6 +23,9 @@ namespace blocksstable
 class ObInvIdxAggDataDecoder final
 {
 public:
+  // Sum only the fixed descriptors; do not materialize logical metas or BM25 frontiers.
+  static int get_total_doc_length(const char *buf, const int64_t size, uint64_t &total_doc_length);
+
   // 将聚合数据 [buf, buf + size) 解码为 metas（先清空，按 block_idx 升序），
   // 同时输出 M 的 posting value 微块定位信息。
   static int decode(const char *buf,

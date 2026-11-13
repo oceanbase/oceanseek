@@ -5,12 +5,12 @@
 
 #define USING_LOG_PREFIX SQL_OPT
 #include "sql/hybrid_search/ob_fulltext_search_node.h"
+#include "storage/blocksstable/async_index/ob_inv_sstable_struct.h"
 
 namespace oceanbase
 {
 namespace sql
 {
-
 ObTextRetrievalIndexInfo::ObTextRetrievalIndexInfo()
   : token_column_(nullptr),
     token_cnt_column_(nullptr),
@@ -51,12 +51,51 @@ int ObTextRetrievalIndexInfo::generate_exprs(
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected null pointer", K(ret), KP(session_info), KP(schema_guard));
   } else if (OB_FAIL(generate_column_exprs(
-      inv_idx_tid, doc_id_as_domain_id, table_item, expr_factory, *session_info, *schema_guard))) {
+      inv_idx_tid, doc_id_as_domain_id, table_item, expr_factory, *session_info, *schema_guard,
+      opt_ctx.get_query_ctx()))) {
     LOG_WARN("failed to generate column exprs", K(ret));
   } else if (OB_FAIL(generate_calc_exprs(expr_factory, *session_info, is_async))) {
     LOG_WARN("failed to generate calc exprs", K(ret));
   } else {
     generated_ = true;
+  }
+  return ret;
+}
+
+int ObTextRetrievalIndexInfo::generate_search_text_column_exprs(
+    const ObTableSchema &schema, const TableItem &table_item,
+    ObRawExprFactory &expr_factory, ObSQLSessionInfo &session_info)
+{
+  using namespace blocksstable;
+  int ret = OB_SUCCESS;
+  // Search Text columns belong to the physical child; their IDs are unrelated
+  // to the source JSON column or to generated columns on an ordinary FTS table.
+  for (int64_t i = 0; OB_SUCC(ret) && i < schema.get_column_count(); ++i) {
+    const ObColumnSchemaV2 *col = schema.get_column_schema_by_idx(i);
+    ObColumnRefRawExpr **target = nullptr;
+    if (OB_ISNULL(col)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null Search Text column", K(ret), K(i), K(schema.get_table_id()));
+    } else if (i == SEARCH_TEXT_TOKEN) {
+      target = &token_column_;
+    } else if (i == SEARCH_TEXT_DOC_ID) {
+      target = &domain_id_column_;
+    } else if (i == SEARCH_TEXT_TOKEN_FREQ) {
+      target = &token_cnt_column_;
+    } else if (i == SEARCH_TEXT_DOC_LENGTH) {
+      target = &doc_length_column_;
+    } else if (i == SEARCH_TEXT_POSITION_LIST) {
+      target = &pos_list_column_;
+    }
+    if (OB_SUCC(ret) && nullptr != target) {
+      if (OB_FAIL(ObRawExprUtils::build_column_expr(expr_factory, *col, &session_info, *target))) {
+        LOG_WARN("failed to build Search Text column expr", K(ret), KPC(col));
+      } else {
+        (*target)->set_ref_id(table_item.table_id_, col->get_column_id());
+        (*target)->set_column_attr(schema.get_table_name_str(), col->get_column_name_str());
+        (*target)->set_database_name(table_item.database_name_);
+      }
+    }
   }
   return ret;
 }
@@ -67,11 +106,10 @@ int ObTextRetrievalIndexInfo::generate_column_exprs(
     const TableItem &table_item,
     ObRawExprFactory &expr_factory,
     ObSQLSessionInfo &session_info,
-    ObSqlSchemaGuard &schema_guard)
+    ObSqlSchemaGuard &schema_guard,
+    ObQueryCtx *query_ctx)
 {
   int ret = OB_SUCCESS;
-  uint64_t table_id = OB_INVALID_ID;
-  const ObTableSchema *table_schema = nullptr;
   const ObTableSchema *inv_idx_schema = nullptr;
   if (OB_UNLIKELY(OB_INVALID_ID == inv_idx_tid)) {
     ret = OB_INVALID_ARGUMENT;
@@ -81,8 +119,39 @@ int ObTextRetrievalIndexInfo::generate_column_exprs(
   } else if (OB_ISNULL(inv_idx_schema)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected inv idx schema", K(ret), KP(inv_idx_schema), K(inv_idx_tid));
-  } else if (FALSE_IT(table_id = inv_idx_schema->get_data_table_id())) {
-  } else if (OB_FAIL(schema_guard.get_table_schema(table_id, table_schema))) {
+  } else if (inv_idx_schema->is_async_search_text_index()) {
+    if (OB_ISNULL(query_ctx)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null query context for Search Text column expressions", K(ret), K(inv_idx_tid));
+    } else {
+      // Each retrieval has its own expression identity, including two aliases of
+      // the same base table. The binding retains the physical Text table ID.
+      TableItem text_item(expr_factory.get_allocator());
+      text_item.table_id_ = query_ctx->available_tb_id_--;
+      text_item.database_name_ = table_item.database_name_;
+      if (OB_FAIL(generate_search_text_column_exprs(*inv_idx_schema, text_item, expr_factory, session_info))) {
+        LOG_WARN("failed to generate Search Text column expressions", K(ret), K(inv_idx_tid));
+      }
+    }
+  } else if (OB_FAIL(generate_fts_column_exprs(
+      inv_idx_schema, doc_id_as_domain_id, table_item, expr_factory, session_info, schema_guard))) {
+    LOG_WARN("failed to generate FTS column exprs", K(ret));
+  }
+  return ret;
+}
+
+int ObTextRetrievalIndexInfo::generate_fts_column_exprs(
+    const ObTableSchema *inv_idx_schema,
+    const bool doc_id_as_domain_id,
+    const TableItem &table_item,
+    ObRawExprFactory &expr_factory,
+    ObSQLSessionInfo &session_info,
+    ObSqlSchemaGuard &schema_guard)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t table_id = inv_idx_schema->get_data_table_id();
+  const ObTableSchema *table_schema = nullptr;
+  if (OB_FAIL(schema_guard.get_table_schema(table_id, table_schema))) {
     LOG_WARN("failed to get table schema", K(ret));
   } else if (OB_ISNULL(table_schema)) {
     ret = OB_ERR_UNEXPECTED;
@@ -372,6 +441,68 @@ ObFullTextQueryNode::ObFullTextQueryNode(common::ObIAllocator &allocator, const 
   node_type_ = INDEX_MERGE_HYBRID_FTS_QUERY;
 }
 
+int ObFullTextQueryNode::resolve_index(const ObTableSchema &main_table_schema,
+                                      const ObSqlSchemaGuard &schema_guard,
+                                      const ObIArray<uint64_t> &valid_index_ids,
+                                      ObIAllocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  ObColumnRefRawExpr *field = nullptr;
+  uint64_t *inv_idx_tid = nullptr;
+  const ObIArray<ObColumnRefRawExpr *> *fields = nullptr;
+  ObIArray<uint64_t> *inv_idx_tids = nullptr;
+  ObIArray<ObString> *index_names = nullptr;
+  ObIArray<ObSearchIndexTextInfo> *search_infos = nullptr;
+  if (query_type_ == OB_FULLTEXT_QUERY_TYPE_MATCH) {
+    ObMatchQueryNode *node = static_cast<ObMatchQueryNode *>(this);
+    field = node->field_;
+    inv_idx_tid = &node->inv_idx_tid_;
+  } else if (query_type_ == OB_FULLTEXT_QUERY_TYPE_MATCH_PHRASE) {
+    ObMatchPhraseQueryNode *node = static_cast<ObMatchPhraseQueryNode *>(this);
+    field = node->field_;
+    inv_idx_tid = &node->inv_idx_tid_;
+  } else if (query_type_ == OB_FULLTEXT_QUERY_TYPE_MULTI_MATCH) {
+    ObMultiMatchQueryNode *node = static_cast<ObMultiMatchQueryNode *>(this);
+    fields = &node->fields_;
+    inv_idx_tids = &node->inv_idx_tids_;
+    index_names = &node->index_names_;
+    search_infos = &node->search_index_fulltext_infos_;
+  } else if (query_type_ == OB_FULLTEXT_QUERY_TYPE_QUERY_STRING) {
+    ObQueryStringQueryNode *node = static_cast<ObQueryStringQueryNode *>(this);
+    fields = &node->fields_;
+    inv_idx_tids = &node->inv_idx_tids_;
+    index_names = &node->index_names_;
+    search_infos = &node->search_index_fulltext_infos_;
+  }
+  if (nullptr != fields) {
+    if (OB_FAIL(ObDSLFullTextQuery::resolve_fields_index(
+        *fields, main_table_schema, schema_guard, valid_index_ids, allocator,
+        *inv_idx_tids, *index_names, *search_infos, doc_id_idx_tid_, is_async_))) {
+      LOG_WARN("failed to resolve fulltext indexes with fields", K(ret));
+    }
+  } else if (OB_ISNULL(field) || OB_ISNULL(inv_idx_tid)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected fulltext query field", K(ret), K_(query_type), KP(field), KP(inv_idx_tid));
+  } else {
+    ObFullTextIndexBinding binding;
+    binding.search_info_.path_ = search_index_fulltext_info_.path_;
+    if (OB_FAIL(ObDSLFullTextQuery::resolve_single_field_index(
+        *field, need_pos_list(), main_table_schema, schema_guard, valid_index_ids, allocator, binding))) {
+      LOG_WARN("failed to resolve fulltext index", K(ret), K(search_index_fulltext_info_.path_));
+    } else {
+      *inv_idx_tid = binding.inv_idx_tid_;
+      doc_id_idx_tid_ = binding.doc_id_idx_tid_;
+      index_name_ = binding.index_name_;
+      is_async_ = binding.is_async_;
+      search_index_fulltext_info_ = binding.search_info_;
+    }
+  }
+  if (OB_SUCC(ret) && is_async_ && OB_FAIL(resolve_async_delete_index(main_table_schema))) {
+    LOG_WARN("failed to resolve async delete index", K(ret));
+  }
+  return ret;
+}
+
 int ObFullTextQueryNode::generate_access_exprs(const TableItem &table_item, ObOptimizerContext &opt_ctx)
 {
   int ret = OB_SUCCESS;
@@ -420,6 +551,9 @@ int ObFullTextQueryNode::get_all_index_ids(ObIArray<uint64_t> &index_ids) const
     // skip doc id idx tid
   } else if (OB_FAIL(index_ids.push_back(doc_id_idx_tid_))) {
     LOG_WARN("failed to push back index id", K(ret));
+  }
+  if (OB_SUCC(ret) && search_index_fulltext_info_.has_search_index_fulltext()) {
+    OZ(index_ids.push_back(search_index_fulltext_info_.def_table_id_));
   }
   if (OB_SUCC(ret) && is_async_
       && OB_FAIL(async_delete_info_.append_index_id(index_ids))) {
@@ -494,6 +628,7 @@ int ObMatchQueryNode::explain_info(char *buf, int64_t buf_len, int64_t &pos, Exp
 ObMultiMatchQueryNode::ObMultiMatchQueryNode(common::ObIAllocator &allocator)
   : ObFullTextQueryNode(allocator, OB_FULLTEXT_QUERY_TYPE_MULTI_MATCH),
     fields_(),
+    search_index_fulltext_infos_(),
     field_boosts_(),
     inv_idx_tids_(),
     index_infos_(),
@@ -556,6 +691,9 @@ int ObMultiMatchQueryNode::get_all_index_ids(ObIArray<uint64_t> &index_ids) cons
       LOG_WARN("unexpected invalid inv idx tid", K(ret), K(i), KPC(this));
     } else if (OB_FAIL(index_ids.push_back(inv_idx_tids_.at(i)))) {
       LOG_WARN("failed to append index id", K(ret));
+    } else if (search_index_fulltext_infos_.at(i).has_search_index_fulltext()
+        && OB_FAIL(add_var_to_array_no_dup(index_ids, search_index_fulltext_infos_.at(i).def_table_id_))) {
+      LOG_WARN("failed to append Search Def dependency", K(ret));
     }
   }
   return ret;
@@ -568,7 +706,7 @@ int ObMultiMatchQueryNode::explain_info(char *buf, int64_t buf_len, int64_t &pos
     LOG_WARN("failed to print blank space", K(ret), K(blank_space_count));
   } else if (OB_FAIL(BUF_PRINTF("multi match node: "))) {
     LOG_WARN("BUF_PRINTF fails", K(ret));
-  } else if (OB_FAIL(BUF_PRINTF("index name=("))) {
+  } else if (OB_FAIL(BUF_PRINTF("index name=%s", index_names_.count() == 1 ? "" : "("))) {
     LOG_WARN("BUF_PRINTF fails", K(ret));
   }
   for (int i = 0; i < index_names_.count() && OB_SUCC(ret); i++) {
@@ -579,7 +717,7 @@ int ObMultiMatchQueryNode::explain_info(char *buf, int64_t buf_len, int64_t &pos
     }
   }
   if (OB_FAIL(ret)) {
-  } else if (OB_FAIL(BUF_PRINTF(")"))) {
+  } else if (index_names_.count() != 1 && OB_FAIL(BUF_PRINTF(")"))) {
     LOG_WARN("BUF_PRINTF fails", K(ret));
   }
   return ret;
@@ -654,6 +792,7 @@ int ObMatchPhraseQueryNode::explain_info(char *buf, int64_t buf_len, int64_t &po
 ObQueryStringQueryNode::ObQueryStringQueryNode(common::ObIAllocator &allocator)
   : ObFullTextQueryNode(allocator, OB_FULLTEXT_QUERY_TYPE_QUERY_STRING),
     fields_(),
+    search_index_fulltext_infos_(),
     field_boosts_(),
     inv_idx_tids_(),
     index_infos_(),
@@ -717,6 +856,9 @@ int ObQueryStringQueryNode::get_all_index_ids(ObIArray<uint64_t> &index_ids) con
       LOG_WARN("unexpected invalid inv idx tid", K(ret), K(i), KPC(this));
     } else if (OB_FAIL(index_ids.push_back(inv_idx_tids_.at(i)))) {
       LOG_WARN("failed to append index id", K(ret));
+    } else if (search_index_fulltext_infos_.at(i).has_search_index_fulltext()
+        && OB_FAIL(add_var_to_array_no_dup(index_ids, search_index_fulltext_infos_.at(i).def_table_id_))) {
+      LOG_WARN("failed to append Search Def dependency", K(ret));
     }
   }
   return ret;

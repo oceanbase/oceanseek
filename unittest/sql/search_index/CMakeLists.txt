@@ -1,0 +1,2 @@
+sql_unittest(test_search_text_binding)
+sql_unittest(test_search_text_execution)

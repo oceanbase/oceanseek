@@ -124,6 +124,7 @@ private:
   int init_inv_meta();
 
   int inner_append_row(const ObDatumRow &row);
+  int check_search_text_row(const ObDatumRow &row) const;
   int extract_term(const ObDatumRow &row, ObDatumRowkey &term) const;
   int check_term_order(const ObDatumRowkey &term) const;
   int compare_term(const ObDatumRowkey &left, const ObDatumRowkey &right, int &cmp_ret) const;

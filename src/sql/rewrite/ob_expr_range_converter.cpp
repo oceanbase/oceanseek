@@ -4913,9 +4913,10 @@ int ObExprRangeConverter::convert_json_contains_path(const ObRawExpr &expr,
     } else if (OB_FALSE_IT(column_expr = static_cast<const ObColumnRefRawExpr *>(target))) {
     } else if (!is_range_key(column_expr->get_column_id(), key_idx)) {
       can_extract = false;
-    } else if (OB_NOT_NULL(search_ctx.get_json_filter())) {
-      // Path/type restrictions can omit the only entry proving that a parent
-      // exists. Conservatively require an unfiltered JSON column index.
+    } else if (OB_NOT_NULL(search_ctx.get_json_filter())
+        && (search_ctx.get_json_filter()->has_paths() || search_ctx.get_json_filter()->has_types())) {
+      // A normalized default VALUE comment also creates a filter object. Only
+      // actual path/type restrictions can omit the entry proving a parent exists.
       can_extract = false;
     } else if (!mode_literal->is_immutable_const_expr() || !path_literal->is_immutable_const_expr()) {
       // Do not freeze mutable paths or modes into a cached range. SQL literals

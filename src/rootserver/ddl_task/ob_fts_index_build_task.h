@@ -66,14 +66,20 @@ public:
       K(doc_rowkey_aux_table_id_),
       K(domain_index_aux_table_id_),
       K(fts_doc_word_aux_table_id_),
+      K(search_text_match_aux_table_id_),
+      K(search_text_match_phrase_aux_table_id_),
       K(rowkey_doc_task_submitted_),
       K(doc_rowkey_task_submitted_),
       K(domain_index_aux_task_submitted_),
       K(fts_doc_word_task_submitted_),
+      K(search_text_match_task_submitted_),
+      K(search_text_match_phrase_task_submitted_),
       K(rowkey_doc_task_id_),
       K(doc_rowkey_task_id_),
       K(domain_index_aux_task_id_),
       K(fts_doc_word_task_id_),
+      K(search_text_match_task_id_),
+      K(search_text_match_phrase_task_id_),
       K(drop_index_task_id_),
       K(drop_index_task_submitted_),
       K(schema_version_),
@@ -98,6 +104,12 @@ public:
   OB_INLINE uint64_t get_domain_index_aux_table_id() const { return domain_index_aux_table_id_; }
   void set_fts_doc_word_aux_table_id(const uint64_t id) { fts_doc_word_aux_table_id_ = id; }
   OB_INLINE uint64_t get_fts_doc_word_aux_table_id() const { return fts_doc_word_aux_table_id_; }
+  void set_search_text_match_aux_table_id(const uint64_t id) { search_text_match_aux_table_id_ = id; }
+  OB_INLINE uint64_t get_search_text_match_aux_table_id() const { return search_text_match_aux_table_id_; }
+  void set_search_text_match_phrase_aux_table_id(const uint64_t id) { search_text_match_phrase_aux_table_id_ = id; }
+  OB_INLINE uint64_t get_search_text_match_phrase_aux_table_id() const { return search_text_match_phrase_aux_table_id_; }
+  void set_search_text_match_task_submitted(const bool status) { search_text_match_task_submitted_ = status; }
+  void set_search_text_match_phrase_task_submitted(const bool status) { search_text_match_phrase_task_submitted_ = status; }
   void set_drop_index_task_id(const uint64_t id) { drop_index_task_id_ = id; }
   void set_rowkey_doc_task_submitted(const bool status) { rowkey_doc_task_submitted_ = status; }
   void set_doc_rowkey_task_submitted(const bool status) { doc_rowkey_task_submitted_ = status; }
@@ -108,7 +120,8 @@ public:
   void set_doc_rowkey_aux_task_id(const uint64_t id) { doc_rowkey_task_id_ = id; }
   void set_fts_index_aux_task_id(const uint64_t id) { domain_index_aux_task_id_ = id; }
   void set_fts_doc_word_aux_task_id(const uint64_t id) { fts_doc_word_task_id_ = id; }
-  
+  void set_search_text_match_aux_task_id(const int64_t id) { search_text_match_task_id_ = id; }
+  void set_search_text_match_phrase_aux_task_id(const int64_t id) { search_text_match_phrase_task_id_ = id; }
   int update_task_message(common::ObISQLClient &proxy);
 
 private:
@@ -138,6 +151,8 @@ private:
   int prepare_domain_index_table();
   int enable_word_doc_aux_index_table();
   int enable_async_delete_index_table();
+  int enable_search_text_match_aux_table();
+  int enable_search_text_match_phrase_aux_table();
   int prepare_aux_index_tables();
   int construct_create_index_arg(
       const ObIndexType index_type,
@@ -159,6 +174,12 @@ private:
       obrpc::ObCreateIndexArg &arg,
       common::ObIAllocator &allocator);
   int construct_search_data_index_arg(
+      obrpc::ObCreateIndexArg &arg,
+      common::ObIAllocator &allocator);
+  int construct_search_text_match_index_arg(
+      obrpc::ObCreateIndexArg &arg,
+      common::ObIAllocator &allocator);
+  int construct_search_text_match_phrase_index_arg(
       obrpc::ObCreateIndexArg &arg,
       common::ObIAllocator &allocator);
   int calculate_aux_table_parallelism(
@@ -206,6 +227,7 @@ private:
   int try_release_snapshot(ObMySQLTransaction &trans, const int64_t snapshot_to_release);
 
 private:
+  // Upgrades disable new DDL and drain existing tasks before switching binaries.
   static const int64_t OB_FTS_INDEX_BUILD_TASK_VERSION = 1;
   using ObDDLTask::tenant_id_;
   using ObDDLTask::task_id_;
@@ -219,18 +241,25 @@ private:
   using ObDDLTask::target_object_id_;
   using ObDDLTask::is_inited_;
   uint64_t &index_table_id_;
+  // Async Search reuses rowkey_doc_* for Delete and domain_index_aux_* for Data.
   uint64_t rowkey_doc_aux_table_id_;
   uint64_t doc_rowkey_aux_table_id_;
   uint64_t domain_index_aux_table_id_;
   uint64_t fts_doc_word_aux_table_id_;
+  uint64_t search_text_match_aux_table_id_;
+  uint64_t search_text_match_phrase_aux_table_id_;
   bool rowkey_doc_task_submitted_;
   bool doc_rowkey_task_submitted_;
   bool domain_index_aux_task_submitted_;
   bool fts_doc_word_task_submitted_;
+  bool search_text_match_task_submitted_;
+  bool search_text_match_phrase_task_submitted_;
   int64_t rowkey_doc_task_id_;
   int64_t doc_rowkey_task_id_;
   int64_t domain_index_aux_task_id_;
   int64_t fts_doc_word_task_id_;
+  int64_t search_text_match_task_id_;
+  int64_t search_text_match_phrase_task_id_;
   int64_t drop_index_task_id_;
   bool drop_index_task_submitted_;
   ObRootService *root_service_;
@@ -240,6 +269,8 @@ private:
   bool is_fts_doc_word_succ_;
   bool fts_index_aux_is_trans_end_;
   bool fts_doc_word_aux_is_trans_end_;
+  bool search_text_match_aux_is_trans_end_;
+  bool search_text_match_phrase_aux_is_trans_end_;
   obrpc::ObCreateIndexArg create_index_arg_;
   common::hash::ObHashMap<uint64_t, share::ObDomainDependTaskStatus> dependent_task_result_map_;
   bool is_retryable_ddl_;

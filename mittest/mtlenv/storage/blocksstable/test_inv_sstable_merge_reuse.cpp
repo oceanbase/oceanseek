@@ -111,10 +111,19 @@
 //      - 固定四叶拓扑精确回归比较中 aaa→stress 跳变压住 nfppvcr 的现场根因。
 //  14i. four_way_non_max_range_source_end_is_not_global_end
 //      - 非 MAX 上界耗尽单个 source 时不误判全局结束，并校验无静默丢行。
+//  14j. search_text_macro_reuse_* / search_text_logical_block_reuse_*
+//      - Search Text with a four-column rowkey: full comparison of whole-macro reuse, logical-block reuse and row-by-row rewrite (with/without POS).
+//  14k. search_text_deletion_rewrites_dirty_macro_and_reuses_clean_macros
+//      - Search Text deletion filtering: hit logical blocks are rewritten row by row, other logical blocks and clean macros are still reused.
+//  14l. search_text_all_deleted_merge_writes_empty_meta / search_text_empty_inc_meta_inherits_major_format
+//      - All-deleted and empty-increment outputs keep the Search Text format, an empty doc id range and total_doc_length_ == 0.
 //
 // 四、元信息与计数
 //  15. index_builder_inv_meta_merge_aggregates
 //      - 唯一权威源 index builder 聚合 inv_meta，并检查格式与溢出。
+//  15a. index_tree_length_matches_row_scan
+//      - Search Text intermediate summaries and boundary logical descriptors match
+//        the row-by-row TF sum, with clustered and non-clustered index layouts.
 //  16. reused_macro_advances_iter_row_count
 //      - 复用宏正确推进 iter row count。
 //  17. inv_block_stats_accumulate_from_uint64_max_sentinel
@@ -133,7 +142,9 @@
 //      - 超限迭代器数量在分配 comparator/tree 前拒绝。
 // =============================================================================
 
+#include <tuple>
 #include <signal.h>
+#include <map>
 #include <gtest/gtest.h>
 
 #define OK(ass) ASSERT_EQ(OB_SUCCESS, (ass))
@@ -141,10 +152,14 @@
 #define protected public
 
 #include "test_inv_idx_sstable_prepare.h"
+#include "storage/retrieval/ob_inv_bm25_stat_cache.h"
 #include "lib/checksum/ob_crc64.h"
 #include "lib/roaringbitmap/ob_roaringbitmap.h"
 #include "storage/access/ob_table_read_info.h"
+#include "storage/retrieval/ob_inv_idx_field_aggregator.h"
+#include "storage/access/ob_index_block_tree_traverser.h"
 #include "storage/async_index/ob_deletion_bitmap_provider.h"
+#include "storage/blocksstable/async_index/ob_inv_idx_agg_data_decoder.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable_merge_helper.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable_merge_iter.h"
 #include "storage/blocksstable/async_index/ob_partition_inv_sstable_merger.h"
@@ -156,15 +171,13 @@ namespace oceanbase
 namespace unittest
 {
 
-namespace
-{
 using Level = blocksstable::ObInvSSTableMergeIter::Level;
 
 // ObInvSSTableMergeIter 的 read_info —— 直接使用生产同款 ObRowkeyReadInfo，从 schema 的
 // multi-version 列序构造，cols_index_ 恒等映射。输出行为完整 schema 存储序，列角色由传给
 // merge iter 的 ObInvIdxRowDesc（同一坐标系）决定。与 test_inv_sstable_merge_iter.cpp 同款：
 // 必须与 inv_idx_row_desc_ 的 *_col_idx_ 处在同一坐标系，否则行级会 col idx 越界。
-inline int build_merge_read_info(common::ObIAllocator &allocator,
+static inline int build_merge_read_info(common::ObIAllocator &allocator,
     const share::schema::ObTableSchema &table_schema,
     storage::ObRowkeyReadInfo &read_info)
 {
@@ -180,7 +193,7 @@ inline int build_merge_read_info(common::ObIAllocator &allocator,
 }
 
 // 构造 (term, doc_id) datum rowkey（深拷贝到 alloc）。
-inline int build_term_doc_rowkey(common::ObIAllocator &alloc,
+static inline int build_term_doc_rowkey(common::ObIAllocator &alloc,
     const ObString &term, const uint64_t doc_id, ObDatumRowkey &out)
 {
   int ret = OB_SUCCESS;
@@ -195,7 +208,7 @@ inline int build_term_doc_rowkey(common::ObIAllocator &alloc,
 }
 
 // 构造带明确开闭端点的 (term, doc_id) datum range（深拷贝）。
-inline int build_term_doc_range(common::ObIAllocator &alloc,
+static inline int build_term_doc_range(common::ObIAllocator &alloc,
     const ObString &term_lo, const uint64_t doc_lo, const bool incl_lo,
     const ObString &term_hi, const uint64_t doc_hi, const bool incl_hi,
     ObDatumRange &range)
@@ -216,12 +229,25 @@ inline int build_term_doc_range(common::ObIAllocator &alloc,
   return ret;
 }
 
-inline ObString datum_string(const ObStorageDatum &d)
+static inline ObString datum_string(const ObStorageDatum &d)
 {
   return ObString(d.len_, d.ptr_);
 }
 
-inline int init_deletion_bitmap(common::ObIAllocator &allocator,
+// Term columns precede doc_id in the stored rowkey: one term column for FTS and three
+// (COL_IDX, PATH, TOKEN) for search text. For FTS this hashes the same bytes as the term string.
+static inline uint64_t crc64_row_term(const ObDatumRow &row, const ObInvIdxRowDesc &row_desc,
+    const uint64_t crc)
+{
+  uint64_t ret_crc = crc;
+  for (int64_t i = 0; i < row_desc.doc_id_col_idx_; ++i) {
+    const ObString term_col = datum_string(row.storage_datums_[i]);
+    ret_crc = ob_crc64(ret_crc, term_col.ptr(), term_col.length());
+  }
+  return ret_crc;
+}
+
+static inline int init_deletion_bitmap(common::ObIAllocator &allocator,
     const uint64_t *doc_ids,
     const int64_t doc_id_cnt,
     storage::ObDeletionBitmapHandle &handle)
@@ -247,7 +273,7 @@ inline int init_deletion_bitmap(common::ObIAllocator &allocator,
   return ret;
 }
 
-inline int drill_to_first_row(ObInvSSTableMergeIter &iter)
+static inline int drill_to_first_row(ObInvSSTableMergeIter &iter)
 {
   int ret = OB_SUCCESS;
   while (OB_SUCC(ret) && !iter.is_end() && Level::ROW != iter.get_curr_level()) {
@@ -268,7 +294,7 @@ inline int drill_to_first_row(ObInvSSTableMergeIter &iter)
   return ret;
 }
 
-inline void reset_output_desc(TestInvIdxSSTablePrepare &fixture)
+static inline void reset_output_desc(TestInvIdxSSTablePrepare &fixture)
 {
   if (OB_NOT_NULL(fixture.index_builder_)) {
     fixture.index_builder_->~ObSSTableIndexBuilder();
@@ -278,7 +304,7 @@ inline void reset_output_desc(TestInvIdxSSTablePrepare &fixture)
   fixture.prepare_desc();
 }
 
-inline void open_output_writer(TestInvIdxSSTablePrepare &fixture,
+static inline void open_output_writer(TestInvIdxSSTablePrepare &fixture,
     ObInvIdxMacroBlockWriter &writer,
     ObSSTablePrivateObjectCleaner &cleaner,
     const int16_t sstable_logic_seq = -1)
@@ -299,7 +325,7 @@ inline void open_output_writer(TestInvIdxSSTablePrepare &fixture,
   ASSERT_TRUE(writer.is_opened());
 }
 
-inline void finalize_closed_output_sstable(TestInvIdxSSTablePrepare &fixture,
+static inline void finalize_closed_output_sstable(TestInvIdxSSTablePrepare &fixture,
     ObInvIdxMacroBlockWriter &writer,
     ObInvSSTable &output)
 {
@@ -319,7 +345,7 @@ inline void finalize_closed_output_sstable(TestInvIdxSSTablePrepare &fixture,
   fixture.finalize_inv_sstable_from_res(res, output);
 }
 
-inline void finalize_output_sstable(TestInvIdxSSTablePrepare &fixture,
+static inline void finalize_output_sstable(TestInvIdxSSTablePrepare &fixture,
     ObInvIdxMacroBlockWriter &writer,
     ObInvSSTable &output)
 {
@@ -374,7 +400,7 @@ struct InvMergeCloseStats
 // Execute the real writer close / inv-meta merge / accounting / history sequence.  The row and
 // filter counts are produced through the writer APIs; only the scan progress is placed on a test
 // iterator because close_ consumes the aggregate exposed by ObInvSSTableMergeHelper.
-inline void run_inv_merge_close(TestInvIdxSSTablePrepare &fixture,
+static inline void run_inv_merge_close(TestInvIdxSSTablePrepare &fixture,
     const int64_t output_row_count,
     const int64_t filter_row_count,
     const int64_t scan_units,
@@ -441,7 +467,7 @@ inline void run_inv_merge_close(TestInvIdxSSTablePrepare &fixture,
       history.running_info_.parallel_merge_info_.info_[ObParalleMergeInfo::SCAN_UNITS];
 }
 
-inline void build_production_merged_sstable(TestInvIdxSSTablePrepare &fixture,
+static inline void build_production_merged_sstable(TestInvIdxSSTablePrepare &fixture,
     const ObIArray<ObInvSSTable *> &inputs,
     const ObITableReadInfo &read_info,
     const ObDatumRange &merge_range,
@@ -558,7 +584,7 @@ struct InvSSTableKeyDigest
   uint64_t rowkey_checksum_;
 };
 
-inline void build_reused_sstable(TestInvIdxSSTablePrepare &fixture,
+static inline void build_reused_sstable(TestInvIdxSSTablePrepare &fixture,
     ObInvSSTable &input,
     const ObITableReadInfo &read_info,
     ObInvSSTable &output,
@@ -610,7 +636,7 @@ inline void build_reused_sstable(TestInvIdxSSTablePrepare &fixture,
   finalize_output_sstable(fixture, writer, output);
 }
 
-inline void build_logically_reused_sstable(TestInvIdxSSTablePrepare &fixture,
+static inline void build_logically_reused_sstable(TestInvIdxSSTablePrepare &fixture,
     ObInvSSTable &input,
     const ObITableReadInfo &read_info,
     ObInvSSTable &output,
@@ -674,7 +700,7 @@ inline void build_logically_reused_sstable(TestInvIdxSSTablePrepare &fixture,
   finalize_output_sstable(fixture, writer, output);
 }
 
-inline void build_rewritten_sstable(TestInvIdxSSTablePrepare &fixture,
+static inline void build_rewritten_sstable(TestInvIdxSSTablePrepare &fixture,
     ObInvSSTable &input,
     const ObITableReadInfo &read_info,
     ObInvSSTable &output)
@@ -697,7 +723,7 @@ inline void build_rewritten_sstable(TestInvIdxSSTablePrepare &fixture,
   finalize_output_sstable(fixture, writer, output);
 }
 
-inline void build_filtered_rewritten_sstable(TestInvIdxSSTablePrepare &fixture,
+static inline void build_filtered_rewritten_sstable(TestInvIdxSSTablePrepare &fixture,
     ObInvSSTable &input,
     const ObITableReadInfo &read_info,
     storage::ObDeletionBitmapHandle &deletion_bitmap_handle,
@@ -729,7 +755,7 @@ inline void build_filtered_rewritten_sstable(TestInvIdxSSTablePrepare &fixture,
   finalize_output_sstable(fixture, writer, output);
 }
 
-inline void build_range_rewritten_sstable(TestInvIdxSSTablePrepare &fixture,
+static inline void build_range_rewritten_sstable(TestInvIdxSSTablePrepare &fixture,
     ObInvSSTable &input,
     const ObITableReadInfo &read_info,
     const ObDatumRange &range,
@@ -751,7 +777,7 @@ inline void build_range_rewritten_sstable(TestInvIdxSSTablePrepare &fixture,
   finalize_output_sstable(fixture, writer, output);
 }
 
-inline void digest_inv_sstable(ObInvSSTable &sstable,
+static inline void digest_inv_sstable(ObInvSSTable &sstable,
     const ObITableReadInfo &read_info,
     const ObInvIdxRowDesc &row_desc,
     ObIAllocator &allocator,
@@ -769,11 +795,10 @@ inline void digest_inv_sstable(ObInvSSTable &sstable,
   while (OB_SUCC(ret = iter.next())) {
     const ObDatumRow *row = iter.get_curr_row();
     ASSERT_NE(nullptr, row);
-    const ObString term = datum_string(row->storage_datums_[0]);
-    const uint64_t doc_id = row->storage_datums_[1].get_uint();
+    const uint64_t doc_id = row->storage_datums_[row_desc.doc_id_col_idx_].get_uint();
     const uint64_t token_freq = row->storage_datums_[row_desc.token_freq_col_idx_].get_uint();
     const uint64_t doc_length = row->storage_datums_[row_desc.doc_length_col_idx_].get_uint();
-    digest.rowkey_checksum_ = ob_crc64(digest.rowkey_checksum_, term.ptr(), term.length());
+    digest.rowkey_checksum_ = crc64_row_term(*row, row_desc, digest.rowkey_checksum_);
     digest.rowkey_checksum_ = ob_crc64(digest.rowkey_checksum_, &doc_id, sizeof(doc_id));
     digest.posting_checksum_ = ob_crc64(digest.posting_checksum_, &token_freq, sizeof(token_freq));
     digest.posting_checksum_ = ob_crc64(digest.posting_checksum_, &doc_length, sizeof(doc_length));
@@ -791,7 +816,7 @@ inline void digest_inv_sstable(ObInvSSTable &sstable,
   ASSERT_EQ(OB_ITER_END, ret);
 }
 
-inline void digest_inv_sstable_set(ObInvSSTable &sstable,
+static inline void digest_inv_sstable_set(ObInvSSTable &sstable,
     const ObITableReadInfo &read_info,
     const ObInvIdxRowDesc &row_desc,
     ObIAllocator &allocator,
@@ -812,8 +837,7 @@ inline void digest_inv_sstable_set(ObInvSSTable &sstable,
   while (OB_SUCC(ret = iter.next())) {
     const ObDatumRow *row = iter.get_curr_row();
     ASSERT_NE(nullptr, row);
-    const ObString term = datum_string(row->storage_datums_[0]);
-    const uint64_t doc_id = row->storage_datums_[1].get_uint();
+    const uint64_t doc_id = row->storage_datums_[row_desc.doc_id_col_idx_].get_uint();
     const bool deleted = OB_NOT_NULL(deletion_bitmap_handle)
         && deletion_bitmap_handle->is_valid()
         && deletion_bitmap_handle->contains(static_cast<int64_t>(doc_id));
@@ -823,7 +847,7 @@ inline void digest_inv_sstable_set(ObInvSSTable &sstable,
     const uint64_t token_freq = row->storage_datums_[row_desc.token_freq_col_idx_].get_uint();
     const uint64_t doc_length = row->storage_datums_[row_desc.doc_length_col_idx_].get_uint();
     uint64_t row_hash = 0;
-    row_hash = ob_crc64(row_hash, term.ptr(), term.length());
+    row_hash = crc64_row_term(*row, row_desc, row_hash);
     row_hash = ob_crc64(row_hash, &doc_id, sizeof(doc_id));
     row_hash = ob_crc64(row_hash, &token_freq, sizeof(token_freq));
     row_hash = ob_crc64(row_hash, &doc_length, sizeof(doc_length));
@@ -844,7 +868,7 @@ inline void digest_inv_sstable_set(ObInvSSTable &sstable,
   ASSERT_EQ(OB_ITER_END, ret);
 }
 
-inline void digest_inv_sstable_keys(ObInvSSTable &sstable,
+static inline void digest_inv_sstable_keys(ObInvSSTable &sstable,
     const ObITableReadInfo &read_info,
     const ObInvIdxRowDesc &row_desc,
     ObIAllocator &allocator,
@@ -859,10 +883,8 @@ inline void digest_inv_sstable_keys(ObInvSSTable &sstable,
   while (OB_SUCC(ret = iter.next())) {
     const ObDatumRow *row = iter.get_curr_row();
     ASSERT_NE(nullptr, row);
-    const ObString term = datum_string(row->storage_datums_[0]);
-    const uint64_t doc_id = row->storage_datums_[1].get_uint();
-    digest.rowkey_checksum_ =
-        ob_crc64(digest.rowkey_checksum_, term.ptr(), term.length());
+    const uint64_t doc_id = row->storage_datums_[row_desc.doc_id_col_idx_].get_uint();
+    digest.rowkey_checksum_ = crc64_row_term(*row, row_desc, digest.rowkey_checksum_);
     digest.rowkey_checksum_ =
         ob_crc64(digest.rowkey_checksum_, &doc_id, sizeof(doc_id));
     ++digest.row_count_;
@@ -870,7 +892,7 @@ inline void digest_inv_sstable_keys(ObInvSSTable &sstable,
   ASSERT_EQ(OB_ITER_END, ret);
 }
 
-inline void find_three_logical_block_range(ObInvSSTable &input,
+static inline void find_three_logical_block_range(ObInvSSTable &input,
     const ObITableReadInfo &read_info,
     const ObInvIdxRowDesc &row_desc,
     ObIAllocator &allocator,
@@ -940,7 +962,7 @@ inline void find_three_logical_block_range(ObInvSSTable &input,
   ASSERT_TRUE(range.is_valid());
 }
 
-inline void collect_macro_ids(ObInvSSTable &sstable,
+static inline void collect_macro_ids(ObInvSSTable &sstable,
     const ObITableReadInfo &read_info,
     const ObInvIdxRowDesc &row_desc,
     ObIAllocator &allocator,
@@ -962,7 +984,7 @@ inline void collect_macro_ids(ObInvSSTable &sstable,
   ASSERT_EQ(OB_ITER_END, ret);
 }
 
-inline void collect_other_macro_ids(
+static inline void collect_other_macro_ids(
     ObInvSSTable &sstable,
     ObIArray<MacroBlockId> &macro_ids)
 {
@@ -981,7 +1003,17 @@ inline void collect_other_macro_ids(
   ASSERT_EQ(OB_ITER_END, ret);
 }
 
-inline void assert_macro_reuse_output_matches_row_rewrite(
+static inline void assert_same_inv_format(ObInvSSTable &expected, ObInvSSTable &actual)
+{
+  const ObInvIdxStatsMeta &expected_meta = expected.get_inv_meta().get_stats();
+  const ObInvIdxStatsMeta &actual_meta = actual.get_inv_meta().get_stats();
+  ASSERT_EQ(expected_meta.index_type_, actual_meta.index_type_);
+  ASSERT_EQ(expected_meta.has_relevance_params_, actual_meta.has_relevance_params_);
+  ASSERT_EQ(expected_meta.has_position_list_, actual_meta.has_position_list_);
+  ASSERT_EQ(expected_meta.has_nested_key_, actual_meta.has_nested_key_);
+}
+
+static inline void assert_macro_reuse_output_matches_row_rewrite(
     TestInvIdxSSTablePrepare &fixture,
     const bool has_pos_list,
     const int64_t row_cnt,
@@ -1049,9 +1081,11 @@ inline void assert_macro_reuse_output_matches_row_rewrite(
   ASSERT_EQ(input.get_inv_meta().get_stats().max_doc_id_, rewritten_output.get_inv_meta().get_stats().max_doc_id_);
   ASSERT_EQ(input.get_inv_meta().get_stats().total_doc_length_,
       rewritten_output.get_inv_meta().get_stats().total_doc_length_);
+  assert_same_inv_format(input, reused_output);
+  assert_same_inv_format(input, rewritten_output);
 }
 
-inline void assert_logical_block_reuse_output_matches_row_rewrite(
+static inline void assert_logical_block_reuse_output_matches_row_rewrite(
     TestInvIdxSSTablePrepare &fixture,
     const bool has_pos_list,
     const bool micro_index_clustered = false)
@@ -1107,12 +1141,405 @@ inline void assert_logical_block_reuse_output_matches_row_rewrite(
   ASSERT_EQ(rewritten_output.get_inv_meta().get_stats().max_doc_id_, reused_output.get_inv_meta().get_stats().max_doc_id_);
   ASSERT_EQ(rewritten_output.get_inv_meta().get_stats().total_doc_length_,
       reused_output.get_inv_meta().get_stats().total_doc_length_);
+  assert_same_inv_format(input, reused_output);
+  assert_same_inv_format(input, rewritten_output);
 }
-} // namespace
 
-// =============================================================================
-// 粗粒度停在 MACRO 边界 + get_macro_block_desc + is_macro/micro_block_opened
-// =============================================================================
+static uint64_t small_document_length(const ObStorageDatum &datum)
+{
+  uint64_t value = 0;
+  EXPECT_TRUE(number::ObNumber(datum.get_number()).is_valid_uint64(value));
+  return value;
+}
+
+static void assert_cached_lengths_reuse_visible_sstables(TestInvIdxSSTablePrepare &fixture, const bool search_text)
+{
+  DEFER(OB_INV_BM25_STAT_CACHE.destroy());
+  OK(OB_INV_BM25_STAT_CACHE.init("test_inv_bm25_stat", 1));
+  fixture.search_text_ = search_text;
+  ObInvSSTable first;
+  ObInvSSTable second;
+  fixture.build_inv_sstable(true /*has_pos_list*/, 1000, first, true /*vary_posting_payload*/);
+  fixture.index_builder_->~ObSSTableIndexBuilder();
+  fixture.index_builder_ = nullptr;
+  fixture.whole_desc_.reset();
+  fixture.table_schema_.reset();
+  fixture.build_inv_sstable(true /*has_pos_list*/, 2000, second, true /*vary_posting_payload*/);
+  second.key_.version_range_.snapshot_version_ = TestInvIdxSSTablePrepare::SNAPSHOT_VERSION + 1;
+  storage::ObRowkeyReadInfo read_info;
+  OK(build_merge_read_info(fixture.allocator_, fixture.table_schema_, read_info));
+  const ObString path = search_text ? ObString::make_string("$.f0") : ObString();
+  const uint64_t column_idx = search_text ? 1 : storage::ObInvBM25StatCacheKey::FULLTEXT_COLUMN_IDX;
+  ObStorageDatum prefix_datums[SEARCH_TEXT_TOKEN];
+  prefix_datums[SEARCH_TEXT_COL_IDX].set_uint(column_idx);
+  prefix_datums[SEARCH_TEXT_PATH].set_string(path);
+  const ObDatumRowkey field_prefix(prefix_datums, SEARCH_TEXT_TOKEN);
+  ObStorageDatum first_length;
+  ObStorageDatum second_length;
+  OK(storage::ObInvIdxFieldAggregator::aggregate_total_doc_length(
+      first, read_info, search_text ? &field_prefix : nullptr, nullptr, first_length));
+  OK(storage::ObInvIdxFieldAggregator::aggregate_total_doc_length(
+      second, read_info, search_text ? &field_prefix : nullptr, nullptr, second_length));
+  ASSERT_GT(small_document_length(first_length), 0);
+  ASSERT_GT(small_document_length(second_length), 0);
+  if (!search_text) {
+    ASSERT_EQ(first.get_inv_meta().get_stats().total_doc_length_, small_document_length(first_length));
+    // A saturated legacy SSTable scalar must never replace the exact tree value.
+    auto stats = first.get_inv_meta().get_stats();
+    stats.total_doc_length_ = UINT64_MAX;
+    ObInvSSTableMeta meta;
+    OK(meta.init(stats));
+    OK(first.set_inv_meta(meta));
+  }
+
+  auto get_length = [&](ObInvSSTable &sstable, const ObString &field_path,
+                        const storage::ObITableReadInfo &info, ObStorageDatum &length) {
+    ObStorageDatum datums[SEARCH_TEXT_TOKEN];
+    datums[SEARCH_TEXT_COL_IDX].set_uint(column_idx);
+    datums[SEARCH_TEXT_PATH].set_string(field_path);
+    const ObDatumRowkey prefix(datums, SEARCH_TEXT_TOKEN);
+    return OB_INV_BM25_STAT_CACHE.get_sstable_total_doc_length(
+           sstable, info, nullptr, search_text ? &prefix : nullptr, length);
+  };
+  for (ObInvSSTable *sstable : {&first, &second}) {
+    const uint64_t expected = small_document_length(sstable == &first ? first_length : second_length);
+    const storage::ObInvBM25StatCacheKey key(MTL_ID(), column_idx, path, sstable->get_key());
+    storage::ObInvBM25StatCacheHandle handle;
+    EXPECT_EQ(OB_ENTRY_NOT_EXIST, OB_INV_BM25_STAT_CACHE.get_stat(key, handle));
+    ObStorageDatum length;
+    OK(get_length(*sstable, path, read_info, length));
+    ASSERT_EQ(expected, small_document_length(length));
+    OK(OB_INV_BM25_STAT_CACHE.get_stat(key, handle));
+    ASSERT_TRUE(handle.is_valid());
+    ASSERT_EQ(expected, small_document_length(handle.value_->get_value()));
+    ASSERT_EQ(0, reinterpret_cast<uintptr_t>(handle.value_) % alignof(storage::ObInvBM25StatCacheValue));
+    // A duplicate insertion succeeds but must retain the first published value.
+    OK(OB_INV_BM25_STAT_CACHE.put_stat(key, number::ObNumber::get_zero()));
+    handle.reset();
+    OK(OB_INV_BM25_STAT_CACHE.get_stat(key, handle));
+    ASSERT_EQ(expected, small_document_length(handle.value_->get_value()));
+    storage::ObInvBM25StatCacheHandle another_query;
+    OK(OB_INV_BM25_STAT_CACHE.get_stat(key, another_query));
+    handle.reset();
+    ASSERT_EQ(expected, small_document_length(another_query.value_->get_value()));
+    another_query.reset();
+
+    const int64_t hits = OB_INV_BM25_STAT_CACHE.get_hit_cnt(MTL_ID());
+    OK(get_length(*sstable, path, read_info, length));
+    ASSERT_EQ(expected, small_document_length(length));
+    ASSERT_EQ(hits + 1, OB_INV_BM25_STAT_CACHE.get_hit_cnt(MTL_ID()));
+    OK(OB_INV_BM25_STAT_CACHE.erase(key));
+    ASSERT_EQ(OB_ENTRY_NOT_EXIST, OB_INV_BM25_STAT_CACHE.get_stat(key, handle));
+    OK(get_length(*sstable, path, read_info, length));
+    ASSERT_EQ(expected, small_document_length(length));
+    OK(OB_INV_BM25_STAT_CACHE.get_stat(key, handle));
+    ASSERT_EQ(expected, small_document_length(handle.value_->get_value()));
+  }
+  ObStorageDatum length;
+  if (search_text) {
+    // An absent field has a cacheable zero; an empty PATH is a legal root path.
+    OK(get_length(first, ObString(), read_info, length));
+    ASSERT_EQ(0, small_document_length(length));
+    const int64_t hits = OB_INV_BM25_STAT_CACHE.get_hit_cnt(MTL_ID());
+    OK(get_length(first, ObString(), read_info, length));
+    ASSERT_EQ(0, small_document_length(length));
+    ASSERT_EQ(hits + 1, OB_INV_BM25_STAT_CACHE.get_hit_cnt(MTL_ID()));
+    // Reject a prefix with no datums before reading COL_IDX or PATH, and reset outputs.
+    const ObDatumRowkey invalid_prefix;
+    length.set_uint(UINT64_MAX);
+    ASSERT_EQ(OB_INVALID_ARGUMENT, OB_INV_BM25_STAT_CACHE.get_sstable_total_doc_length(
+                                  first, read_info, nullptr, &invalid_prefix, length));
+    ASSERT_TRUE(length.is_nop());
+    uint64_t count = UINT64_MAX;
+    ASSERT_EQ(OB_INVALID_ARGUMENT, OB_INV_BM25_STAT_CACHE.get_sstable_token_doc_cnt(
+                                  first, read_info, nullptr, &invalid_prefix,
+                                  ObString::make_string("token"), count));
+    ASSERT_EQ(0, count);
+  }
+  // Cache failures preserve computed L; a real aggregation error still propagates.
+  OB_INV_BM25_STAT_CACHE.destroy();
+  OK(get_length(first, path, read_info, length));
+  ASSERT_EQ(0, number::ObNumber(first_length.get_number()).compare(length.get_number()));
+  storage::ObRowkeyReadInfo invalid_read_info;
+  ASSERT_EQ(OB_INVALID_ARGUMENT, get_length(first, path, invalid_read_info, length));
+
+  ObInvSSTable empty;
+  ObInvIdxMacroBlockWriter writer;
+  ObSSTablePrivateObjectCleaner cleaner;
+  open_output_writer(fixture, writer, cleaner);
+  finalize_output_sstable(fixture, writer, empty);
+  ASSERT_TRUE(empty.is_empty());
+  OK(get_length(empty, path, read_info, length));
+  ASSERT_TRUE(length.get_number().is_zero());
+  empty.inv_meta_.reset();
+  ASSERT_EQ(OB_ERR_UNEXPECTED, get_length(empty, path, read_info, length));
+}
+
+
+static void assert_cached_token_counts_match_posting_rows(TestInvIdxSSTablePrepare &fixture, const bool search_text)
+{
+  DEFER(OB_INV_BM25_STAT_CACHE.destroy());
+  OK(OB_INV_BM25_STAT_CACHE.init("test_inv_bm25_token", 1));
+  fixture.search_text_ = search_text;
+  ObInvSSTable first;
+  ObInvSSTable second;
+  fixture.build_inv_sstable(true, 10000, first, true);
+  fixture.index_builder_->~ObSSTableIndexBuilder();
+  fixture.index_builder_ = nullptr;
+  fixture.whole_desc_.reset();
+  fixture.table_schema_.reset();
+  fixture.build_inv_sstable(true, 20000, second, true);
+  second.key_.version_range_.snapshot_version_ = TestInvIdxSSTablePrepare::SNAPSHOT_VERSION + 1;
+  storage::ObRowkeyReadInfo read_info;
+  OK(build_merge_read_info(fixture.allocator_, fixture.table_schema_, read_info));
+  using Term = std::tuple<uint64_t, std::string, std::string>;
+  std::map<Term, uint64_t> expected;
+  std::map<Term, uint64_t> second_expected;
+  for (ObInvSSTable *sstable : {&first, &second}) {
+    ObDatumRange whole;
+    whole.set_whole_range();
+    ObInvSSTableMergeIter iter;
+    OK(iter.init(*sstable, read_info, fixture.inv_idx_row_desc_, whole, fixture.allocator_));
+    int ret = OB_SUCCESS;
+    while (OB_SUCC(ret = iter.next())) {
+      const auto *datums = iter.get_curr_row()->storage_datums_;
+      const int64_t token_idx = search_text ? SEARCH_TEXT_TOKEN : 0;
+      const Term term = std::make_tuple(
+                        search_text ? datums[SEARCH_TEXT_COL_IDX].get_uint()
+                                    : storage::ObInvBM25StatCacheKey::FULLTEXT_COLUMN_IDX,
+                        search_text ? std::string(datums[SEARCH_TEXT_PATH].ptr_, datums[SEARCH_TEXT_PATH].len_) : "",
+                        std::string(datums[token_idx].ptr_, datums[token_idx].len_));
+      ++expected[term];
+      if (&second == sstable) {
+        ++second_expected[term];
+      }
+    }
+    ASSERT_EQ(OB_ITER_END, ret);
+  }
+  ASSERT_GT(expected.size(), 1);
+  const auto kind = storage::ObInvBM25StatKind::TOKEN_DOC_CNT;
+  for (const auto &entry : expected) {
+    const uint64_t col = std::get<0>(entry.first);
+    const auto &p = std::get<1>(entry.first);
+    const auto &t = std::get<2>(entry.first);
+    const ObString path(p.size(), p.data());
+    const ObString token(t.size(), t.data());
+    ObStorageDatum datums[SEARCH_TEXT_TOKEN];
+    datums[SEARCH_TEXT_COL_IDX].set_uint(col);
+    datums[SEARCH_TEXT_PATH].set_string(path);
+    const ObDatumRowkey prefix(datums, SEARCH_TEXT_TOKEN);
+    for (ObInvSSTable *sstable : {&first, &second}) {
+      const uint64_t expected_count = sstable == &first
+                                       ? entry.second - second_expected[entry.first]
+                                       : second_expected[entry.first];
+      auto get_count = [&](uint64_t &count) {
+        return OB_INV_BM25_STAT_CACHE.get_sstable_token_doc_cnt(
+               *sstable, read_info, nullptr, search_text ? &prefix : nullptr, token, count);
+      };
+      uint64_t count = 0;
+      OK(get_count(count));
+      ASSERT_EQ(expected_count, count);
+      const int64_t hits = OB_INV_BM25_STAT_CACHE.get_hit_cnt(MTL_ID());
+      OK(get_count(count));
+      ASSERT_EQ(expected_count, count);
+      ASSERT_EQ(hits + (expected_count > 0 ? 1 : 0), OB_INV_BM25_STAT_CACHE.get_hit_cnt(MTL_ID()));
+      const uint64_t column_idx = search_text ? col : storage::ObInvBM25StatCacheKey::FULLTEXT_COLUMN_IDX;
+      const storage::ObInvBM25StatCacheKey key(MTL_ID(), column_idx, path, sstable->get_key(), kind, token);
+      storage::ObInvBM25StatCacheHandle handle;
+      if (0 == expected_count) {
+        ASSERT_EQ(OB_ENTRY_NOT_EXIST, OB_INV_BM25_STAT_CACHE.get_stat(key, handle));
+      } else {
+        OK(OB_INV_BM25_STAT_CACHE.erase(key));
+        ASSERT_EQ(OB_ENTRY_NOT_EXIST, OB_INV_BM25_STAT_CACHE.get_stat(key, handle));
+        OK(get_count(count));
+        ASSERT_EQ(expected_count, count);
+        OK(OB_INV_BM25_STAT_CACHE.get_stat(key, handle));
+        ASSERT_EQ(expected_count, handle.value_->get_value().get_uint());
+        OK(OB_INV_BM25_STAT_CACHE.put_stat(key, static_cast<uint64_t>(UINT64_MAX)));
+        handle.reset();
+        OK(OB_INV_BM25_STAT_CACHE.get_stat(key, handle));
+        ASSERT_EQ(expected_count, handle.value_->get_value().get_uint());
+      }
+      ObStorageDatum length;
+      OK(OB_INV_BM25_STAT_CACHE.get_sstable_total_doc_length(
+         *sstable, read_info, nullptr, search_text ? &prefix : nullptr, length));
+      ASSERT_GE(small_document_length(length), count);
+    }
+  }
+  ObStorageDatum datums[SEARCH_TEXT_TOKEN];
+  datums[SEARCH_TEXT_COL_IDX].set_uint(1);
+  datums[SEARCH_TEXT_PATH].set_string(ObString::make_string("$.f0"));
+  const ObDatumRowkey prefix(datums, SEARCH_TEXT_TOKEN);
+  const ObString missing = ObString::make_string("missing-token");
+  uint64_t count = 0;
+  OK(OB_INV_BM25_STAT_CACHE.get_sstable_token_doc_cnt(
+     first, read_info, nullptr, search_text ? &prefix : nullptr, missing, count));
+  ASSERT_EQ(0, count);
+  const int64_t hits = OB_INV_BM25_STAT_CACHE.get_hit_cnt(MTL_ID());
+  OK(OB_INV_BM25_STAT_CACHE.get_sstable_token_doc_cnt(
+     first, read_info, nullptr, search_text ? &prefix : nullptr, missing, count));
+  ASSERT_EQ(hits, OB_INV_BM25_STAT_CACHE.get_hit_cnt(MTL_ID()));
+  ASSERT_EQ(0, count);
+  const storage::ObInvBM25StatCacheKey missing_key(
+      MTL_ID(), search_text ? 1 : storage::ObInvBM25StatCacheKey::FULLTEXT_COLUMN_IDX,
+      search_text ? ObString::make_string("$.f0") : ObString(), first.get_key(), kind, missing);
+  storage::ObInvBM25StatCacheHandle missing_handle;
+  ASSERT_EQ(OB_ENTRY_NOT_EXIST, OB_INV_BM25_STAT_CACHE.get_stat(missing_key, missing_handle));
+  OB_INV_BM25_STAT_CACHE.destroy();
+  OK(OB_INV_BM25_STAT_CACHE.get_sstable_token_doc_cnt(
+     first, read_info, nullptr, search_text ? &prefix : nullptr, missing, count));
+  ASSERT_EQ(0, count);
+  EXPECT_EQ(OB_INVALID_ARGUMENT, OB_INV_BM25_STAT_CACHE.get_sstable_token_doc_cnt(
+                                first, read_info, nullptr, search_text ? &prefix : nullptr, ObString(), count));
+}
+
+TEST_F(TestInvIdxSSTablePrepare, fulltext_tree_and_cache_preserve_length_beyond_uint64)
+{
+  DEFER(OB_INV_BM25_STAT_CACHE.destroy());
+  OK(OB_INV_BM25_STAT_CACHE.init("test_inv_large_length", 1));
+  ObInvSSTable input, output;
+  build_inv_sstable(true, 100000, input, true);
+  ASSERT_GT(input.get_data_macro_block_count(), 1);
+  ObRowkeyReadInfo read_info;
+  OK(build_merge_read_info(allocator_, table_schema_, read_info));
+  ObInvIdxMacroBlockWriter writer;
+  ObSSTablePrivateObjectCleaner cleaner;
+  open_output_writer(*this, writer, cleaner);
+  ObDatumRange whole;
+  whole.set_whole_range();
+  ObInvSSTableMergeIter iter;
+  OK(iter.init(input, read_info, inv_idx_row_desc_, whole, allocator_));
+  int ret = iter.next_macro_block();
+  int64_t macro_count = 0;
+  while (OB_SUCCESS == ret) {
+    ObMacroBlockDesc desc;
+    OK(iter.get_macro_block_desc(desc));
+    ObInvMacroMeta meta;
+    OK(iter.get_curr_macro_inv_meta(meta));
+    auto stats = meta.get_stats();
+    // Synthetic boundary values exercise the real macro -> tree -> query/cache path.
+    // No enormous posting corpus is needed; each macro value itself still fits uint64.
+    stats.total_doc_length_ = UINT64_MAX;
+    meta.reset();
+    OK(meta.init(stats));
+    char bytes[512];
+    int64_t pos = 0;
+    OK(meta.serialize(bytes, sizeof(bytes), pos));
+    ObDataMacroBlockMeta macro_meta;
+    OK(macro_meta.assign(*desc.macro_meta_));
+    macro_meta.nested_offset_ = desc.macro_meta_->nested_offset_;
+    macro_meta.nested_size_ = desc.macro_meta_->nested_size_;
+    macro_meta.val_.agg_row_buf_ = bytes;
+    macro_meta.val_.agg_row_len_ = pos;
+    desc.macro_meta_ = &macro_meta;
+    OK(writer.append_macro_block(desc, meta));
+    ++macro_count;
+    ret = iter.next_macro_block();
+  }
+  ASSERT_EQ(OB_ITER_END, ret);
+  finalize_output_sstable(*this, writer, output);
+  ASSERT_EQ(UINT64_MAX, output.get_inv_meta().get_stats().total_doc_length_);
+  number::ObNumber maximum, count, expected;
+  OK(maximum.from(UINT64_MAX, allocator_));
+  OK(count.from(macro_count, allocator_));
+  OK(maximum.mul_v3(count, expected, allocator_));
+  ObStorageDatum length;
+  OK(ObInvIdxFieldAggregator::aggregate_total_doc_length(output, read_info, nullptr, nullptr, length));
+  ASSERT_EQ(0, expected.compare(length.get_number()));
+  const ObInvBM25StatCacheKey key(MTL_ID(), ObInvBM25StatCacheKey::FULLTEXT_COLUMN_IDX, ObString(), output.get_key());
+  ObInvBM25StatCacheHandle handle;
+  ASSERT_EQ(OB_ENTRY_NOT_EXIST, OB_INV_BM25_STAT_CACHE.get_stat(key, handle));
+  OK(OB_INV_BM25_STAT_CACHE.get_sstable_total_doc_length(output, read_info, nullptr, nullptr, length));
+  ASSERT_EQ(0, expected.compare(length.get_number()));
+  OK(OB_INV_BM25_STAT_CACHE.get_stat(key, handle));
+  ASSERT_EQ(0, expected.compare(handle.value_->get_value().get_number()));
+  const int64_t hits = OB_INV_BM25_STAT_CACHE.get_hit_cnt(MTL_ID());
+  length.set_number(number::ObNumber::get_zero());
+  OK(OB_INV_BM25_STAT_CACHE.get_sstable_total_doc_length(output, read_info, nullptr, nullptr, length));
+  ASSERT_EQ(hits + 1, OB_INV_BM25_STAT_CACHE.get_hit_cnt(MTL_ID()));
+  handle.reset();
+  OK(OB_INV_BM25_STAT_CACHE.erase(key));
+  ASSERT_EQ(0, expected.compare(length.get_number()));
+}
+
+TEST_F(TestInvIdxSSTablePrepare, cached_lengths_reuse_visible_sstables)
+{
+  assert_cached_lengths_reuse_visible_sstables(*this, true /*search_text*/);
+}
+
+TEST_F(TestInvIdxSSTablePrepare, cached_token_counts_match_posting_rows)
+{
+  assert_cached_token_counts_match_posting_rows(*this, true /*search_text*/);
+}
+
+TEST_F(TestInvIdxSSTablePrepare, cached_fulltext_lengths_reuse_visible_sstables)
+{
+  assert_cached_lengths_reuse_visible_sstables(*this, false /*search_text*/);
+}
+
+TEST_F(TestInvIdxSSTablePrepare, cached_fulltext_token_counts_match_posting_rows)
+{
+  assert_cached_token_counts_match_posting_rows(*this, false /*search_text*/);
+}
+
+TEST_F(TestInvIdxSSTablePrepare, search_text_unsigned_column_idx_statistics)
+{
+  DEFER(OB_INV_BM25_STAT_CACHE.destroy());
+  OK(OB_INV_BM25_STAT_CACHE.init("test_inv_uint_column", 1));
+  prepare_search_text_idx_schema(table_schema_, false /*has_pos_list*/);
+  OK(prepare_inv_idx_row_desc(table_schema_, inv_idx_row_desc_));
+
+  ObInvIdxMacroBlockWriter writer;
+  ObSSTablePrivateObjectCleaner cleaner;
+  open_output_writer(*this, writer, cleaner);
+  ObDatumRow row;
+  OK(row.init(mv_col_cnt_));
+  const uint64_t column_indexes[] = {1, static_cast<uint64_t>(INT64_MAX) + 1};
+  const uint64_t frequencies[] = {2, 3};
+  const ObString path = ObString::make_string("$.f0");
+  const ObString token = ObString::make_string("token");
+  for (int64_t i = 0; i < ARRAYSIZEOF(column_indexes); ++i) {
+    OK(make_search_text_inv_idx_row(row, inv_idx_row_desc_, mv_col_cnt_, column_indexes[i],
+                                   path, token, i + 1, frequencies[i], 3, ObString()));
+    ASSERT_EQ(column_indexes[i], row.storage_datums_[SEARCH_TEXT_COL_IDX].get_uint());
+    ASSERT_EQ(token, row.storage_datums_[SEARCH_TEXT_TOKEN].get_string());
+    OK(writer.append_row(row));
+  }
+  ObInvSSTable sstable;
+  finalize_output_sstable(*this, writer, sstable);
+  ObRowkeyReadInfo read_info;
+  OK(build_merge_read_info(allocator_, table_schema_, read_info));
+
+  ObStorageDatum datums[SEARCH_TEXT_TOKEN];
+  datums[SEARCH_TEXT_PATH].set_string(path);
+  const ObDatumRowkey prefix(datums, SEARCH_TEXT_TOKEN);
+  for (int64_t i = 0; i < ARRAYSIZEOF(column_indexes); ++i) {
+    datums[SEARCH_TEXT_COL_IDX].set_uint(column_indexes[i]);
+    ObStorageDatum length;
+    uint64_t count = 0;
+    OK(OB_INV_BM25_STAT_CACHE.get_sstable_total_doc_length(sstable, read_info, nullptr, &prefix, length));
+    ASSERT_EQ(frequencies[i], small_document_length(length));
+    OK(OB_INV_BM25_STAT_CACHE.get_sstable_token_doc_cnt(sstable, read_info, nullptr, &prefix, token, count));
+    ASSERT_EQ(1, count);
+    const int64_t hits = OB_INV_BM25_STAT_CACHE.get_hit_cnt(MTL_ID());
+    OK(OB_INV_BM25_STAT_CACHE.get_sstable_total_doc_length(sstable, read_info, nullptr, &prefix, length));
+    OK(OB_INV_BM25_STAT_CACHE.get_sstable_token_doc_cnt(sstable, read_info, nullptr, &prefix, token, count));
+    ASSERT_EQ(frequencies[i], small_document_length(length));
+    ASSERT_EQ(1, count);
+    ASSERT_EQ(hits + 2, OB_INV_BM25_STAT_CACHE.get_hit_cnt(MTL_ID()));
+  }
+
+  datums[SEARCH_TEXT_COL_IDX].set_uint(ObInvBM25StatCacheKey::FULLTEXT_COLUMN_IDX);
+  ObStorageDatum length;
+  uint64_t count = 1;
+  ASSERT_EQ(OB_INVALID_ARGUMENT,
+            OB_INV_BM25_STAT_CACHE.get_sstable_total_doc_length(sstable, read_info, nullptr, &prefix, length));
+  ASSERT_TRUE(length.is_nop());
+  ASSERT_EQ(OB_INVALID_ARGUMENT,
+            OB_INV_BM25_STAT_CACHE.get_sstable_token_doc_cnt(sstable, read_info, nullptr, &prefix, token, count));
+  ASSERT_EQ(0, count);
+}
+
 TEST_F(TestInvIdxSSTablePrepare, macro_boundary_state_and_desc)
 {
   const bool has_pos_list = true;
@@ -1161,6 +1588,126 @@ TEST_F(TestInvIdxSSTablePrepare, macro_boundary_state_and_desc)
   ASSERT_TRUE(iter.is_macro_block_opened());
   ObMacroBlockDesc desc2;
   ASSERT_EQ(OB_ERR_UNEXPECTED, iter.get_macro_block_desc(desc2));
+}
+
+class SearchTextRootLengthContext : public storage::ObIIndexTreeTraverserContext
+{
+public:
+  SearchTextRootLengthContext()
+    : ObIIndexTreeTraverserContext(true, false), length_(0), count_(0), ended_(false)
+  { range_.set_whole_range(); }
+  bool is_valid() const override { return true; }
+  bool is_ended() const override { return ended_; }
+  const ObDatumRange &get_curr_range() const override { return range_; }
+  int next_range() override { ended_ = true; return OB_SUCCESS; }
+  int on_inner_node(const ObMicroIndexInfo &row, const bool covered, ObTraverserOperationType &operation) override
+  {
+    int ret = OB_SUCCESS;
+    operation = NOTHING;
+    ObInvIdxAggInfo stats;
+    int64_t pos = 0;
+    uint64_t length = 0;
+    if (!covered || !row.row_header_->is_inverted_index()) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(ObInvIdxAggInfoSerializer::deserialize(row.agg_row_buf_, row.agg_buf_size_, pos, stats))) {
+    } else if (OB_FAIL(stats.get(ObInvIdxBM25Stat::TOTAL_DOC_LENGTH, length))) {
+    } else {
+      length_ += length;
+      ++count_;
+    }
+    return ret;
+  }
+  int on_node_estimate(const ObMicroIndexInfo &, const bool) override { return OB_ERR_UNEXPECTED; }
+  int on_leaf_node(const ObMicroIndexInfo &, const storage::ObPartitionEst &) override { return OB_ERR_UNEXPECTED; }
+  VIRTUAL_TO_STRING_KV(K_(length), K_(count));
+  uint64_t length_;
+  int64_t count_;
+private:
+  ObDatumRange range_;
+  bool ended_;
+};
+
+static void assert_index_tree_length_matches_row_scan(
+    TestInvIdxSSTablePrepare &fixture, const bool micro_index_clustered)
+{
+  const int64_t row_cnt = 100000;
+  int64_t term_count = 0;
+  ObInvSSTable inv_sstable;
+  fixture.search_text_ = true;
+  fixture.build_inv_sstable(true /*has_pos_list*/, row_cnt, inv_sstable,
+                           true /*vary_posting_payload*/, 0 /*initial_term_seq*/, 0 /*initial_doc_id*/,
+                           micro_index_clustered, 1 /*doc_id_step*/, &term_count);
+  ASSERT_GT(term_count, 7);
+  ASSERT_TRUE(inv_sstable.get_inv_meta().get_stats().is_search_text_index());
+
+  storage::ObRowkeyReadInfo read_info;
+  OK(build_merge_read_info(fixture.allocator_, fixture.table_schema_, read_info));
+  // Prove newly written parent rows carry L; the full range stops at the root
+  // instead of silently falling back to visiting every macro/term.
+  storage::ObIndexBlockTreeTraverser traverser;
+  SearchTextRootLengthContext root_context;
+  OK(traverser.init(inv_sstable, read_info, nullptr /*tablet*/, "TestFieldDL"));
+  OK(traverser.traverse(root_context));
+  ASSERT_GT(root_context.count_, 0);
+  ASSERT_EQ(inv_sstable.get_inv_meta().get_stats().total_doc_length_, root_context.length_);
+  ObDatumRange whole;
+  whole.set_whole_range();
+  std::map<std::pair<uint64_t, std::string>, uint64_t> expected;
+  ObInvSSTableMergeIter row_iter;
+  OK(row_iter.init(inv_sstable, read_info, fixture.inv_idx_row_desc_, whole, fixture.allocator_));
+  int ret = OB_SUCCESS;
+  while (OB_SUCC(ret = row_iter.next())) {
+    const ObDatumRow *row = row_iter.get_curr_row();
+    ASSERT_NE(nullptr, row);
+    const auto &datums = row->storage_datums_;
+    const uint64_t column_idx = datums[SEARCH_TEXT_COL_IDX].get_uint();
+    const std::string path(datums[SEARCH_TEXT_PATH].ptr_, datums[SEARCH_TEXT_PATH].len_);
+    expected[std::make_pair(column_idx, path)] += datums[fixture.inv_idx_row_desc_.token_freq_col_idx_].get_uint();
+  }
+  ASSERT_EQ(OB_ITER_END, ret);
+  auto aggregate_field = [&](const uint64_t column_idx, const ObString &path, uint64_t &length) {
+    ObStorageDatum datums[SEARCH_TEXT_TOKEN];
+    datums[SEARCH_TEXT_COL_IDX].set_uint(column_idx);
+    datums[SEARCH_TEXT_PATH].set_string(path);
+    ObDatumRowkey prefix(datums, SEARCH_TEXT_TOKEN);
+    ObStorageDatum result;
+    const int ret = storage::ObInvIdxFieldAggregator::aggregate_total_doc_length(
+                    inv_sstable, read_info, &prefix, nullptr /*tablet*/, result);
+    if (OB_SUCCESS == ret) {
+      length = small_document_length(result);
+    }
+    return ret;
+  };
+  uint64_t whole_total = 0;
+  for (const auto &field : expected) {
+    const ObString path(static_cast<int32_t>(field.first.second.size()), field.first.second.data());
+    uint64_t length = 0;
+    OK(aggregate_field(field.first.first, path, length));
+    ASSERT_EQ(field.second, length) << field.first.first << ":" << field.first.second;
+    whole_total += length;
+  }
+  ASSERT_EQ(inv_sstable.get_inv_meta().get_stats().total_doc_length_, whole_total);
+  for (const char *missing_path : {"", "$.f00", "$.zz"}) {
+    uint64_t length = UINT64_MAX;
+    OK(aggregate_field(2, ObString::make_string(missing_path), length));
+    ASSERT_EQ(0, length);
+  }
+  for (const uint64_t column_idx : {static_cast<uint64_t>(0), static_cast<uint64_t>(INT64_MAX - 1)}) {
+    uint64_t length = UINT64_MAX;
+    OK(aggregate_field(column_idx, ObString::make_string("$.f0"), length));
+    ASSERT_EQ(0, length);
+  }
+}
+
+// Keep both layouts in the same suite: the tenant environment cannot be reinitialized after destroy().
+TEST_F(TestInvIdxSSTablePrepare, index_tree_length_matches_row_scan)
+{
+  assert_index_tree_length_matches_row_scan(*this, false /*micro_index_clustered*/);
+}
+
+TEST_F(TestInvIdxSSTablePrepare, clustered_index_tree_length_matches_row_scan)
+{
+  assert_index_tree_length_matches_row_scan(*this, true /*micro_index_clustered*/);
 }
 
 // 两源首宏 start 同为 MIN_ROWKEY 时，主线 compare_range 以 endkey 判定：
@@ -2709,20 +3256,21 @@ TEST_F(TestInvIdxSSTablePrepare, macro_compressor_change_reuses_without_changing
 // remain eligible for whole-block reuse. Within the dirty macro, only logical blocks containing
 // deleted doc ids fall back to rows; other logical blocks are still reused. The mixed output must
 // equal a full filtered rewrite.
-TEST_F(TestInvIdxSSTablePrepare, deletion_rewrites_dirty_macro_and_reuses_clean_macros)
+inline void assert_deletion_rewrites_dirty_macro_and_reuses_clean_macros(
+    TestInvIdxSSTablePrepare &fixture)
 {
   const int64_t row_cnt = 100000;
   ObInvSSTable input;
-  build_inv_sstable(true /*has_pos_list*/, row_cnt, input, true /*vary_posting_payload*/);
+  fixture.build_inv_sstable(true /*has_pos_list*/, row_cnt, input, true /*vary_posting_payload*/);
   const int64_t input_macro_count = input.get_data_macro_block_count();
   ASSERT_GT(input_macro_count, 1);
 
   storage::ObRowkeyReadInfo read_info;
-  OK(build_merge_read_info(allocator_, table_schema_, read_info));
+  OK(build_merge_read_info(fixture.allocator_, fixture.table_schema_, read_info));
   ObDatumRange whole;
   whole.set_whole_range();
   ObInvSSTableMergeIter stats_iter;
-  OK(stats_iter.init(input, read_info, inv_idx_row_desc_, whole, allocator_));
+  OK(stats_iter.init(input, read_info, fixture.inv_idx_row_desc_, whole, fixture.allocator_));
   OK(stats_iter.next_macro_block());
   ObInvMacroMeta dirty_stats;
   OK(stats_iter.get_curr_macro_inv_meta(dirty_stats));
@@ -2738,11 +3286,11 @@ TEST_F(TestInvIdxSSTablePrepare, deletion_rewrites_dirty_macro_and_reuses_clean_
   };
   storage::ObDeletionBitmapHandle deletion_bitmap_handle;
   OK(init_deletion_bitmap(
-      allocator_, deleted_doc_ids, ARRAYSIZEOF(deleted_doc_ids), deletion_bitmap_handle));
+      fixture.allocator_, deleted_doc_ids, ARRAYSIZEOF(deleted_doc_ids), deletion_bitmap_handle));
   ASSERT_TRUE(deletion_bitmap_handle.is_valid());
 
   ObInvSSTableMergeHelper helper(
-      read_info, inv_idx_row_desc_, allocator_, deletion_bitmap_handle);
+      read_info, fixture.inv_idx_row_desc_, fixture.allocator_, deletion_bitmap_handle);
   helper.is_inited_ = true;
   ASSERT_TRUE(helper.has_deletion_in_range(
       dirty_stats.get_stats().min_doc_id_, dirty_stats.get_stats().max_doc_id_));
@@ -2756,13 +3304,13 @@ TEST_F(TestInvIdxSSTablePrepare, deletion_rewrites_dirty_macro_and_reuses_clean_
   // Exercise the production merger path instead of reproducing its deletion policy in the test.
   ObInvIdxMacroBlockWriter writer;
   ObSSTablePrivateObjectCleaner cleaner;
-  open_output_writer(*this, writer, cleaner);
+  open_output_writer(fixture, writer, cleaner);
   ObInvSSTableMergeHelper merge_helper(
-      read_info, inv_idx_row_desc_, allocator_, deletion_bitmap_handle,
-      &whole_desc_.get_desc());
-  ObInvSSTableMergeIter *merge_iter = OB_NEWx(ObInvSSTableMergeIter, &allocator_);
+      read_info, fixture.inv_idx_row_desc_, fixture.allocator_, deletion_bitmap_handle,
+      &fixture.whole_desc_.get_desc());
+  ObInvSSTableMergeIter *merge_iter = OB_NEWx(ObInvSSTableMergeIter, &fixture.allocator_);
   ASSERT_NE(nullptr, merge_iter);
-  OK(merge_iter->init(input, read_info, inv_idx_row_desc_, whole, allocator_));
+  OK(merge_iter->init(input, read_info, fixture.inv_idx_row_desc_, whole, fixture.allocator_));
   OK(merge_helper.iters_.push_back(merge_iter));
   OK(merge_helper.prepare_rows_merger_(false /*is_full_merge*/));
   merge_helper.is_inited_ = true;
@@ -2795,7 +3343,7 @@ TEST_F(TestInvIdxSSTablePrepare, deletion_rewrites_dirty_macro_and_reuses_clean_
 
   // Run the production close path on the mixed row/filter/macro-reuse/logical-reuse result.
   compaction::ObTabletMergeDagParam close_dag_param;
-  compaction::ObAsyncIndexMergeCtx async_ctx(close_dag_param, allocator_);
+  compaction::ObAsyncIndexMergeCtx async_ctx(close_dag_param, fixture.allocator_);
   async_ctx.get_merge_info().get_index_builder()->set_is_async_index(true);
   ObSSTableMergeHistory &history = async_ctx.get_merge_info().get_merge_history();
   history.static_info_.concurrent_cnt_ = 2;
@@ -2814,14 +3362,14 @@ TEST_F(TestInvIdxSSTablePrepare, deletion_rewrites_dirty_macro_and_reuses_clean_
       .info_[ObParalleMergeInfo::SCAN_UNITS].sum_value_);
 
   ObInvSSTable mixed_output;
-  finalize_closed_output_sstable(*this, writer, mixed_output);
+  finalize_closed_output_sstable(fixture, writer, mixed_output);
   ObSEArray<MacroBlockId, 8> input_macro_ids;
-  collect_macro_ids(input, read_info, inv_idx_row_desc_, allocator_, input_macro_ids);
+  collect_macro_ids(input, read_info, fixture.inv_idx_row_desc_, fixture.allocator_, input_macro_ids);
   ASSERT_EQ(input_macro_count, input_macro_ids.count());
 
   ObSEArray<MacroBlockId, 8> mixed_output_ids;
   collect_macro_ids(
-      mixed_output, read_info, inv_idx_row_desc_, allocator_, mixed_output_ids);
+      mixed_output, read_info, fixture.inv_idx_row_desc_, fixture.allocator_, mixed_output_ids);
   int64_t output_pos = 0;
   for (int64_t i = 1; i < input_macro_ids.count(); ++i) {
     while (output_pos < mixed_output_ids.count()
@@ -2835,13 +3383,13 @@ TEST_F(TestInvIdxSSTablePrepare, deletion_rewrites_dirty_macro_and_reuses_clean_
 
   ObInvSSTable rewritten_output;
   build_filtered_rewritten_sstable(
-      *this, input, read_info, deletion_bitmap_handle, rewritten_output);
+      fixture, input, read_info, deletion_bitmap_handle, rewritten_output);
   InvSSTableDigest mixed_digest;
   InvSSTableDigest rewritten_digest;
   digest_inv_sstable(
-      mixed_output, read_info, inv_idx_row_desc_, allocator_, mixed_digest);
+      mixed_output, read_info, fixture.inv_idx_row_desc_, fixture.allocator_, mixed_digest);
   digest_inv_sstable(
-      rewritten_output, read_info, inv_idx_row_desc_, allocator_, rewritten_digest);
+      rewritten_output, read_info, fixture.inv_idx_row_desc_, fixture.allocator_, rewritten_digest);
   ASSERT_EQ(row_cnt - ARRAYSIZEOF(deleted_doc_ids), mixed_digest.row_count_);
   ASSERT_EQ(rewritten_digest.row_count_, mixed_digest.row_count_);
   ASSERT_EQ(rewritten_digest.rowkey_checksum_, mixed_digest.rowkey_checksum_);
@@ -2853,6 +3401,161 @@ TEST_F(TestInvIdxSSTablePrepare, deletion_rewrites_dirty_macro_and_reuses_clean_
   ASSERT_EQ(rewritten_output.get_inv_meta().get_stats().max_doc_id_, mixed_output.get_inv_meta().get_stats().max_doc_id_);
   ASSERT_EQ(rewritten_output.get_inv_meta().get_stats().total_doc_length_,
       mixed_output.get_inv_meta().get_stats().total_doc_length_);
+  assert_same_inv_format(input, mixed_output);
+}
+
+TEST_F(TestInvIdxSSTablePrepare, deletion_rewrites_dirty_macro_and_reuses_clean_macros)
+{
+  assert_deletion_rewrites_dirty_macro_and_reuses_clean_macros(*this);
+}
+
+// =============================================================================
+// Search Text: the (COL_IDX, PATH, TOKEN, DOC_ID) rowkey and DOC_ID/TF/DL[/POS] posting go through the same
+// macro block reuse -> logical block reuse -> row-by-row rewrite flow, plus the deletion filtering and empty output paths.
+// =============================================================================
+TEST_F(TestInvIdxSSTablePrepare, search_text_macro_reuse_output_matches_row_rewrite)
+{
+  search_text_ = true;
+  assert_macro_reuse_output_matches_row_rewrite(
+      *this, true /*has_pos_list*/, 100000, true /*vary_posting_payload*/,
+      true /*require_multiple_macros*/);
+}
+
+TEST_F(TestInvIdxSSTablePrepare, search_text_macro_reuse_without_position_list_matches_row_rewrite)
+{
+  search_text_ = true;
+  assert_macro_reuse_output_matches_row_rewrite(
+      *this, false /*has_pos_list*/, 200000, false /*vary_posting_payload*/,
+      false /*require_multiple_macros*/);
+}
+
+TEST_F(TestInvIdxSSTablePrepare, search_text_logical_block_reuse_matches_row_rewrite)
+{
+  search_text_ = true;
+  assert_logical_block_reuse_output_matches_row_rewrite(*this, true /*has_pos_list*/);
+}
+
+TEST_F(TestInvIdxSSTablePrepare,
+    search_text_logical_block_reuse_without_position_list_matches_row_rewrite)
+{
+  search_text_ = true;
+  assert_logical_block_reuse_output_matches_row_rewrite(*this, false /*has_pos_list*/);
+}
+
+TEST_F(TestInvIdxSSTablePrepare, search_text_deletion_rewrites_dirty_macro_and_reuses_clean_macros)
+{
+  search_text_ = true;
+  assert_deletion_rewrites_dirty_macro_and_reuses_clean_macros(*this);
+}
+
+// Every DOC_ID is purged: do_merge_ filters all rows, and the empty output keeps the search text
+// format with an empty doc id range and zero total_doc_length_.
+TEST_F(TestInvIdxSSTablePrepare, search_text_all_deleted_merge_writes_empty_meta)
+{
+  search_text_ = true;
+  const int64_t row_cnt = 1000;
+  ObInvSSTable input;
+  build_inv_sstable(true /*has_pos_list*/, row_cnt, input);
+  ASSERT_EQ(1u, input.get_inv_meta().get_stats().min_doc_id_);
+  ASSERT_EQ(static_cast<uint64_t>(row_cnt), input.get_inv_meta().get_stats().max_doc_id_);
+
+  uint64_t *deleted_doc_ids =
+      static_cast<uint64_t *>(allocator_.alloc(sizeof(uint64_t) * row_cnt));
+  ASSERT_NE(nullptr, deleted_doc_ids);
+  for (int64_t i = 0; i < row_cnt; ++i) {
+    deleted_doc_ids[i] = static_cast<uint64_t>(i + 1);
+  }
+  storage::ObDeletionBitmapHandle deletion_bitmap_handle;
+  OK(init_deletion_bitmap(allocator_, deleted_doc_ids, row_cnt, deletion_bitmap_handle));
+
+  storage::ObRowkeyReadInfo read_info;
+  OK(build_merge_read_info(allocator_, table_schema_, read_info));
+  ObDatumRange whole;
+  whole.set_whole_range();
+  ObInvIdxMacroBlockWriter writer;
+  ObSSTablePrivateObjectCleaner cleaner;
+  open_output_writer(*this, writer, cleaner);
+  ObInvSSTableMergeHelper merge_helper(
+      read_info, inv_idx_row_desc_, allocator_, deletion_bitmap_handle,
+      &whole_desc_.get_desc());
+  ObInvSSTableMergeIter *merge_iter = OB_NEWx(ObInvSSTableMergeIter, &allocator_);
+  ASSERT_NE(nullptr, merge_iter);
+  OK(merge_iter->init(input, read_info, inv_idx_row_desc_, whole, allocator_));
+  OK(merge_helper.iters_.push_back(merge_iter));
+  OK(merge_helper.prepare_rows_merger_(false /*is_full_merge*/));
+  merge_helper.is_inited_ = true;
+
+  compaction::ObLocalArena merger_arena("TInvAllDel");
+  compaction::ObTabletMergeDagParam dag_param;
+  compaction::ObStaticMergeParam static_param(dag_param);
+  ObPartitionInvSSTableMerger merger(merger_arena, static_param);
+  merger.merge_helper_ = &merge_helper;
+  merger.macro_writer_ = &writer;
+  const int merge_ret = merger.do_merge_();
+  merger.merge_helper_ = nullptr;
+  merger.macro_writer_ = nullptr;
+  ASSERT_EQ(OB_SUCCESS, merge_ret);
+  ASSERT_TRUE(merge_helper.is_iter_end());
+  ASSERT_EQ(row_cnt, merge_helper.get_iters_row_count());
+  ASSERT_EQ(0, writer.get_merge_block_info().multiplexed_macro_block_count_);
+  ASSERT_EQ(0, writer.get_merge_block_info().multiplexed_logical_block_count_);
+  ASSERT_EQ(row_cnt, writer.get_merge_block_info().filter_row_count_);
+
+  OK(writer.close());
+  const ObInvSSTableMeta &seg_meta = writer.get_seg_inv_meta();
+  ASSERT_TRUE(seg_meta.is_valid());
+  ASSERT_TRUE(seg_meta.get_stats().is_search_text_index());
+  ASSERT_TRUE(seg_meta.get_stats().has_relevance_params_);
+  ASSERT_TRUE(seg_meta.get_stats().has_position_list_);
+  ASSERT_FALSE(seg_meta.get_stats().has_nested_key_);
+  ASSERT_TRUE(seg_meta.get_stats().is_empty_range());
+  ASSERT_EQ(0u, seg_meta.get_stats().total_doc_length_);
+
+  OK(index_builder_->merge_inv_meta(seg_meta));
+  ObSSTableMergeRes res;
+  OK(index_builder_->close(res));
+  ASSERT_EQ(0, res.row_count_);
+  ASSERT_EQ(0, res.data_blocks_cnt_);
+  ASSERT_TRUE(res.inv_meta_.is_valid());
+  ASSERT_TRUE(res.inv_meta_.get_stats().is_search_text_index());
+  ASSERT_TRUE(res.inv_meta_.get_stats().has_relevance_params_);
+  ASSERT_TRUE(res.inv_meta_.get_stats().has_position_list_);
+  ASSERT_TRUE(res.inv_meta_.get_stats().is_empty_range());
+  ASSERT_EQ(0u, res.inv_meta_.get_stats().total_doc_length_);
+}
+
+// An incremental major with no rows inherits the format from the search text major sstable and
+// clears only the statistics through the initializer used by the incremental major helper.
+TEST_F(TestInvIdxSSTablePrepare, search_text_empty_inc_meta_inherits_major_format)
+{
+  search_text_ = true;
+  ObInvSSTable major;
+  build_inv_sstable(false /*has_pos_list*/, 100 /*row_cnt*/, major);
+  ObInvIdxStatsMeta empty_stats;
+  ASSERT_EQ(OB_SUCCESS, empty_stats.init_empty_for_write(major.get_inv_meta().get_stats()));
+  ObInvSSTableMeta empty_inv_meta;
+  ASSERT_EQ(OB_SUCCESS, empty_inv_meta.init(empty_stats));
+  ASSERT_TRUE(empty_inv_meta.get_stats().is_search_text_index());
+  ASSERT_TRUE(empty_inv_meta.get_stats().has_relevance_params_);
+  ASSERT_FALSE(empty_inv_meta.get_stats().has_nested_key_);
+  ASSERT_TRUE(empty_inv_meta.is_valid());
+  ASSERT_TRUE(empty_inv_meta.get_stats().is_empty_range());
+  ASSERT_EQ(0u, empty_inv_meta.get_stats().total_doc_length_);
+
+  reset_output_desc(*this);
+  // No writer.open() here, so mirror the real inc-major flow that flags the builder before merge_inv_meta.
+  index_builder_->set_is_async_index(true);
+  OK(index_builder_->merge_inv_meta(empty_inv_meta));
+  ObSSTableMergeRes res;
+  OK(index_builder_->close(res));
+  ASSERT_EQ(0, res.row_count_);
+  ASSERT_TRUE(res.inv_meta_.is_valid());
+  ASSERT_EQ(major.get_inv_meta().get_stats().index_type_, res.inv_meta_.get_stats().index_type_);
+  ASSERT_EQ(major.get_inv_meta().get_stats().has_relevance_params_, res.inv_meta_.get_stats().has_relevance_params_);
+  ASSERT_EQ(major.get_inv_meta().get_stats().has_position_list_, res.inv_meta_.get_stats().has_position_list_);
+  ASSERT_EQ(major.get_inv_meta().get_stats().has_nested_key_, res.inv_meta_.get_stats().has_nested_key_);
+  ASSERT_TRUE(res.inv_meta_.get_stats().is_empty_range());
+  ASSERT_EQ(0u, res.inv_meta_.get_stats().total_doc_length_);
 }
 
 TEST_F(TestInvIdxSSTablePrepare, incremental_row_count_for_inc_inv_sstable)

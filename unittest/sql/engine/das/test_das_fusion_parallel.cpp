@@ -493,6 +493,26 @@ static void init_docid_range_slice(
 // Section 1: ObDASFusionMaterializedRow Tests
 // ============================================================================
 
+TEST(ObIDASSearchOpOptionalInterfaceTest, rowid_only_operator_defaults)
+{
+  share::ObTenantEnv::get_tenant_local()->id_ = 500;
+  ObArenaAllocator alloc("OptionalNK");
+  ObDASScanOp scan_op(alloc);
+  ObDASSearchCtx search_ctx(alloc, scan_op);
+  TestEnumerableSearchOp op(search_ctx, {7});
+  ObDASRowID rowid;
+  ObDASNestedKey target;
+  ObDASNestedKey key;
+  double score = 0.0;
+  int64_t count = 0;
+  EXPECT_EQ(OB_NOT_IMPLEMENT, op.next_rowid(key, score));
+  EXPECT_EQ(OB_NOT_IMPLEMENT, op.advance_to(target, key, score));
+  EXPECT_EQ(OB_NOT_IMPLEMENT, op.next_rowids(1, count));
+  ASSERT_EQ(OB_SUCCESS, op.next_rowid(rowid, score));
+  EXPECT_EQ(7, rowid.get_uint64());
+  EXPECT_EQ(OB_ITER_END, op.next_rowid(rowid, score));
+}
+
 TEST(ObDASFusionMaterializedRowTest, default_constructor)
 {
   ObDASFusionMaterializedRow row;
@@ -941,6 +961,7 @@ TEST(ObDASFusionSliceProviderTest, async_query_supports_docid_range)
   ExprFixedArray nested_rowid_exprs(alloc);
   search_ctx.scopes_[DAS_SCOPE_NESTED_SYNC].rowid_exprs_ =
       &nested_rowid_exprs;
+  search_ctx.nested_scope_id_ = DAS_SCOPE_NESTED_SYNC;
   EXPECT_FALSE(provider.is_supported(
       ObDASFusionPathType::QUERY, search_ctx));
 }

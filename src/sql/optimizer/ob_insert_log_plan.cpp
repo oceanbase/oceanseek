@@ -1727,7 +1727,7 @@ int ObInsertLogPlan::prepare_table_dml_info_for_ddl(const ObInsertTableInfo& tab
     } else if (index_schema->is_index_table() && !index_schema->is_global_index_table()) {
       // local index
       ObArray<uint64_t> index_part_ids;
-      if (!index_schema->is_search_data_index()) {
+      if (!index_schema->is_search_aux_index()) {
         if (OB_FAIL(schema_guard->get_table_schema(session_info->get_effective_tenant_id(),
                                                   index_schema->get_data_table_id(),
                                                   data_table_schema))) {
@@ -1751,9 +1751,9 @@ int ObInsertLogPlan::prepare_table_dml_info_for_ddl(const ObInsertTableInfo& tab
         }
       }
       if (OB_FAIL(ret)) {
-      } else if (index_schema->is_search_data_index()) {
-        // For search data index DDL, table_info.part_ids_ are already resolved against
-        // the search data index itself in resolver. They are not data table partition ids,
+      } else if (index_schema->is_search_aux_index()) {
+        // For search auxiliary index DDL, table_info.part_ids_ are already resolved against
+        // the auxiliary index itself in resolver. They are not data table partition ids,
         // so we must not remap them through get_index_part_ids().
         if (OB_FAIL(index_dml_info->part_ids_.assign(table_info.part_ids_))) {
           LOG_WARN("fail to assign part ids", K(ret), K(table_info.part_ids_));

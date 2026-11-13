@@ -7,6 +7,8 @@
 
 #include "share/ob_async_index_refresh_util.h"
 #include "share/ob_debug_sync.h"
+#include "share/search_index/ob_search_index_lifecycle_util.h"
+#include "share/schema/ob_schema_struct.h"
 #include "lib/oblog/ob_log_module.h"
 #include "share/ob_ddl_common.h"
 #include "share/ob_share_util.h"
@@ -1150,6 +1152,70 @@ int64_t ObAsyncIndexRefreshUtil::get_async_index_refresh_dop_limit(
   return dop_limit;
 }
 
+// Caller-owned schema and status policy; expansion itself is policy-free.
+static int collect_refresh_targets(
+    share::schema::ObSchemaGetterGuard &guard, const share::schema::ObTableSchema &base,
+    common::ObIArray<share::ObAsyncPhysicalTarget> &targets,
+    const bool retry_on_missing_search_schema, const bool allow_unavailable)
+{
+  int ret = OB_SUCCESS;
+  targets.reset();
+  const auto &infos = base.get_simple_index_infos();
+  for (int64_t i = 0; OB_SUCC(ret) && i < infos.count(); ++i) {
+    const auto &info = infos.at(i);
+    const share::schema::ObTableSchema *logical = nullptr;
+    common::ObSEArray<share::ObAsyncPhysicalTarget, 3> expanded;
+    if (!share::schema::is_async_index(info.index_type_)) {
+      continue;
+    } else if (OB_FAIL(guard.get_table_schema(base.get_tenant_id(), info.table_id_, logical))) {
+      LOG_WARN("failed to get logical async schema", K(ret), K(info));
+    } else if (OB_ISNULL(logical)) {
+      if (retry_on_missing_search_schema
+          && share::schema::is_async_search_def_index(info.index_type_)) {
+        ret = OB_SCHEMA_EAGAIN;
+        LOG_WARN("async search def schema is missing", K(ret), K(info));
+      } else {
+        LOG_INFO("async index schema is missing, skip refresh", K(base.get_tenant_id()),
+            K(base.get_table_id()), K(info));
+      }
+    } else if (share::schema::INDEX_STATUS_AVAILABLE != logical->get_index_status()
+        && !(allow_unavailable
+            && share::schema::INDEX_STATUS_UNAVAILABLE == logical->get_index_status())) {
+      LOG_INFO("index schema is not available, skip", K(base.get_tenant_id()), K(base.get_table_id()), K(i), K(info));
+    } else if (OB_FAIL(share::ObSearchIndexLifecycleUtil::expand_async_index(
+        base, *logical, expanded))) {
+      LOG_WARN("failed to expand async index", K(ret), K(info));
+    } else {
+      for (int64_t j = 0; OB_SUCC(ret) && j < expanded.count(); ++j) {
+        const auto &target = expanded.at(j);
+        const share::schema::ObTableSchema *physical = nullptr;
+        if (OB_FAIL(share::ObSearchIndexLifecycleUtil::get_target_schema(
+            guard, base, target, physical))) {
+          LOG_WARN("failed to get async target", K(ret), K(target));
+        } else if (OB_ISNULL(physical)) {
+          if (retry_on_missing_search_schema && OB_INVALID_ID != target.def_table_id_) {
+            ret = OB_SCHEMA_EAGAIN;
+            LOG_WARN("async search child schema is missing", K(ret), K(target));
+          } else {
+            LOG_INFO("async target schema is missing, skip refresh", K(base.get_tenant_id()),
+                K(base.get_table_id()), K(target));
+          }
+        } else if (share::schema::INDEX_STATUS_AVAILABLE != physical->get_index_status()
+            && !(allow_unavailable
+                && share::schema::INDEX_STATUS_UNAVAILABLE == physical->get_index_status())) {
+            LOG_INFO("async search index schema is not available, skip",  K(base.get_tenant_id()), K(base.get_table_id()), K(physical->get_table_id()));
+        } else if (OB_FAIL(targets.push_back(target))) {
+          LOG_WARN("failed to append async target", K(ret), K(target));
+        }
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+    targets.reset();
+  }
+  return ret;
+}
+
 int ObAsyncIndexRefreshUtil::collect_async_index_table_ids(
     const uint64_t tenant_id,
     const uint64_t data_table_id,
@@ -1174,48 +1240,20 @@ int ObAsyncIndexRefreshUtil::collect_async_index_table_ids(
       ret = OB_TABLE_NOT_EXIST;
       LOG_WARN("data table schema not exist", K(ret), K(data_table_id));
     } else {
-      const common::ObIArray<share::schema::ObAuxTableMetaInfo> &simple_index_infos =
-          data_table_schema->get_simple_index_infos();
-      for (int64_t i = 0; OB_SUCC(ret) && i < simple_index_infos.count(); ++i) {
-        const share::schema::ObAuxTableMetaInfo &info = simple_index_infos.at(i);
-        const bool is_async_search = share::schema::is_async_search_def_index(info.index_type_);
-        uint64_t index_table_id = info.table_id_;
-        const share::schema::ObTableSchema *index_schema = nullptr;
-        if (!share::schema::is_async_index(info.index_type_)) {
-        } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id, index_table_id, index_schema))) {
-          LOG_WARN("fail to get index schema", K(ret), K(index_table_id));
-        } else if (OB_ISNULL(index_schema)) {
-          if (retry_on_missing_search_schema && is_async_search) {
-            ret = OB_SCHEMA_EAGAIN;
-            LOG_WARN("async search def schema does not exist", K(ret), K(tenant_id), K(info));
-          } else {
-            LOG_INFO("index schema does not exist, skip", K(tenant_id), K(data_table_id), K(i), K(info));
-          }
-        } else if (share::schema::INDEX_STATUS_AVAILABLE != index_schema->get_index_status()
-                   && !(allow_unavailable && share::schema::INDEX_STATUS_UNAVAILABLE == index_schema->get_index_status())) {
-          LOG_INFO("index schema is not available, skip", K(tenant_id), K(data_table_id), K(i), K(info));
-        } else if (is_async_search
-                   && OB_FAIL(index_schema->get_search_data_index_tid(index_table_id))) {
-          LOG_WARN("fail to get async search data table id", K(ret), K(info));
-        } else if (is_async_search
-                   && OB_FAIL(schema_guard.get_table_schema(tenant_id, index_table_id, index_schema))) {
-          LOG_WARN("fail to get async search data schema", K(ret), K(index_table_id));
-        } else if (OB_ISNULL(index_schema)) {
-          if (retry_on_missing_search_schema) {
-            ret = OB_SCHEMA_EAGAIN;
-            LOG_WARN("async search data schema does not exist", K(ret), K(tenant_id), K(index_table_id));
-          } else {
-            LOG_INFO("async search data schema does not exist, skip", K(tenant_id), K(data_table_id), K(index_table_id));
-          }
-        } else if (share::schema::INDEX_STATUS_AVAILABLE != index_schema->get_index_status()
-                   && !(allow_unavailable && share::schema::INDEX_STATUS_UNAVAILABLE == index_schema->get_index_status())) {
-          LOG_INFO("async search data schema is not available, skip",
-              K(tenant_id), K(data_table_id), K(index_table_id));
-        } else if (OB_FAIL(out_index_table_ids.push_back(index_table_id))) {
-          LOG_WARN("fail to push back index table id", K(ret), K(index_table_id));
+      common::ObSEArray<ObAsyncPhysicalTarget, 8> targets;
+      if (OB_FAIL(collect_refresh_targets(schema_guard, *data_table_schema, targets,
+          retry_on_missing_search_schema, allow_unavailable))) {
+        LOG_WARN("failed to collect physical async refresh targets", K(ret), K(data_table_id));
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < targets.count(); ++i) {
+        if (OB_FAIL(out_index_table_ids.push_back(targets.at(i).table_id_))) {
+          LOG_WARN("failed to append async refresh target", K(ret), K(targets.at(i)));
         }
       }
     }
+  }
+  if (OB_FAIL(ret)) {
+    out_index_table_ids.reset();
   }
   return ret;
 }

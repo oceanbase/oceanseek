@@ -9,6 +9,7 @@
 #include "share/schema/ob_table_param.h"
 #include "ob_index_block_util.h"
 #include "ob_index_block_row_struct.h"
+#include "storage/blocksstable/async_index/ob_inv_idx_aggregator.h"
 
 namespace oceanbase
 {
@@ -475,9 +476,12 @@ public:
   int init(const ObDataStoreDesc &store_desc, ObIAllocator &allocator);
   int eval(const ObIndexBlockRowDesc &row_desc);
   int get_index_agg_result(ObIndexBlockRowDesc &row_desc);
+  const ObInvIdxAggregator *get_inverted_aggregator() const
+  { return !has_reused_null_agg_in_this_micro_block_ && inverted_aggregator_.has_rows() ? &inverted_aggregator_ : nullptr; }
   int get_index_row_agg_info(ObIndexRowAggInfo &index_row_agg_info, ObIAllocator &allocator);
   bool is_agg_meta_match_col_desc(const ObIArray<ObSkipIndexColMeta> &agg_meta_array, const ObIArray<ObColDesc> &col_descs);
-  inline bool need_data_aggregate() const { return need_data_aggregate_ && !has_reused_null_agg_in_this_micro_block_; };
+  inline bool need_data_aggregate() const
+  { return need_data_aggregate_ && !has_reused_null_agg_in_this_micro_block_ && !inverted_aggregator_.has_rows(); }
   inline int64_t get_max_agg_size() { return skip_index_aggregator_.get_max_agg_size(); }
   inline int64_t get_row_count() const { return aggregate_info_.row_count_; }
   inline bool contain_uncommitted_row() const { return aggregate_info_.contain_uncommitted_row_; }
@@ -487,11 +491,12 @@ public:
   inline int64_t get_max_merged_trans_version() const { return aggregate_info_.max_merged_trans_version_; }
   int get_agg_datum(const ObSkipIndexColMeta &col_meta, const ObStorageDatum *&datum) const
   { datum = nullptr; return need_data_aggregate() ? skip_index_aggregator_.get_agg_datum(col_meta, datum) : OB_SUCCESS; }
-  TO_STRING_KV(K_(skip_index_aggregator), K_(aggregate_info),
+  TO_STRING_KV(K_(skip_index_aggregator), K_(aggregate_info), K_(inverted_aggregator),
       K_(need_data_aggregate), K_(has_reused_null_agg_in_this_micro_block), K_(is_inited));
 private:
   ObSkipIndexIndexAggregator skip_index_aggregator_;
   ObAggregateInfo aggregate_info_;
+  ObInvIdxAggregator inverted_aggregator_;
   bool need_data_aggregate_;
   bool has_reused_null_agg_in_this_micro_block_;
   bool is_inited_;

@@ -160,6 +160,90 @@ TEST_F(JsonLengthExprTest, MysqlInvalidJsonPath)
   EXPECT_EQ(common::OB_ERR_INVALID_JSON_PATH, result.get_ret_code());
 }
 
+// ============================================================================
+// _enable_json_bin_view switch comparison tests.
+//
+// JSON_LENGTH calls wrapper.member_count() (no path) or wrapper.seek() (with
+// path).  When _enable_json_bin_view is ON and the input is cast(... as json),
+// the wrapper holds an ObJsonBinView and these operations run on the zero-copy
+// bin path.  When OFF, the wrapper holds an ObJsonBin DOM.
+//
+// Note: _enable_json_bin_view is an OB_TENANT_PARAMETER, not a session
+// variable, so with_session_vars() cannot set it.  We use WITH_TENANT_CONFS
+// (TestParameterGuard RAII) which pushes into TestDefaultParameterConf TLS,
+// consumed by OpTestEngine::apply_tenant_config_overrides() during prepare().
+// ============================================================================
+
+// B1: switch ON — member_count without path via cast(s as json).
+TEST_F(JsonLengthExprTest, BinViewSwitchOnMemberCount)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "true"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256)")
+        .with_expr("json_length(cast(s as json))")
+        .with_data({
+            {R"({"a": 1, "b": 2, "c": 3})"},
+            {R"([10, 20, 30, 40])"},
+            {R"(42)"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"3"}, {"4"}, {"1"}}));
+  }
+}
+
+// B2: switch OFF — same input as B1, expect identical results.
+TEST_F(JsonLengthExprTest, BinViewSwitchOffMemberCount)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "false"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256)")
+        .with_expr("json_length(cast(s as json))")
+        .with_data({
+            {R"({"a": 1, "b": 2, "c": 3})"},
+            {R"([10, 20, 30, 40])"},
+            {R"(42)"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"3"}, {"4"}, {"1"}}));
+  }
+}
+
+// B3: switch ON — seek with path via cast(s as json).
+TEST_F(JsonLengthExprTest, BinViewSwitchOnSeekWithPath)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "true"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256), p varchar(16)")
+        .with_expr("json_length(cast(s as json), p)")
+        .with_data({
+            {R"({"a": [1, 2, 3], "b": {"x": 1, "y": 2}})", "$.a"},
+            {R"({"a": [1, 2, 3], "b": {"x": 1, "y": 2}})", "$.b"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"3"}, {"2"}}));
+  }
+}
+
+// B4: switch OFF — same input as B3, expect identical results.
+TEST_F(JsonLengthExprTest, BinViewSwitchOffSeekWithPath)
+{
+  WITH_TENANT_CONFS({"_enable_json_bin_view", "false"}) {
+    auto result = expr_unit_test()
+        .columns("s varchar(256), p varchar(16)")
+        .with_expr("json_length(cast(s as json), p)")
+        .with_data({
+            {R"({"a": [1, 2, 3], "b": {"x": 1, "y": 2}})", "$.a"},
+            {R"({"a": [1, 2, 3], "b": {"x": 1, "y": 2}})", "$.b"},
+        })
+        .run(engine_);
+    EXPECT_EQ(common::OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_ordered({{"3"}, {"2"}}));
+  }
+}
+
 int main(int argc, char **argv)
 {
   ::testing::InitGoogleTest(&argc, argv);

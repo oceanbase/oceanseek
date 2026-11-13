@@ -13,6 +13,7 @@
 #include "share/vector/ob_i_vector.h"
 #include "share/search_index/ob_search_index_encoder.h"
 #include "storage/blocksstable/ob_datum_row.h"
+#include "storage/fts/ob_fts_plugin_helper.h"
 #include "sql/engine/basic/ob_chunk_datum_store.h"
 #include "ob_search_index_config_filter.h"
 
@@ -21,11 +22,15 @@ namespace oceanbase
 namespace common
 {
 class ObCollectionArrayType;
+class ObJsonWrapper;
 }
 
 namespace share
 {
+namespace schema { class ObTableSchema; }
+struct ObSearchIndexModeConfig;
 
+// One invocation generates rows for exactly one physical child table.
 enum ObSearchIndexRowTarget { SEARCH_DATA = 0, SEARCH_TEXT_MATCH = 1, SEARCH_TEXT_PHRASE = 2 };
 
 // Generated search-index tuple: [column_idx, path, value, doc_id] or
@@ -89,6 +94,10 @@ public:
   ObDatum value_;
   uint64_t doc_id_;
   ObDatum nested_key_;     // encoded big-endian array indices; null when path is not under nested path
+  int64_t text_column_count_ = 0;
+  uint64_t token_freq_ = 0;
+  uint64_t doc_length_ = 0;
+  ObString positions_;
   bool    has_nested_key_; // true when the generated tuple includes the fifth nested-key column
 };
 
@@ -154,8 +163,7 @@ private:
   class Generator {
   public:
     Generator(ObIAllocator &allocator,
-              ObIAllocator &inner_allocator,
-              const bool has_nested_key = false)
+              ObIAllocator &inner_allocator)
       : allocator_(allocator),
         inner_allocator_(inner_allocator),
         column_idx_(OB_INVALID_ID),
@@ -168,13 +176,22 @@ private:
         config_filter_(nullptr),
         array_index_path_(),
         nested_key_stack_(OB_MALLOC_NORMAL_BLOCK_SIZE, inner_allocator_),
-        has_nested_key_(has_nested_key),
-        has_nested_paths_(false) {}
-    virtual ~Generator() {}
-
+        has_nested_key_(false),
+        has_nested_paths_(false),
+        parser_(nullptr), is_fulltext_(false), phrase_(false) {}
+    virtual ~Generator()
+    {
+      if (parser_ != nullptr) {
+        parser_->~ObFTParseHelper();
+      }
+    }
+    void set_has_nested_key(bool value) { has_nested_key_ = value;
+      if (elem_generator_ != nullptr) { elem_generator_->set_has_nested_key(value); } }
     int init(const uint64_t column_idx, const ObObjMeta &obj_meta,
              const common::ObCollectionArrayType *arr_type,
-             const ObSearchIndexConfigFilter *config_filter = nullptr);
+             const ObSearchIndexConfigFilter *config_filter,
+             const ObSearchIndexModeConfig &mode,
+             const bool is_ddl_mode);
     int generate_rows(const int64_t doc_id, const ObDatum& datum, ObSearchIndexRows &rows);
     int generate_rows(const ObIVector &doc_id_vec, const ObIVector &data_vec,
                       const int64_t batch_size, ObSearchIndexRows &rows);
@@ -182,13 +199,35 @@ private:
     TO_STRING_KV(K_(column_idx), K_(enc_param), K_(obj_meta));
 
   private:
+    struct TextPathStat
+    {
+      int64_t doc_length_ = 0;
+      int64_t next_position_ = 0;
+    };
+    // Per document and generator: (encoded path, encoded token, empty nested key)
+    // -> accumulated token frequency and position list (PHRASE only).
+    // FULLTEXT does not support NESTED_PATHS, so the nested key is always empty.
+    typedef common::hash::ObHashMap<PathValueKey, storage::ObFTTokenInfo,
+                                   common::hash::NoPthreadDefendMode,
+                                   PathValueKeyHash, PathValueKeyEqual> ObSearchIndexTermMap;
+    // Per document and generator: encoded path -> accumulated document length
+    // and the next string's position base (PHRASE only). Strings sharing a path,
+    // e.g. array elements, contribute to the same statistics. The position base
+    // is temporary state and is not stored in index rows.
+    typedef common::hash::ObHashMap<ObString, TextPathStat> ObSearchIndexTextPathMap;
+    int generate_fulltext_rows(uint64_t doc_id, const ObDatum &datum, ObSearchIndexRows &rows);
+    int generate_fulltext_rows(const common::ObJsonWrapper &json,
+                               common::ObIArray<ObSearchIndexPathEncoder::JsonPathItem> &path,
+                               ObSearchIndexTermMap &terms, ObSearchIndexTextPathMap &paths);
+    int add_text_value(const ObString &text, const ObString &path,
+                       ObSearchIndexTermMap &terms, ObSearchIndexTextPathMap &paths);
     int init_array_generator(const common::ObCollectionArrayType *arr_type);
     int generate_json_rows(const int64_t doc_id, const ObDatum& datum, ObSearchIndexRows &rows);
     int generate_array_rows(const int64_t doc_id, const ObDatum& datum, ObSearchIndexRows &rows);
     int generate_rows_for_array_obj(const int64_t doc_id,
                                     common::ObIArrayType *arr_obj,
                                     ObSearchIndexRows &rows);
-    int generate_rows(const int64_t doc_id, ObIJsonBase *j_base,
+    int generate_rows(const int64_t doc_id, const ObJsonWrapper &json,
                       ObIArray<ObSearchIndexPathEncoder::JsonPathItem> &path_items,
                       ObSearchIndexRows &rows,
                       PathValueDedupSet &dedup_set);
@@ -216,19 +255,27 @@ private:
     common::ObSEArray<uint32_t, 4, common::ObIAllocator&> nested_key_stack_;
     bool has_nested_key_;   // true when the index schema has a nested_key column
     bool has_nested_paths_; // true when this column config has NESTED_PATHS
+
+    // for fulltext mode
+    storage::ObFTParseHelper *parser_;
+    bool is_fulltext_;
+    bool phrase_;
   };
 
 public:
   explicit ObSearchIndexRowGenerator()
     : row_allocator_(common::ObMemAttr(MTL_ID(), "SearchIdxRow")),
       inner_allocator_(common::ObMemAttr(MTL_ID(), "SearchIdxGen")),
-      config_filters_(inner_allocator_),
-      generators_(inner_allocator_), row_projector_(inner_allocator_), row_projector_ptr_(nullptr),
+      config_filters_(OB_MALLOC_NORMAL_BLOCK_SIZE, inner_allocator_),
+      generators_(OB_MALLOC_NORMAL_BLOCK_SIZE, inner_allocator_),
+      generator_sources_(OB_MALLOC_NORMAL_BLOCK_SIZE, inner_allocator_),
+      row_projector_(inner_allocator_), row_projector_ptr_(nullptr),
       has_nested_key_(false)
       {}
   virtual ~ObSearchIndexRowGenerator() { reset(); }
 
   void reset();
+  static int get_target(const schema::ObTableSchema &schema, ObSearchIndexRowTarget &target);
 
   // true when any indexed column has NESTED_PATHS, i.e. the generated row owns the extra
   // NESTED_KEY column and the search_data table is expected to have SEARCH_INDEX_KEY_CNT_WITH_NK
@@ -240,8 +287,12 @@ public:
            const common::ObIArray<int64_t> &row_projector,
            const common::ObIArray<ObString> &column_comments,
            bool rowkey_only,
-           const common::ObIArray<common::ObCollectionArrayType*> *arr_types);
+           const common::ObIArray<common::ObCollectionArrayType*> *arr_types,
+           ObSearchIndexRowTarget target = SEARCH_DATA,
+           const bool is_ddl_mode = false);
 
+  // All rows for one source document; SUCCESS + null/zero means no matching rows.
+  // Output lives until the next generate/reset.
   int generate_rows(const sql::ObChunkDatumStore::StoredRow *store_row,
                         blocksstable::ObDatumRow *&rows, int64_t& row_cnt);
   int generate_rows(const blocksstable::ObDatumRow &store_row,
@@ -254,8 +305,9 @@ private:
   common::ObArenaAllocator inner_allocator_;
   // config filters created in init() via placement new on inner_allocator_; explicitly
   // destructed in reset() so their matcher arenas/hashmaps are reclaimed.
-  common::ObFixedArray<ObSearchIndexConfigFilter*, ObIAllocator> config_filters_;
-  common::ObFixedArray<Generator*, ObIAllocator> generators_;
+  common::ObSEArray<ObSearchIndexConfigFilter*, 8, ObIAllocator&> config_filters_;
+  common::ObSEArray<Generator*, 8, ObIAllocator&> generators_;
+  common::ObSEArray<int64_t, 8, common::ObIAllocator&> generator_sources_;
   common::ObFixedArray<int64_t, ObIAllocator> row_projector_;
   const common::ObFixedArray<int64_t, ObIAllocator> *row_projector_ptr_;
   bool has_nested_key_;

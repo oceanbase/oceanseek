@@ -9,7 +9,9 @@
 #include "ob_json_wrapper.h"
 #include "ob_json_path.h"
 #include "ob_json_base.h"
+#include "ob_json_print.h"
 #include "lib/utility/serialization.h"
+#include "rpc/obmysql/ob_mysql_global.h"
 #include "common/object/ob_object.h"
 
 namespace oceanbase {
@@ -350,7 +352,8 @@ int ObJsonBinView::parse_scalar(const char *buf, int64_t buf_len, int64_t data_o
 int ObJsonBinView::populate_child(uint64_t value_offset, uint8_t value_type, ObJsonBinView &result) const
 {
   int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(value_offset >= length_)) {
+  // A zero offset would let a container reference itself.
+  if (OB_UNLIKELY(value_offset == 0 || value_offset >= length_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("child value_offset out of bounds", K(ret), K(value_offset), K(length_));
   } else {
@@ -406,6 +409,50 @@ number::ObNumber ObJsonBinView::get_decimal_data() const
   return nmb;
 }
 
+int ObJsonBinView::to_number(ObIAllocator *allocator, number::ObNumber &number) const
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(allocator)) {
+    ret = OB_ERR_NULL_VALUE;
+    LOG_WARN("allocator is null", K(ret));
+  } else if (OB_UNLIKELY(!is_valid())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("json binary view is invalid", K(ret));
+  } else {
+    number::ObNumber num;
+    switch (json_type()) {
+      case ObJsonNodeType::J_DECIMAL:
+      case ObJsonNodeType::J_ODECIMAL:
+        num = get_decimal_data();
+        break;
+      case ObJsonNodeType::J_INT:
+      case ObJsonNodeType::J_OINT:
+        ret = num.from(get_int(), *allocator);
+        break;
+      case ObJsonNodeType::J_UINT:
+      case ObJsonNodeType::J_OLONG:
+        ret = num.from(get_uint(), *allocator);
+        break;
+      case ObJsonNodeType::J_DOUBLE:
+      case ObJsonNodeType::J_ODOUBLE:
+        ret = ObJsonBaseUtil::double_to_number(get_double(), *allocator, num);
+        break;
+      default: {
+        // Preserve the other conversions and errors without materializing a node.
+        ObJsonBinViewAdapter adapter(*this);
+        ret = adapter.to_number(allocator, num);
+        break;
+      }
+    }
+    if (OB_FAIL(ret)) {
+      LOG_WARN("convert json number failed", K(ret), K(json_type()));
+    } else {
+      number = num;
+    }
+  }
+  return ret;
+}
+
 ObObjType ObJsonBinView::field_type() const
 {
   ObObjType ret_type = ObObjType::ObNullType;
@@ -445,7 +492,7 @@ int ObJsonBinView::lookup_impl(const ObString &key, ObJsonBinView &result) const
   int64_t low = 0;
   int64_t high = static_cast<int64_t>(element_count_) - 1;
 
-  while (low <= high) {
+  while (OB_SUCC(ret) && low <= high) {
     int64_t mid = low + (high - low) / 2;
     uint64_t key_offset;
     uint64_t key_len;
@@ -831,6 +878,17 @@ int ObJsonBinViewAdapter::get_raw_binary(common::ObString &out, ObIAllocator *al
 
 // ============ Seek Implementation ============
 
+// At the last path step, .* / [*] / ranges can append this container's
+// children without deduplication when hits is empty before the traversal:
+// the children are distinct nodes and there are no earlier hits, even after **.
+// Check once before the loop so the decision applies to the whole batch.
+static OB_INLINE bool can_skip_children_dedup(const ObJsonPath &path,
+                                                  int64_t node_idx,
+                                                  const ObIArray<ObJsonWrapper> &hits)
+{
+  return node_idx + 1 >= path.path_node_cnt() && hits.empty();
+}
+
 bool ObJsonBinView::is_same_view(const ObJsonBinView &other) const
 {
   bool is_same = false;
@@ -867,7 +925,13 @@ int ObJsonBinView::seek(const ObJsonPath &path,
   if (path.is_simple_path()) {
     ret = seek_simple_path(path, hits, auto_wrap);
   } else {
-    ret = seek_complex_path(path, 0, auto_wrap, only_need_one, hits);
+    // Skip deduplication for this seek when in MySQL mode, hits is initially empty,
+    // and the path contains no recursive wildcard (**).
+    bool need_dedup = !hits.empty() || !lib::is_mysql_mode();
+    for (JsonPathIterator it = path.begin(); !need_dedup && it != path.end(); ++it) {
+      need_dedup = ((*it)->get_node_type() == JPN_WILDCARD_ELLIPSIS);
+    }
+    ret = seek_complex_path(path, 0, auto_wrap, only_need_one, need_dedup, hits);
   }
   return ret;
 }
@@ -959,35 +1023,39 @@ int ObJsonBinView::seek_simple_path(const ObJsonPath &path,
 int ObJsonBinView::seek_complex_path(const ObJsonPath &path,
                                      int64_t node_idx,
                                      bool auto_wrap,
-                                     bool only_need_one,
+                                     bool only_need_one, bool need_dedup,
                                      ObIArray<ObJsonWrapper> &hits) const
 {
   int ret = OB_SUCCESS;
   int64_t node_count = path.path_node_cnt();
   if (node_idx >= node_count) {
-    ret = push_unique_hit(*this, hits);
+    if (need_dedup) {
+      ret = push_unique_hit(*this, hits);
+    } else if (OB_FAIL(hits.push_back(ObJsonWrapper(*this)))) {
+      LOG_WARN("push_back fail", K(ret));
+    }
   } else {
     JsonPathIterator it = path.begin() + node_idx;
     ObJsonPathNodeType node_type = (*it)->get_node_type();
 
     switch (node_type) {
       case JPN_MEMBER:
-        ret = seek_member(path, node_idx, auto_wrap, only_need_one, hits);
+        ret = seek_member(path, node_idx, auto_wrap, only_need_one, need_dedup, hits);
         break;
       case JPN_MEMBER_WILDCARD:
-        ret = seek_member_wildcard(path, node_idx, auto_wrap, only_need_one, hits);
+        ret = seek_member_wildcard(path, node_idx, auto_wrap, only_need_one, need_dedup, hits);
         break;
       case JPN_ARRAY_CELL:
-        ret = seek_array_cell(path, node_idx, auto_wrap, only_need_one, hits);
+        ret = seek_array_cell(path, node_idx, auto_wrap, only_need_one, need_dedup, hits);
         break;
       case JPN_ARRAY_RANGE:
-        ret = seek_array_range(path, node_idx, auto_wrap, only_need_one, hits);
+        ret = seek_array_range(path, node_idx, auto_wrap, only_need_one, need_dedup, hits);
         break;
       case JPN_ARRAY_CELL_WILDCARD:
-        ret = seek_array_wildcard(path, node_idx, auto_wrap, only_need_one, hits);
+        ret = seek_array_wildcard(path, node_idx, auto_wrap, only_need_one, need_dedup, hits);
         break;
       case JPN_WILDCARD_ELLIPSIS:
-        ret = seek_ellipsis(path, node_idx, auto_wrap, only_need_one, hits);
+        ret = seek_ellipsis(path, node_idx, auto_wrap, only_need_one, need_dedup, hits);
         break;
       default:
         ret = OB_NOT_SUPPORTED;
@@ -999,7 +1067,7 @@ int ObJsonBinView::seek_complex_path(const ObJsonPath &path,
 }
 
 int ObJsonBinView::seek_member(const ObJsonPath &path, int64_t node_idx,
-                               bool auto_wrap, bool only_need_one,
+                               bool auto_wrap, bool only_need_one, bool need_dedup,
                                ObIArray<ObJsonWrapper> &hits) const
 {
   int ret = OB_SUCCESS;
@@ -1014,7 +1082,7 @@ int ObJsonBinView::seek_member(const ObJsonPath &path, int64_t node_idx,
     } else if (OB_FAIL(ret)) {
       LOG_WARN("lookup fail", K(ret));
     } else {
-      ret = child.seek_complex_path(path, node_idx + 1, auto_wrap, only_need_one, hits);
+      ret = child.seek_complex_path(path, node_idx + 1, auto_wrap, only_need_one, need_dedup, hits);
     }
   } else if (auto_wrap && lib::is_oracle_mode() && is_array_like()) {
     for (uint64_t i = 0; OB_SUCC(ret) && i < element_count_; ++i) {
@@ -1023,7 +1091,7 @@ int ObJsonBinView::seek_member(const ObJsonPath &path, int64_t node_idx,
       if (OB_FAIL(element(i, child))) {
         LOG_WARN("element fail", K(ret), K(i));
       } else {
-        ret = child.seek_complex_path(path, node_idx, false, only_need_one, hits);
+        ret = child.seek_complex_path(path, node_idx, false, only_need_one, need_dedup, hits);
       }
     }
   }
@@ -1031,18 +1099,23 @@ int ObJsonBinView::seek_member(const ObJsonPath &path, int64_t node_idx,
 }
 
 int ObJsonBinView::seek_member_wildcard(const ObJsonPath &path, int64_t node_idx,
-                                        bool auto_wrap, bool only_need_one,
+                                        bool auto_wrap, bool only_need_one, bool need_dedup,
                                         ObIArray<ObJsonWrapper> &hits) const
 {
   int ret = OB_SUCCESS;
   if (json_type() == ObJsonNodeType::J_OBJECT) {
+    const bool skip_children_dedup = can_skip_children_dedup(path, node_idx, hits);
     for (uint64_t i = 0; OB_SUCC(ret) && i < element_count_; ++i) {
       if (only_need_one && hits.count() > 0) break;
       ObJsonBinView child;
       if (OB_FAIL(element(i, child))) {
         LOG_WARN("element fail", K(ret), K(i));
+      } else if (skip_children_dedup) {
+        if (OB_FAIL(hits.push_back(ObJsonWrapper(child)))) {
+          LOG_WARN("push_back fail", K(ret));
+        }
       } else {
-        ret = child.seek_complex_path(path, node_idx + 1, auto_wrap, only_need_one, hits);
+        ret = child.seek_complex_path(path, node_idx + 1, auto_wrap, only_need_one, need_dedup, hits);
       }
     }
   } else if (auto_wrap && lib::is_oracle_mode() && is_array_like()) {
@@ -1052,7 +1125,7 @@ int ObJsonBinView::seek_member_wildcard(const ObJsonPath &path, int64_t node_idx
       if (OB_FAIL(element(i, child))) {
         LOG_WARN("element fail", K(ret), K(i));
       } else {
-        ret = child.seek_complex_path(path, node_idx, false, only_need_one, hits);
+        ret = child.seek_complex_path(path, node_idx, false, only_need_one, need_dedup, hits);
       }
     }
   }
@@ -1060,7 +1133,7 @@ int ObJsonBinView::seek_member_wildcard(const ObJsonPath &path, int64_t node_idx
 }
 
 int ObJsonBinView::seek_array_cell(const ObJsonPath &path, int64_t node_idx,
-                                   bool auto_wrap, bool only_need_one,
+                                   bool auto_wrap, bool only_need_one, bool need_dedup,
                                    ObIArray<ObJsonWrapper> &hits) const
 {
   int ret = OB_SUCCESS;
@@ -1075,7 +1148,7 @@ int ObJsonBinView::seek_array_cell(const ObJsonPath &path, int64_t node_idx,
       if (OB_FAIL(element(array_index.get_array_index(), child))) {
         LOG_WARN("element fail", K(ret));
       } else {
-        ret = child.seek_complex_path(path, node_idx + 1, auto_wrap, only_need_one, hits);
+        ret = child.seek_complex_path(path, node_idx + 1, auto_wrap, only_need_one, need_dedup, hits);
       }
     }
   } else if (auto_wrap && path_node->is_autowrap()) {
@@ -1083,14 +1156,14 @@ int ObJsonBinView::seek_array_cell(const ObJsonPath &path, int64_t node_idx,
     if (OB_FAIL(path_node->get_first_array_index(1, array_index))) {
       LOG_WARN("get array index fail", K(ret));
     } else if (array_index.is_within_bounds() && array_index.get_array_index() == 0) {
-      ret = seek_complex_path(path, node_idx + 1, auto_wrap, only_need_one, hits);
+      ret = seek_complex_path(path, node_idx + 1, auto_wrap, only_need_one, need_dedup, hits);
     }
   }
   return ret;
 }
 
 int ObJsonBinView::seek_array_range(const ObJsonPath &path, int64_t node_idx,
-                                    bool auto_wrap, bool only_need_one,
+                                    bool auto_wrap, bool only_need_one, bool need_dedup,
                                     ObIArray<ObJsonWrapper> &hits) const
 {
   int ret = OB_SUCCESS;
@@ -1101,52 +1174,62 @@ int ObJsonBinView::seek_array_range(const ObJsonPath &path, int64_t node_idx,
     if (OB_FAIL(path_node->get_array_range(element_count(), range))) {
       LOG_WARN("get array range fail", K(ret));
     } else {
+      const bool skip_children_dedup = can_skip_children_dedup(path, node_idx, hits);
       for (uint64_t i = range.array_begin_; OB_SUCC(ret) && i < range.array_end_ && i < element_count_; ++i) {
         if (only_need_one && hits.count() > 0) break;
         ObJsonBinView child;
         if (OB_FAIL(element(i, child))) {
           LOG_WARN("element fail", K(ret), K(i));
+        } else if (skip_children_dedup) {
+          if (OB_FAIL(hits.push_back(ObJsonWrapper(child)))) {
+            LOG_WARN("push_back fail", K(ret));
+          }
         } else {
-          ret = child.seek_complex_path(path, node_idx + 1, auto_wrap, only_need_one, hits);
+          ret = child.seek_complex_path(path, node_idx + 1, auto_wrap, only_need_one, need_dedup, hits);
         }
       }
     }
   } else if (auto_wrap && path_node->is_autowrap()) {
-    ret = seek_complex_path(path, node_idx + 1, auto_wrap, only_need_one, hits);
+    ret = seek_complex_path(path, node_idx + 1, auto_wrap, only_need_one, need_dedup, hits);
   }
   return ret;
 }
 
 int ObJsonBinView::seek_array_wildcard(const ObJsonPath &path, int64_t node_idx,
-                                       bool auto_wrap, bool only_need_one,
+                                       bool auto_wrap, bool only_need_one, bool need_dedup,
                                        ObIArray<ObJsonWrapper> &hits) const
 {
   int ret = OB_SUCCESS;
   JsonPathIterator it = path.begin() + node_idx;
   const ObJsonPathBasicNode *path_node = static_cast<const ObJsonPathBasicNode*>(*it);
   if (is_array_like()) {
+    const bool skip_children_dedup = can_skip_children_dedup(path, node_idx, hits);
     for (uint64_t i = 0; OB_SUCC(ret) && i < element_count_; ++i) {
       if (only_need_one && hits.count() > 0) break;
       ObJsonBinView child;
       if (OB_FAIL(element(i, child))) {
         LOG_WARN("element fail", K(ret), K(i));
+      } else if (skip_children_dedup) {
+        if (OB_FAIL(hits.push_back(ObJsonWrapper(child)))) {
+          LOG_WARN("push_back fail", K(ret));
+        }
       } else {
-        ret = child.seek_complex_path(path, node_idx + 1, auto_wrap, only_need_one, hits);
+        ret = child.seek_complex_path(path, node_idx + 1, auto_wrap, only_need_one, need_dedup, hits);
       }
     }
   } else if (auto_wrap && (lib::is_oracle_mode() ? path_node->is_multi_array_autowrap()
                                                   : path_node->is_autowrap())) {
-    ret = seek_complex_path(path, node_idx + 1, auto_wrap, only_need_one, hits);
+    ret = seek_complex_path(path, node_idx + 1, auto_wrap, only_need_one, need_dedup, hits);
   }
   return ret;
 }
 
 int ObJsonBinView::seek_ellipsis(const ObJsonPath &path, int64_t node_idx,
-                                 bool auto_wrap, bool only_need_one,
+                                 bool auto_wrap, bool only_need_one, bool need_dedup,
                                  ObIArray<ObJsonWrapper> &hits) const
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(seek_complex_path(path, node_idx + 1, auto_wrap, only_need_one, hits))) {
+  if (OB_FAIL(seek_complex_path(path, node_idx + 1, auto_wrap, only_need_one, need_dedup, hits))) {
     LOG_WARN("seek after ellipsis fail", K(ret));
   }
 
@@ -1158,7 +1241,7 @@ int ObJsonBinView::seek_ellipsis(const ObJsonPath &path, int64_t node_idx,
         if (OB_FAIL(element(i, child))) {
           LOG_WARN("element fail", K(ret), K(i));
         } else {
-          ret = child.seek_ellipsis(path, node_idx, auto_wrap, only_need_one, hits);
+          ret = child.seek_ellipsis(path, node_idx, auto_wrap, only_need_one, need_dedup, hits);
         }
       }
     }
@@ -1183,6 +1266,20 @@ uint32_t ObJsonBinView::depth() const
     depth = max_child + 1;
   }
   return depth;
+}
+
+int ObJsonBinView::print(ObJsonBuffer &j_buf, bool is_quoted,
+                         uint64_t reserve_len, bool is_pretty,
+                         uint64_t depth) const
+{
+  return ObJsonPrint::print(*this, j_buf, is_quoted, reserve_len, is_pretty, depth);
+}
+
+int ObJsonBinViewAdapter::print(ObJsonBuffer &j_buf, bool is_quoted,
+                                uint64_t reserve_len, bool is_pretty,
+                                uint64_t depth) const
+{
+  return view_.print(j_buf, is_quoted, reserve_len, is_pretty, depth);
 }
 
 } // namespace common

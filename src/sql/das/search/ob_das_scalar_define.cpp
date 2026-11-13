@@ -472,7 +472,7 @@ static int create_async_range_materializer(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid async scalar range materializer argument", K(ret),
         KP(ctdef), KP(input_op));
-  } else if (DAS_SCOPE_NESTED_SYNC == search_ctx.get_op_creating_scope()) {
+  } else if (DAS_SCOPE_NESTED_ASYNC == search_ctx.get_op_creating_scope()) {
     // The same nested RowID may match multiple terms or overlapping ranges.
     ObDASSortOpParam sort_param(
         input_op, ctdef, &scalar_rtdef, true /* unique_sort */);

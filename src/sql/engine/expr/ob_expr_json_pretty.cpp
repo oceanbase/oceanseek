@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX SQL_ENG
 #include "ob_expr_json_pretty.h"
 #include "sql/engine/expr/ob_expr_json_func_helper.h"
+#include "lib/json_type/ob_json_wrapper.h"
 
 using namespace oceanbase::common;
 using namespace oceanbase::sql;
@@ -52,9 +53,12 @@ int ObExprJsonPretty::calc(ObEvalCtx &ctx, const ObDatum &data, ObDatumMeta meta
   INIT_SUCC(ret);
   ObObjType type = meta.type_;
   ObCollationType cs_type = meta.cs_type_;
-  ObIJsonBase *j_base = NULL;
+  ObJsonWrapper wrapper;
   ObJsonInType j_in_type = ObJsonExprHelper::get_json_internal_type(type);
   common::ObString j_str = data.get_string(); // json text or json binary
+  bool enable_json_bin_view = true;
+  int32_t max_depth = 0;
+  ObSQLSessionInfo *session = ctx.exec_ctx_.get_my_session();
 
   if (OB_ISNULL(allocator)) { // check allocator
     ret = OB_NOT_INIT;
@@ -66,17 +70,19 @@ int ObExprJsonPretty::calc(ObEvalCtx &ctx, const ObDatum &data, ObDatumMeta meta
     LOG_USER_ERROR(OB_ERR_INVALID_TYPE_FOR_JSON, 1, "json_pretty");
   } else if (OB_FAIL(ObJsonExprHelper::ensure_collation(type, cs_type))) {
     LOG_WARN("fail to ensure collation", K(ret), K(type), K(cs_type));
-  } else if (OB_FAIL(ObTextStringHelper::read_real_string_data(*allocator, data, meta, j_str))) {
+  } else if (OB_FAIL(ObTextStringHelper::read_real_string_data(*allocator, data, meta, j_str, &ctx.exec_ctx_))) {
     LOG_WARN("fail to get real data.", K(ret), K(j_str));
   } else if (OB_FALSE_IT(allocator->add_baseline_size(j_str.length()))) {
-  } else if (OB_FAIL(ObJsonBaseFactory::get_json_base(allocator, j_str, j_in_type,
-                                                      j_in_type, j_base, 0,
-                                                      ObJsonExprHelper::get_json_max_depth_config(ctx)))) {
+  } else if (OB_FALSE_IT(enable_json_bin_view = OB_NOT_NULL(session) ? session->is_enable_json_bin_view() : true)) {
+  } else if (OB_FALSE_IT(max_depth = ObJsonExprHelper::get_json_max_depth_config(ctx))) {
+  } else if (OB_FAIL(common::get_json_wrapper(j_str, j_in_type, *allocator, wrapper, 0,
+                                              max_depth,
+                                              enable_json_bin_view))) {
     if (ret == OB_ERR_INVALID_JSON_TEXT) {
       ret = OB_ERR_INVALID_JSON_TEXT_IN_PARAM;
     }
-    LOG_WARN("fail to get json base", K(ret), K(type), K(j_str), K(j_in_type));
-  } else if (OB_FAIL(j_base->print(j_buf, true, j_str.length(), true, 0))) {
+    LOG_WARN("fail to get json wrapper", K(ret), K(type), K(j_str), K(j_in_type));
+  } else if (OB_FAIL(wrapper.print(j_buf, true, j_str.length(), true))) {
     LOG_WARN("fail to print json", K(ret), K(type), K(j_str), K(j_in_type));
   }
 
@@ -88,8 +94,7 @@ int ObExprJsonPretty::eval_json_pretty(const ObExpr &expr, ObEvalCtx &ctx, ObDat
 {
   INIT_SUCC(ret);
   ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
-  uint64_t tenant_id = ObMultiModeExprHelper::get_tenant_id(ctx.exec_ctx_.get_my_session());
-  MultimodeAlloctor tmp_allocator(tmp_alloc_g.get_allocator(), expr.type_, tenant_id, ret);
+  MultimodeAlloctor tmp_allocator(tmp_alloc_g.get_allocator(), expr.type_, ret, ctx, "json_pretty");
   ObExpr *arg = expr.args_[0];
   ObDatum *j_datum = NULL;
   ObJsonBuffer j_buf(&tmp_allocator);

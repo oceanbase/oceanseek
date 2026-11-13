@@ -14,6 +14,7 @@
 #include "sql/resolver/expr/ob_raw_expr_util.h"
 #include "share/search_index/ob_search_index_encoder.h"
 #include "share/search_index/ob_search_index_config_filter.h"
+#include "share/search_index/ob_search_index_config.h"
 
 namespace oceanbase {
 using namespace common;
@@ -2027,7 +2028,8 @@ int ObSearchIndexRangeCtx::init(const ObTableSchema *base_table_schema,
 bool ObSearchIndexRangeCtx::try_activate_range_key(const uint64_t column_id) {
   bool is_range_key = false;
   for (int64_t i = 0; !is_range_key && i < col_ctxs_.count(); ++i) {
-    if (col_ctxs_.at(i).column_meta_.column_id_ == column_id) {
+    if (col_ctxs_.at(i).column_meta_.column_id_ == column_id
+        && col_ctxs_.at(i).column_idx_ != OB_INVALID_INDEX) {
       activate_column_ctx(col_ctxs_.at(i));
       is_range_key = true;
     }
@@ -2085,19 +2087,28 @@ int ObSearchIndexRangeCtx::fill_col_ctx_info(const ObTableSchema *base_table_sch
       if (OB_NOT_NULL(index_column_schema)) {
         const ObString &column_comment = index_column_schema->get_comment_str();
         if (!column_comment.empty()) {
-          void *filter_buf = allocator.alloc(sizeof(share::ObSearchIndexConfigFilter));
-          if (OB_ISNULL(filter_buf)) {
-            ret = OB_ALLOCATE_MEMORY_FAILED;
-            LOG_WARN("failed to allocate memory for json filter", K(ret));
+          ObSqlString value_comment;
+          bool has_value = false;
+          if (OB_FAIL(share::ObSearchIndexConfig::get_value_mode_comment(
+              column_comment, value_comment, has_value))) {
+            LOG_WARN("failed to get search index VALUE comment", K(ret), K(column_id));
+          } else if (!has_value) {
+            info.column_idx_ = OB_INVALID_INDEX;
           } else {
-            const uint64_t tenant_id = index_schema->get_tenant_id();
-            info.json_filter_ = new (filter_buf) share::ObSearchIndexConfigFilter(tenant_id);
-            if (OB_FAIL(info.json_filter_->init_from_comment(column_comment))) {
-              LOG_WARN("failed to parse json column filter", K(ret), K(column_comment));
-              info.json_filter_->~ObSearchIndexConfigFilter();
-              info.json_filter_ = nullptr;
+            void *filter_buf = allocator.alloc(sizeof(share::ObSearchIndexConfigFilter));
+            if (OB_ISNULL(filter_buf)) {
+              ret = OB_ALLOCATE_MEMORY_FAILED;
+              LOG_WARN("failed to allocate memory for json filter", K(ret));
             } else {
-              info.cons_encode_type_ = info.json_filter_->get_type_mask();
+              const uint64_t tenant_id = index_schema->get_tenant_id();
+              info.json_filter_ = new (filter_buf) share::ObSearchIndexConfigFilter(tenant_id);
+              if (OB_FAIL(info.json_filter_->init_from_comment(value_comment.string()))) {
+                LOG_WARN("failed to parse search VALUE filter", K(ret), K(column_comment));
+                info.json_filter_->~ObSearchIndexConfigFilter();
+                info.json_filter_ = nullptr;
+              } else {
+                info.cons_encode_type_ = info.json_filter_->get_type_mask();
+              }
             }
           }
         }

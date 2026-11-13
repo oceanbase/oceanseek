@@ -8,6 +8,7 @@
 
 #include "sql/engine/expr/ob_expr_operator.h"
 #include "lib/json_type/ob_json_tree.h"
+#include "lib/json_type/ob_json_wrapper.h"
 
 using namespace oceanbase::common;
 
@@ -32,8 +33,9 @@ public:
                       ObExpr &rt_expr) const override;
   virtual bool need_rt_ctx() const override { return true; }
 private:
-  static int get_keys_from_wrapper(ObIJsonBase *json_doc, 
+  static int get_keys_from_wrapper(const ObJsonWrapper &wrapper,
                                    ObIAllocator *allocator,
+                                   bool enable_json_bin_view,
                                    ObString &str);
   DISALLOW_COPY_AND_ASSIGN(ObExprJsonKeys);
 };

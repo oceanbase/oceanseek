@@ -9,7 +9,9 @@
 #include "ob_json_bin_view.h"
 #include "ob_json_base.h"
 #include "ob_json_tree.h"
+#include "lib/container/ob_se_array.h"
 #include "lib/hash/ob_hashset.h"
+#include "ob_json_parse.h"        // for JSON_DOCUMENT_MAX_DEPTH (print depth guard default)
 
 namespace oceanbase {
 namespace common {
@@ -83,6 +85,8 @@ public:
   // Object: get key string at the given index without materializing the value.
   // Both bin and DOM paths return OB_OUT_OF_ELEMENT when index >= member_count.
   int get_key(uint64_t index, ObString &key) const;
+
+  int get_json_keys(ObSEArray<ObString, 8> &keys) const;
   
   // Object/array: get value at the given index without materializing the value.
   // Both bin and DOM paths return OB_OUT_OF_ELEMENT when index >= member_count.
@@ -103,6 +107,15 @@ public:
   {
     return is_bin_ ? bin_.get_string() : ObString(dom_->get_data_length(), dom_->get_data());
   }
+
+  static bool is_json_scalar(ObJsonNodeType type)
+  {
+    return ObIJsonBase::is_json_scalar(type);
+  }
+
+  bool is_real_json_null() const;
+  int get_obtime(ObTime &t) const;
+  int to_number(ObIAllocator *allocator, number::ObNumber &number) const;
 
   // Compare two wrappers regardless of representation. both-bin uses the
   // ObJsonBinView::compare fast path; both-dom uses the ObIJsonBase path. For
@@ -141,6 +154,13 @@ public:
 
   // Parse a binary JSON document into this wrapper.
   int parse_bin(const char *data, int64_t len);
+
+  // Print this node as JSON text into a buffer.
+  // bin path: scalars printed directly, containers recursed via bin view child access.
+  // DOM path: delegates to dom_->print().
+  int print(ObJsonBuffer &j_buf, bool is_quoted,
+            uint64_t reserve_len = 0, bool is_pretty = false,
+            uint64_t depth = 0) const;
 
   // Upgrade to full ObIJsonBase* (for write operations or when DOM is needed)
   int to_json_base(ObIAllocator &alloc, ObIJsonBase *&base) const;

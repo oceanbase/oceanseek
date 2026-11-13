@@ -3561,7 +3561,8 @@ int ObCreateTableResolver::resolve_index_node(const ParseNode *node)
                                                               node->value_))) {
                 SQL_RESV_LOG(WARN, "fail to resolve fts index constraint", K(ret), K(column_name));
               } else if (OB_FAIL(resolve_search_index_constraint(*column_schema,
-                                                                 node->value_))) {
+                                                                 node->value_,
+                                                                 sort_item.column_comment_))) {
                 SQL_RESV_LOG(WARN, "fail to resolve search index constraint", K(ret), K(column_name));
               } else if (OB_FAIL(resolve_multivalue_index_constraint(*column_schema, index_keyname_))) {
                 SQL_RESV_LOG(WARN, "fail to resolve multivalue index constraint", K(ret), K(column_name));

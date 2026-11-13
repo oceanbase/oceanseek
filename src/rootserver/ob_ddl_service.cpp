@@ -7138,21 +7138,25 @@ static int lock_async_index_refresh_for_drop_(
       LOG_WARN("async index schema is null", KR(ret), K(index_info));
     } else {
       if (index_schema->is_async_search_def_index()) {
-        uint64_t search_data_table_id = OB_INVALID_ID;
-        if (OB_FAIL(index_schema->get_search_data_index_tid(search_data_table_id))) {
-          LOG_WARN("fail to resolve async search data index", KR(ret), KPC(index_schema));
-        } else if (OB_FAIL(schema_guard.get_table_schema(
-                       tenant_id, search_data_table_id, index_schema))) {
-          LOG_WARN("fail to get async search data index schema", KR(ret),
-                   K(search_data_table_id));
-        } else if (OB_ISNULL(index_schema)) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("async search data index schema is null", KR(ret),
-                   K(search_data_table_id));
+        ObSEArray<uint64_t, 3> search_aux_table_ids;
+        if (OB_FAIL(index_schema->get_search_aux_index_tids(search_aux_table_ids))) {
+          LOG_WARN("failed to collect search children for refresh fence", K(ret));
+        }
+        for (int64_t k = 0; OB_SUCC(ret) && k < search_aux_table_ids.count(); ++k) {
+          const uint64_t search_aux_table_id = search_aux_table_ids.at(k);
+          const ObTableSchema *aux_table_schema = nullptr;
+          if (OB_FAIL(schema_guard.get_table_schema(tenant_id, search_aux_table_id, aux_table_schema))) {
+            LOG_WARN("failed to get search child for refresh fence", K(ret), K(search_aux_table_id));
+          } else if (OB_ISNULL(aux_table_schema)) {
+            ret = OB_SCHEMA_EAGAIN;
+            LOG_WARN("search child schema is null", K(ret), K(search_aux_table_id));
+          } else if (OB_FAIL(aux_table_schema->get_tablet_ids(index_tablet_ids))) {
+            LOG_WARN("failed to collect search child tablets", K(ret), K(search_aux_table_id));
+          }
         }
       }
       if (OB_SUCC(ret) && OB_FAIL(index_schema->get_tablet_ids(index_tablet_ids))) {
-        LOG_WARN("fail to get async index tablet ids", KR(ret), KPC(index_schema));
+        LOG_WARN("failed to collect async index tablets", K(ret));
       }
     }
   }
@@ -7492,7 +7496,7 @@ int ObDDLService::generate_aux_index_schema_(
     if (OB_FAIL(ret)) {
     } else if (index_schema.is_vec_delta_buffer_type() || index_schema.is_hybrid_vec_index_log_type() || index_schema.is_vec_index_id_type()) {
       index_schema.set_index_status(INDEX_STATUS_AVAILABLE);
-    } else if (index_schema.is_search_data_index()
+    } else if (index_schema.is_search_aux_index()
       && OB_FAIL(set_search_index_mapping_(create_index_arg, index_schema))) {
       LOG_WARN("failed to set search index mapping", K(ret));
     }
@@ -7824,7 +7828,7 @@ int ObDDLService::create_aux_index(
         const bool need_parent_snapshot = idx_schema->is_rowkey_doc_id()
             || idx_schema->is_vec_rowkey_vid_type()
             || idx_schema->is_user_defined_async_index()
-            || idx_schema->is_async_search_data_index();
+            || idx_schema->is_async_search_aux_index();
         if (OB_FAIL(create_aux_index_task_(data_schema,
                                            idx_schema,
                                            create_index_arg,
@@ -7875,7 +7879,7 @@ int ObDDLService::create_aux_index(
                                                 trans,
                                                 task_record,
                                                 (index_schema.is_user_defined_async_index()
-                                                 || index_schema.is_async_search_data_index())
+                                                 || index_schema.is_async_search_aux_index())
                                                     ? arg.snapshot_version_ : 0))) {
         LOG_WARN("failed to create aux index ddl task", K(ret), K(create_index_arg));
       } else if (FALSE_IT(result.ddl_task_id_ = task_record.task_id_)) {
@@ -15530,7 +15534,7 @@ int ObDDLService::get_effective_data_table_schema_(const ObTableSchema &orig_tab
 {
   int ret = OB_SUCCESS;
   effective_data_table_schema = &orig_data_table_schema;
-  if (orig_table_schema.is_search_data_index()) {
+  if (orig_table_schema.is_search_aux_index()) {
     const ObTableSchema *search_def_table_schema = NULL;
     if (OB_FAIL(schema_guard.get_table_schema(tenant_id, orig_table_schema.get_data_table_id(), search_def_table_schema))) {
       LOG_WARN("failed to get search def table schema", KR(ret), K(orig_table_schema));
@@ -32562,7 +32566,7 @@ int ObDDLService::set_search_index_mapping_(obrpc::ObCreateIndexArg &create_inde
                                             ObTableSchema &data_index_schema)
 {
   int ret = OB_SUCCESS;
-  if (!data_index_schema.is_search_data_index()) {
+  if (!data_index_schema.is_search_aux_index()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(data_index_schema.get_index_type()));
   } else {
@@ -41837,7 +41841,9 @@ int ObDDLService::drop_index_to_scheduler_(ObMySQLTransaction &trans,
         const bool async_search_index_count_invalid = (!drop_index_arg->is_inner_
                                                        && index_table_schema->is_async_search_def_index()
                                                        && new_index_schemas.count() != SEARCH_INDEX_COUNT
-                                                       && new_index_schemas.count() != ASYNC_SEARCH_INDEX_COUNT);
+                                                       && new_index_schemas.count() != ASYNC_SEARCH_INDEX_COUNT
+                                                       && new_index_schemas.count() != ASYNC_SEARCH_INDEX_COUNT + 1
+                                                       && new_index_schemas.count() != ASYNC_SEARCH_INDEX_COUNT + 2);
 
         if (OB_UNLIKELY(normal_index_count_invalid
                         || vec_index_count_invalid || fts_index_count_invalid
@@ -43066,7 +43072,7 @@ ERRSIM_POINT_DEF(EN_FORK_REBUILD_SEARCH_DATA_SCHEMA,
     "Inject an error while rebuilding fork search data schema");
 #endif
 
-// 从源 SEARCH_DEF 找到它的 SEARCH_DATA 子表，克隆并改写成目标端的子表 Schema
+// 从源 SEARCH_DEF 找到实际存在的 SEARCH_DATA、SEARCH_MATCH、SEARCH_PHRASE 辅助表，克隆并改写成目标端的辅助表 Schema。
 int ObDDLService::fork_rebuild_search_data_index_schema_(
     const ObTableSchema &orig_search_def_schema,
     const uint64_t new_search_def_table_id,
@@ -43078,55 +43084,60 @@ int ObDDLService::fork_rebuild_search_data_index_schema_(
 {
   int ret = OB_SUCCESS;
   const uint64_t tenant_id = orig_search_def_schema.get_tenant_id();
-  uint64_t orig_search_data_table_id = OB_INVALID_ID;
+  ObSEArray<uint64_t, 3> ori_search_aux_table_ids;
   const ObTableSchema *orig_search_data_schema = nullptr;
   if (OB_UNLIKELY(!orig_search_def_schema.is_search_def_index() || OB_INVALID_ID == new_search_def_table_id)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid search def index argument", KR(ret), K(orig_search_def_schema), K(new_search_def_table_id));
-  } else if (OB_FAIL(orig_search_def_schema.get_search_data_index_tid(orig_search_data_table_id))) {
+  } else if (OB_FAIL(orig_search_def_schema.get_search_aux_index_tids(ori_search_aux_table_ids))) {
     LOG_WARN("failed to get search data index id", KR(ret), K(orig_search_def_schema));
-  } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id, orig_search_data_table_id, orig_search_data_schema))) {
-    LOG_WARN("failed to get search data index schema", KR(ret), K(tenant_id), K(orig_search_data_table_id));
-#ifdef ERRSIM
-  } else if (OB_FAIL(EVENT_CALL(EN_FORK_REBUILD_SEARCH_DATA_SCHEMA))) {
-    LOG_WARN("errsim: failed to rebuild fork search data schema", KR(ret));
-#endif
-  } else if (OB_ISNULL(orig_search_data_schema)) {
-    ret = OB_SCHEMA_EAGAIN;
-    LOG_WARN("search data index schema is null", KR(ret), K(tenant_id), K(orig_search_data_table_id));
-  } else if (OB_UNLIKELY(!orig_search_data_schema->is_search_data_index()
-                         || orig_search_data_schema->get_data_table_id() != orig_search_def_schema.get_table_id()
-                         || orig_search_data_schema->is_in_recyclebin()
-                         || INDEX_STATUS_AVAILABLE != orig_search_data_schema->get_index_status())) {
-    ret = OB_SCHEMA_EAGAIN;
-    LOG_WARN("search index schema topology is not ready", KR(ret), K(orig_search_def_schema), KPC(orig_search_data_schema));
   } else {
-    HEAP_VAR(ObTableSchema, new_search_data_schema) {
-      ObString search_data_index_name;
-      ObString new_search_data_table_name;
-      uint64_t new_search_data_table_id = OB_INVALID_ID;
-      if (OB_FAIL(new_search_data_schema.assign(*orig_search_data_schema))) {
-        LOG_WARN("failed to assign search data index schema", KR(ret), KPC(orig_search_data_schema));
-      } else if (OB_FAIL(ObTableSchema::get_index_name(allocator, orig_search_def_schema.get_table_id(),
-                     orig_search_data_schema->get_table_name_str(), search_data_index_name))) {
-        LOG_WARN("failed to get search data index name", KR(ret),
-                 "search_def_table_id", orig_search_def_schema.get_table_id(),
-                 "search_data_table_name", orig_search_data_schema->get_table_name_str());
-      } else if (OB_FAIL(ObTableSchema::build_index_table_name(allocator, new_search_def_table_id,
-                     search_data_index_name, new_search_data_table_name))) {
-        LOG_WARN("failed to build search data index table name", KR(ret),
-                 K(new_search_def_table_id), K(search_data_index_name));
-      } else if (OB_FAIL(schema_service.fetch_new_table_id(tenant_id, new_search_data_table_id))) {
-        LOG_WARN("failed to fetch table id for search data index", KR(ret), K(tenant_id));
-      } else if (OB_FAIL(new_search_data_schema.set_table_name(new_search_data_table_name))) {
-        LOG_WARN("failed to set search data table name", KR(ret), K(new_search_data_table_name));
+    for (int64_t i = 0; OB_SUCC(ret) && i < ori_search_aux_table_ids.count(); ++i) {
+      const uint64_t orig_search_data_table_id = ori_search_aux_table_ids.at(i);
+      if (OB_FAIL(schema_guard.get_table_schema(tenant_id, orig_search_data_table_id, orig_search_data_schema))) {
+        LOG_WARN("failed to get search data index schema", KR(ret), K(tenant_id), K(orig_search_data_table_id));
+  #ifdef ERRSIM
+      } else if (OB_FAIL(EVENT_CALL(EN_FORK_REBUILD_SEARCH_DATA_SCHEMA))) {
+        LOG_WARN("errsim: failed to rebuild fork search data schema", KR(ret));
+  #endif
+      } else if (OB_ISNULL(orig_search_data_schema)) {
+        ret = OB_SCHEMA_EAGAIN;
+        LOG_WARN("search data index schema is null", KR(ret), K(tenant_id), K(orig_search_data_table_id));
+      } else if (OB_UNLIKELY(!orig_search_data_schema->is_search_aux_index()
+                            || orig_search_data_schema->get_data_table_id() != orig_search_def_schema.get_table_id()
+                            || orig_search_data_schema->is_in_recyclebin()
+                            || INDEX_STATUS_AVAILABLE != orig_search_data_schema->get_index_status())) {
+        ret = OB_SCHEMA_EAGAIN;
+        LOG_WARN("search index schema topology is not ready", KR(ret), K(orig_search_def_schema), KPC(orig_search_data_schema));
       } else {
-        new_search_data_schema.set_table_id(new_search_data_table_id);
-        new_search_data_schema.set_data_table_id(new_search_def_table_id);
-        new_search_data_schema.set_database_id(new_database_schema.get_database_id());
-        new_search_data_schema.set_index_status(INDEX_STATUS_AVAILABLE);
-        if (OB_FAIL(new_search_data_schemas.push_back(new_search_data_schema))) {
-          LOG_WARN("failed to add search data index schema", KR(ret), K(new_search_data_schema));
+        HEAP_VAR(ObTableSchema, new_search_data_schema) {
+          ObString search_data_index_name;
+          ObString new_search_data_table_name;
+          uint64_t new_search_data_table_id = OB_INVALID_ID;
+          if (OB_FAIL(new_search_data_schema.assign(*orig_search_data_schema))) {
+            LOG_WARN("failed to assign search data index schema", KR(ret), KPC(orig_search_data_schema));
+          } else if (OB_FAIL(ObTableSchema::get_index_name(allocator, orig_search_def_schema.get_table_id(),
+                        orig_search_data_schema->get_table_name_str(), search_data_index_name))) {
+            LOG_WARN("failed to get search data index name", KR(ret),
+                    "search_def_table_id", orig_search_def_schema.get_table_id(),
+                    "search_data_table_name", orig_search_data_schema->get_table_name_str());
+          } else if (OB_FAIL(ObTableSchema::build_index_table_name(allocator, new_search_def_table_id,
+                        search_data_index_name, new_search_data_table_name))) {
+            LOG_WARN("failed to build search data index table name", KR(ret),
+                    K(new_search_def_table_id), K(search_data_index_name));
+          } else if (OB_FAIL(schema_service.fetch_new_table_id(tenant_id, new_search_data_table_id))) {
+            LOG_WARN("failed to fetch table id for search data index", KR(ret), K(tenant_id));
+          } else if (OB_FAIL(new_search_data_schema.set_table_name(new_search_data_table_name))) {
+            LOG_WARN("failed to set search data table name", KR(ret), K(new_search_data_table_name));
+          } else {
+            new_search_data_schema.set_table_id(new_search_data_table_id);
+            new_search_data_schema.set_data_table_id(new_search_def_table_id);
+            new_search_data_schema.set_database_id(new_database_schema.get_database_id());
+            new_search_data_schema.set_index_status(INDEX_STATUS_AVAILABLE);
+            if (OB_FAIL(new_search_data_schemas.push_back(new_search_data_schema))) {
+              LOG_WARN("failed to add search data index schema", KR(ret), K(new_search_data_schema));
+            }
+          }
         }
       }
     }
@@ -43243,13 +43254,14 @@ int ObDDLService::fork_rebuild_index_schemas_(
       LOG_WARN("fail to retrieve complete index", KR(ret));
     }
   }
-  // (4) Search Index 需要先创建 SEARCH_DATA，再创建 SEARCH_DEF，
-  // 因此按 SEARCH_DATA、SEARCH_DEF 的顺序追加到 new_schemas。
+  // (4) Search Index 需要先创建实际存在的 Data、Match、Phrase 辅助表，再创建 Def，
+  // 因此先将所有辅助表 Schema 追加到 new_schemas，再追加 Def Schema。
   if (OB_SUCC(ret) && (!search_def_schema_array.empty() || !search_data_schema_array.empty())) {
-    if (search_def_schema_array.count() != search_data_schema_array.count()) {
+    if (search_data_schema_array.count() < search_def_schema_array.count()
+        || search_data_schema_array.count() > 3 * search_def_schema_array.count()) {
       ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("search def and search data index count mismatch", KR(ret), "search_def_count",
-               search_def_schema_array.count(), "search_data_count", search_data_schema_array.count());
+      LOG_WARN("invalid search auxiliary table count", KR(ret),
+               K(search_def_schema_array.count()), K(search_data_schema_array.count()));
     }
     for (int64_t i = 0; OB_SUCC(ret) && i < search_data_schema_array.count(); ++i) {
       if (OB_FAIL(new_schemas.push_back(search_data_schema_array.at(i)))) {

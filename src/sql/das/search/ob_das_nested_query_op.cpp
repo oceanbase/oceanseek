@@ -176,15 +176,16 @@ bool ObDASNestedQueryRtDef::can_generate_parent_prefix_skip(const ObDASSearchCtx
 // ScopePropagateGuard is responsible for propagating scope to children
 struct ScopePropagateGuard
 {
-  ScopePropagateGuard(ObDASSearchCtx &search_ctx)
-    : search_ctx_(search_ctx) {
-      search_ctx_.enter_scope_for_op_creating(ObDASScopeId::DAS_SCOPE_NESTED_SYNC, old_scope_);
+  ScopePropagateGuard(ObDASSearchCtx &search_ctx, ObDASScopeId scope, int32_t depth)
+    : search_ctx_(search_ctx), old_depth_(search_ctx.get_op_creating_depth()) {
+      search_ctx_.enter_scope_for_op_creating(scope, depth, old_scope_);
   }
   ~ScopePropagateGuard() {
-    search_ctx_.exit_scope_after_op_created(old_scope_);
+    search_ctx_.exit_scope_after_op_created(old_scope_, old_depth_);
   }
   ObDASSearchCtx &search_ctx_;
   ObDASScopeId old_scope_;
+  int32_t old_depth_;
 };
 
 int ObDASNestedQueryRtDef::generate_op(ObDASSearchCost lead_cost, ObDASSearchCtx &search_ctx,
@@ -210,8 +211,11 @@ int ObDASNestedQueryRtDef::generate_op(ObDASSearchCost lead_cost, ObDASSearchCtx
       if (OB_FAIL(inner_rtdef->generate_op(lead_cost, search_ctx, inner_op))) {
         LOG_WARN("failed to generate DOC_ID_ONLY subtree for nested query", KR(ret));
       }
+    } else if (!search_ctx.has_nested_scope()) {
+      ret = OB_NOT_INIT;
+      LOG_WARN("nested scope is not registered", KR(ret));
     } else {
-      ScopePropagateGuard guard(search_ctx);
+      ScopePropagateGuard guard(search_ctx, search_ctx.get_nested_scope_id(), ctdef->nesting_depth_);
       if (OB_FAIL(inner_rtdef->generate_op(lead_cost, search_ctx, inner_op))) {
         LOG_WARN("failed to generate inner op for nested query", KR(ret));
       }
@@ -245,12 +249,12 @@ int ObDASNestedQueryRtDef::generate_op(ObDASSearchCost lead_cost, ObDASSearchCtx
 ObDASNestedQueryOp::ObDASNestedQueryOp(ObDASSearchCtx &ctx)
   : ObIDASSearchOp(ctx),
     inner_op_(nullptr),
-    nesting_depth_(0),
     is_doc_id_only_(false),
     enable_group_skip_(false),
     pending_group_doc_id_(0),
     last_emitted_rowid_(),
     has_emitted_(false),
+    last_emitted_score_(0.0),
     has_pending_group_skip_(false),
     dedup_allocator_a_("DASDedupA"),
     dedup_allocator_b_("DASDedupB"),
@@ -275,14 +279,16 @@ int ObDASNestedQueryOp::do_init(const ObIDASSearchOpParam &op_param)
     enable_group_skip_ = false;
     reset_iteration_state();
     // DOC_ID_ONLY keeps both the boundary and its child in BASE/UINT64. The
-    // regular path propagates NESTED/COMPACT only to the child.
+    // regular path propagates the registered nested scope only to the child.
     const ObDASScopeId expected_inner_scope =
-        is_doc_id_only_ ? DAS_SCOPE_BASE : DAS_SCOPE_NESTED_SYNC;
+        is_doc_id_only_ ? DAS_SCOPE_BASE : search_ctx_.get_nested_scope_id();
     const ObDASRowIDType expected_inner_rowid_type =
-        is_doc_id_only_ ? DAS_ROWID_TYPE_UINT64 : DAS_ROWID_TYPE_COMPACT;
-    const bool output_shape_valid =
-        !is_doc_id_only_
-        || (scope_ == DAS_SCOPE_BASE && get_rowid_type() == DAS_ROWID_TYPE_UINT64);
+        (is_doc_id_only_ || is_async_nested_scope(expected_inner_scope))
+            ? DAS_ROWID_TYPE_UINT64 : DAS_ROWID_TYPE_COMPACT;
+    const bool output_shape_valid = is_doc_id_only_
+        ? (scope_ == DAS_SCOPE_BASE && get_rowid_type() == DAS_ROWID_TYPE_UINT64)
+        : (is_nested_scope(expected_inner_scope)
+           && (scope_ == DAS_SCOPE_BASE || scope_ == expected_inner_scope));
     if (OB_ISNULL(inner_op_)) {
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("nested query op requires non-null inner_op", K(ret));
@@ -313,7 +319,8 @@ int ObDASNestedQueryOp::do_init(const ObIDASSearchOpParam &op_param)
       const bool can_skip_parent_group = p.enable_parent_prefix_skip_
           && scope_ == DAS_SCOPE_NESTED_SYNC
           && get_rowid_type() == DAS_ROWID_TYPE_COMPACT;
-      enable_group_skip_ = can_skip_doc_group || can_skip_parent_group;
+      enable_group_skip_ = !is_async_nested_scope(inner_op_->get_scope())
+          && (can_skip_doc_group || can_skip_parent_group);
     }
   }
   return ret;
@@ -360,6 +367,11 @@ int ObDASNestedQueryOp::do_rescan()
 int ObDASNestedQueryOp::do_next_rowid(ObDASRowID &next_id, double &score)
 {
   int ret = OB_SUCCESS;
+  const bool cache_doc = DAS_SCOPE_BASE == scope_ && OB_NOT_NULL(inner_op_)
+      && is_async_nested_scope(inner_op_->get_scope());
+  if (cache_doc) {
+    has_emitted_ = false;
+  }
   if (OB_ISNULL(inner_op_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("inner_op_ is null", K(ret));
@@ -382,22 +394,64 @@ int ObDASNestedQueryOp::do_next_rowid(ObDASRowID &next_id, double &score)
                  K(inner_op_->get_scope()),
                  K(inner_op_->get_rowid_type()), K(inner_op_->get_op_type()),
                  "inner_id", NestedRowIDDump(search_ctx_, inner_op_->get_scope(), inner_id));
-        ObDASRowID truncated;
-        bool is_dup = false;
-        if (OB_FAIL(truncate_and_emit(inner_id, truncated, is_dup))) {
-          LOG_WARN("failed to truncate and emit", K(ret));
-        } else if (is_dup) {
-          continue; // skip duplicate, fetch next
+        if (is_async_nested_scope(inner_op_->get_scope())) {
+          bool has_match = true;
+          if (DAS_SCOPE_BASE == scope_ && OB_FAIL(check_current_doc_nk(has_match))) {
+            LOG_WARN("failed to check current document nested keys", K(ret));
+          } else if (has_match) {
+            next_id = inner_id;
+            score = inner_score;
+            emitted = true;
+          }
         } else {
-          next_id = truncated;
-          score = inner_score;
-          emitted = true;
+          ObDASRowID truncated;
+          bool is_dup = false;
+          if (OB_FAIL(truncate_and_emit(inner_id, truncated, is_dup))) {
+            LOG_WARN("failed to truncate and emit", K(ret));
+          } else if (is_dup) {
+            continue; // skip duplicate, fetch next
+          } else {
+            next_id = truncated;
+            score = inner_score;
+            emitted = true;
+          }
         }
       }
     }
   }
   if (OB_SUCC(ret) && OB_FAIL(remember_for_next_skip(next_id))) {
     LOG_WARN("failed to remember emitted group for next skip", K(ret));
+  }
+  if (OB_SUCC(ret) && cache_doc) {
+    last_emitted_rowid_ = next_id;
+    last_emitted_score_ = score;
+    has_emitted_ = true;
+  }
+  return ret;
+}
+
+int ObDASNestedQueryOp::do_next_rowid(ObDASNestedKey &next_nk, double &score)
+{
+  int ret = OB_SUCCESS;
+  if (!is_async_nested_scope(scope_)) {
+    ret = OB_NOT_IMPLEMENT;
+  } else if (OB_FAIL(inner_op_->next_rowid(next_nk, score))) {
+    LOG_WARN_IGNORE_ITER_END(ret, "failed to get inner nested key", KR(ret));
+  } else if (OB_FAIL(project_nested_key(next_nk))) {
+    LOG_WARN("failed to project nested key to parent", KR(ret));
+  }
+  return ret;
+}
+
+int ObDASNestedQueryOp::project_nested_key(ObDASNestedKey &key) const
+{
+  int ret = OB_SUCCESS;
+  const int32_t parent_bytes = (nesting_depth_ - 1) * ObSearchIndexNestedKeyEncoder::BYTES_PER_LEVEL;
+  if (OB_UNLIKELY(!key.is_normal() || parent_bytes <= 0 || key.length() < parent_bytes)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected nested key for parent projection", KR(ret), K(key), K(parent_bytes));
+  } else {
+    key.assign(key, parent_bytes);
   }
   return ret;
 }
@@ -463,6 +517,25 @@ int ObDASNestedQueryOp::build_truncated_rowid(const ObDASRowID &inner_rowid,
         LOG_WARN("failed to build truncated nested rowid", K(ret));
       }
     }
+  }
+  return ret;
+}
+
+int ObDASNestedQueryOp::check_current_doc_nk(bool &has_match)
+{
+  int ret = OB_SUCCESS;
+  has_match = false;
+  ObDASNestedKey target;
+  ObDASNestedKey key;
+  double unused_score = 0.0;
+  if (OB_FAIL(inner_op_->advance_to(target, key, unused_score))) {
+    if (OB_ITER_END == ret) {
+      ret = OB_SUCCESS;
+    } else {
+      LOG_WARN("failed to find a matching nested key", K(ret));
+    }
+  } else {
+    has_match = true;
   }
   return ret;
 }
@@ -648,7 +721,7 @@ int ObDASNestedQueryOp::compare_inner_group_with_pending(
   ObDatum doc_id_datum;
   ObDatum nk_datum;
   const ObDASScopeId inner_scope =
-      is_doc_id_only_ ? DAS_SCOPE_BASE : DAS_SCOPE_NESTED_SYNC;
+      is_doc_id_only_ ? DAS_SCOPE_BASE : search_ctx_.get_nested_scope_id();
   const int64_t pending_prefix_len = scope_ == DAS_SCOPE_NESTED_SYNC
       ? static_cast<int64_t>(nesting_depth_ - 1)
           * ObSearchIndexNestedKeyEncoder::BYTES_PER_LEVEL
@@ -815,10 +888,38 @@ void ObDASNestedQueryOp::reset_iteration_state()
   clear_pending_group_skip();
   last_emitted_rowid_.reset();
   has_emitted_ = false;
+  last_emitted_score_ = 0.0;
   current_allocator_is_a_ = true;
   dedup_allocator_a_.reset();
   dedup_allocator_b_.reset();
   advance_scratch_allocator_.reset();
+}
+
+int ObDASNestedQueryOp::do_advance_shallow(
+    const ObDASRowID &target, const bool inclusive, const MaxScoreTuple *&max_score_tuple)
+{
+  int ret = OB_SUCCESS;
+  if (inclusive || !target.is_normal() || DAS_SCOPE_BASE != scope_
+      || DAS_ROWID_TYPE_UINT64 != get_rowid_type() || OB_ISNULL(inner_op_)
+      || !is_async_nested_scope(inner_op_->get_scope())) {
+    ret = ObIDASSearchOp::do_advance_shallow(target, inclusive, max_score_tuple);
+  } else if (UINT64_MAX == target.get_uint64()) {
+    has_emitted_ = false;
+    ret = OB_ITER_END;
+  } else {
+    ObDASRowID successor;
+    ObDASRowID next_id;
+    double score = 0.0;
+    // Exclude target before checking NK, avoiding a second check of that document.
+    successor.set_uint64(target.get_uint64() + 1);
+    if (OB_FAIL(do_advance_to(successor, next_id, score))) {
+      LOG_WARN_IGNORE_ITER_END(ret, "failed to advance past nested target", K(ret), K(target));
+    } else {
+      max_score_tuple_.set(next_id, next_id, score);
+      max_score_tuple = &max_score_tuple_;
+    }
+  }
+  return ret;
 }
 
 int ObDASNestedQueryOp::do_advance_to(const ObDASRowID &target, ObDASRowID &curr_id, double &score)
@@ -833,6 +934,37 @@ int ObDASNestedQueryOp::do_advance_to(const ObDASRowID &target, ObDASRowID &curr
   if (OB_ISNULL(inner_op_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("inner_op_ is null", K(ret));
+  } else if (is_async_nested_scope(inner_op_->get_scope())) {
+    const bool cache_doc = DAS_SCOPE_BASE == scope_;
+    if (cache_doc && has_emitted_
+        && (target.is_min() || (target.is_normal()
+            && target.get_uint64() <= last_emitted_rowid_.get_uint64()))) {
+      // Reuse the verified document before a child can reset or consume its NK cursor.
+      curr_id = last_emitted_rowid_;
+      score = last_emitted_score_;
+    } else {
+      if (cache_doc) {
+        has_emitted_ = false;
+      }
+      ObDASRowID inner_id;
+      bool has_match = true;
+      if (OB_FAIL(inner_op_->advance_to(target, inner_id, score))) {
+        if (OB_UNLIKELY(OB_ITER_END != ret)) {
+          LOG_WARN("failed to advance inner nested row", K(ret));
+        }
+      } else if (cache_doc && OB_FAIL(check_current_doc_nk(has_match))) {
+        LOG_WARN("failed to check current document nested keys", K(ret));
+      } else if (has_match) {
+        curr_id = inner_id;
+      } else {
+        ret = do_next_rowid(curr_id, score);
+      }
+      if (OB_SUCC(ret) && cache_doc) {
+        last_emitted_rowid_ = curr_id;
+        last_emitted_score_ = score;
+        has_emitted_ = true;
+      }
+    }
   } else if (is_doc_id_only_) {
     double inner_score = 0.0;
     if (OB_FAIL(inner_op_->advance_to(target, curr_id, inner_score))) {
@@ -908,6 +1040,19 @@ int ObDASNestedQueryOp::do_advance_to(const ObDASRowID &target, ObDASRowID &curr
         }
       }
     }
+  }
+  return ret;
+}
+
+int ObDASNestedQueryOp::do_advance_to(const ObDASNestedKey &target, ObDASNestedKey &curr_nk, double &score)
+{
+  int ret = OB_SUCCESS;
+  if (!is_async_nested_scope(scope_)) {
+    ret = OB_NOT_IMPLEMENT;
+  } else if (OB_FAIL(inner_op_->advance_to(target, curr_nk, score))) {
+    LOG_WARN_IGNORE_ITER_END(ret, "failed to get inner nested key", KR(ret));
+  } else if (OB_FAIL(project_nested_key(curr_nk))) {
+    LOG_WARN("failed to project nested key to parent", KR(ret));
   }
   return ret;
 }

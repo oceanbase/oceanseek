@@ -23,6 +23,7 @@ namespace sql
 class ObStaticEngineCG;
 class ObTableScanCtDef;
 class ObFullTextQueryNode;
+struct ObSearchIndexTextInfo;
 class ObMatchQueryNode;
 class ObDASMatchCtDef;
 class ObMatchPhraseQueryNode;
@@ -500,6 +501,8 @@ private:
   int generate_text_ir_ctdef(ObLogTableScan &op,
                              const ObTextRetrievalIndexInfo &index_info,
                              const ObFullTextQueryNode &fulltext_node,
+                             const ObColumnRefRawExpr &field,
+                             const ObSearchIndexTextInfo &info,
                              const bool is_topk_query,
                              const uint64_t inv_idx_tid,
                              const uint64_t doc_id_idx_tid,

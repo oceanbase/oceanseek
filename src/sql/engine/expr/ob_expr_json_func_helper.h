@@ -526,6 +526,10 @@ public:
                                            ObIAllocator* allocator,
                                            ObString& in_str,
                                            ObString &out_str);
+  static int append_json_strings(ObIAllocator &allocator,
+                                 const ObIArray<ObString> &strings,
+                                 ObJsonArray &json_array);
+
   template <typename T>
   static int pack_json_str_res(const ObExpr &expr,
                                ObEvalCtx &ctx,

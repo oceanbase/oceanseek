@@ -216,6 +216,21 @@ int ObCreateIndexResolver::resolve_index_column_node(
             LOG_USER_ERROR(OB_NOT_SUPPORTED, "tenant data version is less than 4.3.3, multivalue index");
           }
         }
+        if (OB_SUCC(ret)
+            && (index_keyname_ == INDEX_KEYNAME::SEARCH_KEY
+                || index_keyname_ == INDEX_KEYNAME::ASYNC_SEARCH_KEY)
+            && OB_NOT_NULL(search_with_node)) {
+          const ObColumnSchemaV2 *col_schema = tbl_schema->get_column_schema(sort_item.column_name_);
+          if (OB_ISNULL(col_schema)) {
+            ret = OB_INVALID_ARGUMENT;
+            FORWARD_USER_ERROR_MSG(ret, "Incorrect arguments, key column '%.*s' doesn't exist in table",
+                                   sort_item.column_name_.length(), sort_item.column_name_.ptr());
+            LOG_WARN("search index key column doesn't exist in table", K(sort_item.column_name_));
+          } else if (OB_FAIL(ObDDLResolver::resolve_search_index_column_comment(
+                  search_with_node, col_schema, sort_item.column_name_, allocator_, sort_item.column_comment_))) {
+            LOG_WARN("failed to resolve search index column config", K(ret), K(sort_item.column_name_));
+          }
+        }
         if (OB_SUCC(ret)) {
           const ObColumnSchemaV2 *column_schema = NULL;
           if (is_oracle_mode()) { // oracle mode is not support vector column yet 
@@ -268,7 +283,8 @@ int ObCreateIndexResolver::resolve_index_column_node(
             if (OB_FAIL(ret)) {
             } else if (OB_FAIL(resolve_search_index_constraint(*tbl_schema,
                                                                sort_item.column_name_,
-                                                               static_cast<int64_t>(index_keyname_)))) {
+                                                               static_cast<int64_t>(index_keyname_),
+                                                               sort_item.column_comment_))) {
               LOG_WARN("resolve search index constraint fail", K(ret), K(sort_item.column_name_));
             }
           }
@@ -418,22 +434,6 @@ int ObCreateIndexResolver::resolve_index_column_node(
           LOG_WARN("Only support for sync ddl user to specify column id", K(ret), K(session_info_->get_user_name()));
         } else {
           sort_item.column_id_ = static_cast<int32_t>(id_node->children_[0]->value_);
-        }
-      }
-
-      if (OB_SUCC(ret)
-          && (index_keyname_ == INDEX_KEYNAME::SEARCH_KEY
-              || index_keyname_ == INDEX_KEYNAME::ASYNC_SEARCH_KEY)
-          && OB_NOT_NULL(search_with_node)) {
-        const ObColumnSchemaV2 *col_schema = tbl_schema->get_column_schema(sort_item.column_name_);
-        if (OB_ISNULL(col_schema)) {
-          ret = OB_INVALID_ARGUMENT;
-          FORWARD_USER_ERROR_MSG(ret, "Incorrect arguments, key column '%.*s' doesn't exist in table",
-                                 sort_item.column_name_.length(), sort_item.column_name_.ptr());
-          LOG_WARN("search index key column doesn't exist in table", K(sort_item.column_name_));
-        } else if (OB_FAIL(ObDDLResolver::resolve_search_index_column_comment(
-                search_with_node, col_schema, sort_item.column_name_, allocator_, sort_item.column_comment_))) {
-          LOG_WARN("failed to resolve search index column config", K(ret), K(sort_item.column_name_));
         }
       }
 
@@ -837,6 +837,10 @@ int ObCreateIndexResolver::resolve(const ParseNode &parse_tree)
                                                data_tbl_schema,
                                                NULL != parse_node.children_[5]))) {
     LOG_WARN("fail to resolve index option node", K(ret));
+  } else if (is_search_def_index(crt_idx_stmt->get_create_index_arg().index_type_)
+             && OB_FAIL(share::ObSearchIndexBuilderUtil::resolve_search_index_args(
+                 crt_idx_stmt->get_create_index_arg()))) {
+    LOG_WARN("unsupported search index configuration", K(ret));
   } else if (global_ && OB_FAIL(generate_global_index_schema(crt_idx_stmt))) {
     LOG_WARN("fail to generate index schema", K(ret));
   } else {

@@ -11278,18 +11278,56 @@ int ObTableSchema::get_hidden_column_count(int64_t &hidden_column_count) const
   return ret;
 }
 
-int ObTableSchema::get_search_data_index_tid(uint64_t &tid) const
+int ObTableSchema::get_search_aux_index_tid(const ObIndexType type, uint64_t &tid) const
 {
   int ret = OB_SUCCESS;
-  if (is_search_def_index()) {
-    if (1 != get_index_tid_count()
-      || !share::schema::is_search_data_index(get_simple_index_infos().at(0).index_type_)) {
+  tid = OB_INVALID_ID;
+  if (!is_search_def_index() || !share::schema::is_search_aux_index(type)
+      || (is_async_search_def_index() != share::schema::is_async_search_aux_index(type))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid search auxiliary index lookup", K(ret), K_(tenant_id), K_(table_id), K_(index_type), K(type));
+  } else {
+    const ObIArray<ObAuxTableMetaInfo> &infos = get_simple_index_infos();
+    for (int64_t i = 0; OB_SUCC(ret) && i < infos.count(); ++i) {
+      if (infos.at(i).index_type_ == type) {
+        tid = infos.at(i).table_id_;
+        break;
+      }
+    }
+    if (OB_SUCC(ret) && tid == OB_INVALID_ID) {
       ret = OB_SCHEMA_EAGAIN;
-      LOG_WARN("the search index definition table and the search index data table should"
-               " correspond one-to-one",
-               K_(data_table_id), K_(table_id), K(get_index_tid_count()), K(ret));
-    } else {
-      tid = get_simple_index_infos().at(0).table_id_;
+      LOG_WARN("search auxiliary index does not exist", K(ret), K_(tenant_id), K_(table_id), K(type));
+    }
+  }
+  return ret;
+}
+
+int ObTableSchema::get_search_data_index_tid(uint64_t &tid) const
+{
+  return get_search_aux_index_tid(is_async_search_def_index()
+      ? INDEX_TYPE_ASYNC_SEARCH_DATA_INDEX_LOCAL : INDEX_TYPE_SEARCH_DATA_INDEX_LOCAL, tid);
+}
+
+int ObTableSchema::get_search_aux_index_tids(ObIArray<uint64_t> &tids) const
+{
+  int ret = OB_SUCCESS;
+  tids.reset();
+  if (!is_search_def_index()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("table is not a search definition index", K(ret), K_(tenant_id), K_(table_id), K_(index_type));
+  } else {
+    const ObIArray<ObAuxTableMetaInfo> &infos = get_simple_index_infos();
+    for (int64_t i = 0; OB_SUCC(ret) && i < infos.count(); ++i) {
+      const ObAuxTableMetaInfo &info = infos.at(i);
+      if (!share::schema::is_search_aux_index(info.index_type_)) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("invalid search auxiliary table metadata", K(ret), K(info));
+      } else if (info.table_id_ == OB_INVALID_ID) {
+        ret = OB_SCHEMA_EAGAIN;
+        LOG_WARN("invalid search auxiliary table id", K(ret), K(info));
+      } else if (OB_FAIL(tids.push_back(info.table_id_))) {
+        LOG_WARN("failed to collect search auxiliary table", K(ret), K(info));
+      }
     }
   }
   return ret;
