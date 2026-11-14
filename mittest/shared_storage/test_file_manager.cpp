@@ -6,10 +6,12 @@
 
 #include <atomic>
 #include <gmock/gmock.h>
+#include <sys/time.h>
 #include <thread>
 #define protected public
 #define private public
 #include "lib/utility/ob_test_util.h"
+#include "lib/utility/ob_defer.h"
 #include "lib/literals/ob_literals.h"
 #include "lib/utility/utility.h"
 #include "mittest/mtlenv/mock_tenant_module_env.h"
@@ -169,6 +171,15 @@ public:
                           const int64_t ls_epoch_id,
                           int64_t &dir_size);
   int prepare_calibration_macro(const uint64_t tablet_id, MacroBlockId &macro_id);
+  // 构造过期 .tmp.seq，不修改 quota。
+  static int create_expired_tmp_seq_file_(const MacroBlockId &macro_id,
+      const uint64_t seq, const int64_t size_bytes, ObPathContext &ctx);
+  // 应用真实扫描结果并校验 quota，退出时恢复账目供原用例收尾。
+  static void check_retried_scan_quota_(const ObSSMacroCacheType cache_type,
+      const ObFileStatInfo &initial_stat_info, const int64_t initial_hot_tablet_used_size,
+      ObCalibrateDiskSpaceResult &scan, const ObCalibrateDiskSpaceResult &stable_scan);
+  void check_tmp_seq_calibration_lifecycle(const uint64_t tablet_id, const bool is_clean,
+      const ObSSMacroCacheType cache_type, const int64_t physical_size_bytes);
   int write_fail_and_clean_tmp_seq_file(
       const uint64_t tablet_id,
       const ObSSMacroCacheType expected_cache_type,
@@ -329,6 +340,113 @@ void TestFileManager::get_ls_id_dir_size(
     scatter_dir_size += statbuf.size_;
   }
   dir_size += scatter_dir_size;
+}
+
+// 构造真实临时文件，把扫描结果送入正式校准应用接口，再清理并核对账目。
+// 既有文件和目录用量作为固定基线；初始快照后的新增预留由增量补偿保留。
+// 失败退出时恢复 GC 标志和基线用量，避免影响后续场景。
+void TestFileManager::check_tmp_seq_calibration_lifecycle(const uint64_t tablet_id,
+    const bool is_clean, const ObSSMacroCacheType cache_type, const int64_t physical_size_bytes)
+{
+  LOG_INFO("tmp seq accounting lifecycle begin", K(tablet_id), K(is_clean), K(cache_type));
+  ObTenantFileManager *files = MTL(ObTenantFileManager *);
+  ObTenantDiskSpaceManager *disk = MTL(ObTenantDiskSpaceManager *);
+  ASSERT_NE(nullptr, files);
+  ASSERT_NE(nullptr, disk);
+  constexpr int64_t RESERVED_BYTES = 64_KB;
+  constexpr int64_t DELTA_BYTES = 4_KB;
+  constexpr uint64_t WRITE_SEQ = 99;
+  MacroBlockId id;
+  id.set_storage_object_type(static_cast<uint64_t>(ObStorageObjectType::PRIVATE_DATA_MACRO));
+  id.set_second_id(tablet_id);
+  id.set_reorganization_scn(0 /*reorganization_scn*/);
+  id.set_tenant_seq(1 /*tenant_seq*/);
+  char parent[common::MAX_PATH_SIZE] = {0};
+  OK(OB_DIR_MGR.get_local_tablet_data_scatter_dir(
+      parent, sizeof(parent), MTL_ID(), MTL_EPOCH_ID(), tablet_id));
+  const int mkdir_ret = ObDirManager::create_dir(parent, ObStorageObjectType::PRIVATE_DATA_MACRO);
+  ASSERT_TRUE(OB_SUCCESS == mkdir_ret || OB_FILE_OR_DIRECTORY_EXIST == mkdir_ret);
+  OK(ObFileHelper::create_file_parent_dir(id, 0 /*ls_id*/, MTL_EPOCH_ID()));
+  OK(ObFileHelper::get_file_parent_dir(parent, sizeof(parent), id, MTL_EPOCH_ID()));
+  ObPathContext ctx;
+  OK(ctx.set_atomic_write_ctx(id, MTL_EPOCH_ID(), WRITE_SEQ, GCONF.observer_id));
+  ObCalibrateDiskSpaceTask task;
+  OK(task.init(MTL_ID()));
+  ObFileStatInfo meta, tmp, macro_before, hot_before;
+  ObFileStatInfo macro_initial, hot_initial, macro_after, hot_after;
+  OK(task.get_macro_cache_used_size(meta, tmp, macro_before, hot_before));
+  const int64_t total_before = disk->get_tenant_macro_cache_used_size();
+  NAMED_DEFER(restore,
+      files->set_allow_gc();
+      IGNORE_RETURN(ObIODeviceLocalFileOp::unlink(ctx.get_path()));
+      IGNORE_RETURN(files->erase_from_atomic_write_file_map(is_clean, id));
+      IGNORE_RETURN(disk->calibrate_alloc_size(
+          macro_before.total_size_, ObSSMacroCacheType::MACRO_BLOCK));
+      IGNORE_RETURN(disk->calibrate_alloc_size(hot_before.total_size_,
+          ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK)));
+
+  // 真实文件长度为零或部分写入长度，预留始终为 64 KB。
+  ObIOFd fd;
+  OK(ObIODeviceLocalFileOp::open(ctx.get_path(),
+      O_RDWR | O_CREAT | O_TRUNC /*flags*/, S_IRUSR | S_IWUSR /*mode*/, fd));
+  OK(ObIODeviceLocalFileOp::close(fd));
+  OK(ObIODeviceLocalFileOp::truncate(ctx.get_path(), physical_size_bytes));
+  OK(disk->alloc_file_size(RESERVED_BYTES, cache_type, ObDiskSpaceType::FILE));
+  ObAtomicWriteFileInfo info(0 /*ls_id*/, MTL_EPOCH_ID(), WRITE_SEQ, RESERVED_BYTES);
+  info.cache_type_ = cache_type;
+  OK(files->push_to_atomic_write_file_map(is_clean, id, info));
+  OK(task.get_macro_cache_used_size(meta, tmp, macro_initial, hot_initial));
+  OK(disk->alloc_file_size(DELTA_BYTES, cache_type, ObDiskSpaceType::FILE));
+  ObIODFileStat stat;
+  OK(ObIODeviceLocalFileOp::stat(ctx.get_path(), stat));
+  volatile bool is_stop = false;
+  ObDirCalcSizeOp op(is_stop, parent);
+  op.set_macro_cache_type(ObSSMacroCacheType::MACRO_BLOCK);
+  OK(op.set_start_calc_size_time(stat.mtime_s_ + 1));
+  dirent entry = {};
+  OK(databuff_printf(entry.d_name, sizeof(entry.d_name), "%s", STRRCHR(ctx.get_path(), '/') + 1));
+  files->set_pause_gc();
+  OK(op.func(&entry));
+  LOG_INFO("verify reserved bytes before calibration", K(op), K(info), K(stat));
+  ASSERT_EQ(physical_size_bytes, stat.size_);
+  ASSERT_EQ(RESERVED_BYTES, op.get_total_file_size() + op.get_hot_tablet_total_file_size());
+
+  // 经过真实扫描入口后应用校准，既有目录不产生额外修正。
+  ObCalibrateDiskSpaceResult scan;
+  scan.total_file_size_ = macro_before.total_size_ + op.get_total_file_size();
+  scan.hot_tablet_total_used_size_ = hot_before.total_size_ + op.get_hot_tablet_total_file_size();
+  scan.total_dir_size_ = macro_initial.dir_num_ * ObDirManager::DEFAULT_DIR_SIZE;
+  scan.total_dir_num_ = macro_initial.dir_num_;
+  OK(task.calibrate_macro_cache_used_size_normally(
+      ObSSMacroCacheType::MACRO_BLOCK, macro_initial, hot_initial.total_size_, scan));
+  OK(task.get_macro_cache_used_size(meta, tmp, macro_after, hot_after));
+  const bool is_hot = (ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK == cache_type);
+  ASSERT_EQ(macro_initial.total_size_ + ((is_hot) ? 0 : DELTA_BYTES), macro_after.total_size_);
+  ASSERT_EQ(hot_initial.total_size_ + ((is_hot) ? DELTA_BYTES : 0), hot_after.total_size_);
+  ASSERT_EQ(total_before + RESERVED_BYTES + DELTA_BYTES, disk->get_tenant_macro_cache_used_size());
+
+  // 暂停期间既不删文件也不扣账，逐条回调必须吸收延期错误。
+  ASSERT_EQ(OB_FILE_DELETE_FAILED, files->delete_tmp_seq_file(id, info));
+  OK(files->do_tmp_seq_file_clean_work(is_clean, 0 /*safe_del_time_s*/));
+  OK(files->get_from_atomic_write_file_map(is_clean, id, info));
+  OK(ObIODeviceLocalFileOp::stat(ctx.get_path(), stat));
+  ASSERT_EQ(total_before + RESERVED_BYTES + DELTA_BYTES, disk->get_tenant_macro_cache_used_size());
+  files->set_allow_gc();
+  OK(files->do_tmp_seq_file_clean_work(is_clean, 0 /*safe_del_time_s*/));
+  ASSERT_EQ(OB_HASH_NOT_EXIST, files->get_from_atomic_write_file_map(is_clean, id, info));
+  ASSERT_EQ(OB_NO_SUCH_FILE_OR_DIRECTORY, ObIODeviceLocalFileOp::stat(ctx.get_path(), stat));
+  ASSERT_EQ(total_before + DELTA_BYTES, disk->get_tenant_macro_cache_used_size());
+  OK(disk->free_file_size(DELTA_BYTES, cache_type, ObDiskSpaceType::FILE));
+  OK(task.get_macro_cache_used_size(meta, tmp, macro_after, hot_after));
+  LOG_INFO("verify cleanup restores accounting", K(macro_before), K(hot_before),
+      K(macro_after), K(hot_after), K(total_before));
+  ASSERT_EQ(macro_before.total_size_, macro_after.total_size_);
+  ASSERT_EQ(hot_before.total_size_, hot_after.total_size_);
+  ASSERT_EQ(total_before, disk->get_tenant_macro_cache_used_size());
+  OK(files->do_tmp_seq_file_clean_work(is_clean, 0 /*safe_del_time_s*/));
+  ASSERT_EQ(total_before, disk->get_tenant_macro_cache_used_size());
+  restore.deactivate();
+  LOG_INFO("tmp seq accounting lifecycle end", K(tablet_id));
 }
 
 // 写 .tmp.seq 并注入失败，污染 meta map 后清理，验证按写入时 cache_type 扣减空间。
@@ -2707,6 +2825,10 @@ TEST_F(TestFileManager, test_list_and_delete_dir_operator)
   ASSERT_EQ(OB_SUCCESS, tenant_file_mgr->delete_ls_dir(ls_id, ls_epoch_id));
 }
 
+// 验证失败写的临时文件在暂停 GC 时保留，恢复 GC 后完成清理。
+// 场景：制造 rename 失败并等待 clean map 条目到期。
+// 操作：暂停 GC 后运行清理，再恢复 GC 并重新运行。
+// 校验：暂停时清理遍历返回成功、文件和记录均在，恢复后两者均被删除。
 TEST_F(TestFileManager, test_delete_tmp_seq_files)
 {
   int ret = OB_SUCCESS;
@@ -2764,7 +2886,26 @@ TEST_F(TestFileManager, test_delete_tmp_seq_files)
   // step 4: sleep CLEAN_MAP_SAFE_DEL_TIME_S + 1 and clean
   const int64_t CLEAN_MAP_SAFE_DEL_TIME_S = 5L; // 5s
   sleep(CLEAN_MAP_SAFE_DEL_TIME_S + 1);
-  tenant_file_mgr->tmp_seq_file_clean_task_.init();
+  OK(tenant_file_mgr->tmp_seq_file_clean_task_.init());
+
+  // 暂停时不能把“未删除”当作成功清理；先恢复标志，再做致命断言。
+  LOG_INFO("========== verify tmp seq cleanup during GC pause begin ==========");
+  tenant_file_mgr->set_pause_gc();
+  const int paused_clean_ret = tenant_file_mgr->do_tmp_seq_file_clean_work(
+      true /*is_clean*/, CLEAN_MAP_SAFE_DEL_TIME_S);
+  const int paused_lookup_ret = tenant_file_mgr->get_from_atomic_write_file_map(
+      true /*is_clean*/, macro_id, atomic_write_file);
+  const int paused_stat_ret = ObIODeviceLocalFileOp::stat(ctx.get_path(), stat);
+  tenant_file_mgr->set_allow_gc();
+  LOG_INFO("verify paused cleanup retained file and entry",
+      KR(paused_clean_ret), KR(paused_lookup_ret), KR(paused_stat_ret),
+      K(atomic_write_file), K(stat));
+  OK(paused_clean_ret);
+  OK(paused_lookup_ret);
+  OK(paused_stat_ret);
+  ASSERT_EQ(write_io_size, atomic_write_file.size_);
+  LOG_INFO("========== verify tmp seq cleanup during GC pause end ==========");
+
   tenant_file_mgr->tmp_seq_file_clean_task_.runTimerTask();
   ASSERT_EQ(OB_HASH_NOT_EXIST, tenant_file_mgr->get_from_atomic_write_file_map(true/*is_clean*/, macro_id, atomic_write_file));
   ASSERT_NE(OB_SUCCESS, ObIODeviceLocalFileOp::stat(ctx.get_path(), stat));
@@ -3284,16 +3425,17 @@ TEST_F(TestFileManager, test_tmp_file_calibration_retry_on_logical_delete)
 }
 
 // ----------------------------------------------------------------------------
-// TMP 校准完成目录扫描后发生逻辑删除时，会通过 after epoch 校验丢弃结果并重试
+// TMP 校准完成扫描后发生逻辑删除时会重扫，并保留首轮删除过期 .tmp.seq 的补偿
 //
 // 场景：创建一个本地 TMP segment，在首轮目录扫描完成、读取 after epoch/inflight 前暂停，
-//       由另一线程将该 segment 逻辑删除为 .deleted。
+//       由另一线程将该 segment 逻辑删除为 .deleted；目录内另有一个过期 .tmp.seq。
 //
 // 操作：AFTER DEBUG_SYNC 连续命中两次；第一次命中时执行 logical rename，第二次仅放行，
 //       用 action 耗尽证明首轮结果已被丢弃并进入重试。
 //
 // 校验：第一次等待在 timeout 前收到 scan-finished signal；rename 使 epoch 增加且
-//       inflight 归零；校准重试后成功，结果与无并发稳定扫描逐字段一致。
+//       inflight 归零；重扫后存量统计与稳定扫描一致，删除补偿仍保留首轮删除量。
+//       将真实重扫结果应用校准后，quota 只包含存量，不加回已删除文件。
 // ----------------------------------------------------------------------------
 TEST_F(TestFileManager, test_tmp_file_calibration_retry_on_logical_delete_after_scan)
 {
@@ -3331,6 +3473,25 @@ TEST_F(TestFileManager, test_tmp_file_calibration_retry_on_logical_delete_after_
       tmp_file, 0 /*ls_epoch_id*/, is_local_file_exist));
   ASSERT_TRUE(is_local_file_exist);
 
+  // 同时放入真实过期 .tmp.seq；首轮已删除，第二轮无法再次扫描到。
+  constexpr int64_t TMP_SEQ_SIZE_BYTES = 8_KB;
+  ObTenantDiskSpaceManager *disk = MTL(ObTenantDiskSpaceManager *);
+  ASSERT_NE(nullptr, disk);
+  ObPathContext expired_ctx;
+  bool reserved = false;
+  NAMED_DEFER(clean_expired,
+      if (expired_ctx.is_valid()) {
+        IGNORE_RETURN(ObIODeviceLocalFileOp::unlink(expired_ctx.get_path()));
+      }
+      if (reserved) {
+        IGNORE_RETURN(disk->free_file_size(TMP_SEQ_SIZE_BYTES,
+            ObSSMacroCacheType::TMP_FILE, ObDiskSpaceType::FILE));
+      });
+  OK(create_expired_tmp_seq_file_(tmp_file, 92001 /*seq*/, TMP_SEQ_SIZE_BYTES, expired_ctx));
+  OK(disk->alloc_file_size(TMP_SEQ_SIZE_BYTES,
+      ObSSMacroCacheType::TMP_FILE, ObDiskSpaceType::FILE));
+  reserved = true;
+
   // step 2：在每轮扫描完成后、读取 after epoch/inflight 前设置同步点。
   constexpr int64_t DEBUG_SYNC_TIMEOUT_US = 5_s;
   constexpr int64_t SIGNAL_WAIT_LIMIT_US = DEBUG_SYNC_TIMEOUT_US * 9 / 10;
@@ -3346,10 +3507,24 @@ TEST_F(TestFileManager, test_tmp_file_calibration_retry_on_logical_delete_after_
       false /*is_global*/, point_actions));
   OK(GDS.set_thread_local_actions(point_actions));
   const int64_t original_debug_sync_timeout_us = GCONF.debug_sync_timeout;
+  NAMED_DEFER(restore_tmp_scan_state,
+      tenant_file_mgr->set_tmp_file_cache_allow_gc();
+      IGNORE_RETURN(ObSSObjectAccessUtil::delete_local_file(tmp_file));
+      GCONF.debug_sync_timeout = original_debug_sync_timeout_us;
+      point_actions.reset();
+      IGNORE_RETURN(GDS.set_thread_local_actions(point_actions)));
   GCONF.debug_sync_timeout = DEBUG_SYNC_TIMEOUT_US;
   const bool is_debug_sync_enabled = GCONF.is_debug_sync_enabled();
+  ASSERT_TRUE(is_debug_sync_enabled);
+  ASSERT_NE(nullptr, GDS.thread_local_actions());
+  ASSERT_TRUE(GDS.thread_local_actions()->is_active(AFTER_TMP_FILE_CALIBRATE_SCAN));
 
   tenant_file_mgr->set_tmp_file_cache_pause_gc();
+  // TMP 的重试不刷新初始账目，必须在线程启动和扫描之前保存。
+  ObCalibrateDiskSpaceTask snapshot_task;
+  OK(snapshot_task.init(tenant_id));
+  ObFileStatInfo initial_stat_info;
+  OK(snapshot_task.get_macro_cache_used_size(ObSSMacroCacheType::TMP_FILE, initial_stat_info));
   const int64_t epoch_before = tenant_file_mgr->get_tmp_logical_delete_epoch();
   std::atomic<int> first_wait_ret(OB_EAGAIN);
   std::atomic<int> second_wait_ret(OB_EAGAIN);
@@ -3408,6 +3583,14 @@ TEST_F(TestFileManager, test_tmp_file_calibration_retry_on_logical_delete_after_
   ObCalibrateDiskSpaceResult stable_calibrate_res;
   const int stable_scan_ret = tenant_file_mgr->calc_tmp_file_disk_space(
       start_calc_size_time_s, stable_calibrate_res);
+  if (OB_SUCCESS == scan_ret && OB_SUCCESS == stable_scan_ret) {
+    // 非致命封装保证 helper 内断言失败后，仍执行下面的 .deleted 文件清理。
+    EXPECT_NO_FATAL_FAILURE(check_retried_scan_quota_(
+        ObSSMacroCacheType::TMP_FILE /*cache_type*/, initial_stat_info,
+        0 /*initial_hot_tablet_used_size*/, calibrate_res, stable_calibrate_res));
+  }
+  ObIODFileStat expired_stat;
+  const int expired_stat_ret = ObIODeviceLocalFileOp::stat(expired_ctx.get_path(), expired_stat);
   const int64_t epoch_after = tenant_file_mgr->get_tmp_logical_delete_epoch();
   const int64_t inflight_after = tenant_file_mgr->get_tmp_logical_delete_inflight();
   ObPathContext deleted_path_ctx;
@@ -3438,7 +3621,7 @@ TEST_F(TestFileManager, test_tmp_file_calibration_retry_on_logical_delete_after_
       K(original_debug_sync_timeout_us), K(restored_debug_sync_timeout_us),
       K(epoch_before), K(epoch_after), K(inflight_after), K(path_ret), K(exist_ret),
       K(is_deleted_file_exist), K(calibrate_res), K(stable_calibrate_res),
-      K(cleanup_deleted_ret), K(cleanup_original_ret));
+      K(cleanup_deleted_ret), K(cleanup_original_ret), KR(expired_stat_ret));
 
   OK(first_wait_result);
   OK(second_wait_result);
@@ -3463,7 +3646,9 @@ TEST_F(TestFileManager, test_tmp_file_calibration_retry_on_logical_delete_after_
   ASSERT_EQ(stable_calibrate_res.total_file_size_, calibrate_res.total_file_size_);
   ASSERT_EQ(stable_calibrate_res.hot_tablet_total_used_size_,
       calibrate_res.hot_tablet_total_used_size_);
-  ASSERT_EQ(stable_calibrate_res.del_tmp_seq_file_size_, calibrate_res.del_tmp_seq_file_size_);
+  ASSERT_EQ(TMP_SEQ_SIZE_BYTES, calibrate_res.del_tmp_seq_file_size_);
+  ASSERT_EQ(0, stable_calibrate_res.del_tmp_seq_file_size_);
+  ASSERT_EQ(OB_NO_SUCH_FILE_OR_DIRECTORY, expired_stat_ret);
   ASSERT_EQ(stable_calibrate_res.tmp_seq_file_size_, calibrate_res.tmp_seq_file_size_);
   ASSERT_EQ(stable_calibrate_res.tmp_seq_file_cnt_, calibrate_res.tmp_seq_file_cnt_);
   ASSERT_EQ(stable_calibrate_res.total_dir_size_, calibrate_res.total_dir_size_);
@@ -4774,7 +4959,35 @@ TEST_F(TestFileManager, test_dir_create_time_and_meta_write_impact)
 // B. 扫描并发：双向迁移、持续迁移及扫描中取消；
 // C. 重试与退出：在途耗尽、跨秒重试、取消/未初始化；
 // D. 转换回调：失败计数归零。
+// E. 删除补偿：跨重扫累计，且不加回最终 quota。
 // ============================================================================
+
+// 在已有父目录下创建稀疏 .tmp.seq 文件，并回拨 mtime，使扫描立即走过期删除分支。
+// 只构造磁盘文件；调用方负责预留和回收等量 quota，以及失败退出时的文件清理。
+int TestFileManager::create_expired_tmp_seq_file_(const MacroBlockId &macro_id,
+    const uint64_t seq, const int64_t size_bytes, ObPathContext &ctx)
+{
+  int ret = OB_SUCCESS;
+  ctx.reset();
+  ObIOFd fd;
+  const int64_t expired_time_s = ObTimeUtility::current_time_s() - 2_hour / 1_s;
+  struct timeval times[2] = {{expired_time_s, 0}, {expired_time_s, 0}};
+  if (OB_FAIL(ctx.set_atomic_write_ctx(macro_id, MTL_EPOCH_ID(), seq, GCONF.observer_id))) {
+    LOG_WARN("fail to build expired tmp seq path", KR(ret), K(macro_id), K(seq));
+  } else if (OB_FAIL(ObIODeviceLocalFileOp::open(ctx.get_path(),
+      O_RDWR | O_CREAT | O_TRUNC /*flags*/, S_IRUSR | S_IWUSR /*mode*/, fd))) {
+    LOG_WARN("fail to create expired tmp seq file", KR(ret), K(ctx));
+  } else if (OB_FAIL(ObIODeviceLocalFileOp::close(fd))) {
+    LOG_WARN("fail to close expired tmp seq file", KR(ret), K(ctx));
+  } else if (OB_FAIL(ObIODeviceLocalFileOp::truncate(ctx.get_path(), size_bytes))) {
+    LOG_WARN("fail to resize expired tmp seq file", KR(ret), K(ctx), K(size_bytes));
+  } else if (OB_UNLIKELY(0 != ::utimes(ctx.get_path(), times))) {
+    ret = OB_IO_ERROR;
+    LOG_WARN("fail to age tmp seq file", KR(ret), K(ctx), K(errno));
+  }
+  LOG_INFO("prepared expired tmp seq file", KR(ret), K(ctx), K(size_bytes));
+  return ret;
+}
 
 int TestFileManager::prepare_calibration_macro(const uint64_t tablet_id, MacroBlockId &macro_id)
 {
@@ -4905,30 +5118,36 @@ TEST_F(TestFileManager, test_macro_calibration_refreshes_stale_snapshot)
   LOG_INFO("========== macro calibration stale snapshot end ==========");
 }
 
-// 扫描前后发生双向迁移会重扫；持续迁移耗尽或扫描中取消时清空结果。
+// 扫描前后发生双向迁移会重扫，并保留已删除 tmp.seq 的补偿；失败仍清空结果。
 // 操作：四种方向/时机组合首轮转换、次轮放行；
-// 再分别注入三轮转换和扫描后的停止请求。
-// 校验：成功场景与独立稳定扫描一致；
-// 耗尽/取消场景无残留结果，epoch/inflight 正常。
+// 再覆盖三轮转换耗尽、扫描取消、两轮分别删除后第三轮成功，以及不重试直接成功。
+// 校验：存量大小与独立稳定扫描一致，删除补偿按实际文件大小累计；
+// 耗尽/取消场景不发布删除补偿或其他结果，epoch/inflight 正常。
+// 成功场景将真实扫描结果继续应用校准，验证 AUTO/HOT 和租户合计占用。
 TEST_F(TestFileManager, test_macro_calibration_retry_on_cache_type_change)
 {
   LOG_INFO("========== macro calibration concurrent conversion begin ==========");
   ObTenantFileManager *files = MTL(ObTenantFileManager *);
   ObSSMacroCacheMgr *mgr = MTL(ObSSMacroCacheMgr *);
+  ObTenantDiskSpaceManager *disk = MTL(ObTenantDiskSpaceManager *);
   ASSERT_NE(nullptr, files);
   ASSERT_NE(nullptr, mgr);
+  ASSERT_NE(nullptr, disk);
   ObCalibrateDiskSpaceTask &task = files->calibrate_disk_space_task_;
   task.stop();
   task.wait();
   task.is_stop_ = false;
   const uint64_t tenant_id = MTL_ID();
   const char *points[] = {"BEFORE_MACRO_BLOCK_CALIBRATE_SCAN", "AFTER_MACRO_BLOCK_CALIBRATE_SCAN"};
-  for (int scenario = 0; scenario < 6; ++scenario) {
+  for (int scenario = 0; scenario < 8; ++scenario) {
     const bool exhaust_retries = (4 == scenario);
     const bool cancel_scan = (5 == scenario);
-    const int stage = ((exhaust_retries || cancel_scan) ? 1 : scenario / 2);
+    const bool delete_on_two_scans = (6 == scenario);
+    const bool no_retry = (7 == scenario);
+    const int stage = ((scenario >= 4) ? 1 : scenario / 2);
     const bool starts_hot = (0 == scenario % 2);
-    const int attempt_count = ((cancel_scan) ? 1 : ((exhaust_retries) ? 3 : 2));
+    const int attempt_count = ((cancel_scan || no_retry) ? 1
+        : ((exhaust_retries || delete_on_two_scans) ? 3 : 2));
     MacroBlockId macro_id;
     OK(prepare_calibration_macro(204011 + scenario /*tablet_id*/, macro_id));
     const ObSSMacroCacheType original_type = ((starts_hot)
@@ -4939,6 +5158,28 @@ TEST_F(TestFileManager, test_macro_calibration_retry_on_cache_type_change)
       OK(mgr->modify_macro_cache_type(macro_id,
           ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK, ObSSMacroCacheType::MACRO_BLOCK));
     }
+    // 每个场景均有真实过期文件；第七个场景在首轮结束后再创建第二个。
+    constexpr int64_t TMP_SEQ_SIZE_BYTES = 8_KB;
+    ObPathContext expired_ctx, second_expired_ctx;
+    int64_t reserved_bytes = 0;
+    NAMED_DEFER(clean_expired,
+        files->set_allow_gc();
+        task.is_stop_ = false;
+        IGNORE_RETURN(ObSSObjectAccessUtil::delete_local_file(macro_id));
+        if (expired_ctx.is_valid()) {
+          IGNORE_RETURN(ObIODeviceLocalFileOp::unlink(expired_ctx.get_path()));
+        }
+        if (second_expired_ctx.is_valid()) {
+          IGNORE_RETURN(ObIODeviceLocalFileOp::unlink(second_expired_ctx.get_path()));
+        }
+        if (reserved_bytes > 0) {
+          IGNORE_RETURN(disk->free_file_size(reserved_bytes,
+              ObSSMacroCacheType::MACRO_BLOCK, ObDiskSpaceType::FILE));
+        });
+    OK(create_expired_tmp_seq_file_(macro_id, 91001 /*seq*/, TMP_SEQ_SIZE_BYTES, expired_ctx));
+    OK(disk->alloc_file_size(TMP_SEQ_SIZE_BYTES,
+        ObSSMacroCacheType::MACRO_BLOCK, ObDiskSpaceType::FILE));
+    reserved_bytes += TMP_SEQ_SIZE_BYTES;
     common::ObMalloc allocator;
     common::ObDSSessionActions point_actions, control_actions;
     OK(point_actions.init(1024 /*page_size*/, allocator));
@@ -4951,7 +5192,15 @@ TEST_F(TestFileManager, test_macro_calibration_retry_on_cache_type_change)
     OK(GDS.add_debug_sync(action, false /*is_global*/, point_actions));
     OK(GDS.set_thread_local_actions(point_actions));
     const int64_t saved_timeout = GCONF.debug_sync_timeout;
+    NAMED_DEFER(restore_macro_scan_state,
+        GCONF.debug_sync_timeout = saved_timeout;
+        point_actions.reset();
+        IGNORE_RETURN(GDS.set_thread_local_actions(point_actions)));
     GCONF.debug_sync_timeout = 10_s;
+    ASSERT_TRUE(GCONF.is_debug_sync_enabled());
+    ASSERT_NE(nullptr, GDS.thread_local_actions());
+    ASSERT_TRUE(GDS.thread_local_actions()->is_active(
+        ((0 == stage) ? BEFORE_MACRO_BLOCK_CALIBRATE_SCAN : AFTER_MACRO_BLOCK_CALIBRATE_SCAN)));
     files->set_pause_gc();
     const int64_t epoch_before = mgr->get_cache_type_change_epoch();
     std::atomic<int> worker_ret(OB_SUCCESS);
@@ -4974,12 +5223,22 @@ TEST_F(TestFileManager, test_macro_calibration_retry_on_cache_type_change)
               KR(ret), K(scenario), K(attempt), K(wait_piece));
         } else if (cancel_scan) {
           task.stop();
-        } else if (0 == attempt || exhaust_retries) {
-          const bool reverse = (exhaust_retries && 1 == attempt % 2);
+        } else if (!no_retry && (0 == attempt || exhaust_retries
+            || (delete_on_two_scans && 1 == attempt))) {
+          const bool reverse = ((exhaust_retries || delete_on_two_scans) && 1 == attempt % 2);
           const ObSSMacroCacheType source = ((reverse) ? target_type : original_type);
           const ObSSMacroCacheType target = ((reverse) ? original_type : target_type);
+          const bool create_second_file = (delete_on_two_scans && 0 == attempt);
           if (OB_FAIL(mgr->modify_macro_cache_type(macro_id, source, target))) {
             LOG_WARN("fail to convert calibration test macro", KR(ret), K(macro_id), K(attempt));
+          } else if (create_second_file && OB_FAIL(create_expired_tmp_seq_file_(
+              macro_id, 91002 /*seq*/, TMP_SEQ_SIZE_BYTES, second_expired_ctx))) {
+            LOG_WARN("fail to create second expired tmp seq file", KR(ret), K(macro_id));
+          } else if (create_second_file && OB_FAIL(disk->alloc_file_size(TMP_SEQ_SIZE_BYTES,
+              ObSSMacroCacheType::MACRO_BLOCK, ObDiskSpaceType::FILE))) {
+            LOG_WARN("fail to reserve second tmp seq quota", KR(ret), K(macro_id));
+          } else if (create_second_file) {
+            reserved_bytes += TMP_SEQ_SIZE_BYTES;
           }
         }
         int tmp_ret = OB_SUCCESS;
@@ -5011,37 +5270,106 @@ TEST_F(TestFileManager, test_macro_calibration_retry_on_cache_type_change)
     ObCalibrateDiskSpaceResult stable_scan;
     const int stable_ret = task.calc_macro_block_disk_space_with_retry_(
         stable_initial, stable_hot_initial, stable_scan);
+    if (OB_SUCCESS == scan_ret && OB_SUCCESS == stable_ret) {
+      // 线程已经 join，仍保持 GC 暂停；使用重扫返回的原始快照和结果。
+      EXPECT_NO_FATAL_FAILURE(check_retried_scan_quota_(
+          ObSSMacroCacheType::MACRO_BLOCK /*cache_type*/, initial, hot_initial, scan, stable_scan));
+    }
     files->set_allow_gc();
     const int delete_ret = ObSSObjectAccessUtil::delete_local_file(macro_id);
     const int worker_result = worker_ret.load();
+    ObIODFileStat expired_stat;
+    const int expired_stat_ret = ObIODeviceLocalFileOp::stat(expired_ctx.get_path(), expired_stat);
     LOG_INFO("verify conversion scan retry", KR(scan_ret), K(scenario), K(stage), K(consumed),
         KR(worker_result), KR(clear_ret), KR(reset_ret), KR(delete_ret), KR(stable_ret),
-        K(initial), K(hot_initial), K(scan), K(stable_scan));
+        K(initial), K(hot_initial), K(scan), K(stable_scan),
+        K(reserved_bytes), KR(expired_stat_ret));
     if (exhaust_retries || cancel_scan) {
       ASSERT_EQ(((cancel_scan) ? OB_CANCELED : OB_EAGAIN), scan_ret);
       ASSERT_EQ(0, initial.total_size_);
       ASSERT_EQ(0, hot_initial);
       ASSERT_EQ(0, scan.total_file_size_);
       ASSERT_EQ(0, scan.hot_tablet_total_used_size_);
+      ASSERT_EQ(0, scan.del_tmp_seq_file_size_);
     } else {
       OK(scan_ret);
       ASSERT_EQ(stable_scan.total_file_size_, scan.total_file_size_);
       ASSERT_EQ(stable_scan.hot_tablet_total_used_size_, scan.hot_tablet_total_used_size_);
       ASSERT_EQ(stable_scan.total_dir_size_, scan.total_dir_size_);
       ASSERT_EQ(stable_scan.total_dir_num_, scan.total_dir_num_);
+      ASSERT_EQ(TMP_SEQ_SIZE_BYTES * ((delete_on_two_scans) ? 2 : 1),
+          scan.del_tmp_seq_file_size_);
     }
+    ASSERT_EQ(OB_NO_SUCH_FILE_OR_DIRECTORY, expired_stat_ret);
+    ASSERT_EQ(0, stable_scan.del_tmp_seq_file_size_);
     OK(worker_result);
     OK(clear_ret);
     OK(reset_ret);
     OK(stable_ret);
     OK(delete_ret);
     ASSERT_TRUE(consumed);
-    const int64_t epoch_delta = ((cancel_scan) ? 0 : ((exhaust_retries) ? 3 : 1));
+    const int64_t epoch_delta = ((cancel_scan || no_retry) ? 0
+        : ((exhaust_retries) ? 3 : ((delete_on_two_scans) ? 2 : 1)));
     ASSERT_EQ(epoch_before + epoch_delta, mgr->get_cache_type_change_epoch());
     ASSERT_EQ(0, mgr->get_cache_type_change_inflight());
     ASSERT_EQ(scan.hot_tablet_total_used_size_, hot_initial);
   }
   LOG_INFO("========== macro calibration concurrent conversion end ==========");
+}
+
+// 将真实重扫结果送入校准接口，以现有独立稳定扫描的存量作为 quota 期望。
+// 调用时控制线程已结束，GC 仍暂停。退出时恢复调用前账目，避免原用例收尾
+// 再次释放已经通过校准扣除的测试预留；所有实际 quota 断言均在恢复前执行。
+void TestFileManager::check_retried_scan_quota_(const ObSSMacroCacheType cache_type,
+    const ObFileStatInfo &initial_stat_info, const int64_t initial_hot_tablet_used_size,
+    ObCalibrateDiskSpaceResult &scan, const ObCalibrateDiskSpaceResult &stable_scan)
+{
+  LOG_INFO("========== apply retried scan quota begin ==========", K(cache_type));
+  ObTenantDiskSpaceManager *disk = MTL(ObTenantDiskSpaceManager *);
+  ASSERT_NE(nullptr, disk);
+  ObCalibrateDiskSpaceTask task;
+  OK(task.init(MTL_ID()));
+  const bool is_macro = (ObSSMacroCacheType::MACRO_BLOCK == cache_type);
+  ObFileStatInfo before, after, hot_before, hot_after;
+  OK(task.get_macro_cache_used_size(cache_type, before));
+  OK(task.get_macro_cache_used_size(ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK, hot_before));
+  const int64_t total_before = disk->get_tenant_macro_cache_used_size();
+  NAMED_DEFER(restore_quota,
+      IGNORE_RETURN(disk->calibrate_alloc_size(before.total_size_, cache_type));
+      if (is_macro) {
+        IGNORE_RETURN(disk->calibrate_alloc_size(hot_before.total_size_,
+            ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK));
+      });
+
+  // 期望取独立稳定扫描；补偿只用于偏差检查，不进入存量目标。
+  int64_t dir_correction = 0;
+  OK(stable_scan.get_dir_calibrate_size(initial_stat_info.dir_num_, dir_correction));
+  const int64_t used_delta = before.total_size_ - initial_stat_info.total_size_;
+  const int64_t hot_used_delta = hot_before.total_size_ - initial_hot_tablet_used_size;
+  const int64_t expected_used = stable_scan.total_file_size_ + dir_correction + used_delta;
+  const int64_t expected_hot_used = ((is_macro)
+      ? stable_scan.hot_tablet_total_used_size_ + hot_used_delta
+      : hot_before.total_size_);
+  const int64_t expected_total = total_before - before.total_size_ + expected_used
+      + ((is_macro) ? expected_hot_used - hot_before.total_size_ : 0);
+  LOG_INFO("apply actual retried scan to calibration", K(cache_type), K(initial_stat_info),
+      K(initial_hot_tablet_used_size), K(scan), K(stable_scan),
+      K(expected_used), K(expected_hot_used), K(expected_total));
+  ASSERT_GT(scan.del_tmp_seq_file_size_, 0);
+  OK(task.calibrate_macro_cache_used_size_normally(
+      cache_type, initial_stat_info, initial_hot_tablet_used_size, scan));
+
+  // 查询应用后的真实分类账和总额度，断言完成后才允许 guard 恢复现场。
+  OK(task.get_macro_cache_used_size(cache_type, after));
+  OK(task.get_macro_cache_used_size(ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK, hot_after));
+  const int64_t total_after = disk->get_tenant_macro_cache_used_size();
+  LOG_INFO("verify actual retried scan quota", K(cache_type), K(before), K(after),
+      K(hot_before), K(hot_after), K(total_before), K(total_after),
+      K(expected_used), K(expected_hot_used), K(expected_total));
+  ASSERT_EQ(expected_used, after.total_size_);
+  ASSERT_EQ(expected_hot_used, hot_after.total_size_);
+  ASSERT_EQ(expected_total, total_after);
+  LOG_INFO("========== apply retried scan quota end ==========", K(cache_type));
 }
 
 // 在途迁移使三次尝试均失败时，不提交任何分类用量，
@@ -5475,6 +5803,422 @@ TEST_F(TestFileManager, test_delete_tmp_seq_files_cache_type_record)
       "auto_alloc_become_hot_free",
       CLEAN_MAP_SAFE_DEL_TIME_S,
       write_io_size));
+}
+
+// 验证校准按匹配写入的预留额度统计，且不会消费两个 map 的记录。
+// 场景：模拟未写入完成的文件，覆盖普通 map、clean map、双 map 和 seq 不匹配。
+// 操作：用真实路径转换和 map 查询，直接执行单个文件的校准处理。
+// 校验：MACRO/HOT 分别记账；双 map 不重复；错误 seq 回退文件大小；新文件不计入。
+TEST_F(TestFileManager, test_calibrate_tmp_seq_reserved_size)
+{
+  LOG_INFO("========== test_calibrate_tmp_seq_reserved_size begin ==========");
+  ObTenantFileManager *file_mgr = MTL(ObTenantFileManager *);
+  ASSERT_NE(nullptr, file_mgr);
+  file_mgr->tmp_seq_file_clean_task_.destroy();
+  file_mgr->calibrate_disk_space_task_.destroy();
+  constexpr int64_t RESERVED_SIZE_BYTES = 64_KB;
+  constexpr uint64_t WRITE_SEQ = 77;
+  constexpr uint64_t PRIVATE_MACRO_THIRD_ID = 0;
+  constexpr uint64_t TENANT_SEQ = 1;
+  const int64_t cutoff_s = ObTimeUtility::current_time_s();
+  struct Scenario
+  {
+    bool normal_entry_;
+    bool clean_entry_;
+    bool wrong_normal_seq_;
+    bool hot_;
+    bool after_cutoff_;
+    int64_t physical_size_;
+    int64_t expected_macro_size_;
+    int64_t expected_hot_size_;
+  };
+  // 期望由场景输入独立给定，不复用被测函数计算结果。
+  const Scenario scenarios[] = {
+    {true, false, false, false, false, 0, RESERVED_SIZE_BYTES, 0},
+    {true, false, false, false, false, 4_KB, RESERVED_SIZE_BYTES, 0},
+    {false, true, false, false, false, 0, RESERVED_SIZE_BYTES, 0},
+    {true, false, false, true, false, 0, 0, RESERVED_SIZE_BYTES},
+    {false, true, false, true, false, 0, 0, RESERVED_SIZE_BYTES},
+    {false, true, false, true, false, 4_KB, 0, RESERVED_SIZE_BYTES},
+    {true, true, false, true, false, 0, 0, RESERVED_SIZE_BYTES},
+    {true, true, true, true, false, 0, 0, RESERVED_SIZE_BYTES},
+    {true, false, true, false, false, 4_KB, 4_KB, 0},
+    {false, false, false, false, false, 4_KB, 4_KB, 0},
+    {true, false, false, false, true, 0, 0, 0},
+  };
+  for (int64_t i = 0; i < static_cast<int64_t>(ARRAYSIZEOF(scenarios)); ++i) {
+    const Scenario &scenario = scenarios[i];
+    // 使用独立 tablet，避免和已有文件、后台清理共享同一个 map key。
+    MacroBlockId macro_id;
+    macro_id.set_storage_object_type(
+        static_cast<uint64_t>(ObStorageObjectType::PRIVATE_DATA_MACRO));
+    macro_id.set_second_id(200990 + i);
+    macro_id.set_reorganization_scn(PRIVATE_MACRO_THIRD_ID);
+    macro_id.set_tenant_seq(TENANT_SEQ);
+    ObAtomicWriteFileInfo info(0 /*ls_id*/, MTL_EPOCH_ID(), WRITE_SEQ, RESERVED_SIZE_BYTES);
+    info.cache_type_ = ((scenario.hot_) ? ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK
+                                      : ObSSMacroCacheType::MACRO_BLOCK);
+    LOG_INFO("prepare tmp seq calibration scenario", K(i), K(macro_id), K(info));
+    NAMED_DEFER(restore,
+        if (scenario.normal_entry_) {
+          IGNORE_RETURN(file_mgr->erase_from_atomic_write_file_map(false /*is_clean*/, macro_id));
+        }
+        if (scenario.clean_entry_) {
+          IGNORE_RETURN(file_mgr->erase_from_atomic_write_file_map(true /*is_clean*/, macro_id));
+        });
+    if (scenario.clean_entry_) {
+      OK(file_mgr->push_to_atomic_write_file_map(true /*is_clean*/, macro_id, info));
+    }
+    if (scenario.normal_entry_) {
+      ObAtomicWriteFileInfo normal_info = info;
+      if (scenario.wrong_normal_seq_) {
+        normal_info.seq_ = WRITE_SEQ + 1;
+      }
+      OK(file_mgr->push_to_atomic_write_file_map(false /*is_clean*/, macro_id, normal_info));
+    }
+    ObPathContext ctx;
+    OK(ctx.set_atomic_write_ctx(macro_id, MTL_EPOCH_ID(), WRITE_SEQ, GCONF.observer_id));
+    ObIODFileStat stat;
+    stat.size_ = scenario.physical_size_;
+    stat.mtime_s_ = ((scenario.after_cutoff_) ? cutoff_s : cutoff_s - 1);
+    volatile bool is_stop = false;
+    ObDirCalcSizeOp op(is_stop);
+    op.set_macro_cache_type(ObSSMacroCacheType::MACRO_BLOCK);
+    OK(op.set_start_calc_size_time(cutoff_s));
+    OK(op.process_tmp_seq_file(stat, ctx.get_path()));
+    LOG_INFO("verify tmp seq calibration result", K(i), K(op));
+    EXPECT_EQ(scenario.expected_macro_size_, op.get_total_file_size());
+    EXPECT_EQ(scenario.expected_hot_size_, op.get_hot_tablet_total_file_size());
+    const int64_t expected_physical_size = ((scenario.after_cutoff_) ? 0 : stat.size_);
+    EXPECT_EQ(expected_physical_size, op.get_tmp_seq_file_size());
+    if (scenario.after_cutoff_) {
+      // 同时核对等于截点和晚于截点，不能把新增预留重复计入扫描。
+      ++stat.mtime_s_;
+      OK(op.process_tmp_seq_file(stat, ctx.get_path()));
+      EXPECT_EQ(0, op.get_total_file_size());
+      EXPECT_EQ(0, op.get_hot_tablet_total_file_size());
+    }
+
+    // 校准只能读记录；核对后主动收尾，不留下虚构的待清理写入。
+    ObAtomicWriteFileInfo actual;
+    if (scenario.normal_entry_) {
+      const int lookup_ret = file_mgr->get_from_atomic_write_file_map(
+          false /*is_clean*/, macro_id, actual);
+      OK(file_mgr->erase_from_atomic_write_file_map(false /*is_clean*/, macro_id));
+      OK(lookup_ret);
+      EXPECT_EQ(RESERVED_SIZE_BYTES, actual.size_);
+      const uint64_t expected_seq = ((scenario.wrong_normal_seq_) ? WRITE_SEQ + 1 : WRITE_SEQ);
+      EXPECT_EQ(expected_seq, actual.seq_);
+      EXPECT_EQ(info.cache_type_, actual.cache_type_);
+    }
+    if (scenario.clean_entry_) {
+      const int lookup_ret = file_mgr->get_from_atomic_write_file_map(
+          true /*is_clean*/, macro_id, actual);
+      OK(file_mgr->erase_from_atomic_write_file_map(true /*is_clean*/, macro_id));
+      OK(lookup_ret);
+      EXPECT_EQ(WRITE_SEQ, actual.seq_);
+      EXPECT_EQ(RESERVED_SIZE_BYTES, actual.size_);
+      EXPECT_EQ(info.cache_type_, actual.cache_type_);
+    }
+    restore.deactivate();
+    LOG_INFO("tmp seq calibration scenario complete", K(i));
+  }
+  LOG_INFO("========== test_calibrate_tmp_seq_reserved_size end ==========");
+}
+
+// 同 seq 的预留记录类别异常时，校准失败并保留记录。
+// 场景：两个 map 的宏块记录被登记为 TMP_FILE 或 MAX_TYPE，文件实际有 4 KB。
+// 操作：执行单文件校准处理，随后查询并清理本测试的 map 记录。
+// 校验：返回 OB_ERR_UNEXPECTED，统计值保持为零，不能回退到物理大小。
+TEST_F(TestFileManager, test_calibrate_tmp_seq_cache_type_mismatch)
+{
+  LOG_INFO("========== test_calibrate_tmp_seq_cache_type_mismatch begin ==========");
+  ObTenantFileManager *file_mgr = MTL(ObTenantFileManager *);
+  ASSERT_NE(nullptr, file_mgr);
+  constexpr uint64_t WRITE_SEQ = 88;
+  constexpr uint64_t PRIVATE_MACRO_THIRD_ID = 0;
+  constexpr uint64_t TENANT_SEQ = 1;
+  constexpr int64_t RESERVED_SIZE_BYTES = 64_KB;
+  constexpr ObSSMacroCacheType INVALID_FILE_CACHE_TYPES[] = {
+    ObSSMacroCacheType::TMP_FILE, ObSSMacroCacheType::MAX_TYPE
+  };
+  const int64_t cutoff_s = ObTimeUtility::current_time_s();
+  for (int64_t i = 0; i < 2 * ARRAYSIZEOF(INVALID_FILE_CACHE_TYPES); ++i) {
+    const bool is_clean = (i >= ARRAYSIZEOF(INVALID_FILE_CACHE_TYPES));
+    // 使用独立 key，确保只核对本次注入的错误类别。
+    MacroBlockId macro_id;
+    macro_id.set_storage_object_type(
+        static_cast<uint64_t>(ObStorageObjectType::PRIVATE_DATA_MACRO));
+    macro_id.set_second_id(201990 + i);
+    macro_id.set_reorganization_scn(PRIVATE_MACRO_THIRD_ID);
+    macro_id.set_tenant_seq(TENANT_SEQ);
+    ObAtomicWriteFileInfo info(0 /*ls_id*/, MTL_EPOCH_ID(), WRITE_SEQ, RESERVED_SIZE_BYTES);
+    info.cache_type_ = INVALID_FILE_CACHE_TYPES[i % ARRAYSIZEOF(INVALID_FILE_CACHE_TYPES)];
+    ObPathContext ctx;
+    OK(ctx.set_atomic_write_ctx(macro_id, MTL_EPOCH_ID(), WRITE_SEQ, GCONF.observer_id));
+    ObIODFileStat stat;
+    stat.size_ = 4_KB;
+    stat.mtime_s_ = cutoff_s - 1;
+    volatile bool is_stop = false;
+    ObDirCalcSizeOp op(is_stop);
+    op.set_macro_cache_type(ObSSMacroCacheType::MACRO_BLOCK);
+    OK(op.set_start_calc_size_time(cutoff_s));
+    LOG_INFO("prepare invalid tmp seq cache type", K(i), K(info), K(stat));
+    OK(file_mgr->push_to_atomic_write_file_map(is_clean, macro_id, info));
+
+    // 先保存返回结果并收尾，再断言，避免失败时残留虚构的写入记录。
+    const int scan_ret = op.process_tmp_seq_file(stat, ctx.get_path());
+    ObAtomicWriteFileInfo actual;
+    const int lookup_ret = file_mgr->get_from_atomic_write_file_map(
+        is_clean, macro_id, actual);
+    OK(file_mgr->erase_from_atomic_write_file_map(is_clean, macro_id));
+    LOG_INFO("verify invalid cache type rejects calibration",
+        K(i), KR(scan_ret), KR(lookup_ret), K(op), K(actual));
+    EXPECT_EQ(OB_ERR_UNEXPECTED, scan_ret);
+    EXPECT_EQ(0, op.get_total_file_size());
+    EXPECT_EQ(0, op.get_hot_tablet_total_file_size());
+    EXPECT_EQ(0, op.get_tmp_seq_file_size());
+    OK(lookup_ret);
+    EXPECT_EQ(WRITE_SEQ, actual.seq_);
+    EXPECT_EQ(info.cache_type_, actual.cache_type_);
+  }
+  LOG_INFO("========== test_calibrate_tmp_seq_cache_type_mismatch end ==========");
+}
+
+// TMP 和 META 的有效预留必须进入各自扫描结果，两个 map 都能提供记录。
+// 场景：真实格式的 TMP_FILE/PRIVATE_TABLET_META 路径，物理大小小于预留。
+// 操作：分别把记录放入普通 map、clean map，执行单文件统计。
+// 校验：统计预留大小、保持物理字节诊断和记录内容，HOT 统计不变。
+TEST_F(TestFileManager, test_calibrate_tmp_seq_tmp_and_meta)
+{
+  LOG_INFO("========== test_calibrate_tmp_seq_tmp_and_meta begin ==========");
+  ObTenantFileManager *files = MTL(ObTenantFileManager *);
+  ASSERT_NE(nullptr, files);
+  files->tmp_seq_file_clean_task_.destroy();
+  files->calibrate_disk_space_task_.destroy();
+  constexpr uint64_t WRITE_SEQ = 101;
+  constexpr int64_t RESERVED_BYTES = 64_KB;
+  const int64_t cutoff_s = ObTimeUtility::current_time_s();
+  for (int64_t i = 0; i < 4; ++i) {
+    const bool is_clean = (0 != i % 2);
+    const bool is_tmp = (i < 2);
+    const ObSSMacroCacheType cache_type = ((is_tmp) ? ObSSMacroCacheType::TMP_FILE
+                                                  : ObSSMacroCacheType::META_FILE);
+    const ObStorageObjectType object_type = ((is_tmp) ? ObStorageObjectType::TMP_FILE
+                                                    : ObStorageObjectType::PRIVATE_TABLET_META);
+    MacroBlockId id;
+    id.set_storage_object_type(static_cast<uint64_t>(object_type));
+    id.set_second_id(224000 + i);
+    id.set_reorganization_scn(0 /*reorganization_scn*/);
+    if (is_tmp) {
+      id.set_fourth_id(1 /*fourth_id*/);
+    } else {
+      id.set_meta_version_id(1 /*meta_version_id*/);
+    }
+    ObAtomicWriteFileInfo info(1 /*ls_id*/, MTL_EPOCH_ID(), WRITE_SEQ, RESERVED_BYTES);
+    info.cache_type_ = cache_type;
+    ObPathContext ctx;
+    OK(ctx.set_atomic_write_ctx(id, MTL_EPOCH_ID(), WRITE_SEQ, GCONF.observer_id, info.ls_id_));
+    ObIODFileStat stat;
+    stat.size_ = 4_KB;
+    stat.mtime_s_ = cutoff_s - 1;
+    volatile bool is_stop = false;
+    ObDirCalcSizeOp op(is_stop);
+    op.set_macro_cache_type(cache_type);
+    OK(op.set_start_calc_size_time(cutoff_s));
+    LOG_INFO("prepare tmp/meta reservation", K(i), K(id), K(info));
+    OK(files->push_to_atomic_write_file_map(is_clean, id, info));
+    NAMED_DEFER(restore, IGNORE_RETURN(files->erase_from_atomic_write_file_map(is_clean, id)));
+    OK(op.process_tmp_seq_file(stat, ctx.get_path()));
+    ObAtomicWriteFileInfo actual;
+    OK(files->get_from_atomic_write_file_map(is_clean, id, actual));
+    LOG_INFO("verify tmp/meta reservation", K(i), K(op), K(actual));
+    EXPECT_EQ(RESERVED_BYTES, op.get_total_file_size());
+    EXPECT_EQ(0, op.get_hot_tablet_total_file_size());
+    EXPECT_EQ(stat.size_, op.get_tmp_seq_file_size());
+    EXPECT_EQ(WRITE_SEQ, actual.seq_);
+    EXPECT_EQ(cache_type, actual.cache_type_);
+  }
+  LOG_INFO("========== test_calibrate_tmp_seq_tmp_and_meta end ==========");
+}
+
+// 路径和长度异常必须返回错误且重置输出，不能崩溃或采用旧结果。
+// 场景：空指针、缺少后缀、无效序号、过长路径和超出 int64_t 的预留。
+// 操作：直接调用预留查询接口，再对异常预留执行单文件统计。
+// 校验：错误码明确，输出为默认值，失败的扫描不会发布任何字节统计。
+TEST_F(TestFileManager, test_tmp_seq_reservation_invalid_inputs)
+{
+  LOG_INFO("========== test_tmp_seq_reservation_invalid_inputs begin ==========");
+  volatile bool is_stop = false;
+  ObDirCalcSizeOp op(is_stop);
+  op.set_macro_cache_type(ObSSMacroCacheType::MACRO_BLOCK);
+  const char *invalid_paths[] = {nullptr, "", "/cache/object.T1", "/cache/object.T1.tmp.",
+      "/cache/object.T1.tmp.abc"};
+  for (int64_t i = 0; i < ARRAYSIZEOF(invalid_paths); ++i) {
+    int64_t size = 1;
+    ObSSMacroCacheType type = ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK;
+    bool found = true;
+    const int ret = op.get_tmp_seq_file_reserved_size_(invalid_paths[i], size, type, found);
+    LOG_INFO("verify invalid tmp seq path", K(i), KR(ret), K(size), K(type), K(found));
+    EXPECT_EQ(OB_INVALID_ARGUMENT, ret);
+    EXPECT_EQ(0, size);
+    EXPECT_EQ(ObSSMacroCacheType::MAX_TYPE, type);
+    EXPECT_FALSE(found);
+  }
+
+  // 前缀恰好占满目标缓冲区，格式化接口必须拒绝截断结果。
+  char long_path[common::MAX_PATH_SIZE + 32] = {0};
+  MEMSET(long_path, 'x', common::MAX_PATH_SIZE);
+  int64_t pos = common::MAX_PATH_SIZE;
+  OK(databuff_printf(long_path, sizeof(long_path), pos, ".tmp.%lu", 102UL /*write_seq*/));
+  int64_t size = 1;
+  ObSSMacroCacheType type = ObSSMacroCacheType::MACRO_BLOCK;
+  bool found = true;
+  const int overflow_ret = op.get_tmp_seq_file_reserved_size_(long_path, size, type, found);
+  LOG_INFO("verify oversized tmp seq path", KR(overflow_ret), K(size), K(type), K(found));
+  ASSERT_EQ(OB_SIZE_OVERFLOW, overflow_ret);
+  EXPECT_EQ(0, size);
+  EXPECT_EQ(ObSSMacroCacheType::MAX_TYPE, type);
+  EXPECT_FALSE(found);
+
+  // 大小溢出也不能被当成“未命中”而回退物理大小。
+  ObTenantFileManager *files = MTL(ObTenantFileManager *);
+  ASSERT_NE(nullptr, files);
+  MacroBlockId id;
+  id.set_storage_object_type(static_cast<uint64_t>(ObStorageObjectType::PRIVATE_DATA_MACRO));
+  id.set_second_id(225000 /*second_id*/);
+  id.set_reorganization_scn(0 /*reorganization_scn*/);
+  id.set_tenant_seq(1 /*tenant_seq*/);
+  constexpr uint64_t WRITE_SEQ = 102;
+  ObAtomicWriteFileInfo info(0 /*ls_id*/, MTL_EPOCH_ID(), WRITE_SEQ,
+      static_cast<uint64_t>(INT64_MAX) + 1 /*size*/);
+  info.cache_type_ = ObSSMacroCacheType::MACRO_BLOCK;
+  ObPathContext ctx;
+  OK(ctx.set_atomic_write_ctx(id, MTL_EPOCH_ID(), WRITE_SEQ, GCONF.observer_id));
+  OK(files->push_to_atomic_write_file_map(false /*is_clean*/, id, info));
+  NAMED_DEFER(restore,
+      IGNORE_RETURN(files->erase_from_atomic_write_file_map(false /*is_clean*/, id)));
+  ObIODFileStat stat;
+  stat.size_ = 4_KB;
+  stat.mtime_s_ = ObTimeUtility::current_time_s();
+  OK(op.set_start_calc_size_time(stat.mtime_s_ + 1));
+  const int scan_ret = op.process_tmp_seq_file(stat, ctx.get_path());
+  LOG_INFO("verify invalid reservation size", KR(scan_ret), K(op), K(info));
+  EXPECT_EQ(OB_ERR_UNEXPECTED, scan_ret);
+  EXPECT_EQ(0, op.get_total_file_size());
+  EXPECT_EQ(0, op.get_tmp_seq_file_size());
+  LOG_INFO("========== test_tmp_seq_reservation_invalid_inputs end ==========");
+}
+
+// 覆盖写对象即使有原子写记录，也不能把该记录大小作为预留额度。
+// 场景：PRIVATE_SLOG_FILE 使用独立预留空间，is_need_stat 为 false。
+// 操作：按真实路径反解 canonical key，向 map 放入同 seq 的记录，再查询预留。
+// 校验：查询成功但 found 为 false，大小为零，原记录仍在。
+TEST_F(TestFileManager, test_tmp_seq_reservation_ignores_overwrite)
+{
+  LOG_INFO("========== test_tmp_seq_reservation_ignores_overwrite begin ==========");
+  ObTenantFileManager *files = MTL(ObTenantFileManager *);
+  ASSERT_NE(nullptr, files);
+  MacroBlockId id;
+  id.set_storage_object_type(static_cast<uint64_t>(ObStorageObjectType::PRIVATE_SLOG_FILE));
+  id.set_second_id(MTL_ID());
+  id.set_third_id(0 /*third_id*/);
+  id.set_fourth_id(MTL_EPOCH_ID());
+  id.set_fifth_id(228000 /*fifth_id*/);
+  ObPathContext base_ctx;
+  OK(base_ctx.set_file_ctx(id, MTL_EPOCH_ID(), true /*is_local_cache*/, GCONF.observer_id));
+  MacroBlockId parsed_id;
+  OK(ObFileHelper::convert_path_to_macro_id(base_ctx.get_path(), parsed_id));
+  ASSERT_FALSE(SSObjUtil::is_need_stat(parsed_id));
+  constexpr uint64_t WRITE_SEQ = 104;
+  ObAtomicWriteFileInfo info(0 /*ls_id*/, MTL_EPOCH_ID(), WRITE_SEQ, 64_KB /*size*/);
+  info.cache_type_ = ObSSMacroCacheType::MACRO_BLOCK;
+  ObPathContext ctx;
+  OK(ctx.set_atomic_write_ctx(parsed_id, MTL_EPOCH_ID(), WRITE_SEQ, GCONF.observer_id));
+  OK(files->push_to_atomic_write_file_map(false /*is_clean*/, parsed_id, info));
+  NAMED_DEFER(restore,
+      IGNORE_RETURN(files->erase_from_atomic_write_file_map(false /*is_clean*/, parsed_id)));
+  volatile bool is_stop = false;
+  ObDirCalcSizeOp op(is_stop);
+  op.set_macro_cache_type(ObSSMacroCacheType::MACRO_BLOCK);
+  int64_t size = 1;
+  ObSSMacroCacheType type = ObSSMacroCacheType::MACRO_BLOCK;
+  bool found = true;
+  OK(op.get_tmp_seq_file_reserved_size_(ctx.get_path(), size, type, found));
+  LOG_INFO("verify overwrite has no reservation", K(parsed_id), K(size), K(type), K(found));
+  EXPECT_FALSE(found);
+  EXPECT_EQ(0, size);
+  EXPECT_EQ(ObSSMacroCacheType::MAX_TYPE, type);
+  OK(files->get_from_atomic_write_file_map(false /*is_clean*/, parsed_id, info));
+  EXPECT_EQ(WRITE_SEQ, info.seq_);
+  LOG_INFO("========== test_tmp_seq_reservation_ignores_overwrite end ==========");
+}
+
+// 延期清理只吸收 OB_FILE_DELETE_FAILED，其他真实错误必须向上传播。
+// 场景：普通 map 和 clean map 中分别放入 ls_epoch_id 非法的记录。
+// 操作：先测试未到清理时间，再显式到期清理；最后移除本测试记录。
+// 校验：未到期返回成功且保留记录，到期返回 OB_INVALID_ARGUMENT 且保留记录。
+TEST_F(TestFileManager, test_tmp_seq_cleanup_propagates_errors)
+{
+  LOG_INFO("========== test_tmp_seq_cleanup_propagates_errors begin ==========");
+  ObTenantFileManager *files = MTL(ObTenantFileManager *);
+  ASSERT_NE(nullptr, files);
+  files->tmp_seq_file_clean_task_.destroy();
+  files->calibrate_disk_space_task_.destroy();
+  for (int64_t i = 0; i < 2; ++i) {
+    const bool is_clean = (1 == i);
+    MacroBlockId id;
+    id.set_storage_object_type(static_cast<uint64_t>(ObStorageObjectType::PRIVATE_DATA_MACRO));
+    id.set_second_id(226000 + i);
+    id.set_reorganization_scn(0 /*reorganization_scn*/);
+    id.set_tenant_seq(1 /*tenant_seq*/);
+    ObAtomicWriteFileInfo info(0 /*ls_id*/, -1 /*ls_epoch_id*/, 103 /*seq*/, 4_KB /*size*/);
+    info.cache_type_ = ObSSMacroCacheType::MACRO_BLOCK;
+    OK(files->push_to_atomic_write_file_map(is_clean, id, info));
+    NAMED_DEFER(restore, IGNORE_RETURN(files->erase_from_atomic_write_file_map(is_clean, id)));
+    constexpr int64_t NOT_EXPIRED_TIME_S = 3600;
+    OK(files->do_tmp_seq_file_clean_work(is_clean, NOT_EXPIRED_TIME_S));
+    OK(files->get_from_atomic_write_file_map(is_clean, id, info));
+    const int ret = files->do_tmp_seq_file_clean_work(is_clean, 0 /*safe_del_time_s*/);
+    LOG_INFO("verify cleanup error propagation", K(is_clean), KR(ret), K(info));
+    EXPECT_EQ(OB_INVALID_ARGUMENT, ret);
+    OK(files->get_from_atomic_write_file_map(is_clean, id, info));
+    EXPECT_EQ(-1, info.ls_epoch_id_);
+  }
+  LOG_INFO("========== test_tmp_seq_cleanup_propagates_errors end ==========");
+}
+
+// 真实临时文件经过校准和清理后，分类账和总额度必须恢复到原值。
+// 场景：AUTO/HOT、普通 map/clean map，以及空文件/部分写入交叉组合。
+// 操作：真实目录扫描 -> 应用校准 -> 暂停清理 -> 恢复清理 -> 重复清理。
+// 校验：校准保留完整预留；暂停不扣账；恢复仅释放一次，文件和记录均移除。
+TEST_F(TestFileManager, test_tmp_seq_calibration_then_cleanup)
+{
+  LOG_INFO("========== test_tmp_seq_calibration_then_cleanup begin ==========");
+  ObTenantFileManager *files = MTL(ObTenantFileManager *);
+  ASSERT_NE(nullptr, files);
+  files->tmp_seq_file_clean_task_.destroy();
+  files->calibrate_disk_space_task_.destroy();
+  struct Scenario
+  {
+    bool is_clean_;
+    ObSSMacroCacheType cache_type_;
+    int64_t physical_size_;
+  };
+  const Scenario scenarios[] = {
+    {false, ObSSMacroCacheType::MACRO_BLOCK, 0},
+    {true, ObSSMacroCacheType::MACRO_BLOCK, 4_KB},
+    {false, ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK, 4_KB},
+    {true, ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK, 0},
+  };
+  for (int64_t i = 0; i < ARRAYSIZEOF(scenarios); ++i) {
+    const Scenario &scenario = scenarios[i];
+    LOG_INFO("run tmp seq accounting lifecycle", K(i), K(scenario.is_clean_),
+        K(scenario.cache_type_), K(scenario.physical_size_));
+    ASSERT_NO_FATAL_FAILURE(check_tmp_seq_calibration_lifecycle(227000 + i,
+        scenario.is_clean_, scenario.cache_type_, scenario.physical_size_));
+  }
+  LOG_INFO("========== test_tmp_seq_calibration_then_cleanup end ==========");
 }
 
 TEST_F(TestFileManager, test_delete_tenant)

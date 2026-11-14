@@ -265,7 +265,9 @@ public:
   int delete_files(const ObIArray<blocksstable::MacroBlockId> &block_ids); // delete files
   int delete_local_files(const ObIArray<blocksstable::MacroBlockId> &block_ids); // delete local files
   int delete_remote_files(const ObIArray<blocksstable::MacroBlockId> &block_ids); // delete remote files
-  int delete_tmp_seq_file(const blocksstable::MacroBlockId &file_id, const ObAtomicWriteFileInfo &atomic_write_file); // delete .tmp.seq file when atomic write fail
+  // Cleans a failed atomic-write file, deferring deletion while GC is paused.
+  int delete_tmp_seq_file(const blocksstable::MacroBlockId &file_id,
+      const ObAtomicWriteFileInfo &atomic_write_file);
   int delete_shared_tablet_data_dir(const int64_t tablet_id, const int64_t reorganization_scn); // delete shared tablet data dir files
   int delete_local_major_data_dir(const int64_t delete_time_stamp_s); // when restart observer, need gc local major_data dir's major macro file
   int list_tmp_file(ObIArray<blocksstable::MacroBlockId> &tmp_file_ids); // No guarantee of order

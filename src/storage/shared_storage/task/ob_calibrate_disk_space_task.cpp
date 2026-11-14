@@ -530,6 +530,7 @@ int ObCalibrateDiskSpaceTask::calc_macro_block_disk_space_with_retry_(
   ObSSMacroCacheMgr *macro_cache_mgr = MTL(ObSSMacroCacheMgr *);
   bool is_scan_stable = false;
   int64_t scan_attempt = 0;
+  int64_t deleted_tmp_seq_size = 0;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("calibrate disk space task is not init", KR(ret));
@@ -558,6 +559,8 @@ int ObCalibrateDiskSpaceTask::calc_macro_block_disk_space_with_retry_(
             ObSSMacroCacheType::MACRO_BLOCK, start_calc_time_s, scan_result))) {
           LOG_WARN("fail to scan macro block disk space", KR(ret), K(scan_attempt));
         } else {
+          // Unlink does not release quota; its deviation compensation must survive a rescan.
+          deleted_tmp_seq_size += scan_result.del_tmp_seq_file_size_;
           DEBUG_SYNC(AFTER_MACRO_BLOCK_CALIBRATE_SCAN);
           const int64_t inflight_after = macro_cache_mgr->get_cache_type_change_inflight();
           const int64_t epoch_after = macro_cache_mgr->get_cache_type_change_epoch();
@@ -573,6 +576,7 @@ int ObCalibrateDiskSpaceTask::calc_macro_block_disk_space_with_retry_(
             initial_stat_info = macro_stat;
             initial_hot_tablet_used_size = hot_stat.total_size_;
             calibrate_res = scan_result;
+            calibrate_res.del_tmp_seq_file_size_ = deleted_tmp_seq_size;
             is_scan_stable = true;
           }
         }
@@ -588,7 +592,8 @@ int ObCalibrateDiskSpaceTask::calc_macro_block_disk_space_with_retry_(
     }
   }
   LOG_INFO("finish stable macro block calibration scan", KR(ret), K(scan_attempt),
-      K(initial_stat_info), K(initial_hot_tablet_used_size), K(calibrate_res), K(time_piece));
+      K(initial_stat_info), K(initial_hot_tablet_used_size), K(calibrate_res),
+      K(deleted_tmp_seq_size), K(time_piece));
   return ret;
 }
 

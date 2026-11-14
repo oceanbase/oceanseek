@@ -1368,6 +1368,7 @@ int ObTenantFileManager::calc_meta_file_disk_space(
   return ret;
 }
 
+// Keeps tmp-seq deletion compensation across completed scans invalidated by logical renames.
 int ObTenantFileManager::calc_tmp_file_disk_space(
     const int64_t start_calc_time_s,
     ObCalibrateDiskSpaceResult &calibrate_res)
@@ -1375,6 +1376,7 @@ int ObTenantFileManager::calc_tmp_file_disk_space(
   int ret = OB_SUCCESS;
   ObTimePiece time_piece;
   int64_t scan_attempt = 0;
+  int64_t deleted_tmp_seq_size = 0;
   constexpr int64_t MAX_SCAN_RETRY_COUNT = 3;
   // A delete batch can keep short renames continuously in flight; allow the batch to make progress.
   constexpr int64_t SCAN_RETRY_INTERVAL_US = 100_ms;
@@ -1402,6 +1404,8 @@ int ObTenantFileManager::calc_tmp_file_disk_space(
           tmp_file_dir, ObSSMacroCacheType::TMP_FILE, start_calc_time_s, scan_result))) {
         LOG_WARN("fail to calc disk space", KR(ret), K(tmp_file_dir), K(scan_attempt));
       } else {
+        // Unlink does not release quota; its deviation compensation must survive a rescan.
+        deleted_tmp_seq_size += scan_result.del_tmp_seq_file_size_;
         DEBUG_SYNC(AFTER_TMP_FILE_CALIBRATE_SCAN);
         const int64_t inflight_after = get_tmp_logical_delete_inflight();
         const int64_t epoch_after = get_tmp_logical_delete_epoch();
@@ -1412,6 +1416,7 @@ int ObTenantFileManager::calc_tmp_file_disk_space(
               K(inflight_before), K(inflight_after), K(scan_result));
         } else {
           calibrate_res = scan_result;
+          calibrate_res.del_tmp_seq_file_size_ = deleted_tmp_seq_size;
           is_scan_stable = true;
         }
       }
@@ -1429,7 +1434,7 @@ int ObTenantFileManager::calc_tmp_file_disk_space(
   }
   LOG_INFO("finish to calc tmp file disk space",
       KR(ret), K(tenant_id_), K(start_calc_time_s),
-      K(scan_attempt), K(calibrate_res), K(time_piece));
+      K(scan_attempt), K(calibrate_res), K(deleted_tmp_seq_size), K(time_piece));
   return ret;
 }
 
@@ -1825,7 +1830,9 @@ int ObTenantFileManager::delete_tmp_file(const MacroBlockId &file_id, const int6
   return ret;
 }
 
-int ObTenantFileManager::delete_tmp_seq_file(const blocksstable::MacroBlockId &file_id, const ObAtomicWriteFileInfo &atomic_write_file)
+// Returns OB_FILE_DELETE_FAILED while GC is paused.
+int ObTenantFileManager::delete_tmp_seq_file(const blocksstable::MacroBlockId &file_id,
+    const ObAtomicWriteFileInfo &atomic_write_file)
 {
   ObSSMacroCacheMgr *macro_cache_mgr = nullptr;
   ObTenantDiskSpaceManager *disk_space_mgr = nullptr;
@@ -1845,7 +1852,11 @@ int ObTenantFileManager::delete_tmp_seq_file(const blocksstable::MacroBlockId &f
              KP(macro_cache_mgr), KP(disk_space_mgr));
   } else if (!is_object_type_need_stat(file_id)) {
   } else if (is_pause_gc()) {
-    // if pause gc, do not delete .tmp.seq file to avoid effect the disk space calibration 
+    ret = OB_FILE_DELETE_FAILED;
+    if (TC_REACH_TIME_INTERVAL(PRINT_LOG_INTERVAL)) {
+      LOG_WARN("fail to delete tmp seq file while disk space calibration pauses GC",
+          KR(ret), K(file_id), K(atomic_write_file));
+    }
   } else if (OB_FAIL(ctx.set_atomic_write_ctx(
       file_id, atomic_write_file.ls_epoch_id_, atomic_write_file.seq_,
       GCONF.observer_id, atomic_write_file.ls_id_))) {
@@ -2813,7 +2824,12 @@ int ObTmpSeqFileCleanFunc::operator()(const ObAtomicWriteFileInfoMapPairType &en
     LOG_WARN("tenant file manager is null", KR(ret));
   } else if (entry.second.time_s_ > (ObTimeUtility::current_time_s() - tmp_seq_file_del_secy_time_s_)) {
   } else if (OB_FAIL(tenant_file_manager->delete_tmp_seq_file(entry.first, entry.second))) {
-    LOG_WARN("fail to delete tmp seq file", KR(ret), K(entry.first), K(entry.second));
+    if (OB_FILE_DELETE_FAILED == ret) {
+      // Keep this entry for a later round without stopping the map traversal.
+      ret = OB_SUCCESS;
+    } else {
+      LOG_WARN("fail to delete tmp seq file", KR(ret), K(entry.first), K(entry.second));
+    }
   } else if (OB_FAIL(deleted_file_ids_.push_back(entry.first))) {
     LOG_WARN("fail to push back deleted file id", KR(ret), K(entry.first));
   }

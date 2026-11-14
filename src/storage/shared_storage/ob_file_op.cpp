@@ -212,10 +212,104 @@ int ObDirCalcSizeOp::process_tmp_seq_file(const ObIODFileStat &statbuf, const ch
       FLOG_INFO("succ to del tmp seq file", KR(ret), K(full_path));
     }
   } else if (statbuf.mtime_s_ < start_calc_size_time_s_) {
-    // .tmp.seq file has not reached security deleting time, need statistics file size
-    total_file_size_ += statbuf.size_;
-    tmp_seq_file_size_ += statbuf.size_;
-    tmp_seq_file_num_ += 1;
+    int64_t reserved_size = 0;
+    ObSSMacroCacheType cache_type = ObSSMacroCacheType::MAX_TYPE;
+    bool found = false;
+    if (OB_FAIL(get_tmp_seq_file_reserved_size_(full_path, reserved_size, cache_type, found))) {
+      LOG_WARN("fail to get tmp seq file reservation", KR(ret), K(full_path));
+    } else {
+      const int64_t file_size = ((found) ? reserved_size : statbuf.size_);
+      if (found && ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK == cache_type) {
+        hot_tablet_total_file_size_ += file_size;
+      } else {
+        total_file_size_ += file_size;
+      }
+      tmp_seq_file_size_ += statbuf.size_;
+      tmp_seq_file_num_ += 1;
+      if (!found) {
+        LOG_TRACE("tmp seq reservation not found, use file size", K(full_path), K(statbuf));
+      }
+    }
+  }
+  return ret;
+}
+
+// Expected full_path: <cache_dir>/<object_name>.T<type>.tmp.<write_seq>
+// Count only objects with disk accounting. Overwrite objects can also have atomic-write
+// entries, but have no reservation to restore. A failed write is inserted into the clean
+// map before being removed from the normal map; check both and count a matching seq once.
+// A matching write with a cache type outside the scan range returns an error.
+int ObDirCalcSizeOp::get_tmp_seq_file_reserved_size_(const char *full_path,
+    int64_t &reserved_size, ObSSMacroCacheType &cache_type, bool &found) const
+{
+  int ret = OB_SUCCESS;
+  reserved_size = 0;
+  cache_type = ObSSMacroCacheType::MAX_TYPE;
+  found = false;
+
+  // file_name: <object_name>.T<type>.tmp.<write_seq>
+  // tmp_suffix: .tmp.<write_seq>
+  const char *file_name = nullptr;
+  const char *tmp_suffix = nullptr;
+  if (OB_ISNULL(full_path)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid tmp seq file path", KR(ret), KP(full_path));
+  } else {
+    file_name = STRRCHR(full_path, '/');
+    file_name = (OB_ISNULL(file_name) ? full_path : file_name + 1);
+    tmp_suffix = STRSTR(file_name, DEFAULT_TMP_STR);
+  }
+
+  // Path without ".tmp.<write_seq>", retaining ".T<type>" for macro-id parsing.
+  char path[common::MAX_PATH_SIZE] = { 0 };
+  uint64_t seq = 0;
+  ObTenantFileManager *file_manager = nullptr;
+  MacroBlockId macro_id;
+  if (OB_FAIL(ret)) {
+  } else if (OB_ISNULL(tmp_suffix)
+      || OB_UNLIKELY(1 != sscanf(tmp_suffix, ".tmp.%lu", &seq))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid tmp seq file path", KR(ret), K(full_path));
+  } else if (OB_ISNULL(file_manager = MTL(ObTenantFileManager *))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("file manager is null", KR(ret), K(full_path));
+  } else if (OB_FAIL(databuff_printf(path, sizeof(path), "%.*s",
+      static_cast<int>(tmp_suffix - full_path), full_path))) {
+    LOG_WARN("fail to format tmp seq file path", KR(ret), K(full_path));
+  } else if (OB_FAIL(ObFileHelper::convert_path_to_macro_id(path, macro_id))) {
+    LOG_WARN("fail to convert tmp seq file path", KR(ret), K(full_path), K(path));
+  } else if (SSObjUtil::is_need_stat(macro_id)) {
+    for (int64_t map_idx = 0; OB_SUCC(ret) && !found && map_idx < 2; ++map_idx) {
+      ObAtomicWriteFileInfo file_info;
+      const bool is_clean = (1 == map_idx);
+      if (OB_FAIL(file_manager->get_from_atomic_write_file_map(is_clean, macro_id, file_info))) {
+        if (OB_HASH_NOT_EXIST == ret) {
+          ret = OB_SUCCESS;
+        } else {
+          LOG_WARN("fail to get atomic write file", KR(ret), K(macro_id), K(seq), K(is_clean));
+        }
+      } else if (file_info.seq_ == seq) {
+        // Scan macro_cache_type_ -> accepted file_info.cache_type_:
+        // TMP_FILE -> TMP_FILE
+        // META_FILE -> META_FILE
+        // MACRO_BLOCK -> MACRO_BLOCK (AUTO) or HOT_TABLET_MACRO_BLOCK
+        const bool matches_scan_type = (file_info.cache_type_ == macro_cache_type_
+            || (ObSSMacroCacheType::MACRO_BLOCK == macro_cache_type_
+                && ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK == file_info.cache_type_));
+        if (OB_UNLIKELY(!matches_scan_type)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("fail to validate atomic write cache type for calibration scan",
+              KR(ret), K(full_path), K(seq), K(macro_cache_type_), K(file_info), K(is_clean));
+        } else if (OB_UNLIKELY(file_info.size_ > INT64_MAX)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("invalid atomic write file size", KR(ret), K(full_path), K(file_info));
+        } else {
+          reserved_size = file_info.size_;
+          cache_type = file_info.cache_type_;
+          found = true;
+        }
+      }
+    }
   }
   return ret;
 }

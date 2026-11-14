@@ -159,6 +159,9 @@ public:
 
 private:
   int process_tmp_seq_file(const common::ObIODFileStat &statbuf, const char *full_path);
+  // Looks up the reservation for the exact .tmp.seq write.
+  int get_tmp_seq_file_reserved_size_(const char *full_path, int64_t &reserved_size,
+      ObSSMacroCacheType &cache_type, bool &found) const;
   int process_tmp_file(const common::ObIODFileStat &statbuf, const char *path);
   int process_meta_file(const common::ObIODFileStat &statbuf, const char *path);
   int process_macro_block(const common::ObIODFileStat &statbuf, const char *path);
