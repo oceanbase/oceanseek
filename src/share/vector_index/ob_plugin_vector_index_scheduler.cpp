@@ -2330,7 +2330,7 @@ int ObVectorIndexMemSyncInfo::promote_due_deferred_tasks()
     ObVecIndexAsyncTaskCtx *existing_ctx = nullptr;
     if (OB_FAIL(deferred_map_.get_refactored(tablet_id, info))) {
       LOG_WARN("fail to get due deferred mem sync tablet", KR(ret), K(tablet_id));
-    } else if (OB_SUCCESS == waiting_map.get_refactored(tablet_id, existing_ctx)) {
+    } else if (OB_SUCCESS == (ret = waiting_map.get_refactored(tablet_id, existing_ctx))) {
       // A newer clog or maintenance event has already re-armed this tablet.
     } else if (OB_HASH_NOT_EXIST != ret) {
       LOG_WARN("fail to check waiting mem sync tablet", KR(ret), K(tablet_id));
