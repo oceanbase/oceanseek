@@ -8,6 +8,7 @@
 #include "sql/das/iter/ob_das_vec_scan_utils.h"
 #include "share/diagnosis/ob_runtime_profile.h"
 #include "share/vector_index/ob_plugin_vector_index_util.h"
+#include "share/vector_index/ob_vector_index_util.h"
 #include "share/vector_type/ob_vector_common_util.h"
 
 namespace oceanbase
@@ -165,6 +166,22 @@ void ObDASVecIndexBruteScanIter::reset_adaptor_vid_iter()
     adaptor_vid_iter_->~ObVectorQueryVidIterator();
     adaptor_vid_iter_ = nullptr;
   }
+}
+
+int ObDASVecIndexBruteScanIter::distance_to_score(ObExpr *sort_expr, double distance, double &score)
+{
+  int ret = OB_SUCCESS;
+  double vsag_distance = 0;
+  if (OB_ISNULL(sort_expr)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("sort expr is null", K(ret));
+  } else if (OB_FAIL(ObVectorIndexUtil::convert_ob_to_vsag_distance(
+                 distance, sort_expr->type_, vsag_distance))) {
+    LOG_WARN("failed to convert brute force distance for scoring", K(ret), K(distance), K(sort_expr->type_));
+  } else if (OB_FAIL(ObDASVecIndexScanIter::distance_to_score(sort_expr, vsag_distance, score))) {
+    LOG_WARN("failed to convert distance to score", K(ret), K(vsag_distance));
+  }
+  return ret;
 }
 
 int ObDASVecIndexBruteScanIter::build_query_condition(ObIAllocator &alloc, ObEvalCtx &eval_ctx,

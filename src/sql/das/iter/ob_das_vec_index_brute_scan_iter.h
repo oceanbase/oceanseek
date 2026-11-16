@@ -64,7 +64,7 @@ public:
 // score every row with the CG-generated distance expression and keep the best K in a
 // bounded heap. The scoring kernel makes no assumption about the expression semantics,
 // so the only vector-specific behaviour is skipping NULL vectors and the
-// distance-to-score conversion inherited from ObDASVecIndexScanIter.
+// distance-to-score conversion adapted to the indexed-search distance representation.
 class ObDASVecIndexBruteScanIter : public ObDASVecIndexScanIter
 {
 public:
@@ -108,6 +108,7 @@ public:
       int64_t iter_unfiltered_vid_cnt, int64_t iter_added_cnt,
       int64_t iter_scan_total_num, bool &stop_search) override;
   virtual int64_t get_max_query_result_size() const override { return INT64_MAX; }
+  virtual int distance_to_score(ObExpr *sort_expr, double distance, double &score) override;
 
 protected:
   virtual int inner_init(ObDASIterParam &param) override;
