@@ -5757,14 +5757,16 @@ def_storage_object_type_cfg(
     is_valid = '''
 bool is_valid(const MacroBlockId &file_id) const
 {
-  // second_id: creation time; third_id: LOB Meta tablet ID; fourth_id: tenant-wide unique sequence number
+  // second_id: creation time;
+  // third_id: LOB Meta tablet ID;
+  // fourth_id: tenant-wide unique sequence number
+  // fifth_id: hash value, stores the Outtable LOB chunk's CRC bit pattern.
   return file_id.is_in_object_storage()
       && file_id.second_id() > 0
       && file_id.second_id() < INT64_MAX
       && file_id.third_id() > 0
       && file_id.third_id() < INT64_MAX
-      && file_id.fourth_id() > 0
-      && file_id.fifth_id() == 0;
+      && file_id.fourth_id() > 0;
 }
 ''',
     to_local_path_format = '''
@@ -5774,12 +5776,16 @@ int to_local_path_format(char *path, const int64_t length, int64_t &pos,
 {
   int ret = OB_SUCCESS;
   const uint8_t obj_id = static_cast<uint8_t>(file_id.storage_object_type());
-  if (OB_FAIL(databuff_printf(path, length, pos,
-      "%s/%lu_%ld/%s/%02lX/tablet_%ld_create_%ld_seq_%ld.T%hhu",
+  if (OB_ISNULL(path) || OB_UNLIKELY(!file_id.is_valid() || !is_valid(file_id))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid outtable lob local cache path arguments", KR(ret), KP(path), K(file_id));
+  } else if (OB_FAIL(databuff_printf(path, length, pos,
+      "%s/%lu_%ld/%s/%02lX/tablet_%ld_create_%ld_seq_%ld_hash_%lu.T%hhu",
       OB_DIR_MGR.get_local_cache_root_dir(), tenant_id, tenant_epoch_id,
       SHARED_MAJOR_MACRO_CACHE_DIR_STR,
       file_id.hash() % ObDirManager::SHARED_MACRO_SCATTER_DIR_NUM,
-      file_id.third_id(), file_id.second_id(), file_id.fourth_id(), obj_id))) {
+      file_id.third_id(), file_id.second_id(), file_id.fourth_id(),
+      static_cast<uint64_t>(file_id.fifth_id()), obj_id))) {
     LOG_WARN("fail to format outtable lob local cache path", KR(ret), K(file_id));
   }
   return ret;
@@ -5789,34 +5795,27 @@ int to_local_path_format(char *path, const int64_t length, int64_t &pos,
 int local_path_to_macro_id(const char *path, MacroBlockId &macro_id) const
 {
   int ret = OB_SUCCESS;
-  char format[128] = {0};
-  int num = 0;
   const char *sub_path = nullptr;
+  int parsed_len = 0;
   int64_t tablet_id = 0;
   int64_t create_ts_us = 0;
   int64_t seq = 0;
+  uint64_t crc = 0;
   if (OB_ISNULL(path)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", KR(ret), KP(path));
-  } else if (OB_ISNULL(sub_path = ObString(path).reverse_find('/', 1))) {
+  } else if (OB_ISNULL(sub_path = ObString(path).reverse_find('/', 1))
+      || 4 != sscanf(sub_path, "/tablet_%ld_create_%ld_seq_%ld_hash_%lu.T42%n",
+          &tablet_id, &create_ts_us, &seq, &crc, &parsed_len)
+      || 0 == parsed_len || 0 != sub_path[parsed_len]) {
     ret = OB_UNEXPECTED_MACRO_CACHE_FILE;
     LOG_WARN("unexpected outtable lob local cache path", KR(ret), K(path));
-  } else if (OB_FAIL(databuff_printf(format, sizeof(format),
-      "/tablet_%%ld_create_%%ld_seq_%%ld.T%hhu", static_cast<uint8_t>(type_)))) {
-    LOG_WARN("fail to build outtable lob local cache path format", KR(ret), K(type_));
-  } else if (FALSE_IT(num = sscanf(sub_path, format, &tablet_id, &create_ts_us, &seq))) {
-  } else if (OB_UNLIKELY(3 != num)) {
-    ret = OB_UNEXPECTED_MACRO_CACHE_FILE;
-    LOG_WARN("unexpected outtable lob local cache path", KR(ret), K(path), K(format), K(num));
   } else {
-    macro_id.set_version_v1();
+    macro_id = MacroBlockId(
+        MacroBlockId::DEFAULT_FIRST_ID, create_ts_us, tablet_id, seq, static_cast<int64_t>(crc));
     macro_id.set_id_mode(static_cast<uint64_t>(ObMacroBlockIdMode::ID_MODE_SHARE));
     macro_id.set_storage_object_type(static_cast<uint64_t>(type_));
     macro_id.set_location(ObMacroBlockIdLocation::OBJECT_STORAGE);
-    macro_id.set_second_id(create_ts_us);
-    macro_id.set_third_id(tablet_id);
-    macro_id.set_fourth_id(seq);
-    macro_id.set_fifth_id(0);
   }
   return ret;
 }
@@ -5827,12 +5826,13 @@ int to_relative_remote_path_format(char *path, const int64_t length, int64_t &po
 {
   int ret = OB_SUCCESS;
   const uint8_t obj_id = static_cast<uint8_t>(file_id.storage_object_type());
-  if (OB_ISNULL(path) || OB_UNLIKELY(!file_id.is_valid())) {
+  if (OB_ISNULL(path) || OB_UNLIKELY(!file_id.is_valid() || !is_valid(file_id))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", KR(ret), KP(path), K(file_id));
   } else if (OB_FAIL(databuff_printf(path, length, pos,
-      "outtable_lob/%ld/%ld/%ld.T%hhu", file_id.third_id(), file_id.second_id(),
-      file_id.fourth_id(), obj_id))) {
+      "outtable_lob/%ld/%ld/%ld_%lu.T%hhu", file_id.third_id(), file_id.second_id(),
+      file_id.fourth_id(),
+      static_cast<uint64_t>(file_id.fifth_id()), obj_id))) {
     LOG_WARN("fail to format outtable lob remote path", KR(ret), K(file_id));
   }
   return ret;
@@ -5852,34 +5852,27 @@ int to_remote_path_format(char *path, const int64_t length, int64_t &pos,
 int remote_path_to_macro_id(const char *path, MacroBlockId &macro_id) const
 {
   int ret = OB_SUCCESS;
-  char format[128] = {0};
-  int num = 0;
   const char *sub_path = nullptr;
+  int parsed_len = 0;
   int64_t tablet_id = 0;
   int64_t create_ts_us = 0;
   int64_t seq = 0;
+  uint64_t crc = 0;
   if (OB_ISNULL(path)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", KR(ret), KP(path));
-  } else if (OB_ISNULL(sub_path = STRSTR(path, "outtable_lob/"))) {
+  } else if (OB_ISNULL(sub_path = STRSTR(path, "outtable_lob/"))
+      || 4 != sscanf(sub_path, "outtable_lob/%ld/%ld/%ld_%lu.T42%n",
+          &tablet_id, &create_ts_us, &seq, &crc, &parsed_len)
+      || 0 == parsed_len || 0 != sub_path[parsed_len]) {
     ret = OB_UNEXPECTED_MACRO_CACHE_FILE;
     LOG_WARN("unexpected outtable lob path", KR(ret), K(path));
-  } else if (OB_FAIL(databuff_printf(format, sizeof(format),
-      "outtable_lob/%%ld/%%ld/%%ld.T%hhu", static_cast<uint8_t>(type_)))) {
-    LOG_WARN("fail to build outtable lob path format", KR(ret), K(type_));
-  } else if (FALSE_IT(num = sscanf(sub_path, format, &tablet_id, &create_ts_us, &seq))) {
-  } else if (OB_UNLIKELY(3 != num)) {
-    ret = OB_UNEXPECTED_MACRO_CACHE_FILE;
-    LOG_WARN("unexpected outtable lob path", KR(ret), K(path), K(format), K(num));
   } else {
-    macro_id.set_version_v1();
+    macro_id = MacroBlockId(
+        MacroBlockId::DEFAULT_FIRST_ID, create_ts_us, tablet_id, seq, static_cast<int64_t>(crc));
     macro_id.set_id_mode(static_cast<uint64_t>(ObMacroBlockIdMode::ID_MODE_SHARE));
     macro_id.set_storage_object_type(static_cast<uint64_t>(type_));
     macro_id.set_location(ObMacroBlockIdLocation::OBJECT_STORAGE);
-    macro_id.set_second_id(create_ts_us);
-    macro_id.set_third_id(tablet_id);
-    macro_id.set_fourth_id(seq);
-    macro_id.set_fifth_id(0);
   }
   return ret;
 }

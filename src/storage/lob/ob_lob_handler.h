@@ -10,6 +10,7 @@
 #include "storage/lob/ob_lob_manager.h"
 #include "storage/lob/store/ob_lob_aux_manager.h"
 #include "storage/lob/store/ob_lob_meta.h"
+#include "storage/lob/store/ob_lob_persistent_iterator.h"
 
 namespace oceanbase
 {
@@ -20,7 +21,6 @@ class ObLobMetaManager;
 class ObLobOutRowQueryIter;
 class ObLobQueryIter;
 class ObLobManager;
-struct ObLobWriteStats;
 
 class ObLobQueryBaseHandler
 {
@@ -157,6 +157,7 @@ private:
                           const uint64_t total_byte_len,
                           const uint64_t total_char_len,
                           const uint64_t chunk_count,
+                          const uint64_t compressed_len,
                           const bool is_outtable);
   int write_external_lob_meta_summary_(const common::ObLobId &lob_id,
                                        const common::ObExternalBlobInfo &external_info);

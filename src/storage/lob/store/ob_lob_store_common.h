@@ -85,12 +85,16 @@ public:
                             const common::ObExternalBlobInfo &external_lob_info);
   bool is_external_lob() const { return lob_chunk_type_.external_reference(); }
   bool is_valid();
-  TO_STRING_KV(K(extra_info_type_), K(lob_chunk_type_), K(chunk_count_), K(last_write_type_), K(external_lob_info_));
+  TO_STRING_KV(K(extra_info_type_), K(lob_chunk_type_), K(chunk_count_), K(last_write_type_),
+               K(has_crc_), K(crc_), K(compressed_len_), K(external_lob_info_));
 public:
   ExtraInfoType extra_info_type_;
   ObLobChunkType lob_chunk_type_;
   uint64_t chunk_count_;
   ObLobLastWriteType last_write_type_;
+  bool has_crc_;
+  uint64_t crc_;
+  uint64_t compressed_len_; // Positive for OutTable metadata.
   common::ObExternalBlobInfo external_lob_info_;
 };
 

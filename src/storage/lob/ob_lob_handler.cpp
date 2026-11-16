@@ -387,8 +387,8 @@ int ObLobInserter::insert()
   } else if (OB_FAIL(open_src_lob_query_(query_iter))) {
     LOG_WARN("failed to open source lob query", KR(ret), KPC(this));
   } else {
-    ObLobWriteStats write_stats;
     ObLobMetaTableBatchInsertIter meta_insert_iter;
+    ObLobWriteStats write_stats;
     metas_.reset();
     // 设置 lob 辅助表的 dml 操作符号，以及所用的 seq_no
     ctx_->dml_op_ = ObLobDmlOp::INSERT;
@@ -411,27 +411,26 @@ int ObLobInserter::insert()
       }
     }
 
-    if (OB_FAIL(ret)) {
-    } else if (OB_UNLIKELY(write_stats.byte_len_ != source_byte_len_
-                       || write_stats.chunk_count_ != static_cast<uint64_t>(metas_.count()))) {
+    if (OB_SUCC(ret) && OB_UNLIKELY(write_stats.byte_len_ != source_byte_len_
+        || write_stats.chunk_count_ != static_cast<uint64_t>(metas_.count()))) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("lob stream statistics do not match source", KR(ret), K(source_byte_len_),
                K(write_stats), "meta_count", metas_.count(), K(is_outtable), KPC(this));
     }
 
-    if (FAILEDx(write_meta_summary_(
-        lob_id_, write_stats.byte_len_, write_stats.char_len_,
-        write_stats.chunk_count_, is_outtable))) {
-      LOG_WARN("failed to write meta summary row", KR(ret), K(lob_id_),
-               K(write_stats), KPC(this));
-    } else if (OB_FAIL(meta_insert_iter.init(&metas_))) {
-      LOG_WARN("failed to initialize meta insert iterator", KR(ret), KPC(this));
-    } else if (OB_FAIL(meta_mgr_->batch_insert(*ctx_, meta_insert_iter))) {
-      LOG_WARN("failed to batch insert meta info", KR(ret), KPC(this));
-    }
-
-    if (OB_SUCC(ret) && is_outtable) {
-      ret = write_outtable_clog_();
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(write_meta_summary_(
+          lob_id_, write_stats.byte_len_, write_stats.char_len_,
+          write_stats.chunk_count_, write_stats.compressed_len_, is_outtable))) {
+        LOG_WARN("failed to write meta summary row", KR(ret), K(lob_id_),
+            K(write_stats), KPC(this));
+      } else if (OB_FAIL(meta_insert_iter.init(&metas_))) {
+        LOG_WARN("failed to initialize meta insert iterator", KR(ret), KPC(this));
+      } else if (OB_FAIL(meta_mgr_->batch_insert(*ctx_, meta_insert_iter))) {
+        LOG_WARN("failed to batch insert meta info", KR(ret), KPC(this));
+      } else if (is_outtable && OB_FAIL(write_outtable_clog_())) {
+        LOG_WARN("failed to write outtable lob clog", KR(ret), K(lob_id_), KPC(this));
+      }
     }
   }
   if (OB_NOT_NULL(query_iter)) {
@@ -549,6 +548,7 @@ int ObLobInserter::write_meta_summary_(
     const uint64_t total_byte_len,
     const uint64_t total_char_len,
     const uint64_t chunk_count,
+    const uint64_t compressed_len,
     const bool is_outtable)
 {
   int ret = OB_SUCCESS;
@@ -570,6 +570,7 @@ int ObLobInserter::write_meta_summary_(
     lob_extra_info.chunk_count_ = chunk_count;
     if (is_outtable) {
       lob_extra_info.lob_chunk_type_.set_out_table();
+      lob_extra_info.compressed_len_ = compressed_len;
     } else {
       lob_extra_info.lob_chunk_type_.set_in_table();
     }

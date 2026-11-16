@@ -140,7 +140,9 @@ bool MacroBlockId::is_valid() const
           && meta_version_id() >= 0
           && 0 == fifth_id_;
     } else if (is_valid && (is_private_data_or_meta() || is_shared_data_or_meta())) {
-      is_valid = -1 != third_id_ && -1 != fourth_id_ && -1 != fifth_id_;
+      is_valid = -1 != third_id_ && -1 != fourth_id_
+          && (-1 != fifth_id_
+              || ObStorageObjectType::SHARED_OUTTABLE_LOB_DATA_MACRO == storage_object_type());
     }
   }
   return is_valid;

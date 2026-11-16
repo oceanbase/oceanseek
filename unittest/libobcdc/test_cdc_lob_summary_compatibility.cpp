@@ -185,12 +185,15 @@ protected:
     extra_info.last_write_type_ = ObLobLastWriteType::INSERT;
     if (OB_FAIL(extra_info.lob_chunk_type_.from_string(lob_chunk_type))) {
       LOG_WARN("parse lob chunk type failed", KR(ret), KCSTRING(lob_chunk_type));
-    } else if (OB_FAIL(extra_info.serialize(allocator, meta_info.lob_extra_info_))) {
-      LOG_WARN("serialize lob summary extra info failed", KR(ret), K(extra_info));
     } else {
+      if (extra_info.lob_chunk_type_.out_table()) {
+        extra_info.compressed_len_ = byte_len;
+      }
       meta_info.byte_len_ = byte_len;
       meta_info.char_len_ = byte_len;
-      if (OB_FAIL(ObCDCLobAuxTableParser::encode_summary_value(
+      if (OB_FAIL(extra_info.serialize(allocator, meta_info.lob_extra_info_))) {
+        LOG_WARN("serialize lob summary extra info failed", KR(ret), K(extra_info));
+      } else if (OB_FAIL(ObCDCLobAuxTableParser::encode_summary_value(
           allocator, meta_info, summary_value))) {
         LOG_WARN("encode lob summary cache value failed", KR(ret), K(meta_info));
       }
@@ -420,7 +423,7 @@ TEST_F(TestCDCLobSummaryCompatibility, parser_accepts_out_table_summary)
 {
   const char *extra_info_json =
       "{\"extra_info_type\":1,\"lob_chunk_type\":\"OUT_TABLE\","
-      "\"chunk_count\":2,\"last_write_type\":0}";
+      "\"chunk_count\":2,\"last_write_type\":0,\"compressed_len\":8}";
   ASSERT_EQ(OB_SUCCESS, build_summary_row(extra_info_json, 8/*byte_len*/));
 
   ObArenaAllocator allocator;
@@ -442,6 +445,8 @@ TEST_F(TestCDCLobSummaryCompatibility, parser_accepts_out_table_summary)
   EXPECT_EQ(8U, char_len);
   EXPECT_EQ(2U, extra_info.chunk_count_);
   EXPECT_TRUE(extra_info.lob_chunk_type_.out_table());
+  EXPECT_FALSE(extra_info.has_crc_);
+  EXPECT_EQ(8U, extra_info.compressed_len_);
 }
 
 // 通过真实 ObCDCLobDataMerger 同步拼接路径验证历史 INVALID_TYPE 和当前 IN_TABLE Summary 都会放行，
@@ -516,6 +521,13 @@ TEST_F(TestCDCLobSummaryCompatibility, merger_rejects_no_logging_summary_in_both
     EXPECT_EQ(0, task_count);
     EXPECT_EQ(OB_SUCCESS, instance_->lob_aux_storager_.del(summary_key));
   }
+}
+
+TEST_F(TestCDCLobSummaryCompatibility, merger_accepts_outtable_insert_summary)
+{
+  ASSERT_EQ(OB_SUCCESS, init_merger_environment());
+  EXPECT_EQ(OB_SUCCESS,
+      run_merger_with_summary("OUT_TABLE", 8/*byte_len*/, 1/*chunk_count*/, "lob-data"));
 }
 
 // 通过真实 ObCDCLobDataMerger 校验分支验证 INVALID_TYPE 只获得类型兼容，

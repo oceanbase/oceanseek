@@ -7,6 +7,7 @@
 
 #include "lib/ob_define.h"
 #include "lib/ob_errno.h"
+#include "lib/checksum/ob_crc64.h"
 #include "lib/container/ob_se_array.h"
 #include "lib/utility/ob_macro_utils.h"
 #include "lib/utility/ob_tracepoint.h"
@@ -499,11 +500,13 @@ void ObLobWriteStats::reset()
   byte_len_ = 0;
   char_len_ = 0;
   chunk_count_ = 0;
+  compressed_len_ = 0;
 }
 
 int ObLobWriteStats::add_chunk(const ObLobChunk &chunk)
 {
   int ret = OB_SUCCESS;
+  const uint64_t compressed_len = chunk.lob_extra_info_.compressed_len_;
   if (OB_UNLIKELY(0 == chunk.byte_len_
                   || 0 == chunk.char_len_
                   || chunk.char_len_ > chunk.byte_len_)) {
@@ -511,12 +514,14 @@ int ObLobWriteStats::add_chunk(const ObLobChunk &chunk)
     LOG_WARN("invalid lob chunk", KR(ret), K(chunk));
   } else if (OB_UNLIKELY(UINT64_MAX - byte_len_ < chunk.byte_len_
                          || UINT64_MAX - char_len_ < chunk.char_len_
-                         || UINT64_MAX == chunk_count_)) {
+                         || UINT64_MAX == chunk_count_
+                         || UINT64_MAX - compressed_len_ < compressed_len)) {
     ret = OB_SIZE_OVERFLOW;
     LOG_WARN("lob write stats overflow", KR(ret), KPC(this), K(chunk));
   } else {
     byte_len_ += chunk.byte_len_;
     char_len_ += chunk.char_len_;
+    compressed_len_ += compressed_len;
     ++chunk_count_;
   }
   return ret;
@@ -784,7 +789,10 @@ int ObLobOutTableInsertIter::prepare_batch_(
       ObLobMetaInfo meta_info;
       ObOuttableLobControlKey key;
       ObString data;
+      const uint64_t crc = common::ob_crc64(chunk_.lob_data_.ptr(), chunk_.lob_data_.length());
+      macro_id_array_.at(idx_).set_fifth_id(static_cast<int64_t>(crc));
       key.macro_id_ = macro_id_array_.at(idx_);
+      key.hash_ = static_cast<uint64_t>(key.macro_id_.fifth_id());
       chunk_.lob_col_idx_ = lob_col_idx_;
       chunk_.lob_id_ = lob_id_;
       chunk_.lob_extra_info_.lob_chunk_type_.set_out_table();
@@ -801,7 +809,9 @@ int ObLobOutTableInsertIter::prepare_batch_(
       } else if (OB_FAIL(ob_write_string(batch_allocator, chunk_.lob_data_, data))) {
         LOG_WARN("failed to copy outtable lob batch data", KR(ret), K(chunk_));
       } else {
-        key.hash_ = data.hash();
+        chunk_.lob_extra_info_.has_crc_ = true;
+        chunk_.lob_extra_info_.crc_ = crc;
+        chunk_.lob_extra_info_.compressed_len_ = data.length();
         // Query and sequence buffers are reused; copy the data and Meta before the next read.
         if (OB_FAIL(chunk_data.push_back(data))) {
           LOG_WARN("failed to append outtable lob batch data", KR(ret));

@@ -140,24 +140,20 @@ static int decode_lob_chunk_type(
   return ret;
 }
 
-static int decode_chunk_count(const ObJsonObject &json_root, uint64_t &chunk_count)
+static int decode_lob_meta_uint(const ObJsonObject &json_root, const char *key, uint64_t &value)
 {
   int ret = OB_SUCCESS;
-  ObJsonNode *node = json_root.get_value("chunk_count");
-  if (OB_ISNULL(node)
-      || OB_UNLIKELY((ObJsonNodeType::J_INT != node->json_type()
-                      && ObJsonNodeType::J_UINT != node->json_type()))) {
+  const ObJsonNode *node = json_root.get_value(key);
+  if (OB_ISNULL(node)) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid chunk count json node", KR(ret), KP(node));
-  } else if (ObJsonNodeType::J_INT == node->json_type() && node->get_int() < 0) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("negative chunk count", KR(ret), "chunk_count", node->get_int());
+    LOG_WARN("missing unsigned lob meta field", KR(ret), KCSTRING(key));
+  } else if (ObJsonNodeType::J_UINT == node->json_type()) {
+    value = node->get_uint();
+  } else if (ObJsonNodeType::J_INT == node->json_type() && node->get_int() >= 0) {
+    value = static_cast<uint64_t>(node->get_int());
   } else {
-    if (ObJsonNodeType::J_INT == node->json_type()) {
-      chunk_count = static_cast<uint64_t>(node->get_int());
-    } else {
-      chunk_count = node->get_uint();
-    }
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid unsigned lob meta field", KR(ret), KCSTRING(key), K(node->json_type()));
   }
   return ret;
 }
@@ -186,6 +182,22 @@ static int decode_last_write_type(
   return ret;
 }
 
+static int decode_outtable_lob_stats(const ObJsonObject &root, ObLobMetaExtraInfo &extra_info)
+{
+  int ret = OB_SUCCESS;
+  const bool is_chunk = ObLobMetaExtraInfo::LOB_DATA == extra_info.extra_info_type_;
+  if (OB_FAIL(decode_lob_meta_uint(root, "compressed_len", extra_info.compressed_len_))) {
+    LOG_WARN("failed to decode outtable lob compressed length", KR(ret), K(extra_info));
+  } else if (OB_UNLIKELY(0 == extra_info.compressed_len_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("outtable lob compressed length must be positive", KR(ret), K(extra_info));
+  } else if (is_chunk && OB_FAIL(decode_lob_meta_uint(root, "crc", extra_info.crc_))) {
+    LOG_WARN("failed to decode outtable lob chunk crc", KR(ret), K(extra_info));
+  } else {
+    extra_info.has_crc_ = is_chunk;
+  }
+  return ret;
+}
 
 //==================== External LOB identity encoding ====================
 
@@ -323,6 +335,9 @@ void ObLobMetaExtraInfo::reset()
   lob_chunk_type_.reset();
   chunk_count_ = 0;
   last_write_type_ = ObLobLastWriteType::INSERT;
+  has_crc_ = false;
+  crc_ = 0;
+  compressed_len_ = 0;
   external_lob_info_ = common::ObExternalBlobInfo();
 }
 
@@ -353,12 +368,20 @@ int ObLobMetaExtraInfo::serialize(ObIAllocator &allocator, ObString &str)
   ObJsonString lob_chunk_type(lob_chunk_type_str, STRLEN(lob_chunk_type_str));
   ObJsonUint chunk_count(chunk_count_);
   ObJsonInt last_write_type(static_cast<int64_t>(last_write_type_));
+  ObJsonUint crc(crc_);
+  ObJsonUint compressed_len(compressed_len_);
+  const bool is_outtable = lob_chunk_type_.out_table();
+  const bool is_outtable_chunk = is_outtable && LOB_DATA == extra_info_type_;
   ObJsonBuffer json_buf(&allocator);
   if (OB_UNLIKELY(!is_valid_lob_last_write_type(last_write_type_)
                   || (is_external_lob() && !is_valid())
                   || (!is_external_lob() && external_lob_info_.is_valid()))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid lob meta extra info", KR(ret), KPC(this));
+  } else if (OB_UNLIKELY((is_outtable && 0 == compressed_len_)
+                         || (is_outtable_chunk && !has_crc_))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid outtable lob storage statistics", KR(ret), KPC(this));
   } else if (OB_FAIL(json_obj.add("extra_info_type", &extra_info_type))) {
     LOG_WARN("failed to add extra info type to json object", KR(ret), KPC(this));
   } else if (OB_FAIL(json_obj.add("lob_chunk_type", &lob_chunk_type))) {
@@ -368,6 +391,10 @@ int ObLobMetaExtraInfo::serialize(ObIAllocator &allocator, ObString &str)
   } else if (LOB_META_SUMMARY == extra_info_type_
              && OB_FAIL(json_obj.add("last_write_type", &last_write_type))) {
     LOG_WARN("failed to add last write type to json object", KR(ret), KPC(this));
+  } else if (is_outtable_chunk && OB_FAIL(json_obj.add("crc", &crc))) {
+    LOG_WARN("failed to add crc to lob meta json", KR(ret), KPC(this));
+  } else if (is_outtable && OB_FAIL(json_obj.add("compressed_len", &compressed_len))) {
+    LOG_WARN("failed to add compressed length to lob meta json", KR(ret), KPC(this));
   } else if (is_external_lob() && OB_FAIL(external_lob_info_.serialize(allocator, json_obj))) {
     LOG_WARN("failed to serialize external lob summary", KR(ret), KPC(this));
   }
@@ -401,10 +428,13 @@ int ObLobMetaExtraInfo::deserialize(ObIAllocator &allocator, const ObString &str
       LOG_WARN("failed to decode lob extra info type", KR(ret), K(str));
     } else if (OB_FAIL(decode_lob_chunk_type(root, decoded.lob_chunk_type_))) {
       LOG_WARN("failed to decode lob chunk type", KR(ret), K(str));
-    } else if (OB_FAIL(decode_chunk_count(root, decoded.chunk_count_))) {
+    } else if (OB_FAIL(decode_lob_meta_uint(root, "chunk_count", decoded.chunk_count_))) {
       LOG_WARN("failed to decode lob chunk count", KR(ret), K(str));
     } else if (OB_FAIL(decode_last_write_type(root, decoded.last_write_type_))) {
       LOG_WARN("failed to decode lob last write type", KR(ret), K(str));
+    } else if (decoded.lob_chunk_type_.out_table()
+        && OB_FAIL(decode_outtable_lob_stats(root, decoded))) {
+      LOG_WARN("failed to decode outtable lob storage statistics", KR(ret), K(str));
     }
   }
   if (OB_SUCC(ret)) {

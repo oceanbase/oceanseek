@@ -271,11 +271,12 @@ struct ObLobWriteStats
   void reset();
   int add_chunk(const ObLobChunk &chunk);
 
-  TO_STRING_KV(K_(byte_len), K_(char_len), K_(chunk_count));
+  TO_STRING_KV(K_(byte_len), K_(char_len), K_(chunk_count), K_(compressed_len));
 
   uint64_t byte_len_;
   uint64_t char_len_;
   uint64_t chunk_count_;
+  uint64_t compressed_len_;
 };
 
 class ObLobInTablePieceInsertIter final : public blocksstable::ObDatumRowIterator

@@ -51,7 +51,7 @@ int ObLobOutTableIO::alloc_macro_id(
     macro_id.set_second_id(ObTimeUtility::current_time_us());
     macro_id.set_third_id(insert_ctx.lob_meta_tablet_id_.id());
     macro_id.set_fourth_id(static_cast<int64_t>(tablet_inc_id));
-    macro_id.set_fifth_id(0);
+    macro_id.set_fifth_id(0); // real crc value will be set later
     if (OB_UNLIKELY(!macro_id.is_valid())) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("generated invalid outtable lob macro id", KR(ret), K(macro_id), K(tablet_inc_id));

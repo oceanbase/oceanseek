@@ -15,6 +15,7 @@
 #define UNITTEST
 
 #include <cstdlib>
+#include "lib/checksum/ob_crc64.h"
 #include "lib/literals/ob_literals.h"
 
 #include "storage/tx_storage/ob_ls_service.h"
@@ -1022,18 +1023,14 @@ TEST_F(ObSSLocalMinorWatermarkTest, lob_columns_real_ctrl_history)
 
 static void verify_lob_physical_backup_restore(
     const ObTablet &tablet, const blocksstable::MacroBlockId &object_id,
-    const ObLSID &ls_id, const int64_t object_size)
+    const ObLSID &ls_id, const ObString &source)
 {
   using namespace blocksstable;
   using namespace share;
   const uint64_t tenant_id = MTL_ID();
   ObObjectStorageTenantGuard storage_guard(tenant_id, 60 * 1000 * 1000L);
   ObArenaAllocator allocator(ObMemAttr(tenant_id, "LobBackupTest"));
-  char *source = static_cast<char *>(allocator.alloc(object_size));
-  ASSERT_NE(nullptr, source);
-  MEMSET(source, 'L', object_size);
-  source[0] = 'A';
-  source[object_size - 1] = 'Z';
+  const int64_t object_size = source.length();
   DEFER({
     const int cleanup_ret = ObObjectManager::delete_object(object_id, 0 /*ls_epoch*/);
     EXPECT_TRUE(OB_SUCCESS == cleanup_ret || OB_OBJECT_NOT_EXIST == cleanup_ret);
@@ -1101,7 +1098,7 @@ static void verify_lob_physical_backup_restore(
   MacroBlockId missing_id;
   ASSERT_EQ(OB_OBJECT_NOT_EXIST, missing_reader.get_next_macro_block(allocator, missing_data, missing_id));
   // This direct object write generates no LOB redo; the Meta SSTable is isolated from the live LS.
-  ASSERT_EQ(OB_SUCCESS, ObLobOutTableIO::write(object_id, ObString(object_size, source)));
+  ASSERT_EQ(OB_SUCCESS, ObLobOutTableIO::write(object_id, source));
   ObCopySSMacroBlockBackupReader backup_reader;
   ASSERT_EQ(OB_SUCCESS, backup_reader.init(backup_dest, backup_set_desc, backup_mod, macro_batch));
   ObCopySSMacroBlockBackupWriter backup_writer;
@@ -1121,7 +1118,7 @@ static void verify_lob_physical_backup_restore(
       backup_path.get_obstr(), backup_set_dest.get_storage_info(),
       backup_bytes, object_size, backup_read_size, backup_mod));
   ASSERT_EQ(object_size, backup_read_size);
-  ASSERT_EQ(0, MEMCMP(source, backup_bytes, object_size));
+  ASSERT_EQ(0, MEMCMP(source.ptr(), backup_bytes, object_size));
 
   // Remove both the source object and its local cache before restoring from the backup file.
   ASSERT_EQ(OB_SUCCESS, ObObjectManager::delete_object(object_id, 0 /*ls_epoch*/));
@@ -1158,7 +1155,7 @@ static void verify_lob_physical_backup_restore(
       ObString::make_string(object_path.get_path()), storage_dest.get_storage_info(),
       restored, object_size, restored_size, ObStorageIdMod::get_default_id_mod()));
   ASSERT_EQ(object_size, restored_size);
-  ASSERT_EQ(0, MEMCMP(source, restored, object_size));
+  ASSERT_EQ(0, MEMCMP(source.ptr(), restored, object_size));
 }
 
 TEST_F(ObSSLocalMinorWatermarkTest, lob_ctrl_does_not_collect_objects)
@@ -1308,8 +1305,6 @@ TEST_F(ObSSLocalMinorWatermarkTest, lob_columns_meta_file_layouts)
   object_a.set_second_id(2026101804);
   object_a.set_third_id(tablet_id.id());
   object_a.set_fourth_id(INT64_MAX - 1);
-  object_a.set_fifth_id(0);
-  ASSERT_TRUE(object_a.is_valid());
   // M011: write real Meta-layout SSTables with the existing writer. This tests file reading,
   // not SQL LOB allocation or compaction policy. The files are never installed in the live LS.
   const ObRowStoreType layouts[] = {FLAT_ROW_STORE, ENCODING_ROW_STORE};
@@ -1322,6 +1317,15 @@ TEST_F(ObSSLocalMinorWatermarkTest, lob_columns_meta_file_layouts)
         // the in-memory macro cache or cancel pending cache persistence.
         object_a.set_fourth_id(object_a.fourth_id() - 1);
         ObArenaAllocator allocator("LobGCFileTest");
+        char *source_buf = static_cast<char *>(allocator.alloc(object_size));
+        ASSERT_NE(nullptr, source_buf);
+        MEMSET(source_buf, 'L', object_size);
+        source_buf[0] = 'A';
+        source_buf[object_size - 1] = 'Z';
+        const ObString source(object_size, source_buf);
+        const uint64_t crc = common::ob_crc64(source.ptr(), source.length());
+        object_a.set_fifth_id(static_cast<int64_t>(crc));
+        ASSERT_TRUE(object_a.is_valid());
         ObTableSchema meta_table_schema;
         ASSERT_EQ(OB_SUCCESS, share::ObInnerTableSchema::all_tenant_profile_aux_lob_meta_schema(meta_table_schema));
         meta_table_schema.set_schema_version(100);
@@ -1364,8 +1368,16 @@ TEST_F(ObSSLocalMinorWatermarkTest, lob_columns_meta_file_layouts)
           ObLobMetaExtraInfo extra_info;
           extra_info.extra_info_type_ = i == 2
               ? ObLobMetaExtraInfo::LOB_META_SUMMARY : ObLobMetaExtraInfo::LOB_DATA;
-          if (i == 1) { extra_info.lob_chunk_type_.set_in_table(); }
-          else { extra_info.lob_chunk_type_.set_out_table(); }
+          if (i == 1) {
+            extra_info.lob_chunk_type_.set_in_table();
+          } else {
+            extra_info.lob_chunk_type_.set_out_table();
+            extra_info.compressed_len_ = object_size;
+            if (i == 0) {
+              extra_info.has_crc_ = true;
+              extra_info.crc_ = crc;
+            }
+          }
           ASSERT_EQ(OB_SUCCESS, extra_info.serialize(allocator, lob_infos[i]));
         }
         const int64_t physical_rows = is_minor ? 5 : 4;
@@ -1467,7 +1479,8 @@ TEST_F(ObSSLocalMinorWatermarkTest, lob_columns_meta_file_layouts)
           ASSERT_EQ(OB_ERR_UNEXPECTED, meta_iter.get_next_row(output));
           ASSERT_EQ(nullptr, output);
         }
-        ASSERT_NO_FATAL_FAILURE(verify_lob_physical_backup_restore(isolated, object_a, ls_ids.at(0), object_size));
+        ASSERT_NO_FATAL_FAILURE(
+            verify_lob_physical_backup_restore(isolated, object_a, ls_ids.at(0), source));
       };
       const int64_t object_sizes[] = {OB_DEFAULT_MACRO_BLOCK_SIZE, 8193};
       for (const int64_t object_size : object_sizes) {

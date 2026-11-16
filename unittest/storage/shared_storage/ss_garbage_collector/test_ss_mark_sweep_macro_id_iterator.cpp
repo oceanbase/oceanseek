@@ -253,6 +253,8 @@ TEST_F(TestSSMarkSweepMacroIDIterator, data_checker_policy_skips_ctrl_but_keeps_
   ObString encoded_info;
   info.extra_info_type_ = ObLobMetaExtraInfo::LOB_DATA;
   info.lob_chunk_type_.set_out_table();
+  info.has_crc_ = true;
+  info.compressed_len_ = 1;
   ASSERT_EQ(OB_SUCCESS, info.serialize(allocator_, encoded_info));
   for (const ObTableType type : {AUX_LOB_META, AUX_OUTTABLE_LOB_CONTROL}) {
     TabletFixture f;
@@ -446,6 +448,8 @@ TEST_F(TestSSMarkSweepMacroIDIterator, gc_retains_uncommitted_references_across_
   ObString encoded_info;
   info.extra_info_type_ = ObLobMetaExtraInfo::LOB_DATA;
   info.lob_chunk_type_.set_out_table();
+  info.has_crc_ = true;
+  info.compressed_len_ = 1;
   ASSERT_EQ(OB_SUCCESS, info.serialize(allocator_, encoded_info));
   for (const ObTableType type : {AUX_LOB_META, AUX_OUTTABLE_LOB_CONTROL}) {
     TabletFixture f;
@@ -587,6 +591,8 @@ TEST_F(TestSSMarkSweepMacroIDIterator, meta_outtable_and_non_outtable_rows)
   ASSERT_EQ(OB_SUCCESS, ObLobMetaUtil::get_lob_meta_macro_id(row, allocator_, id));
   ASSERT_FALSE(id.is_valid());
   info.lob_chunk_type_.set_out_table();
+  info.has_crc_ = true;
+  info.compressed_len_ = 1;
   ASSERT_EQ(OB_SUCCESS, info.serialize(allocator_, encoded_info));
   row.storage_datums_[0].set_string(encoded_info);
   ObString encoded_id;
@@ -618,6 +624,8 @@ TEST_F(TestSSMarkSweepMacroIDIterator, meta_summary_and_external_blob_are_not_ou
   ObLobMetaExtraInfo info;
   info.extra_info_type_ = ObLobMetaExtraInfo::LOB_META_SUMMARY;
   info.lob_chunk_type_.set_out_table();
+  info.chunk_count_ = 1;
+  info.compressed_len_ = 1;
   ObString encoded_info;
   ASSERT_EQ(OB_SUCCESS, info.serialize(allocator_, encoded_info));
   row.storage_datums_[0].set_string(encoded_info);
@@ -628,6 +636,8 @@ TEST_F(TestSSMarkSweepMacroIDIterator, meta_summary_and_external_blob_are_not_ou
   external.url_ = ObString::make_string("s3://test/external_lob");
   external.length_ = 16;
   external.kind_ = ObExternalBlobKind::REFERENCE;
+  info.reset();
+  info.extra_info_type_ = ObLobMetaExtraInfo::LOB_META_SUMMARY;
   ASSERT_EQ(OB_SUCCESS, info.set_external_lob_info(allocator_, external));
   ASSERT_EQ(OB_SUCCESS, info.serialize(allocator_, encoded_info));
   ObString external_id;

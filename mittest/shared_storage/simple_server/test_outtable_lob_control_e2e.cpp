@@ -359,9 +359,16 @@ void TestOuttableLobControlE2E::check_remote_owner_complete_(const bool commit)
 {
   ASSERT_NO_FATAL_FAILURE(init_user_());
   ObOuttableLobControlRow doing_row;
-  doing_row.key_.macro_id_ = blocksstable::MacroBlockId(
-      blocksstable::MacroBlockId::DEFAULT_FIRST_ID, 2026102901 + commit, 0, 0, 0);
-  doing_row.key_.hash_ = 0x4455667788990011ULL;
+  blocksstable::MacroBlockId &macro_id = doing_row.key_.macro_id_;
+  macro_id.set_id_mode(static_cast<uint64_t>(blocksstable::ObMacroBlockIdMode::ID_MODE_SHARE));
+  macro_id.set_storage_object_type(
+      static_cast<uint64_t>(blocksstable::ObStorageObjectType::SHARED_OUTTABLE_LOB_DATA_MACRO));
+  macro_id.set_location(blocksstable::ObMacroBlockIdLocation::OBJECT_STORAGE);
+  macro_id.set_second_id(2026102901 + commit);
+  macro_id.set_third_id(1001);
+  macro_id.set_fourth_id(1);
+  macro_id.set_fifth_id(commit ? -1 : INT64_MIN);
+  doing_row.key_.hash_ = static_cast<uint64_t>(macro_id.fifth_id());
   doing_row.status_ = OUTTABLE_LOB_CONTROL_DOING;
   ObSqlString cleanup_sql;
   ASSERT_EQ(OB_SUCCESS, cleanup_sql.assign_fmt("DELETE FROM %s WHERE ",
@@ -501,6 +508,8 @@ void TestOuttableLobControlE2E::check_remote_owner_complete_(const bool commit)
   ASSERT_EQ(OB_SUCCESS, ObOuttableLobControlOperator::select(inner_proxy(), tenant_id_,
       doing_row.key_.macro_id_, doing_row.key_.hash_, false /*for_update*/,
       row_allocator, row_scn, selected_row));
+  EXPECT_EQ(doing_row.key_.macro_id_, selected_row.key_.macro_id_);
+  EXPECT_EQ(doing_row.key_.hash_, selected_row.key_.hash_);
   EXPECT_EQ(commit ? OUTTABLE_LOB_CONTROL_COMPLETE : OUTTABLE_LOB_CONTROL_DOING,
       selected_row.status_);
 }
@@ -731,6 +740,9 @@ void TestOuttableLobControlE2E::insert_gc_row_(
   ASSERT_NO_FATAL_FAILURE(collect_new_keys_(before, keys));
   const int64_t chunk_size = ObLobMetaUtil::LOB_OUTTABLE_BLOCK_DATA_SIZE;
   ASSERT_EQ((bytes + chunk_size - 1) / chunk_size, keys.count());
+  for (int64_t i = 0; i < keys.count(); ++i) {
+    ASSERT_EQ(static_cast<uint64_t>(keys.at(i).macro_id_.fifth_id()), keys.at(i).hash_);
+  }
   ASSERT_NO_FATAL_FAILURE(check_keys_(inner_proxy(), keys, OUTTABLE_LOB_CONTROL_COMPLETE));
 }
 
@@ -984,8 +996,7 @@ TEST_F(TestOuttableLobControlE2E, shared_versions_to_complete_row_gc)
   ASSERT_NO_FATAL_FAILURE(insert_gc_row_(2, 'o', 3 * chunk_size + 17, true, orphan_keys));
   ASSERT_NO_FATAL_FAILURE(insert_gc_row_(1, 'k', chunk_size + 17, false, live_keys));
   ASSERT_EQ(OB_SUCCESS, old_live_keys.assign(live_keys));
-  // Reusing the payload touches the orphan's hash partitions with newer live rows.
-  // Their real checkpoints can then cover the old candidates without rewriting candidate SCNs.
+  // Repeat the payloads to advance the same control partition checkpoints.
   ASSERT_NO_FATAL_FAILURE(insert_gc_row_(4, 'o', 3 * chunk_size + 17, false, newer_live_keys));
   ASSERT_EQ(OB_SUCCESS, append(live_keys, newer_live_keys));
   newer_live_keys.reuse();
@@ -1141,7 +1152,7 @@ TEST_F(TestOuttableLobControlE2E, cold_empty_control_checkpoints_do_not_pin_gc)
   ASSERT_NO_FATAL_FAILURE(insert_gc_row_(1, 'k', bytes, false, live_keys));
   ASSERT_EQ(1, orphan_keys.count());
   ASSERT_EQ(1, live_keys.count());
-  ASSERT_NE(orphan_keys.at(0).hash_, live_keys.at(0).hash_);
+  ASSERT_NE(orphan_keys.at(0).macro_id_, live_keys.at(0).macro_id_);
   ASSERT_EQ(OB_SUCCESS, append(all_keys, orphan_keys));
   ASSERT_EQ(OB_SUCCESS, append(all_keys, live_keys));
   ObTabletID meta_tablet_id;

@@ -282,6 +282,80 @@ TEST_F(TestMacroBlockId, fifth_id_semantics)
   ASSERT_EQ(600002, inner_tablet_macro.reorganization_scn());
 }
 
+TEST_F(TestMacroBlockId, outtable_lob_fifth_id_path_round_trip)
+{
+  const ObStorageObjectType type = ObStorageObjectType::SHARED_OUTTABLE_LOB_DATA_MACRO;
+  MacroBlockId macro_id;
+  macro_id.set_id_mode(static_cast<uint64_t>(ObMacroBlockIdMode::ID_MODE_SHARE));
+  macro_id.set_storage_object_type(static_cast<uint64_t>(type));
+  macro_id.set_location(ObMacroBlockIdLocation::OBJECT_STORAGE);
+  macro_id.set_second_id(1001);
+  macro_id.set_third_id(1002);
+  macro_id.set_fourth_id(1003);
+
+  const int64_t fifth_ids[] = {0, INT64_MAX, INT64_MIN, -1};
+  const char *remote_paths[] = {
+    "outtable_lob/1002/1001/1003_0.T42",
+    "outtable_lob/1002/1001/1003_9223372036854775807.T42",
+    "outtable_lob/1002/1001/1003_9223372036854775808.T42",
+    "outtable_lob/1002/1001/1003_18446744073709551615.T42"
+  };
+  const char *local_names[] = {
+    "tablet_1002_create_1001_seq_1003_hash_0.T42",
+    "tablet_1002_create_1001_seq_1003_hash_9223372036854775807.T42",
+    "tablet_1002_create_1001_seq_1003_hash_9223372036854775808.T42",
+    "tablet_1002_create_1001_seq_1003_hash_18446744073709551615.T42"
+  };
+  MacroBlockId decoded;
+  for (int64_t i = 0; i < ARRAYSIZEOF(fifth_ids); ++i) {
+    SCOPED_TRACE(fifth_ids[i]);
+    macro_id.set_fifth_id(fifth_ids[i]);
+    ASSERT_TRUE(SSObjUtil::is_valid(macro_id));
+
+    char encoded_id[64] = {};
+    int64_t pos = 0;
+    ASSERT_EQ(OB_SUCCESS, macro_id.serialize(encoded_id, sizeof(encoded_id), pos));
+    const int64_t encoded_len = pos;
+    pos = 0;
+    ASSERT_EQ(OB_SUCCESS, decoded.deserialize(encoded_id, encoded_len, pos));
+    ASSERT_EQ(macro_id, decoded);
+
+    char remote_path[256] = {};
+    pos = 0;
+    ASSERT_EQ(OB_SUCCESS,
+        SSObjUtil::to_relative_remote_path_format(macro_id, remote_path, sizeof(remote_path), pos));
+    ASSERT_STREQ(remote_paths[i], remote_path);
+    ASSERT_EQ(OB_SUCCESS, SSObjUtil::remote_path_to_macro_id(remote_path, decoded));
+    ASSERT_EQ(macro_id, decoded);
+
+    char local_path[256] = {};
+    pos = 0;
+    ASSERT_EQ(OB_SUCCESS, SSObjUtil::to_local_path_format(
+        macro_id, local_path, sizeof(local_path), pos,
+        1 /*tenant_id*/, 1 /*tenant_epoch_id*/, 0, 0, 0));
+    const char *local_basename = ObString(local_path).reverse_find('/', 1);
+    ASSERT_NE(nullptr, local_basename);
+    ASSERT_STREQ(local_names[i], local_basename + 1);
+    ASSERT_EQ(OB_SUCCESS, SSObjUtil::local_path_to_macro_id(type, local_path, decoded));
+    ASSERT_EQ(macro_id, decoded);
+  }
+
+  ASSERT_EQ(OB_SUCCESS, SSObjUtil::remote_path_to_macro_id(
+      type, "object_root/outtable_lob/1002/1001/1003_18446744073709551615.T42", decoded));
+  ASSERT_EQ(macro_id, decoded);
+  ASSERT_NE(OB_SUCCESS, SSObjUtil::remote_path_to_macro_id(
+      type, "outtable_lob/1002/1001/1003_0.T042", decoded));
+  ASSERT_NE(OB_SUCCESS, SSObjUtil::remote_path_to_macro_id(
+      "outtable_lob/1002/1001/1003.T42", decoded));
+  ASSERT_NE(OB_SUCCESS, SSObjUtil::local_path_to_macro_id(
+      type, "/tablet_1002_create_1001_seq_1003.T42", decoded));
+
+  macro_id.set_storage_object_type(
+      static_cast<uint64_t>(ObStorageObjectType::SHARED_MAJOR_DATA_MACRO));
+  macro_id.set_fifth_id(-1);
+  ASSERT_FALSE(macro_id.is_valid());
+}
+
 TEST_F(TestMacroBlockId, shared_major_inner_tablet_uses_ls_id)
 {
   const ObStorageObjectType types[] = {

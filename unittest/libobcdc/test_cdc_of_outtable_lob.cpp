@@ -479,15 +479,15 @@ protected:
         extra_info.external_lob_info_.url_ = ObString::make_string("oss://example/object");
         extra_info.external_lob_info_.length_ = byte_len;
         extra_info.external_lob_info_.kind_ = ObExternalBlobKind::REFERENCE;
+      } else if (extra_info.lob_chunk_type_.out_table()) {
+        // Keep the storage metadata valid when testing rejection of an empty piece.
+        extra_info.compressed_len_ = 0 == byte_len ? 1 : byte_len;
       }
-      if (OB_FAIL(extra_info.serialize(allocator, meta_info.lob_extra_info_))) {
-        LOG_WARN("serialize lob summary extra info failed", KR(ret), K(extra_info));
-      }
-    }
-    if (OB_SUCC(ret)) {
       meta_info.byte_len_ = byte_len;
       meta_info.char_len_ = byte_len;
-      if (OB_FAIL(ObCDCLobAuxTableParser::encode_summary_value(
+      if (OB_FAIL(extra_info.serialize(allocator, meta_info.lob_extra_info_))) {
+        LOG_WARN("serialize lob summary extra info failed", KR(ret), K(extra_info));
+      } else if (OB_FAIL(ObCDCLobAuxTableParser::encode_summary_value(
           allocator, meta_info, summary_value))) {
         LOG_WARN("encode lob summary cache value failed", KR(ret), K(meta_info));
       }
@@ -1837,9 +1837,10 @@ TEST_F(TestCDCOfOuttableLob, ddl_main_row_before_summary_and_two_megabyte_chunks
   // Publish a real META summary row after the main row was prepared.
   LOG_INFO("step 3: publish META summary for the pending DDL image",
       "expected_sql_len", expected_sql.length(), "piece_count", pieces.size());
-  const char *summary_json = "{\"extra_info_type\":1,\"lob_chunk_type\":\"OUT_TABLE\","
-      "\"chunk_count\":2,\"last_write_type\":0}";
-  OK(build_summary_row(summary_json, expected_sql.length()));
+  const std::string summary_json = "{\"extra_info_type\":1,\"lob_chunk_type\":\"OUT_TABLE\","
+      "\"chunk_count\":2,\"last_write_type\":0,\"compressed_len\":" +
+      std::to_string(expected_sql.length()) + "}";
+  OK(build_summary_row(summary_json.c_str(), expected_sql.length()));
   const auto &meta_schema = instance_->global_info_.get_lob_aux_meta_table_schema_info();
   const auto &meta_columns = meta_schema.get_cols_des_array();
   std::vector<ObObj> meta_values(meta_columns.count());

@@ -1056,6 +1056,8 @@ TEST_F(TestSSOuttableLobUserGCTask, meta_scan_skips_non_outtable_rows)
 
   extra_info.extra_info_type_ = ObLobMetaExtraInfo::LOB_META_SUMMARY;
   extra_info.lob_chunk_type_.set_out_table();
+  extra_info.chunk_count_ = 1;
+  extra_info.compressed_len_ = 1;
   ASSERT_EQ(OB_SUCCESS, extra_info.serialize(allocator, encoded_info));
   row.storage_datums_[0].set_string(encoded_info);
   ASSERT_EQ(OB_SUCCESS, ObLobMetaUtil::get_lob_meta_macro_id(row, allocator, macro_id));
@@ -1065,6 +1067,8 @@ TEST_F(TestSSOuttableLobUserGCTask, meta_scan_skips_non_outtable_rows)
   external_info.url_ = ObString::make_string("s3://test/external_lob");
   external_info.length_ = 16;
   external_info.kind_ = ObExternalBlobKind::REFERENCE;
+  extra_info.reset();
+  extra_info.extra_info_type_ = ObLobMetaExtraInfo::LOB_META_SUMMARY;
   ASSERT_EQ(OB_SUCCESS, extra_info.set_external_lob_info(allocator, external_info));
   ASSERT_EQ(OB_SUCCESS, extra_info.serialize(allocator, encoded_info));
   ObString external_id;
@@ -1094,6 +1098,8 @@ TEST_F(TestSSOuttableLobUserGCTask, meta_scan_preserves_all_physical_outtable_re
   ObString encoded_info;
   extra_info.extra_info_type_ = ObLobMetaExtraInfo::LOB_DATA;
   extra_info.lob_chunk_type_.set_out_table();
+  extra_info.has_crc_ = true;
+  extra_info.compressed_len_ = 1;
   ASSERT_EQ(OB_SUCCESS, extra_info.serialize(allocator, encoded_info));
   row.storage_datums_[0].set_string(encoded_info);
   const int64_t versions[] = {100, 200, 100};
@@ -1118,6 +1124,8 @@ TEST_F(TestSSOuttableLobUserGCTask, meta_scan_rejects_missing_or_invalid_outtabl
   ObString encoded_info;
   extra_info.extra_info_type_ = ObLobMetaExtraInfo::LOB_DATA;
   extra_info.lob_chunk_type_.set_out_table();
+  extra_info.has_crc_ = true;
+  extra_info.compressed_len_ = 1;
   ASSERT_EQ(OB_SUCCESS, extra_info.serialize(allocator, encoded_info));
   row.storage_datums_[0].set_string(encoded_info);
   row.storage_datums_[1].set_null();

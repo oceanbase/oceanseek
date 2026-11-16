@@ -41,7 +41,6 @@ void ObLobPersistentAppender::reset()
   source_iter_.reset();
   old_piece_.reset();
   first_buffer_.reset();
-  append_data_.reset();
   old_summary_info_.reset();
   last_meta_info_.reset();
   piece_mgr_ = nullptr;
@@ -120,12 +119,13 @@ int ObLobPersistentAppender::prepare_source_()
     }
   }
 
-  ObString append_data;
   const ObMemLobExternHeader *_header = nullptr;
+  ObString append_data;
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(ctx_->delta_loc_.get_append_delta(_header, append_data))) {
     LOG_WARN("failed to get append data", KR(ret), KPC(this));
-  } else if (OB_FAIL(source_iter_.open(&ctx_->own_allocator_, first_buffer_, append_data, ctx_->coll_type_))) {
+  } else if (OB_FAIL(source_iter_.open(
+      &ctx_->own_allocator_, first_buffer_, append_data, ctx_->coll_type_))) {
     LOG_WARN("failed to open lob append source iterator", KR(ret), KPC(ctx_));
   }
   return ret;
@@ -165,6 +165,7 @@ int ObLobPersistentAppender::write_meta_summary_(const uint64_t total_chunk_coun
     extra_info.last_write_type_ = ObLobLastWriteType::APPEND;
     if (is_outtable()) {
       extra_info.lob_chunk_type_.set_out_table();
+      extra_info.compressed_len_ = ctx_->cur_byte_length_ + write_stats_.compressed_len_;
     } else {
       extra_info.lob_chunk_type_.set_in_table();
     }

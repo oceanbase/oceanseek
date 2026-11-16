@@ -11,6 +11,7 @@
 #define private public
 
 #include "lib/allocator/page_arena.h"
+#include "lib/checksum/ob_crc64.h"
 #include "storage/access/ob_dml_param.h"
 #include "storage/blocksstable/ob_storage_object_handle.h"
 #include "storage/lob/access/ob_lob_iterator.h"
@@ -155,6 +156,8 @@ TEST_F(TestLobChunkSpliter, lob_meta_extra_info_uses_lob_chunk_type)
   ObLobMetaExtraInfo source;
   source.extra_info_type_ = ObLobMetaExtraInfo::LOB_DATA;
   source.lob_chunk_type_.set_out_table();
+  source.has_crc_ = true;
+  source.compressed_len_ = 4;
 
   ASSERT_EQ(OB_SUCCESS, source.serialize(allocator, serialized));
   const std::string json(serialized.ptr(), serialized.length());
@@ -166,6 +169,62 @@ TEST_F(TestLobChunkSpliter, lob_meta_extra_info_uses_lob_chunk_type)
   ASSERT_EQ(OB_SUCCESS, decoded.deserialize(external_info_allocator_, serialized));
   ASSERT_EQ(ObLobMetaExtraInfo::LOB_DATA, decoded.extra_info_type_);
   ASSERT_TRUE(decoded.lob_chunk_type_.out_table());
+  ASSERT_TRUE(decoded.has_crc_);
+  ASSERT_EQ(0U, decoded.crc_);
+  ASSERT_EQ(4U, decoded.compressed_len_);
+
+  source.crc_ = UINT64_MAX;
+  ASSERT_EQ(OB_SUCCESS, source.serialize(allocator, serialized));
+  ASSERT_EQ(OB_SUCCESS, decoded.deserialize(allocator, serialized));
+  ASSERT_EQ(UINT64_MAX, decoded.crc_);
+
+  const char *invalid_chunks[] = {
+    "{\"extra_info_type\":2,\"lob_chunk_type\":\"OUT_TABLE\",\"chunk_count\":0,"
+    "\"compressed_len\":4}",
+    "{\"extra_info_type\":2,\"lob_chunk_type\":\"OUT_TABLE\",\"chunk_count\":0,"
+    "\"crc\":-1,\"compressed_len\":4}",
+  };
+  for (const char *invalid_chunk : invalid_chunks) {
+    SCOPED_TRACE(invalid_chunk);
+    ASSERT_EQ(OB_INVALID_ARGUMENT,
+              decoded.deserialize(allocator, ObString::make_string(invalid_chunk)));
+  }
+}
+
+TEST_F(TestLobChunkSpliter, outtable_summary_omits_crc_and_requires_positive_length)
+{
+  ObArenaAllocator allocator;
+  const char *invalid_summaries[] = {
+    "{\"extra_info_type\":1,\"lob_chunk_type\":\"OUT_TABLE\",\"chunk_count\":1}",
+    "{\"extra_info_type\":1,\"lob_chunk_type\":\"OUT_TABLE\",\"chunk_count\":1,"
+    "\"compressed_len\":0}",
+  };
+  ObLobMetaExtraInfo decoded;
+  for (const char *json : invalid_summaries) {
+    SCOPED_TRACE(json);
+    ASSERT_EQ(OB_INVALID_ARGUMENT, decoded.deserialize(allocator, ObString::make_string(json)));
+  }
+
+  ObLobMetaExtraInfo extra_info;
+  extra_info.extra_info_type_ = ObLobMetaExtraInfo::LOB_META_SUMMARY;
+  extra_info.lob_chunk_type_.set_out_table();
+  extra_info.chunk_count_ = 1;
+  extra_info.compressed_len_ = 4;
+  ObString serialized;
+  ASSERT_EQ(OB_SUCCESS, extra_info.serialize(allocator, serialized));
+  const std::string json(serialized.ptr(), serialized.length());
+  ASSERT_EQ(std::string::npos, json.find("\"crc\""));
+  ASSERT_EQ(OB_SUCCESS, decoded.deserialize(allocator, serialized));
+  ASSERT_FALSE(decoded.has_crc_);
+  ASSERT_EQ(4U, decoded.compressed_len_);
+
+  const ObString summary_with_crc = ObString::make_string(
+      "{\"extra_info_type\":1,\"lob_chunk_type\":\"OUT_TABLE\",\"chunk_count\":1,"
+      "\"crc\":7,\"compressed_len\":4}");
+  ASSERT_EQ(OB_SUCCESS, decoded.deserialize(allocator, summary_with_crc));
+  ASSERT_FALSE(decoded.has_crc_);
+  ASSERT_EQ(0U, decoded.crc_);
+  ASSERT_EQ(4U, decoded.compressed_len_);
 }
 
 TEST_F(TestLobChunkSpliter, lob_meta_extra_info_rejects_invalid_last_write_type)
@@ -621,11 +680,12 @@ TEST_F(TestLobChunkSpliter, outtable_batch_preparation_preserves_chunks_and_erro
   const int64_t capacity = ObLobConcurrentPuter::DEFAULT_CAPACITY;
   const int64_t chunk_count = capacity + 2;
   const int64_t chunk_size = ObLobMetaUtil::LOB_OUTTABLE_BLOCK_DATA_SIZE;
-  for (int64_t missing_macro_id = 0; missing_macro_id < 2; ++missing_macro_id) {
+  for (const bool missing_macro_id : {false, true}) {
     SCOPED_TRACE(missing_macro_id);
     ObArenaAllocator allocator;
     ObArenaAllocator batch_allocator;
     ObString data = make_data(allocator, "a", (chunk_count - 1) * chunk_size + 17);
+    MEMSET(data.ptr() + capacity * chunk_size, 'b', chunk_size + 17);
     ObLobAppendSourceIter query_iter;
     ASSERT_EQ(OB_SUCCESS, query_iter.open(&allocator, ObString(), data, CS_TYPE_BINARY));
     ObLobInsertContext insert_ctx;
@@ -645,7 +705,6 @@ TEST_F(TestLobChunkSpliter, outtable_batch_preparation_preserves_chunks_and_erro
     macro_id.set_third_id(1001);
     macro_id.set_fourth_id(2002);
     for (int64_t i = 0; i < chunk_count; ++i) {
-      MEMSET(data.ptr() + i * chunk_size, 'a' + i, (i + 1 == chunk_count) ? 17 : chunk_size);
       macro_id.set_second_id(100 + i);
       if (i < chunk_count - missing_macro_id) {
         ASSERT_EQ(OB_SUCCESS, iter.macro_id_array_.push_back(macro_id));
@@ -656,7 +715,7 @@ TEST_F(TestLobChunkSpliter, outtable_batch_preparation_preserves_chunks_and_erro
     for (int64_t batch = 0; batch < 2; ++batch) {
       batch_allocator.reuse();
       const int ret = iter.prepare_batch_(batch_allocator, chunk_data, control_keys);
-      if (1 == missing_macro_id && 1 == batch) {
+      if (missing_macro_id && 1 == batch) {
         ASSERT_EQ(OB_ERR_UNEXPECTED, ret);
         ASSERT_FALSE(iter.is_end());
         ASSERT_EQ(chunk_count - 1, iter.idx_);
@@ -670,10 +729,13 @@ TEST_F(TestLobChunkSpliter, outtable_batch_preparation_preserves_chunks_and_erro
         const int64_t idx = batch * capacity + i;
         const ObString expected((idx + 1 == chunk_count) ? 17 : chunk_size,
                                 data.ptr() + idx * chunk_size);
+        const uint64_t expected_crc = ob_crc64(expected.ptr(), expected.length());
         ASSERT_EQ(expected, chunk_data.at(i));
         ASSERT_NE(query_iter.buffer_.ptr(), chunk_data.at(i).ptr());
-        ASSERT_EQ(expected.hash(), control_keys.at(i).hash_);
-        ASSERT_EQ(iter.macro_id_array_.at(idx), control_keys.at(i).macro_id_);
+        const blocksstable::MacroBlockId &expected_macro_id = iter.macro_id_array_.at(idx);
+        ASSERT_EQ(expected_macro_id, control_keys.at(i).macro_id_);
+        ASSERT_EQ(expected_crc, control_keys.at(i).hash_);
+        ASSERT_EQ(expected_crc, static_cast<uint64_t>(expected_macro_id.fifth_id()));
       }
       ASSERT_EQ((0 == batch) ? capacity : chunk_count, iter.idx_);
       ASSERT_EQ(iter.idx_, metas.count());
@@ -684,6 +746,7 @@ TEST_F(TestLobChunkSpliter, outtable_batch_preparation_preserves_chunks_and_erro
     const int64_t expected_len = missing_macro_id ? (chunk_count - 1) * chunk_size : data.length();
     ASSERT_EQ(static_cast<uint64_t>(expected_len), stats.byte_len_);
     ASSERT_EQ(stats.byte_len_, stats.char_len_);
+    ASSERT_EQ(stats.byte_len_, stats.compressed_len_);
     for (int64_t i = 0; i < metas.count(); ++i) {
       ObString expected_seq;
       ASSERT_EQ(OB_SUCCESS, ObLobSeqId::get_seq_id(allocator, i + 1, expected_seq));
@@ -699,6 +762,9 @@ TEST_F(TestLobChunkSpliter, outtable_batch_preparation_preserves_chunks_and_erro
       ObLobMetaExtraInfo extra_info;
       ASSERT_EQ(OB_SUCCESS, extra_info.deserialize(allocator, metas.at(i).lob_extra_info_));
       ASSERT_TRUE(extra_info.lob_chunk_type_.out_table());
+      ASSERT_TRUE(extra_info.has_crc_);
+      ASSERT_EQ(metas.at(i).byte_len_, extra_info.compressed_len_);
+      ASSERT_EQ(ob_crc64(data.ptr() + i * chunk_size, metas.at(i).byte_len_), extra_info.crc_);
     }
   }
 }

@@ -57,7 +57,6 @@ protected:
   ObLobMetaManager *meta_mgr_;
   ObLobPieceManager *piece_mgr_;
   common::ObString first_buffer_;
-  common::ObString append_data_;
   ObLobMetaInfo old_summary_info_;
   ObLobMetaInfo last_meta_info_;
   ObLobPieceInfo old_piece_;
