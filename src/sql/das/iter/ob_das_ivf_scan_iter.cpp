@@ -3192,7 +3192,11 @@ int ObDASIVFAsyncIter::scan_async_disk_bbq_post_filter(
     // Do not turn an interrupted/partially processed window into a zero proof.
     if (OB_SUCC(ret) && !scan_budget.should_stop()) {
       const bool stalled = progress.finish_window(collected_count);
-      if (collected_count == 0 || stalled) {
+      // Exhausting centroids does not exhaust the matching rows: quantized
+      // Top-M selection may have discarded them before SQL filtering. Reuse
+      // the PRE fallback when the completed POST scan cannot fill LIMIT + OFFSET.
+      const bool recall_insufficient = !has_active_segment && collected_count < limit_k;
+      if (collected_count == 0 || stalled || recall_insufficient) {
         need_pre_filter = true;
         break;
       }
