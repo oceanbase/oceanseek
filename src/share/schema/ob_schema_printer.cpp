@@ -498,6 +498,8 @@ int ObSchemaPrinter::print_generated_column_definition(const ObColumnSchemaV2 &g
                                                        int64_t &pos) const
 {
   int ret = OB_SUCCESS;
+  const uint64_t tenant_id = table_schema.get_tenant_id();
+  const ObTenantSchema *tenant_schema = nullptr;
   ObString expr_str;
   ObArenaAllocator allocator("SchemaPrinter");
   sql::ObRawExprFactory expr_factory(allocator);
@@ -516,6 +518,13 @@ int ObSchemaPrinter::print_generated_column_definition(const ObColumnSchemaV2 &g
                                     0 /*default proxy id*/,
                                     &allocator))) {
       SHARE_SCHEMA_LOG(WARN, "fail to init session", K(ret));
+    } else if (OB_FAIL(schema_guard_.get_tenant_info(tenant_id, tenant_schema))) {
+      SHARE_SCHEMA_LOG(WARN, "failed to get tenant schema", K(ret), K(tenant_id));
+    } else if (OB_ISNULL(tenant_schema)) {
+      ret = OB_TENANT_NOT_EXIST;
+      SHARE_SCHEMA_LOG(WARN, "tenant does not exist", K(ret), K(tenant_id));
+    } else if (OB_FAIL(session.init_tenant(tenant_schema->get_tenant_name_str(), tenant_id))) {
+      SHARE_SCHEMA_LOG(WARN, "failed to init session tenant", K(ret), K(tenant_id));
     } else if (OB_FAIL(session.load_default_sys_variable(false, false))) {
       SHARE_SCHEMA_LOG(WARN, "session load default system variable failed", K(ret));
       /* bug: 
