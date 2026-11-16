@@ -213,6 +213,7 @@ public:
   virtual void handle(void *task) override;
 public:
   ObReadOnlyTxChecker &get_read_tx_checker() { return read_only_checker_; }
+  ObTxLogCbPoolBudget &get_log_cb_pool_budget() { return log_cb_pool_budget_; }
   int64_t get_unique_seq()
   { return ATOMIC_AAF(&tx_debug_seq_, 1); }
   int check_trans_partition_leader_unsafe(const share::ObLSID &ls_id, bool &is_leader);

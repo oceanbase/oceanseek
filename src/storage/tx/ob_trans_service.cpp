@@ -102,7 +102,7 @@ int ObTransService::init(const ObAddr &self,
 {
   int ret = OB_SUCCESS;
   ObSimpleThreadPool::set_run_wrapper(MTL_CTX());
-  const int64_t tenant_id = MTL_ID();
+  const uint64_t tenant_id = MTL_ID();
   const int64_t tenant_memory_limit = lib::get_tenant_memory_limit(tenant_id);
   int64_t msg_task_cnt = MSG_TASK_CNT_PER_GB * (tenant_memory_limit / (1024 * 1024 * 1024));
   if (msg_task_cnt < MSG_TASK_CNT_PER_GB) {
@@ -131,6 +131,8 @@ int ObTransService::init(const ObAddr &self,
                  std::bind(&ObTransService::gen_trans_id, this, std::placeholders::_1),
                  lib::ObMemAttr(tenant_id, "TxDescMgr")))) {
     TRANS_LOG(WARN, "ObTxDescMgr init error", K(ret));
+  } else if (OB_FAIL(log_cb_pool_budget_.init(tenant_id))) {
+    TRANS_LOG(WARN, "log cb pool budget init error", KR(ret), K(tenant_id));
   } else if (OB_FAIL(tx_ctx_mgr_.init(tenant_id, ts_mgr, this))) {
     TRANS_LOG(WARN, "tx_ctx_mgr_ init error", KR(ret));
   } else if (OB_FAIL(dup_table_loop_worker_.init())) {

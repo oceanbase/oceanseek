@@ -21,6 +21,28 @@ class ObPartTransCtx;
 
 typedef common::ObDList<ObTxLogCbPool> TxLogCbPoolList;
 
+// Real-time count of the log cb pools of a tenant, shared by all its LS managers and
+// bounded by LOG_CB_POOL_MEM_PERCENT of the tenant memory limit. The label hold used
+// before is a 10s snapshot and can not bound a single expansion round.
+class ObTxLogCbPoolBudget
+{
+public:
+  static const int64_t LOG_CB_POOL_MEM_PERCENT = 10;
+  ObTxLogCbPoolBudget() : tenant_id_(common::OB_INVALID_TENANT_ID), pool_cnt_(0) {}
+  int init(const uint64_t tenant_id);
+  // OB_SIZE_OVERFLOW when the budget is used up.
+  int try_acquire();
+  void release();
+  int64_t get_limit() const;
+  int64_t get_used() const { return ATOMIC_LOAD(&pool_cnt_); }
+  uint64_t get_tenant_id() const { return tenant_id_; }
+
+private:
+  uint64_t tenant_id_;
+  int64_t pool_cnt_;
+  DISALLOW_COPY_AND_ASSIGN(ObTxLogCbPoolBudget);
+};
+
 class ObTxLogCbPoolMgr
 {
 public:
@@ -29,7 +51,8 @@ public:
 public:
   ObTxLogCbPoolMgr() : allocator_("TxLogCbPool", common::OB_SERVER_TENANT_ID), pool_list_rw_lock_(common::ObLatchIds::OB_TX_LOG_CB_POOL_MGR_POOL_LIST_LOCK), sync_size_his_lock_(common::ObLatchIds::OB_TX_LOG_CB_POOL_MGR_SYNC_SIZE_HIS_LOCK) { reset(); }
 
-  int init(const int64_t tenant_id, const ObLSID ls_id);
+  // The budget must outlive this manager, pools awaiting GC are still counted in it.
+  int init(const uint64_t tenant_id, const ObLSID ls_id, ObTxLogCbPoolBudget &pool_budget);
   void reset();
   void destroy();
 
@@ -55,6 +78,11 @@ private:
 
   int alloc_log_cb_pool_(ObTxLogCbPool *&alloc_ptr);
   int free_log_cb_pool_(ObTxLogCbPool *&free_ptr, const int64_t wait_timeout = 1000);
+  // The only place a pool is freed and its budget slot returned.
+  void destroy_log_cb_pool_(ObTxLogCbPool *&pool_ptr);
+  // Takes pool_list_rw_lock_ and reclaims freeable GC pools without waiting for busy ones.
+  // Returns the number of pools still in the GC list.
+  int64_t reclaim_gc_pool_list_();
 
   void print_gc_pool_list_();
   int iter_idle_pool_(ObTxLogCbPoolRefGuard &ref_guard);
@@ -101,6 +129,7 @@ private:
   common::SpinRWLock pool_list_rw_lock_;
   TxLogCbPoolList pool_list_;
   bool allow_expand_;
+  ObTxLogCbPoolBudget *pool_budget_ = nullptr;
 
   TxLogCbPoolList gc_pool_list_;
 

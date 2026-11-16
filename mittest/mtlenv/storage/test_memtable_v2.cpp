@@ -4055,7 +4055,7 @@ int ObMemtable::check_row_locked_on_frozen_stores_(
 
 namespace transaction
 {
-int ObLSTxCtxMgr::init(const int64_t tenant_id,
+int ObLSTxCtxMgr::init(const uint64_t tenant_id,
                        const ObLSID &ls_id,
                        ObTxTable *tx_table,
                        ObLockTable *lock_table,

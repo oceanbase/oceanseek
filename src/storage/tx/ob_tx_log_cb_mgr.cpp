@@ -11,19 +11,21 @@ namespace oceanbase
 namespace transaction
 {
 
-int ObTxLogCbPoolMgr::init(const int64_t tenant_id, const ObLSID ls_id)
+int ObTxLogCbPoolMgr::init(const uint64_t tenant_id, const ObLSID ls_id,
+                           ObTxLogCbPoolBudget &pool_budget)
 {
   int ret = OB_SUCCESS;
 
-  if (tenant_id <= 0) {
+  if (!common::is_valid_tenant_id(tenant_id) || tenant_id != pool_budget.get_tenant_id()) {
     ret = OB_INVALID_ARGUMENT;
-    TRANS_LOG(WARN, "invalid argument", K(ret), K(tenant_id));
+    TRANS_LOG(WARN, "invalid argument", K(ret), K(tenant_id), K(pool_budget.get_tenant_id()));
   } else if (ATOMIC_LOAD(&is_inited_)) {
     ret = OB_INIT_TWICE;
     TRANS_LOG(WARN, "init twice", K(ret), KPC(this));
   } else {
     clear_sync_size_history_();
     allocator_.set_tenant_id(tenant_id);
+    pool_budget_ = &pool_budget;
     ls_id_ = ls_id;
     ATOMIC_STORE(&is_inited_, true);
   }
@@ -113,7 +115,12 @@ int ObTxLogCbPoolMgr::clear_log_cb_pool(const bool for_replay)
 int ObTxLogCbPoolMgr::switch_to_leader(const int64_t active_tx_cnt)
 {
   int ret = OB_SUCCESS;
-  ATOMIC_STORE(&allow_expand_, true);
+  if (!ATOMIC_LOAD(&is_inited_)) {
+    ret = OB_NOT_INIT;
+    TRANS_LOG(WARN, "the log cb pool mgr is not inited", K(ret), KPC(this));
+  } else {
+    ATOMIC_STORE(&allow_expand_, true);
+  }
 
   const int64_t active_tx_default_log_pool_cnt =
       ObTxLogCbGroup::ACTIVE_TX_DEFAULT_LOG_GROUP_COUNT * active_tx_cnt
@@ -127,6 +134,11 @@ int ObTxLogCbPoolMgr::switch_to_leader(const int64_t active_tx_cnt)
   int64_t target_log_pool_cnt =
       active_tx_default_log_pool_cnt <= 0 ? 1 : active_tx_default_log_pool_cnt;
 
+  // Return the budget of the pools left in GC by the previous leader before prewarming.
+  if (OB_SUCC(ret)) {
+    (void)reclaim_gc_pool_list_();
+  }
+
   if (OB_SUCC(ret)) {
     int64_t pool_list_size = 0;
     {
@@ -138,6 +150,11 @@ int ObTxLogCbPoolMgr::switch_to_leader(const int64_t active_tx_cnt)
     } else {
       for (int i = pool_list_size; OB_SUCC(ret) && i < target_log_pool_cnt; i++) {
         if (OB_FAIL(append_new_log_cb_pool_())) {
+          if (OB_SIZE_OVERFLOW == ret) {
+            // The tenant budget is used up, a huge active_tx_cnt must not prewarm more.
+            ret = OB_SUCCESS;
+            break;
+          }
           TRANS_LOG(WARN, "append a new log cb pool failed", K(ret), K(i), K(target_log_pool_cnt),
                     K(active_tx_default_log_pool_cnt), K(pool_list_size), KPC(this));
         }
@@ -157,14 +174,34 @@ int ObTxLogCbPoolMgr::adjust_log_cb_pool(const int64_t active_tx_cnt)
   int tmp_ret = OB_SUCCESS;
   int estimated_ret = OB_SUCCESS;
   int64_t expected_pool_cnt = -1;
+  // Tenant budget snapshot, for logging only. -1 when the manager is not inited.
   int64_t limit_pool_cnt = -1;
+  int64_t tenant_pool_cnt = -1;
+
+  if (OB_UNLIKELY(!ATOMIC_LOAD(&is_inited_))) {
+    // Do not read the budget or publish a history sample before initialization.
+    ret = OB_NOT_INIT;
+    estimated_ret = ret;
+    TRANS_LOG(WARN, "the log cb pool mgr is not inited", K(ret), KPC(this));
+  } else {
+    limit_pool_cnt = pool_budget_->get_limit();
+    tenant_pool_cnt = pool_budget_->get_used();
+  }
 
 #ifdef ERRSIM
-  ret = EN_ADJUST_TX_LOG_CB_POOL;
-  if (ret != OB_SUCCESS) {
-    TRANS_LOG(WARN, "adjust tx log cb pool", K(ret), K(active_tx_cnt), KPC(this));
+  // Guarded so that the injected result can not overwrite OB_NOT_INIT.
+  if (OB_SUCC(ret)) {
+    ret = EN_ADJUST_TX_LOG_CB_POOL;
+    if (ret != OB_SUCCESS) {
+      TRANS_LOG(WARN, "adjust tx log cb pool", K(ret), K(active_tx_cnt), KPC(this));
+    }
   }
 #endif
+
+  // Return old pool budget before taking the history lock.
+  if (OB_SUCC(ret)) {
+    (void)reclaim_gc_pool_list_();
+  }
 
   SpinWLockGuard w_lock_guard(sync_size_his_lock_);
 
@@ -184,14 +221,6 @@ int ObTxLogCbPoolMgr::adjust_log_cb_pool(const int64_t active_tx_cnt)
   int64_t sync_size_increased_cnt = 0;
 
   int64_t removed_cnt = 0;
-
-  const int64_t tenant_memory_limit = ::oceanbase::lib::get_tenant_memory_limit(MTL_ID());
-
-  common::ObLabelItem item;
-  ObLabel mem_label("TxLogCbPool");
-  (void)::oceanbase::lib::get_tenant_label_memory(MTL_ID(), mem_label, item);
-  const int64_t log_cb_pool_mem_used = item.hold_;
-  // ::oceanbase::lib::get_tenant_label_memory(MTL_ID(), ObLabel &label, common::ObLabelItem &item);
 
   if (OB_SUCC(ret)) {
     SpinRLockGuard guard(pool_list_rw_lock_);
@@ -232,20 +261,11 @@ int ObTxLogCbPoolMgr::adjust_log_cb_pool(const int64_t active_tx_cnt)
       TRANS_LOG(WARN, "check sync_size increased failed", K(ret), K(expand_cnt),
                 K(sync_size_increased_cnt));
     } else {
-      if ((expand_cnt > 0 && sync_size_increased_cnt < expand_cnt)
-          || (log_cb_pool_mem_used >= tenant_memory_limit / 10)) {
+      if (expand_cnt > 0 && sync_size_increased_cnt < expand_cnt) {
         ATOMIC_STORE(&allow_expand_, false);
       } else {
         ATOMIC_STORE(&allow_expand_, true);
       }
-    }
-  }
-
-  if (OB_SUCC(ret)) {
-    if (!ATOMIC_LOAD(&allow_expand_)) {
-      ret = OB_OP_NOT_ALLOW;
-      TRANS_LOG(WARN, "the expansion operation has been prohibited", K(ret), K(expand_cnt),
-                K(sync_size_increased_cnt), KPC(this));
     }
   }
 
@@ -272,6 +292,9 @@ int ObTxLogCbPoolMgr::adjust_log_cb_pool(const int64_t active_tx_cnt)
                  > ObTxLogCbPool::MAX_LOG_CB_GROUP_COUNT_IN_POOL / 4) {
         expected_pool_float_cnt = 1.0;
       }
+    } else if (aver_adjust_interval <= 0) {
+      // No usable observation interval yet, do not divide by zero.
+      expected_pool_float_cnt = pool_list_size;
     } else if (cur_group_occupy_percent >= max_group_occupy_percent
                || cur_group_occupy_percent <= min_group_occupy_percent) {
       expected_pool_float_cnt = total_occupied_time / expected_group_occupy_percent
@@ -282,10 +305,19 @@ int ObTxLogCbPoolMgr::adjust_log_cb_pool(const int64_t active_tx_cnt)
     }
 
     expected_pool_cnt = ceil(expected_pool_float_cnt);
+    // Prohibiting expansion must not skip shrinking.
+    if (expected_pool_cnt > pool_list_size && !ATOMIC_LOAD(&allow_expand_)) {
+      expected_pool_cnt = pool_list_size;
+    }
 
     if (pool_list_size < expected_pool_cnt) {
       for (int64_t i = pool_list_size; i < expected_pool_cnt && OB_SUCC(ret); i++) {
         if (OB_FAIL(append_new_log_cb_pool_())) {
+          if (OB_SIZE_OVERFLOW == ret) {
+            // The tenant budget bounds the round, expected_pool_cnt itself is not bounded.
+            ret = OB_SUCCESS;
+            break;
+          }
           TRANS_LOG(WARN, "append a new log cb pool failed", K(ret), K(i), K(pool_list_size),
                     K(expected_pool_cnt), KPC(this));
         } else {
@@ -303,9 +335,9 @@ int ObTxLogCbPoolMgr::adjust_log_cb_pool(const int64_t active_tx_cnt)
       int64_t iter_cnt = 0;
 
       SpinWLockGuard guard(pool_list_rw_lock_);
-      DLIST_FOREACH_REMOVESAFE_X(
-          curr, pool_list_, removed_cnt < actual_need_remove_cnt && iter_cnt < MAX_ITER_POOL_CNT)
-      {
+      const int64_t scan_pool_cnt = MIN(MAX_ITER_POOL_CNT, pool_list_.get_size());
+      while (removed_cnt < actual_need_remove_cnt && iter_cnt < scan_pool_cnt) {
+        ObTxLogCbPool *curr = pool_list_.get_first();
         if (curr->can_be_freed()) {
           ATOMIC_BCAS(&idle_pool_ptr_, curr, nullptr);
           if (OB_TMP_FAIL(free_log_cb_pool_(curr))) {
@@ -314,6 +346,9 @@ int ObTxLogCbPoolMgr::adjust_log_cb_pool(const int64_t active_tx_cnt)
           } else {
             removed_cnt++;
           }
+        } else {
+          // Rotate the scanned busy pools so that later rounds reach the idle tail.
+          (void)pool_list_.move_to_last(curr);
         }
         iter_cnt++;
       }
@@ -338,8 +373,8 @@ int ObTxLogCbPoolMgr::adjust_log_cb_pool(const int64_t active_tx_cnt)
 
   TRANS_LOG(INFO, "[LogCbPool Adjust] adjust log cb pools", K(ret), K(estimated_ret),
             K(removed_cnt), K(sync_size_increased_cnt), K(expand_cnt), K(pool_list_size),
-            K(tenant_memory_limit), K(log_cb_pool_mem_used), K(expected_pool_cnt),
-            K(limit_pool_cnt), K(start_estimated_time), K(total_synced_size), K(total_synced_time),
+            K(tenant_pool_cnt), K(expected_pool_cnt), K(limit_pool_cnt),
+            K(start_estimated_time), K(total_synced_size), K(total_synced_time),
             K(total_occupied_count), K(total_occupied_time), K(total_syncing_size),
             K(total_occpying_size), K(aver_adjust_interval), K(sync_his_flag), KPC(this));
   (void)print_sync_size_history_();
@@ -401,7 +436,9 @@ int ObTxLogCbPoolMgr::append_new_log_cb_pool_()
 
   ObTxLogCbPool *log_cb_alloc_ptr = nullptr;
   if (OB_FAIL(alloc_log_cb_pool_(log_cb_alloc_ptr))) {
-    TRANS_LOG(WARN, "alloc a log cb pool failed", K(ret), KPC(log_cb_alloc_ptr), KPC(this));
+    if (OB_SIZE_OVERFLOW != ret) {
+      TRANS_LOG(WARN, "alloc a log cb pool failed", K(ret), KPC(log_cb_alloc_ptr), KPC(this));
+    }
   } else {
     SpinWLockGuard guard(pool_list_rw_lock_);
     if (false == pool_list_.add_last(log_cb_alloc_ptr)) {
@@ -410,8 +447,7 @@ int ObTxLogCbPoolMgr::append_new_log_cb_pool_()
     }
 
     if (OB_FAIL(ret)) {
-      log_cb_alloc_ptr->~ObTxLogCbPool();
-      (void)allocator_.free(log_cb_alloc_ptr);
+      destroy_log_cb_pool_(log_cb_alloc_ptr);
     } else {
       TRANS_LOG(INFO, "append a new log cb pool", K(ret), KPC(log_cb_alloc_ptr), KPC(this));
     }
@@ -427,13 +463,17 @@ int ObTxLogCbPoolMgr::alloc_log_cb_pool_(ObTxLogCbPool *&alloc_ptr)
   const int64_t log_cb_mem_size = sizeof(ObTxLogCbPool);
   ObTxLogCbPool *tmp_alloc_ptr = nullptr;
 
-  if (OB_ISNULL(tmp_alloc_ptr = static_cast<ObTxLogCbPool *>(allocator_.alloc(log_cb_mem_size)))) {
+  if (OB_FAIL(pool_budget_->try_acquire())) {
+    // The tenant budget is used up, transactions fall back to inline log cbs.
+  } else if (OB_ISNULL(tmp_alloc_ptr =
+                           static_cast<ObTxLogCbPool *>(allocator_.alloc(log_cb_mem_size)))) {
+    pool_budget_->release();
     ret = OB_ALLOCATE_MEMORY_FAILED;
     TRANS_LOG(WARN, "alloc log cb pool failed", K(ret), K(log_cb_mem_size), KP(tmp_alloc_ptr));
   } else if (OB_FALSE_IT(new (tmp_alloc_ptr) ObTxLogCbPool())) {
   } else if (OB_FAIL(tmp_alloc_ptr->init())) {
-    allocator_.free(tmp_alloc_ptr);
-    TRANS_LOG(WARN, "init alloc ptr failed", K(ret), KPC(alloc_ptr), KPC(this));
+    TRANS_LOG(WARN, "init alloc ptr failed", K(ret), KPC(tmp_alloc_ptr), KPC(this));
+    destroy_log_cb_pool_(tmp_alloc_ptr);
   } else {
     alloc_ptr = tmp_alloc_ptr;
     TRANS_LOG(INFO, "alloc a new log cb pool", K(ret), K(log_cb_mem_size), KP(alloc_ptr),
@@ -494,8 +534,7 @@ int ObTxLogCbPoolMgr::free_log_cb_pool_(ObTxLogCbPool *&free_ptr, const int64_t 
           if (gc_pool_ptr->get_next() != nullptr || gc_pool_ptr->get_prev() != nullptr) {
             gc_pool_list_.remove(gc_pool_ptr);
           }
-          gc_pool_ptr->~ObTxLogCbPool();
-          (void)allocator_.free(gc_pool_ptr);
+          destroy_log_cb_pool_(gc_pool_ptr);
           gc_pool_count++;
         }
       }
@@ -664,6 +703,74 @@ int ObTxLogCbPoolMgr::cal_expected_log_cb_pool_cnt_(int64_t &expected_pool_cnt)
   }
 
   return ret;
+}
+
+int ObTxLogCbPoolBudget::init(const uint64_t tenant_id)
+{
+  int ret = OB_SUCCESS;
+  if (!common::is_valid_tenant_id(tenant_id)) {
+    ret = OB_INVALID_ARGUMENT;
+    TRANS_LOG(WARN, "invalid argument", K(ret), K(tenant_id));
+  } else {
+    tenant_id_ = tenant_id;
+  }
+  return ret;
+}
+
+int ObTxLogCbPoolBudget::try_acquire()
+{
+  int ret = OB_SUCCESS;
+  const int64_t limit = get_limit();
+  if (get_used() >= limit) {
+    ret = OB_SIZE_OVERFLOW;
+  } else if (ATOMIC_AAF(&pool_cnt_, 1) > limit) {
+    // Another LS took the last slot after the load above.
+    release();
+    ret = OB_SIZE_OVERFLOW;
+  }
+  if (OB_SIZE_OVERFLOW == ret && REACH_TIME_INTERVAL(5 * 1000 * 1000)) {
+    TRANS_LOG(WARN, "log cb pool budget is used up, transactions fall back to inline log cbs",
+              K_(tenant_id), K(limit), "used", get_used());
+  }
+  return ret;
+}
+
+void ObTxLogCbPoolBudget::release()
+{
+  const int64_t pool_cnt = ATOMIC_AAF(&pool_cnt_, -1);
+  if (OB_UNLIKELY(pool_cnt < 0)) {
+    TRANS_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "log cb pool budget released more than acquired",
+                  K_(tenant_id), K(pool_cnt));
+  }
+}
+
+int64_t ObTxLogCbPoolBudget::get_limit() const
+{
+  // Divide instead of multiplying first, so that a huge limit (e.g. INT64_MAX) can not overflow.
+  return ::oceanbase::lib::get_tenant_memory_limit(tenant_id_) / (100 / LOG_CB_POOL_MEM_PERCENT)
+         / static_cast<int64_t>(sizeof(ObTxLogCbPool));
+}
+
+int64_t ObTxLogCbPoolMgr::reclaim_gc_pool_list_()
+{
+  SpinWLockGuard guard(pool_list_rw_lock_);
+  // Return old quota without waiting for busy pools or stopping at a busy tail.
+  DLIST_FOREACH_REMOVESAFE_NORET(curr, gc_pool_list_)
+  {
+    if (curr->can_be_freed()) {
+      gc_pool_list_.remove(curr);
+      destroy_log_cb_pool_(curr);
+    }
+  }
+  return gc_pool_list_.get_size();
+}
+
+void ObTxLogCbPoolMgr::destroy_log_cb_pool_(ObTxLogCbPool *&pool_ptr)
+{
+  pool_ptr->~ObTxLogCbPool();
+  (void)allocator_.free(pool_ptr);
+  pool_ptr = nullptr;
+  pool_budget_->release();
 }
 
 } // namespace transaction

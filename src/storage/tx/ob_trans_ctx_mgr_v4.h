@@ -187,7 +187,7 @@ public:
   // @param [in] ts_mgr: used to get gts, see: update_max_replay_commit_version function;
   // @param [in] txs: transaction service which hold the ObTxCtxMgr;
   // @param [in] log_param: the params which is used to init ObLSTxCtxMgr's log_adapter_def_;
-  int init(const int64_t tenant_id,
+  int init(const uint64_t tenant_id,
            const share::ObLSID &ls_id,
            ObTxTable *tx_table,
            ObLockTable *lock_table,
@@ -549,7 +549,7 @@ public:
   ObTxRetainCtxMgr &get_retain_ctx_mgr() { return ls_retain_ctx_mgr_; }
 
   // Get the tenant_id corresponding to this ObLSTxCtxMgr;
-  int64_t get_tenant_id() { return tenant_id_; }
+  uint64_t get_tenant_id() { return tenant_id_; }
 
   // check is master
   bool is_master() const { return is_master_(); }
@@ -667,7 +667,7 @@ private:
   ObLSTxCtxMap ls_tx_ctx_map_;
 
   // The tenant ID to which this ObLSTxCtxMgr belongs
-  int64_t tenant_id_;
+  uint64_t tenant_id_;
 
   // The ls ID associated with this ObLSTxCtxMgr
   share::ObLSID ls_id_;

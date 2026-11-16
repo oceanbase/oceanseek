@@ -148,7 +148,7 @@ int ObLSTxCtxIterator::get_next_tx_id_(ObTransID& tx_id)
   return ret;
 }
 
-int ObLSTxCtxMgr::init(const int64_t tenant_id,
+int ObLSTxCtxMgr::init(const uint64_t tenant_id,
                        const ObLSID &ls_id,
                        ObTxTable *tx_table,
                        ObLockTable *lock_table,
@@ -171,7 +171,7 @@ int ObLSTxCtxMgr::init(const int64_t tenant_id,
     TRANS_LOG(WARN, "tx log adapter init error", KR(ret));
   } else if (OB_NOT_NULL(log_adapter) && OB_FALSE_IT(tx_log_adapter_ = log_adapter)) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (OB_FAIL(log_cb_pool_mgr_.init(tenant_id, ls_id))) {
+  } else if (OB_FAIL(log_cb_pool_mgr_.init(tenant_id, ls_id, txs->get_log_cb_pool_budget()))) {
     TRANS_LOG(WARN, "init log_cb_pool_mgr failed", K(ret), K(ls_id_), K(log_cb_pool_mgr_));
   } else if (OB_FAIL(ls_log_writer_.init(tenant_id, ls_id, tx_log_adapter_, this))) {
     TRANS_LOG(WARN, "ls_log_writer init fail", KR(ret));

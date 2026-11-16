@@ -366,6 +366,8 @@ int assign_user_savepoint_(ObTxDesc &tx, ObTxSavePointList &savepoints);
 int update_user_savepoint_(ObTxDesc &tx, const ObTxSavePointList &savepoints);
 
 private:
+// Declared before tx_ctx_mgr_ so that it outlives the LS pool managers.
+ObTxLogCbPoolBudget log_cb_pool_budget_;
 ObTxCtxMgr tx_ctx_mgr_;
 void invalid_registered_snapshot_(ObTxDesc &tx);
 void process_registered_snapshot_on_commit_(ObTxDesc &tx);
