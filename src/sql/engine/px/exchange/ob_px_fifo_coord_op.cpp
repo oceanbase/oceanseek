@@ -115,6 +115,7 @@ int ObPxFifoCoordOp::inner_get_next_batch(const int64_t max_row_cnt)
 int ObPxFifoCoordOp::fetch_rows(const int64_t row_cnt)
 {
   int ret = OB_SUCCESS;
+  const bool use_rich_batch = is_vectorized() && get_spec().use_rich_format_;
   ObPhysicalPlanCtx *phy_plan_ctx = GET_PHY_PLAN_CTX(ctx_);
   if (iter_end_) {
     ret = OB_ITER_END;
@@ -139,6 +140,10 @@ int ObPxFifoCoordOp::fetch_rows(const int64_t row_cnt)
   }
 #endif
 
+  // rich-format 预取前归还旧批的耗尽块，部分消费块继续保留。
+  if (OB_SUCC(ret) && use_rich_batch && OB_FAIL(row_reader_.prepare_next_batch())) {
+    LOG_WARN("failed to prepare receive batch", K(ret));
+  }
   while (OB_SUCC(ret)) {
     // rows must received by coord op instead of receive op, otherwise we will
     // trap in receive op and lose control.

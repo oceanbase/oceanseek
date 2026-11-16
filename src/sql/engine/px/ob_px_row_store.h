@@ -132,6 +132,8 @@ public:
                          ObEvalCtx &eval_ctx,
                          const int64_t max_rows, int64_t &read_rows,
                          const ObCompactRow **srows);
+  // 下一批预取前回收旧批引用的耗尽块，部分消费块继续保留。
+  int prepare_next_batch();
   void reset();
 
   int init_row_meta();
@@ -145,6 +147,8 @@ private:
                             int64_t max_rows,
                             int64_t &read_rows,
                             const ObCompactRow **srows);
+  int collect_compact_rows(int64_t max_rows, int64_t &read_rows,
+                           const ObCompactRow **srows);
   int check_and_switch_buffer(dtl::ObDtlLinkedBuffer *&buffer);
   void move_to_iterated(const int64_t rows);
   void free(dtl::ObDtlLinkedBuffer *buf);

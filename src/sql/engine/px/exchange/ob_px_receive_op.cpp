@@ -797,6 +797,10 @@ int ObPxFifoReceiveOp::get_rows_from_channels_vec(const int64_t row_cnt, int64_t
   int ret = OB_SUCCESS;
   bool got_row = false;
   UNUSED(timeout_us);
+  // 预取前归还上一批的耗尽块，避免新旧批次同时持有整批 buffer。
+  if (OB_FAIL(row_reader_.prepare_next_batch())) {
+    LOG_WARN("failed to prepare receive batch", K(ret));
+  }
   while (!got_row && OB_SUCC(ret)) {
     // Check uniterated rows first, then check all channels are EOF.
     // Because channel may mark to EOF after transfer buffer to reader, rows still in reader.

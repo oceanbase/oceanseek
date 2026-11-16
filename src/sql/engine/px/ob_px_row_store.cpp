@@ -354,11 +354,62 @@ int ObReceiveRowReader::check_and_switch_buffer(dtl::ObDtlLinkedBuffer *&curr)
           }
         }
       } else {
+        // 最后一个块将被归还，清除解码器的旧引用，保证后续新块重新解码。
+        curr_vector_.reset();
         recv_head_->next_ = iterated_buffers_;
         iterated_buffers_ = recv_head_;
         recv_tail_ = nullptr;
         recv_head_ = nullptr;
         curr = nullptr;
+      }
+    }
+  }
+  return ret;
+}
+
+int ObReceiveRowReader::prepare_next_batch()
+{
+  int ret = OB_SUCCESS;
+  if (nullptr == datum_iter_ && nullptr == vec_row_iter_) {
+    // 消费者已请求下一批，旧输出的浅引用可以失效。
+    free_iterated_buffers();
+    dtl::ObDtlLinkedBuffer *curr = nullptr;
+    if (OB_FAIL(check_and_switch_buffer(curr))) {
+      LOG_WARN("failed to prepare next receive batch", K(ret));
+    } else {
+      // 切块可能刚把最后一个耗尽块移入延迟回收链表，须在预取前一并归还。
+      free_iterated_buffers();
+    }
+  }
+  return ret;
+}
+
+int ObReceiveRowReader::collect_compact_rows(
+    int64_t max_rows, int64_t &read_rows, const ObCompactRow **srows)
+{
+  int ret = OB_SUCCESS;
+  read_rows = 0;
+  // 只收集已接管块的行指针，当前批完成前不能归还任何引用块。
+  while (OB_SUCC(ret) && read_rows < max_rows) {
+    dtl::ObDtlLinkedBuffer *curr = nullptr;
+    if (OB_FAIL(check_and_switch_buffer(curr))) {
+      LOG_WARN("failed to switch receive buffer", K(ret));
+    } else if (nullptr == curr || dtl::PX_VECTOR_ROW != curr->msg_type()) {
+      break;
+    } else {
+      auto *blk = reinterpret_cast<ObTempRowStore::RowBlock *>(curr->buf());
+      int64_t chunk_rows = 0;
+      // 从累计行数之后追加指针，保持各列的有效行下标连续。
+      if (OB_FAIL(get_next_compact_rows(blk, max_rows - read_rows,
+                                       chunk_rows, srows + read_rows))) {
+        LOG_WARN("failed to collect compact rows", K(ret));
+      } else if (chunk_rows <= 0) {
+        // 未耗尽的 ROW 块必须有读取进展，避免异常块导致无限循环。
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("no progress when collecting compact rows", K(ret), K(chunk_rows), K(read_rows),
+                 K(max_rows), K(blk->rows()), K_(cur_iter_rows), K_(cur_iter_pos));
+      } else {
+        read_rows += chunk_rows;
       }
     }
   }
@@ -784,8 +835,8 @@ int ObReceiveRowReader::get_next_batch_vec(const ObIArray<ObExpr*> &exprs,
     } else {
       switch (curr_buffer->msg_type()) {
         case dtl::PX_VECTOR_ROW : {
-          ObTempRowStore::RowBlock *blk = reinterpret_cast<ObTempRowStore::RowBlock *> (curr_buffer->buf());
-          if (OB_FAIL(get_next_compact_rows(blk, max_rows, read_rows, srows))) {
+          // 跨块收集完再统一初始化和投影，避免后续块覆盖前面块的向量结果。
+          if (OB_FAIL(collect_compact_rows(max_rows, read_rows, srows))) {
             LOG_WARN("failed to get next compact rows", K(ret));
           } else {
             for (int64_t i = 0; OB_SUCC(ret) && i < exprs.count(); ++i) {
