@@ -52,7 +52,7 @@ ObSpecialSysVarValues::ObSpecialSysVarValues()
 #ifdef OB_BUILD_CLOSE_MODULES
                                      "OceanBase 4.6.0.0 AI %s (r%s) (Built %s %s)",
 #else
-                                     "OceanBase_AI_CE %s (r%s) (Built %s %s)",
+                                     "OceanSeek %s (r%s) (Built %s %s)",
 
 #endif
                                      PACKAGE_VERSION, build_version(),
@@ -68,7 +68,7 @@ ObSpecialSysVarValues::ObSpecialSysVarValues()
 #ifdef OB_BUILD_CLOSE_MODULES
                                      pos, "5.7.25-OceanBase Database AI-v%s", PACKAGE_VERSION))) {
 #else
-                                     pos, "5.7.25-OceanBase_CE-v%s", PACKAGE_VERSION))) {
+                                     pos, "5.7.25-OceanSeek-v%s", PACKAGE_VERSION))) {
 
 #endif
     LOG_ERROR("fail to print version to buff", K(ret));
