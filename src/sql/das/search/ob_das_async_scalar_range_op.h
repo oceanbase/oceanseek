@@ -102,6 +102,8 @@ public:
   // Convert a four-column SQL range to a storage scan range. Preserve complete
   // MIN/MAX doc_id boundaries and project open boundaries to term keys. Nested
   // keys live in posting values rather than async-index rowkeys.
+  // The projected range is deep-copied into allocator before from_range(), so
+  // the shallow store_rowkey_ does not refer to the temporary projection.
   static int project_term_range(const common::ObNewRange &range,
                                 common::ObIAllocator &allocator,
                                 blocksstable::ObDatumRange &term_range);

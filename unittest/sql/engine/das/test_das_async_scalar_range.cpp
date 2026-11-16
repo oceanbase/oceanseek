@@ -164,6 +164,47 @@ TEST(TestDASAsyncScalarRange, project_closed_term_range)
   EXPECT_TRUE(term_range.get_border_flag().inclusive_end());
 }
 
+void overwrite_projection_stack()
+{
+  volatile unsigned char stack_buf[8192];
+  for (int64_t i = 0; i < static_cast<int64_t>(sizeof(stack_buf)); ++i) {
+    stack_buf[i] = 0xA5;
+  }
+}
+
+TEST(TestDASAsyncScalarRange, project_term_range_store_rowkey_outlives_projection)
+{
+  ObArenaAllocator allocator;
+  ObObj start_objs[SEARCH_INDEX_KEY_CNT];
+  ObObj end_objs[SEARCH_INDEX_KEY_CNT];
+  ObNewRange range;
+  ObDatumRange term_range;
+  set_term(start_objs, 1, 2, 3);
+  set_term(end_objs, 4, 5, 6);
+  start_objs[SEARCH_INDEX_DOC_ID].set_min_value();
+  end_objs[SEARCH_INDEX_DOC_ID].set_max_value();
+  set_range(range, start_objs, end_objs, SEARCH_INDEX_KEY_CNT);
+
+  ASSERT_EQ(OB_SUCCESS, ObDASAsyncScalarRangeOp::project_term_range(
+      range, allocator, term_range));
+  overwrite_projection_stack();
+
+  const ObStoreRowkey &start_key = term_range.get_start_key().get_store_rowkey();
+  const ObStoreRowkey &end_key = term_range.get_end_key().get_store_rowkey();
+  ASSERT_EQ(SEARCH_INDEX_KEY_CNT, start_key.get_obj_cnt());
+  ASSERT_EQ(SEARCH_INDEX_KEY_CNT, end_key.get_obj_cnt());
+  ASSERT_NE(start_objs, start_key.get_obj_ptr());
+  ASSERT_NE(end_objs, end_key.get_obj_ptr());
+  EXPECT_EQ(1, start_key.get_obj_ptr()[0].get_int());
+  EXPECT_EQ(2, start_key.get_obj_ptr()[1].get_int());
+  EXPECT_EQ(3, start_key.get_obj_ptr()[2].get_int());
+  EXPECT_TRUE(start_key.get_obj_ptr()[SEARCH_INDEX_DOC_ID].is_min_value());
+  EXPECT_EQ(4, end_key.get_obj_ptr()[0].get_int());
+  EXPECT_EQ(5, end_key.get_obj_ptr()[1].get_int());
+  EXPECT_EQ(6, end_key.get_obj_ptr()[2].get_int());
+  EXPECT_TRUE(end_key.get_obj_ptr()[SEARCH_INDEX_DOC_ID].is_max_value());
+}
+
 TEST(TestDASAsyncScalarRange, project_open_term_range)
 {
   ObArenaAllocator allocator;

@@ -80,13 +80,20 @@ int ObDASAsyncScalarRangeOp::project_term_range(
 {
   int ret = OB_SUCCESS;
   ObDASSearchUtils::AsyncScalarTermRange projected_range;
+  // from_rowkey() keeps store_rowkey_ as a pointer to the source ObObj array.
+  // Copy the projection into allocator first, as the row-count estimate path does,
+  // so the pointer does not refer to this temporary.
+  common::ObNewRange stable_range;
   term_range.reset();
   if (OB_FAIL(ObDASSearchUtils::project_async_scalar_term_range(
       range, projected_range))) {
     LOG_WARN("failed to project async scalar term range", K(ret), K(range));
-  } else if (OB_FAIL(term_range.from_range(projected_range.range_, allocator, true))) {
-    LOG_WARN("failed to convert async scalar scan range",
+  } else if (OB_FAIL(common::deep_copy_range(
+      allocator, projected_range.range_, stable_range))) {
+    LOG_WARN("deep copy async scalar term range failed",
         K(ret), K(projected_range.range_));
+  } else if (OB_FAIL(term_range.from_range(stable_range, allocator, true))) {
+    LOG_WARN("failed to convert async scalar scan range", K(ret), K(stable_range));
   }
   return ret;
 }
