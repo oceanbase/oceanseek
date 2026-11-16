@@ -1061,7 +1061,8 @@ int ObRawExpr::is_const_inherit_expr(bool &is_const_inherit,
 {
   int ret = OB_SUCCESS;
   is_const_inherit = true;
-  if (T_FUN_SYS_RAND == type_
+  if (T_FUN_SYS_LOB_META == type_
+      || T_FUN_SYS_RAND == type_
       || T_FUN_SYS_RANDOM == type_
       || T_FUN_SYS_GENERATOR == type_
       || T_FUN_SYS_UUID == type_

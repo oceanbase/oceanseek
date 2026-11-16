@@ -271,7 +271,9 @@ int ObLobReadContext::build(
   allocator_ = &allocator;
   offset_ = offset;
   len_ = len;
-  if (lob_locator.is_persist_lob() && !lob_locator.has_inrow_data()) {
+  // Cached payload does not replace the snapshot and routing needed for persistent metadata.
+  const bool is_persist_outrow = lob_locator.is_persist_lob() && !lob_locator.is_inrow();
+  if (is_persist_outrow) {
     ObMemLobCommon *mem_loc = nullptr;
     ObMemLobLocationInfo *location_info = nullptr;
     ObMemLobExternHeader *extern_header = nullptr;
@@ -297,12 +299,13 @@ int ObLobReadContext::build(
         timeout_ = retry_info->timeout_;
         if (OB_FAIL(ObLobLocationUtil::is_remote(*this, is_remote, addr_))) {
           LOG_WARN("get lob addr fail", K(ret), KPC(this), K(lob_locator));
+        } else if (lob_locator.has_inrow_data() && OB_FAIL(init_src_loc_wrapper_())) {
+          LOG_WARN("failed to init src loc wrapper", K(ret), K(lob_locator));
         }
       }
     }
   }
-  if (OB_SUCC(ret) && !lob_locator.has_inrow_data()
-      && OB_FAIL(init_src_loc_wrapper_())) {
+  if (OB_SUCC(ret) && !lob_locator.has_inrow_data() && OB_FAIL(init_src_loc_wrapper_())) {
     LOG_WARN("failed to init src loc wrapper", K(ret), K(lob_locator));
   }
   return ret;
@@ -355,7 +358,7 @@ int ObLobReadContext::get_tx_read_snapshot_(
 {
   int ret = OB_SUCCESS;
   ObMemLobExternHeader *extern_header = nullptr;
-  if (!locator.is_persist_lob() || locator.has_inrow_data()) {
+  if (!locator.is_persist_lob() || locator.is_inrow()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("not outrow persist lob", K(ret), K(locator));
   } else if (OB_FAIL(locator.get_extern_header(extern_header))) {

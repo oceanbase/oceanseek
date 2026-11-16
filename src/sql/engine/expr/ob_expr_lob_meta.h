@@ -22,6 +22,8 @@ public:
 
   virtual int calc_result_type1(ObExprResType &type, ObExprResType &arg,
                                 common::ObExprTypeCtx &type_ctx) const override;
+  virtual int calc_result_typeN(ObExprResType &type, ObExprResType *types, int64_t param_num,
+                                common::ObExprTypeCtx &type_ctx) const override;
   virtual int cg_expr(ObExprCGCtx &expr_cg_ctx, const ObRawExpr &raw_expr,
                       ObExpr &rt_expr) const override;
   static int eval_lob_meta(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res);

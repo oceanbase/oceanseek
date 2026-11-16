@@ -11,6 +11,8 @@
 #define private public
 
 #include "lib/allocator/page_arena.h"
+#include "lib/utility/ob_defer.h"
+#include "share/config/ob_server_config.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
 #include "share/ob_lob_access_utils.h"
 #include "storage/lob/common/ob_lob_context.h"
@@ -674,6 +676,115 @@ TEST_F(TestLobLocatorBuilder, read_context_locator_build_and_rebuild)
   EXPECT_TRUE(read_ctx.src_loc_.is_external_temp_lob());
 }
 
+static int make_persistent_test_locator(ObIAllocator &allocator, const ObAddr &addr, const bool is_external,
+                                        const int64_t payload_length, const int64_t tx_id, ObLobLocatorV2 &locator)
+{
+  int ret = OB_SUCCESS;
+  ObLobLocatorV2 disk_locator;
+  ObString disk_data;
+  ObMemLobLocatorBuilder builder;
+  transaction::ObTxReadSnapshot snapshot;
+  snapshot.init_special_read(share::SCN::base_scn());
+  snapshot.set_tx_id(transaction::ObTransID(tx_id));
+  ObExternalBlobInfo info;
+  info.url_ = ObString::make_string("s3://bucket/object");
+  info.length_ = 17;
+  info.kind_ = ObExternalBlobKind::REFERENCE;
+  if (OB_FAIL(make_outrow_disk_locator(allocator, disk_locator, disk_data))) {
+  } else if (OB_FAIL(builder.init(allocator, disk_data, false))) {
+  } else if (OB_FAIL(builder.set_extern_info(200, 1, CS_TYPE_BINARY))) {
+  } else if (OB_FAIL(builder.set_location_info(300, 4, addr))) {
+  } else if (OB_FAIL(builder.set_retry_info(true, false, 123456))) {
+  } else if (OB_FAIL(builder.set_read_snapshot(snapshot, 4, share::SCN::invalid_scn(), 0, false))) {
+  } else if (OB_FAIL(builder.set_rowkey(ObString::make_string("rowkey")))) {
+  } else if (is_external && OB_FAIL(builder.set_external_lob_info(info))) {
+  } else if (OB_FAIL(builder.build(locator))) {
+  } else if (payload_length > 0) {
+    const uint32_t metadata_size = locator.size_;
+    char *with_payload = static_cast<char *>(allocator.alloc(metadata_size + payload_length));
+    if (OB_ISNULL(with_payload)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      MEMCPY(with_payload, locator.ptr_, metadata_size);
+      MEMSET(with_payload + metadata_size, 'x', payload_length);
+      locator.assign_buffer(with_payload, metadata_size + payload_length);
+      ObMemLobCommon *mem_lob = locator.get_mem_lob_common();
+      mem_lob->set_has_payload(true);
+      mem_lob->payload_offset_ = metadata_size;
+      mem_lob->payload_size_ = payload_length;
+    }
+  }
+  return ret;
+}
+
+TEST_F(TestLobLocatorBuilder, read_context_initializes_persistent_outrow_with_cached_payload)
+{
+  const ObAddr saved_addr = GCONF.self_addr_;
+  DEFER(GCONF.self_addr_ = saved_addr);
+  ASSERT_TRUE(GCONF.self_addr_.set_ip_addr("127.0.0.1", 2882));
+  ObArenaAllocator allocator;
+  ObLobId expected_lob_id;
+  expected_lob_id.assign(1, 1001, 2002);
+  for (int64_t kind = 0; kind < 3; ++kind) {
+    SCOPED_TRACE(kind);
+    const bool is_external = 2 == kind;
+    const int64_t payload_length = 1 == kind ? 3 : 0;
+    ObLobLocatorV2 locator;
+    ASSERT_EQ(OB_SUCCESS,
+              make_persistent_test_locator(allocator, GCONF.self_addr_, is_external, payload_length, 0, locator));
+    const std::string original(locator.ptr_, locator.size_);
+    ObLobReadContext read_ctx;
+    // Cached bytes do not replace the physical identity or the read snapshot.
+    ASSERT_EQ(OB_SUCCESS, read_ctx.build(locator, allocator, 0, UINT64_MAX));
+    EXPECT_EQ(locator.ptr_, read_ctx.src_loc_.ptr_);
+    EXPECT_EQ(locator.size_, read_ctx.src_loc_.size_);
+    EXPECT_FALSE(read_ctx.src_loc_.is_inrow());
+    EXPECT_EQ(payload_length > 0, read_ctx.src_loc_.has_inrow_data());
+    EXPECT_EQ(is_external, read_ctx.src_loc_.is_mem_external_lob());
+    EXPECT_EQ(&allocator, read_ctx.allocator_);
+    EXPECT_EQ(CS_TYPE_BINARY, read_ctx.coll_type_);
+    EXPECT_EQ(1, read_ctx.store_column_idx_);
+    EXPECT_EQ(4, read_ctx.ls_id_.id());
+    EXPECT_EQ(300, read_ctx.tablet_id_.id());
+    EXPECT_EQ(123456, read_ctx.timeout_);
+    EXPECT_EQ(share::SCN::base_scn(), read_ctx.snapshot_.version());
+    EXPECT_FALSE(read_ctx.snapshot_.tx_id().is_valid());
+    EXPECT_EQ(UINT64_MAX, read_ctx.byte_size_);
+    ASSERT_TRUE(read_ctx.src_loc_wrapper_.is_valid());
+    EXPECT_EQ(expected_lob_id, read_ctx.src_loc_wrapper_.get_lob_id());
+    if (payload_length > 0) {
+      ObString data;
+      ASSERT_EQ(OB_SUCCESS, read_ctx.src_loc_.get_inrow_data(data));
+      expect_ob_string_eq(data, "xxx", 3);
+    }
+    EXPECT_EQ(0, MEMCMP(locator.ptr_, original.data(), original.size()));
+  }
+}
+
+TEST_F(TestLobLocatorBuilder, read_context_checks_cached_transaction_and_accepts_index_sequence)
+{
+  const ObAddr saved_addr = GCONF.self_addr_;
+  DEFER(GCONF.self_addr_ = saved_addr);
+  ASSERT_TRUE(GCONF.self_addr_.set_ip_addr("127.0.0.1", 2882));
+  ObArenaAllocator allocator;
+  ObLobLocatorV2 locator;
+  ASSERT_EQ(OB_SUCCESS, make_persistent_test_locator(allocator, GCONF.self_addr_, false, 3, 77, locator));
+  ObString disk_locator;
+  ASSERT_EQ(OB_SUCCESS, locator.get_disk_locator(disk_locator));
+  MEMSET(disk_locator.ptr() + sizeof(ObLobCommon) + sizeof(ObLobId), 0, sizeof(int64_t));
+  const std::string original(locator.ptr_, locator.size_);
+  transaction::ObTxDesc tx_desc;
+  tx_desc.tx_id_ = transaction::ObTransID(77);
+  ObLobReadContext read_ctx;
+  ASSERT_EQ(OB_SUCCESS, read_ctx.build(locator, allocator, 0, UINT64_MAX, &tx_desc));
+  EXPECT_EQ(transaction::ObTransID(77), read_ctx.snapshot_.tx_id());
+  ASSERT_TRUE(read_ctx.src_loc_wrapper_.is_valid());
+  EXPECT_FALSE(read_ctx.src_loc_wrapper_.get_seq_no().is_valid());
+  tx_desc.tx_id_ = transaction::ObTransID(88);
+  EXPECT_EQ(OB_NOT_SUPPORTED, read_ctx.build(locator, allocator, 0, UINT64_MAX, &tx_desc));
+  EXPECT_EQ(0, MEMCMP(locator.ptr_, original.data(), original.size()));
+}
+
 TEST_F(TestLobLocatorBuilder, read_context_locator_assign_and_failure)
 {
   ObArenaAllocator allocator;
@@ -979,6 +1090,12 @@ TEST_F(TestLobLocatorBuilder, append_delta_is_operation_not_lob_value)
   ASSERT_EQ(OB_SUCCESS, make_append_delta_locator(allocator, "abc", locator));
   ASSERT_TRUE(locator.is_valid());
   ASSERT_TRUE(locator.is_append_delta_lob());
+
+  // An append delta carries cached bytes without a Disk locator to initialize.
+  ObLobReadContext read_ctx;
+  ASSERT_EQ(OB_SUCCESS, read_ctx.build(locator, allocator, 0, UINT64_MAX));
+  EXPECT_EQ(locator.ptr_, read_ctx.src_loc_.ptr_);
+  EXPECT_FALSE(read_ctx.src_loc_wrapper_.is_valid());
 
   const ObMemLobExternHeader *extern_header = nullptr;
   ObString append_data;

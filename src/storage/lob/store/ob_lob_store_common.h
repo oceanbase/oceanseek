@@ -33,6 +33,19 @@ inline bool is_valid_lob_last_write_type(const ObLobLastWriteType type)
   return type >= ObLobLastWriteType::INSERT && type < ObLobLastWriteType::MAX;
 }
 
+inline const char *lob_last_write_type_to_string(const ObLobLastWriteType type)
+{
+  const char *str = "UNKNOWN";
+  if (type == ObLobLastWriteType::INSERT) {
+    str = "INSERT";
+  } else if (type == ObLobLastWriteType::APPEND) {
+    str = "APPEND";
+  } else if (type == ObLobLastWriteType::MULTIPART_WRITE) {
+    str = "MULTIPART_WRITE";
+  }
+  return str;
+}
+
 class ObLobChunkType
 {
 public:

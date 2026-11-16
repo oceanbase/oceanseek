@@ -49,7 +49,8 @@ const char *ObLobChunkType::to_string() const
 {
   const char *str = nullptr;
   if (type_ == INVALID_TYPE) {
-    str = "INVALID_TYPE";
+    // For historical reasons, INVALID_TYPE is treated as IN_TABLE
+    str = "IN_TABLE";
   } else if (type_ == IN_TABLE) {
     str = "IN_TABLE";
   } else if (type_ == OUT_TABLE) {
@@ -88,7 +89,8 @@ int ObLobChunkType::from_string(const ObString &str)
 {
   int ret = OB_SUCCESS;
   if (0 == str.compare("INVALID_TYPE")) {
-    type_ = ObLobChunkType::INVALID_TYPE;
+    // For historical reasons, INVALID_TYPE is treated as IN_TABLE
+    type_ = ObLobChunkType::IN_TABLE;
   } else if (0 == str.compare("IN_TABLE")) {
     type_ = ObLobChunkType::IN_TABLE;
   } else if (0 == str.compare("OUT_TABLE")) {

@@ -14,6 +14,7 @@
 #include "lib/alloc/ob_malloc_allocator.h"
 #include "lib/allocator/page_arena.h"
 #include "lib/thread/ob_multi_fixed_queue_thread.h"
+#include "lib/utility/ob_print_utils.h"
 #include "logservice/libobcdc/src/ob_cdc_lob_ctx.h"
 #define private public
 #include "logservice/libobcdc/src/ob_cdc_lob_aux_storager.h"
@@ -179,21 +180,25 @@ protected:
   {
     int ret = OB_SUCCESS;
     ObLobMetaInfo meta_info;
-    ObLobMetaExtraInfo extra_info;
-    extra_info.extra_info_type_ = ObLobMetaExtraInfo::LOB_META_SUMMARY;
-    extra_info.chunk_count_ = chunk_count;
-    extra_info.last_write_type_ = ObLobLastWriteType::INSERT;
-    if (OB_FAIL(extra_info.lob_chunk_type_.from_string(lob_chunk_type))) {
-      LOG_WARN("parse lob chunk type failed", KR(ret), KCSTRING(lob_chunk_type));
+    char extra_info_buf[256];
+    int64_t pos = 0;
+    // Build the cache from raw JSON so the fixture retains the historical type string.
+    if (OB_FAIL(databuff_printf(extra_info_buf, sizeof(extra_info_buf), pos,
+        "{\"extra_info_type\":1,\"lob_chunk_type\":\"%s\","
+        "\"chunk_count\":%lu,\"last_write_type\":0", lob_chunk_type, chunk_count))) {
+      LOG_WARN("format lob summary fixture failed", KR(ret), KCSTRING(lob_chunk_type),
+          K(chunk_count));
+    } else if (0 == STRCMP(lob_chunk_type, "OUT_TABLE")
+        && OB_FAIL(databuff_printf(extra_info_buf, sizeof(extra_info_buf), pos,
+            ",\"compressed_len\":%lu", byte_len))) {
+      LOG_WARN("format outtable summary compressed length failed", KR(ret), K(byte_len));
+    } else if (OB_FAIL(databuff_printf(extra_info_buf, sizeof(extra_info_buf), pos, "}"))) {
+      LOG_WARN("finish lob summary fixture failed", KR(ret), KCSTRING(lob_chunk_type));
     } else {
-      if (extra_info.lob_chunk_type_.out_table()) {
-        extra_info.compressed_len_ = byte_len;
-      }
       meta_info.byte_len_ = byte_len;
       meta_info.char_len_ = byte_len;
-      if (OB_FAIL(extra_info.serialize(allocator, meta_info.lob_extra_info_))) {
-        LOG_WARN("serialize lob summary extra info failed", KR(ret), K(extra_info));
-      } else if (OB_FAIL(ObCDCLobAuxTableParser::encode_summary_value(
+      meta_info.lob_extra_info_.assign_ptr(extra_info_buf, static_cast<int32_t>(pos));
+      if (OB_FAIL(ObCDCLobAuxTableParser::encode_summary_value(
           allocator, meta_info, summary_value))) {
         LOG_WARN("encode lob summary cache value failed", KR(ret), K(meta_info));
       }
@@ -385,8 +390,7 @@ protected:
   ObString expected_summary_seq_id_;
 };
 
-// 验证历史 ObLobWriteIter::build_summary_() 写出的 INVALID_TYPE Summary
-// 能被 CDC 正常解析和发布，并在缓存编解码后完整保留长度、分片数和类型信息。
+// CDC must decode the historical type as IN_TABLE while preserving lengths and chunk count.
 TEST_F(TestCDCLobSummaryCompatibility, parser_accepts_historical_invalid_type_summary)
 {
   const char *extra_info_json =
@@ -414,7 +418,8 @@ TEST_F(TestCDCLobSummaryCompatibility, parser_accepts_historical_invalid_type_su
   EXPECT_EQ(8U, byte_len);
   EXPECT_EQ(8U, char_len);
   EXPECT_EQ(ObLobMetaExtraInfo::LOB_META_SUMMARY, extra_info.extra_info_type_);
-  EXPECT_FALSE(extra_info.lob_chunk_type_.is_valid());
+  EXPECT_TRUE(extra_info.lob_chunk_type_.is_valid());
+  EXPECT_STREQ("IN_TABLE", extra_info.lob_chunk_type_.to_string());
   EXPECT_EQ(2U, extra_info.chunk_count_);
   EXPECT_EQ(ObLobLastWriteType::INSERT, extra_info.last_write_type_);
 }

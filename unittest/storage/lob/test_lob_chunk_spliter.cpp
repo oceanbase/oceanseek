@@ -139,7 +139,9 @@ TEST_F(TestLobChunkSpliter, lob_meta_extra_info_legacy_invalid_type_round_trip)
   ObLobMetaExtraInfo extra_info;
   ASSERT_EQ(OB_SUCCESS, extra_info.deserialize(external_info_allocator_, old_summary));
   ASSERT_TRUE(extra_info.lob_chunk_type_.in_table());
+  ASSERT_STREQ("IN_TABLE", extra_info.lob_chunk_type_.to_string());
   ASSERT_EQ(ObLobLastWriteType::INSERT, extra_info.last_write_type_);
+  ASSERT_STREQ("INSERT", lob_last_write_type_to_string(extra_info.last_write_type_));
 
   ObString serialized;
   ASSERT_EQ(OB_SUCCESS, extra_info.serialize(external_info_allocator_, serialized));

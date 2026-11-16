@@ -508,7 +508,8 @@ int ObRawExprInfoExtractor::visit(ObSysFunRawExpr &expr)
     LOG_WARN("add enum or set flag failed", K(ret));
   } else {
     // these functions should not be calculated first
-    if (T_FUN_SYS_AUTOINC_NEXTVAL == expr.get_expr_type()
+    if (T_FUN_SYS_LOB_META == expr.get_expr_type()
+        || T_FUN_SYS_AUTOINC_NEXTVAL == expr.get_expr_type()
         || T_FUN_SYS_VEC_VID == expr.get_expr_type()
         || T_FUN_SYS_DOC_ID == expr.get_expr_type()
         || T_PSEUDO_HIDDEN_CLUSTERING_KEY == expr.get_expr_type()
