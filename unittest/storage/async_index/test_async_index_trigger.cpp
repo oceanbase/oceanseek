@@ -2366,9 +2366,11 @@ TEST_F(TestAsyncIndexTrigger, manual_refresh_location_timeout_preserves_progress
   {
     RefreshTestDispatcher proxy(transport, location, progress);
     ASSERT_NO_FATAL_FAILURE(init_refresh_test_dispatcher(proxy, 3));
+    int64_t node_index = -1;
+    ASSERT_EQ(OB_SUCCESS, progress.get_node(server, node_index));
     const int results[] = {OB_SUCCESS, OB_GET_LOCATION_TIME_OUT, OB_EAGAIN};
     for (int64_t i = 0; i < 3; ++i) {
-      ASSERT_EQ(OB_SUCCESS, proxy.post_partition(server, 1000000, i));
+      ASSERT_EQ(OB_SUCCESS, proxy.post_partition(node_index, 1000000, i));
       proxy.callback_->result_.ret_code_ = results[i];
       ASSERT_EQ(OB_SUCCESS, proxy.callback_->process());
       proxy.retry_states_.at(i).deadline_ = ObTimeUtility::current_time() + 1000000;
@@ -2391,11 +2393,13 @@ TEST_F(TestAsyncIndexTrigger, manual_refresh_location_timeout_preserves_progress
   ASSERT_NO_FATAL_FAILURE(init_refresh_test_dispatcher(retry, 3));
   retry.args_.at(1).ls_id_ = ObLSID(2001);
   ASSERT_EQ(OB_SUCCESS, progress.prepare(retry.args_, retry.memory_tenant_id_));
+  int64_t node_index = -1;
+  ASSERT_EQ(OB_SUCCESS, progress.get_node(server, node_index));
   EXPECT_TRUE(progress.is_success(0));
   for (int64_t i = 1; i < 3; ++i) {
     EXPECT_FALSE(progress.is_success(i));
     EXPECT_EQ(5000, retry.args_.at(i).target_refresh_scn_);
-    ASSERT_EQ(OB_SUCCESS, retry.post_partition(server, 1000000, i));
+    ASSERT_EQ(OB_SUCCESS, retry.post_partition(node_index, 1000000, i));
     ASSERT_EQ(OB_SUCCESS, retry.callback_->process());
   }
   ASSERT_EQ(OB_SUCCESS, retry.collect_results());
