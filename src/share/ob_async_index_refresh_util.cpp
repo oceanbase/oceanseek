@@ -295,17 +295,14 @@ int ObAsyncIndexRefreshUtil::RefreshDispatcher::post_rpc(
 }
 
 int ObAsyncIndexRefreshUtil::RefreshDispatcher::post_partition(
-    const ObAddr &server, const int64_t timeout, const int64_t target_index)
+    const int64_t node_index, const int64_t timeout, const int64_t target_index)
 {
   int ret = OB_SUCCESS;
   const auto &arg = args_.at(target_index);
   void *buf = nullptr;
-  int64_t node_index = -1;
-  if (!server.is_valid() || timeout <= 0 || !arg.is_valid()) {
+  if (node_index < 0 || node_index >= progress_.get_nodes().count() || timeout <= 0 || !arg.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid refresh RPC argument", K(ret), K(server), K(timeout), K(arg));
-  } else if (OB_FAIL(progress_.get_node(server, node_index))) {
-    LOG_WARN("failed to get refresh node", K(ret), K(server));
+    LOG_WARN("invalid refresh RPC argument", K(ret), K(node_index), K(timeout), K(arg));
   } else if (OB_ISNULL(buf = allocator_.alloc(sizeof(Callback)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("failed to allocate refresh RPC callback", K(ret));
@@ -321,7 +318,7 @@ int ObAsyncIndexRefreshUtil::RefreshDispatcher::post_partition(
         ++pending_count_;
         ++progress_.get_nodes().at(node_index).inflight_;
       }
-      if (OB_FAIL(post_rpc(server, timeout, arg, *cb))) {
+      if (OB_FAIL(post_rpc(progress_.get_nodes().at(node_index).server_, timeout, arg, *cb))) {
         int tmp_ret = OB_SUCCESS;
         if (OB_TMP_FAIL(complete(*cb, ret))) {
           LOG_WARN("failed to record refresh posting failure", K(tmp_ret), K(ret));
@@ -464,12 +461,12 @@ int ObAsyncIndexRefreshUtil::RefreshDispatcher::init(
   return ret;
 }
 
-int ObAsyncIndexRefreshUtil::RefreshDispatcher::send_partition(const int64_t i)
+int ObAsyncIndexRefreshUtil::RefreshDispatcher::send_partition(
+    const int64_t i, const int64_t node_index)
 {
   int ret = OB_SUCCESS;
   auto &state = retry_states_.at(i);
   const auto &arg = args_.at(i);
-  ObAddr leader_addr = state.server_;
   common::ObTimeoutCtx timeout_ctx;
   if (OB_FAIL(ObShareUtil::set_default_timeout_ctx(timeout_ctx, refresh_rpc_timeout_))) {
     LOG_WARN("failed to initialize refresh RPC timeout", K(ret), K(arg));
@@ -478,14 +475,6 @@ int ObAsyncIndexRefreshUtil::RefreshDispatcher::send_partition(const int64_t i)
     LOG_WARN("failed to set refresh RPC deadline", K(ret), K(arg), K(state.deadline_));
   } else {
     state.deadline_ = MIN(state.deadline_, timeout_ctx.get_abs_timeout());
-    if (timeout_ctx.is_timeouted()) {
-      ret = OB_TIMEOUT;
-      LOG_WARN("refresh RPC deadline expired before leader lookup", K(ret), K(arg), K(state.deadline_));
-    } else if (OB_FAIL(THIS_WORKER.check_status())) {
-      LOG_WARN("refresh RPC interrupted before leader lookup", K(ret), K(arg));
-    } else if (!leader_addr.is_valid() && OB_FAIL(resolve_server(i, leader_addr))) {
-      LOG_WARN("failed to get refresh RPC leader", K(ret), K(arg), K(state.force_renew_));
-    }
   }
   if (OB_SUCC(ret)) {
     if (storage::ASYNC_REFRESH_TYPE_MANUAL == refresh_type_) {
@@ -498,9 +487,9 @@ int ObAsyncIndexRefreshUtil::RefreshDispatcher::send_partition(const int64_t i)
       LOG_WARN("refresh RPC deadline expired before dispatch", K(ret), K(arg), K(state.deadline_));
     } else {
       ++rpc_count_;
-      if (OB_FAIL(post_partition(leader_addr, timeout_ctx.get_timeout(), i))) {
+      if (OB_FAIL(post_partition(node_index, timeout_ctx.get_timeout(), i))) {
         // The caller retains posting failures even when no callback was allocated.
-        LOG_WARN("failed to post async index refresh RPC", K(ret), K(arg), K(leader_addr));
+        LOG_WARN("failed to post async index refresh RPC", K(ret), K(arg), K(node_index));
       }
     }
   }
@@ -670,7 +659,7 @@ int ObAsyncIndexRefreshUtil::RefreshDispatcher::dispatch_partition(
         waiting_for_slot = true;
       } else {
         state.handled_this_round_ = true;
-        if (OB_SUCCESS != (dispatch_ret = send_partition(i))) {
+        if (OB_SUCCESS != (dispatch_ret = send_partition(i, node_index))) {
           LOG_WARN("failed to dispatch refresh partition", K(dispatch_ret), K(i), K(state.server_));
         }
         state.result_ = dispatch_ret;

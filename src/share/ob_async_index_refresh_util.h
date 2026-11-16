@@ -188,9 +188,8 @@ private:
     int dispatch_partition(const int64_t i, bool &waiting_for_slot);
     int consume_completed();
     bool can_retry_result(const int code) const;
-    bool need_renew_leader(const int code) const;
     virtual int terminate_rpc(const uint64_t gtid, const uint32_t pkt_id);
-    int post_partition(const common::ObAddr &server, const int64_t timeout, const int64_t target_index);
+    int post_partition(const int64_t node_index, const int64_t timeout, const int64_t target_index);
     int complete(Callback &cb, const int code);
     int drain_callbacks();
     void reuse_callbacks();
@@ -205,7 +204,8 @@ private:
       common::ObAddr server_;
       TO_STRING_KV(K_(deadline), K_(result), K_(pending), K_(force_renew));
     };
-    int send_partition(const int64_t i);
+    // Send to the node selected by dispatch_partition after its window check.
+    int send_partition(const int64_t i, const int64_t node_index);
     int collect_results();
     int prepare_retry(const int64_t attempt, const int current_ret,
         bool &has_pending, int64_t &sleep_us);

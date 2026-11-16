@@ -2152,9 +2152,11 @@ TEST_F(TestAsyncIndexTrigger, ddl_refresh_allocates_on_coordinator_without_busin
       EXPECT_EQ(OB_SYS_TENANT_ID, proxy.callbacks_.get_block_allocator().get_attr().tenant_id_);
       EXPECT_EQ(absent_tenant_id, proxy.args_.at(0).tenant_id_);
       EXPECT_EQ(type, proxy.args_.at(0).refresh_type_);
+      int64_t node_index = -1;
+      ASSERT_EQ(OB_SUCCESS, progress.get_node(server, node_index));
       // Allocate callbacks and exercise retry reuse without real network traffic.
       for (int round = 0; round < 2; ++round) {
-        ASSERT_EQ(OB_SUCCESS, proxy.post_partition(server, 1000000, partition_count - 1));
+        ASSERT_EQ(OB_SUCCESS, proxy.post_partition(node_index, 1000000, partition_count - 1));
         ASSERT_EQ(OB_SUCCESS, proxy.callback_->process());
         ASSERT_EQ(OB_SUCCESS, proxy.collect_results());
         EXPECT_TRUE(progress.is_success(partition_count - 1));
@@ -2215,12 +2217,14 @@ TEST_F(TestAsyncIndexTrigger, async_refresh_transport_errors_preserve_retry_clas
   ObAddr server;
   ASSERT_TRUE(server.set_ip_addr("127.0.0.1", 2882));
   ASSERT_NO_FATAL_FAILURE(init_refresh_test_dispatcher(proxy, 1));
+  int64_t node_index = -1;
+  ASSERT_EQ(OB_SUCCESS, progress.get_node(server, node_index));
   const int errors[] = {PNIO_CONNECT_FAIL, PNIO_TIMEOUT_NOT_SENT_OUT,
       PNIO_DISCONNECT_NOT_SENT_OUT, PNIO_TIMEOUT, PNIO_DISCONNECT, PNIO_PKT_TERMINATE};
   for (const int error : errors) {
     SCOPED_TRACE(error);
     proxy.retry_states_.at(0).result_ = OB_SUCCESS;
-    ASSERT_EQ(OB_SUCCESS, proxy.post_partition(server, 1000000, 0));
+    ASSERT_EQ(OB_SUCCESS, proxy.post_partition(node_index, 1000000, 0));
     ASSERT_NE(nullptr, proxy.callback_);
     // Mirror ObAsyncRespCallback::handle_resp: a non-success return falls back
     // to on_timeout. This catches both classification loss and double completion.
@@ -2241,7 +2245,7 @@ TEST_F(TestAsyncIndexTrigger, async_refresh_transport_errors_preserve_retry_clas
     if (unsent) {
       // Reposting the same target after a confirmed send failure can succeed.
       proxy.retry_states_.at(0).result_ = OB_SUCCESS;
-      ASSERT_EQ(OB_SUCCESS, proxy.post_partition(server, 1000000, 0));
+      ASSERT_EQ(OB_SUCCESS, proxy.post_partition(node_index, 1000000, 0));
       ASSERT_EQ(OB_SUCCESS, proxy.callback_->process());
       ASSERT_EQ(OB_SUCCESS, proxy.collect_results());
       EXPECT_TRUE(progress.is_success(0));
@@ -2263,7 +2267,9 @@ TEST_F(TestAsyncIndexTrigger, async_refresh_failed_post_returns_then_drains_slow
   ObAddr server;
   ASSERT_TRUE(server.set_ip_addr("127.0.0.1", 2882));
   ASSERT_NO_FATAL_FAILURE(init_refresh_test_dispatcher(proxy, 2));
-  ASSERT_EQ(OB_SUCCESS, proxy.post_partition(server, 60 * 1000 * 1000, 0));
+  int64_t node_index = -1;
+  ASSERT_EQ(OB_SUCCESS, progress.get_node(server, node_index));
+  ASSERT_EQ(OB_SUCCESS, proxy.post_partition(node_index, 60 * 1000 * 1000, 0));
   auto *slow_callback = proxy.callback_;
   ASSERT_NE(nullptr, slow_callback);
   bool terminated = false;
@@ -2286,7 +2292,7 @@ TEST_F(TestAsyncIndexTrigger, async_refresh_failed_post_returns_then_drains_slow
     }
   });
   proxy.fail_post_ = true;
-  const int post_ret = proxy.post_partition(server, 60 * 1000 * 1000, 1);
+  const int post_ret = proxy.post_partition(node_index, 60 * 1000 * 1000, 1);
   int64_t pending_after_post = 0;
   {
     ObThreadCondGuard guard(proxy.cond_);
@@ -2323,12 +2329,14 @@ TEST_F(TestAsyncIndexTrigger, async_refresh_no_callback_failure_preserves_partit
   ASSERT_NO_FATAL_FAILURE(init_refresh_test_dispatcher(proxy, 2));
   ObAddr server;
   ASSERT_TRUE(server.set_ip_addr("127.0.0.1", 2882));
+  int64_t node_index = -1;
+  ASSERT_EQ(OB_SUCCESS, progress.get_node(server, node_index));
   ASSERT_EQ(OB_SUCCESS, proxy.allocator_.get_arena().init(OB_MALLOC_NORMAL_BLOCK_SIZE, failing_pages));
-  proxy.retry_states_.at(0).result_ = proxy.post_partition(server, 1000000, 0);
+  proxy.retry_states_.at(0).result_ = proxy.post_partition(node_index, 1000000, 0);
   EXPECT_EQ(OB_ALLOCATE_MEMORY_FAILED, proxy.retry_states_.at(0).result_);
   EXPECT_EQ(0, proxy.callbacks_.count());
   ASSERT_EQ(OB_SUCCESS, proxy.allocator_.get_arena().init(OB_MALLOC_NORMAL_BLOCK_SIZE, normal_pages));
-  ASSERT_EQ(OB_SUCCESS, proxy.post_partition(server, 1000000, 1));
+  ASSERT_EQ(OB_SUCCESS, proxy.post_partition(node_index, 1000000, 1));
   ASSERT_EQ(OB_SUCCESS, proxy.callback_->process());
   ASSERT_EQ(OB_SUCCESS, proxy.collect_results());
   EXPECT_FALSE(progress.is_success(0));
@@ -2605,7 +2613,9 @@ TEST_F(TestAsyncIndexTrigger, refresh_completion_releases_original_node_only_onc
   ObAddr new_server;
   ASSERT_TRUE(old_server.set_ip_addr("127.0.0.1", 2882));
   ASSERT_TRUE(new_server.set_ip_addr("127.0.0.1", 2883));
-  ASSERT_EQ(OB_SUCCESS, proxy.post_partition(old_server, 1000000, 0));
+  int64_t node_index = -1;
+  ASSERT_EQ(OB_SUCCESS, progress.get_node(old_server, node_index));
+  ASSERT_EQ(OB_SUCCESS, proxy.post_partition(node_index, 1000000, 0));
   proxy.retry_states_.at(0).server_ = new_server;
   int64_t new_index = -1;
   ASSERT_EQ(OB_SUCCESS, progress.get_node(new_server, new_index));
