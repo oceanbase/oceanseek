@@ -14,6 +14,7 @@
 #define private public
 #define protected public
 #include "storage/blocksstable/vector_index/ob_ivf_merge_runtime.h"
+#include "storage/blocksstable/vector_index/ob_ivf_merge_strategy.h"
 #include "storage/compaction/ob_async_index_merge_task.h"
 #include "storage/ddl/ob_column_clustered_dag.h"
 #include "storage/blocksstable/vector_index/ob_ivf_ddl_dag.h"
@@ -28,6 +29,29 @@ using namespace common;
 using namespace compaction;
 using namespace share;
 using namespace storage;
+
+TEST(TestIVFMetadataStrategy, chooses_from_counts_without_vectors_or_memberships)
+{
+  struct Case { int64_t n, dominant, k, dominant_k; ObIVFProcessType expected; };
+  const Case cases[] = {
+    {1599, 1599, 64, 64, ObIVFProcessType::FULL_REBUILD},
+    {1600, 1280, 64, 32, ObIVFProcessType::INSERTION},
+    {1600, 1279, 64, 32, ObIVFProcessType::CONCATENATION},
+    {1600, 800, 32, 16, ObIVFProcessType::CONCATENATION},
+    {1600, 1600, 31, 31, ObIVFProcessType::FULL_REBUILD},
+    {INT64_MAX, INT64_MAX, 64, 64, ObIVFProcessType::INSERTION},
+  };
+  for (const auto &c : cases) {
+    ObIVFProcessType selected = ObIVFProcessType::INITIAL_BUILD;
+    ASSERT_EQ(OB_SUCCESS, ObIVFMergeStrategy::select_from_counts(
+        c.n, c.dominant, c.k, c.dominant_k, 400, selected));
+    EXPECT_EQ(c.expected, selected);
+  }
+  ObIVFProcessType selected;
+  EXPECT_EQ(OB_INVALID_ARGUMENT, ObIVFMergeStrategy::select_from_counts(0, 0, 0, 0, 400, selected));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, ObIVFMergeStrategy::select_from_counts(100, 101, 32, 32, 400, selected));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, ObIVFMergeStrategy::select_from_counts(100, 100, 32, 33, 400, selected));
+}
 
 struct TestStepSpec
 {

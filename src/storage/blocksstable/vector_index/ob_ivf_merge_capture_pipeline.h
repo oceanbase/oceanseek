@@ -29,10 +29,10 @@ struct ObIVFMergeCaptureRange
 // the deletion bitmap belong to the owner merge context and remain read-only.
 struct ObIVFMergeCaptureSlice
 {
-  ObIVFMergeCaptureSlice();
+  ObIVFMergeCaptureSlice(common::ObIAllocator &locator_allocator, ObCompactionMemoryContext *memory_context);
   common::ObArenaAllocator allocator_;
   common::ObArray<ObIVFMergeCaptureRange> ranges_;
-  common::ObArray<ObAsyncIVFSourceLocator> locators_;
+  ObIVFSourceLocators locators_;
   storage::ObIVFSampleCandidateMaxCmp sample_cmp_;
   storage::ObIVFSampleHeap samples_;
   // Non-owning: the input adapter retains sealed stores after capture finishes.

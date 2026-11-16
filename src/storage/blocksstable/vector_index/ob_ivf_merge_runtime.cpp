@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "storage/blocksstable/vector_index/ob_ivf_merge_runtime.h"
+#include "storage/blocksstable/vector_index/ob_ivf_block_reuse_source.h"
 #include "storage/blocksstable/vector_index/ob_ivf_parent_centroid_build.h"
 #include "storage/blocksstable/vector_index/ob_ivf_ddl_runtime.h"
 #include "storage/blocksstable/vector_index/ob_ivf_ddl_hca_adapter.h"
@@ -1608,9 +1609,9 @@ int ObIVFMergeProcessor::init_merge_runtime(
       LOG_WARN("insertion requires a complete encoded posting source", K(ret));
     } else if (prior != nullptr && OB_FAIL(prior->validate())) {
       LOG_WARN("invalid IVF runtime prior", K(ret));
-    }  else if (OB_FAIL(runtime_->all_vids_.reserve(vector_count))) {
-      LOG_WARN("failed to reserve IVF MERGE VIDs", K(ret),
-          K(vector_count));
+    } else if (process_type == ObIVFProcessType::INITIAL_BUILD
+        && OB_FAIL(runtime_->all_vids_.reserve(vector_count))) {
+      LOG_WARN("failed to reserve initial build VIDs", K(ret), K(vector_count));
     } else if (OB_FAIL(
         runtime_->vector_store_->get_all_vids(runtime_->all_vids_))) {
       LOG_WARN("fail to enumerate IVF full rebuild VIDs", K(ret));
@@ -1676,6 +1677,11 @@ bool ObIVFMergeProcessor::uses_prior_prefix() const
   return runtime_ != nullptr && !is_ivf_full_build_process_type(runtime_->effective_type_);
 }
 
+bool ObIVFMergeProcessor::centroid_route_reused() const
+{
+  return runtime_ != nullptr && runtime_->centroid_route_reused_;
+}
+
 int ObIVFMergeProcessor::resolve_centroid_index_operation(
     ObIVFMergeStep &step, int64_t &depth, bool &required)
 {
@@ -1697,8 +1703,26 @@ int ObIVFMergeProcessor::resolve_centroid_index_operation(
       if (runtime_->parent_threshold_ == 0) {
         runtime_->parent_threshold_ = blocksstable::ObIvfCentroidLayout::get_hierarchy_threshold();
       }
-      runtime_->parent_started_us_ = ObTimeUtility::current_time();
       const int64_t leaf_count = runtime_->c1_->count() / runtime_->dimension_;
+      const auto *prior = runtime_->insertion_prior_;
+      if (runtime_->effective_type_ == ObIVFProcessType::INSERTION
+          && prior != nullptr && prior->routing_source_ != nullptr
+          // A configuration change across the FLAT/grouped boundary must keep
+          // the original creation decision, even when every leaf is unchanged.
+          && (leaf_count >= runtime_->parent_threshold_)
+              == !prior->routing_source_->parent_centers_.empty()) {
+        const int reuse_ret = prior->routing_source_->restore_centroid_layout(
+            *runtime_->c1_, runtime_->centroid_layout_, runtime_->centroid_route_reused_);
+        if (OB_SUCCESS != reuse_ret) {
+          // This is optional acceleration. Incomplete source geometry retains
+          // the existing parent builder, including its normal failure handling.
+          LOG_WARN("[DISK_BBQ] cannot retain insertion centroid route", K(reuse_ret));
+        }
+      }
+      runtime_->parent_started_us_ = ObTimeUtility::current_time();
+      if (runtime_->centroid_route_reused_) {
+        return install_centroid_index_layout();
+      }
       if (leaf_count < runtime_->parent_threshold_) {
         if (OB_FAIL(runtime_->centroid_layout_.init_flat(leaf_count, runtime_->dimension_))) {
           LOG_WARN("[DISK_BBQ] failed to initialize flat centroid layout", K(ret), K(leaf_count));
@@ -2012,6 +2036,13 @@ int ObIVFMergeProcessor::init_insertion_memberships()
     lib::ob_sort(postings.begin(), postings.end(), [](const ObIVFPriorPosting &a, const ObIVFPriorPosting &b) {
       return a.vid_ < b.vid_ || (a.vid_ == b.vid_ && a.centroid_idx_ < b.centroid_idx_);
     });
+  }
+  if (OB_SUCC(ret) && (runtime_->all_vids_.count() >= INT64_MAX / int64_t(sizeof(int64_t)) - 1
+      || postings.count() >= INT64_MAX / int64_t(sizeof(int64_t)))) {
+    ret = OB_SIZE_OVERFLOW;
+  } else if (OB_SUCC(ret) && (OB_FAIL(runtime_->insertion_offsets_.reserve(runtime_->all_vids_.count() + 1))
+      || OB_FAIL(runtime_->insertion_candidates_.reserve(postings.count())))) {
+    LOG_WARN("failed to reserve insertion memberships", K(ret));
   }
   int64_t pos = 0;
   int64_t old_vector_count = 0;

@@ -9493,6 +9493,7 @@ TEST_P(TestIVFFastScannerRowStore,
   ObMicroBlockBufferHandle row_handle;
   ASSERT_EQ(OB_SUCCESS, suite.get_ivf_quantized_row_cache().get_cache_block(posting_key, row_handle));
   ASSERT_EQ(ObMicroBlockData::IVF_QUANTIZED_ROW_BLOCK, row_handle.get_block_data()->type_);
+
   ASSERT_EQ(OB_SUCCESS, suite.get_ivf_quantized_row_cache().erase(posting_key));
   ASSERT_EQ(OB_SUCCESS, suite.get_ivf_fastscan_cache().erase(posting_key));
   for (const auto *source : {row_handle.get_block_data(), fast_handle.get_block_data()}) {
@@ -9809,6 +9810,170 @@ TEST_F(TestIVFSSTableWriter, ivf_searchers_handle_different_queries_independentl
   ASSERT_EQ(2, result_b.count());
   ASSERT_EQ(20, result_b.at(0).vid_);
   ASSERT_NE(result_a.at(0).vid_, result_b.at(0).vid_);
+}
+
+class TestIVFPostingLayout : public TestIVFSSTableWriter
+{
+protected:
+  void compare_layouts(int64_t dim, int64_t count, int64_t clusters,
+      const std::vector<int64_t> &cluster_counts = {})
+  {
+    const int64_t per_cluster = count / clusters;
+    std::vector<int64_t> offsets(clusters + 1, 0);
+    ASSERT_TRUE(cluster_counts.empty() || cluster_counts.size() == clusters);
+    for (int64_t c = 0; c < clusters; ++c) {
+      const int64_t n = cluster_counts.empty() ? per_cluster : cluster_counts[c];
+      ASSERT_GT(n, 0); offsets[c + 1] = offsets[c] + n;
+    }
+    ASSERT_EQ(count, offsets.back());
+    std::vector<float> vectors(count * dim), centers(clusters * dim);
+    std::vector<int64_t> cids(count), vids(count);
+    for (int64_t c = 0; c < clusters; ++c) {
+      for (int64_t d = 0; d < dim; ++d) { centers[c * dim + d] = d == 0 ? float(c * 4) : float(d % 11) / 32; }
+    }
+    int64_t cid = 0;
+    for (int64_t i = 0; i < count; ++i) {
+      while (i >= offsets[cid + 1]) { ++cid; }
+      cids[i] = cid; vids[i] = i + 1;
+      uint64_t state = (i + 1) * UINT64_C(0x9e3779b97f4a7c15);
+      for (int64_t d = 0; d < dim; ++d) {
+        state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+        vectors[i * dim + d] = centers[cids[i] * dim + d] + (int64_t(state % 2001) - 1000) / 32768.0F;
+      }
+    }
+    const int64_t targets[] = {0, 16, 32, 64, 128, 256, 2048};
+    const int64_t target_count = ARRAYSIZEOF(targets);
+    std::vector<std::vector<uint64_t>> reference;
+    std::vector<std::vector<float>> reference_distances;
+    for (int slot = 0; slot < target_count; ++slot) {
+      const int64_t kib = targets[slot];
+      SCOPED_TRACE(kib);
+      SCOPED_TRACE(dim);
+      sstable_.reset(); sstable_builder_.reset(); object_cleaner_.reset();
+      whole_desc_.reset(); table_schema_.reset(); table_param_.reset();
+      posting_layout_size_ = kib * 1024;
+      ASSERT_EQ(OB_SUCCESS, prepare_write_env(0, CS_ENCODING_ROW_STORE));
+      // Isolate vector-cache identities across layouts and test invocations
+      // whose cluster counts or layout slots may overlap.
+      static int64_t next_layout_cache_id = 880000;
+      scan_context_.ls_id_ = ObLSID(ATOMIC_AAF(&next_layout_cache_id, 1));
+      auto *service = MTL(ObPluginVectorIndexService *);
+      ASSERT_NE(nullptr, service);
+      ObPluginVectorIndexMgr *ls_mgr = nullptr;
+      ASSERT_EQ(OB_SUCCESS, service->acquire_vector_index_mgr(scan_context_.ls_id_, ls_mgr, false));
+      ASSERT_EQ(OB_SUCCESS, write_disk_bbq_index(vectors.data(), cids.data(), vids.data(), count,
+          centers.data(), clusters, dim, nullptr));
+      ASSERT_EQ(OB_SUCCESS, object_cleaner_.mark_succeed());
+      sstable_.ivf_meta_.vector_count_ = count;
+      sstable_.ivf_meta_.centroid_count_ = clusters;
+      ObTableReadInfo info;
+      ASSERT_EQ(OB_SUCCESS, prepare_read_info(info));
+      ObDatumRange range; range.set_whole_range();
+      ObIMacroBlockIterator *iter = nullptr;
+      ASSERT_EQ(OB_SUCCESS, sstable_.scan_macro_block(range, info, allocator_, iter, false, true, true));
+      ObMacroBlockDesc macro; ObDataMacroBlockMeta meta; macro.macro_meta_ = &meta;
+      int64_t micros = 0, max_micro_size = 0;
+      int64_t posting_rows = 0, shared_cid_micros = 0;
+      int rc = OB_SUCCESS;
+      while (OB_SUCCESS == (rc = iter->get_next_macro_block(macro))) {
+        const auto &keys = iter->get_micro_endkeys(); const auto &blocks = iter->get_micro_index_infos();
+        for (int64_t i = 0; i < keys.count(); ++i) {
+          if (keys.at(i).datums_[0].get_int() == IVF_ROW_TYPE_LOW_PRECISION_VECTOR) {
+            const int64_t block_end = posting_rows + blocks.at(i).get_row_count();
+            ASSERT_LE(block_end, count);
+            const int64_t first_cid = std::upper_bound(offsets.begin(), offsets.end(), posting_rows)
+                - offsets.begin() - 1;
+            const int64_t last_cid = std::upper_bound(offsets.begin(), offsets.end(), block_end - 1)
+                - offsets.begin() - 1;
+            EXPECT_EQ(last_cid + 1, keys.at(i).datums_[1].get_int());
+            EXPECT_EQ(block_end, keys.at(i).datums_[2].get_int());
+            shared_cid_micros += first_cid != last_cid;
+            posting_rows = block_end;
+            ++micros;
+            max_micro_size = MAX(max_micro_size, static_cast<int64_t>(blocks.at(i).get_block_size()));
+          }
+        }
+      }
+      ASSERT_EQ(OB_ITER_END, rc);
+      iter->~ObIMacroBlockIterator(); allocator_.free(iter);
+      EXPECT_EQ(count, posting_rows);
+      if (kib == 2048 && dim == 128 && clusters >= 3 && offsets[2] <= 2 * 384) {
+        EXPECT_GT(shared_cid_micros, 0);
+      }
+      if (kib == 2048 && dim == 768 && per_cluster >= 4096) {
+        // This fixture supplies no count hints: a schema-sized prefix can
+        // be sealed before accumulated payload bytes upgrade the cluster.
+        EXPECT_GE(micros, clusters);
+        EXPECT_GT(max_micro_size, 128L * 1024);
+      }
+      ObRoaringBitmap allowed(&allocator_);
+      for (int64_t i = 0; i < count; ++i) { if (vids[i] % 10 == 0) { ASSERT_EQ(OB_SUCCESS, allowed.value_add(vids[i])); } }
+      ObIvfPreFilter filter;
+      ASSERT_EQ(OB_SUCCESS, filter.init(allowed));
+      std::vector<std::vector<uint64_t>> actual;
+      std::vector<std::vector<float>> actual_distances;
+      int case_idx = 0;
+      for (const bool automatic : {false, true}) {
+        for (const bool pre : {false, true}) {
+          const int queries = 4;
+          for (int q = 0; q < queries; ++q, ++case_idx) {
+            const int64_t query_cid = q % MIN(4L, clusters);
+            const int64_t row = offsets[query_cid] + (offsets[query_cid + 1] - offsets[query_cid]) / 2;
+            ObIvfKnnSearchParam param;
+            fill_search_params(param, &vectors[row * dim], dim, 10);
+            if (automatic) { param.nprobe_ = 0; param.original_k_ = 10; param.num_candidates_ = 40; }
+            param.cluster_size_ = per_cluster;
+            param.pre_filter_ = pre ? &filter : nullptr;
+            ObIvfSSTableReadStats stats; param.read_stats_ = &stats;
+            ObIvfKnnSearchResult result;
+            {
+              ObIvfSearcherGuard searcher;
+              ASSERT_EQ(OB_SUCCESS, create_ivf_searcher(sstable_, scan_param_, scan_context_, searcher.get()));
+              ASSERT_EQ(OB_SUCCESS, searcher->knn_search(param, result));
+            }
+            std::vector<uint64_t> ids;
+            std::vector<float> distances;
+            for (int64_t i = 0; i < result.count(); ++i) {
+              ids.push_back(result.at(i).vid_);
+              distances.push_back(result.at(i).distance_);
+              if (pre) { EXPECT_EQ(0, result.at(i).vid_ % 10); }
+            }
+            actual.push_back(ids); actual_distances.push_back(distances);
+            if (slot != 0) {
+              EXPECT_EQ(reference.at(case_idx), ids);
+              ASSERT_EQ(reference_distances.at(case_idx).size(), distances.size());
+              for (size_t i = 0; i < distances.size(); ++i) {
+                const float expected = reference_distances.at(case_idx).at(i);
+                EXPECT_NEAR(expected, distances[i], 1e-5F * MAX(1.0F, std::abs(expected)));
+              }
+            }
+          }
+        }
+      }
+      if (slot == 0) { reference = actual; reference_distances = actual_distances; }
+    }
+  }
+};
+
+TEST_F(TestIVFPostingLayout, cid_layout_preserves_fixed_auto_and_pre_search_results)
+{
+  ASSERT_NO_FATAL_FAILURE(compare_layouts(128, 4096, 16));
+}
+
+TEST_F(TestIVFPostingLayout, small_384_clusters_preserve_fixed_auto_and_pre_search_results)
+{
+  ASSERT_NO_FATAL_FAILURE(compare_layouts(128, 3 * 384, 3));
+}
+
+TEST_F(TestIVFPostingLayout, mixed_cluster_sizes_preserve_fixed_auto_and_pre_search_results)
+{
+  const std::vector<int64_t> counts = {384, 384, 4096, 384, 384};
+  ASSERT_NO_FATAL_FAILURE(compare_layouts(128, 5632, counts.size(), counts));
+}
+
+TEST_F(TestIVFPostingLayout, adaptive_large_cluster_preserves_fixed_auto_and_pre_search_results)
+{
+  ASSERT_NO_FATAL_FAILURE(compare_layouts(768, 4096, 1));
 }
 
 TEST(TestDiskBBQAutoSearch, budget_with_minimum_candidates_and_bounds)

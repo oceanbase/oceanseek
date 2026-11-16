@@ -57,9 +57,11 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "mtlenv/mock_tenant_module_env.h"
+#include "common/ob_target_specific.h"
 #include "lib/hash_func/splitmix64.h"
 #include "lib/alloc/alloc_func.h"
 #include "lib/utility/ob_tracepoint.h"
+#include "lib/utility/ob_defer.h"
 
 #include <gtest/gtest.h>
 #include <atomic>
@@ -87,23 +89,37 @@
 #include "share/rc/ob_tenant_base.h"
 #include "share/schema/ob_column_schema.h"
 #include "share/schema/ob_table_schema.h"
+#include "share/schema/ob_table_param.h"
 #include "share/vector_index/ob_plugin_vector_index_service.h"
+#include "share/vector_index/disk_bbq_cache/ob_ivf_sstable_cache_controller.h"
 #include "share/vector_index/quantization/rabitq_quantization/ob_rabitq_quantizer.h"
 #include "share/vector_index/quantization/ob_quantization_encoder.h"
 #include "share/vector_index/ob_ivf_replay_memory_mgr.h"
 #include "storage/access/ob_table_access_context.h"
+#include "storage/access/ob_dml_param.h"
 #include "storage/access/ob_table_access_param.h"
 #include "storage/access/ob_table_read_info.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable.h"
 #include "storage/blocksstable/index_block/ob_index_block_builder.h"
 #include "storage/blocksstable/index_block/ob_index_block_macro_iterator.h"
 #include "storage/blocksstable/ob_data_store_desc.h"
+#include "storage/blocksstable/encoding/ob_micro_block_encoder.h"
+#include "storage/blocksstable/cs_encoding/ob_micro_block_cs_encoder.h"
 #include "storage/blocksstable/ob_macro_block_writer.h"
 #include "storage/blocksstable/ob_sstable_private_object_cleaner.h"
 #include "storage/blocksstable/vector_index/ob_ivf_merge_sstable_writer.h"
+#include "storage/blocksstable/vector_index/ob_ivf_block_reuse.h"
 #include "storage/blocksstable/vector_index/ob_ivf_ddl_sstable_writer.h"
 #include "storage/ddl/ob_tablet_slice_writer.h"
+#include "storage/ddl/ob_async_index_macro_writer.h"
+#include "storage/ddl/ob_column_clustered_dag.h"
+#include "storage/ddl/ob_ddl_merge_task.h"
+#include "storage/blocksstable/ob_object_manager.h"
 #include "storage/blocksstable/vector_index/ob_ivf_merge_input.h"
+#include "storage/blocksstable/vector_index/ob_ivf_sstable_searcher.h"
+#include "storage/blocksstable/vector_index/ob_ivf_centroid_iterator.h"
+#include "storage/blocksstable/vector_index/ob_disk_bbq_algorithm.h"
+#include "storage/blocksstable/vector_index/ob_ivf_sorter.h"
 #include "storage/blocksstable/vector_index/ob_ivf_merge_dag.h"
 #include "storage/blocksstable/vector_index/ob_ivf_merge_capture_pipeline.h"
 #include "storage/blocksstable/vector_index/ob_ivf_capture_pipeline.h"
@@ -2433,7 +2449,7 @@ protected:
     ASSERT_EQ(OB_SUCCESS, sstable_.set_ivf_meta(allocator_, meta));
   }
 
-  void convert_source_to_inc()
+  void convert_source_to_inc(const int16_t logic_seq = 0)
   {
     // Recreate the same real macros with valid INC transaction metadata. This
     // lets the production collector inspect both populated and empty inputs.
@@ -2447,6 +2463,7 @@ protected:
     ASSERT_EQ(OB_SUCCESS, param.table_key_.scn_range_.end_scn_.convert_for_tx(940));
     param.min_merged_trans_version_ = 50;
     param.max_merged_trans_version_ = IVF_SNAPSHOT_VERSION;
+    param.sstable_logic_seq_ = logic_seq;
     ObUncommitTxDesc tx_desc(9001, IVF_SNAPSHOT_VERSION, ObUncommitTxDesc::COMMIT_VERSION);
     ASSERT_EQ(OB_SUCCESS, param.uncommit_tx_info_.push_back(tx_desc));
     param.uncommit_tx_info_.set_info_status_record_seq();
@@ -2712,6 +2729,39 @@ TEST_F(TestIVFSingleIncReuse, single_inc_reuses_data_macros_with_source_layout)
   }
 }
 
+TEST_F(TestIVFSingleIncReuse, single_inc_generation_wrap_skips_macro_reuse)
+{
+  ASSERT_NO_FATAL_FAILURE(build_source(false));
+  ASSERT_NO_FATAL_FAILURE(convert_source_to_inc(ObMacroDataSeq::MAX_SSTABLE_SEQ - 1));
+  ObTabletMergeDagParam param(INC_MAJOR_MERGE, ObLSID(IVF_LS_ID), ObTabletID(IVF_TABLET_ID), -1);
+  param.merge_version_ = IVF_SNAPSHOT_VERSION + 10;
+  ObAsyncIndexMergeCtx ctx(param, allocator_);
+  ObTableHandleV2 source;
+  ASSERT_EQ(OB_SUCCESS, source.set_sstable_with_tablet(&sstable_));
+  ASSERT_NO_FATAL_FAILURE(prepare_single_inc_context(ctx, source, param.merge_version_, 1));
+  ObAsyncIndexMergeDag dag(ObDagType::DAG_TYPE_ASYNC_INDEX_INC_MERGE);
+  bool single_inc = false;
+  bool can_reuse = false;
+  ASSERT_EQ(OB_SUCCESS, dag.ivf_merge_dag_ctx_.check_single_inc_reuse_(ctx, single_inc));
+  ASSERT_TRUE(single_inc);
+  ASSERT_EQ(OB_SUCCESS, dag.ivf_merge_dag_ctx_.check_input_reuse_(ctx, can_reuse, single_inc));
+  ASSERT_TRUE(can_reuse);
+
+  // Exercise the shared generation decision, rather than manually setting the
+  // full-merge flag. The same input key must not bypass its rewrite requirement.
+  ASSERT_EQ(OB_SUCCESS, ctx.static_param_.init_sstable_logic_seq());
+  ASSERT_EQ(OB_SUCCESS, ctx.cal_merge_param());
+  ASSERT_EQ(0, ctx.static_param_.sstable_logic_seq_);
+  ASSERT_TRUE(ctx.static_param_.is_full_merge_);
+  ASSERT_EQ(OB_SUCCESS, dag.ivf_merge_dag_ctx_.check_input_reuse_(ctx, can_reuse, single_inc));
+  EXPECT_FALSE(can_reuse);
+  bool reused = true;
+  ASSERT_EQ(OB_SUCCESS, dag.ivf_merge_dag_ctx_.try_reuse_input_(ctx, reused, single_inc));
+  EXPECT_FALSE(reused);
+  EXPECT_FALSE(ctx.merged_table_handle_.is_valid());
+  EXPECT_FALSE(ctx.get_merge_info().get_index_builder()->is_closed());
+}
+
 TEST_F(TestIVFSingleIncReuse, consecutive_single_inc_reuses_previous_output_without_mutation)
 {
   ASSERT_NO_FATAL_FAILURE(build_source(true));
@@ -2950,8 +3000,9 @@ public:
     writer = &writers_[task_idx];
     return OB_SUCCESS;
   }
-  int create_posting_writer(int64_t task_idx, ObITabletSliceWriter *&writer) override
+  int create_posting_writer(int64_t task_idx, int64_t cid_begin, int64_t cid_end, ObITabletSliceWriter *&writer) override
   {
+    EXPECT_GE(cid_begin, 1); EXPECT_GT(cid_end, cid_begin);
     writer = nullptr;
     if (task_idx == fail_posting_create_) { return OB_ALLOCATE_MEMORY_FAILED; }
     if (task_idx < 0 || task_idx >= ObIVFMergeProcessor::MAX_POSTING_TASK_COUNT) {
@@ -3006,7 +3057,8 @@ public:
     RecordingIVFDDLSliceWriter sink_;
   };
   int create_center_writer(ObITabletSliceWriter *&writer) override { return create(CENTER, writer); }
-  int create_posting_writer(int64_t, ObITabletSliceWriter *&writer) override { return create(POSTING, writer); }
+  int create_posting_writer(int64_t, int64_t, int64_t, ObITabletSliceWriter *&writer) override
+  { return create(POSTING, writer); }
   int create_raw_writer(int64_t, ObITabletSliceWriter *&writer) override { return create(RAW, writer); }
   void destroy_writer(ObITabletSliceWriter *writer) override { delete static_cast<Slice *>(writer); }
   int create(Kind kind, ObITabletSliceWriter *&writer)
@@ -3774,7 +3826,8 @@ TEST_F(TestIVFSSTableWriter, partitioned_macro_output_round_trip)
     int create_raw_writer(int64_t, ObITabletSliceWriter *&writer) override {
       writer = nullptr; return OB_NOT_SUPPORTED;
     }
-    int create_posting_writer(int64_t idx, ObITabletSliceWriter *&writer) override {
+    int create_posting_writer(int64_t idx, int64_t cid_begin, int64_t cid_end, ObITabletSliceWriter *&writer) override {
+      EXPECT_GE(cid_begin, 1); EXPECT_GT(cid_end, cid_begin);
       writer = slices_.at(idx + 1).get(); return OB_SUCCESS;
     }
     std::vector<std::unique_ptr<Slice>> slices_;
@@ -4689,7 +4742,8 @@ static void clear_hierarchical_test_cache(const ObLSID &ls_id,
 {
   auto *service = MTL(ObPluginVectorIndexService *);
   if (service == nullptr) { return; }
-  for (int64_t group = 0; group <= parent_count; ++group) {
+  for (int64_t i = 0; i <= parent_count; ++i) {
+    const int64_t group = (i + 1) % (parent_count + 1); // Release child guards before their owner.
     ObIvfCacheMgrGuard guard;
     const ObIvfCacheMgrKey key(table_key, group);
     const int ret = service->acquire_ivf_cache_mgr_guard(ls_id, key, guard);
@@ -4870,10 +4924,17 @@ TEST_F(TestIVFMergeInput, prior_capture_rejects_postings_above_reserved_bound)
   ASSERT_EQ(OB_SUCCESS, writer.close());
   ASSERT_EQ(OB_SUCCESS, close_builder_and_init_ivf_sstable(2));
   sstable_.ivf_meta_.centroid_count_ = k;
+  sstable_.ivf_meta_.vector_count_ = n; // Match real RAW keys; do not preempt the posting-bound check.
   ASSERT_EQ(OB_SUCCESS, object_cleaner_.mark_succeed());
   auto &key = const_cast<ObITable::TableKey &>(sstable_.get_key());
   key.table_type_ = ObITable::INC_IVF_INDEX_SSTABLE;
   key.version_range_.base_version_ = IVF_SNAPSHOT_VERSION / 2;
+  // INC logical bounds live in cached min/max metadata, not the CLOG key.
+  // This fixture converts a committed major source without rewriting its rows.
+  sstable_.meta_cache_.min_merged_trans_version_ = IVF_SNAPSHOT_VERSION / 2;
+  sstable_.meta_cache_.max_merged_trans_version_ = IVF_SNAPSHOT_VERSION;
+  ASSERT_GT(sstable_.get_upper_trans_version(), 0);
+  ASSERT_NE(INT64_MAX, sstable_.get_upper_trans_version());
   ObTabletMergeDagParam param(INC_MAJOR_MERGE, ObLSID(IVF_LS_ID), ObTabletID(IVF_TABLET_ID), -1);
   param.merge_version_ = IVF_SNAPSHOT_VERSION;
   ObAsyncIndexMergeCtx ctx(param, allocator_);
@@ -4894,7 +4955,11 @@ TEST_F(TestIVFMergeInput, prior_capture_rejects_postings_above_reserved_bound)
   input.dist_type_ = VIDA_L2;
   ASSERT_EQ(OB_SUCCESS, input.row_desc_.init(IVF_SSTABLE_FORMAT_VERSION));
   ASSERT_EQ(OB_SUCCESS, input.init_source_(ctx));
+  ASSERT_TRUE(input.uses_metadata_counts());
+  ASSERT_EQ(ObIVFProcessType::FULL_REBUILD, input.metadata_strategy());
+  ASSERT_FALSE(input.uses_lazy_raw());
   EXPECT_EQ(OB_INVALID_DATA, input.capture_prior_(ctx));
+  EXPECT_FALSE(input.uses_metadata_counts());
   EXPECT_EQ(2 * n, input.prior_.postings_.count());
   EXPECT_FALSE(input.prior_.postings_complete_);
 }
@@ -5869,6 +5934,531 @@ TEST_F(TestIVFSSTableWriter, append_batch_failure_keeps_successful_prefix)
   ASSERT_EQ(2, sstable_.get_row_count());
 }
 
+class TestIVFCidMicroLayout : public TestIVFSSTableWriter,
+    public ::testing::WithParamInterface<ObRowStoreType>
+{};
+
+TEST_P(TestIVFCidMicroLayout, aggregates_normal_clusters_and_splits_large_clusters)
+{
+  ASSERT_EQ(OB_SUCCESS, prepare_write_env(1, ObSSTableIndexBuilder::DISABLE, false, GetParam()));
+  ObIvfMacroBlockWriter writer;
+  ASSERT_EQ(OB_SUCCESS, open_format_aware_writer(writer, 0));
+  const auto &caller_desc = whole_desc_.get_desc();
+  const int64_t schema_target = caller_desc.get_micro_block_size();
+  ASSERT_NE(&caller_desc, writer.data_store_desc_);
+  ASSERT_EQ(&writer.ivf_data_store_desc_, writer.data_store_desc_);
+  const int64_t raw_count = 2048;
+  // 4000 postings exceed the former 128 KiB cap but fit in one micro-block.
+  // 40000 postings exceed the storage/encoder limit and must span blocks.
+  // Adjacent small clusters may share blocks. Known large clusters stay
+  // isolated; missing, underestimated and excessive hints must preserve rows.
+  const int64_t counts[] = {33, 33, 4000, 40000, 33, 33, 400, 4000, 33};
+  ObSEArray<uint32_t, ARRAYSIZEOF(counts)> count_hints;
+  for (int64_t i = 0; i < ARRAYSIZEOF(counts); ++i) {
+    // Exercise a missing hint and an underestimated hint as well as exact counts.
+    ASSERT_EQ(OB_SUCCESS, count_hints.push_back(
+        i == 6 ? 0 : i == 7 ? 1 : i == 8 ? UINT32_MAX : counts[i]));
+  }
+  ASSERT_EQ(OB_SUCCESS, writer.set_posting_counts(count_hints, 1));
+  int64_t initial_targets[ARRAYSIZEOF(counts)] = {}, final_targets[ARRAYSIZEOF(counts)] = {};
+  auto payload_for = [](int64_t cid, int64_t vid, int64_t size = 108) {
+    std::string payload(size, '\0');
+    uint64_t state = (cid + 1) * 1234567ULL + vid * 7654321ULL;
+    for (char &byte : payload) {
+      state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+      byte = static_cast<char>(state);
+    }
+    return payload;
+  };
+  ObDatumRow row;
+  const std::string centroid_payload = payload_for(0, 0);
+  ASSERT_EQ(OB_SUCCESS, make_ivf_row(row, IVF_ROW_TYPE_CENTROID, 0, 1,
+      ObString(centroid_payload.size(), centroid_payload.data())));
+  ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+  EXPECT_EQ(schema_target, writer.data_store_desc_->get_micro_block_size());
+  EXPECT_EQ(schema_target, caller_desc.get_micro_block_size());
+  for (int64_t cid = 1; cid <= ARRAYSIZEOF(counts); ++cid) {
+    for (int64_t vid = 0; vid < counts[cid - 1]; ++vid) {
+      const std::string payload = payload_for(cid, vid);
+      ASSERT_EQ(OB_SUCCESS, make_ivf_row(row, IVF_ROW_TYPE_LOW_PRECISION_VECTOR, cid, vid,
+          ObString(payload.size(), payload.data())));
+      ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+      if (vid == 0) { initial_targets[cid - 1] = writer.data_store_desc_->get_micro_block_size(); }
+    }
+    final_targets[cid - 1] = writer.data_store_desc_->get_micro_block_size();
+  }
+  EXPECT_EQ(schema_target, caller_desc.get_micro_block_size());
+  EXPECT_GT(writer.data_store_desc_->get_micro_block_size(), schema_target);
+  for (int64_t vid = 0; vid < raw_count; ++vid) {
+    const std::string payload = payload_for(0, vid, 3072);
+    ASSERT_EQ(OB_SUCCESS, make_ivf_row(row, IVF_ROW_TYPE_RAW_VECTOR, 0, vid,
+        ObString(payload.size(), payload.data())));
+    ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+    if (GetParam() == CS_ENCODING_ROW_STORE && writer.micro_writer_->get_row_count() > 0) {
+      EXPECT_LT(writer.micro_writer_->get_block_size(), 2 * schema_target);
+    }
+  }
+  EXPECT_EQ(schema_target, writer.data_store_desc_->get_micro_block_size());
+  EXPECT_EQ(schema_target, caller_desc.get_micro_block_size());
+  ASSERT_EQ(OB_SUCCESS, writer.close());
+  ASSERT_EQ(OB_SUCCESS, close_builder_and_init_ivf_sstable());
+  ASSERT_EQ(OB_SUCCESS, object_cleaner_.mark_succeed());
+  ObTableReadInfo read_info;
+  ASSERT_EQ(OB_SUCCESS, prepare_read_info(read_info));
+  ObDatumRange range;
+  range.set_whole_range();
+  ObIMacroBlockIterator *macro_iter = nullptr;
+  ASSERT_EQ(OB_SUCCESS, sstable_.scan_macro_block(range, read_info, allocator_, macro_iter, false, true, true));
+  int64_t micro_count[ARRAYSIZEOF(counts)] = {}, rows[ARRAYSIZEOF(counts)] = {};
+  int64_t max_micro_size[ARRAYSIZEOF(counts)] = {};
+  int64_t raw_micros = 0, raw_rows = 0, centroid_rows = 0;
+  int64_t posting_rows = 0, shared_small_micros = 0;
+  int64_t offsets[ARRAYSIZEOF(counts) + 1] = {};
+  for (int64_t i = 0; i < ARRAYSIZEOF(counts); ++i) { offsets[i + 1] = offsets[i] + counts[i]; }
+  ObMacroBlockDesc macro;
+  ObDataMacroBlockMeta meta;
+  macro.macro_meta_ = &meta;
+  int ret = OB_SUCCESS;
+  while (OB_SUCCESS == (ret = macro_iter->get_next_macro_block(macro))) {
+    const auto &infos = macro_iter->get_micro_index_infos();
+    const auto &keys = macro_iter->get_micro_endkeys();
+    ASSERT_EQ(infos.count(), keys.count());
+    for (int64_t i = 0; i < keys.count(); ++i) {
+      const int64_t type = keys.at(i).datums_[0].get_int();
+      if (type == IVF_ROW_TYPE_RAW_VECTOR) {
+        ++raw_micros; raw_rows += infos.at(i).get_row_count();
+      } else if (type == IVF_ROW_TYPE_CENTROID) {
+        centroid_rows += infos.at(i).get_row_count();
+      } else {
+        ASSERT_EQ(IVF_ROW_TYPE_LOW_PRECISION_VECTOR, type);
+        const int64_t cid = keys.at(i).datums_[1].get_int();
+        ASSERT_GE(cid, 1); ASSERT_LE(cid, ARRAYSIZEOF(counts));
+        const int64_t block_size = infos.at(i).get_block_size();
+        const int64_t block_end = posting_rows + infos.at(i).get_row_count();
+        ASSERT_LE(block_end, offsets[ARRAYSIZEOF(counts)]);
+        int64_t first_cid = -1, last_cid = -1;
+        // Endkeys identify only the last CID. Derive every CID covered by
+        // this ordered block before attributing its rows or block count.
+        for (int64_t c = 0; c < ARRAYSIZEOF(counts); ++c) {
+          const int64_t overlap = MIN(block_end, offsets[c + 1]) - MAX(posting_rows, offsets[c]);
+          if (overlap > 0) {
+            if (first_cid < 0) { first_cid = c; }
+            last_cid = c; ++micro_count[c]; rows[c] += overlap;
+            max_micro_size[c] = MAX(max_micro_size[c], block_size);
+          }
+        }
+        ASSERT_GE(first_cid, 0);
+        EXPECT_EQ(last_cid + 1, cid);
+        EXPECT_EQ(block_end - offsets[last_cid] - 1, keys.at(i).datums_[2].get_int());
+        if (first_cid != last_cid) {
+          ++shared_small_micros;
+          // Correctly hinted large CIDs must never share their boundaries.
+          EXPECT_FALSE(first_cid <= 2 && last_cid >= 2);
+          EXPECT_FALSE(first_cid <= 3 && last_cid >= 3);
+        }
+        posting_rows = block_end;
+        EXPECT_LE(block_size, caller_desc.get_micro_block_size_limit());
+      }
+    }
+  }
+  ASSERT_EQ(OB_ITER_END, ret);
+  macro_iter->~ObIMacroBlockIterator();
+  allocator_.free(macro_iter);
+  EXPECT_GT(shared_small_micros, 0);
+  EXPECT_EQ(offsets[ARRAYSIZEOF(counts)], posting_rows);
+  EXPECT_EQ(1, micro_count[2]);
+  EXPECT_GT(max_micro_size[2], 128L * 1024);
+  EXPECT_GT(micro_count[3], 1);
+  EXPECT_EQ(schema_target, initial_targets[0]);
+  EXPECT_EQ(caller_desc.get_micro_block_size_limit() - schema_target, initial_targets[3]);
+  EXPECT_EQ(schema_target, initial_targets[4]);
+  EXPECT_GT(final_targets[6], initial_targets[6]);
+  EXPECT_GT(final_targets[7], initial_targets[7]);
+  EXPECT_EQ(caller_desc.get_micro_block_size_limit() - schema_target, initial_targets[8]);
+  for (int64_t i = 0; i < ARRAYSIZEOF(counts); ++i) {
+    EXPECT_EQ(counts[i], rows[i]);
+    LOG_INFO("adaptive IVF posting micro-block layout", "row_store_type", GetParam(),
+        "cid", i + 1, "posting_count", counts[i], "micro_count", micro_count[i],
+        "max_micro_size", max_micro_size[i], "initial_target", initial_targets[i],
+        "final_target", final_targets[i], "hard_limit", caller_desc.get_micro_block_size_limit());
+  }
+  EXPECT_EQ(1, centroid_rows);
+  EXPECT_EQ(raw_count, raw_rows);
+  EXPECT_GT(raw_micros, 1); // Schema target is soft; do not impose a hard byte-size bound.
+
+  ObTableIterParam param;
+  ObTableAccessContext context;
+  ObStoreCtx store_ctx;
+  param.table_id_ = IVF_TABLE_ID; param.tablet_id_ = IVF_TABLET_ID; param.read_info_ = &read_info;
+  context.query_flag_.set_not_use_row_cache(); context.query_flag_.set_not_use_block_cache();
+  context.store_ctx_ = &store_ctx; context.ls_id_ = IVF_LS_ID; context.tablet_id_ = IVF_TABLET_ID;
+  context.allocator_ = context.stmt_allocator_ = &allocator_;
+  context.trans_version_range_.base_version_ = 0;
+  context.trans_version_range_.snapshot_version_ = IVF_SNAPSHOT_VERSION;
+  ASSERT_EQ(OB_SUCCESS, context.micro_block_handle_mgr_.init(false, context.tablet_id_,
+      context.table_store_stat_, context.table_scan_stat_, context.query_flag_));
+  context.is_inited_ = true;
+  ObStoreRowIterator *iter = nullptr;
+  ASSERT_EQ(OB_SUCCESS, sstable_.scan(param, context, range, iter));
+  const ObDatumRow *actual = nullptr;
+  ASSERT_EQ(OB_SUCCESS, iter->get_next_row(actual));
+  ASSERT_EQ(IVF_ROW_TYPE_CENTROID, actual->storage_datums_[0].get_int());
+  auto center_bytes = actual->storage_datums_[actual->count_ - 1].get_string();
+  EXPECT_EQ(centroid_payload, std::string(center_bytes.ptr(), center_bytes.length()));
+  for (int64_t cid = 1; cid <= ARRAYSIZEOF(counts); ++cid) {
+    for (int64_t vid = 0; vid < counts[cid - 1]; ++vid) {
+      ASSERT_EQ(OB_SUCCESS, iter->get_next_row(actual));
+      ASSERT_EQ(cid, actual->storage_datums_[1].get_int());
+      ASSERT_EQ(vid, actual->storage_datums_[2].get_int());
+      const auto payload = actual->storage_datums_[actual->count_ - 1].get_string();
+      EXPECT_EQ(payload_for(cid, vid), std::string(payload.ptr(), payload.length()));
+    }
+  }
+  for (int64_t vid = 0; vid < raw_count; ++vid) {
+    ASSERT_EQ(OB_SUCCESS, iter->get_next_row(actual));
+    ASSERT_EQ(IVF_ROW_TYPE_RAW_VECTOR, actual->storage_datums_[0].get_int());
+    ASSERT_EQ(vid, actual->storage_datums_[2].get_int());
+    const auto payload = actual->storage_datums_[actual->count_ - 1].get_string();
+    EXPECT_EQ(payload_for(0, vid, 3072), std::string(payload.ptr(), payload.length()));
+  }
+  EXPECT_EQ(OB_ITER_END, iter->get_next_row(actual));
+  iter->~ObStoreRowIterator();
+}
+
+TEST_P(TestIVFCidMicroLayout, payload_bytes_pack_small_cids_and_isolate_large_cids)
+{
+  ASSERT_EQ(OB_SUCCESS, prepare_write_env(1, ObSSTableIndexBuilder::DISABLE, false, GetParam()));
+  ObIvfMacroBlockWriter writer;
+  ASSERT_EQ(OB_SUCCESS, open_format_aware_writer(writer, 0));
+  const int64_t count = 384, clusters = 6;
+  const int64_t schema_target = whole_desc_.get_desc().get_micro_block_size();
+  // One-bit 128D and 768D posting payload lengths, including quantizer factors.
+  const int64_t sizes[] = {28, 28, 28, 108, 28, 28};
+  ObSEArray<uint32_t, clusters> hints;
+  for (int64_t c = 0; c < clusters; ++c) { ASSERT_EQ(OB_SUCCESS, hints.push_back(count)); }
+  ASSERT_EQ(OB_SUCCESS, writer.set_posting_counts(hints, 1));
+  auto payload_for = [&](int64_t c, int64_t vid) {
+    std::string bytes(sizes[c], '\0');
+    uint64_t state = (c + 1) * 1234567ULL + vid * 7654321ULL;
+    for (char &byte : bytes) {
+      state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+      byte = static_cast<char>(state);
+    }
+    return bytes;
+  };
+  ObDatumRow row;
+  for (int64_t c = 0; c < clusters; ++c) {
+    for (int64_t vid = 0; vid < count; ++vid) {
+      const std::string bytes = payload_for(c, vid);
+      ASSERT_EQ(OB_SUCCESS, make_ivf_row(row, IVF_ROW_TYPE_LOW_PRECISION_VECTOR, c + 1, vid,
+          ObString(bytes.size(), bytes.data())));
+      ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+      if (vid == 0) {
+        EXPECT_EQ(c == 3, writer.posting_cluster_is_large_);
+        if (c == 3) { EXPECT_GT(writer.data_store_desc_->get_micro_block_size(), schema_target); }
+        else { EXPECT_EQ(schema_target, writer.data_store_desc_->get_micro_block_size()); }
+      }
+    }
+  }
+  ASSERT_EQ(OB_SUCCESS, writer.close());
+  ASSERT_EQ(OB_SUCCESS, close_builder_and_init_ivf_sstable());
+  ASSERT_EQ(OB_SUCCESS, object_cleaner_.mark_succeed());
+  ObTableReadInfo info;
+  ASSERT_EQ(OB_SUCCESS, prepare_read_info(info));
+  ObDatumRange range; range.set_whole_range();
+  ObIMacroBlockIterator *macro_iter = nullptr;
+  ASSERT_EQ(OB_SUCCESS, sstable_.scan_macro_block(range, info, allocator_, macro_iter, false, true, true));
+  ObMacroBlockDesc macro; ObDataMacroBlockMeta meta; macro.macro_meta_ = &meta;
+  int64_t rows = 0, shared_before_large = 0, shared_after_large = 0, large_micros = 0;
+  int ret = OB_SUCCESS;
+  while (OB_SUCCESS == (ret = macro_iter->get_next_macro_block(macro))) {
+    const auto &keys = macro_iter->get_micro_endkeys();
+    const auto &blocks = macro_iter->get_micro_index_infos();
+    ASSERT_EQ(keys.count(), blocks.count());
+    for (int64_t i = 0; i < keys.count(); ++i) {
+      ASSERT_EQ(IVF_ROW_TYPE_LOW_PRECISION_VECTOR, keys.at(i).datums_[0].get_int());
+      const int64_t end = rows + blocks.at(i).get_row_count();
+      const int64_t first_cid = rows / count, last_cid = (end - 1) / count;
+      ASSERT_LE(end, count * clusters);
+      EXPECT_EQ(last_cid + 1, keys.at(i).datums_[1].get_int());
+      EXPECT_EQ((end - 1) % count, keys.at(i).datums_[2].get_int());
+      if (first_cid <= 3 && last_cid >= 3) {
+        EXPECT_EQ(3, first_cid); EXPECT_EQ(3, last_cid); ++large_micros;
+      }
+      if (first_cid != last_cid) {
+        if (last_cid < 3) { ++shared_before_large; }
+        if (first_cid > 3) { ++shared_after_large; }
+      }
+      EXPECT_LE(blocks.at(i).get_block_size(), whole_desc_.get_desc().get_micro_block_size_limit());
+      rows = end;
+    }
+  }
+  ASSERT_EQ(OB_ITER_END, ret);
+  macro_iter->~ObIMacroBlockIterator(); allocator_.free(macro_iter);
+  EXPECT_EQ(count * clusters, rows);
+  EXPECT_GT(shared_before_large, 0);
+  EXPECT_GT(shared_after_large, 0);
+  EXPECT_EQ(1, large_micros);
+
+  ObTableIterParam param; ObTableAccessContext context; ObStoreCtx store_ctx;
+  param.table_id_ = IVF_TABLE_ID; param.tablet_id_ = IVF_TABLET_ID; param.read_info_ = &info;
+  context.query_flag_.set_not_use_row_cache(); context.query_flag_.set_not_use_block_cache();
+  context.store_ctx_ = &store_ctx; context.ls_id_ = IVF_LS_ID; context.tablet_id_ = IVF_TABLET_ID;
+  context.allocator_ = context.stmt_allocator_ = &allocator_;
+  context.trans_version_range_.base_version_ = 0;
+  context.trans_version_range_.snapshot_version_ = IVF_SNAPSHOT_VERSION;
+  ASSERT_EQ(OB_SUCCESS, context.micro_block_handle_mgr_.init(false, context.tablet_id_,
+      context.table_store_stat_, context.table_scan_stat_, context.query_flag_));
+  context.is_inited_ = true;
+  ObStoreRowIterator *iter = nullptr;
+  ASSERT_EQ(OB_SUCCESS, sstable_.scan(param, context, range, iter));
+  const ObDatumRow *actual = nullptr;
+  for (int64_t c = 0; c < clusters; ++c) {
+    for (int64_t vid = 0; vid < count; ++vid) {
+      ASSERT_EQ(OB_SUCCESS, iter->get_next_row(actual));
+      ASSERT_EQ(IVF_ROW_TYPE_LOW_PRECISION_VECTOR, actual->storage_datums_[0].get_int());
+      ASSERT_EQ(c + 1, actual->storage_datums_[1].get_int());
+      ASSERT_EQ(vid, actual->storage_datums_[2].get_int());
+      const auto bytes = actual->storage_datums_[actual->count_ - 1].get_string();
+      EXPECT_EQ(payload_for(c, vid), std::string(bytes.ptr(), bytes.length()));
+    }
+  }
+  EXPECT_EQ(OB_ITER_END, iter->get_next_row(actual));
+  iter->~ObStoreRowIterator();
+}
+
+TEST_P(TestIVFCidMicroLayout, counts_select_target_at_first_row_and_respect_explicit_cap)
+{
+  ASSERT_EQ(OB_SUCCESS, prepare_write_env(1, ObSSTableIndexBuilder::DISABLE, false, GetParam()));
+  const int64_t cap = 256L * 1024;
+  ObIvfMacroBlockWriter writer(cap);
+  ObSEArray<uint32_t, 4> hints;
+  ASSERT_EQ(OB_SUCCESS, hints.push_back(1));
+  ASSERT_EQ(OB_SUCCESS, hints.push_back(4000));
+  ASSERT_EQ(OB_SUCCESS, hints.push_back(UINT32_MAX));
+  ASSERT_EQ(OB_SUCCESS, hints.push_back(1));
+  EXPECT_EQ(OB_NOT_INIT, writer.set_posting_counts(hints, 101));
+  ASSERT_EQ(OB_SUCCESS, open_format_aware_writer(writer, 0));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, writer.set_posting_counts(hints, -1));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, writer.set_posting_counts(hints, INT64_MAX));
+  ASSERT_EQ(OB_SUCCESS, writer.set_posting_counts(hints, 101));
+  ObDatumRow row;
+  int64_t targets[4] = {};
+  for (int64_t i = 0; i < 4; ++i) {
+    ASSERT_EQ(OB_SUCCESS, make_ivf_row(row, IVF_ROW_TYPE_LOW_PRECISION_VECTOR, 101 + i, 1, "posting"));
+    ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+    targets[i] = writer.data_store_desc_->get_micro_block_size();
+  }
+  EXPECT_GT(targets[1], targets[0]);
+  EXPECT_LT(targets[1], cap);
+  EXPECT_EQ(cap, targets[2]);
+  EXPECT_EQ(targets[0], targets[3]);
+  EXPECT_EQ(OB_STATE_NOT_MATCH, writer.set_posting_counts(hints, 101));
+  ASSERT_EQ(OB_SUCCESS, writer.close());
+  ASSERT_EQ(OB_SUCCESS, close_builder_and_init_ivf_sstable());
+  ASSERT_EQ(OB_SUCCESS, object_cleaner_.mark_succeed());
+  EXPECT_EQ(4, sstable_.get_row_count());
+}
+
+TEST_P(TestIVFCidMicroLayout, private_target_is_bounded_and_reopen_restores_row_type_state)
+{
+  ASSERT_EQ(OB_SUCCESS, prepare_write_env(1, ObSSTableIndexBuilder::DISABLE, false, GetParam()));
+  const auto &caller = whole_desc_.get_desc();
+  const int64_t schema_target = caller.get_micro_block_size();
+  const int64_t hard_limit = caller.get_micro_block_size_limit();
+  ASSERT_LE(schema_target, hard_limit);
+  ObIvfMacroBlockWriter writer;
+  ObDatumRow row;
+  for (int pass = 0; pass < 2; ++pass) {
+    ASSERT_EQ(OB_SUCCESS, open_format_aware_writer(writer, pass * 1000000));
+    ASSERT_NE(&caller, writer.data_store_desc_);
+    EXPECT_EQ(hard_limit - schema_target, writer.data_store_desc_->get_micro_block_size());
+    ASSERT_EQ(OB_SUCCESS, make_ivf_row(row, IVF_ROW_TYPE_CENTROID, 0, 1, "centroid"));
+    ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+    EXPECT_EQ(schema_target, writer.data_store_desc_->get_micro_block_size());
+    ASSERT_EQ(OB_SUCCESS, make_ivf_row(row, IVF_ROW_TYPE_LOW_PRECISION_VECTOR, 1, 1, "posting"));
+    ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+    EXPECT_GE(writer.data_store_desc_->get_micro_block_size(), schema_target);
+    EXPECT_LT(writer.data_store_desc_->get_micro_block_size(), hard_limit);
+    EXPECT_EQ(schema_target, caller.get_micro_block_size());
+    ASSERT_EQ(OB_SUCCESS, make_ivf_row(row, IVF_ROW_TYPE_RAW_VECTOR, 0, 1, "raw"));
+    ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+    EXPECT_EQ(schema_target, writer.data_store_desc_->get_micro_block_size());
+    EXPECT_EQ(schema_target, caller.get_micro_block_size());
+    writer.reset(); // Abandon the draft; reopen must not inherit RAW/CID state.
+    EXPECT_EQ(nullptr, writer.data_store_desc_);
+    EXPECT_EQ(0, writer.get_appended_row_count());
+    EXPECT_EQ(-1, writer.previous_row_type_);
+    EXPECT_EQ(-1, writer.previous_posting_cid_);
+    EXPECT_EQ(nullptr, writer.posting_counts_);
+    EXPECT_EQ(0, writer.posting_split_size_);
+    EXPECT_FALSE(writer.posting_cluster_is_large_);
+    EXPECT_EQ(0, writer.posting_cluster_payload_bytes_);
+  }
+}
+
+INSTANTIATE_TEST_CASE_P(RowStores, TestIVFCidMicroLayout,
+    ::testing::Values(FLAT_ROW_STORE, ENCODING_ROW_STORE, CS_ENCODING_ROW_STORE));
+
+// Keep the real encoders, serialization and checksums. Only their compressed
+// size estimate is wrong; reject one row before consuming it to exercise the
+// common writer's seal-and-retry path at the same time.
+template <typename Encoder>
+class UnderestimatingIVFMicroEncoder : public Encoder
+{
+public:
+  explicit UnderestimatingIVFMicroEncoder(int64_t &rejections) : rejections_(rejections) {}
+  int64_t get_block_size() const override { return 1; }
+  int append_row(const ObDatumRow &row) override
+  {
+    if (rejections_ == 0 && Encoder::get_row_count() >= 10) {
+      ++rejections_;
+      return OB_BUF_NOT_ENOUGH;
+    }
+    return Encoder::append_row(row);
+  }
+private:
+  int64_t &rejections_;
+};
+
+class TestIVFPostingEstimateFailure : public TestIVFSSTableWriter,
+    public ::testing::WithParamInterface<ObRowStoreType>
+{
+protected:
+  template <typename Encoder>
+  int install_underestimating_encoder(ObIvfMacroBlockWriter &writer, int64_t &rejections)
+  {
+    using Replacement = UnderestimatingIVFMicroEncoder<Encoder>;
+    int ret = OB_SUCCESS;
+    auto *original = static_cast<Encoder *>(writer.micro_writer_);
+    // Copy initialization inputs only. Adaptive history owns initialized
+    // containers and must not be shallow-copied into a second encoder.
+    ObMicroBlockEncodingCtx ctx;
+    ctx.macro_block_size_ = original->ctx_.macro_block_size_;
+    ctx.micro_block_size_ = original->ctx_.micro_block_size_;
+    ctx.column_cnt_ = original->ctx_.column_cnt_;
+    ctx.rowkey_column_cnt_ = original->ctx_.rowkey_column_cnt_;
+    ctx.col_descs_ = original->ctx_.col_descs_;
+    ctx.encoder_opt_ = original->ctx_.encoder_opt_;
+    ctx.major_working_cluster_version_ = original->ctx_.major_working_cluster_version_;
+    ctx.row_store_type_ = original->ctx_.row_store_type_;
+    ctx.need_calc_column_chksum_ = original->ctx_.need_calc_column_chksum_;
+    ctx.compressor_type_ = original->ctx_.compressor_type_;
+    ctx.encoding_granularity_ = original->ctx_.encoding_granularity_;
+    auto *replacement = OB_NEWx(Replacement, &writer.allocator_, rejections);
+    if (replacement == nullptr) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_FAIL(replacement->init(ctx))) {
+      replacement->~Replacement();
+      writer.allocator_.free(replacement);
+    } else {
+      replacement->set_micro_block_merge_verify_level(original->get_micro_block_merge_verify_level());
+      original->~Encoder();
+      writer.allocator_.free(original);
+      writer.micro_writer_ = replacement;
+    }
+    return ret;
+  }
+};
+
+TEST_P(TestIVFPostingEstimateFailure, wrong_compression_estimate_and_capacity_rejection_preserve_all_rows)
+{
+  ASSERT_EQ(OB_SUCCESS, prepare_write_env(1, ObSSTableIndexBuilder::DISABLE, false, GetParam()));
+  int64_t rejections = 0;
+  const int64_t cap = 128L * 1024;
+  ObIvfMacroBlockWriter writer(cap);
+  ASSERT_EQ(OB_SUCCESS, open_format_aware_writer(writer, 0));
+  if (GetParam() == ENCODING_ROW_STORE) {
+    ASSERT_EQ(OB_SUCCESS, install_underestimating_encoder<ObMicroBlockEncoder>(writer, rejections));
+  } else {
+    ASSERT_EQ(OB_SUCCESS, install_underestimating_encoder<ObMicroBlockCSEncoder<false>>(writer, rejections));
+  }
+  ObSEArray<uint32_t, 1> hints;
+  ASSERT_EQ(OB_SUCCESS, hints.push_back(UINT32_MAX)); // Overestimation must also remain harmless.
+  ASSERT_EQ(OB_SUCCESS, writer.set_posting_counts(hints, 1));
+  const int64_t row_count = 4096;
+  auto payload_for = [](int64_t vid) {
+    std::string payload(108, '\0');
+    uint64_t state = (vid + 1) * UINT64_C(0x9e3779b97f4a7c15);
+    for (char &byte : payload) {
+      state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+      byte = static_cast<char>(state);
+    }
+    return payload;
+  };
+  ObDatumRow row;
+  for (int64_t vid = 0; vid < row_count; ++vid) {
+    const std::string payload = payload_for(vid);
+    ASSERT_EQ(OB_SUCCESS, make_ivf_row(row, IVF_ROW_TYPE_LOW_PRECISION_VECTOR, 1, vid,
+        ObString(payload.size(), payload.data())));
+    ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+  }
+  EXPECT_EQ(1, rejections);
+  EXPECT_EQ(row_count, writer.get_appended_row_count());
+  ASSERT_EQ(OB_SUCCESS, writer.close());
+  ASSERT_EQ(OB_SUCCESS, close_builder_and_init_ivf_sstable());
+  ASSERT_EQ(OB_SUCCESS, object_cleaner_.mark_succeed());
+
+  ObTableReadInfo read_info;
+  ASSERT_EQ(OB_SUCCESS, prepare_read_info(read_info));
+  ObDatumRange range;
+  range.set_whole_range();
+  ObIMacroBlockIterator *macro_iter = nullptr;
+  ASSERT_EQ(OB_SUCCESS, sstable_.scan_macro_block(range, read_info, allocator_, macro_iter, false, true, true));
+  ObMacroBlockDesc macro;
+  ObDataMacroBlockMeta meta;
+  macro.macro_meta_ = &meta;
+  int64_t blocks = 0, indexed_rows = 0;
+  int ret = OB_SUCCESS;
+  while (OB_SUCCESS == (ret = macro_iter->get_next_macro_block(macro))) {
+    const auto &infos = macro_iter->get_micro_index_infos();
+    for (int64_t i = 0; i < infos.count(); ++i) {
+      EXPECT_LE(infos.at(i).get_block_size(), cap);
+      indexed_rows += infos.at(i).get_row_count();
+      ++blocks;
+    }
+  }
+  ASSERT_EQ(OB_ITER_END, ret);
+  macro_iter->~ObIMacroBlockIterator();
+  allocator_.free(macro_iter);
+  EXPECT_GT(blocks, 1);
+  EXPECT_EQ(row_count, indexed_rows);
+
+  ObTableIterParam param;
+  param.table_id_ = IVF_TABLE_ID;
+  param.tablet_id_ = IVF_TABLET_ID;
+  param.read_info_ = &read_info;
+  ObTableAccessContext context;
+  ObStoreCtx store_ctx;
+  context.query_flag_.set_not_use_row_cache();
+  context.query_flag_.set_not_use_block_cache();
+  context.store_ctx_ = &store_ctx;
+  context.ls_id_ = IVF_LS_ID;
+  context.tablet_id_ = IVF_TABLET_ID;
+  context.allocator_ = context.stmt_allocator_ = &allocator_;
+  context.trans_version_range_.base_version_ = 0;
+  context.trans_version_range_.snapshot_version_ = IVF_SNAPSHOT_VERSION;
+  ASSERT_EQ(OB_SUCCESS, context.micro_block_handle_mgr_.init(false, context.tablet_id_,
+      context.table_store_stat_, context.table_scan_stat_, context.query_flag_));
+  context.is_inited_ = true;
+  ObStoreRowIterator *iter = nullptr;
+  ASSERT_EQ(OB_SUCCESS, sstable_.scan(param, context, range, iter));
+  const ObDatumRow *actual = nullptr;
+  for (int64_t vid = 0; vid < row_count; ++vid) {
+    ASSERT_EQ(OB_SUCCESS, iter->get_next_row(actual));
+    EXPECT_EQ(IVF_ROW_TYPE_LOW_PRECISION_VECTOR, actual->storage_datums_[0].get_int());
+    EXPECT_EQ(1, actual->storage_datums_[1].get_int());
+    EXPECT_EQ(vid, actual->storage_datums_[2].get_int());
+    const auto payload = actual->storage_datums_[actual->count_ - 1].get_string();
+    EXPECT_EQ(payload_for(vid), std::string(payload.ptr(), payload.length()));
+  }
+  EXPECT_EQ(OB_ITER_END, iter->get_next_row(actual));
+  iter->~ObStoreRowIterator();
+}
+
+INSTANTIATE_TEST_CASE_P(EncodedRowStores, TestIVFPostingEstimateFailure,
+    ::testing::Values(ENCODING_ROW_STORE, CS_ENCODING_ROW_STORE));
+
 TEST_F(TestIVFSSTableWriter, flush_micro_block_not_init_and_empty)
 {
   ObIvfMacroBlockWriter not_opened;
@@ -6240,6 +6830,17 @@ TEST_F(TestIVFSSTableWriter, scan_macros_and_rows_after_write)
 class TestIVFInsertionStorage : public TestIVFMergeInput
 {
 protected:
+  bool clustered_ = false, reverse_sources_ = false, native_inc_sources_ = false, inc_source_metadata_ = false;
+  bool native_delta_ = false, single_source_ = false;
+  bool route_reuse_ = false, warm_route_cache_ = false;
+  bool rewrite_blocks_ = false;
+  bool metadata_input_ = true, natural_selection_ = false;
+  const char *delta_compressor_name_ = nullptr;
+  const char *compressor_name_ = "none";
+  ObRowStoreType minor_store_type_ = FLAT_ROW_STORE;
+  int64_t unresolved_source_ = -1;
+  ObAdaptiveMergePolicy::AdaptiveMergeReason merge_reason_ = ObAdaptiveMergePolicy::NONE;
+  int64_t output_schema_version_ = 10, output_progressive_round_ = 0;
   static constexpr int64_t DIM = 128;
   static constexpr int64_t REPLAY_BYTES = 64L * 1024 * 1024;
   struct Record
@@ -6255,29 +6856,44 @@ protected:
   {
     MacroBlockId id_;
     int64_t type_;
+    int64_t source_ = 0;
+    int64_t merge_type_ = -1;
+    int64_t row_store_type_ = -1;
+    uint64_t schema_version_ = UINT64_MAX;
+    bool clustered_ = false;
   };
   struct Result
   {
-    bool eligible_ = false;
+    bool eligible_ = false, saw_hierarchy_cluster_ = false, saw_prior_work_ = false;
+    bool route_reused_ = false;
+    ObIVFProcessType process_type_ = ObIVFProcessType::FULL_REBUILD;
     int64_t elapsed_us_ = 0, readback_us_ = 0, close_us_ = 0, verify_us_ = 0, compare_us_ = 0;
     int64_t replay_reserved_ = 0, replay_hold_ = 0, spill_bytes_ = 0;
     int64_t run_arena_bytes_ = 0, rss_before_readback_ = 0, rss_after_validation_ = 0;
     int64_t capture_rows_ = 0, old_capture_rows_ = 0, old_vids_ = 0;
+    bool metadata_counts_ = false, lazy_raw_ = false, metadata_before_capture_ = false;
+    ObIVFProcessType metadata_strategy_ = ObIVFProcessType::FULL_REBUILD;
+    int64_t replay_rows_ = 0, capture_us_ = 0, prior_us_ = 0, lazy_raw_read_rows_ = 0;
     int64_t reused_ids_[IVF_ROW_TYPE_MAX] = {};
+    int64_t reused_source_ids_[2][IVF_ROW_TYPE_MAX] = {};
     struct { int64_t removed_base_raw_rows_ = 0; } stats_;
+    int64_t data_macros_ = 0, new_data_bytes_ = 0, reused_data_bytes_ = 0;
+    int64_t cs_data_macros_ = 0, flat_data_macros_ = 0;
+    int64_t posting_tasks_ = 0, raw_tasks_ = 0;
     ObIvfSSTableMeta meta_;
     std::vector<Record> rows_;
+    std::vector<int64_t> logical_column_checksums_;
   };
   class Data : public ObIVFVectorStore
   {
   public:
     int64_t n_ = 10000, k_ = 32, delta_ = 1000;
-    bool spread_ = false, empty_leaf_ = false;
+    bool spread_ = false, empty_leaf_ = false, interleave_vids_ = false;
     bool is_valid() const override { return n_ > 0 && k_ > 1; }
     int64_t get_vector_count() const override { return n_; }
     int64_t get_dimension() const override { return DIM; }
     uint64_t base_vid(int64_t i) const { return 2 * (i + 1); }
-    uint64_t delta_vid(int64_t i) const { return 2 * n_ + 2 * i + 1; }
+    uint64_t delta_vid(int64_t i) const { return (interleave_vids_ ? 2 * (n_ / 2) : 2 * n_) + 2 * i + 1; }
     float center(int64_t cid, int64_t d) const
     {
       return d == 0 ? (empty_leaf_ && cid == k_ - 1 ? 1000000.125F : cid * 8.0F + 0.125F)
@@ -6392,6 +7008,21 @@ protected:
   }
   void TearDown() override
   {
+    auto *service = MTL(ObPluginVectorIndexService *);
+    ObPluginVectorIndexMgr *mgr = nullptr;
+    if (service != nullptr && OB_SUCCESS == service->acquire_vector_index_mgr(ObLSID(IVF_LS_ID), mgr, false)) {
+      std::vector<ObIvfCacheMgrKey> keys;
+      {
+        common::RWLock::RLockGuard guard(mgr->get_ivf_cache_mgr_map_rwlock());
+        auto &map = mgr->get_ivf_cache_mgr_map();
+        for (auto it = map.begin(); it != map.end(); ++it) {
+          if (it->first.is_sstable_key() && it->first.get_tablet_id() == ObTabletID(IVF_TABLET_ID)) {
+            keys.push_back(it->first);
+          }
+        }
+      }
+      for (const auto &key : keys) { EXPECT_EQ(OB_SUCCESS, mgr->erase_ivf_cache_mgr(key)); }
+    }
     delta_.reset(); base_.reset();
     base_rows_.clear(); source_macros_.clear();
     omt::ObTenantConfigGuard config(TENANT_CONF(MTL_ID()));
@@ -6409,16 +7040,32 @@ protected:
     sstable_builder_.reset(); object_cleaner_.reset();
     whole_desc_.reset(); table_schema_.reset();
     prepare_ivf_schema(table_schema_);
+    table_schema_.set_table_type(USER_INDEX);
+    table_schema_.set_data_table_id(table_schema_.get_table_id());
+    table_schema_.set_index_type(INDEX_TYPE_ASYNC_IVF_INDEX_LOCAL);
     table_schema_.set_row_store_type(type);
-    table_schema_.set_micro_index_clustered(false);
+    table_schema_.set_minor_row_store_type(minor_store_type_);
+    table_schema_.set_micro_index_clustered(clustered_);
+    EXPECT_TRUE(table_schema_.is_valid());
+    if (!table_schema_.is_valid()) { return OB_INVALID_ARGUMENT; }
     SCN end_scn;
     if (OB_FAIL(end_scn.convert_for_tx(snapshot))) {
-    } else if (OB_FAIL(table_schema_.set_compress_func_name("none"))) {
+    } else if (OB_FAIL(table_schema_.set_compress_func_name(compressor_name_))) {
     } else if (OB_FAIL(whole_desc_.init(false, table_schema_, ObLSID(IVF_LS_ID),
         ObTabletID(IVF_TABLET_ID), merge_type, snapshot, DATA_CURRENT_VERSION,
-        false, 0, 1, SCN::min_scn(), end_scn))) {
+        clustered_, 0, 1, SCN::min_scn(), end_scn, nullptr, 0, EXEC_MODE_LOCAL,
+        true /* submit IO */, is_inc_major_merge(merge_type)))) {
     } else {
-      whole_desc_.get_desc().static_desc_->schema_version_ = 10;
+      const auto expected_type = is_inc_major_merge(merge_type) ? table_schema_.get_minor_row_store_type() : type;
+      EXPECT_EQ(expected_type, whole_desc_.get_desc().get_row_store_type());
+      EXPECT_EQ(table_schema_.get_compressor_type(), whole_desc_.get_desc().get_compressor_type());
+      EXPECT_EQ(is_inc_major_merge(merge_type), whole_desc_.get_static_desc().is_inc_major_);
+      if (expected_type != whole_desc_.get_desc().get_row_store_type()
+          || table_schema_.get_compressor_type() != whole_desc_.get_desc().get_compressor_type()) {
+        return OB_ERR_UNEXPECTED;
+      }
+      whole_desc_.get_desc().static_desc_->schema_version_ = output_schema_version_;
+      whole_desc_.get_desc().static_desc_->progressive_merge_round_ = output_progressive_round_;
       whole_desc_.get_desc().sstable_index_builder_ = &sstable_builder_;
       ret = sstable_builder_.init(whole_desc_.get_desc(), ObSSTableIndexBuilder::DISABLE);
       if (OB_SUCC(ret)) { sstable_builder_.set_is_async_index(true); }
@@ -6447,17 +7094,53 @@ protected:
         OB_DEFAULT_MACRO_BLOCK_SIZE, 0, warm, index_window.end_))) {
     } else if (OB_FAIL(fill_create_param(res, param))) {
     } else {
+      if (is_inc_major_merge(whole_desc_.get_desc().get_merge_type())) {
+        param.column_checksums_.reset(); // Production INC compaction does not publish this array.
+      } else if (OB_FAIL(param.column_checksums_.assign(res.data_column_checksums_))) { return ret; }
+      param.latest_row_store_type_ = table_schema_.get_row_store_type(); // Declared/latest, as init_for_merge.
       param.ivf_meta_ = meta;
       param.table_key_.version_range_.snapshot_version_ = snapshot;
-      if (delta || inc_source_) {
+      if (delta) {
         param.table_key_.table_type_ = ObITable::INC_IVF_INDEX_SSTABLE;
         param.table_key_.scn_range_.start_scn_.convert_for_tx(
-            delta && snapshot == IVF_SNAPSHOT_VERSION ? IVF_SNAPSHOT_VERSION : IVF_SNAPSHOT_VERSION - 10);
+            &table == delta_.get() ? IVF_SNAPSHOT_VERSION : IVF_SNAPSHOT_VERSION - 10);
         param.table_key_.scn_range_.end_scn_.convert_for_tx(
-            delta || snapshot > IVF_SNAPSHOT_VERSION ? IVF_SNAPSHOT_VERSION + 10 : IVF_SNAPSHOT_VERSION);
-        ObUncommitTxDesc tx(20261025, IVF_SNAPSHOT_VERSION, ObUncommitTxDesc::COMMIT_VERSION);
+            &table == delta_.get() || snapshot > IVF_SNAPSHOT_VERSION ? IVF_SNAPSHOT_VERSION + 10 : IVF_SNAPSHOT_VERSION);
+        ObUncommitTxDesc tx(20261025, (native_inc_sources_ || native_delta_ || inc_source_metadata_)
+            ? IVF_SNAPSHOT_VERSION + 20 : IVF_SNAPSHOT_VERSION, ObUncommitTxDesc::COMMIT_VERSION);
         ret = param.uncommit_tx_info_.push_back(tx);
         param.uncommit_tx_info_.set_info_status_record_seq();
+        // Persist the logical refresh window separately from the physical MVCC
+        // row versions and the TableKey's CLOG range, as init_for_merge does.
+        param.min_merged_trans_version_ = &table == base_.get() ? IVF_SNAPSHOT_VERSION - 10
+            : &table == delta_.get() ? IVF_SNAPSHOT_VERSION : 0;
+        param.max_merged_trans_version_ = &table == base_.get()
+            ? IVF_SNAPSHOT_VERSION : IVF_SNAPSHOT_VERSION + 10;
+      }
+      if ((native_inc_sources_ || native_delta_ || inc_source_metadata_) && delta) {
+        const bool source_table = snapshot == IVF_SNAPSHOT_VERSION;
+        const int64_t source_idx = &table == base_.get() ? 0 : 1;
+        if (source_table) {
+          // INC TableKey stores the CLOG range, not the logical refresh window.
+          param.table_key_.scn_range_.start_scn_.convert_for_tx(1000 + (source_idx == 0
+              ? IVF_SNAPSHOT_VERSION - 10 : IVF_SNAPSHOT_VERSION));
+          param.table_key_.scn_range_.end_scn_.convert_for_tx(1000 + (source_idx == 0
+              ? IVF_SNAPSHOT_VERSION : IVF_SNAPSHOT_VERSION + 10));
+        }
+        param.min_merged_trans_version_ = source_table && source_idx == 0
+            ? IVF_SNAPSHOT_VERSION - 10 : source_table ? IVF_SNAPSHOT_VERSION : IVF_SNAPSHOT_VERSION - 10;
+        param.max_merged_trans_version_ = source_table && source_idx == 0
+            ? IVF_SNAPSHOT_VERSION : IVF_SNAPSHOT_VERSION + 10;
+        // A table commit can be later than the logical refresh snapshot. Reuse
+        // must certify both independently, not compare commit time to snapshot.
+        param.upper_trans_version_ = source_table && source_idx == unresolved_source_
+            ? INT64_MAX : IVF_SNAPSHOT_VERSION + 20;
+        if (source_table && source_idx == unresolved_source_) {
+          param.uncommit_tx_info_.reuse();
+          ObUncommitTxDesc tx(20261025, 1, ObUncommitTxDesc::TXID);
+          ret = param.uncommit_tx_info_.push_back(tx);
+          param.uncommit_tx_info_.set_info_status_record_seq();
+        }
       }
       if (OB_SUCC(ret)) { ret = table.init(param, &allocator); }
     }
@@ -6508,10 +7191,28 @@ protected:
     iter->~ObStoreRowIterator();
     return ret;
   }
+  void collect_source_macros(ObIvfSSTable &table, int64_t source_idx)
+  {
+    ObTableReadInfo info;
+    ASSERT_EQ(OB_SUCCESS, prepare_read_info(info));
+    ObDatumRange range; range.set_whole_range();
+    ObIMacroBlockIterator *iter = nullptr;
+    ASSERT_EQ(OB_SUCCESS, table.scan_macro_block(range, info, allocator_, iter, false, true, true));
+    ObMacroBlockDesc macro; ObDataMacroBlockMeta meta; macro.macro_meta_ = &meta;
+    int rc = OB_SUCCESS;
+    while (OB_SUCCESS == (rc = iter->get_next_macro_block(macro))) {
+      source_macros_.push_back({macro.macro_block_id_, macro.range_.end_key_.datums_[0].get_int(), source_idx,
+          meta.get_logic_id().merge_type_, meta.val_.row_store_type_, meta.val_.schema_version_,
+          macro.is_clustered_index_tree_});
+    }
+    ASSERT_EQ(OB_ITER_END, rc);
+    iter->~ObIMacroBlockIterator(); allocator_.free(iter);
+  }
   void build_inputs(bool duplicate_delta = false, ObRowStoreType row_store_type = CS_ENCODING_ROW_STORE,
       bool grouped = false, bool distinct_delta = false)
   {
-    ASSERT_EQ(OB_SUCCESS, reset_output(row_store_type));
+    ASSERT_EQ(OB_SUCCESS, reset_output(row_store_type, IVF_SNAPSHOT_VERSION,
+        native_inc_sources_ && inc_source_ ? INC_MAJOR_MERGE : MAJOR_MERGE));
     base_.reset(new ObIvfSSTable()); delta_.reset(new ObIvfSSTable());
     ObArray<float> centers;
     ObArray<ObIVFVectorVID> all;
@@ -6582,8 +7283,9 @@ protected:
     ASSERT_EQ(OB_SUCCESS, writer.write_raw_vectors(reader, all, 0, all.count(), 0));
     ASSERT_EQ(OB_SUCCESS, writer.finish_raw_write(data_.n_));
     ObSSTableMergeRes base_res;
-    ASSERT_EQ(OB_SUCCESS, seal_table(*base_, allocator_, false, writer.get_ivf_meta(), base_res));
-    ASSERT_EQ(OB_SUCCESS, read_rows(*base_, base_rows_));
+    ASSERT_EQ(OB_SUCCESS, seal_table(*base_, allocator_, inc_source_, writer.get_ivf_meta(), base_res));
+    base_rows_.clear();
+    if (unresolved_source_ != 0) { ASSERT_EQ(OB_SUCCESS, read_rows(*base_, base_rows_)); }
     ObTableReadInfo info;
     ASSERT_EQ(OB_SUCCESS, prepare_read_info(info));
     ObDatumRange range;
@@ -6599,12 +7301,16 @@ protected:
       const int64_t type = macro.range_.end_key_.datums_[0].get_int();
       ASSERT_GE(type, 0);
       ASSERT_LT(type, IVF_ROW_TYPE_MAX);
-      source_macros_.push_back({macro.macro_block_id_, type});
+      source_macros_.push_back({macro.macro_block_id_, type, 0, meta.get_logic_id().merge_type_, meta.val_.row_store_type_, meta.val_.schema_version_,
+          macro.is_clustered_index_tree_});
     }
     ASSERT_EQ(OB_ITER_END, rc);
     iter->~ObIMacroBlockIterator(); allocator_.free(iter);
 
-    ASSERT_EQ(OB_SUCCESS, reset_output(row_store_type));
+    const char *output_compressor = compressor_name_;
+    if (delta_compressor_name_ != nullptr) { compressor_name_ = delta_compressor_name_; }
+    ASSERT_EQ(OB_SUCCESS, reset_output(row_store_type, IVF_SNAPSHOT_VERSION,
+        native_inc_sources_ || native_delta_ ? INC_MAJOR_MERGE : MAJOR_MERGE));
     if (data_.delta_ == 0) {
       ObStorageSchema schema;
       ObTabletCreateSSTableParam param;
@@ -6642,6 +7348,201 @@ protected:
       ObSSTableMergeRes delta_res;
       ASSERT_EQ(OB_SUCCESS, seal_table(*delta_, allocator_, true, delta_writer.get_ivf_meta(), delta_res));
     }
+    if (!delta_->is_empty()) { ASSERT_NO_FATAL_FAILURE(collect_source_macros(*delta_, 1)); }
+    compressor_name_ = output_compressor;
+  }
+
+  void rewrite_source_through_refresh_sealing(int64_t source_idx, bool extra_column = false)
+  {
+    ASSERT_TRUE(source_idx == 0 || source_idx == 1);
+    auto &source = source_idx == 0 ? base_ : delta_;
+    std::vector<Record> records;
+    ASSERT_EQ(OB_SUCCESS, read_rows(*source, records));
+    const ObIvfSSTableMeta ivf_meta = source->get_ivf_meta();
+    ASSERT_FALSE(records.empty());
+    ASSERT_EQ(OB_SUCCESS, reset_output(CS_ENCODING_ROW_STORE));
+    table_schema_.set_schema_version(output_schema_version_);
+    if (extra_column) {
+      ObColumnSchemaV2 column;
+      column.set_table_id(IVF_TABLE_ID);
+      column.set_column_id(OB_APP_MIN_COLUMN_ID + 4);
+      ASSERT_EQ(OB_SUCCESS, column.set_column_name("future_payload_tail"));
+      column.set_data_type(ObIntType); column.set_collation_type(CS_TYPE_BINARY);
+      ASSERT_EQ(OB_SUCCESS, table_schema_.add_column(column));
+      table_schema_.set_max_used_column_id(OB_APP_MIN_COLUMN_ID + 4);
+    }
+    ObStorageSchema schema;
+    ASSERT_EQ(OB_SUCCESS, schema.init(allocator_, table_schema_, lib::Worker::CompatMode::MYSQL));
+    ObColumnClusteredDag owner;
+    owner.is_inc_major_log_ = true;
+    owner.ddl_task_param_.is_async_index_refresh_ = true;
+    owner.ddl_task_param_.ddl_task_id_ = 2026110400 + source_idx;
+    owner.ddl_task_param_.ddl_build_id_ = 2026111400 + source_idx;
+    ObDDLTabletContext tablet_context;
+    tablet_context.ivf_ctx_ = OB_NEW(ObIVFTabletContext, ObMemAttr(MTL_ID(), "IVFCtx"));
+    ASSERT_NE(nullptr, tablet_context.ivf_ctx_);
+    ASSERT_EQ(OB_SUCCESS, tablet_context.ivf_ctx_->ivf_meta_.assign(tablet_context.arena_, ivf_meta));
+    ObWriteMacroParam write_param;
+    write_param.ls_id_ = ObLSID(IVF_LS_ID); write_param.tablet_id_ = ObTabletID(IVF_TABLET_ID);
+    write_param.tenant_data_version_ = DATA_CURRENT_VERSION;
+    write_param.schema_version_ = output_schema_version_;
+    write_param.snapshot_version_ = IVF_SNAPSHOT_VERSION + source_idx * 10;
+    write_param.direct_load_type_ = DIRECT_LOAD_INCREMENTAL_MAJOR;
+    write_param.task_id_ = owner.ddl_task_param_.ddl_task_id_;
+    write_param.ddl_dag_ = &owner; write_param.tablet_context_ = &tablet_context;
+    write_param.tablet_param_.storage_schema_ = &schema;
+    write_param.tablet_param_.is_micro_index_clustered_ = true;
+    write_param.tablet_param_.tablet_transfer_seq_ = 0;
+    write_param.tablet_param_.reorganization_scn_.set_min();
+    ASSERT_EQ(OB_SUCCESS, write_param.start_scn_.convert_for_tx(1000 + source_idx * 10));
+    ObAsyncIndexMacroWriterAdapter adapter;
+    adapter.tablet_id_ = write_param.tablet_id_;
+    adapter.parallel_idx_ = 0; adapter.cg_idx_ = 0; adapter.is_disk_bbq_writer_ = true;
+    // Exercise the production physical adapter. The redo/transaction callback
+    // is the integration boundary; no table schema or macro meta is fabricated.
+    ASSERT_EQ(OB_SUCCESS, adapter.build_ivf_row_desc(write_param, adapter.ivf_row_desc_));
+    ASSERT_EQ(OB_SUCCESS, adapter.prepare_data_store_desc(write_param, adapter.inv_idx_row_desc_));
+    ASSERT_TRUE(adapter.data_desc_.get_static_desc().is_inc_major_);
+    ASSERT_FALSE(adapter.data_desc_.get_desc().micro_index_clustered());
+    ASSERT_EQ(output_schema_version_, adapter.data_desc_.get_desc().get_schema_version());
+    ASSERT_EQ(OB_SUCCESS, ObISSTableObjectCleaner::get_cleaner_from_data_store_desc(
+        adapter.data_desc_.get_desc(), adapter.object_cleaner_));
+    ASSERT_NE(nullptr, adapter.object_cleaner_);
+    ObMacroSeqParam data_seq; data_seq.seq_type_ = ObMacroSeqParam::SEQ_TYPE_INC; data_seq.start_ = 0;
+    const ObPreWarmerParam warm(PRE_WARM_TYPE_NONE);
+    ASSERT_EQ(OB_SUCCESS, adapter.ivf_writer_.open(adapter.ivf_row_desc_, adapter.data_desc_.get_desc(),
+        0, data_seq, warm, *adapter.object_cleaner_));
+    adapter.is_inited_ = true;
+    ObDatumRow row;
+    const int64_t physical_columns = adapter.data_desc_.get_desc().get_row_column_count();
+    ASSERT_EQ(extra_column ? 7 : 6, physical_columns);
+    ASSERT_EQ(OB_SUCCESS, row.init(allocator_, physical_columns));
+    for (const auto &record : records) {
+      ASSERT_EQ(OB_SUCCESS, make_ivf_row(row, record.type_, record.cid_, record.vid_,
+          ObString(record.payload_.size(), record.payload_.data())));
+      row.storage_datums_[3].set_int(-write_param.snapshot_version_);
+      if (extra_column) { ASSERT_EQ(7, row.get_column_count()); row.storage_datums_[6].set_int(7); }
+      ASSERT_EQ(OB_SUCCESS, adapter.append_row(row));
+    }
+    ASSERT_EQ(OB_SUCCESS, adapter.close());
+    ASSERT_EQ(records.size(), adapter.get_row_count());
+    ObMacroSeqWindow stage_index_window;
+    ASSERT_EQ(OB_SUCCESS, ObVersionLocalMacroSeq::build_window(1, stage_index_window));
+    ObSSTableMergeRes stage;
+    ASSERT_EQ(OB_SUCCESS, adapter.index_builder_->close_with_macro_seq(stage, stage_index_window.start_,
+        OB_DEFAULT_MACRO_BLOCK_SIZE, 0, warm, stage_index_window.end_));
+
+    ObTablet tablet;
+    tablet.tablet_meta_.tablet_id_ = ObTabletID(IVF_TABLET_ID);
+    tablet.tablet_meta_.ls_id_ = ObLSID(IVF_LS_ID);
+    tablet.tablet_meta_.micro_index_clustered_ = true;
+    ASSERT_EQ(OB_SUCCESS, tablet.tablet_meta_.transfer_info_.init());
+    ObITable::TableKey table_key;
+    table_key.table_type_ = ObITable::INC_IVF_INDEX_SSTABLE;
+    table_key.tablet_id_ = ObTabletID(IVF_TABLET_ID);
+    ASSERT_EQ(OB_SUCCESS, table_key.scn_range_.start_scn_.convert_for_tx(1000 + source_idx * 10));
+    ASSERT_EQ(OB_SUCCESS, table_key.scn_range_.end_scn_.convert_for_tx(1010 + source_idx * 10));
+    ObWholeDataStoreDesc sealing_desc;
+    ASSERT_EQ(OB_SUCCESS, ObTabletDDLUtil::prepare_index_data_desc(tablet, table_key,
+        write_param.snapshot_version_, DATA_CURRENT_VERSION, nullptr, &schema, SCN::min_scn(), sealing_desc));
+    ASSERT_TRUE(sealing_desc.get_desc().micro_index_clustered());
+    ObSSTableIndexBuilder sealing_builder(true);
+    ASSERT_EQ(OB_SUCCESS, sealing_builder.init(sealing_desc.get_desc(), ObSSTableIndexBuilder::DISABLE));
+    sealing_desc.get_desc().sstable_index_builder_ = &sealing_builder;
+    sealing_builder.set_is_async_index(true);
+    ASSERT_EQ(OB_SUCCESS, sealing_builder.set_ivf_meta(ivf_meta));
+    ObIndexBlockRebuilder rebuilder;
+    ObMacroSeqParam index_seq; index_seq.seq_type_ = ObMacroSeqParam::SEQ_TYPE_INC; index_seq.start_ = 0;
+    ASSERT_EQ(OB_SUCCESS, rebuilder.init(sealing_builder, index_seq, nullptr, table_key));
+    ObArenaAllocator io_allocator("IVFRefreshRead");
+    char *buffer = static_cast<char *>(io_allocator.alloc(OB_DEFAULT_MACRO_BLOCK_SIZE));
+    ASSERT_NE(nullptr, buffer);
+    for (const auto &id : stage.data_block_ids_) {
+      ObStorageObjectReadInfo io;
+      ObStorageObjectHandle handle;
+      io.macro_block_id_ = id; io.offset_ = 0; io.size_ = OB_DEFAULT_MACRO_BLOCK_SIZE;
+      io.buf_ = buffer; io.mtl_tenant_id_ = MTL_ID(); io.io_timeout_ms_ = DEFAULT_IO_WAIT_TIME_MS;
+      io.io_desc_.set_mode(ObIOMode::READ);
+      io.io_desc_.set_wait_event(ObWaitEventIds::DB_FILE_COMPACT_READ);
+      io.io_desc_.set_sys_module_id(ObIOModule::INDEX_BLOCK_MICRO_ITER_IO);
+      ASSERT_EQ(OB_SUCCESS, ObObjectManager::async_read_object(io, handle));
+      ASSERT_EQ(OB_SUCCESS, handle.wait());
+      ASSERT_EQ(OB_SUCCESS, rebuilder.append_macro_row(handle.get_buffer(), handle.get_data_size(), id, -1));
+    }
+    ASSERT_EQ(OB_SUCCESS, rebuilder.close());
+    ObSSTableMergeRes sealed;
+    ObMacroSeqWindow sealing_window;
+    ASSERT_EQ(OB_SUCCESS, ObVersionLocalMacroSeq::build_window(2, sealing_window));
+    ASSERT_EQ(OB_SUCCESS, sealing_builder.close_with_macro_seq(sealed, sealing_window.start_,
+        OB_DEFAULT_MACRO_BLOCK_SIZE, 0, warm, sealing_window.end_));
+    ObNewVersionRange logical;
+    logical.base_version_ = IVF_SNAPSHOT_VERSION - 10 + source_idx * 10;
+    logical.snapshot_version_ = write_param.snapshot_version_;
+    ObTabletCreateSSTableParam create;
+    ASSERT_EQ(OB_SUCCESS, create.init_for_async_index_ss_ddl(sealed, table_key, schema,
+        0 /* real SS refresh create_schema_version_on_tablet default */,
+        DIRECT_LOAD_INCREMENTAL_MAJOR, transaction::ObTransID(2026110400 + source_idx),
+        transaction::ObTxSEQ(2001, 0), logical));
+    ASSERT_EQ(0, create.schema_version_);
+    std::unique_ptr<ObIvfSSTable> replacement(new ObIvfSSTable());
+    ASSERT_EQ(OB_SUCCESS, ObTabletCreateDeleteHelper::create_sstable<ObIvfSSTable>(create, allocator_, *replacement));
+    SCN commit_scn; ASSERT_EQ(OB_SUCCESS, commit_scn.convert_for_tx(2000));
+    ASSERT_EQ(OB_SUCCESS, replacement->backfill_commit_version(allocator_, IVF_SNAPSHOT_VERSION + 20, commit_scn));
+    // close_with_macro_seq owns mark_succeed and returns its failure. Calling
+    // the cleaner again would be an invalid second completion, not publication.
+    ASSERT_TRUE(adapter.index_builder_->is_closed_);
+    ASSERT_TRUE(sealing_builder.is_closed_);
+    std::vector<Record> actual;
+    ASSERT_EQ(OB_SUCCESS, read_rows(*replacement, actual));
+    EXPECT_EQ(records, actual);
+    source = std::move(replacement);
+    if (source_idx == 0) { base_rows_ = actual; }
+  }
+
+  void extend_source_centroid_headers()
+  {
+    auto meta = base_->get_ivf_meta();
+    auto records = base_rows_;
+    ASSERT_EQ(OB_SUCCESS, reset_output(FLAT_ROW_STORE));
+    ObIvfMacroBlockWriter writer;
+    ASSERT_EQ(OB_SUCCESS, open_format_aware_writer(writer, 0));
+    ObDatumRow row;
+    int64_t centers = 0;
+    for (auto &record : records) {
+      if (record.type_ == IVF_ROW_TYPE_CENTROID) {
+        ObIvfCentroidPayloadHeader header;
+        MEMCPY(&header, record.payload_.data(), sizeof(header));
+        header.header_size_ += 4;
+        record.payload_ = std::string(reinterpret_cast<const char *>(&header), sizeof(header))
+            + std::string(4, 'E') + record.payload_.substr(sizeof(header));
+      }
+      ASSERT_EQ(OB_SUCCESS, make_ivf_row(row, record.type_, record.cid_, record.vid_,
+          ObString(record.payload_.size(), record.payload_.data())));
+      ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+      if (record.type_ == IVF_ROW_TYPE_CENTROID && ++centers % 32 == 0) {
+        ASSERT_EQ(OB_SUCCESS, writer.flush_micro_block());
+        ASSERT_EQ(OB_SUCCESS, writer.try_switch_macro_block());
+      }
+    }
+    ASSERT_EQ(OB_SUCCESS, writer.close());
+    std::unique_ptr<ObIvfSSTable> replacement(new ObIvfSSTable());
+    ObSSTableMergeRes res;
+    ASSERT_EQ(OB_SUCCESS, seal_table(*replacement, allocator_, false, meta, res));
+    base_ = std::move(replacement);
+    ASSERT_EQ(OB_SUCCESS, read_rows(*base_, base_rows_));
+    ObTableReadInfo info;
+    ASSERT_EQ(OB_SUCCESS, prepare_read_info(info));
+    ObDatumRange range; range.set_whole_range();
+    ObIMacroBlockIterator *iter = nullptr;
+    ASSERT_EQ(OB_SUCCESS, base_->scan_macro_block(range, info, allocator_, iter, false, false, true));
+    ObMacroBlockDesc macro; ObDataMacroBlockMeta block_meta; macro.macro_meta_ = &block_meta;
+    source_macros_.clear();
+    int rc = OB_SUCCESS;
+    while (OB_SUCCESS == (rc = iter->get_next_macro_block(macro))) {
+      source_macros_.push_back({macro.macro_block_id_, macro.range_.end_key_.datums_[0].get_int()});
+    }
+    ASSERT_EQ(OB_ITER_END, rc);
+    iter->~ObIMacroBlockIterator(); allocator_.free(iter);
   }
 
   int configure_context(ObAsyncIndexMergeCtx &ctx, ObIVFMergeInputAdapter &input,
@@ -6649,7 +7550,9 @@ protected:
   {
     int ret = OB_SUCCESS;
     ctx.static_param_.is_ivf_index_ = true;
-    ctx.static_param_.version_range_.base_version_ = 0;
+    ctx.static_param_.merge_reason_ = merge_reason_;
+    ctx.static_param_.version_range_.base_version_ = (native_inc_sources_ || native_delta_ || inc_source_metadata_)
+        && is_inc_major_merge(ctx.get_merge_type()) ? IVF_SNAPSHOT_VERSION - 10 : 0;
     ctx.static_param_.version_range_.snapshot_version_ = IVF_SNAPSHOT_VERSION + 10;
     ctx.static_param_.concurrent_cnt_ = 1;
     ObTableHandleV2 base_handle, delta_handle;
@@ -6659,12 +7562,15 @@ protected:
         table_schema_.get_rowkey_column_num(), false, whole_desc_.get_desc().get_full_stored_col_descs()))) {
     } else if (OB_FAIL(base_handle.set_sstable_with_tablet(base_.get()))
         || OB_FAIL(delta_handle.set_sstable_with_tablet(delta_.get()))
-        || OB_FAIL(ctx.static_param_.tables_handle_.add_table(base_handle))
-        || OB_FAIL(ctx.static_param_.tables_handle_.add_table(delta_handle))
+        || OB_FAIL(ctx.static_param_.tables_handle_.add_table(reverse_sources_ ? delta_handle : base_handle))
+        || (!single_source_ && OB_FAIL(ctx.static_param_.tables_handle_.add_table(reverse_sources_ ? base_handle : delta_handle)))
         || OB_FAIL(ctx.deletion_bitmap_handle_.init_from_bitmap(arena, bitmap))) {
     }
     for (auto vid : deleted) { if (OB_SUCC(ret)) { ret = bitmap->value_add(vid); } }
     input.index_table_id_ = IVF_TABLE_ID; input.index_tablet_id_ = ObTabletID(IVF_TABLET_ID);
+    // Existing forced-strategy cases retain their legacy setup. New natural
+    // strategy cases exercise metadata selection before capture is started.
+    input.enable_metadata_ = metadata_input_ && natural_selection_;
     const ObHcaTrainParam training;
     input.vector_dim_ = DIM;
     input.max_sample_count_ = training.max_local_k_ * training.samples_per_cluster_;
@@ -6676,7 +7582,8 @@ protected:
 
   int run_merge(Result &result, const std::vector<uint64_t> &deleted = {},
       ObRowStoreType output_type = CS_ENCODING_ROW_STORE, ObMergeType merge_type = MAJOR_MERGE,
-      ObIVFProcessType selected = ObIVFProcessType::INSERTION, int64_t parent_threshold = 0)
+      ObIVFProcessType selected = ObIVFProcessType::INSERTION, int64_t parent_threshold = 0,
+      bool block_reuse = false, int64_t parallelism = 1, ObIvfSSTable *persisted_output = nullptr)
   {
     int ret = reset_output(output_type, IVF_SNAPSHOT_VERSION + 10, merge_type);
     if (OB_FAIL(ret)) { return ret; }
@@ -6685,10 +7592,16 @@ protected:
     dag_param.merge_version_ = IVF_SNAPSHOT_VERSION + 10;
     ObAsyncIndexMergeCtx ctx(dag_param, arena);
     ObIVFMergeInputAdapter input(arena);
+    ObArray<uint32_t> final_posting_counts;
     ObMacroSeqWindow window;
     if (OB_FAIL(ObVersionLocalMacroSeq::build_window(0, window))) { return ret; }
     const int64_t started = ObTimeUtility::current_time();
     if (OB_FAIL(configure_context(ctx, input, arena, deleted))) { return ret; }
+    result.metadata_counts_ = input.uses_metadata_counts();
+    result.lazy_raw_ = input.uses_lazy_raw();
+    result.metadata_strategy_ = input.metadata_strategy();
+    result.metadata_before_capture_ = result.metadata_counts_ && input.locators_.empty()
+        && input.replay_inputs_.empty();
     if (is_inc_major_merge(merge_type)) { ctx.deletion_bitmap_handle_.reset(); }
     result.eligible_ = true;
     ObIVFMergeCaptureCtx capture;
@@ -6696,11 +7609,13 @@ protected:
     for (int64_t t = 0; OB_SUCC(ret) && t < capture.get_task_count(); ++t) { ret = capture.scan(t); }
     if (OB_SUCC(ret)) { ret = capture.finish(); }
     if (OB_FAIL(ret)) { return ret; }
+    result.capture_us_ = ObTimeUtility::current_time() - started;
     result.capture_rows_ = input.locators_.count();
-    for (const auto &locator : input.locators_) { result.old_capture_rows_ += locator.table_idx_ == 0; }
+    for (const auto &locator : input.locators_) { result.old_capture_rows_ += locator.table_idx_ == (reverse_sources_ ? 1 : 0); }
     result.stats_.removed_base_raw_rows_ = data_.n_ - result.old_capture_rows_;
     result.replay_reserved_ = input.replay_memory_reservation_.get_reserved_bytes();
     for (int64_t i = 0; i < input.replay_inputs_.count(); ++i) {
+      result.replay_rows_ += input.replay_inputs_.at(i)->get_row_count();
       result.replay_hold_ += input.replay_inputs_.at(i)->get_mem_hold();
       result.spill_bytes_ += input.replay_inputs_.at(i)->get_file_size();
     }
@@ -6709,72 +7624,168 @@ protected:
       empty.set_empty();
       ret = sstable_builder_.set_ivf_meta(empty);
     } else {
-      // This fixture exercises insertion itself, including a single surviving
-      // vector. Heuristic strategy selection is covered separately.
+      // Legacy cases drive a concrete algorithm; natural cases consume the
+      // strategy chosen from metadata before capture (or the scan fallback).
       EventItem force, reset;
       force.error_code_ = OB_ERR_UNEXPECTED; force.occur_ = 1;
-      const char *event = selected == ObIVFProcessType::CONCATENATION
-          ? "ERRSIM_IVF_FORCE_CONCAT" : "ERRSIM_IVF_FORCE_INSERTION";
-      if (OB_FAIL(EventTable::set_event(event, force))) { return ret; }
+      const char *event = selected == ObIVFProcessType::CONCATENATION ? "ERRSIM_IVF_FORCE_CONCAT"
+          : selected == ObIVFProcessType::INSERTION ? "ERRSIM_IVF_FORCE_INSERTION"
+          : "ERRSIM_IVF_FORCE_FULL_REBUILD";
+      if (!natural_selection_ && OB_FAIL(EventTable::set_event(event, force))) { return ret; }
+      const int64_t prior_started = ObTimeUtility::current_time();
       ret = input.capture_prior_(ctx);
+      result.prior_us_ = ObTimeUtility::current_time() - prior_started;
       const int reset_ret = EventTable::set_event(event, reset);
       if (OB_FAIL(ret)) { return ret; }
       if (reset_ret != OB_SUCCESS) { return reset_ret; }
+      if (natural_selection_) {
+        if (input.uses_metadata_counts()) { selected = input.metadata_strategy(); }
+        else if (OB_FAIL(ObIVFMergeStrategy::select(
+            input.get_prior(), input.cluster_size_, selected))) { return ret; }
+      }
       ObIVFDDLHcaAdapter algorithm;
       ObIVFMergeSSTableWriter output(arena);
       ObIVFMergeProcessor processor;
       ObIVFInsertionPlanner insertion;
       ObIVFConcatPlanner concat;
+      ObIVFFullRebuildPlanner full_rebuild;
       ObIVFMergePlanner &planner = selected == ObIVFProcessType::CONCATENATION
-          ? static_cast<ObIVFMergePlanner &>(concat) : static_cast<ObIVFMergePlanner &>(insertion);
+          ? static_cast<ObIVFMergePlanner &>(concat) : selected == ObIVFProcessType::INSERTION
+          ? static_cast<ObIVFMergePlanner &>(insertion) : static_cast<ObIVFMergePlanner &>(full_rebuild);
       if (OB_FAIL(algorithm.init(ObIVFHcaAlgorithmParam()))
           || OB_FAIL(output.init(whole_desc_.get_desc(), sstable_builder_, window,
               IVF_SNAPSHOT_VERSION + 10, DIM, VIDA_L2))) { return ret; }
-      algorithm.prepare_insertion_source(input, input.get_prior(), VIDA_L2, base_->get_ivf_meta().leaf_cid_base());
+      if ((block_reuse || route_reuse_) && OB_FAIL(input.prepare_block_reuse())) { return ret; }
+      if (block_reuse && OB_FAIL(output.set_reuse_sources(input.get_reuse_sources(), rewrite_blocks_))) { return ret; }
+      if (route_reuse_ && input.prior_.dominant_segment_ >= 0
+          && input.prior_.dominant_segment_ < input.reuse_sources_.count()) {
+        input.prior_.routing_source_ = input.reuse_sources_.at(input.prior_.dominant_segment_);
+      }
+      if (selected == ObIVFProcessType::INSERTION) {
+        algorithm.prepare_insertion_source(input, input.get_prior(), VIDA_L2, base_->get_ivf_meta().leaf_cid_base());
+      }
       if (OB_FAIL(processor.init(arena, input.get_merge_input(), algorithm, output, selected, &input.get_prior()))
-          || OB_FAIL(processor.configure_ddl_runtime(algorithm, 1))
-          || OB_FAIL(selected == ObIVFProcessType::CONCATENATION
-              ? concat.init(arena, processor) : insertion.init(arena, processor))) { return ret; }
+          || OB_FAIL(processor.configure_ddl_runtime(algorithm, parallelism))
+          || OB_FAIL(selected == ObIVFProcessType::CONCATENATION ? concat.init(arena, processor)
+              : selected == ObIVFProcessType::INSERTION ? insertion.init(arena, processor)
+              : full_rebuild.init(arena, processor))) { return ret; }
+      result.process_type_ = processor.get_process_type();
       if (parent_threshold > 0 && OB_FAIL(ObIVFMergeTestPeer::set_parent_build_threshold(processor, parent_threshold))) {
         return ret;
       }
       const ObIVFTaskPlan *plan = nullptr;
       ret = planner.start(plan);
       for (int64_t step = 0; OB_SUCC(ret) && plan != nullptr && step < 128; ++step) {
+        result.saw_hierarchy_cluster_ |= planner.get_step() == ObIVFMergeStep::HIERARCHY_CLUSTER;
+        result.saw_prior_work_ |= planner.get_step() == ObIVFMergeStep::PRIOR_WORK;
+        result.posting_tasks_ = MAX(result.posting_tasks_, output.posting_write_task_count());
+        if (planner.get_step() == ObIVFMergeStep::RAW_WRITE) { result.raw_tasks_ = plan->get_task_count(); }
+        // Production allocators must be thread-safe; this fixture deliberately
+        // uses its arena serially while exercising multiple disjoint task ranges.
         for (int64_t t = 0; OB_SUCC(ret) && t < plan->get_task_count(); ++t) { ret = planner.process_task(*plan, t); }
         const ObIVFTaskPlan *next = nullptr;
         if (OB_SUCC(ret)) { ret = planner.finish_task_plan(*plan, next); }
         plan = next;
       }
       if (OB_SUCC(ret) && (plan != nullptr || !output.is_finished())) { ret = OB_STATE_NOT_MATCH; }
+      result.route_reused_ = processor.centroid_route_reused();
+      if (OB_SUCC(ret) && result.route_reused_) { ret = final_posting_counts.assign(output.get_leaf_posting_counts()); }
     }
     if (OB_FAIL(ret)) { return ret; }
     result.old_vids_ = result.old_capture_rows_;
+    result.metadata_counts_ = input.uses_metadata_counts();
+    result.lazy_raw_ = input.uses_lazy_raw();
+    result.lazy_raw_read_rows_ = input.lazy_raw_read_rows();
     result.meta_ = sstable_builder_.get_ivf_meta();
     ObSSTableMergeRes res;
-    ObIvfSSTable table;
+    ObIvfSSTable local_table;
+    ObIvfSSTable &table = persisted_output == nullptr ? local_table : *persisted_output;
     const int64_t close_started = ObTimeUtility::current_time();
-    ret = seal_table(table, arena, is_inc_major_merge(merge_type), result.meta_, res, IVF_SNAPSHOT_VERSION + 10);
+    ret = seal_table(table, persisted_output == nullptr ? arena : allocator_, is_inc_major_merge(merge_type),
+        result.meta_, res, IVF_SNAPSHOT_VERSION + 10);
     result.close_us_ = ObTimeUtility::current_time() - close_started;
     result.elapsed_us_ = ObTimeUtility::current_time() - started;
     if (OB_FAIL(ret)) { return ret; }
+    if (warm_route_cache_ && result.route_reused_) { input.reuse_centroid_cache(table, final_posting_counts); }
     result.run_arena_bytes_ = arena.total();
     result.rss_before_readback_ = resident_bytes();
-    for (int64_t i = 0; i < res.data_block_ids_.count(); ++i) {
-      for (const auto &source : source_macros_) {
-        if (res.data_block_ids_.at(i) == source.id_) {
-          ++result.reused_ids_[source.type_];
+    if (!table.is_empty()) {
+      ObTableReadInfo info;
+      ObDatumRange whole;
+      whole.set_whole_range();
+      ObIMacroBlockIterator *iter = nullptr;
+      if (OB_FAIL(prepare_read_info(info)) || OB_FAIL(table.scan_macro_block(whole, info, arena, iter, false, false, true))) { return ret; }
+      ObMacroBlockDesc macro;
+      ObDataMacroBlockMeta macro_meta;
+      macro.macro_meta_ = &macro_meta;
+      std::vector<MacroBlockId> seen;
+      while (OB_SUCCESS == (ret = iter->get_next_macro_block(macro))) {
+        if (std::find(seen.begin(), seen.end(), macro.macro_block_id_) != seen.end()) { ret = OB_INVALID_DATA; break; }
+        seen.push_back(macro.macro_block_id_);
+        bool reused = false;
+        for (const auto &source : source_macros_) {
+          if (macro.macro_block_id_ == source.id_) {
+            ++result.reused_ids_[source.type_];
+            ++result.reused_source_ids_[source.source_][source.type_];
+            reused = true;
+          }
         }
+        ++result.data_macros_;
+        if (macro_meta.val_.row_store_type_ == CS_ENCODING_ROW_STORE) { ++result.cs_data_macros_; }
+        if (macro_meta.val_.row_store_type_ == FLAT_ROW_STORE || macro_meta.val_.row_store_type_ == FLAT_OPT_ROW_STORE) {
+          ++result.flat_data_macros_;
+        }
+        if (reused) { result.reused_data_bytes_ += macro_meta.val_.data_zsize_; }
+        else { result.new_data_bytes_ += macro_meta.val_.data_zsize_; }
       }
+      iter->~ObIMacroBlockIterator(); arena.free(iter);
+      if (ret == OB_ITER_END) { ret = OB_SUCCESS; }
+      if (OB_FAIL(ret)) { return ret; }
     }
     const int64_t read_started = ObTimeUtility::current_time();
     ret = read_rows(table, result.rows_);
     result.readback_us_ = ObTimeUtility::current_time() - read_started;
+    // Verify persisted aggregate checksums against the independently scanned
+    // logical rows. Reused MVCC versions may legitimately differ from rewrites.
+    ObSSTableMetaHandle checksum_meta;
+    ObIvfSSTableRowDesc columns;
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(table.get_meta(checksum_meta))
+        || OB_FAIL(columns.init(IVF_SSTABLE_FORMAT_VERSION))) {
+    } else if (table.is_inc_ivf_sstable()) {
+      // INC publication carries no table-level column checksum. Its complete
+      // logical records are compared by callers, without inventing an array.
+      if (checksum_meta.get_sstable_meta().get_col_checksum_cnt() != 0) { ret = OB_INVALID_DATA; }
+      result.logical_column_checksums_.clear();
+    } else if (checksum_meta.get_sstable_meta().get_col_checksum_cnt() != whole_desc_.get_desc().get_row_column_count()
+        || checksum_meta.get_sstable_meta().get_col_checksum() == nullptr) {
+      ret = OB_INVALID_DATA;
+    } else {
+      const int64_t logical_columns[] = {columns.row_type_col_idx_, columns.centroid_id_col_idx_,
+          columns.vector_id_col_idx_, columns.payload_col_idx_};
+      uint64_t expected[4] = {};
+      ObDatumRow row;
+      for (const auto &record : result.rows_) {
+        if (OB_FAIL(make_ivf_row(row, record.type_, record.cid_, record.vid_,
+            ObString(record.payload_.size(), record.payload_.data())))) { break; }
+        for (int64_t c = 0; c < 4; ++c) { expected[c] += row.storage_datums_[logical_columns[c]].checksum(0); }
+      }
+      result.logical_column_checksums_.clear();
+      for (int64_t c = 0; OB_SUCC(ret) && c < 4; ++c) {
+        const int64_t actual = checksum_meta.get_sstable_meta().get_col_checksum()[logical_columns[c]];
+        result.logical_column_checksums_.push_back(actual);
+        if (static_cast<uint64_t>(actual) != expected[c]
+            || (c == 3 && !result.rows_.empty() && actual == 0)) {
+          ret = OB_CHECKSUM_ERROR;
+          LOG_WARN("IVF test output logical checksum mismatch", K(ret), K(c), K(actual), "expected", expected[c]);
+        }
+      }
+    }
     return ret;
   }
 
   void verify_concat(const Result &result, const std::vector<Record> &delta_rows,
-      const ObIvfSSTableMeta &delta_meta, const std::vector<uint64_t> &deleted)
+      const ObIvfSSTableMeta &delta_meta, const std::vector<uint64_t> &deleted, bool allow_reuse = false)
   {
     using Key = std::pair<std::string, uint64_t>;
     std::map<Key, std::string> expected, actual;
@@ -6822,10 +7833,12 @@ protected:
     EXPECT_EQ(expected_raw.size(), result.meta_.vector_count_);
     if (expected_raw.empty()) { EXPECT_TRUE(result.meta_.is_empty()); EXPECT_TRUE(result.rows_.empty()); }
     else { EXPECT_EQ(expected_centers, actual_centers); EXPECT_EQ(expected_centers.size(), result.meta_.centroid_count_); }
-    for (int64_t type = IVF_ROW_TYPE_CENTROID; type < IVF_ROW_TYPE_MAX; ++type) { EXPECT_EQ(0, result.reused_ids_[type]); }
+    if (!allow_reuse) {
+      for (int64_t type = IVF_ROW_TYPE_CENTROID; type < IVF_ROW_TYPE_MAX; ++type) { EXPECT_EQ(0, result.reused_ids_[type]); }
+    }
   }
 
-  void verify(Result &result, const std::vector<uint64_t> &deleted = {})
+  void verify(Result &result, const std::vector<uint64_t> &deleted = {}, bool allow_reuse = false)
   {
     const int64_t started = ObTimeUtility::current_time();
     const ObIvfSSTableMeta &meta = result.meta_;
@@ -6911,7 +7924,7 @@ protected:
         EXPECT_EQ(removed(data_.delta_vid(i)) ? 0 : 1, delta_secondary[i]);
       }
     }
-    for (int64_t type = IVF_ROW_TYPE_CENTROID; type < IVF_ROW_TYPE_MAX; ++type) {
+    for (int64_t type = IVF_ROW_TYPE_CENTROID; !allow_reuse && type < IVF_ROW_TYPE_MAX; ++type) {
       EXPECT_EQ(0, result.reused_ids_[type]);
 
     }
@@ -6925,7 +7938,688 @@ protected:
   std::vector<SourceMacro> source_macros_;
   int64_t saved_replay_bytes_ = 0;
   bool inc_source_ = false;
+
+  void detach_centroid_caches(const ObIvfSSTable &table)
+  {
+    auto *service = MTL(ObPluginVectorIndexService *);
+    ASSERT_NE(nullptr, service);
+    ObPluginVectorIndexMgr *mgr = nullptr;
+    ASSERT_EQ(OB_SUCCESS, service->acquire_vector_index_mgr(ObLSID(IVF_LS_ID), mgr, false));
+    for (int64_t group = 0; group <= table.get_ivf_meta().parent_centroid_count_; ++group) {
+      const int ret = mgr->erase_ivf_cache_mgr(ObIvfCacheMgrKey(table.get_key(), group));
+      EXPECT_TRUE(ret == OB_SUCCESS || ret == OB_HASH_NOT_EXIST);
+    }
+  }
+
+  void read_centroid_route(ObIvfSSTable &table, std::map<int64_t, uint32_t> &counts,
+      std::vector<std::pair<uint64_t, float>> *ann = nullptr)
+  {
+    auto *service = MTL(ObPluginVectorIndexService *);
+    ASSERT_NE(nullptr, service);
+    ObPluginVectorIndexMgr *ls_mgr = nullptr;
+    ASSERT_EQ(OB_SUCCESS, service->acquire_vector_index_mgr(ObLSID(IVF_LS_ID), ls_mgr, false));
+    ObArenaAllocator arena("IVFRouteQuery");
+    ObTableReadInfo info;
+    ASSERT_EQ(OB_SUCCESS, prepare_read_info(info));
+    ObTableAccessParam access;
+    ObStoreCtx store;
+    ObTableAccessContext context;
+    ObVersionRange versions;
+    versions.base_version_ = 0; versions.multi_version_start_ = 0;
+    versions.snapshot_version_ = MERGE_READ_SNAPSHOT_VERSION;
+    ObQueryFlag flag; flag.disable_cache();
+    ASSERT_EQ(OB_SUCCESS, access.init_merge_param(IVF_TABLE_ID, ObTabletID(IVF_TABLET_ID), info, false));
+    ASSERT_EQ(OB_SUCCESS, store.init_for_read(ObLSID(IVF_LS_ID), ObTabletID(IVF_TABLET_ID),
+        INT64_MAX, -1, SCN::max_scn()));
+    ASSERT_EQ(OB_SUCCESS, context.init(flag, store, arena, arena, versions));
+    context.ls_id_ = ObLSID(IVF_LS_ID);
+    float query[DIM]; data_.vector(0, false, query);
+    ObIvfKnnSearchParam param;
+    param.query_ = query; param.dim_ = DIM; param.k_ = table.get_ivf_meta().centroid_count_;
+    param.nprobe_ = param.k_;
+    if (ann != nullptr) {
+      // KNN uses its own readers, including cached/transformed index blocks.
+      context.query_flag_.set_use_block_cache();
+      ObTableScanParam scan;
+      ObTableParam table_param(arena);
+      ObSEArray<uint64_t, 8> columns;
+      for (int64_t i = 0; i < table_schema_.get_column_count(); ++i) {
+        ASSERT_EQ(OB_SUCCESS, columns.push_back(table_schema_.get_column_schema_by_idx(i)->get_column_id()));
+      }
+      ASSERT_EQ(OB_SUCCESS, table_param.convert(table_schema_, columns, scan.pd_storage_flag_));
+      scan.allocator_ = &arena; scan.table_param_ = &table_param;
+      scan.tablet_id_ = ObTabletID(IVF_TABLET_ID); scan.ls_id_ = ObLSID(IVF_LS_ID);
+      ObTableHandleV2 handle;
+      ASSERT_EQ(OB_SUCCESS, handle.set_sstable_with_tablet(&table));
+      ObIvfSSTableSearcher *searcher = nullptr;
+      ASSERT_EQ(OB_SUCCESS, table.create_searcher(handle, scan, context, searcher));
+      DEFER(ObIvfSSTableSearcher::destroy(searcher));
+      param.k_ = 10;
+      ObIvfKnnSearchResult result;
+      ASSERT_EQ(OB_SUCCESS, searcher->knn_search(param, result));
+      ann->clear();
+      for (int64_t i = 0; i < result.count(); ++i) { ann->emplace_back(result.at(i).vid_, result.at(i).distance_); }
+      EXPECT_EQ(10, ann->size());
+      return;
+    }
+    ObIvfSSTableRowDesc desc;
+    ASSERT_EQ(OB_SUCCESS, desc.init(IVF_SSTABLE_FORMAT_VERSION));
+    // prepare_read_info projects the four schema columns, excluding MVCC.
+    ASSERT_EQ(IVF_ROWKEY_COL_COUNT + 1, info.get_columns_index().count());
+    desc.payload_col_idx_ = IVF_ROWKEY_COL_COUNT;
+    ObIvfCentroidIterator *iter = nullptr;
+    ASSERT_EQ(OB_SUCCESS, table.create_centroid_iterator(param, query, arena, arena,
+        access.iter_param_, desc, context, iter));
+    DEFER(iter->~ObIvfCentroidIterator());
+    ASSERT_EQ(OB_SUCCESS, iter->prepare_next_batch(param.k_));
+    ObIvfCentroidInfo center;
+    counts.clear();
+    int ret = OB_SUCCESS;
+    while (OB_SUCCESS == (ret = iter->get_next(center))) { counts[center.cid_] = center.child_count_; }
+    EXPECT_EQ(OB_ITER_END, ret);
+    EXPECT_EQ(table.get_ivf_meta().centroid_count_, counts.size());
+  }
 };
+
+TEST_F(TestIVFInsertionStorage, insertion_retains_complete_flat_and_grouped_routes)
+{
+  data_.n_ = 2048; data_.delta_ = 64;
+  for (const auto merge_type : {MAJOR_MERGE, INC_MAJOR_MERGE}) {
+  for (bool grouped : {false, true}) {
+    SCOPED_TRACE(testing::Message() << "merge_type=" << merge_type << " grouped=" << grouped);
+    ASSERT_NO_FATAL_FAILURE(build_inputs(false, CS_ENCODING_ROW_STORE, grouped));
+    route_reuse_ = true;
+    Result retained;
+    ASSERT_EQ(OB_SUCCESS, run_merge(retained, {}, CS_ENCODING_ROW_STORE, merge_type,
+        ObIVFProcessType::INSERTION, grouped ? 1 : data_.k_ + 1, true));
+    ASSERT_TRUE(retained.route_reused_);
+    EXPECT_EQ(grouped, retained.meta_.is_hierarchical());
+    EXPECT_EQ(base_->get_ivf_meta().parent_centroid_count_, retained.meta_.parent_centroid_count_);
+    ASSERT_NO_FATAL_FAILURE(verify(retained, {}, true));
+    // Retaining the route also retains every parent row and group membership;
+    // leaf posting counts are allowed to change with the insertion.
+    std::vector<Record> expected, actual;
+    auto geometry = [&](const std::vector<Record> &rows, std::vector<Record> &result) {
+      for (auto row : rows) {
+        if (row.type_ == IVF_ROW_TYPE_CENTROID) {
+          ObIvfCentroidPayloadHeader header;
+          MEMCPY(&header, row.payload_.data(), sizeof(header));
+          header.child_count_ = 0;
+          MEMCPY(&row.payload_[0], &header, sizeof(header));
+          result.push_back(row);
+        }
+      }
+    };
+    geometry(base_rows_, expected); geometry(retained.rows_, actual);
+    EXPECT_EQ(expected, actual);
+  }
+  }
+}
+
+TEST_F(TestIVFInsertionStorage, route_reuse_rejects_changed_geometry_ids_and_incomplete_groups)
+{
+  data_.n_ = 2048; data_.delta_ = 64;
+  for (bool grouped : {false, true}) {
+    ASSERT_NO_FATAL_FAILURE(build_inputs(false, CS_ENCODING_ROW_STORE, grouped));
+    ObArenaAllocator arena("IVFRouteProof");
+    ObTabletMergeDagParam param(MAJOR_MERGE, ObLSID(IVF_LS_ID), ObTabletID(IVF_TABLET_ID), -1);
+    param.merge_version_ = IVF_SNAPSHOT_VERSION + 10;
+    ObAsyncIndexMergeCtx ctx(param, arena);
+    ObIVFMergeInputAdapter input(arena);
+    ASSERT_EQ(OB_SUCCESS, configure_context(ctx, input, arena, {}));
+    ObIVFMergeCaptureCtx capture;
+    ASSERT_EQ(OB_SUCCESS, capture.init(ctx, input, false));
+    for (int64_t i = 0; i < capture.get_task_count(); ++i) { ASSERT_EQ(OB_SUCCESS, capture.scan(i)); }
+    ASSERT_EQ(OB_SUCCESS, capture.finish());
+    ASSERT_EQ(OB_SUCCESS, input.capture_prior_(ctx));
+    ASSERT_EQ(OB_SUCCESS, input.prepare_block_reuse());
+    ASSERT_FALSE(input.reuse_sources_.empty());
+    auto *source = input.reuse_sources_.at(0);
+    ASSERT_NE(nullptr, source); ASSERT_TRUE(source->has_prior_view());
+    ObArray<float> leaves;
+    for (int64_t i = 0; i < data_.k_ * DIM; ++i) {
+      ASSERT_EQ(OB_SUCCESS, leaves.push_back(input.prior_.centroids_.at(source->centroid_begin_ * DIM + i)));
+    }
+    ObIvfCentroidLayout layout(arena);
+    bool reused = false;
+    ASSERT_EQ(OB_SUCCESS, source->restore_centroid_layout(leaves, layout, reused));
+    ASSERT_TRUE(reused);
+    layout.reset();
+    leaves.at(0) += 1.0F;
+    ASSERT_EQ(OB_SUCCESS, source->restore_centroid_layout(leaves, layout, reused));
+    EXPECT_FALSE(reused); EXPECT_FALSE(layout.is_ready());
+    leaves.at(0) -= 1.0F;
+    const int64_t saved = input.prior_.old_cids_.at(source->centroid_begin_);
+    input.prior_.old_cids_.at(source->centroid_begin_) = saved + 1;
+    ASSERT_EQ(OB_SUCCESS, source->restore_centroid_layout(leaves, layout, reused));
+    EXPECT_FALSE(reused); EXPECT_FALSE(layout.is_ready());
+    input.prior_.old_cids_.at(source->centroid_begin_) = saved;
+    source->centers_.pop_back();
+    (void)source->restore_centroid_layout(leaves, layout, reused);
+    EXPECT_FALSE(reused); EXPECT_FALSE(layout.is_ready());
+  }
+}
+
+TEST_F(TestIVFInsertionStorage, reused_cache_initialization_excludes_statistics_readers)
+{
+  data_.n_ = 2048; data_.delta_ = 64;
+  route_reuse_ = true; warm_route_cache_ = false;
+  omt::ObTenantConfigGuard config(TENANT_CONF(MTL_ID()));
+  ASSERT_TRUE(config.is_valid());
+  auto *service = MTL(ObPluginVectorIndexService *);
+  ASSERT_NE(nullptr, service);
+  const int64_t saved_threshold = config->_disk_bbq_centroid_hgraph_threshold;
+  const int64_t saved_percentage = config->_disk_bbq_centroid_cache_mem_percentage;
+  DEFER(config->_disk_bbq_centroid_hgraph_threshold = saved_threshold;
+      config->_disk_bbq_centroid_cache_mem_percentage = saved_percentage;
+      (void)service->get_ivf_sstable_cache_controller().refresh_config());
+  config->_disk_bbq_centroid_hgraph_threshold = 0;
+  config->_disk_bbq_centroid_cache_mem_percentage = 80;
+  ASSERT_EQ(OB_SUCCESS, service->get_ivf_sstable_cache_controller().refresh_config());
+  // Exercise a flat root, a hierarchical root, and a shared-leaf child.
+  for (int scenario = 0; scenario < 3; ++scenario) {
+    const bool grouped = scenario != 0;
+    const int64_t group = scenario == 2 ? 1 : 0;
+    SCOPED_TRACE(testing::Message() << "grouped=" << grouped << " blocked_group=" << group);
+    ASSERT_NO_FATAL_FAILURE(build_inputs(false, CS_ENCODING_ROW_STORE, grouped));
+    ObIvfSSTable output;
+    Result merged;
+    ASSERT_EQ(OB_SUCCESS, run_merge(merged, {}, CS_ENCODING_ROW_STORE, MAJOR_MERGE,
+        ObIVFProcessType::INSERTION, grouped ? 1 : data_.k_ + 1, true, 1, &output));
+    ASSERT_TRUE(merged.route_reused_);
+    std::map<int64_t, uint32_t> counts;
+    ASSERT_NO_FATAL_FAILURE(read_centroid_route(*base_, counts));
+
+    ObArenaAllocator arena("IVFReuseLockUT");
+    ObTabletMergeDagParam param(MAJOR_MERGE, ObLSID(IVF_LS_ID), ObTabletID(IVF_TABLET_ID), -1);
+    ObAsyncIndexMergeCtx ctx(param, arena);
+    ObIVFMergeInputAdapter input(arena);
+    ASSERT_EQ(OB_SUCCESS, configure_context(ctx, input, arena, {}));
+    ObIVFMergeCaptureCtx capture;
+    ASSERT_EQ(OB_SUCCESS, capture.init(ctx, input, false));
+    ASSERT_EQ(OB_SUCCESS, capture.scan(0));
+    ASSERT_EQ(OB_SUCCESS, capture.finish());
+    ASSERT_EQ(OB_SUCCESS, input.capture_prior_(ctx));
+    ASSERT_EQ(OB_SUCCESS, input.prepare_block_reuse());
+    ASSERT_FALSE(input.reuse_sources_.empty());
+    ASSERT_TRUE(input.reuse_sources_.at(0)->has_prior_view());
+    ASSERT_EQ(base_.get(), input.reuse_sources_.at(0)->table_);
+    input.prior_.routing_source_ = input.reuse_sources_.at(0);
+    ObArray<uint32_t> posting_counts;
+    ASSERT_EQ(OB_SUCCESS, posting_counts.prepare_allocate(merged.meta_.centroid_count_));
+    for (int64_t i = 0; i < posting_counts.count(); ++i) { posting_counts.at(i) = 0; }
+    for (const auto &row : merged.rows_) {
+      if (row.type_ == IVF_ROW_TYPE_CENTROID && (!grouped || row.cid_ > 0)) {
+        ObIvfCentroidPayloadHeader header;
+        ASSERT_GE(row.payload_.size(), sizeof(header));
+        MEMCPY(&header, row.payload_.data(), sizeof(header));
+        const int64_t idx = row.vid_ - merged.meta_.leaf_cid_base();
+        ASSERT_GE(idx, 0); ASSERT_LT(idx, posting_counts.count());
+        posting_counts.at(idx) = header.child_count_;
+      }
+    }
+    ObIvfCacheMgrGuard source_guard, target_guard;
+    ASSERT_EQ(OB_SUCCESS, service->acquire_ivf_cache_mgr_guard(ObLSID(IVF_LS_ID),
+        ObIvfCacheMgrKey(base_->get_key(), group), source_guard));
+    ASSERT_EQ(OB_SUCCESS, service->acquire_ivf_cache_mgr_guard(ObLSID(IVF_LS_ID),
+        ObIvfCacheMgrKey(output.get_key(), group), source_guard.get_ivf_cache_mgr()->get_vec_param(),
+        DIM, IVF_TABLE_ID, target_guard));
+    ObIvfSSTableCentCache *cache = nullptr;
+    ASSERT_EQ(OB_SUCCESS, target_guard.get_ivf_cache_mgr()->get_or_create_cache_node<ObIvfSSTableCentCache>(
+        IVF_SSTABLE_CENTROID_CACHE, cache));
+    ASSERT_NE(nullptr, cache); ASSERT_TRUE(cache->is_idle());
+    std::atomic<bool> finished(false);
+    auto *tenant = ObTenantEnv::get_tenant();
+    std::thread writer;
+    {
+      // The node is already mapped. Use the same read lock and getters as
+      // fill_cache_info, before the production reuse path starts allocation.
+      common::RWLock::RLockGuard reader(cache->get_lock());
+      writer = std::thread([&]() {
+        ObTenantEnv::set_tenant(tenant);
+        THIS_WORKER.set_timeout_ts(INT64_MAX);
+        input.reuse_centroid_cache(output, posting_counts);
+        finished.store(true);
+      });
+      bool writer_waiting = false;
+      const int64_t deadline = ObTimeUtility::current_time() + 5 * 1000 * 1000;
+      while (!finished.load() && !writer_waiting && ObTimeUtility::current_time() < deadline) {
+        if (cache->get_lock().try_rdlock()) { cache->get_lock().rdunlock(); }
+        else { writer_waiting = true; }
+        std::this_thread::yield();
+      }
+      EXPECT_TRUE(writer_waiting);
+      EXPECT_FALSE(finished.load());
+      if (writer_waiting || finished.load()) {
+        EXPECT_EQ(0, cache->get_count());
+        EXPECT_EQ(0, cache->get_capacity());
+        EXPECT_EQ(0, cache->get_nlist());
+        EXPECT_EQ(nullptr, cache->centroids_);
+        EXPECT_EQ(nullptr, cache->leaf_refs_);
+        EXPECT_EQ(nullptr, cache->parent_cache_);
+        EXPECT_EQ(0, cache->shared_leaf_count_);
+      }
+    }
+    writer.join();
+    ASSERT_TRUE(cache->is_completed());
+    ASSERT_GT(cache->get_count(), 0);
+    EXPECT_EQ(cache->get_capacity(), cache->get_count());
+    std::vector<std::pair<uint64_t, float>> inherited, reloaded;
+    ASSERT_NO_FATAL_FAILURE(read_centroid_route(output, counts, &inherited));
+    ASSERT_NO_FATAL_FAILURE(detach_centroid_caches(output));
+    target_guard.reset();
+    ASSERT_NO_FATAL_FAILURE(read_centroid_route(output, counts, &reloaded));
+    EXPECT_EQ(inherited, reloaded);
+    ASSERT_NO_FATAL_FAILURE(detach_centroid_caches(output));
+    ASSERT_NO_FATAL_FAILURE(detach_centroid_caches(*base_));
+  }
+}
+
+TEST_F(TestIVFInsertionStorage, retained_query_caches_use_new_counts_and_survive_source_eviction)
+{
+  data_.n_ = 2048; data_.delta_ = 64;
+  route_reuse_ = true; warm_route_cache_ = true;
+  omt::ObTenantConfigGuard config(TENANT_CONF(MTL_ID()));
+  ASSERT_TRUE(config.is_valid());
+  const int64_t threshold = config->_disk_bbq_centroid_hgraph_threshold;
+  DEFER(config->_disk_bbq_centroid_hgraph_threshold = threshold);
+  auto *service = MTL(ObPluginVectorIndexService *);
+  ASSERT_NE(nullptr, service);
+  const int64_t percentage = config->_disk_bbq_centroid_cache_mem_percentage;
+  DEFER(config->_disk_bbq_centroid_cache_mem_percentage = percentage;
+      (void)service->get_ivf_sstable_cache_controller().refresh_config());
+  config->_disk_bbq_centroid_cache_mem_percentage = 80;
+  ASSERT_EQ(OB_SUCCESS, service->get_ivf_sstable_cache_controller().refresh_config());
+  for (bool grouped : {false, true}) {
+  for (bool graph : {false, true}) {
+    SCOPED_TRACE(testing::Message() << "grouped=" << grouped << " graph=" << graph);
+    config->_disk_bbq_centroid_hgraph_threshold = 0;
+    ASSERT_NO_FATAL_FAILURE(build_inputs(false, CS_ENCODING_ROW_STORE, grouped));
+    std::map<int64_t, uint32_t> before, after;
+    ASSERT_NO_FATAL_FAILURE(read_centroid_route(*base_, before));
+    ObIvfCacheMgrGuard old_guard;
+    ASSERT_EQ(OB_SUCCESS, service->acquire_ivf_cache_mgr_guard(ObLSID(IVF_LS_ID),
+        ObIvfCacheMgrKey(base_->get_key()), old_guard));
+    ObIvfSSTableCentCache *old_cache = nullptr;
+    ASSERT_EQ(OB_SUCCESS, old_guard.get_ivf_cache_mgr()->get_cache_node<ObIvfSSTableCentCache>(
+        IVF_SSTABLE_CENTROID_CACHE, old_cache));
+    ASSERT_NE(nullptr, old_cache);
+    if (graph) {
+      config->_disk_bbq_centroid_hgraph_threshold = 1;
+      ObVectorIndexParam p;
+      p.type_ = VIAT_HGRAPH; p.lib_ = VIAL_VSAG; p.dist_algorithm_ = VIDA_L2;
+      p.dim_ = DIM; p.nlist_ = base_->get_ivf_meta().root_centroid_count();
+      p.m_ = 16; p.ef_construction_ = 200; p.ef_search_ = 64;
+      p.extra_info_actual_size_ = 0; p.refine_type_ = 0; p.bq_bits_query_ = 32; p.bq_use_fht_ = false;
+      ASSERT_EQ(OB_SUCCESS, old_cache->build_sstable_hgraph(p));
+      old_cache->update_registered_hold(old_cache->get_memory_hold());
+      ASSERT_TRUE(old_cache->has_hgraph_index());
+      config->_disk_bbq_centroid_hgraph_threshold = 0;
+    }
+    auto *original_owner = old_guard.get_ivf_cache_mgr();
+    const auto old_graph = old_cache->get_hgraph_index();
+    ObIvfSSTable output;
+    Result result;
+    ASSERT_EQ(OB_SUCCESS, run_merge(result, {}, CS_ENCODING_ROW_STORE, MAJOR_MERGE,
+        ObIVFProcessType::INSERTION, grouped ? 1 : data_.k_ + 1, true, 1, &output));
+    ASSERT_TRUE(result.route_reused_);
+    ASSERT_NO_FATAL_FAILURE(verify(result, {}, true));
+    ObIvfCacheMgrGuard new_guard;
+    ASSERT_EQ(OB_SUCCESS, service->acquire_ivf_cache_mgr_guard(ObLSID(IVF_LS_ID),
+        ObIvfCacheMgrKey(output.get_key()), new_guard));
+    ObIvfSSTableCentCache *new_cache = nullptr;
+    ASSERT_EQ(OB_SUCCESS, new_guard.get_ivf_cache_mgr()->get_cache_node<ObIvfSSTableCentCache>(
+        IVF_SSTABLE_CENTROID_CACHE, new_cache));
+    ASSERT_NE(nullptr, new_cache); ASSERT_TRUE(new_cache->is_completed());
+    EXPECT_EQ(graph, new_cache->has_hgraph_index());
+    if (graph) {
+      EXPECT_EQ(old_graph, new_cache->get_hgraph_index());
+      EXPECT_EQ(original_owner, new_cache->hgraph_owner_guard_.get_ivf_cache_mgr());
+      // A second insertion must pin the original allocation directly, rather
+      // than retain every intermediate SSTable cache in a dependency chain.
+      auto next_key = output.get_key();
+      next_key.version_range_.snapshot_version_ += 10;
+      ObIvfCacheMgrGuard next_guard;
+      ASSERT_EQ(OB_SUCCESS, service->acquire_ivf_cache_mgr_guard(ObLSID(IVF_LS_ID),
+          ObIvfCacheMgrKey(next_key), new_guard.get_ivf_cache_mgr()->get_vec_param(),
+          DIM, IVF_TABLE_ID, next_guard));
+      ObIvfSSTableCentCache *next_cache = nullptr;
+      ASSERT_EQ(OB_SUCCESS, next_guard.get_ivf_cache_mgr()->get_or_create_cache_node<ObIvfSSTableCentCache>(
+          IVF_SSTABLE_CENTROID_CACHE, next_cache));
+      ASSERT_TRUE(next_cache->set_writing_if_idle());
+      ASSERT_EQ(OB_SUCCESS, next_cache->allocate_array(new_cache->get_count()));
+      float vector[DIM] = {};
+      for (int64_t i = 0; i < new_cache->get_count(); ++i) {
+        ASSERT_EQ(OB_SUCCESS, next_cache->write_entry(i, i + 1, vector, 123 + i));
+      }
+      // Cache statistics can hold the destination read lock before publication.
+      // Wait for the writer to announce itself instead of relying on a sleep,
+      // and verify it has released the source lock while waiting for readers.
+      std::atomic<bool> inherited(false);
+      int inherit_ret = OB_ERR_UNEXPECTED;
+      auto *tenant = ObTenantEnv::get_tenant();
+      std::thread inherit_worker;
+      {
+        common::RWLock::RLockGuard reader(next_cache->get_lock());
+        inherit_worker = std::thread([&]() {
+          ObTenantEnv::set_tenant(tenant);
+          THIS_WORKER.set_timeout_ts(INT64_MAX);
+          inherit_ret = next_cache->inherit_hgraph(new_guard);
+          inherited.store(true);
+        });
+        const int64_t deadline = ObTimeUtility::current_time() + 5 * 1000 * 1000;
+        bool writer_waiting = false;
+        while (!inherited.load() && !writer_waiting
+            && ObTimeUtility::current_time() < deadline) {
+          if (next_cache->get_lock().try_rdlock()) {
+            next_cache->get_lock().rdunlock();
+          } else {
+            writer_waiting = true;
+          }
+          std::this_thread::yield();
+        }
+        EXPECT_TRUE(writer_waiting);
+        EXPECT_FALSE(inherited.load());
+        const bool source_unlocked = new_cache->get_lock().try_wrlock();
+        EXPECT_TRUE(source_unlocked);
+        if (source_unlocked) { new_cache->get_lock().wrunlock(); }
+      }
+      inherit_worker.join();
+      ASSERT_EQ(OB_SUCCESS, inherit_ret);
+      EXPECT_EQ(original_owner, next_cache->hgraph_owner_guard_.get_ivf_cache_mgr());
+      EXPECT_EQ(old_graph, next_cache->get_hgraph_index());
+      EXPECT_EQ(123, next_cache->get_child_count(0));
+      // Incomplete entries use the existing failed-build cleanup path.
+      bool erased = false; uint64_t hold = 0;
+      ASSERT_EQ(OB_SUCCESS, service->try_erase_ivf_sstable_cache(ObLSID(IVF_LS_ID),
+          ObIvfCacheMgrKey(next_key), next_guard.get_ivf_cache_mgr(), next_cache,
+          next_cache->get_last_access_ts(), true, erased, hold));
+      ASSERT_TRUE(erased);
+      next_guard.reset(); // Must not destroy the graph used by either published cache.
+      EXPECT_EQ(old_graph, new_cache->get_hgraph_index());
+    }
+    old_guard.reset();
+    ASSERT_NO_FATAL_FAILURE(detach_centroid_caches(*base_));
+    std::vector<std::pair<uint64_t, float>> inherited_result, rebuilt_result;
+    ASSERT_NO_FATAL_FAILURE(read_centroid_route(output, after, &inherited_result));
+    ASSERT_NO_FATAL_FAILURE(read_centroid_route(output, after));
+    std::map<int64_t, uint32_t> expected;
+    for (const auto &row : result.rows_) {
+      if (row.type_ == IVF_ROW_TYPE_CENTROID && (!grouped || row.cid_ > 0)) {
+        ObIvfCentroidPayloadHeader header;
+        MEMCPY(&header, row.payload_.data(), sizeof(header));
+        expected[row.vid_] = header.child_count_;
+      }
+    }
+    EXPECT_EQ(expected, after);
+    EXPECT_NE(before, after); // Old posting budgets must never leak into the new table.
+    ASSERT_NO_FATAL_FAILURE(detach_centroid_caches(output));
+    new_guard.reset();
+    ASSERT_NO_FATAL_FAILURE(read_centroid_route(output, after, &rebuilt_result));
+    EXPECT_EQ(inherited_result, rebuilt_result);
+    ASSERT_NO_FATAL_FAILURE(detach_centroid_caches(output));
+  }
+  }
+}
+
+TEST_F(TestIVFInsertionStorage, concat_and_uncertified_sources_keep_route_rebuild)
+{
+  data_.n_ = 2048; data_.delta_ = 64; route_reuse_ = true;
+  ASSERT_NO_FATAL_FAILURE(build_inputs());
+  Result concat;
+  ASSERT_EQ(OB_SUCCESS, run_merge(concat, {}, CS_ENCODING_ROW_STORE, MAJOR_MERGE,
+      ObIVFProcessType::CONCATENATION));
+  EXPECT_FALSE(concat.route_reused_);
+  ASSERT_NO_FATAL_FAILURE(extend_source_centroid_headers());
+  Result insertion;
+  ASSERT_EQ(OB_SUCCESS, run_merge(insertion));
+  EXPECT_FALSE(insertion.route_reused_);
+  ASSERT_NO_FATAL_FAILURE(verify(insertion));
+}
+
+TEST_F(TestIVFInsertionStorage, inc_full_merge_rewrites_blocks_while_retaining_centroid_route)
+{
+  data_.n_ = 16384; data_.delta_ = 64;
+  inc_source_ = true; route_reuse_ = true;
+  ASSERT_NO_FATAL_FAILURE(build_inputs(false, CS_ENCODING_ROW_STORE, true));
+  Result reused, rewritten;
+  ASSERT_EQ(OB_SUCCESS, run_merge(reused, {}, CS_ENCODING_ROW_STORE, INC_MAJOR_MERGE,
+      ObIVFProcessType::INSERTION, 1, true));
+  ASSERT_TRUE(reused.route_reused_);
+  ASSERT_GT(reused.reused_ids_[IVF_ROW_TYPE_RAW_VECTOR], 0);
+  rewrite_blocks_ = true;
+  ASSERT_EQ(OB_SUCCESS, run_merge(rewritten, {}, CS_ENCODING_ROW_STORE, INC_MAJOR_MERGE,
+      ObIVFProcessType::INSERTION, 1, true));
+  ASSERT_TRUE(rewritten.route_reused_);
+  EXPECT_EQ(reused.rows_, rewritten.rows_);
+  ASSERT_NO_FATAL_FAILURE(verify(rewritten));
+}
+
+TEST_F(TestIVFInsertionStorage, changed_hierarchy_threshold_keeps_original_creation_decision)
+{
+  data_.n_ = 2048; data_.delta_ = 64; route_reuse_ = true;
+  for (bool grouped : {false, true}) {
+    ASSERT_NO_FATAL_FAILURE(build_inputs(false, CS_ENCODING_ROW_STORE, grouped));
+    Result output;
+    ASSERT_EQ(OB_SUCCESS, run_merge(output, {}, CS_ENCODING_ROW_STORE, MAJOR_MERGE,
+        ObIVFProcessType::INSERTION, grouped ? data_.k_ + 1 : 1, true));
+    EXPECT_FALSE(output.route_reused_);
+    EXPECT_EQ(!grouped, output.meta_.is_hierarchical());
+    ASSERT_NO_FATAL_FAILURE(verify(output, {}, true));
+  }
+}
+
+TEST_F(TestIVFInsertionStorage, disabled_cache_retains_route_and_queries_from_storage)
+{
+  data_.n_ = 2048; data_.delta_ = 64;
+  route_reuse_ = true; warm_route_cache_ = true;
+  omt::ObTenantConfigGuard config(TENANT_CONF(MTL_ID()));
+  ASSERT_TRUE(config.is_valid());
+  const int64_t saved = config->_disk_bbq_centroid_cache_mem_percentage;
+  auto *service = MTL(ObPluginVectorIndexService *);
+  ASSERT_NE(nullptr, service);
+  auto &controller = service->get_ivf_sstable_cache_controller();
+  DEFER(config->_disk_bbq_centroid_cache_mem_percentage = saved; (void)controller.refresh_config());
+  config->_disk_bbq_centroid_cache_mem_percentage = 0;
+  ASSERT_EQ(OB_SUCCESS, controller.refresh_config());
+  ASSERT_NO_FATAL_FAILURE(build_inputs(false, CS_ENCODING_ROW_STORE, true));
+  ObIvfSSTable output;
+  Result result;
+  ASSERT_EQ(OB_SUCCESS, run_merge(result, {}, CS_ENCODING_ROW_STORE, MAJOR_MERGE,
+      ObIVFProcessType::INSERTION, 1, true, 1, &output));
+  ASSERT_TRUE(result.route_reused_);
+  ObIvfCacheMgrGuard guard;
+  EXPECT_NE(OB_SUCCESS, service->acquire_ivf_cache_mgr_guard(ObLSID(IVF_LS_ID),
+      ObIvfCacheMgrKey(output.get_key()), guard));
+  std::map<int64_t, uint32_t> counts;
+  ASSERT_NO_FATAL_FAILURE(read_centroid_route(output, counts));
+  EXPECT_EQ(data_.k_, counts.size());
+  ASSERT_NO_FATAL_FAILURE(verify(result, {}, true));
+}
+
+TEST_F(TestIVFInsertionStorage, full_quota_and_foreground_builder_keep_lazy_cache_fallback)
+{
+  data_.n_ = 2048; data_.delta_ = 64; route_reuse_ = true; warm_route_cache_ = true;
+  omt::ObTenantConfigGuard config(TENANT_CONF(MTL_ID()));
+  ASSERT_TRUE(config.is_valid());
+  const int64_t saved = config->_disk_bbq_centroid_cache_mem_percentage;
+  auto *service = MTL(ObPluginVectorIndexService *);
+  ASSERT_NE(nullptr, service);
+  auto &controller = service->get_ivf_sstable_cache_controller();
+  DEFER(config->_disk_bbq_centroid_cache_mem_percentage = saved; (void)controller.refresh_config());
+  config->_disk_bbq_centroid_cache_mem_percentage = 1;
+  ASSERT_EQ(OB_SUCCESS, controller.refresh_config());
+  for (bool busy : {false, true}) {
+    ASSERT_NO_FATAL_FAILURE(build_inputs());
+    std::map<int64_t, uint32_t> counts;
+    ASSERT_NO_FATAL_FAILURE(read_centroid_route(*base_, counts));
+    auto key = base_->get_key(); key.version_range_.snapshot_version_ += 10;
+    ObIvfCacheMgrGuard builder;
+    ObIvfSSTableCentCache *placeholder = nullptr;
+    uint64_t reservation = 0;
+    if (busy) {
+      ObVectorIndexParam p; p.type_ = VIAT_DISK_BBQ; p.lib_ = VIAL_OB;
+      p.dist_algorithm_ = VIDA_L2; p.dim_ = DIM;
+      ASSERT_EQ(OB_SUCCESS, service->acquire_ivf_cache_mgr_guard(ObLSID(IVF_LS_ID),
+          ObIvfCacheMgrKey(key), p, DIM, IVF_TABLE_ID, builder));
+      ASSERT_EQ(OB_SUCCESS, builder.get_ivf_cache_mgr()->get_or_create_cache_node<ObIvfSSTableCentCache>(
+          IVF_SSTABLE_CENTROID_CACHE, placeholder));
+      ASSERT_TRUE(placeholder->set_writing_if_idle());
+    } else {
+      reservation = controller.get_limit() - controller.get_resident_hold() - controller.get_reserved_hold();
+      ASSERT_GT(reservation, 0);
+      ASSERT_TRUE(controller.try_reserve(reservation));
+    }
+    DEFER(if (reservation > 0) { controller.release_reservation(reservation); });
+    ObIvfSSTable output;
+    Result result;
+    ASSERT_EQ(OB_SUCCESS, run_merge(result, {}, CS_ENCODING_ROW_STORE, MAJOR_MERGE,
+        ObIVFProcessType::INSERTION, data_.k_ + 1, true, 1, &output));
+    EXPECT_EQ(key, output.get_key());
+    ASSERT_TRUE(result.route_reused_);
+    if (busy) {
+      EXPECT_TRUE(placeholder->is_writing()); EXPECT_EQ(0, placeholder->get_count());
+    } else {
+      ObIvfCacheMgrGuard missing;
+      EXPECT_NE(OB_SUCCESS, service->acquire_ivf_cache_mgr_guard(ObLSID(IVF_LS_ID),
+          ObIvfCacheMgrKey(key), missing));
+      controller.release_reservation(reservation); reservation = 0;
+    }
+    ASSERT_NO_FATAL_FAILURE(detach_centroid_caches(output));
+    builder.reset();
+    std::vector<std::pair<uint64_t, float>> results;
+    ASSERT_NO_FATAL_FAILURE(read_centroid_route(output, counts, &results));
+    ASSERT_NO_FATAL_FAILURE(detach_centroid_caches(output));
+    ASSERT_NO_FATAL_FAILURE(detach_centroid_caches(*base_));
+  }
+}
+
+TEST_F(TestIVFInsertionStorage, refresh_soar_spilled_replay_persists_postings_raw_and_checksums)
+{
+  data_.n_ = 257;
+  data_.k_ = 3;
+  clustered_ = true;
+  std::vector<Record> resident_rows;
+  for (const auto format : {FLAT_ROW_STORE, ENCODING_ROW_STORE, CS_ENCODING_ROW_STORE}) {
+    for (const bool spill : {false, true}) {
+      SCOPED_TRACE(testing::Message() << "format=" << format << " spill=" << spill);
+      ASSERT_EQ(OB_SUCCESS, reset_output(format));
+      ObArenaAllocator arena("RefreshSoarUT");
+      ObIVFReplayInput replay(arena);
+      ASSERT_EQ(OB_SUCCESS, replay.init(MTL_ID(), DIM, spill ? 1 : 64L << 20));
+      float centers[3][DIM];
+      ObSEArray<float *, 3> center_ptrs;
+      for (int64_t c = 0; c < 3; ++c) {
+        for (int64_t d = 0; d < DIM; ++d) { centers[c][d] = data_.center(c, d); }
+        ASSERT_EQ(OB_SUCCESS, center_ptrs.push_back(centers[c]));
+      }
+      float vector[DIM];
+      for (int64_t i = data_.n_ - 1; i >= 0; --i) {
+        data_.vector(i, false, vector);
+        ASSERT_EQ(OB_SUCCESS, replay.add_row(data_.base_vid(i),
+            ObString(sizeof(vector), reinterpret_cast<const char *>(vector))));
+      }
+      ASSERT_EQ(OB_SUCCESS, replay.seal());
+      EXPECT_EQ(spill, replay.get_file_size() > 0);
+      if (spill) { ASSERT_EQ(0, replay.get_inmemory_row_count()); }
+      quantization::ObFhtKacRotator rotator;
+      ASSERT_EQ(OB_SUCCESS, quantization::ObFhtKacRotator::generate(arena, DIM, rotator));
+      quantization::ObQuantizationParams params = {DIM, DISK_BBQ_RABITQ_BITS,
+          rotator, quantization::calc_inv_sqrt_dim(DIM)};
+      quantization::ObQuantizationEncoder encoder;
+      ASSERT_EQ(OB_SUCCESS, encoder.init(arena, quantization::ObQuantizationType::RABITQ, VIDA_L2, params));
+      ObIVFSorter sorter;
+      ASSERT_EQ(OB_SUCCESS, sorter.init(MTL_ID()));
+      int64_t vectors = 0, postings = 0;
+      ASSERT_EQ(OB_SUCCESS, ObDiskBBQAlgorithm::build_rows_with_centers(MTL_ID(), DIM,
+          VIDA_L2, center_ptrs, replay, encoder, sorter, vectors, postings));
+      ASSERT_EQ(data_.n_, vectors);
+      ASSERT_GT(postings, vectors); // This fixture must actually exercise secondary postings.
+      ASSERT_EQ(3 + vectors + postings, sorter.get_row_count());
+      ASSERT_EQ(OB_SUCCESS, sorter.finish());
+      ObIvfMacroBlockWriter writer;
+      ASSERT_EQ(OB_SUCCESS, open_format_aware_writer(writer, 0));
+      ObDatumRow row;
+      const ObIVFSortItem *item = nullptr;
+      std::vector<Record> expected;
+      uint64_t checksums[6] = {};
+      int64_t actual_postings = 0, raw_count = 0;
+      std::vector<int64_t> postings_by_vid(data_.n_, 0), raw_by_vid(data_.n_, 0);
+      int64_t children[3] = {};
+      int64_t decoded_children[3] = {};
+      int ret = OB_SUCCESS;
+      while (OB_SUCCESS == (ret = sorter.get_next_item(item))) {
+        ASSERT_NE(nullptr, item);
+        expected.push_back({item->row_type_, item->cid_, item->vid_,
+            std::string(item->payload_.ptr(), item->payload_.length())});
+        if (item->row_type_ == IVF_ROW_TYPE_CENTROID) {
+          const float *center = nullptr;
+          uint32_t count = 0;
+          ASSERT_GE(item->vid_, 1); ASSERT_LE(item->vid_, 3);
+          ASSERT_EQ(OB_SUCCESS, ObIvfCentroidPayload::decode(item->payload_, DIM, center, count));
+          decoded_children[item->vid_ - 1] = count;
+        } else {
+          const int64_t vector_idx = item->vid_ / 2 - 1;
+          ASSERT_GE(vector_idx, 0); ASSERT_LT(vector_idx, data_.n_);
+          data_.vector(vector_idx, false, vector);
+          if (item->row_type_ == IVF_ROW_TYPE_LOW_PRECISION_VECTOR) {
+            ASSERT_GE(item->cid_, 1); ASSERT_LE(item->cid_, 3);
+            int64_t primary = -1, secondary = -1;
+            data_.reference(vector, primary, secondary);
+            EXPECT_TRUE(item->cid_ - 1 == primary || item->cid_ - 1 == secondary);
+            std::vector<uint8_t> code(encoder.code_size());
+            ASSERT_EQ(OB_SUCCESS, encoder.encode(vector, centers[item->cid_ - 1], {code.data(), encoder.code_size()}));
+            ASSERT_EQ(code.size(), item->payload_.length());
+            EXPECT_EQ(0, MEMCMP(code.data(), item->payload_.ptr(), code.size()));
+            ++actual_postings;
+            ++postings_by_vid[vector_idx];
+            ++children[item->cid_ - 1];
+          } else {
+            ASSERT_EQ(IVF_ROW_TYPE_RAW_VECTOR, item->row_type_);
+            ASSERT_EQ(sizeof(vector), item->payload_.length());
+            EXPECT_EQ(0, MEMCMP(vector, item->payload_.ptr(), sizeof(vector)));
+            ++raw_count;
+            ++raw_by_vid[vector_idx];
+          }
+        }
+        ASSERT_EQ(OB_SUCCESS, make_ivf_row(row, item->row_type_, item->cid_, item->vid_, item->payload_));
+        for (const int c : {0, 1, 2, 5}) { checksums[c] += row.storage_datums_[c].checksum(0); }
+        ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+      }
+      ASSERT_EQ(OB_ITER_END, ret);
+      EXPECT_EQ(vectors, raw_count);
+      EXPECT_EQ(postings, actual_postings);
+      for (int64_t i = 0; i < data_.n_; ++i) {
+        data_.vector(i, false, vector);
+        int64_t primary = -1, secondary = -1;
+        data_.reference(vector, primary, secondary);
+        EXPECT_EQ(secondary < 0 ? 1 : 2, postings_by_vid[i]);
+        EXPECT_EQ(1, raw_by_vid[i]);
+      }
+      for (int64_t c = 0; c < 3; ++c) { EXPECT_EQ(children[c], decoded_children[c]); }
+      ASSERT_EQ(OB_SUCCESS, writer.close());
+      ObIvfSSTableMeta meta;
+      fill_ivf_meta(DIM, meta);
+      meta.vector_count_ = vectors;
+      meta.centroid_count_ = 3;
+      ObIvfSSTable table;
+      ObSSTableMergeRes res;
+      ASSERT_EQ(OB_SUCCESS, seal_table(table, arena, false, meta, res));
+      std::vector<Record> actual;
+      ASSERT_EQ(OB_SUCCESS, read_rows(table, actual));
+      EXPECT_EQ(expected, actual);
+      if (resident_rows.empty()) { resident_rows = actual; }
+      else { EXPECT_EQ(resident_rows, actual); }
+      ObSSTableMetaHandle handle;
+      ASSERT_EQ(OB_SUCCESS, table.get_meta(handle));
+      ASSERT_EQ(6, handle.get_sstable_meta().get_col_checksum_cnt());
+      for (const int c : {0, 1, 2, 5}) {
+        EXPECT_EQ(checksums[c], static_cast<uint64_t>(handle.get_sstable_meta().get_col_checksum()[c]));
+      }
+      EXPECT_NE(0, checksums[5]);
+    }
+  }
+}
 
 TEST_F(TestIVFInsertionStorage, concat_remaps_and_deduplicates_centers_preserving_encoded_rows)
 {
@@ -6978,6 +8672,1194 @@ TEST_F(TestIVFInsertionStorage, concat_preserves_incremental_visibility_and_empt
     }
   }
   }
+}
+
+TEST_F(TestIVFInsertionStorage, block_reuse_matches_row_output_for_insertion_and_concat)
+{
+  data_.n_ = 16384; data_.delta_ = 16;
+  for (const ObRowStoreType format : {FLAT_ROW_STORE, ENCODING_ROW_STORE, CS_ENCODING_ROW_STORE}) {
+    SCOPED_TRACE(format);
+    ASSERT_NO_FATAL_FAILURE(build_inputs(false, format));
+    for (const auto strategy : {ObIVFProcessType::INSERTION, ObIVFProcessType::CONCATENATION}) {
+      SCOPED_TRACE(static_cast<int>(strategy));
+      Result ordinary, reused;
+      ASSERT_EQ(OB_SUCCESS, run_merge(ordinary, {}, format, MAJOR_MERGE, strategy));
+      ASSERT_EQ(OB_SUCCESS, run_merge(reused, {}, format, MAJOR_MERGE, strategy, 0, true));
+      EXPECT_EQ(ordinary.rows_, reused.rows_);
+      EXPECT_EQ(ordinary.logical_column_checksums_, reused.logical_column_checksums_);
+      EXPECT_GT(reused.reused_ids_[IVF_ROW_TYPE_RAW_VECTOR], 0);
+      EXPECT_EQ(ordinary.old_capture_rows_, reused.old_capture_rows_); // Same logical input set.
+    }
+  }
+}
+
+TEST_F(TestIVFInsertionStorage, one_range_mixes_macro_references_micro_copies_and_rows)
+{
+  data_.n_ = 16384; data_.delta_ = 0;
+  ASSERT_NO_FATAL_FAILURE(build_inputs(false, FLAT_ROW_STORE));
+  ASSERT_EQ(OB_SUCCESS, reset_output(FLAT_ROW_STORE, IVF_SNAPSHOT_VERSION + 10));
+  ObTableReadInfo info;
+  ASSERT_EQ(OB_SUCCESS, prepare_read_info(info));
+  ObIVFBlockReuseSource source(allocator_);
+  source.source_slot_ = 0; source.commit_version_ = IVF_SNAPSHOT_VERSION;
+  source.table_ = base_.get(); source.read_info_ = &info;
+  ObArray<ObIVFBlockReuseSource *> sources;
+  ASSERT_EQ(OB_SUCCESS, sources.push_back(&source));
+  ObIVFReuseRange task, left, right;
+  left.source_slot_ = right.source_slot_ = 0;
+  task.first_ = ObIVFReuseKey(IVF_ROW_TYPE_CENTROID, 0, 0);
+  task.last_ = ObIVFReuseKey(IVF_ROW_TYPE_RAW_VECTOR, 0, UINT64_MAX);
+  const uint64_t cut = data_.base_vid(data_.n_ / 2);
+  left.first_ = task.first_; left.last_ = ObIVFReuseKey(IVF_ROW_TYPE_RAW_VECTOR, 0, cut - 1);
+  right.first_ = ObIVFReuseKey(IVF_ROW_TYPE_RAW_VECTOR, 0, cut + 1); right.last_ = task.last_;
+  ObArray<ObIVFReuseRange> ranges;
+  ASSERT_EQ(OB_SUCCESS, ranges.push_back(left));
+  ASSERT_EQ(OB_SUCCESS, ranges.push_back(right));
+  ObIvfMacroBlockWriter writer;
+  ASSERT_EQ(OB_SUCCESS, open_format_aware_writer(writer, 0));
+  ObIVFBlockReuseWriter reuse(allocator_);
+  ASSERT_EQ(OB_SUCCESS, reuse.init(sources, ranges, task, whole_desc_.get_desc(), writer));
+  ObDatumRow row;
+  for (const auto &record : base_rows_) {
+    ASSERT_EQ(OB_SUCCESS, make_ivf_row(row, record.type_, record.cid_, record.vid_,
+        ObString(record.payload_.size(), record.payload_.data())));
+    ASSERT_EQ(OB_SUCCESS, reuse.append_row(row));
+  }
+  ASSERT_EQ(OB_SUCCESS, reuse.finish());
+  EXPECT_GT(reuse.reused_macros(), 0);
+  EXPECT_GT(reuse.copied_micros(), 0);
+  EXPECT_GT(writer.get_appended_row_count(), 0);
+  ASSERT_EQ(base_rows_.size(), reuse.row_count());
+  ASSERT_EQ(OB_SUCCESS, writer.close());
+  ObIvfSSTable output;
+  ObSSTableMergeRes res;
+  ASSERT_EQ(OB_SUCCESS, seal_table(output, allocator_, false, base_->get_ivf_meta(), res, IVF_SNAPSHOT_VERSION + 10));
+  std::vector<Record> actual;
+  ASSERT_EQ(OB_SUCCESS, read_rows(output, actual));
+  EXPECT_EQ(base_rows_, actual);
+}
+
+TEST_F(TestIVFInsertionStorage, interleaved_raw_vids_and_fragmented_fallback_preserve_rows)
+{
+  data_.n_ = 16384; data_.interleave_vids_ = true;
+  for (const int64_t delta : {32, 5000}) {
+    SCOPED_TRACE(delta);
+    data_.delta_ = delta;
+    ASSERT_NO_FATAL_FAILURE(build_inputs());
+    Result ordinary, reused;
+    ASSERT_EQ(OB_SUCCESS, run_merge(ordinary));
+    ASSERT_EQ(OB_SUCCESS, run_merge(reused, {}, CS_ENCODING_ROW_STORE, MAJOR_MERGE,
+        ObIVFProcessType::INSERTION, 0, true));
+    EXPECT_EQ(ordinary.rows_, reused.rows_);
+    EXPECT_EQ(ordinary.logical_column_checksums_, reused.logical_column_checksums_);
+    if (delta == 32) { EXPECT_GT(reused.reused_ids_[IVF_ROW_TYPE_RAW_VECTOR], 0); }
+    else { EXPECT_EQ(0, reused.reused_ids_[IVF_ROW_TYPE_RAW_VECTOR]); }
+  }
+}
+
+TEST_F(TestIVFInsertionStorage, centroid_blocks_are_partially_reused_when_only_some_counts_change)
+{
+  data_.n_ = 8192; data_.k_ = 4096; data_.delta_ = 1;
+  ASSERT_NO_FATAL_FAILURE(build_inputs(false, FLAT_ROW_STORE));
+  Result ordinary, reused;
+  ASSERT_EQ(OB_SUCCESS, run_merge(ordinary, {}, FLAT_ROW_STORE));
+  ASSERT_EQ(OB_SUCCESS, run_merge(reused, {}, FLAT_ROW_STORE, MAJOR_MERGE, ObIVFProcessType::INSERTION, 0, true));
+  EXPECT_EQ(ordinary.rows_, reused.rows_);
+  EXPECT_EQ(ordinary.logical_column_checksums_, reused.logical_column_checksums_);
+  EXPECT_GT(reused.reused_ids_[IVF_ROW_TYPE_CENTROID], 0);
+  EXPECT_GT(reused.reused_ids_[IVF_ROW_TYPE_LOW_PRECISION_VECTOR], 0);
+}
+
+TEST_F(TestIVFInsertionStorage, incomplete_reused_range_fails_without_damaging_source)
+{
+  data_.n_ = 8192; data_.delta_ = 0;
+  ASSERT_NO_FATAL_FAILURE(build_inputs(false, FLAT_ROW_STORE));
+  ASSERT_EQ(OB_SUCCESS, reset_output(FLAT_ROW_STORE, IVF_SNAPSHOT_VERSION + 10));
+  ObTableReadInfo info;
+  ASSERT_EQ(OB_SUCCESS, prepare_read_info(info));
+  ObIVFBlockReuseSource source(allocator_);
+  source.source_slot_ = 0; source.commit_version_ = IVF_SNAPSHOT_VERSION;
+  source.table_ = base_.get(); source.read_info_ = &info;
+  ObArray<ObIVFBlockReuseSource *> sources;
+  ASSERT_EQ(OB_SUCCESS, sources.push_back(&source));
+  ObIVFReuseRange whole;
+  whole.source_slot_ = 0;
+  whole.first_ = ObIVFReuseKey(IVF_ROW_TYPE_CENTROID, 0, 0);
+  whole.last_ = ObIVFReuseKey(IVF_ROW_TYPE_RAW_VECTOR, 0, UINT64_MAX);
+  ObArray<ObIVFReuseRange> ranges;
+  ASSERT_EQ(OB_SUCCESS, ranges.push_back(whole));
+  {
+    ObIvfMacroBlockWriter writer;
+    ASSERT_EQ(OB_SUCCESS, open_format_aware_writer(writer, 0));
+    ObIVFBlockReuseWriter reuse(allocator_);
+    ASSERT_EQ(OB_SUCCESS, reuse.init(sources, ranges, whole, whole_desc_.get_desc(), writer));
+    ObDatumRow row;
+    for (size_t i = 0; i + 1 < base_rows_.size(); ++i) {
+      const auto &record = base_rows_[i];
+      ASSERT_EQ(OB_SUCCESS, make_ivf_row(row, record.type_, record.cid_, record.vid_,
+          ObString(record.payload_.size(), record.payload_.data())));
+      ASSERT_EQ(OB_SUCCESS, reuse.append_row(row));
+    }
+    EXPECT_GT(reuse.reused_macros(), 0);
+    EXPECT_EQ(OB_STATE_NOT_MATCH, reuse.finish());
+    // Abort: never close/publish a failed draft. The source remains readable.
+    writer.reset();
+  }
+  std::vector<Record> actual;
+  ASSERT_EQ(OB_SUCCESS, read_rows(*base_, actual));
+  EXPECT_EQ(base_rows_, actual);
+}
+
+TEST_F(TestIVFInsertionStorage, deletion_in_one_source_does_not_disable_an_unchanged_inc_source)
+{
+  data_.n_ = 16384; data_.delta_ = 8192; inc_source_metadata_ = true;
+  ASSERT_NO_FATAL_FAILURE(build_inputs());
+  const std::vector<uint64_t> deleted = {data_.base_vid(0)};
+  Result ordinary, reused;
+  ASSERT_EQ(OB_SUCCESS, run_merge(ordinary, deleted));
+  ASSERT_EQ(OB_SUCCESS, run_merge(reused, deleted, CS_ENCODING_ROW_STORE, MAJOR_MERGE,
+      ObIVFProcessType::INSERTION, 0, true));
+  EXPECT_EQ(ordinary.rows_, reused.rows_);
+  EXPECT_EQ(ordinary.logical_column_checksums_, reused.logical_column_checksums_);
+  for (auto count : reused.reused_source_ids_[0]) { EXPECT_EQ(0, count); }
+  EXPECT_GT(reused.reused_source_ids_[1][IVF_ROW_TYPE_RAW_VECTOR], 0);
+}
+
+TEST_F(TestIVFInsertionStorage, committed_inc_sources_reuse_macros_in_inc_and_major_outputs)
+{
+  data_.n_ = 16384; data_.delta_ = 8192;
+  inc_source_ = inc_source_metadata_ = true;
+  for (const bool native : {false, true}) {
+    SCOPED_TRACE(native);
+    native_inc_sources_ = native;
+    ASSERT_NO_FATAL_FAILURE(build_inputs(false, CS_ENCODING_ROW_STORE, false, true));
+    ASSERT_TRUE(base_->is_inc_ivf_sstable()); ASSERT_TRUE(delta_->is_inc_ivf_sstable());
+    ASSERT_EQ(IVF_SNAPSHOT_VERSION + 20, base_->get_upper_trans_version());
+    for (const ObMergeType merge : {INC_MAJOR_MERGE, MAJOR_MERGE}) {
+      SCOPED_TRACE(static_cast<int>(merge));
+      for (const auto strategy : {ObIVFProcessType::INSERTION, ObIVFProcessType::CONCATENATION}) {
+        SCOPED_TRACE(static_cast<int>(strategy));
+        Result ordinary, reused;
+        ASSERT_EQ(OB_SUCCESS, run_merge(ordinary, {}, CS_ENCODING_ROW_STORE, merge, strategy));
+        ASSERT_EQ(OB_SUCCESS, run_merge(reused, {}, CS_ENCODING_ROW_STORE, merge, strategy, 0, true, 2));
+        EXPECT_EQ(ordinary.rows_, reused.rows_);
+        EXPECT_EQ(ordinary.logical_column_checksums_, reused.logical_column_checksums_);
+        if (!native || merge == INC_MAJOR_MERGE) {
+          EXPECT_GT(reused.reused_source_ids_[0][IVF_ROW_TYPE_RAW_VECTOR], 0);
+          EXPECT_GT(reused.reused_source_ids_[1][IVF_ROW_TYPE_RAW_VECTOR], 0);
+          EXPECT_LT(reused.new_data_bytes_, ordinary.new_data_bytes_);
+        } else {
+          // Native INC macros lack the original major-format checksum proof.
+          for (auto count : reused.reused_ids_) { EXPECT_EQ(0, count); }
+        }
+        EXPECT_EQ(data_.n_ + data_.delta_, reused.capture_rows_);
+      }
+    }
+  }
+  // Clustered payload reuse decodes the source index and retains each data
+  // micro codec; differing output row format does not require rewriting data.
+  clustered_ = true;
+  for (const bool native : {false, true}) {
+    native_inc_sources_ = native;
+    ASSERT_NO_FATAL_FAILURE(build_inputs(false, CS_ENCODING_ROW_STORE, false, true));
+    for (const auto merge : {INC_MAJOR_MERGE, MAJOR_MERGE}) {
+      SCOPED_TRACE(native);
+      SCOPED_TRACE(static_cast<int>(merge));
+      Result ordinary, reused;
+      ASSERT_EQ(OB_SUCCESS, run_merge(ordinary, {}, CS_ENCODING_ROW_STORE, merge,
+          ObIVFProcessType::CONCATENATION));
+      ASSERT_EQ(OB_SUCCESS, run_merge(reused, {}, CS_ENCODING_ROW_STORE, merge,
+          ObIVFProcessType::CONCATENATION, 0, true, 2));
+      EXPECT_EQ(ordinary.rows_, reused.rows_);
+      EXPECT_EQ(ordinary.logical_column_checksums_, reused.logical_column_checksums_);
+      if (!native || merge == INC_MAJOR_MERGE) {
+        EXPECT_GT(reused.reused_source_ids_[0][IVF_ROW_TYPE_RAW_VECTOR], 0);
+        EXPECT_GT(reused.reused_source_ids_[1][IVF_ROW_TYPE_RAW_VECTOR], 0);
+      } else { for (auto count : reused.reused_ids_) { EXPECT_EQ(0, count); } }
+    }
+  }
+}
+
+TEST_F(TestIVFInsertionStorage, compressed_inc_sources_reuse_macros_with_production_descriptor_flags)
+{
+  data_.n_ = 65536; data_.delta_ = 32768; inc_source_ = native_inc_sources_ = true;
+  compressor_name_ = "zstd_1.3.8";
+  ASSERT_NO_FATAL_FAILURE(build_inputs(false, CS_ENCODING_ROW_STORE, false, true));
+  int64_t source_raw_macros[2] = {};
+  for (const auto &macro : source_macros_) {
+    if (macro.type_ == IVF_ROW_TYPE_RAW_VECTOR) { ++source_raw_macros[macro.source_]; }
+  }
+  ASSERT_GT(source_raw_macros[0], 1);
+  ASSERT_GT(source_raw_macros[1], 1);
+  ASSERT_NE(ObCompressorType::NONE_COMPRESSOR, whole_desc_.get_desc().get_compressor_type());
+  ASSERT_TRUE(whole_desc_.get_static_desc().is_inc_major_);
+  Result ordinary, reused;
+  ASSERT_EQ(OB_SUCCESS, run_merge(ordinary, {}, CS_ENCODING_ROW_STORE, INC_MAJOR_MERGE,
+      ObIVFProcessType::CONCATENATION));
+  ASSERT_EQ(OB_SUCCESS, run_merge(reused, {}, CS_ENCODING_ROW_STORE, INC_MAJOR_MERGE,
+      ObIVFProcessType::CONCATENATION, 0, true));
+  EXPECT_EQ(ordinary.rows_, reused.rows_);
+  EXPECT_EQ(ordinary.logical_column_checksums_, reused.logical_column_checksums_);
+  EXPECT_GT(reused.reused_source_ids_[0][IVF_ROW_TYPE_RAW_VECTOR], 0);
+  EXPECT_GT(reused.reused_source_ids_[1][IVF_ROW_TYPE_RAW_VECTOR], 0);
+  EXPECT_LT(reused.new_data_bytes_, ordinary.new_data_bytes_);
+}
+
+TEST_F(TestIVFInsertionStorage, full_rebuild_reuses_each_inc_raw_source_after_actual_retraining)
+{
+  data_.n_ = 16384; data_.delta_ = 8192; inc_source_ = native_inc_sources_ = true;
+  ASSERT_NO_FATAL_FAILURE(build_inputs(false, CS_ENCODING_ROW_STORE, false, true));
+  std::vector<Record> delta_rows;
+  ASSERT_EQ(OB_SUCCESS, read_rows(*delta_, delta_rows));
+  std::map<uint64_t, std::string> expected_raw;
+  for (const auto *rows : {&base_rows_, &delta_rows}) {
+    for (const auto &record : *rows) {
+      if (record.type_ == IVF_ROW_TYPE_RAW_VECTOR) {
+        ASSERT_TRUE(expected_raw.emplace(record.vid_, record.payload_).second);
+      }
+    }
+  }
+  Result ordinary, reused;
+  ASSERT_EQ(OB_SUCCESS, run_merge(ordinary, {}, CS_ENCODING_ROW_STORE, INC_MAJOR_MERGE,
+      ObIVFProcessType::FULL_REBUILD));
+  ASSERT_EQ(OB_SUCCESS, run_merge(reused, {}, CS_ENCODING_ROW_STORE, INC_MAJOR_MERGE,
+      ObIVFProcessType::FULL_REBUILD, 0, true));
+  for (const auto *result : {&ordinary, &reused}) {
+    EXPECT_EQ(ObIVFProcessType::FULL_REBUILD, result->process_type_);
+    EXPECT_TRUE(result->saw_hierarchy_cluster_);
+    EXPECT_FALSE(result->saw_prior_work_);
+    std::map<uint64_t, std::string> actual_raw;
+    for (const auto &record : result->rows_) {
+      if (record.type_ == IVF_ROW_TYPE_RAW_VECTOR) {
+        ASSERT_TRUE(actual_raw.emplace(record.vid_, record.payload_).second);
+      }
+    }
+    EXPECT_EQ(expected_raw, actual_raw);
+  }
+  // Fixed seeds and sequential execution give a complete output A/B comparison;
+  // run_merge also checks persisted logical column checksums against readback.
+  EXPECT_EQ(ordinary.rows_, reused.rows_);
+  EXPECT_EQ(ordinary.logical_column_checksums_, reused.logical_column_checksums_);
+  EXPECT_GT(reused.reused_source_ids_[0][IVF_ROW_TYPE_RAW_VECTOR], 0);
+  EXPECT_GT(reused.reused_source_ids_[1][IVF_ROW_TYPE_RAW_VECTOR], 0);
+  EXPECT_EQ(0, reused.reused_ids_[IVF_ROW_TYPE_CENTROID]);
+  EXPECT_EQ(0, reused.reused_ids_[IVF_ROW_TYPE_LOW_PRECISION_VECTOR]);
+}
+
+TEST_F(TestIVFInsertionStorage, mixed_format_inc_chain_preserves_original_major_macro_provenance)
+{
+  inc_source_ = inc_source_metadata_ = native_delta_ = true;
+  for (const bool compressed : {false, true}) {
+    SCOPED_TRACE(compressed);
+    data_.n_ = compressed ? 65536 : 16384;
+    data_.delta_ = compressed ? 32768 : 8192;
+    compressor_name_ = compressed ? "zstd_1.3.8" : "none";
+    delta_compressor_name_ = compressed ? "none" : nullptr;
+    single_source_ = false;
+    ASSERT_NO_FATAL_FAILURE(build_inputs(false, CS_ENCODING_ROW_STORE, false, true));
+    for (const auto *table : {base_.get(), delta_.get()}) {
+      ObSSTableMetaHandle meta;
+      ASSERT_EQ(OB_SUCCESS, table->get_meta(meta));
+      EXPECT_EQ(CS_ENCODING_ROW_STORE, meta.get_sstable_meta().get_basic_meta().latest_row_store_type_);
+    }
+    int64_t raw_macros[2] = {};
+    for (const auto &macro : source_macros_) {
+      EXPECT_EQ(macro.source_ == 0 ? MAJOR_MERGE : INC_MAJOR_MERGE, macro.merge_type_);
+      EXPECT_EQ(macro.source_ == 0 ? CS_ENCODING_ROW_STORE : FLAT_ROW_STORE, macro.row_store_type_);
+      if (macro.type_ == IVF_ROW_TYPE_RAW_VECTOR) { ++raw_macros[macro.source_]; }
+    }
+    ASSERT_GT(raw_macros[0], 1); ASSERT_GT(raw_macros[1], 1);
+    // Keep the original IDs and producer tags across both intermediate INCs.
+    // Each persisted output uses the fixture allocator, beyond run_merge's arena.
+    for (int pass = 0; pass < 3; ++pass) {
+      SCOPED_TRACE(pass);
+      const ObMergeType merge = pass < 2 ? INC_MAJOR_MERGE : MAJOR_MERGE;
+      Result ordinary, reused;
+      std::unique_ptr<ObIvfSSTable> persisted(new ObIvfSSTable());
+      ASSERT_EQ(OB_SUCCESS, run_merge(ordinary, {}, CS_ENCODING_ROW_STORE, merge,
+          ObIVFProcessType::CONCATENATION));
+      ASSERT_EQ(OB_SUCCESS, run_merge(reused, {}, CS_ENCODING_ROW_STORE, merge,
+          ObIVFProcessType::CONCATENATION, 0, true, 1, persisted.get()));
+      EXPECT_EQ(ordinary.rows_, reused.rows_);
+      EXPECT_EQ(ordinary.logical_column_checksums_, reused.logical_column_checksums_);
+      EXPECT_GT(reused.reused_source_ids_[0][IVF_ROW_TYPE_RAW_VECTOR], 0);
+      if (pass < 2) {
+        EXPECT_GT(reused.reused_source_ids_[1][IVF_ROW_TYPE_RAW_VECTOR], 0);
+        ASSERT_TRUE(persisted->is_inc_ivf_sstable());
+        ObSSTableMetaHandle meta;
+        ASSERT_EQ(OB_SUCCESS, persisted->get_meta(meta));
+        EXPECT_EQ(0, meta.get_sstable_meta().get_col_checksum_cnt());
+        EXPECT_EQ(CS_ENCODING_ROW_STORE, meta.get_sstable_meta().get_basic_meta().latest_row_store_type_);
+        EXPECT_GT(reused.cs_data_macros_, 0);
+        EXPECT_GT(reused.flat_data_macros_, 0);
+        base_ = std::move(persisted); base_rows_ = reused.rows_; single_source_ = true;
+      } else {
+        EXPECT_EQ(0, reused.reused_source_ids_[1][IVF_ROW_TYPE_RAW_VECTOR]);
+        ASSERT_FALSE(persisted->is_inc_ivf_sstable());
+      }
+    }
+  }
+}
+
+TEST_F(TestIVFInsertionStorage, concat_reuses_nonleading_raw_without_reusing_remapped_cid_blocks)
+{
+  data_.n_ = 16384; data_.delta_ = 8192; inc_source_metadata_ = true;
+  ASSERT_NO_FATAL_FAILURE(build_inputs(false, CS_ENCODING_ROW_STORE, false, true));
+  std::vector<Record> delta_rows;
+  ASSERT_EQ(OB_SUCCESS, read_rows(*delta_, delta_rows));
+  const auto delta_meta = delta_->get_ivf_meta();
+  Result ordinary, reused;
+  ASSERT_EQ(OB_SUCCESS, run_merge(ordinary, {}, CS_ENCODING_ROW_STORE, MAJOR_MERGE,
+      ObIVFProcessType::CONCATENATION));
+  ASSERT_EQ(OB_SUCCESS, run_merge(reused, {}, CS_ENCODING_ROW_STORE, MAJOR_MERGE,
+      ObIVFProcessType::CONCATENATION, 0, true, 2));
+  EXPECT_EQ(ordinary.rows_, reused.rows_);
+  EXPECT_EQ(ordinary.logical_column_checksums_, reused.logical_column_checksums_);
+  ASSERT_NO_FATAL_FAILURE(verify_concat(reused, delta_rows, delta_meta, {}, true));
+  EXPECT_GT(reused.reused_source_ids_[0][IVF_ROW_TYPE_RAW_VECTOR], 0);
+  EXPECT_GT(reused.reused_source_ids_[1][IVF_ROW_TYPE_RAW_VECTOR], 0);
+  EXPECT_EQ(0, reused.reused_source_ids_[1][IVF_ROW_TYPE_CENTROID]);
+  EXPECT_EQ(0, reused.reused_source_ids_[1][IVF_ROW_TYPE_LOW_PRECISION_VECTOR]);
+  reverse_sources_ = true;
+  Result reverse_rows, reverse_reuse;
+  ASSERT_EQ(OB_SUCCESS, run_merge(reverse_rows, {}, CS_ENCODING_ROW_STORE, MAJOR_MERGE,
+      ObIVFProcessType::CONCATENATION));
+  ASSERT_EQ(OB_SUCCESS, run_merge(reverse_reuse, {}, CS_ENCODING_ROW_STORE, MAJOR_MERGE,
+      ObIVFProcessType::CONCATENATION, 0, true));
+  EXPECT_EQ(reverse_rows.rows_, reverse_reuse.rows_);
+  EXPECT_GT(reverse_reuse.reused_source_ids_[0][IVF_ROW_TYPE_RAW_VECTOR], 0);
+  EXPECT_GT(reverse_reuse.reused_source_ids_[1][IVF_ROW_TYPE_RAW_VECTOR], 0);
+}
+
+TEST_F(TestIVFInsertionStorage, merge_reason_does_not_change_inc_reuse_eligibility)
+{
+  data_.n_ = 16384; data_.delta_ = 4096; inc_source_ = native_inc_sources_ = true;
+  ASSERT_NO_FATAL_FAILURE(build_inputs(false, CS_ENCODING_ROW_STORE, false, true));
+  Result ordinary;
+  ASSERT_EQ(OB_SUCCESS, run_merge(ordinary, {}, CS_ENCODING_ROW_STORE, INC_MAJOR_MERGE,
+      ObIVFProcessType::CONCATENATION));
+  for (const auto reason : {ObAdaptiveMergePolicy::FREQUENT_WRITE,
+      ObAdaptiveMergePolicy::TOO_MANY_INC_MAJOR, ObAdaptiveMergePolicy::TENANT_MAJOR,
+      ObAdaptiveMergePolicy::WINDOW_COMPACTION, ObAdaptiveMergePolicy::USER_REQUEST,
+      ObAdaptiveMergePolicy::ASYNC_INDEX_FORCE_MERGE, ObAdaptiveMergePolicy::TOMBSTONE_SCENE}) {
+    SCOPED_TRACE(reason);
+    merge_reason_ = reason;
+    Result reused;
+    ASSERT_EQ(OB_SUCCESS, run_merge(reused, {}, CS_ENCODING_ROW_STORE, INC_MAJOR_MERGE,
+        ObIVFProcessType::CONCATENATION, 0, true));
+    EXPECT_EQ(ordinary.rows_, reused.rows_);
+    EXPECT_EQ(ordinary.logical_column_checksums_, reused.logical_column_checksums_);
+    EXPECT_GT(reused.reused_source_ids_[0][IVF_ROW_TYPE_RAW_VECTOR], 0);
+    EXPECT_GT(reused.reused_source_ids_[1][IVF_ROW_TYPE_RAW_VECTOR], 0);
+  }
+}
+
+TEST_F(TestIVFInsertionStorage, unresolved_inc_transaction_is_not_certified_from_committed_row_flags)
+{
+  natural_selection_ = true;
+  data_.n_ = 16384; data_.delta_ = 8192; inc_source_ = native_inc_sources_ = true;
+  unresolved_source_ = 0;
+  ASSERT_NO_FATAL_FAILURE(build_inputs());
+  ASSERT_EQ(INT64_MAX, base_->get_upper_trans_version());
+  ASSERT_FALSE(base_->contain_uncommitted_row()); // Row flag alone does not prove table commit.
+  ASSERT_EQ(OB_SUCCESS, reset_output(CS_ENCODING_ROW_STORE, IVF_SNAPSHOT_VERSION + 10, INC_MAJOR_MERGE));
+  ObArenaAllocator arena("IVFUncertified");
+  ObTabletMergeDagParam param(INC_MAJOR_MERGE, ObLSID(IVF_LS_ID), ObTabletID(IVF_TABLET_ID), -1);
+  param.merge_version_ = IVF_SNAPSHOT_VERSION + 10;
+  ObAsyncIndexMergeCtx ctx(param, arena);
+  ObIVFMergeInputAdapter input(arena);
+  ASSERT_EQ(OB_SUCCESS, configure_context(ctx, input, arena, {}));
+  EXPECT_FALSE(input.uses_metadata_counts());
+  EXPECT_FALSE(input.uses_lazy_raw());
+  ASSERT_EQ(2, input.get_reuse_sources().count());
+  EXPECT_EQ(nullptr, input.get_reuse_sources().at(0));
+  ASSERT_NE(nullptr, input.get_reuse_sources().at(1));
+  EXPECT_EQ(IVF_SNAPSHOT_VERSION + 20, input.get_reuse_sources().at(1)->commit_version_);
+  // There is no transaction-table fixture for this unresolved TXID. Test only
+  // certification; scanning it would correctly fail ordinary access checks.
+  ObIVFBlockReuseSource uncertified(arena);
+  uncertified.table_ = base_.get(); uncertified.source_slot_ = 0;
+  bool compatible = true;
+  ASSERT_EQ(OB_SUCCESS, ObIVFBlockReuseWriter::check_source(uncertified, whole_desc_.get_desc(), compatible));
+  EXPECT_FALSE(compatible);
+}
+
+TEST_F(TestIVFInsertionStorage, inc_reuse_uses_logical_window_and_requires_commit_certificate)
+{
+  data_.n_ = 8192; data_.delta_ = 0; inc_source_ = inc_source_metadata_ = true;
+  ASSERT_NO_FATAL_FAILURE(build_inputs());
+  ASSERT_GT(base_->get_end_scn().get_val_for_tx(), IVF_SNAPSHOT_VERSION + 10);
+  ObIVFBlockReuseSource source(allocator_);
+  source.source_slot_ = 0; source.table_ = base_.get();
+  for (const ObMergeType merge : {MAJOR_MERGE, INC_MAJOR_MERGE}) {
+    SCOPED_TRACE(merge);
+    ASSERT_EQ(OB_SUCCESS, reset_output(CS_ENCODING_ROW_STORE, IVF_SNAPSHOT_VERSION + 10, merge));
+    bool compatible = true;
+    source.commit_version_ = -1;
+    ASSERT_EQ(OB_SUCCESS, ObIVFBlockReuseWriter::check_source(source, whole_desc_.get_desc(), compatible));
+    EXPECT_FALSE(compatible);
+    source.commit_version_ = IVF_SNAPSHOT_VERSION + 20;
+    ASSERT_EQ(OB_SUCCESS, ObIVFBlockReuseWriter::check_source(source, whole_desc_.get_desc(), compatible));
+    EXPECT_TRUE(compatible); // CLOG end and table commit are both later than the logical output snapshot.
+    ASSERT_EQ(OB_SUCCESS, reset_output(CS_ENCODING_ROW_STORE, IVF_SNAPSHOT_VERSION - 1, merge));
+    ASSERT_EQ(OB_SUCCESS, ObIVFBlockReuseWriter::check_source(source, whole_desc_.get_desc(), compatible));
+    EXPECT_FALSE(compatible); // The source's logical end is not contained by the output snapshot.
+  }
+}
+
+TEST_F(TestIVFInsertionStorage, inc_reuse_across_multiple_tasks_and_source_boundaries_has_unique_macro_ids)
+{
+  data_.n_ = 70000; data_.delta_ = 10000; inc_source_ = native_inc_sources_ = true;
+  ASSERT_NO_FATAL_FAILURE(build_inputs(false, CS_ENCODING_ROW_STORE, false, true));
+  Result ordinary, reused;
+  ASSERT_EQ(OB_SUCCESS, run_merge(ordinary, {}, CS_ENCODING_ROW_STORE, INC_MAJOR_MERGE,
+      ObIVFProcessType::CONCATENATION, 0, false, 3));
+  ASSERT_EQ(OB_SUCCESS, run_merge(reused, {}, CS_ENCODING_ROW_STORE, INC_MAJOR_MERGE,
+      ObIVFProcessType::CONCATENATION, 0, true, 3));
+  EXPECT_EQ(ordinary.rows_, reused.rows_);
+  EXPECT_EQ(ordinary.logical_column_checksums_, reused.logical_column_checksums_);
+  EXPECT_GT(reused.raw_tasks_, 1); EXPECT_EQ(3, reused.posting_tasks_);
+  EXPECT_GT(reused.reused_source_ids_[0][IVF_ROW_TYPE_RAW_VECTOR], 0);
+  EXPECT_GT(reused.reused_source_ids_[1][IVF_ROW_TYPE_RAW_VECTOR], 0);
+  // run_merge scans every output macro ID and rejects a repeated ID before readback.
+}
+
+TEST_F(TestIVFInsertionStorage, overlapping_source_certificates_are_rejected_before_output)
+{
+  data_.n_ = 8192; data_.delta_ = 4096; inc_source_metadata_ = true;
+  ASSERT_NO_FATAL_FAILURE(build_inputs());
+  ASSERT_EQ(OB_SUCCESS, reset_output(CS_ENCODING_ROW_STORE, IVF_SNAPSHOT_VERSION + 10));
+  ObTableReadInfo info;
+  ASSERT_EQ(OB_SUCCESS, prepare_read_info(info));
+  ObIVFBlockReuseSource first(allocator_), second(allocator_);
+  first.source_slot_ = 0; first.table_ = base_.get(); first.read_info_ = &info;
+  first.commit_version_ = IVF_SNAPSHOT_VERSION;
+  second.source_slot_ = 1; second.table_ = delta_.get(); second.read_info_ = &info;
+  second.commit_version_ = IVF_SNAPSHOT_VERSION + 20;
+  ObArray<ObIVFBlockReuseSource *> sources;
+  ASSERT_EQ(OB_SUCCESS, sources.push_back(&first)); ASSERT_EQ(OB_SUCCESS, sources.push_back(&second));
+  ObIVFReuseRange left, right, task;
+  task.first_ = ObIVFReuseKey(IVF_ROW_TYPE_RAW_VECTOR, 0, 0);
+  task.last_ = ObIVFReuseKey(IVF_ROW_TYPE_RAW_VECTOR, 0, UINT64_MAX);
+  left.source_slot_ = 0; left.first_ = task.first_;
+  left.last_ = ObIVFReuseKey(IVF_ROW_TYPE_RAW_VECTOR, 0, data_.base_vid(data_.n_ - 1));
+  right.source_slot_ = 1; right.first_ = left.last_; right.last_ = task.last_;
+  ObArray<ObIVFReuseRange> ranges;
+  ASSERT_EQ(OB_SUCCESS, ranges.push_back(left)); ASSERT_EQ(OB_SUCCESS, ranges.push_back(right));
+  ObIvfMacroBlockWriter writer;
+  ASSERT_EQ(OB_SUCCESS, open_format_aware_writer(writer, 0));
+  ObIVFBlockReuseWriter reuse(allocator_);
+  EXPECT_EQ(OB_INVALID_ARGUMENT, reuse.init(sources, ranges, task, whole_desc_.get_desc(), writer));
+  EXPECT_EQ(0, writer.get_appended_row_count()); EXPECT_EQ(0, reuse.reused_macros());
+  writer.reset();
+}
+
+TEST_F(TestIVFSSTable, reuse_source_views_do_not_cross_into_adjacent_sources)
+{
+  ObArray<float> coordinates;
+  ObArray<int64_t> ids, counts;
+  for (const float value : {10.F, 11.F, 20.F, 21.F, 30.F, 31.F}) { ASSERT_EQ(OB_SUCCESS, coordinates.push_back(value)); }
+  for (const int64_t value : {100, 200, 300}) { ASSERT_EQ(OB_SUCCESS, ids.push_back(value)); ASSERT_EQ(OB_SUCCESS, counts.push_back(value / 10)); }
+  ObIVFBlockReuseSource source(allocator_);
+  source.source_slot_ = 1; source.centroid_begin_ = 1; source.centroid_count_ = 1; source.dimension_ = 2;
+  source.leaf_coordinates_ = &coordinates; source.old_cids_ = &ids; source.posting_counts_ = &counts;
+  ASSERT_TRUE(source.has_prior_view());
+  EXPECT_EQ(-1, source.local_centroid_index(0)); EXPECT_EQ(0, source.local_centroid_index(1));
+  EXPECT_EQ(-1, source.local_centroid_index(2));
+  EXPECT_EQ(200, source.old_cid(0)); EXPECT_EQ(20, source.posting_count(0));
+  ObIVFReuseCentroid row;
+  row.coordinate_idx_ = 0;
+  ASSERT_NE(nullptr, source.coordinates(row)); EXPECT_EQ(20.F, source.coordinates(row)[0]);
+  row.coordinate_idx_ = 2;
+  EXPECT_EQ(nullptr, source.coordinates(row)); // Valid in the global array, outside this source.
+}
+
+TEST_F(TestIVFInsertionStorage, extended_centroid_headers_are_read_but_not_certified_unchanged)
+{
+  data_.n_ = 8192; data_.k_ = 128; data_.delta_ = 0;
+  ASSERT_NO_FATAL_FAILURE(build_inputs(false, FLAT_ROW_STORE));
+  ASSERT_NO_FATAL_FAILURE(extend_source_centroid_headers());
+  for (const auto &r : base_rows_) {
+    if (r.type_ == IVF_ROW_TYPE_CENTROID) { ASSERT_EQ(ObIvfCentroidPayload::get_size(DIM) + 4, r.payload_.size()); }
+  }
+  Result ordinary, reused;
+  ASSERT_EQ(OB_SUCCESS, run_merge(ordinary, {}, FLAT_ROW_STORE));
+  ASSERT_EQ(OB_SUCCESS, run_merge(reused, {}, FLAT_ROW_STORE, MAJOR_MERGE, ObIVFProcessType::INSERTION, 0, true));
+  EXPECT_EQ(ordinary.rows_, reused.rows_);
+  EXPECT_EQ(ordinary.logical_column_checksums_, reused.logical_column_checksums_);
+  EXPECT_EQ(0, reused.reused_ids_[IVF_ROW_TYPE_CENTROID]);
+  EXPECT_GT(reused.reused_ids_[IVF_ROW_TYPE_RAW_VECTOR], 0);
+  for (const auto &r : reused.rows_) {
+    if (r.type_ == IVF_ROW_TYPE_CENTROID) { EXPECT_EQ(ObIvfCentroidPayload::get_size(DIM), r.payload_.size()); }
+  }
+}
+
+TEST_F(TestIVFInsertionStorage, multiple_posting_and_raw_ranges_do_not_reuse_crossing_macros_twice)
+{
+  data_.n_ = 70000; data_.delta_ = 32; data_.interleave_vids_ = true;
+  ASSERT_NO_FATAL_FAILURE(build_inputs());
+  Result ordinary, reused;
+  ASSERT_EQ(OB_SUCCESS, run_merge(ordinary, {}, CS_ENCODING_ROW_STORE, MAJOR_MERGE,
+      ObIVFProcessType::INSERTION, 0, false, 3));
+  ASSERT_EQ(OB_SUCCESS, run_merge(reused, {}, CS_ENCODING_ROW_STORE, MAJOR_MERGE,
+      ObIVFProcessType::INSERTION, 0, true, 3));
+  EXPECT_EQ(ordinary.rows_, reused.rows_);
+  EXPECT_EQ(ordinary.logical_column_checksums_, reused.logical_column_checksums_);
+  EXPECT_EQ(3, reused.posting_tasks_); EXPECT_GT(reused.raw_tasks_, 1);
+  EXPECT_GT(reused.reused_ids_[IVF_ROW_TYPE_RAW_VECTOR], 0);
+  EXPECT_LT(reused.new_data_bytes_, ordinary.new_data_bytes_);
+  // run_merge also rejects duplicate macro IDs in the resulting table.
+}
+
+TEST_F(TestIVFInsertionStorage, clustered_macro_payload_is_reused_and_tree_mismatch_falls_back)
+{
+  data_.n_ = 16384; data_.delta_ = 16; clustered_ = true;
+  ASSERT_NO_FATAL_FAILURE(build_inputs());
+  Result ordinary, reused;
+  ASSERT_EQ(OB_SUCCESS, run_merge(ordinary));
+  ASSERT_EQ(OB_SUCCESS, run_merge(reused, {}, CS_ENCODING_ROW_STORE, MAJOR_MERGE,
+      ObIVFProcessType::INSERTION, 0, true, 2));
+  EXPECT_EQ(ordinary.rows_, reused.rows_);
+  EXPECT_EQ(ordinary.logical_column_checksums_, reused.logical_column_checksums_);
+  EXPECT_GT(reused.reused_ids_[IVF_ROW_TYPE_RAW_VECTOR], 0);
+  clustered_ = false;
+  Result converted;
+  ASSERT_EQ(OB_SUCCESS, run_merge(converted, {}, CS_ENCODING_ROW_STORE, MAJOR_MERGE,
+      ObIVFProcessType::INSERTION, 0, true));
+  EXPECT_EQ(ordinary.rows_, converted.rows_);
+  for (auto count : converted.reused_ids_) { EXPECT_EQ(0, count); }
+}
+
+TEST_F(TestIVFInsertionStorage, parent_group_changes_and_nonleading_source_keep_exact_output)
+{
+  data_.n_ = 8192; data_.delta_ = 16;
+  for (const bool grouped : {false, true}) {
+    ASSERT_NO_FATAL_FAILURE(build_inputs(false, CS_ENCODING_ROW_STORE, grouped));
+    for (const int64_t threshold : {0, 1}) {
+      Result ordinary, reused;
+      ASSERT_EQ(OB_SUCCESS, run_merge(ordinary, {}, CS_ENCODING_ROW_STORE, MAJOR_MERGE,
+          ObIVFProcessType::INSERTION, threshold));
+      ASSERT_EQ(OB_SUCCESS, run_merge(reused, {}, CS_ENCODING_ROW_STORE, MAJOR_MERGE,
+          ObIVFProcessType::INSERTION, threshold, true, 2));
+      EXPECT_EQ(ordinary.rows_, reused.rows_);
+      EXPECT_EQ(ordinary.logical_column_checksums_, reused.logical_column_checksums_);
+      EXPECT_EQ(threshold == 1, reused.meta_.is_hierarchical());
+    }
+  }
+  reverse_sources_ = true;
+  Result ordinary, nonleading;
+  ASSERT_EQ(OB_SUCCESS, run_merge(ordinary));
+  ASSERT_EQ(OB_SUCCESS, run_merge(nonleading, {}, CS_ENCODING_ROW_STORE, MAJOR_MERGE,
+      ObIVFProcessType::INSERTION, 0, true));
+  EXPECT_EQ(ordinary.rows_, nonleading.rows_);
+  EXPECT_GT(nonleading.reused_source_ids_[0][IVF_ROW_TYPE_RAW_VECTOR], 0);
+}
+
+TEST_F(TestIVFInsertionStorage, refresh_adapter_sealing_zero_schema_reuses_inc_then_major)
+{
+  data_.n_ = 16384; data_.delta_ = 8192;
+  inc_source_ = inc_source_metadata_ = clustered_ = true;
+  minor_store_type_ = FLAT_OPT_ROW_STORE;
+  ASSERT_NO_FATAL_FAILURE(build_inputs(false, CS_ENCODING_ROW_STORE, false, true));
+  ASSERT_NO_FATAL_FAILURE(rewrite_source_through_refresh_sealing(0));
+  ASSERT_NO_FATAL_FAILURE(rewrite_source_through_refresh_sealing(1));
+  source_macros_.clear();
+  ASSERT_NO_FATAL_FAILURE(collect_source_macros(*base_, 0));
+  ASSERT_NO_FATAL_FAILURE(collect_source_macros(*delta_, 1));
+  for (const auto *table : {base_.get(), delta_.get()}) {
+    ObSSTableMetaHandle meta;
+    ASSERT_EQ(OB_SUCCESS, table->get_meta(meta));
+    EXPECT_EQ(0, meta.get_sstable_meta().get_basic_meta().schema_version_);
+  }
+  for (const auto &macro : source_macros_) {
+    EXPECT_EQ(output_schema_version_, macro.schema_version_);
+    EXPECT_TRUE(macro.clustered_); // The real DDL index rebuild converts the adapter's index tree.
+    EXPECT_EQ(MAJOR_MERGE, macro.merge_type_);
+  }
+  std::vector<Record> previous;
+  for (const auto merge : {INC_MAJOR_MERGE, MAJOR_MERGE}) {
+    SCOPED_TRACE(static_cast<int>(merge));
+    Result ordinary, reused;
+    std::unique_ptr<ObIvfSSTable> persisted(new ObIvfSSTable());
+    ASSERT_EQ(OB_SUCCESS, run_merge(ordinary, {}, CS_ENCODING_ROW_STORE, merge,
+        ObIVFProcessType::CONCATENATION));
+    ASSERT_EQ(OB_SUCCESS, run_merge(reused, {}, CS_ENCODING_ROW_STORE, merge,
+        ObIVFProcessType::CONCATENATION, 0, true, 2, persisted.get()));
+    EXPECT_EQ(merge == INC_MAJOR_MERGE ? FLAT_OPT_ROW_STORE : CS_ENCODING_ROW_STORE,
+        whole_desc_.get_desc().get_row_store_type());
+    EXPECT_EQ(ordinary.rows_, reused.rows_);
+    EXPECT_EQ(ordinary.logical_column_checksums_, reused.logical_column_checksums_);
+    EXPECT_GT(reused.reused_source_ids_[0][IVF_ROW_TYPE_RAW_VECTOR], 0);
+    EXPECT_GT(reused.reused_source_ids_[1][IVF_ROW_TYPE_RAW_VECTOR], 0);
+    if (!previous.empty()) { EXPECT_EQ(previous, reused.rows_); }
+    previous = reused.rows_;
+    base_ = std::move(persisted); base_rows_ = reused.rows_; single_source_ = true;
+  }
+}
+
+TEST_F(TestIVFInsertionStorage, refresh_sealing_rejects_real_extra_column_schema)
+{
+  data_.n_ = 8192; data_.delta_ = 16; inc_source_ = inc_source_metadata_ = clustered_ = true;
+  ASSERT_NO_FATAL_FAILURE(build_inputs());
+  ASSERT_NO_FATAL_FAILURE(rewrite_source_through_refresh_sealing(0, true));
+  ObSSTableMetaHandle meta;
+  ASSERT_EQ(OB_SUCCESS, base_->get_meta(meta));
+  EXPECT_EQ(0, meta.get_sstable_meta().get_basic_meta().schema_version_);
+  EXPECT_EQ(7, meta.get_sstable_meta().get_basic_meta().column_cnt_);
+  ASSERT_EQ(OB_SUCCESS, reset_output(CS_ENCODING_ROW_STORE, IVF_SNAPSHOT_VERSION + 10));
+  ObIVFBlockReuseSource source(allocator_);
+  source.table_ = base_.get(); source.source_slot_ = 0; source.commit_version_ = IVF_SNAPSHOT_VERSION + 20;
+  bool compatible = true;
+  ASSERT_EQ(OB_SUCCESS, ObIVFBlockReuseWriter::check_source(source, whole_desc_.get_desc(), compatible));
+  EXPECT_FALSE(compatible);
+}
+
+TEST_F(TestIVFInsertionStorage, schema_version_change_reuses_but_encryption_and_progressive_round_reject)
+{
+  data_.n_ = 8192; data_.delta_ = 16;
+  ASSERT_NO_FATAL_FAILURE(build_inputs());
+  bool compatible = false;
+  ASSERT_EQ(OB_SUCCESS, reset_output(CS_ENCODING_ROW_STORE, IVF_SNAPSHOT_VERSION + 10));
+  auto &desc = whole_desc_.get_desc();
+  ObIVFBlockReuseSource source(allocator_);
+  source.source_slot_ = 0; source.table_ = base_.get(); source.commit_version_ = IVF_SNAPSHOT_VERSION;
+  ASSERT_EQ(OB_SUCCESS, ObIVFBlockReuseWriter::check_source(source, desc, compatible));
+  ASSERT_TRUE(compatible);
+  ++desc.static_desc_->encrypt_id_;
+  ASSERT_EQ(OB_SUCCESS, ObIVFBlockReuseWriter::check_source(source, desc, compatible));
+  EXPECT_FALSE(compatible);
+  --desc.static_desc_->encrypt_id_; ++desc.static_desc_->master_key_id_;
+  ASSERT_EQ(OB_SUCCESS, ObIVFBlockReuseWriter::check_source(source, desc, compatible));
+  EXPECT_FALSE(compatible);
+  for (const bool schema_change : {true, false}) {
+    output_schema_version_ = schema_change ? 11 : 10;
+    output_progressive_round_ = schema_change ? 0 : 1;
+    Result ordinary, rejected;
+    ASSERT_EQ(OB_SUCCESS, run_merge(ordinary));
+    ASSERT_EQ(OB_SUCCESS, run_merge(rejected, {}, CS_ENCODING_ROW_STORE, MAJOR_MERGE,
+        ObIVFProcessType::INSERTION, 0, true));
+    EXPECT_EQ(ordinary.rows_, rejected.rows_);
+    if (schema_change) {
+      EXPECT_GT(rejected.reused_ids_[IVF_ROW_TYPE_RAW_VECTOR], 0);
+    } else { for (auto count : rejected.reused_ids_) { EXPECT_EQ(0, count); } }
+  }
+}
+
+TEST_F(TestIVFInsertionStorage, raw_entry_failure_aborts_without_closing_a_draft_index)
+{
+  data_.n_ = 16384; data_.delta_ = 16;
+  ASSERT_NO_FATAL_FAILURE(build_inputs());
+  for (const int failure : {OB_TIMEOUT, OB_CANCELED}) {
+    ASSERT_EQ(OB_SUCCESS, reset_output(CS_ENCODING_ROW_STORE, IVF_SNAPSHOT_VERSION + 10));
+    ObArenaAllocator arena("IVFRawAbort");
+    ObTabletMergeDagParam param(MAJOR_MERGE, ObLSID(IVF_LS_ID), ObTabletID(IVF_TABLET_ID), -1);
+    param.merge_version_ = IVF_SNAPSHOT_VERSION + 10;
+    ObAsyncIndexMergeCtx ctx(param, arena);
+    ObIVFMergeInputAdapter input(arena);
+    ASSERT_EQ(OB_SUCCESS, configure_context(ctx, input, arena, {}));
+    ObIVFMergeCaptureCtx capture;
+    ASSERT_EQ(OB_SUCCESS, capture.init(ctx, input, false));
+    ASSERT_EQ(OB_SUCCESS, capture.scan(0)); ASSERT_EQ(OB_SUCCESS, capture.finish());
+    ASSERT_EQ(OB_SUCCESS, input.capture_prior_(ctx));
+    ASSERT_EQ(OB_SUCCESS, input.prepare_block_reuse());
+    ASSERT_GT(input.get_reuse_sources().count(), 0);
+    ASSERT_NE(nullptr, input.get_reuse_sources().at(0));
+    ASSERT_NE(nullptr, input.get_reuse_sources().at(0)->table_);
+    class FailingReader final : public ObIVFVectorStore {
+    public:
+      FailingReader(const ObIVFVectorStore &source, int error) : source_(source), error_(error), failed_(false) {}
+      bool is_valid() const override { return source_.is_valid(); }
+      int64_t get_dimension() const override { return source_.get_dimension(); }
+      int64_t get_vector_count() const override { return source_.get_vector_count(); }
+      int get_all_vids(ObIArray<ObIVFVectorVID> &v) const override { return source_.get_all_vids(v); }
+      int batch_get_by_vid(const ObIArray<ObIVFVectorVID> &v, int64_t begin, int64_t end, ObIArray<float> &out) const override {
+        if (begin >= 8192) { failed_ = true; return error_; }
+        return source_.batch_get_by_vid(v, begin, end, out);
+      }
+      const ObIVFVectorStore &source_; int error_; mutable bool failed_;
+    } failing(input, failure);
+    ObIVFVectorReader reader;
+    ASSERT_EQ(OB_SUCCESS, reader.init(failing));
+    ObArray<ObIVFVectorVID> vids;
+    ASSERT_EQ(OB_SUCCESS, input.get_all_vids(vids));
+    ObMacroSeqWindow window;
+    ASSERT_EQ(OB_SUCCESS, ObVersionLocalMacroSeq::build_window(0, window));
+    ObIVFMergeSSTableWriter output(arena);
+    ASSERT_EQ(OB_SUCCESS, output.init(whole_desc_.get_desc(), sstable_builder_, window,
+        IVF_SNAPSHOT_VERSION + 10, DIM, VIDA_L2));
+    ASSERT_EQ(OB_SUCCESS, output.set_reuse_sources(input.get_reuse_sources()));
+    output.quantization_finished_ = true; // Isolate the actual production RAW entry after its QUANT barrier.
+    EXPECT_EQ(failure, output.write_raw_vectors(reader, vids, 0, vids.count(), 0));
+    EXPECT_TRUE(failing.failed_);
+    EXPECT_EQ(0, output.get_row_count()); EXPECT_FALSE(output.is_finished());
+    for (int64_t i = 0; i < sstable_builder_.roots_.count(); ++i) {
+      EXPECT_FALSE(sstable_builder_.roots_.at(i)->is_valid());
+      EXPECT_EQ(0, sstable_builder_.roots_.at(i)->get_data_block_cnt());
+    }
+    std::vector<Record> source_rows;
+    ASSERT_EQ(OB_SUCCESS, read_rows(*base_, source_rows));
+    EXPECT_EQ(base_rows_, source_rows);
+  }
+}
+
+TEST_F(TestIVFInsertionStorage, metadata_first_natural_insertion_and_concat_match_scanned_input)
+{
+  natural_selection_ = true;
+  for (const auto format : {FLAT_ROW_STORE, ENCODING_ROW_STORE, CS_ENCODING_ROW_STORE}) {
+    for (const bool concat : {false, true}) {
+      SCOPED_TRACE(format);
+      SCOPED_TRACE(concat);
+      data_.n_ = 4096; data_.k_ = 32; data_.delta_ = concat ? 4096 : 128;
+      ASSERT_NO_FATAL_FAILURE(build_inputs(false, format, concat /* grouped */));
+      Result scanned, metadata;
+      metadata_input_ = false;
+      ASSERT_EQ(OB_SUCCESS, run_merge(scanned, {}, format, MAJOR_MERGE,
+          ObIVFProcessType::INSERTION, 0, true));
+      metadata_input_ = true;
+      ASSERT_EQ(OB_SUCCESS, run_merge(metadata, {}, format, MAJOR_MERGE,
+          ObIVFProcessType::INSERTION, 0, true));
+      const auto expected = concat ? ObIVFProcessType::CONCATENATION : ObIVFProcessType::INSERTION;
+      EXPECT_EQ(expected, scanned.process_type_);
+      EXPECT_EQ(expected, metadata.process_type_);
+      EXPECT_EQ(expected, metadata.metadata_strategy_);
+      EXPECT_FALSE(scanned.metadata_counts_);
+      EXPECT_TRUE(metadata.metadata_before_capture_);
+      EXPECT_TRUE(metadata.lazy_raw_);
+      EXPECT_EQ(data_.n_ + data_.delta_, scanned.replay_rows_);
+      EXPECT_EQ(0, metadata.replay_rows_);
+      EXPECT_EQ(0, metadata.replay_hold_);
+      EXPECT_EQ(0, metadata.spill_bytes_);
+      EXPECT_EQ(scanned.capture_rows_, metadata.capture_rows_);
+      EXPECT_EQ(scanned.rows_, metadata.rows_);
+      EXPECT_EQ(scanned.logical_column_checksums_, metadata.logical_column_checksums_);
+      EXPECT_EQ(data_.n_ + data_.delta_, metadata.meta_.vector_count_);
+    }
+  }
+}
+
+
+TEST_F(TestIVFInsertionStorage, metadata_first_committed_native_inc_sources_match_scanned_input)
+{
+  natural_selection_ = true;
+  inc_source_ = native_inc_sources_ = true;
+  data_.n_ = 2048; data_.k_ = 32;
+  for (const int64_t delta : {64L, 2048L}) {
+    SCOPED_TRACE(delta);
+    data_.delta_ = delta;
+    ASSERT_NO_FATAL_FAILURE(build_inputs());
+    ASSERT_TRUE(base_->is_inc_ivf_sstable());
+    ASSERT_TRUE(delta_->is_inc_ivf_sstable());
+    ASSERT_FALSE(base_->contain_uncommitted_row());
+    ASSERT_FALSE(delta_->contain_uncommitted_row());
+    ASSERT_EQ(IVF_SNAPSHOT_VERSION + 20, base_->get_upper_trans_version());
+    ASSERT_EQ(IVF_SNAPSHOT_VERSION + 20, delta_->get_upper_trans_version());
+    // Physical CLOG bounds and table commit are both newer than the logical
+    // merge snapshot. Eligibility must use the certified logical windows.
+    ASSERT_GT(base_->get_end_scn().get_val_for_tx(), IVF_SNAPSHOT_VERSION + 10);
+    ASSERT_GT(delta_->get_end_scn().get_val_for_tx(), IVF_SNAPSHOT_VERSION + 10);
+    ObNewVersionRange base_window, delta_window;
+    ASSERT_EQ(OB_SUCCESS, base_->get_async_index_version_range(base_window));
+    ASSERT_EQ(OB_SUCCESS, delta_->get_async_index_version_range(delta_window));
+    EXPECT_EQ(IVF_SNAPSHOT_VERSION - 10, base_window.base_version_);
+    EXPECT_EQ(IVF_SNAPSHOT_VERSION, base_window.snapshot_version_);
+    EXPECT_EQ(IVF_SNAPSHOT_VERSION, delta_window.base_version_);
+    EXPECT_EQ(IVF_SNAPSHOT_VERSION + 10, delta_window.snapshot_version_);
+    std::vector<Record> delta_before;
+    ASSERT_EQ(OB_SUCCESS, read_rows(*delta_, delta_before));
+    const auto expected = delta == 64 ? ObIVFProcessType::INSERTION : ObIVFProcessType::CONCATENATION;
+    for (const auto merge : {INC_MAJOR_MERGE, MAJOR_MERGE}) {
+      SCOPED_TRACE(static_cast<int>(merge));
+      Result scanned, metadata;
+      metadata_input_ = false;
+      ASSERT_EQ(OB_SUCCESS, run_merge(scanned, {}, CS_ENCODING_ROW_STORE, merge,
+          expected, 0, true));
+      metadata_input_ = true;
+      ASSERT_EQ(OB_SUCCESS, run_merge(metadata, {}, CS_ENCODING_ROW_STORE, merge,
+          expected, 0, true));
+      EXPECT_EQ(expected, scanned.process_type_);
+      EXPECT_EQ(expected, metadata.process_type_);
+      EXPECT_EQ(expected, metadata.metadata_strategy_);
+      EXPECT_FALSE(scanned.metadata_counts_);
+      ASSERT_TRUE(metadata.metadata_before_capture_);
+      ASSERT_TRUE(metadata.metadata_counts_);
+      ASSERT_TRUE(metadata.lazy_raw_);
+      EXPECT_EQ(data_.n_ + data_.delta_, scanned.replay_rows_);
+      EXPECT_EQ(0, metadata.replay_rows_);
+      EXPECT_EQ(0, metadata.replay_hold_);
+      EXPECT_EQ(0, metadata.spill_bytes_);
+      EXPECT_EQ(data_.n_ + data_.delta_, metadata.capture_rows_);
+      EXPECT_EQ(data_.n_ + data_.delta_, metadata.meta_.vector_count_);
+      EXPECT_EQ(scanned.rows_, metadata.rows_);
+      EXPECT_EQ(scanned.logical_column_checksums_, metadata.logical_column_checksums_);
+      if (merge == MAJOR_MERGE) { EXPECT_EQ(4, metadata.logical_column_checksums_.size()); }
+      else { EXPECT_TRUE(metadata.logical_column_checksums_.empty()); }
+    }
+    std::vector<Record> base_after, delta_after;
+    ASSERT_EQ(OB_SUCCESS, read_rows(*base_, base_after));
+    ASSERT_EQ(OB_SUCCESS, read_rows(*delta_, delta_after));
+    EXPECT_EQ(base_rows_, base_after);
+    EXPECT_EQ(delta_before, delta_after);
+  }
+}
+
+TEST_F(TestIVFInsertionStorage, metadata_first_full_rebuild_keeps_required_raw_capture)
+{
+  natural_selection_ = true;
+  data_.n_ = 256; data_.k_ = 32; data_.delta_ = 32;
+  ASSERT_NO_FATAL_FAILURE(build_inputs());
+  Result output;
+  ASSERT_EQ(OB_SUCCESS, run_merge(output));
+  EXPECT_TRUE(output.metadata_before_capture_);
+  EXPECT_EQ(ObIVFProcessType::FULL_REBUILD, output.metadata_strategy_);
+  EXPECT_EQ(ObIVFProcessType::FULL_REBUILD, output.process_type_);
+  EXPECT_FALSE(output.lazy_raw_);
+  EXPECT_EQ(data_.n_ + data_.delta_, output.replay_rows_);
+  EXPECT_EQ(data_.n_ + data_.delta_, output.meta_.vector_count_);
+  int64_t raw_count = 0;
+  float expected[DIM];
+  for (const auto &row : output.rows_) {
+    if (row.type_ != IVF_ROW_TYPE_RAW_VECTOR) { continue; }
+    const bool delta = row.vid_ % 2 != 0;
+    const int64_t idx = delta ? (row.vid_ - data_.delta_vid(0)) / 2 : row.vid_ / 2 - 1;
+    ASSERT_GE(idx, 0); ASSERT_LT(idx, delta ? data_.delta_ : data_.n_);
+    data_.vector(idx, delta, expected);
+    ASSERT_EQ(sizeof(expected), row.payload_.size());
+    EXPECT_EQ(0, MEMCMP(expected, row.payload_.data(), sizeof(expected)));
+    ++raw_count;
+  }
+  EXPECT_EQ(data_.n_ + data_.delta_, raw_count);
+}
+
+TEST_F(TestIVFInsertionStorage, metadata_first_deletion_falls_back_to_visible_scan)
+{
+  natural_selection_ = true;
+  data_.n_ = 4096; data_.k_ = 32; data_.delta_ = 128;
+  ASSERT_NO_FATAL_FAILURE(build_inputs());
+  const std::vector<uint64_t> deleted = {data_.base_vid(3), data_.delta_vid(0)};
+  Result output;
+  ASSERT_EQ(OB_SUCCESS, run_merge(output, deleted));
+  EXPECT_FALSE(output.metadata_counts_);
+  EXPECT_FALSE(output.lazy_raw_);
+  EXPECT_EQ(data_.n_ + data_.delta_ - deleted.size(), output.replay_rows_);
+  ASSERT_NO_FATAL_FAILURE(verify(output, deleted));
+}
+
+TEST_F(TestIVFInsertionStorage, metadata_first_duplicate_vid_does_not_publish)
+{
+  natural_selection_ = true;
+  data_.n_ = 2048; data_.k_ = 32; data_.delta_ = 64;
+  ASSERT_NO_FATAL_FAILURE(build_inputs(true));
+  Result output;
+  EXPECT_NE(OB_SUCCESS, run_merge(output));
+  EXPECT_TRUE(output.metadata_before_capture_);
+  EXPECT_TRUE(output.lazy_raw_);
+  EXPECT_TRUE(output.rows_.empty());
+  EXPECT_FALSE(sstable_builder_.get_ivf_meta().is_valid());
+  ASSERT_EQ(OB_SUCCESS, reset_output());
+  std::vector<Record> surviving_source;
+  ASSERT_EQ(OB_SUCCESS, read_rows(*base_, surviving_source));
+  EXPECT_EQ(base_rows_, surviving_source);
+}
+
+TEST_F(TestIVFInsertionStorage, metadata_first_stale_vector_count_falls_back_without_changing_rows)
+{
+  natural_selection_ = true;
+  data_.n_ = 2048; data_.k_ = 32; data_.delta_ = 64;
+  ASSERT_NO_FATAL_FAILURE(build_inputs());
+  metadata_input_ = false;
+  Result scanned;
+  ASSERT_EQ(OB_SUCCESS, run_merge(scanned));
+  metadata_input_ = true;
+  const auto original = base_->get_ivf_meta();
+  auto stale = original;
+  ++stale.vector_count_;
+  ASSERT_EQ(OB_SUCCESS, base_->set_ivf_meta(allocator_, stale));
+  Result output;
+  ASSERT_EQ(OB_SUCCESS, run_merge(output));
+  EXPECT_TRUE(output.metadata_before_capture_);
+  EXPECT_FALSE(output.metadata_counts_);
+  EXPECT_EQ(scanned.rows_, output.rows_);
+  EXPECT_EQ(scanned.logical_column_checksums_, output.logical_column_checksums_);
+  EXPECT_EQ(data_.n_ + data_.delta_, output.meta_.vector_count_);
+  ASSERT_EQ(OB_SUCCESS, base_->set_ivf_meta(allocator_, original));
+  ASSERT_EQ(OB_SUCCESS, reset_output());
+  std::vector<Record> surviving_source;
+  ASSERT_EQ(OB_SUCCESS, read_rows(*base_, surviving_source));
+  EXPECT_EQ(base_rows_, surviving_source);
+}
+
+TEST_F(TestIVFInsertionStorage, metadata_first_small_increment_plans_without_macro_reuse)
+{
+  natural_selection_ = true;
+  data_.n_ = 4096; data_.k_ = 32; data_.delta_ = 16;
+  ASSERT_NO_FATAL_FAILURE(build_inputs());
+  std::vector<Record> delta_rows;
+  ASSERT_EQ(OB_SUCCESS, read_rows(*delta_, delta_rows));
+  const auto delta_meta = delta_->get_ivf_meta();
+  // Build a genuine nested source, rather than changing cached offsets while
+  // leaving the physical data at the old address. Current async publication
+  // disables this generic packing path, so use a standard row-store builder
+  // here to model a compatible older nested IVF source.
+  ASSERT_EQ(OB_SUCCESS, reset_output(FLAT_ROW_STORE));
+  sstable_builder_.optimization_mode_ = ObSSTableIndexBuilder::ENABLE;
+  sstable_builder_.set_is_async_index(false);
+  ObIvfMacroBlockWriter writer;
+  ASSERT_EQ(OB_SUCCESS, open_format_aware_writer(writer, 0));
+  ObDatumRow row;
+  for (const auto &record : delta_rows) {
+    ASSERT_EQ(OB_SUCCESS, make_ivf_row(row, record.type_, record.cid_, record.vid_,
+        ObString(record.payload_.size(), record.payload_.data())));
+    ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+  }
+  ASSERT_EQ(OB_SUCCESS, writer.close());
+  std::unique_ptr<ObIvfSSTable> nested(new ObIvfSSTable());
+  ObSSTableMergeRes sealed;
+  ASSERT_EQ(OB_SUCCESS, seal_table(*nested, allocator_, true, delta_meta, sealed));
+  ASSERT_TRUE(nested->is_small_sstable());
+  std::vector<Record> nested_rows;
+  ASSERT_EQ(OB_SUCCESS, read_rows(*nested, nested_rows));
+  ASSERT_EQ(delta_rows, nested_rows);
+  delta_ = std::move(nested);
+
+  ASSERT_EQ(OB_SUCCESS, reset_output(CS_ENCODING_ROW_STORE, IVF_SNAPSHOT_VERSION + 10));
+  ObIVFBlockReuseSource ordinary(allocator_);
+  ordinary.table_ = base_.get(); ordinary.source_slot_ = 0;
+  ordinary.commit_version_ = base_->get_upper_trans_version();
+  bool ordinary_compatible = false;
+  ASSERT_EQ(OB_SUCCESS, ObIVFBlockReuseWriter::check_source(ordinary, whole_desc_.get_desc(), ordinary_compatible));
+  ASSERT_TRUE(ordinary_compatible);
+  ObIVFBlockReuseSource small(allocator_);
+  small.table_ = delta_.get(); small.source_slot_ = 1;
+  small.commit_version_ = delta_->get_upper_trans_version();
+  ASSERT_GT(small.commit_version_, 0);
+  ASSERT_NE(INT64_MAX, small.commit_version_);
+  bool compatible = true;
+  ASSERT_EQ(OB_SUCCESS, ObIVFBlockReuseWriter::check_source(small, whole_desc_.get_desc(), compatible));
+  EXPECT_FALSE(compatible);
+
+  metadata_input_ = false;
+  Result scanned;
+  ASSERT_EQ(OB_SUCCESS, run_merge(scanned, {}, CS_ENCODING_ROW_STORE, MAJOR_MERGE,
+      ObIVFProcessType::INSERTION, 0, true));
+  metadata_input_ = true;
+  Result metadata;
+  ASSERT_EQ(OB_SUCCESS, run_merge(metadata, {}, CS_ENCODING_ROW_STORE, MAJOR_MERGE,
+      ObIVFProcessType::INSERTION, 0, true));
+  EXPECT_TRUE(metadata.metadata_before_capture_);
+  EXPECT_TRUE(metadata.metadata_counts_);
+  EXPECT_TRUE(metadata.lazy_raw_);
+  EXPECT_EQ(ObIVFProcessType::INSERTION, metadata.process_type_);
+  EXPECT_EQ(0, metadata.replay_rows_);
+  EXPECT_EQ(scanned.rows_, metadata.rows_);
+  EXPECT_EQ(scanned.logical_column_checksums_, metadata.logical_column_checksums_);
+  EXPECT_EQ(0, metadata.reused_source_ids_[1][IVF_ROW_TYPE_RAW_VECTOR]);
+}
+
+TEST_F(TestIVFInsertionStorage, single_slice_capture_transfers_locator_ownership)
+{
+  natural_selection_ = true;
+  data_.n_ = 8192; data_.k_ = 32; data_.delta_ = 8192;
+  ASSERT_NO_FATAL_FAILURE(build_inputs());
+  ObArenaAllocator arena("LocatorMoveUT");
+  ObTabletMergeDagParam param(MAJOR_MERGE, ObLSID(IVF_LS_ID), ObTabletID(IVF_TABLET_ID), -1);
+  ObAsyncIndexMergeCtx ctx(param, arena);
+  ObIVFMergeInputAdapter input(arena);
+  ASSERT_EQ(OB_SUCCESS, configure_context(ctx, input, arena, {}));
+  ObIVFMergeCaptureCtx capture;
+  ASSERT_EQ(OB_SUCCESS, capture.init(ctx, input, false));
+  ASSERT_EQ(1, capture.get_task_count());
+  ASSERT_EQ(OB_SUCCESS, capture.scan(0));
+  const auto *buffer = capture.slices_.at(0)->locators_.begin();
+  const int64_t hold = input.locator_allocator_.used();
+  ASSERT_NE(nullptr, buffer);
+  ASSERT_EQ(OB_SUCCESS, capture.finish());
+  EXPECT_EQ(buffer, input.locators_.begin());
+  EXPECT_EQ(hold, input.locator_allocator_.used());
+  EXPECT_EQ(0, capture.get_task_count());
+  ObArray<ObIVFVectorVID> vids;
+  ASSERT_EQ(OB_SUCCESS, input.get_all_vids(vids));
+  ASSERT_EQ(data_.n_ + data_.delta_, vids.count());
+  for (int64_t i = 1; i < vids.count(); ++i) { EXPECT_LT(vids.at(i - 1), vids.at(i)); }
+  ObArray<float> values;
+  ASSERT_EQ(OB_SUCCESS, input.batch_get_by_vid(vids, 0, 8, values));
+  ASSERT_EQ(8 * DIM, values.count());
+  float expected[DIM];
+  for (int64_t i = 0; i < 8; ++i) {
+    const bool delta = vids.at(i) % 2 != 0;
+    const int64_t idx = delta ? (vids.at(i) - data_.delta_vid(0)) / 2 : vids.at(i) / 2 - 1;
+    data_.vector(idx, delta, expected);
+    EXPECT_EQ(0, MEMCMP(expected, &values.at(i * DIM), sizeof(expected)));
+  }
+  input.release_input_buffers();
+  EXPECT_EQ(0, input.locator_allocator_.used());
+}
+
+TEST(IVFSourceLocators, transfer_growth_failure_and_large_row_ids)
+{
+  class Allocator : public ObIAllocator
+  {
+  public:
+    void *alloc(int64_t bytes) override { return fail_ ? nullptr : memory_.alloc(bytes); }
+    void *alloc(int64_t bytes, const ObMemAttr &) override { return alloc(bytes); }
+    void free(void *ptr) override { memory_.free(ptr); }
+    ObIVFMergeRuntimeAllocator memory_;
+    bool fail_ = false;
+  } allocator, other_allocator;
+  ObArenaAllocator arena("LocatorAcctUT");
+  ObCompactionMemoryContext memory_context(arena);
+  ObIVFSourceLocators source(allocator, &memory_context), target(allocator, &memory_context), other(other_allocator);
+  EXPECT_EQ(24, sizeof(ObAsyncIVFSourceLocator));
+  ASSERT_EQ(OB_SUCCESS, source.reserve(1));
+  ASSERT_EQ(OB_SUCCESS, source.push_back(ObAsyncIVFSourceLocator(UINT64_MAX, INT32_MAX,
+      INT32_MAX, 10000000000L)));
+  const auto *original = source.begin();
+  allocator.fail_ = true;
+  EXPECT_EQ(OB_ALLOCATE_MEMORY_FAILED, source.push_back(source.at(0)));
+  EXPECT_EQ(original, source.begin());
+  EXPECT_EQ(1, source.count());
+  EXPECT_EQ(OB_SIZE_OVERFLOW, source.reserve(INT64_MAX));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, other.take_over(source));
+  ASSERT_EQ(OB_SUCCESS, target.take_over(source));
+  EXPECT_TRUE(source.empty());
+  EXPECT_EQ(original, target.begin());
+  EXPECT_EQ(target.get_data_size(), memory_context.mem_monitor_.get_hold_mem());
+  EXPECT_EQ(UINT64_MAX, target.at(0).vid_);
+  EXPECT_EQ(10000000000L, target.at(0).row_id_);
+  source.reset();
+  allocator.fail_ = false;
+  ASSERT_EQ(OB_SUCCESS, target.push_back(target.at(0)));
+  EXPECT_EQ(2, target.count());
+  EXPECT_EQ(UINT64_MAX, target.at(1).vid_);
+  EXPECT_EQ(OB_INVALID_ARGUMENT, target.push_back(ObAsyncIVFSourceLocator(1,
+      int64_t(INT32_MAX) + 1, 0, 0)));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, target.push_back(ObAsyncIVFSourceLocator(1,
+      0, int64_t(INT32_MAX) + 1, 0)));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, source.take_over(source));
+  target.reset();
+  EXPECT_EQ(0, allocator.memory_.used());
+  EXPECT_EQ(0, memory_context.mem_monitor_.get_hold_mem());
+}
+
+TEST_F(TestIVFInsertionStorage, lazy_raw_batches_preserve_order_and_release_scratch)
+{
+  natural_selection_ = true;
+  data_.n_ = 8192; data_.delta_ = 300;
+  ASSERT_NO_FATAL_FAILURE(build_inputs());
+  ObArenaAllocator arena("IVFLazyBatchUT");
+  ObTabletMergeDagParam param(MAJOR_MERGE, ObLSID(IVF_LS_ID), ObTabletID(IVF_TABLET_ID), -1);
+  ObAsyncIndexMergeCtx ctx(param, arena);
+  ObIVFMergeInputAdapter input(arena);
+  ASSERT_EQ(OB_SUCCESS, configure_context(ctx, input, arena, {}));
+  ASSERT_TRUE(input.uses_lazy_raw());
+  ObIVFMergeCaptureCtx capture;
+  ASSERT_EQ(OB_SUCCESS, capture.init(ctx, input, false));
+  ASSERT_EQ(OB_SUCCESS, capture.scan(0));
+  ASSERT_EQ(OB_SUCCESS, capture.finish());
+  ObArray<ObAsyncIVFSourceLocator> requests;
+  // Reverse order crosses both the 256-row batch and source-table boundaries.
+  for (int64_t i = input.locators_.count() - 1; i >= 0; --i) {
+    ASSERT_EQ(OB_SUCCESS, requests.push_back(input.locators_.at(i)));
+  }
+  ASSERT_EQ(OB_SUCCESS, requests.push_back(requests.at(0))); // Repeated VID.
+  ObArray<float> vectors;
+  ASSERT_EQ(OB_SUCCESS, vectors.prepare_allocate(requests.count() * DIM));
+#ifndef OB_USE_ASAN
+  const int64_t scratch_before = get_tenant_label_used("IVFLazyRead");
+  ASSERT_GE(scratch_before, 0);
+#endif
+  for (int round = 0; round < 3; ++round) {
+    ASSERT_EQ(OB_SUCCESS, input.read_source_vectors_(requests, vectors));
+    for (int64_t i = 0; i < requests.count(); ++i) {
+      const uint64_t vid = requests.at(i).vid_;
+      const bool delta = vid % 2 != 0;
+      const int64_t idx = delta ? (vid - data_.delta_vid(0)) / 2 : vid / 2 - 1;
+      float expected[DIM];
+      data_.vector(idx, delta, expected);
+      ASSERT_EQ(0, MEMCMP(expected, &vectors.at(i * DIM), sizeof(expected)));
+    }
+#ifndef OB_USE_ASAN
+    EXPECT_EQ(scratch_before, get_tenant_label_used("IVFLazyRead"));
+#endif
+  }
+}
+
+TEST_F(TestIVFInsertionStorage, metadata_first_raw_macro_reuse_avoids_lazy_payload_reads)
+{
+  natural_selection_ = true;
+  data_.n_ = 8192; data_.k_ = 32; data_.delta_ = 8192;
+  ASSERT_NO_FATAL_FAILURE(build_inputs());
+  Result rewritten, reused;
+  ASSERT_EQ(OB_SUCCESS, run_merge(rewritten, {}, CS_ENCODING_ROW_STORE, MAJOR_MERGE,
+      ObIVFProcessType::CONCATENATION, 0, false));
+  ASSERT_EQ(OB_SUCCESS, run_merge(reused, {}, CS_ENCODING_ROW_STORE, MAJOR_MERGE,
+      ObIVFProcessType::CONCATENATION, 0, true));
+  EXPECT_EQ(ObIVFProcessType::CONCATENATION, reused.process_type_);
+  ASSERT_TRUE(rewritten.lazy_raw_);
+  ASSERT_TRUE(reused.lazy_raw_);
+  EXPECT_EQ(0, rewritten.replay_rows_);
+  EXPECT_EQ(0, reused.replay_rows_);
+  EXPECT_GT(rewritten.lazy_raw_read_rows_, 0);
+  EXPECT_LT(reused.lazy_raw_read_rows_, rewritten.lazy_raw_read_rows_);
+  EXPECT_GT(reused.reused_ids_[IVF_ROW_TYPE_RAW_VECTOR], 0);
+  EXPECT_EQ(rewritten.rows_, reused.rows_);
+  EXPECT_EQ(rewritten.logical_column_checksums_, reused.logical_column_checksums_);
+}
+
+TEST_F(TestIVFInsertionStorage, metadata_first_count_fallback_can_rebuild_from_lazy_input)
+{
+  natural_selection_ = true;
+  data_.n_ = 512; data_.k_ = 32; data_.delta_ = 32;
+  ASSERT_NO_FATAL_FAILURE(build_inputs());
+  metadata_input_ = false;
+  Result scanned;
+  ObIvfSSTable reference;
+  ASSERT_EQ(OB_SUCCESS, run_merge(scanned, {}, CS_ENCODING_ROW_STORE, MAJOR_MERGE,
+      ObIVFProcessType::FULL_REBUILD, 0, false, 1, &reference));
+  std::map<int64_t, uint32_t> reference_counts;
+  std::vector<std::pair<uint64_t, float>> reference_answers;
+  ASSERT_NO_FATAL_FAILURE(read_centroid_route(reference, reference_counts, &reference_answers));
+  metadata_input_ = true;
+  const auto original = base_->get_ivf_meta();
+  auto stale = original;
+  stale.vector_count_ = 4096; // Metadata suggests insertion; live input is small.
+  ASSERT_EQ(OB_SUCCESS, base_->set_ivf_meta(allocator_, stale));
+  Result output;
+  ObIvfSSTable table;
+  ASSERT_EQ(OB_SUCCESS, run_merge(output, {}, CS_ENCODING_ROW_STORE, MAJOR_MERGE,
+      ObIVFProcessType::INSERTION, 0, false, 1, &table));
+  EXPECT_TRUE(output.metadata_before_capture_);
+  EXPECT_EQ(ObIVFProcessType::INSERTION, output.metadata_strategy_);
+  EXPECT_FALSE(output.metadata_counts_);
+  EXPECT_TRUE(output.lazy_raw_);
+  EXPECT_EQ(ObIVFProcessType::FULL_REBUILD, output.process_type_);
+  EXPECT_EQ(0, output.replay_rows_);
+  EXPECT_GT(output.lazy_raw_read_rows_, 0);
+  EXPECT_EQ(data_.n_ + data_.delta_, output.meta_.vector_count_);
+  int64_t raw_count = 0;
+  float expected[DIM];
+  for (const auto &row : output.rows_) {
+    if (row.type_ != IVF_ROW_TYPE_RAW_VECTOR) { continue; }
+    const bool delta = row.vid_ % 2 != 0;
+    const int64_t idx = delta ? (row.vid_ - data_.delta_vid(0)) / 2 : row.vid_ / 2 - 1;
+    ASSERT_GE(idx, 0); ASSERT_LT(idx, delta ? data_.delta_ : data_.n_);
+    data_.vector(idx, delta, expected);
+    ASSERT_EQ(sizeof(expected), row.payload_.size());
+    EXPECT_EQ(0, MEMCMP(expected, row.payload_.data(), sizeof(expected)));
+    ++raw_count;
+  }
+  EXPECT_EQ(data_.n_ + data_.delta_, raw_count);
+  std::map<int64_t, uint32_t> counts;
+  std::vector<std::pair<uint64_t, float>> answers;
+  ASSERT_NO_FATAL_FAILURE(read_centroid_route(table, counts, &answers));
+  // The fixture stores FHT-space vectors; this query helper accepts original
+  // query coordinates. Compare the legacy result instead of assuming distance0.
+  ASSERT_EQ(reference_answers.size(), answers.size());
+  ASSERT_FALSE(answers.empty());
+  for (size_t i = 0; i < answers.size(); ++i) {
+    EXPECT_EQ(reference_answers[i].first, answers[i].first);
+    EXPECT_FLOAT_EQ(reference_answers[i].second, answers[i].second);
+  }
+  ASSERT_EQ(OB_SUCCESS, base_->set_ivf_meta(allocator_, original));
 }
 
 TEST_F(TestIVFInsertionStorage, insertion_preserves_geometry_and_codes)
@@ -7911,6 +10793,25 @@ TEST_F(TestRADatumStoreReader, replay_sampling_metadata_releases_without_payload
   }
 }
 
+TEST_F(TestRADatumStoreReader, merge_locator_slice_boundary_does_not_wrap)
+{
+  ObArenaAllocator arena("LocatorBoundUT");
+  ObIVFMergeInputAdapter input(arena);
+  input.is_inited_ = true;
+  input.vector_dim_ = 2;
+  input.dist_type_ = VIDA_L2;
+  input.lazy_raw_ = true;
+  input.samples_released_ = true;
+  ASSERT_EQ(OB_SUCCESS, input.row_desc_.init(IVF_SSTABLE_FORMAT_VERSION));
+  ASSERT_EQ(OB_SUCCESS, input.locators_.push_back(ObAsyncIVFSourceLocator(0, 0, INT32_MAX, 0)));
+  ASSERT_EQ(OB_SUCCESS, input.replay_row_offsets_.push_back(0));
+  ASSERT_EQ(OB_SUCCESS, input.replay_row_offsets_.push_back(1));
+  ASSERT_TRUE(input.is_valid());
+  int64_t source_idx = 0;
+  EXPECT_EQ(OB_INVALID_DATA, input.get_source_row_idx(0, source_idx));
+  EXPECT_EQ(-1, source_idx);
+}
+
 TEST_F(TestRADatumStoreReader, merge_input_release_waits_for_success_and_returns_quota)
 {
   for (int mode = 0; mode < 3; ++mode) {
@@ -7919,6 +10820,10 @@ TEST_F(TestRADatumStoreReader, merge_input_release_waits_for_success_and_returns
     ObArenaAllocator arena("IVFMergeEndUT");
     ObCompactionMemoryContext memory_context(arena);
     ObIVFMergeInputAdapter input(arena, &memory_context);
+    auto *reuse_source = OB_NEWx(ObIVFBlockReuseSource, &arena, arena);
+    ASSERT_NE(nullptr, reuse_source);
+    ASSERT_EQ(OB_SUCCESS, input.reuse_sources_.push_back(reuse_source));
+    input.prior_.routing_source_ = reuse_source;
     ASSERT_EQ(OB_SUCCESS, budget.reserve(64L << 20, 1, input.replay_memory_reservation_));
     auto *replay = OB_NEWx(ObIVFReplayInput, &arena, arena);
     ASSERT_NE(nullptr, replay);
@@ -7951,6 +10856,8 @@ TEST_F(TestRADatumStoreReader, merge_input_release_waits_for_success_and_returns
     dag.release_finished_input_();
     dag.release_finished_input_();
     EXPECT_TRUE(input.replay_inputs_.empty());
+    EXPECT_TRUE(input.reuse_sources_.empty());
+    EXPECT_EQ(nullptr, input.prior_.routing_source_);
     EXPECT_TRUE(input.locators_.empty());
     EXPECT_TRUE(input.prior_.postings_.empty());
     EXPECT_EQ(0, input.prior_posting_allocator_.total());
@@ -8448,6 +11355,8 @@ TEST_F(TestRADatumStoreReader, replay_batches_read_spilled_rows_concurrently)
 int main(int argc, char **argv)
 {
   using namespace oceanbase;
+  signal(49, SIG_IGN);
+  common::init_arches();
   system("rm -f test_ivf_sstable.log*");
   OB_LOGGER.set_file_name("test_ivf_sstable.log", true);
   OB_LOGGER.set_log_level("INFO");
@@ -8456,6 +11365,10 @@ int main(int argc, char **argv)
   MTL_BIND2(mtl_new_default,
       oceanbase::share::ObIVFReplayMemoryMgr::mtl_init,
       nullptr, nullptr, nullptr, mtl_destroy_default);
+  MTL_BIND2(mtl_new_default,
+      oceanbase::share::ObPluginVectorIndexService::mtl_init,
+      mtl_start_default, mtl_stop_default, mtl_wait_default, mtl_destroy_default);
+  if (OB_SUCCESS != common::ObRbMemMgr::init_memory_hook()) { return 1; }
   if (OB_SUCCESS != oceanbase::MockTenantModuleEnv::get_instance().init()) {
     return 1;
   }
@@ -8466,6 +11379,15 @@ int main(int argc, char **argv)
   memory_dump.stop();
   memory_dump.wait();
 #endif
+  // Storage fixtures intentionally reuse synthetic TableKeys across cases.
+  // Cache-specific cases opt in and clean up their own mapped generations.
+  {
+    omt::ObTenantConfigGuard config(TENANT_CONF(MTL_ID()));
+    if (!config.is_valid()) { return 1; }
+    config->_disk_bbq_centroid_cache_mem_percentage = 0;
+    if (OB_SUCCESS != MTL(share::ObPluginVectorIndexService *)
+        ->get_ivf_sstable_cache_controller().refresh_config()) { return 1; }
+  }
   const int ret = RUN_ALL_TESTS();
 #ifndef OB_USE_ASAN
   memory_dump.destroy();

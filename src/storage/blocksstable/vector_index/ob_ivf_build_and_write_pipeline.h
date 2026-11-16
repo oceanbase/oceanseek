@@ -27,7 +27,7 @@ struct ObIVFBuildContext final
   ObIVFBuildContext()
     : allocator_(common::ObMemAttr(MTL_ID(), "IVFBuild")),
       schema_ctx_(allocator_), sample_refs_(), sorter_(), ivf_meta_(),
-      center_count_(0), vector_count_(0), is_ready_(false), refresh_monitor_(nullptr)
+      center_count_(0), vector_count_(0), posting_count_(0), is_ready_(false), refresh_monitor_(nullptr)
   {}
 
   common::ObArenaAllocator allocator_;
@@ -37,6 +37,7 @@ struct ObIVFBuildContext final
   blocksstable::ObIvfSSTableMeta ivf_meta_;
   int64_t center_count_;
   int64_t vector_count_;
+  int64_t posting_count_; // primary + SOAR secondary; RAW remains one per vector
   bool is_ready_;
   ObIVFRefreshMonitor *refresh_monitor_; // borrowed from tablet context
 };
@@ -58,6 +59,7 @@ public:
   TO_STRING_KV(K_(is_inited), K_(tablet_id),
                "center_count", build_ctx_.center_count_,
                "vector_count", build_ctx_.vector_count_,
+               "posting_count", build_ctx_.posting_count_,
                "is_ready", build_ctx_.is_ready_);
 protected:
   virtual int execute(const ObChunk &input_chunk, ResultState &result_state,
@@ -90,6 +92,7 @@ public:
   TO_STRING_KV(K_(is_inited), K_(tablet_id),
                "center_count", build_ctx_.center_count_,
                "vector_count", build_ctx_.vector_count_,
+               "posting_count", build_ctx_.posting_count_,
                "is_ready", build_ctx_.is_ready_);
 protected:
   virtual int execute(const ObChunk &input_chunk, ResultState &result_state,

@@ -326,7 +326,8 @@ int ObIVFDDLSSTableWriter::write_posting_range(int64_t task_idx)
     LOG_WARN("failed to sort IVF posting shard", K(ret), K(task_idx));
   } else if (OB_FAIL(row.init(allocator, row_desc_.payload_col_idx_ + 1))) {
     LOG_WARN("failed to initialize IVF posting row", K(ret), K(task_idx));
-  } else if (OB_FAIL(raw_writer_provider_->create_posting_writer(task_idx, writer))) {
+  } else if (OB_FAIL(raw_writer_provider_->create_posting_writer(task_idx,
+      ivf_meta_.leaf_storage_cid(shard.begin_), ivf_meta_.leaf_storage_cid(shard.end_), writer))) {
     LOG_WARN("failed to create IVF posting writer", K(ret), K(task_idx));
   } else if (writer == nullptr) {
     ret = OB_ERR_UNEXPECTED;

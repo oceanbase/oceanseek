@@ -534,7 +534,7 @@ public:
         centroid_ids_(nullptr),
         child_counts_(nullptr),
         shared_leaf_count_(0), leaf_cid_base_(0), shared_leaves_(nullptr), leaf_locks_(nullptr),
-        leaf_refs_(nullptr), parent_cache_(nullptr), parent_guard_(),
+        leaf_refs_(nullptr), parent_cache_(nullptr), parent_guard_(), hgraph_owner_guard_(),
         memory_lock_(common::ObLatchIds::VECTOR_IVF_CACHE_LOCK), memory_controller_(nullptr)
   {}
   virtual ~ObIvfSSTableCentCache();
@@ -579,6 +579,9 @@ public:
   // Build from the published ARRAY without blocking ARRAY readers. The final
   // WLock publication switches this cache to HGraph and retires ARRAY.
   int build_sstable_hgraph(const ObVectorIndexParam &param);
+  // Caller has proved identical routing geometry and installed fresh counts.
+  // Pin the original graph owner, never another merge's intermediate cache.
+  int inherit_hgraph(const ObIvfCacheMgrGuard &source_guard);
   void set_completed() override;
   // One access per centroid reader, recorded before releasing its lifetime guard.
   // A reader that built this cache after a miss only updates the access time.
@@ -623,6 +626,7 @@ private:
   SharedLeaf **leaf_refs_;
   ObIvfSSTableCentCache *parent_cache_;
   ObIvfCacheMgrGuard parent_guard_;
+  ObIvfCacheMgrGuard hgraph_owner_guard_;
   common::ObSpinLock memory_lock_;
   ObIvfSSTableCacheController *memory_controller_;
   // Called only after the cache's memory contexts have been released.

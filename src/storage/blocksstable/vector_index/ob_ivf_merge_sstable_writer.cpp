@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "storage/blocksstable/vector_index/ob_ivf_merge_sstable_writer.h"
+#include "storage/blocksstable/vector_index/ob_ivf_block_reuse.h"
 
 #include "lib/utility/ob_sort.h"
 #include "share/scheduler/ob_tenant_dag_scheduler.h"
@@ -14,6 +15,7 @@
 #include "storage/blocksstable/index_block/ob_index_block_builder.h"
 #include "storage/blocksstable/ob_data_store_desc.h"
 #include "storage/blocksstable/vector_index/ob_ivf_ddl_sstable_writer.h"
+#include "storage/blocksstable/vector_index/ob_ivf_sstable.h"
 #include "storage/ddl/ob_tablet_slice_writer.h"
 
 namespace oceanbase
@@ -40,7 +42,8 @@ public:
   {
   public:
     MacroSlice(ObIVFMergeSSTableWriter &owner, int64_t idx)
-      : owner_(owner), idx_(idx), closed_row_count_(0), opened_(false), closed_(false) {}
+      : owner_(owner), idx_(idx), opened_(false), closed_(false), reuse_(owner.allocator_),
+        use_reuse_(false), rows_(0), error_(OB_SUCCESS), cid_begin_(-1), cid_end_(-1) {}
     ~MacroSlice() override { reset(); }
     int init(const ObWriteMacroParam &param) override { UNUSED(param); return OB_NOT_SUPPORTED; }
     void reset() override
@@ -48,43 +51,62 @@ public:
       // DDL output tasks own close(), including their failure paths. Cleanup
       // must not flush abandoned rows or add an index root during rollback.
       writer_.reset();
-      closed_row_count_ = 0;
+      rows_ = 0;
       opened_ = false;
       closed_ = true;
     }
     int append_row(const ObDatumRow &row) override
     {
       int ret = OB_SUCCESS;
-      if (closed_) {
+      if (error_ != OB_SUCCESS) {
+        ret = error_;
+      } else if (closed_) {
         ret = OB_STATE_NOT_MATCH;
       } else if (!opened_ && OB_FAIL(owner_.open_writer_(writer_, idx_))) {
         LOG_WARN("failed to open loaded merge macro writer", K(ret), K_(idx));
       } else {
-        opened_ = true;
-        if (OB_FAIL(writer_.append_row(row))) {
+        if (!opened_) {
+          opened_ = true;
+          if (!owner_.reuse_sources_.empty()
+              && !(idx_ == IVF_OUTPUT_WRITER_IDX ? owner_.reuse_centroid_ranges_ : owner_.reuse_posting_ranges_).empty()) {
+            const bool center = idx_ == IVF_OUTPUT_WRITER_IDX;
+            ObIVFReuseRange range;
+            if (center) {
+              range.first_ = ObIVFReuseKey(IVF_ROW_TYPE_CENTROID, 0, 0);
+              range.last_ = ObIVFReuseKey(IVF_ROW_TYPE_CENTROID, INT64_MAX, UINT64_MAX);
+            } else {
+              range.first_ = ObIVFReuseKey(IVF_ROW_TYPE_LOW_PRECISION_VECTOR, cid_begin_, 0);
+              range.last_ = ObIVFReuseKey(IVF_ROW_TYPE_LOW_PRECISION_VECTOR, cid_end_ - 1, UINT64_MAX);
+            }
+            const auto &ranges = center ? owner_.reuse_centroid_ranges_ : owner_.reuse_posting_ranges_;
+            if (OB_FAIL(reuse_.init(owner_.reuse_sources_, ranges, range, *owner_.data_store_desc_, writer_))) {
+              LOG_WARN("failed to initialize IVF range reuse", K(ret), K_(idx));
+            } else { use_reuse_ = true; }
+          }
+        }
+        if (OB_SUCC(ret) && OB_FAIL(use_reuse_ ? reuse_.append_row(row) : writer_.append_row(row))) {
           LOG_WARN("failed to append loaded merge macro row", K(ret), K_(idx));
         }
+        if (OB_SUCC(ret)) { ++rows_; }
       }
+      error_ = ret;
       return ret;
     }
     int append_batch(const ObBatchDatumRows &rows) override { UNUSED(rows); return OB_NOT_SUPPORTED; }
-    int64_t get_row_count() const override
-    { return closed_ ? closed_row_count_ : writer_.get_appended_row_count(); }
+    int64_t get_row_count() const override { return rows_; }
     int close() override
     {
       int ret = OB_SUCCESS;
       if (closed_) {
         ret = OB_INIT_TWICE;
       } else {
-        ret = opened_ ? writer_.close() : OB_SUCCESS;
-        closed_row_count_ = writer_.get_appended_row_count();
+        ret = error_;
+        if (OB_SUCC(ret) && use_reuse_) { ret = reuse_.finish(); }
+        if (OB_SUCC(ret) && opened_) { ret = writer_.close(); }
         closed_ = true;
-        if (OB_SUCC(ret)) {
-          // close() has drained IO and transferred the index root. Keep the
-          // row count for validation without retaining this slice's buffers.
-          writer_.reset();
-          opened_ = false;
-        }
+        // Keep the logical row count while releasing closed or failed IO buffers.
+        writer_.reset();
+        opened_ = false;
       }
       return ret;
     }
@@ -92,9 +114,15 @@ public:
   private:
     ObIVFMergeSSTableWriter &owner_;
     int64_t idx_;
-    int64_t closed_row_count_;
     bool opened_, closed_;
     ObIvfMacroBlockWriter writer_;
+    ObIVFBlockReuseWriter reuse_;
+    bool use_reuse_;
+    int64_t rows_;
+    int error_;
+  public:
+    // Set once by create_posting_writer(), from the actual DDL shard.
+    int64_t cid_begin_, cid_end_;
   };
 
   explicit LoadedOutput(ObIVFMergeSSTableWriter &owner)
@@ -129,12 +157,16 @@ public:
     if (OB_SUCC(ret)) { center_count_ = center_count; }
     return ret;
   }
-  int create_posting_writer(int64_t task_idx, ObITabletSliceWriter *&writer) override
+  int create_posting_writer(int64_t task_idx, int64_t cid_begin, int64_t cid_end,
+      ObITabletSliceWriter *&writer) override
   {
     writer = nullptr;
-    if (task_idx < 0 || task_idx >= writer_.posting_write_task_count() || postings_[task_idx] == nullptr) {
+    if (cid_begin < 0 || cid_end <= cid_begin || task_idx < 0 || task_idx >= writer_.posting_write_task_count() || postings_[task_idx] == nullptr) {
       return OB_INVALID_ARGUMENT;
     }
+    if (postings_[task_idx]->cid_begin_ >= 0) { return OB_INIT_TWICE; }
+    postings_[task_idx]->cid_begin_ = cid_begin;
+    postings_[task_idx]->cid_end_ = cid_end;
     writer = postings_[task_idx];
     return OB_SUCCESS;
   }
@@ -174,6 +206,9 @@ int ObIVFMergeSSTableWriter::prepare_loaded_output(int64_t center_count, int64_t
   } else {
     sorter_.reset();
     sorter_inited_ = false;
+    if (!reuse_sources_.empty()) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < center_count; ++i) { ret = reuse_posting_origins_.push_back(-1); }
+    }
   }
   return ret;
 }
@@ -193,9 +228,10 @@ int ObIVFMergeSSTableWriter::write_posting_range(int64_t task_idx)
 int ObIVFMergeSSTableWriter::write_loaded_centers(const ObIArray<float> &centers,
     int64_t dimension, int64_t begin, int64_t end)
 {
-  return loaded_output_ == nullptr ? OB_STATE_NOT_MATCH
-      : ATOMIC_LOAD(&loaded_output_->error_) != OB_SUCCESS ? ATOMIC_LOAD(&loaded_output_->error_)
-      : loaded_output_->writer_.write_loaded_centers(centers, dimension, begin, end);
+  int ret = loaded_output_ == nullptr ? OB_STATE_NOT_MATCH : ATOMIC_LOAD(&loaded_output_->error_);
+  if (OB_SUCC(ret)) { ret = prepare_centroid_reuse_(centers, dimension); }
+  if (OB_SUCC(ret)) { ret = loaded_output_->writer_.write_loaded_centers(centers, dimension, begin, end); }
+  return ret;
 }
 
 int ObIVFMergeSSTableWriter::set_leaf_posting_counts(const ObIArray<uint32_t> &counts)
@@ -210,7 +246,7 @@ int ObIVFMergeSSTableWriter::set_leaf_posting_counts(const ObIArray<uint32_t> &c
         KP_(loaded_output), K_(quantization_finished));
   } else if (OB_FAIL(loaded_output_->writer_.set_leaf_posting_counts(counts))) {
     LOG_WARN("[DISK_BBQ] failed to install loaded merge posting counts", K(ret), "count", counts.count());
-  }
+  } else { ret = leaf_posting_counts_.assign(counts); }
   return ret;
 }
 
@@ -309,6 +345,14 @@ int ObIVFMergeSSTableWriter::copy_loaded_postings(const ObIVFEncodedPostingSourc
       LOG_WARN("failed to append loaded IVF reused postings", K(ret), K(source_cid), K(target_cid));
     } else {
       ATOMIC_AAF(&reused_posting_count_, consumer.count_);
+      if (!reuse_sources_.empty() && consumer.count_ > 0) {
+        const ObIVFBlockReuseSource *origin = find_reuse_source_(source_cid);
+        const bool complete = origin != nullptr
+            && consumer.count_ == origin->posting_count(origin->local_centroid_index(source_cid));
+        if (!complete || !ATOMIC_BCAS(&reuse_posting_origins_.at(target_cid), -1L, source_cid)) {
+          ATOMIC_STORE(&reuse_posting_origins_.at(target_cid), -2L);
+        }
+      }
     }
   }
   if (OB_FAIL(ret) && nullptr != loaded_output_ && !quantization_finished_) {
@@ -344,11 +388,204 @@ ObIVFMergeSSTableWriter::ObIVFMergeSSTableWriter(
     quantized_center_count_(0),
     started_quant_ranges_(0),
     loaded_output_(nullptr),
+    reuse_sources_(), reuse_posting_origins_(), reuse_raw_ranges_(), reuse_posting_ranges_(), reuse_centroid_ranges_(),
     is_inited_(false),
     quantization_finished_(false),
     raw_write_finished_(false)
 {
   leaf_posting_counts_.set_block_allocator(ObWrapperAllocator(allocator));
+  reuse_sources_.set_block_allocator(ObWrapperAllocator(allocator));
+  reuse_posting_origins_.set_block_allocator(ObWrapperAllocator(allocator));
+  reuse_raw_ranges_.set_block_allocator(ObWrapperAllocator(allocator));
+  reuse_posting_ranges_.set_block_allocator(ObWrapperAllocator(allocator));
+  reuse_centroid_ranges_.set_block_allocator(ObWrapperAllocator(allocator));
+}
+
+int ObIVFMergeSSTableWriter::set_reuse_sources(const ObIArray<ObIVFBlockReuseSource *> &sources,
+    const bool is_full_merge)
+{
+  int ret = OB_SUCCESS;
+  bool any_compatible = false;
+  bool raw_fragmented = false;
+  if (!is_inited_ || loaded_output_ != nullptr || !reuse_sources_.empty()
+      || quant_centers_ != nullptr || output_row_count_ != 0 || quantization_finished_ || raw_write_finished_) {
+    return OB_STATE_NOT_MATCH;
+  }
+  // Follow the shared INC generation-wrap decision. Row/encoded-payload copies
+  // get new block identities; neither macro nor micro references may survive.
+  if (is_full_merge && compaction::is_inc_major_merge(data_store_desc_->get_merge_type())) {
+    return OB_SUCCESS;
+  }
+  for (int64_t slot = 0; OB_SUCC(ret) && slot < sources.count(); ++slot) {
+    ObIVFBlockReuseSource *source = sources.at(slot);
+    bool compatible = false;
+    if (source == nullptr || source->table_ == nullptr) {
+    } else if (source->source_slot_ != slot || source->read_info_ == nullptr
+        || (source->has_prior_view() && source->dimension_ != vector_dim_)) {
+      ret = OB_INVALID_ARGUMENT;
+    } else {
+      const auto &meta = source->table_->get_ivf_meta();
+      if (meta.format_version_ == ivf_meta_.format_version_ && meta.dim_ == ivf_meta_.dim_
+          && meta.dist_type_ == ivf_meta_.dist_type_ && meta.nbits_ == ivf_meta_.nbits_
+          && meta.fht_algo_version_ == ivf_meta_.fht_algo_version_) {
+        ret = ObIVFBlockReuseWriter::check_source(*source, *data_store_desc_, compatible);
+      }
+    }
+    if (OB_SUCC(ret)) { ret = reuse_sources_.push_back(compatible ? source : nullptr); }
+    if (OB_SUCC(ret) && compatible) {
+      any_compatible = true;
+      for (int64_t i = 0; OB_SUCC(ret) && !raw_fragmented && i < source->raw_ranges_.count(); ++i) {
+        if (reuse_raw_ranges_.count() == ObIVFReuseRange::MAX_RANGES) {
+          reuse_raw_ranges_.reuse(); raw_fragmented = true;
+        } else {
+          ObIVFReuseRange range = source->raw_ranges_.at(i);
+          range.source_slot_ = slot;
+          ret = reuse_raw_ranges_.push_back(range);
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret) && !any_compatible) { reuse_sources_.reuse(); }
+  if (OB_SUCC(ret)) { ret = normalize_reuse_ranges_(reuse_raw_ranges_); }
+  return ret;
+}
+
+const ObIVFBlockReuseSource *ObIVFMergeSSTableWriter::find_reuse_source_(int64_t prior_centroid_index) const
+{
+  for (int64_t slot = 0; slot < reuse_sources_.count(); ++slot) {
+    const auto *source = reuse_sources_.at(slot);
+    if (source != nullptr && source->has_prior_view()
+        && source->local_centroid_index(prior_centroid_index) >= 0) { return source; }
+  }
+  return nullptr;
+}
+
+int ObIVFMergeSSTableWriter::normalize_reuse_ranges_(ObArray<ObIVFReuseRange, ObWrapperAllocator> &ranges)
+{
+  int ret = OB_SUCCESS;
+  if (ranges.count() > 1) {
+    lib::ob_sort(ranges.begin(), ranges.end(), [](const ObIVFReuseRange &a, const ObIVFReuseRange &b) {
+      const int cmp = a.first_.compare(b.first_);
+      return cmp != 0 ? cmp < 0 : a.source_slot_ != b.source_slot_ ? a.source_slot_ < b.source_slot_
+          : a.last_.compare(b.last_) < 0;
+    });
+  }
+  int64_t kept = 0;
+  for (int64_t i = 0; OB_SUCC(ret) && i < ranges.count(); ++i) {
+    const auto &range = ranges.at(i);
+    if (range.source_slot_ < 0 || range.source_slot_ >= reuse_sources_.count()
+        || reuse_sources_.at(range.source_slot_) == nullptr || range.first_.compare(range.last_) > 0) {
+      ret = OB_INVALID_DATA;
+    } else if (kept > 0 && ranges.at(kept - 1).last_.compare(range.first_) >= 0) {
+      if (ranges.at(kept - 1).source_slot_ == range.source_slot_) { ret = OB_INVALID_DATA; }
+      // Two sources may certify the same final centroid records. Keep one
+      // complete range; an overlapping candidate's remainder uses row output.
+      // Do not invent a predecessor/successor for a composite UINT64 key.
+    } else {
+      if (kept != i) { ranges.at(kept) = range; }
+      ++kept;
+    }
+  }
+  if (OB_SUCC(ret)) {
+    while (ranges.count() > kept) { ranges.pop_back(); }
+  }
+  return ret;
+}
+
+int ObIVFMergeSSTableWriter::prepare_posting_reuse_()
+{
+  int ret = OB_SUCCESS;
+  if (reuse_sources_.empty() || loaded_output_ == nullptr) { return ret; }
+  if (leaf_posting_counts_.count() != reuse_posting_origins_.count()) { return OB_STATE_NOT_MATCH; }
+  ObIVFReuseRange span;
+  bool active = false;
+  for (int64_t cid = 0; OB_SUCC(ret) && cid <= reuse_posting_origins_.count(); ++cid) {
+    const int64_t prior_index = cid == reuse_posting_origins_.count() ? -1 : reuse_posting_origins_.at(cid);
+    const auto *source = prior_index < 0 ? nullptr : find_reuse_source_(prior_index);
+    const int64_t local = source == nullptr ? -1 : source->local_centroid_index(prior_index);
+    const bool same = source != nullptr && source->old_cid(local) == ivf_meta_.leaf_storage_cid(cid)
+        && source->posting_count(local) == leaf_posting_counts_.at(cid);
+    if (active && (!same || source->source_slot_ != span.source_slot_)) {
+      if (reuse_posting_ranges_.count() == ObIVFReuseRange::MAX_RANGES) { reuse_posting_ranges_.reuse(); break; }
+      ret = reuse_posting_ranges_.push_back(span); active = false;
+    }
+    if (OB_SUCC(ret) && same) {
+      if (!active) {
+        span.source_slot_ = source->source_slot_;
+        span.first_ = ObIVFReuseKey(IVF_ROW_TYPE_LOW_PRECISION_VECTOR, source->old_cid(local), 0);
+      }
+      span.last_ = ObIVFReuseKey(IVF_ROW_TYPE_LOW_PRECISION_VECTOR, source->old_cid(local), UINT64_MAX);
+      active = true;
+    }
+  }
+  if (OB_SUCC(ret)) { ret = normalize_reuse_ranges_(reuse_posting_ranges_); }
+  return ret;
+}
+
+int ObIVFMergeSSTableWriter::prepare_centroid_reuse_(const ObIArray<float> &centers, int64_t dimension)
+{
+  int ret = OB_SUCCESS;
+  if (reuse_sources_.empty()) { return ret; }
+  if (dimension != vector_dim_ || centers.count() != leaf_posting_counts_.count() * dimension) { return OB_INVALID_ARGUMENT; }
+  bool fragmented = false;
+  for (int64_t slot = 0; OB_SUCC(ret) && !fragmented && slot < reuse_sources_.count(); ++slot) {
+    const auto *source = reuse_sources_.at(slot);
+    if (source == nullptr || !source->has_prior_view() || source->centers_.empty()) { continue; }
+    const auto &old = source->centers_;
+    int64_t pos = 0;
+    bool active = false;
+    ObIVFReuseRange span;
+    span.source_slot_ = slot;
+    auto flush = [&]() {
+      if (active && reuse_centroid_ranges_.count() == ObIVFReuseRange::MAX_RANGES) {
+        fragmented = true; reuse_centroid_ranges_.reuse();
+      }
+      const int rc = active && !fragmented ? reuse_centroid_ranges_.push_back(span) : OB_SUCCESS;
+      active = false;
+      return rc;
+    };
+    // Walk the final stream for each source so a newly inserted final key also
+    // terminates its retained span. Matching only old records would miss gaps.
+    auto compare = [&](int64_t group, int64_t self, const float *vector, uint32_t count) {
+      int rc = OB_SUCCESS;
+      const ObIVFReuseKey key(IVF_ROW_TYPE_CENTROID, group, self);
+      while (OB_SUCC(rc) && pos < old.count() && old.at(pos).key_.compare(key) < 0) {
+        rc = flush(); ++pos; // Removed/moved old record terminates a retained span.
+      }
+      bool same = false;
+      if (OB_SUCC(rc) && pos < old.count() && old.at(pos).key_.compare(key) == 0) {
+        const auto &record = old.at(pos++);
+        const float *coordinates = source->coordinates(record);
+        if (coordinates == nullptr) { rc = OB_INVALID_DATA; }
+        else { same = record.canonical_payload_ && record.count_ == count
+            && MEMCMP(coordinates, vector, dimension * sizeof(float)) == 0; }
+      }
+      if (OB_SUCC(rc) && same) {
+        if (!active) { span.first_ = key; active = true; }
+        span.last_ = key;
+      } else if (OB_SUCC(rc)) { rc = flush(); }
+      return rc;
+    };
+    if (ivf_meta_.is_hierarchical()) {
+      for (int64_t p = 0; OB_SUCC(ret) && !fragmented && p < centroid_layout_->parent_count(); ++p) {
+        ret = compare(0, p + 1, centroid_layout_->parent_vector(p), centroid_layout_->group_count(p));
+      }
+      for (int64_t p = 0; OB_SUCC(ret) && !fragmented && p < centroid_layout_->parent_count(); ++p) {
+        for (int64_t i = centroid_layout_->group_begin(p);
+             OB_SUCC(ret) && !fragmented && i < centroid_layout_->group_end(p); ++i) {
+          const int64_t leaf = centroid_layout_->member(i);
+          ret = compare(p + 1, ivf_meta_.leaf_storage_cid(leaf), &centers.at(leaf * dimension), leaf_posting_counts_.at(leaf));
+        }
+      }
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && !fragmented && i < leaf_posting_counts_.count(); ++i) {
+        ret = compare(0, ivf_meta_.leaf_storage_cid(i), &centers.at(i * dimension), leaf_posting_counts_.at(i));
+      }
+    }
+    if (OB_SUCC(ret)) { ret = flush(); }
+  }
+  if (OB_SUCC(ret)) { ret = normalize_reuse_ranges_(reuse_centroid_ranges_); }
+  return ret;
 }
 
 int ObIVFMergeSSTableWriter::set_centroid_layout(const ObIvfCentroidLayout &layout)
@@ -370,6 +607,7 @@ int ObIVFMergeSSTableWriter::set_centroid_layout(const ObIvfCentroidLayout &layo
   } else {
     centroid_layout_ = &layout;
     layout.set_meta(ivf_meta_);
+    ret = prepare_posting_reuse_();
   }
   return ret;
 }
@@ -963,6 +1201,11 @@ int ObIVFMergeSSTableWriter::quantize_cluster_(
   }
 
   int64_t encoded_begin = 0;
+  if (OB_SUCC(ret) && range != nullptr) {
+    // Each range exclusively owns its CIDs. Publish this count before the
+    // first physical posting so its writer can select a target in O(1).
+    leaf_posting_counts_.at(cid) = total;
+  }
   if (OB_SUCC(ret) && source != nullptr) {
     ReusePostingConsumer consumer(*this, cid, primary_member_vids, reused_prefix_count,
         range, posting_vids, one_bit_codes);
@@ -1105,7 +1348,6 @@ int ObIVFMergeSSTableWriter::finish_quantization_ranges_(
     quantization_finished_ = true;
     quant_centers_ = nullptr;
     centroid_layout_ = nullptr;
-    leaf_posting_counts_.reset();
     LOG_INFO("IVF quantization reuse summary", K(vector_count), K(center_count), K(posting_count),
         "reused_postings", ATOMIC_LOAD(&reused_posting_count_),
         "encoded_postings", posting_count - ATOMIC_LOAD(&reused_posting_count_),
@@ -1277,6 +1519,9 @@ int ObIVFMergeSSTableWriter::open_writer_(
         row_desc_, *data_store_desc_, writer_idx, macro_seq_param,
         pre_warm_param, *object_cleaner))) {
       LOG_WARN("failed to open IVF output writer", K(ret), K(writer_idx));
+    } else if (!leaf_posting_counts_.empty()
+        && OB_FAIL(writer.set_posting_counts(leaf_posting_counts_, ivf_meta_.leaf_cid_base()))) {
+      LOG_WARN("failed to set IVF output posting counts", K(ret), K(writer_idx));
     }
   }
   return ret;
@@ -1285,7 +1530,7 @@ int ObIVFMergeSSTableWriter::open_writer_(
 int ObIVFMergeSSTableWriter::append_macro_row_(
     ObIvfMacroBlockWriter &writer,
     const ObIVFSortItem &item,
-    ObDatumRow &row)
+    ObDatumRow &row, ObIVFBlockReuseWriter *reuse)
 {
   int ret = OB_SUCCESS;
   const int64_t physical_column_count = row_desc_.payload_col_idx_ + 1;
@@ -1309,7 +1554,7 @@ int ObIVFMergeSSTableWriter::append_macro_row_(
     row.count_ = static_cast<int16_t>(physical_column_count);
     row.row_flag_.set_flag(ObDmlFlag::DF_INSERT);
     row.mvcc_row_flag_.set_last_multi_version_row(true);
-    if (OB_FAIL(writer.append_row(row))) {
+    if (OB_FAIL(reuse == nullptr ? writer.append_row(row) : reuse->append_row(row))) {
       LOG_WARN("failed to append sorted IVF output row", K(ret), K(item));
     }
   }
@@ -1388,6 +1633,8 @@ int ObIVFMergeSSTableWriter::write_raw_vectors(
   ObDatumRow row;
   ObIVFSortItem raw_item;
   ObIvfMacroBlockWriter writer;
+  ObIVFBlockReuseWriter reuse(task_allocator);
+  bool use_reuse = false;
   int64_t written_row_count = 0;
   bool writer_opened = false;
   const int64_t physical_column_count = row_desc_.payload_col_idx_ + 1;
@@ -1421,12 +1668,40 @@ int ObIVFMergeSSTableWriter::write_raw_vectors(
   } else if (OB_FAIL(row.init(row_allocator, physical_column_count))) {
     LOG_WARN("failed to initialize IVF raw output row", K(ret));
   }
+  if (OB_SUCC(ret) && !reuse_raw_ranges_.empty()) {
+    ObIVFReuseRange range;
+    range.first_ = ObIVFReuseKey(IVF_ROW_TYPE_RAW_VECTOR, IVF_RAW_VECTOR_CID, all_vids.at(vid_begin));
+    range.last_ = ObIVFReuseKey(IVF_ROW_TYPE_RAW_VECTOR, IVF_RAW_VECTOR_CID, all_vids.at(vid_end - 1));
+    if (OB_FAIL(reuse.init(reuse_sources_, reuse_raw_ranges_, range, *data_store_desc_, writer))) {
+      LOG_WARN("failed to initialize IVF RAW block reuse", K(ret), K(task_idx));
+    } else { use_reuse = true; }
+  }
 
   for (int64_t batch_begin = vid_begin;
-       OB_SUCC(ret) && batch_begin < vid_end;
-       batch_begin += IVF_QUANTIZE_BATCH_SIZE) {
-    const int64_t batch_end = MIN(
+       OB_SUCC(ret) && batch_begin < vid_end;) {
+    int64_t batch_end = MIN(
         vid_end, batch_begin + IVF_QUANTIZE_BATCH_SIZE);
+    if (use_reuse) {
+      int64_t reused_rows = 0, read_end = batch_begin;
+      if (OB_FAIL(reuse.try_reuse_raw_keys(all_vids, batch_begin, vid_end, reused_rows, read_end))) {
+        LOG_WARN("failed to consume certified IVF RAW keys", K(ret), K(batch_begin), K(vid_end));
+        break;
+      } else if (reused_rows > 0) {
+        written_row_count += reused_rows;
+        batch_begin += reused_rows;
+        if (OB_FAIL(share::dag_yield())) {
+          LOG_WARN("IVF RAW reuse was interrupted", K(ret), K(batch_begin), K(task_idx));
+        }
+        continue;
+      } else {
+        batch_end = MIN(batch_end, read_end);
+        if (batch_end <= batch_begin) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("IVF RAW reuse made no progress", K(ret), K(batch_begin), K(batch_end));
+          break;
+        }
+      }
+    }
     vectors.reuse();
     if (OB_FAIL(reader.batch_get_by_vid(
         all_vids, batch_begin, batch_end, vectors))) {
@@ -1446,7 +1721,7 @@ int ObIVFMergeSSTableWriter::write_raw_vectors(
       raw_item.payload_.assign_ptr(
           reinterpret_cast<char *>(&vectors.at(local_idx * vector_dim_)),
           static_cast<int32_t>(vector_dim_ * sizeof(float)));
-      if (OB_SUCC(ret) && OB_FAIL(append_macro_row_(writer, raw_item, row))) {
+      if (OB_SUCC(ret) && OB_FAIL(append_macro_row_(writer, raw_item, row, use_reuse ? &reuse : nullptr))) {
         LOG_WARN("failed to stream IVF raw vector",
             K(ret), K(i), K(all_vids.at(i)));
       } else if (OB_SUCC(ret)) {
@@ -1457,21 +1732,20 @@ int ObIVFMergeSSTableWriter::write_raw_vectors(
       LOG_WARN("IVF raw-vector write was interrupted",
           K(ret), K(batch_begin), K(batch_end));
     }
+    batch_begin = batch_end;
   }
 
+  if (OB_SUCC(ret) && use_reuse) { ret = reuse.finish(); }
   if (OB_SUCC(ret) && written_row_count != vid_end - vid_begin) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("IVF RAW range row count mismatch", K(ret), K(vid_begin),
         K(vid_end), K(written_row_count), K(task_idx));
   }
   if (writer_opened) {
-    const int close_ret = writer.close();
-    if (OB_SUCCESS != close_ret) {
-      LOG_WARN("failed to close IVF RAW range writer", K(close_ret),
-          K(vid_begin), K(vid_end), K(task_idx));
-      if (OB_SUCC(ret)) {
-        ret = close_ret;
-      }
+    if (OB_FAIL(ret)) {
+      writer.reset(); // Abort: do not flush abandoned rows or create an index root.
+    } else if (OB_FAIL(writer.close())) {
+      LOG_WARN("failed to close IVF RAW range writer", K(ret), K(vid_begin), K(vid_end), K(task_idx));
     }
   }
   if (OB_SUCC(ret)) {

@@ -205,12 +205,13 @@ TEST(TestDiskBBQBuild, FlatCenterPreservesSimdTailCoordinates)
     ObSEArray<ObIVFSampleRef, 1> samples;
     CollectingBuildRowSink sink;
     blocksstable::ObIvfSSTableMeta meta;
-    int64_t centers = 0, vectors = 0;
+    int64_t centers = 0, vectors = 0, postings = 0;
     ASSERT_EQ(OB_SUCCESS, ObDiskBBQAlgorithm::build(TEST_TENANT_ID, schema,
-        replay, rotator, samples, sink, meta, centers, vectors));
+        replay, rotator, samples, sink, meta, centers, vectors, postings));
     ASSERT_EQ(7, sink.rows_.size());
     EXPECT_EQ(1, centers);
     EXPECT_EQ(3, vectors);
+    EXPECT_EQ(vectors, postings);
     const OwnedBuildRow &center = sink.rows_.back();
     ASSERT_EQ(blocksstable::IVF_ROW_TYPE_CENTROID, center.row_type_);
     EXPECT_EQ(0, center.cid_);
@@ -261,12 +262,12 @@ TEST(TestDiskBBQBuild, NonFlatSegmentsRequireTrainerAndRejectInvalidClusterSize)
     ObSEArray<ObIVFSampleRef, 1> samples;
     CollectingBuildRowSink sink;
     blocksstable::ObIvfSSTableMeta meta;
-    int64_t center_count = -1, vector_count = -1;
+    int64_t center_count = -1, vector_count = -1, postings = -1;
     // This tenant has no vector service. A segment above the threshold must
     // require the normal trainer, rather than silently use the flat path.
     EXPECT_EQ(test_case[2], ObDiskBBQAlgorithm::build(TEST_TENANT_ID,
         schema, replay, rotator, samples, sink, meta,
-        center_count, vector_count));
+        center_count, vector_count, postings));
     EXPECT_EQ(0, center_count);
     EXPECT_TRUE(sink.rows_.empty());
   }
@@ -325,11 +326,12 @@ TEST(TestDiskBBQBuild, FlatSegmentsBuildOneMeanCenterAndPreserveEveryVector)
       }
       CollectingBuildRowSink sink;
       blocksstable::ObIvfSSTableMeta meta;
-      int64_t center_count = -1, vector_count = -1;
+      int64_t center_count = -1, vector_count = -1, postings = -1;
       ASSERT_EQ(OB_SUCCESS, ObDiskBBQAlgorithm::build(TEST_TENANT_ID, schema,
-          replay, rotator, samples, sink, meta, center_count, vector_count));
+          replay, rotator, samples, sink, meta, center_count, vector_count, postings));
       ASSERT_TRUE(meta.is_valid());
       EXPECT_EQ(count, vector_count);
+      EXPECT_EQ(count, postings);
       EXPECT_EQ(count > 0 ? 1 : 0, center_count);
       EXPECT_EQ(center_count, meta.centroid_count_);
       EXPECT_EQ(count, meta.vector_count_);
@@ -426,11 +428,12 @@ TEST(TestDiskBBQBuild, FlatCenterSpansSlicesAndAllowsZeroMean)
     schema.vector_dim_ = dim;
     CollectingBuildRowSink sink;
     blocksstable::ObIvfSSTableMeta meta;
-    int64_t centers = 0, vectors = 0;
+    int64_t centers = 0, vectors = 0, postings = 0;
     ASSERT_EQ(OB_SUCCESS, ObDiskBBQAlgorithm::build(TEST_TENANT_ID, schema,
-        replay, rotator, samples, sink, meta, centers, vectors));
+        replay, rotator, samples, sink, meta, centers, vectors, postings));
     EXPECT_EQ(1, centers);
     EXPECT_EQ(3, vectors);
+    EXPECT_EQ(vectors, postings);
     ASSERT_EQ(7, sink.rows_.size());
     const OwnedBuildRow &center = sink.rows_.back();
     ASSERT_EQ(blocksstable::IVF_ROW_TYPE_CENTROID, center.row_type_);
@@ -1026,7 +1029,6 @@ TEST(TestDiskBBQBuild, MockRotatedCentersMaterializeTypeOneThreeAndFiveRows)
       {8.5F, 7.5F, 8.25F, 7.75F},
       {1.0F, -1.0F, 0.5F, -0.5F},
   };
-  const int64_t expected_cids[] = {0, 1, 0};
   const int64_t vector_count = ARRAYSIZEOF(vids);
   const float source_center_zero[dim] = {
       0.0F, 0.0F, 0.0F, 0.0F};
@@ -1080,6 +1082,7 @@ TEST(TestDiskBBQBuild, MockRotatedCentersMaterializeTypeOneThreeAndFiveRows)
 
   CollectingBuildRowSink row_sink;
   int64_t materialized_vector_count = 0;
+  int64_t emitted_postings = 0;
   ScopedRefreshTestTenant tenant;
   ObIVFRefreshMonitor progress;
   progress.init(nullptr, 104, 1, 300, 400, 500);
@@ -1087,7 +1090,7 @@ TEST(TestDiskBBQBuild, MockRotatedCentersMaterializeTypeOneThreeAndFiveRows)
             ObDiskBBQAlgorithm::build_rows_with_centers(
                 TEST_TENANT_ID, dim, share::VIDA_L2, centers,
                 replay_input, encoder, row_sink,
-                materialized_vector_count, &progress));
+                materialized_vector_count, emitted_postings, &progress));
   progress.finish(OB_SUCCESS);
   ObDDLDagMonitorEntry assignment_entry;
   ASSERT_EQ(OB_SUCCESS, progress.to_entry(assignment_entry, ObIVFRefreshProgress::ASSIGN_ENCODE));
@@ -1095,12 +1098,12 @@ TEST(TestDiskBBQBuild, MockRotatedCentersMaterializeTypeOneThreeAndFiveRows)
   EXPECT_NE(std::string::npos,
       std::string(assignment_message.ptr(), assignment_message.length()).find("\"completed\":3"));
   ASSERT_EQ(vector_count, materialized_vector_count);
-  ASSERT_EQ(centers.count() + 2 * vector_count,
+  ASSERT_EQ(centers.count() + 3 * vector_count,
             static_cast<int64_t>(row_sink.rows_.size()));
 
   const float *expected_centers[] = {center_zero, center_one};
   bool centroid_seen[] = {false, false};
-  bool posting_seen[] = {false, false, false};
+  bool posting_seen[3][2] = {};
   bool full_precision_seen[] = {false, false, false};
   int64_t centroid_count = 0;
   int64_t posting_count = 0;
@@ -1120,16 +1123,17 @@ TEST(TestDiskBBQBuild, MockRotatedCentersMaterializeTypeOneThreeAndFiveRows)
       uint32_t children = 0;
       ASSERT_EQ(OB_SUCCESS, blocksstable::ObIvfCentroidPayload::decode(
           ObString(row.payload_.size(), row.payload_.data()), dim, decoded, children));
-      EXPECT_EQ(row.vid_ == 1 ? 2 : 1, children);
+      EXPECT_EQ(vector_count, children);
       EXPECT_EQ(0, std::memcmp(expected_centers[row.vid_ - 1], decoded, dim * sizeof(float)));
     } else if (blocksstable::IVF_ROW_TYPE_LOW_PRECISION_VECTOR
                == row.row_type_) {
       const int64_t vector_idx = find_vid(vids, vector_count, row.vid_);
       ASSERT_GE(vector_idx, 0);
-      EXPECT_FALSE(posting_seen[vector_idx]);
-      posting_seen[vector_idx] = true;
+      ASSERT_GE(row.cid_, 1);
+      ASSERT_LE(row.cid_, 2);
+      EXPECT_FALSE(posting_seen[vector_idx][row.cid_ - 1]);
+      posting_seen[vector_idx][row.cid_ - 1] = true;
       ++posting_count;
-      EXPECT_EQ(expected_cids[vector_idx] + 1, row.cid_);
       EXPECT_EQ(encoder.code_size(),
                 static_cast<int64_t>(row.payload_.size()));
       std::vector<uint8_t> expected_code(encoder.code_size());
@@ -1156,14 +1160,148 @@ TEST(TestDiskBBQBuild, MockRotatedCentersMaterializeTypeOneThreeAndFiveRows)
     }
   }
   EXPECT_EQ(centers.count(), centroid_count);
-  EXPECT_EQ(vector_count, posting_count);
+  EXPECT_EQ(2 * vector_count, posting_count);
+  EXPECT_EQ(posting_count, emitted_postings);
   EXPECT_EQ(vector_count, full_precision_count);
   for (int64_t i = 0; i < centers.count(); ++i) {
     EXPECT_TRUE(centroid_seen[i]);
   }
   for (int64_t i = 0; i < vector_count; ++i) {
-    EXPECT_TRUE(posting_seen[i]);
+    EXPECT_TRUE(posting_seen[i][0]);
+    EXPECT_TRUE(posting_seen[i][1]);
     EXPECT_TRUE(full_precision_seen[i]);
+  }
+}
+
+TEST(TestDiskBBQBuild, SoarKeepsPrimaryAndMatchesIndependentResidualReference)
+{
+  const int64_t dim = 4;
+  // Seven centers exercise both the SIMD quartet and scalar tail. In L2,
+  // vector zero's SOAR choice is orthogonal, not its second nearest center.
+  for (const int64_t center_count : {7, 130}) {
+    for (const auto metric : {VIDA_L2, VIDA_COS, VIDA_IP}) {
+      if (center_count == 130 && metric != VIDA_L2) { continue; }
+      SCOPED_TRACE(center_count);
+      SCOPED_TRACE(metric);
+      float values[130][dim] = {{1, 0, 0, 0}, {1.1F, 0, 0, 0}, {0, 1.2F, 0, 0},
+          {-3, 1, 0, 0}, {0, 0, 4, 0}, {0, 0, 0, 5}, {-6, -6, 0, 0}};
+      for (int64_t c = 7; c < center_count; ++c) { values[c][0] = 100 + c; }
+      if (center_count == 130) {
+        // The best secondary lies beyond HCA's small-center neighborhood limit.
+        MEMCPY(values[129], values[2], sizeof(values[2]));
+        values[2][1] = 100;
+      }
+      if (metric != VIDA_L2) {
+        for (int64_t i = 0; i < 7; ++i) {
+          values[i][0] = std::cos(float(i + 1) * 0.4F);
+          values[i][1] = std::sin(float(i + 1) * 0.4F);
+          values[i][2] = values[i][3] = 0;
+        }
+      }
+      float vectors[3][dim] = {{0, 0, 0, 0}, {0.2F, 0.5F, 0.1F, -0.3F}, {1, 0, 0, 0}};
+      if (metric != VIDA_L2) { vectors[0][0] = 7; vectors[2][0] = 3; vectors[2][1] = -2; }
+      ObArenaAllocator allocator("BBQSoarUT");
+      ObSEArray<float *, 7> centers;
+      for (int64_t c = 0; c < center_count; ++c) { ASSERT_EQ(OB_SUCCESS, centers.push_back(values[c])); }
+      ObIVFReplayInput replay(allocator);
+      ASSERT_EQ(OB_SUCCESS, replay.init(TEST_TENANT_ID, dim, TEST_REPLAY_MEMORY_LIMIT));
+      for (int64_t i = 0; i < 3; ++i) {
+        ASSERT_EQ(OB_SUCCESS, replay.add_row(i + 10, as_vector_bytes(vectors[i], dim)));
+      }
+      ASSERT_EQ(OB_SUCCESS, replay.seal());
+      quantization::ObFhtKacRotator rotator;
+      ASSERT_EQ(OB_SUCCESS, quantization::ObFhtKacRotator::generate(allocator, dim, rotator));
+      quantization::ObQuantizationParams params = {dim, share::DISK_BBQ_RABITQ_BITS,
+          rotator, quantization::calc_inv_sqrt_dim(dim)};
+      quantization::ObQuantizationEncoder encoder;
+      ASSERT_EQ(OB_SUCCESS, encoder.init(allocator, quantization::ObQuantizationType::RABITQ, metric, params));
+      CollectingBuildRowSink sink;
+      int64_t materialized = 0, postings = 0;
+      ASSERT_EQ(OB_SUCCESS, ObDiskBBQAlgorithm::build_rows_with_centers(TEST_TENANT_ID,
+          dim, metric, centers, replay, encoder, sink, materialized, postings));
+      ASSERT_EQ(3, materialized);
+      int64_t expected_counts[130] = {};
+      int64_t expected_postings = 0;
+      for (int64_t i = 0; i < 3; ++i) {
+        double x[dim] = {};
+        double norm = 0;
+        for (int64_t d = 0; d < dim; ++d) { norm += double(vectors[i][d]) * vectors[i][d]; }
+        for (int64_t d = 0; d < dim; ++d) {
+          x[d] = vectors[i][d] / (metric == VIDA_L2 ? 1.0 : std::sqrt(norm));
+        }
+        double distances[130] = {};
+        int64_t primary = 0;
+        for (int64_t c = 0; c < center_count; ++c) {
+          for (int64_t d = 0; d < dim; ++d) { distances[c] += std::pow(x[d] - values[c][d], 2); }
+          if (distances[c] < distances[primary]) { primary = c; }
+        }
+        int64_t secondary = -1;
+        double best = std::numeric_limits<double>::infinity();
+        if (distances[primary] > 1e-16) {
+          for (int64_t c = 0; c < center_count; ++c) {
+            double projection = 0;
+            for (int64_t d = 0; d < dim; ++d) {
+              projection += (x[d] - values[primary][d]) * (x[d] - values[c][d]);
+            }
+            const double score = distances[c] + projection * projection / distances[primary];
+            if (c != primary && score < best) { secondary = c; best = score; }
+          }
+        }
+        if (metric == VIDA_L2 && i == 0) { EXPECT_EQ(0, primary); EXPECT_EQ(center_count == 130 ? 129 : 2, secondary); }
+        std::vector<int64_t> actual_cids;
+        int64_t raw_count = 0;
+        for (const auto &row : sink.rows_) {
+          if (row.vid_ != i + 10) { continue; }
+          if (row.row_type_ == blocksstable::IVF_ROW_TYPE_LOW_PRECISION_VECTOR) {
+            actual_cids.push_back(row.cid_ - 1);
+            ASSERT_GE(row.cid_, 1); ASSERT_LE(row.cid_, center_count);
+            std::vector<uint8_t> expected_code(encoder.code_size());
+            ASSERT_EQ(OB_SUCCESS, encoder.encode(vectors[i], values[row.cid_ - 1],
+                {expected_code.data(), encoder.code_size()}));
+            ASSERT_EQ(expected_code.size(), row.payload_.size());
+            EXPECT_EQ(0, std::memcmp(expected_code.data(), row.payload_.data(), expected_code.size()));
+          } else if (row.row_type_ == blocksstable::IVF_ROW_TYPE_RAW_VECTOR) {
+            ++raw_count;
+            EXPECT_EQ(0, row.cid_);
+            ASSERT_EQ(sizeof(vectors[i]), row.payload_.size());
+            EXPECT_EQ(0, std::memcmp(vectors[i], row.payload_.data(), row.payload_.size()));
+          }
+        }
+        std::vector<int64_t> expected_cids{primary};
+        ++expected_counts[primary];
+        if (secondary >= 0) { expected_cids.push_back(secondary); ++expected_counts[secondary]; }
+        EXPECT_EQ(expected_cids, actual_cids); // Primary remains first; secondary is distinct.
+        EXPECT_EQ(1, raw_count);
+        expected_postings += expected_cids.size();
+      }
+      EXPECT_EQ(expected_postings, postings);
+      EXPECT_EQ(center_count + materialized + postings, sink.rows_.size());
+      if (metric == VIDA_L2 && center_count == 7) {
+        class FailSecondarySink final : public ObIVFBuildRowSink {
+        public:
+          int append_row(const ObIVFBuildRow &) override
+          { return ++attempts_ == 2 ? OB_IO_ERROR : OB_SUCCESS; }
+          int64_t attempts_ = 0;
+        } failing;
+        int64_t partial_vectors = -1, partial_postings = -1;
+        EXPECT_EQ(OB_IO_ERROR, ObDiskBBQAlgorithm::build_rows_with_centers(TEST_TENANT_ID,
+            dim, metric, centers, replay, encoder, failing, partial_vectors, partial_postings));
+        EXPECT_EQ(2, failing.attempts_);
+        EXPECT_EQ(1, partial_postings);
+        EXPECT_EQ(0, partial_vectors); // Failed secondary must not publish RAW or centroids.
+      }
+      for (const auto &row : sink.rows_) {
+        if (row.row_type_ == blocksstable::IVF_ROW_TYPE_CENTROID) {
+          const float *center = nullptr;
+          uint32_t children = 0;
+          ASSERT_EQ(OB_SUCCESS, blocksstable::ObIvfCentroidPayload::decode(
+              ObString(row.payload_.size(), row.payload_.data()), dim, center, children));
+          ASSERT_GE(row.vid_, 1); ASSERT_LE(row.vid_, center_count);
+          EXPECT_EQ(expected_counts[row.vid_ - 1], children);
+          EXPECT_EQ(0, std::memcmp(values[row.vid_ - 1], center, dim * sizeof(float)));
+        }
+      }
+    }
   }
 }
 
@@ -1194,9 +1332,9 @@ TEST(TestDiskBBQBuild, RefreshRemainsFlatAtHierarchyThreshold)
   ASSERT_EQ(OB_SUCCESS, encoder.init(allocator, quantization::ObQuantizationType::RABITQ,
       share::VIDA_L2, params));
   CollectingBuildRowSink sink;
-  int64_t materialized = 0;
+  int64_t materialized = 0, emitted_postings = 0;
   ASSERT_EQ(OB_SUCCESS, ObDiskBBQAlgorithm::build_rows_with_centers(
-      TEST_TENANT_ID, dim, share::VIDA_L2, centers, replay, encoder, sink, materialized));
+      TEST_TENANT_ID, dim, share::VIDA_L2, centers, replay, encoder, sink, materialized, emitted_postings));
   ASSERT_EQ(1, materialized);
   ASSERT_EQ(center_count + 2, static_cast<int64_t>(sink.rows_.size()));
   ASSERT_EQ(blocksstable::IVF_ROW_TYPE_LOW_PRECISION_VECTOR, sink.rows_[0].row_type_);
@@ -1277,11 +1415,12 @@ TEST(TestDiskBBQBuild, InnerProductAssignsWithNormalizedQuickCenters)
 
   CollectingBuildRowSink row_sink;
   int64_t materialized_vector_count = 0;
+  int64_t emitted_postings = 0;
   ASSERT_EQ(OB_SUCCESS,
             ObDiskBBQAlgorithm::build_rows_with_centers(
                 TEST_TENANT_ID, dim, share::VIDA_IP, centers,
                 replay_input, encoder, row_sink,
-                materialized_vector_count));
+                materialized_vector_count, emitted_postings));
   ASSERT_EQ(1, materialized_vector_count);
 
   int64_t posting_count = 0;
@@ -1291,10 +1430,15 @@ TEST(TestDiskBBQBuild, InnerProductAssignsWithNormalizedQuickCenters)
         == row.row_type_) {
       ++posting_count;
       EXPECT_EQ(vid, row.vid_);
-      EXPECT_EQ(1, row.cid_);
+      EXPECT_EQ(posting_count == 1 ? 1 : 2, row.cid_);
     }
   }
-  EXPECT_EQ(1, posting_count);
+  EXPECT_EQ(emitted_postings, posting_count);
+  float normalized[dim] = {};
+  ASSERT_EQ(OB_SUCCESS, normalize_info.normalize_func_(dim, vector, normalized, nullptr));
+  double residual = 0;
+  for (int64_t d = 0; d < dim; ++d) { residual += std::pow(double(normalized[d]) - large_center[d], 2); }
+  EXPECT_EQ(residual <= 1e-16 ? 1 : 2, posting_count);
 }
 
 TEST(TestDiskBBQBuild, DiskBBQMetaValidatesAndCopiesFormatV1)

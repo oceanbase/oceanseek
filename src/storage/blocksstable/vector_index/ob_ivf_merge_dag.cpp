@@ -207,6 +207,10 @@ int ObIVFMergeDagCtx::start_with_input(
   } else if (prior != nullptr && OB_FAIL(storage::ObIVFMergeStrategy::select(
       *prior, merge_input.cluster_size_, selected))) {
     LOG_WARN("failed to select IVF merge strategy", K(ret), KPC(prior));
+  } else if (input_adapter_ != nullptr && input_adapter_->uses_metadata_counts()
+      && selected != input_adapter_->metadata_strategy()) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("IVF captured input disagrees with metadata strategy", K(ret), K(selected));
   } else if (OB_FAIL(init_merge_runtime_(
       merge_ctx, merge_input))) {
     LOG_WARN("failed to initialize IVF merge runtime",
@@ -219,6 +223,9 @@ int ObIVFMergeDagCtx::start_with_input(
         && prior->dominant_segment_ >= 0
         && prior->dominant_segment_ < input_adapter_->source_tables_.get_count()) {
       const auto *table = input_adapter_->source_tables_.get_table(prior->dominant_segment_);
+      if (prior->dominant_segment_ < input_adapter_->reuse_sources_.count()) {
+        input_adapter_->prior_.routing_source_ = input_adapter_->reuse_sources_.at(prior->dominant_segment_);
+      }
       hca_algorithm_->prepare_insertion_source(*input_adapter_, *prior, input_adapter_->dist_type_,
           static_cast<const blocksstable::ObIvfSSTable *>(table)->get_ivf_meta().leaf_cid_base());
     }
@@ -443,6 +450,8 @@ int ObIVFMergeDagCtx::init_merge_input_(ObAsyncIndexMergeCtx &merge_ctx, bool &r
     LOG_WARN("failed to prepare IVF source schema", K(ret));
   } else if (OB_FAIL(input_adapter_->prepare_source_(merge_ctx))) {
     LOG_WARN("failed to prepare IVF source handles", K(ret));
+  } else if (FALSE_IT(process_type_ = input_adapter_->uses_metadata_counts()
+      ? input_adapter_->metadata_strategy() : storage::ObIVFProcessType::FULL_REBUILD)) {
   } else if (OB_ISNULL(capture_ctx_ = OB_NEWx(ObIVFMergeCaptureCtx, &allocator))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("failed to allocate IVF capture context", K(ret));
@@ -513,6 +522,10 @@ int ObIVFMergeDagCtx::check_input_reuse_(
   const bool major = is_major_merge_type(merge_ctx.get_merge_type());
   if ((tables.get_count() < 2 && !single_inc)
       || (!major && !is_inc_major_merge(merge_ctx.get_merge_type()))) {
+  } else if (is_inc_major_merge(merge_ctx.get_merge_type())
+      && merge_ctx.static_param_.is_full_merge_) {
+    // Generation wrap requires new block identities, including the same-key
+    // single-input path that bypasses set_reuse_sources(). Continue with capture.
   } else if (major && (!merge_ctx.deletion_bitmap_handle_.is_valid()
       || !merge_ctx.deletion_bitmap_handle_.is_empty())) {
     // Major must apply deletions; INC retains the separate delete-index semantics.
@@ -693,6 +706,11 @@ int ObIVFMergeDagCtx::init_merge_runtime_(
       *data_store_desc_, *index_builder, data_macro_seq_window, merge_ctx.get_snapshot(),
       input.vector_store_->get_dimension(), input.dist_type_))) {
     LOG_WARN("failed to initialize IVF merge SSTable writer", K(ret));
+  } else if (input_adapter_ != nullptr && OB_FAIL(input_adapter_->prepare_block_reuse())) {
+    LOG_WARN("failed to prepare IVF block reuse source", K(ret));
+  } else if (input_adapter_ != nullptr && OB_FAIL(sstable_writer_->set_reuse_sources(
+      input_adapter_->get_reuse_sources(), merge_ctx.static_param_.is_full_merge_))) {
+    LOG_WARN("failed to install IVF block reuse sources", K(ret));
   } else if (OB_ISNULL(vector_index_service =
       MTL(share::ObPluginVectorIndexService *))
       || OB_ISNULL(vector_index_service->get_all_vsag_use_mem())) {
@@ -989,7 +1007,10 @@ int ObIVFMergeFinishTask::process()
   } else {
     // The planner and its final callbacks have returned, all build tasks have
     // drained, and physical publication uses the already installed metadata.
-    ivf_merge_dag_ctx_->release_finished_input_();
+    // Route handoff still borrows the captured geometry until publication.
+    if (!ivf_merge_dag_ctx_->merge_processor_.centroid_route_reused()) {
+      ivf_merge_dag_ctx_->release_finished_input_();
+    }
   }
   return ret;
 }
@@ -1127,11 +1148,38 @@ int ObIVFMergeDagCtx::finish_task_plan(
   return ret;
 }
 
+// Runs after the existing generic publish task. Cache failure cannot roll back
+// a published merge, and no speculative output cache survives a failed publish.
+class ObIVFMergeCacheTask final : public ObITask
+{
+public:
+  ObIVFMergeCacheTask() : ObITask(TASK_TYPE_SSTABLE_MERGE_FINISH), ctx_(nullptr) {}
+  int init(ObIVFMergeDagCtx *ctx) { ctx_ = ctx; return ctx == nullptr ? OB_INVALID_ARGUMENT : OB_SUCCESS; }
+protected:
+  int process() override
+  {
+    const blocksstable::ObSSTable *table = nullptr;
+    if (ctx_->merge_processor_.centroid_route_reused()
+        && ctx_->input_adapter_ != nullptr && ctx_->sstable_writer_ != nullptr
+        && OB_SUCCESS == ctx_->merge_ctx_->merged_table_handle_.get_sstable(table)
+        && table != nullptr && table->is_ivf_sstable()) {
+      ctx_->input_adapter_->reuse_centroid_cache(
+          *static_cast<const blocksstable::ObIvfSSTable *>(table),
+          ctx_->sstable_writer_->get_leaf_posting_counts());
+    }
+    ctx_->release_finished_input_();
+    return OB_SUCCESS;
+  }
+private:
+  ObIVFMergeDagCtx *ctx_;
+};
+
 int ObIVFMergeDagCtx::materialize_finish(
     share::ObITask &parent_task)
 {
   int ret = OB_SUCCESS;
   ObAsyncIndexMergeFinishTask *finish_task = nullptr;
+  ObIVFMergeCacheTask *cache_task = nullptr;
   if (OB_UNLIKELY(!is_inited_ || OB_ISNULL(owner_dag_)
       || OB_ISNULL(merge_ctx_))) {
     ret = OB_NOT_INIT;
@@ -1139,6 +1187,9 @@ int ObIVFMergeDagCtx::materialize_finish(
   } else if (OB_FAIL(owner_dag_->create_task(
       &parent_task, finish_task))) {
     LOG_WARN("fail to create final async index merge finish task", K(ret));
+  } else if (merge_processor_.centroid_route_reused()
+      && OB_FAIL(owner_dag_->create_task(finish_task, cache_task, this))) {
+    LOG_WARN("fail to create insertion centroid cache task", K(ret));
   }
   return ret;
 }

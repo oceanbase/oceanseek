@@ -13,12 +13,14 @@
 #include "storage/blocksstable/vector_index/ob_ivf_macro_block_writer.h"
 #include "storage/blocksstable/vector_index/ob_ivf_sstable_struct.h"
 #include "storage/blocksstable/vector_index/ob_ivf_sorter.h"
+#include "storage/blocksstable/vector_index/ob_ivf_block_reuse_source.h"
 
 namespace oceanbase
 {
 namespace blocksstable
 {
 
+class ObIVFBlockReuseWriter;
 class ObDataStoreDesc;
 class ObSSTableIndexBuilder;
 
@@ -53,6 +55,8 @@ public:
       const common::ObIArray<int64_t> &primary, const common::ObIArray<int64_t> *secondary) override;
   int set_centroid_layout(const ObIvfCentroidLayout &layout) override;
   int set_leaf_posting_counts(const common::ObIArray<uint32_t> &counts) override;
+  int set_reuse_sources(const common::ObIArray<ObIVFBlockReuseSource *> &sources,
+      bool is_full_merge = false);
   virtual bool supports_encoded_posting_reuse() const override { return true; }
   virtual int prepare_quantization(const common::ObIArray<float> &centers,
       const int64_t center_count, int64_t &task_count) override;
@@ -104,6 +108,7 @@ public:
   {
     return quantization_finished_ && raw_write_finished_;
   }
+  const common::ObIArray<uint32_t> &get_leaf_posting_counts() const { return leaf_posting_counts_; }
   int64_t get_row_count() const
   {
     return ATOMIC_LOAD(&output_row_count_);
@@ -141,7 +146,11 @@ private:
   int append_macro_row_(
       ObIvfMacroBlockWriter &writer,
       const storage::ObIVFSortItem &item,
-      ObDatumRow &row);
+      ObDatumRow &row, ObIVFBlockReuseWriter *reuse = nullptr);
+  int prepare_posting_reuse_();
+  int prepare_centroid_reuse_(const common::ObIArray<float> &centers, int64_t dimension);
+  const ObIVFBlockReuseSource *find_reuse_source_(int64_t prior_centroid_index) const;
+  int normalize_reuse_ranges_(common::ObArray<ObIVFReuseRange, common::ObWrapperAllocator> &ranges);
 
 private:
   const ObIvfCentroidLayout *centroid_layout_; // borrowed through QUANT
@@ -172,6 +181,14 @@ private:
   // Reuses DDL encoding and posting sharding with merge-owned macro writers.
   // Encoded reuse ranges and loaded output are mutually exclusive.
   LoadedOutput *loaded_output_;
+  // Slots retain input table identity; incompatible sources stay null. Objects
+  // are owned by the input adapter until all output tasks have drained.
+  common::ObArray<ObIVFBlockReuseSource *, common::ObWrapperAllocator> reuse_sources_;
+  // Global prior ordinals: -1 means no source, -2 means not one complete source.
+  common::ObArray<int64_t, common::ObWrapperAllocator> reuse_posting_origins_;
+  common::ObArray<ObIVFReuseRange, common::ObWrapperAllocator> reuse_raw_ranges_;
+  common::ObArray<ObIVFReuseRange, common::ObWrapperAllocator> reuse_posting_ranges_;
+  common::ObArray<ObIVFReuseRange, common::ObWrapperAllocator> reuse_centroid_ranges_;
   bool is_inited_;
   bool quantization_finished_;
   bool raw_write_finished_;

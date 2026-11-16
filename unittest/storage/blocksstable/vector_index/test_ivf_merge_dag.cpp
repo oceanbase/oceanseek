@@ -389,7 +389,7 @@ TEST(TestIVFMergeDag, generated_capture_tasks_share_input_ready_barrier)
   ObArenaAllocator allocator("IVFCaptureGraph", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
   ObIVFMergeCaptureCtx capture;
   for (int64_t i = 0; i < 3; ++i) {
-    ObIVFMergeCaptureSlice *slice = OB_NEWx(ObIVFMergeCaptureSlice, &capture.allocator_);
+    ObIVFMergeCaptureSlice *slice = OB_NEWx(ObIVFMergeCaptureSlice, &capture.allocator_, allocator, nullptr);
     ASSERT_NE(nullptr, slice);
     ASSERT_EQ(OB_SUCCESS, capture.slices_.push_back(slice));
   }
@@ -2923,8 +2923,12 @@ TEST(TestIVFMergeMonitor, merge_labels_reach_memory_view_statistics)
     ObTabletMergeDagParam param(MAJOR_MERGE, ObLSID(1), ObTabletID(1001), -1);
     ObAsyncIndexMergeCtx ctx(param, allocator);
     ObLocalArena input_allocator(ctx.mem_ctx_, "IVFMergeInput");
-    ObIVFMergeInputAdapter captured_input(input_allocator);
+    ObIVFMergeInputAdapter captured_input(input_allocator, &ctx.mem_ctx_);
     ASSERT_EQ(OB_SUCCESS, captured_input.locators_.prepare_allocate(4096));
+    // Locator payload now has a reclaiming allocator. The input arena still
+    // owns slice offsets, so verify both actual allocation paths are visible.
+    ASSERT_EQ(OB_SUCCESS, captured_input.replay_row_offsets_.push_back(0));
+    ASSERT_EQ(OB_SUCCESS, captured_input.replay_row_offsets_.push_back(4096));
     ObAsyncIndexMajorMergeDag dag;
     ASSERT_EQ(OB_SUCCESS, dag.basic_init(allocator));
     ObFakeTask *prepare = nullptr;
@@ -2941,6 +2945,7 @@ TEST(TestIVFMergeMonitor, merge_labels_reach_memory_view_statistics)
   EXPECT_EQ(1, observed_labels.count("IVFHcaCenter"));
   EXPECT_EQ(1, observed_labels.count("IVFHcaAssign"));
   EXPECT_EQ(1, observed_labels.count("IVFMergeInput"));
+  EXPECT_EQ(1, observed_labels.count("IVFMergeLoc"));
 }
 #endif
 
@@ -4753,7 +4758,8 @@ TEST(TestIVFDDLRuntime, full_pipeline_source_batches_preserve_members_and_zero_r
     const bool soar = (mode & 1) != 0;
     const bool resident = (mode & 2) != 0;
     SCOPED_TRACE(::testing::Message() << "soar=" << soar << "/resident=" << resident);
-    ObArenaAllocator allocator;
+    // FULL_REBUILD borrows this allocator for concurrent source/update tasks.
+    ObIVFMergeRuntimeAllocator allocator;
     DDLCountingStore store;
     store.resident_ = resident;
     ObIVFMergeInput input;

@@ -45,11 +45,15 @@ public:
                    blocksstable::ObIvfSSTableMeta &ivf_meta,
                    int64_t &effective_center_count,
                    int64_t &valid_vector_count,
+                   int64_t &posting_count,
                    share::ObIVFRefreshProgress *progress = nullptr);
 
   // Replay vectors and caller-provided centers are already in the index's
   // rotated coordinate space. Keeping this boundary independent from the
   // trainer supports both flat centers and ObSingleKmeansExecutor output.
+  // Each vector emits one RAW and one primary posting, plus a SOAR secondary
+  // when its primary residual and another center admit one. posting_count is
+  // the actual number emitted, including secondary postings.
   // Refresh always writes a FLAT layout; later merge/rebuild decides whether
   // to construct parent centers.
   static int build_rows_with_centers(
@@ -61,6 +65,7 @@ public:
       quantization::ObQuantizationEncoder &encoder,
       ObIVFBuildRowSink &row_sink,
       int64_t &materialized_vector_count,
+      int64_t &posting_count,
       share::ObIVFRefreshProgress *progress = nullptr);
 
 private:
@@ -83,7 +88,8 @@ private:
                         const share::ObVectorIndexDistAlgorithm distance,
                         const float *vector,
                         common::ObIAllocator &scratch_allocator,
-                        int64_t &cid);
+                        int64_t &cid,
+                        int64_t &secondary_cid);
   static int validate_finite_vector_(const float *vector, const int64_t dim);
 };
 

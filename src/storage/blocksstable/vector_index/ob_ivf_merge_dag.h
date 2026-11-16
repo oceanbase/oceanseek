@@ -63,6 +63,7 @@ private:
   int finish_capture(share::ObITask &ready_task);
   friend class ObIVFMergeTask;
   friend class ObIVFMergeFinishTask;
+  friend class ObIVFMergeCacheTask;
 
   // Internal test seam: replace only the source vectors while keeping the
   // production HCA/writer lifecycle inside this IVF context.

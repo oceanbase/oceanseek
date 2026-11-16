@@ -149,7 +149,7 @@ private:
   virtual int create_center_writer(ObITabletSliceWriter *&writer) override;
   virtual int create_raw_writer(
       const int64_t task_idx, ObITabletSliceWriter *&writer) override;
-  virtual int create_posting_writer(int64_t task_idx, ObITabletSliceWriter *&writer) override;
+  virtual int create_posting_writer(int64_t task_idx, int64_t cid_begin, int64_t cid_end, ObITabletSliceWriter *&writer) override;
   virtual void destroy_writer(ObITabletSliceWriter *writer) override;
   int create_writer_(const int64_t slice_idx, ObITabletSliceWriter *&writer);
   int init_full_build_runtime_();

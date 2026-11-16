@@ -529,11 +529,62 @@ int ObIvfICache::set_centroid_del_scn(int64_t /* cid */, const SCN &/* del_scn *
 
 ObIvfSSTableCentCache::~ObIvfSSTableCentCache()
 {
+  // A borrowed graph is destroyed only by its pinned original owner.
+  if (hgraph_owner_guard_.is_valid()) { hgraph_index_ = nullptr; }
   release_shared_leaves();
   release_metadata();
   release_centroid_memory();
   ObIvfICache::reset();
   unregister_memory();
+}
+
+int ObIvfSSTableCentCache::inherit_hgraph(const ObIvfCacheMgrGuard &source_guard)
+{
+  int ret = OB_SUCCESS;
+  ObIvfSSTableCentCache *source = nullptr;
+  ObIvfCacheMgrGuard owner_guard;
+  common::obvsag::VectorIndexPtr graph = nullptr;
+  int64_t source_count = 0;
+  int64_t source_dimension = 0;
+  auto *mgr = source_guard.get_ivf_cache_mgr();
+  if (!source_guard.is_valid() || mgr == nullptr) {
+    ret = OB_STATE_NOT_MATCH;
+  } else if (OB_FAIL(mgr->get_cache_node<ObIvfSSTableCentCache>(IVF_SSTABLE_CENTROID_CACHE, source))) {
+  } else if (source == nullptr || source == this) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    {
+      RLockGuard guard(source->rwlock_);
+      if (!source->is_completed() || source->group_id_ != 0) {
+        ret = OB_STATE_NOT_MATCH;
+      } else {
+        source_count = source->count_;
+        source_dimension = source->cent_vec_dim_;
+        graph = source->hgraph_index_;
+        if (graph != nullptr) {
+          owner_guard = source->hgraph_owner_guard_.is_valid()
+              ? source->hgraph_owner_guard_ : source_guard;
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      // The target is already visible to cache statistics while WRITING.
+      // Pin the source graph before dropping its lock, and never hold both
+      // cache locks while replacing the target's backing storage.
+      WLockGuard guard(rwlock_);
+      if (!is_writing() || group_id_ != 0 || count_ != capacity_ || count_ <= 0
+          || hgraph_index_ != nullptr || source_count != count_
+          || source_dimension != cent_vec_dim_) {
+        ret = OB_STATE_NOT_MATCH;
+      } else if (graph != nullptr) {
+        hgraph_owner_guard_ = owner_guard;
+        hgraph_index_ = graph;
+        sub_mem_ctx_->Deallocate(centroids_);
+        centroids_ = nullptr;
+      }
+    }
+  }
+  return ret;
 }
 
 void ObIvfSSTableCentCache::release_metadata()
@@ -862,7 +913,9 @@ void ObIvfSSTableCentCache::reuse()
     group_id_ = 0;
     capacity_ = nlist_ = 0;
     count_ = 0;
+    if (hgraph_owner_guard_.is_valid()) { hgraph_index_ = nullptr; }
     cleanup_hgraph_index();
+    hgraph_owner_guard_.reset();
     ObIvfICache::reuse();
   }
 }

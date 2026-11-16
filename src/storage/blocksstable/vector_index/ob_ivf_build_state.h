@@ -309,7 +309,7 @@ struct ObIVFMergeRuntime
       refine_finished_(false),
       old_to_new_(nullptr),
       c1_(nullptr),
-      centroid_layout_(allocator),
+      centroid_layout_(allocator), centroid_route_reused_(false),
       parent_builder_(nullptr),
       parent_started_us_(0),
       parent_threshold_(0),
@@ -411,6 +411,7 @@ struct ObIVFMergeRuntime
   ObArray<int64_t, ObWrapperAllocator> *old_to_new_;
   ObArray<float, ObWrapperAllocator> *c1_;
   blocksstable::ObIvfCentroidLayout centroid_layout_;
+  bool centroid_route_reused_;
   ObIVFParentCentroidBuilder *parent_builder_;
   int64_t parent_started_us_;
   int64_t parent_threshold_;

@@ -10,6 +10,7 @@
 #include "storage/blocksstable/index_block/ob_index_block_macro_iterator.h"
 #include "storage/blocksstable/vector_index/ob_ivf_sstable.h"
 #include "storage/compaction/ob_async_index_merge_ctx.h"
+#include <cmath>
 
 namespace oceanbase
 {
@@ -38,13 +39,12 @@ void make_raw_range(ObDatumRange &range, ObStorageDatum *start, ObStorageDatum *
 }
 }
 
-ObIVFMergeCaptureSlice::ObIVFMergeCaptureSlice()
+ObIVFMergeCaptureSlice::ObIVFMergeCaptureSlice(ObIAllocator &locator_allocator,
+    ObCompactionMemoryContext *memory_context)
   : allocator_(ObMemAttr(MTL_ID(), "IVFCapSlice", ObCtxIds::VECTOR_CTX_ID)),
-    ranges_(), locators_(), sample_cmp_(), samples_(sample_cmp_, &allocator_), replay_(nullptr), slice_idx_(-1), finished_(false)
+    ranges_(), locators_(locator_allocator, memory_context), sample_cmp_(), samples_(sample_cmp_, &allocator_), replay_(nullptr), slice_idx_(-1), finished_(false)
 {
   ranges_.set_attr(ObMemAttr(MTL_ID(), "IVFCapRanges", ObCtxIds::VECTOR_CTX_ID));
-  // Capture length is not known before filtering. Growth must free old buffers.
-  locators_.set_attr(ObMemAttr(MTL_ID(), "IVFCapLocator", ObCtxIds::VECTOR_CTX_ID));
 }
 
 ObIVFMergeCaptureCtx::ObIVFMergeCaptureCtx()
@@ -78,7 +78,8 @@ int ObIVFMergeCaptureCtx::init(
     ret = OB_INIT_TWICE;
     LOG_WARN("IVF capture already initialized", K(ret), K(is_inited_));
   } else if (input.is_inited_ || input.source_tables_.empty() || nullptr == input.read_info_
-      || !input.locators_.empty() || !input.prior_.segments_.empty()) {
+      || !input.locators_.empty() || !input.prior_.segments_.empty()
+      || input.source_tables_.get_count() > INT32_MAX) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid IVF capture input", K(ret), K(input.is_inited_), K(input.source_tables_.get_count()),
         K(input.locators_.count()));
@@ -88,11 +89,11 @@ int ObIVFMergeCaptureCtx::init(
     input.sample_seed_ = ObIVFReplayInput::build_sample_seed(input.index_table_id_, input.index_tablet_id_.id());
     if (OB_FAIL(plan_(parallel))) {
       LOG_WARN("failed to plan IVF capture", K(ret));
-    } else if (OB_FAIL(input.init_replay_inputs_(slices_.count()))) {
+    } else if (!input.lazy_raw_ && OB_FAIL(input.init_replay_inputs_(slices_.count()))) {
       LOG_WARN("failed to initialize IVF merge replay inputs", K(ret));
     } else {
       for (int64_t i = 0; i < slices_.count(); ++i) {
-        slices_.at(i)->replay_ = input.replay_inputs_.at(i);
+        slices_.at(i)->replay_ = input.lazy_raw_ ? nullptr : input.replay_inputs_.at(i);
         slices_.at(i)->slice_idx_ = i;
       }
       is_inited_ = true;
@@ -228,7 +229,8 @@ int ObIVFMergeCaptureCtx::plan_(const bool parallel)
   }
   const int64_t blocks_per_task = (blocks.count() + degree - 1) / degree;
   for (int64_t begin = 0; OB_SUCC(ret) && begin < blocks.count(); begin += blocks_per_task) {
-    ObIVFMergeCaptureSlice *slice = OB_NEWx(ObIVFMergeCaptureSlice, &allocator_);
+    ObIVFMergeCaptureSlice *slice = OB_NEWx(ObIVFMergeCaptureSlice, &allocator_,
+        input_->locator_allocator_, input_->locators_.get_memory_context());
     if (OB_ISNULL(slice)) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("failed to allocate IVF capture slice", K(ret), K(begin), K(blocks_per_task));
@@ -248,7 +250,8 @@ int ObIVFMergeCaptureCtx::plan_(const bool parallel)
   }
   if (OB_SUCC(ret) && slices_.empty()) {
     // Preserve the existing finish path for an empty result, without any scan.
-    ObIVFMergeCaptureSlice *slice = OB_NEWx(ObIVFMergeCaptureSlice, &allocator_);
+    ObIVFMergeCaptureSlice *slice = OB_NEWx(ObIVFMergeCaptureSlice, &allocator_,
+        input_->locator_allocator_, input_->locators_.get_memory_context());
     if (OB_ISNULL(slice)) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("failed to allocate empty IVF capture slice", K(ret),
@@ -280,8 +283,9 @@ int ObIVFMergeCaptureCtx::scan(const int64_t task_idx)
     LOG_WARN("invalid IVF capture task index", K(ret), K(task_idx), K(slices_.count()));
   } else {
     ObIVFMergeCaptureSlice &slice = *slices_.at(task_idx);
-    if (slice.finished_ || !slice.locators_.empty() || nullptr == slice.replay_
-        || slice.replay_->get_row_count() != 0 || slice.replay_->is_sealed()) {
+    if (slice.finished_ || !slice.locators_.empty()
+        || (!input_->lazy_raw_ && (nullptr == slice.replay_
+          || slice.replay_->get_row_count() != 0 || slice.replay_->is_sealed()))) {
       ret = OB_INIT_TWICE;
       LOG_WARN("IVF capture slice already scanned", K(ret), K(task_idx), K(slice.finished_),
           K(slice.locators_.count()));
@@ -293,10 +297,10 @@ int ObIVFMergeCaptureCtx::scan(const int64_t task_idx)
             K(slice.ranges_.at(i).table_idx_));
       }
     }
-    if (OB_SUCC(ret) && (nullptr == slice.replay_
+    if (OB_SUCC(ret) && !input_->lazy_raw_ && (nullptr == slice.replay_
         || slice.replay_->get_row_count() != slice.locators_.count())) {
       ret = OB_STATE_NOT_MATCH;
-    } else if (OB_SUCC(ret) && OB_FAIL(slice.replay_->seal())) {
+    } else if (OB_SUCC(ret) && !input_->lazy_raw_ && OB_FAIL(slice.replay_->seal())) {
       LOG_WARN("failed to seal IVF merge replay slice", K(ret), K(task_idx));
     }
     if (OB_SUCC(ret)) { slice.finished_ = true; }
@@ -331,8 +335,9 @@ int ObIVFMergeCaptureCtx::scan_range_(ObIVFMergeCaptureSlice &slice, ObIVFMergeC
   const ObTablesHandleArray &tables = merge_ctx.get_tables_handle();
   int64_t scanned_row_count = 0;
   query_flag.disable_cache();
-  // Capture full live RAW rows once into the spillable replay store. Subsequent
-  // algorithm and output reads never return to the source SSTables for vectors.
+  // Capture the immutable live RAW key view and preserve validation. Full
+  // rebuild/uncertified input additionally materializes payloads in replay;
+  // certified lazy input fetches payloads later from the pinned SSTables.
   // RAW vectors are already normalized/rotated; preserve their bytes unchanged.
   read_version_range.base_version_ = 0;
   read_version_range.multi_version_start_ = 0;
@@ -432,10 +437,15 @@ int ObIVFMergeCaptureCtx::scan_range_(ObIVFMergeCaptureSlice &slice, ObIVFMergeC
         } else if (!deleted) {
           const int64_t row_id = slice.locators_.count();
           const ObStorageDatum &payload = row->storage_datums_[row_desc_.payload_col_idx_];
-          if (nullptr == slice.replay_ || slice.replay_->get_row_count() != row_id || payload.is_null()) {
+          if (payload.is_null() || payload.is_ext() || payload.ptr_ == nullptr
+              || (!input_->lazy_raw_ && (nullptr == slice.replay_ || slice.replay_->get_row_count() != row_id))) {
             ret = OB_INVALID_DATA;
             LOG_WARN("invalid IVF replay capture row", K(ret), K(row_id), K(vector_id));
-          } else if (OB_FAIL(slice.replay_->add_row(vector_id, payload.get_string()))) {
+          } else if (input_->lazy_raw_
+              && payload.len_ != input_->vector_dim_ * static_cast<int64_t>(sizeof(float))) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("malformed lazy IVF RAW payload", K(ret), K(vector_id), K(payload.len_));
+          } else if (!input_->lazy_raw_ && OB_FAIL(slice.replay_->add_row(vector_id, payload.get_string()))) {
             LOG_WARN("failed to capture IVF vector in replay", K(ret), K(vector_id), K(row_id));
           } else if (OB_FAIL(slice.locators_.push_back(
               ObAsyncIVFSourceLocator(vector_id, table_idx, slice.slice_idx_, row_id)))) {
@@ -443,6 +453,14 @@ int ObIVFMergeCaptureCtx::scan_range_(ObIVFMergeCaptureSlice &slice, ObIVFMergeC
           } else if (OB_FAIL(offer_ivf_sample_candidate(slice.samples_, input_->max_sample_count_,
               input_->sample_seed_, vector_id, 0, row_id))) {
             LOG_WARN("failed to sample IVF RAW key", K(ret));
+          }
+          // Keep the existing source validation even when payloads are not
+          // copied to replay. Lazy capture saves materialization/spill, while
+          // the key scan still certifies missing/duplicate RAW identities.
+          for (int64_t d = 0; input_->lazy_raw_ && OB_SUCC(ret) && d < input_->vector_dim_; ++d) {
+            float value;
+            MEMCPY(&value, payload.ptr_ + d * sizeof(float), sizeof(value));
+            if (!std::isfinite(value)) { ret = OB_ERR_UNEXPECTED; }
           }
         }
       }
@@ -469,9 +487,9 @@ int ObIVFMergeCaptureCtx::finish()
     LOG_WARN("IVF capture cannot finish in current state", K(ret), K(is_inited_), K(is_finished_));
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < slices_.count(); ++i) {
-    if (!slices_.at(i)->finished_ || nullptr == slices_.at(i)->replay_
+    if (!slices_.at(i)->finished_ || (!input_->lazy_raw_ && (nullptr == slices_.at(i)->replay_
         || !slices_.at(i)->replay_->is_sealed()
-        || slices_.at(i)->replay_->get_row_count() != slices_.at(i)->locators_.count()) {
+        || slices_.at(i)->replay_->get_row_count() != slices_.at(i)->locators_.count()))) {
       ret = OB_STATE_NOT_MATCH;
       LOG_WARN("IVF capture slice has not finished", K(ret), K(i), K(slices_.count()));
     } else {
@@ -485,7 +503,9 @@ int ObIVFMergeCaptureCtx::finish()
     LOG_WARN("failed to allocate IVF capture RAW counts", K(ret), K(input_->source_tables_.get_count()));
   } else if (OB_FAIL(input_->prior_.segments_.prepare_allocate(input_->source_tables_.get_count()))) {
     LOG_WARN("failed to allocate IVF captured prior segments", K(ret), K(input_->source_tables_.get_count()));
-  } else if (OB_FAIL(input_->locators_.prepare_allocate(count))) {
+  } else if (OB_FAIL(slices_.count() == 1
+      ? input_->locators_.take_over(slices_.at(0)->locators_)
+      : input_->locators_.prepare_allocate(count))) {
     LOG_WARN("failed to allocate sealed IVF locators", K(ret), K(count));
   } else if (OB_FAIL(input_->replay_row_offsets_.prepare_allocate(slices_.count() + 1))) {
     LOG_WARN("failed to allocate IVF replay source offsets", K(ret));
@@ -493,14 +513,15 @@ int ObIVFMergeCaptureCtx::finish()
   int64_t offset = 0;
   for (int64_t i = 0; OB_SUCC(ret) && i < slices_.count(); ++i) {
     ObIVFMergeCaptureSlice &slice = *slices_.at(i);
+    const auto &locators = slices_.count() == 1 ? input_->locators_ : slice.locators_;
     input_->replay_row_offsets_.at(i) = offset;
-    for (int64_t j = 0; OB_SUCC(ret) && j < slice.locators_.count(); ++j) {
-      const ObAsyncIVFSourceLocator &locator = slice.locators_.at(j);
+    for (int64_t j = 0; OB_SUCC(ret) && j < locators.count(); ++j) {
+      const ObAsyncIVFSourceLocator &locator = locators.at(j);
       if (!locator.is_valid()) {
         ret = OB_INVALID_DATA;
         LOG_WARN("invalid captured IVF locator", K(ret), K(i), K(j), K(locator));
       } else {
-        input_->locators_.at(offset + j) = locator;
+        if (slices_.count() != 1) { input_->locators_.at(offset + j) = locator; }
         if ((offset + j) % ObIVFMergeInputAdapter::IVF_CAPTURE_YIELD_INTERVAL == 0 && OB_FAIL(dag_yield())) {
           LOG_WARN("IVF capture locator sealing yield failed", K(ret), K(i), K(j), K(offset));
         }
@@ -509,11 +530,11 @@ int ObIVFMergeCaptureCtx::finish()
     const ObIArray<ObIVFSampleCandidate> &samples = slice.samples_.get_heap_data();
     for (int64_t j = 0; OB_SUCC(ret) && j < samples.count(); ++j) {
       const ObIVFSampleCandidate &candidate = samples.at(j);
-      if (candidate.row_id_ < 0 || candidate.row_id_ >= slice.locators_.count()
-          || slice.locators_.at(candidate.row_id_).vid_ != candidate.vid_) {
+      if (candidate.row_id_ < 0 || candidate.row_id_ >= locators.count()
+          || locators.at(candidate.row_id_).vid_ != candidate.vid_) {
         ret = OB_INVALID_DATA;
         LOG_WARN("IVF sample does not match captured locator", K(ret), K(i), K(j), K(candidate.row_id_),
-            K(candidate.vid_), K(slice.locators_.count()));
+            K(candidate.vid_), K(locators.count()));
       } else if (OB_FAIL(offer_ivf_sample_candidate(input_->sample_heap_, input_->max_sample_count_,
           input_->sample_seed_, candidate.vid_, 0, offset + candidate.row_id_))) {
         LOG_WARN("failed to combine IVF samples", K(ret));
@@ -525,11 +546,20 @@ int ObIVFMergeCaptureCtx::finish()
       input_->prior_.segments_.at(range.table_idx_).live_vector_count_ += range.live_count_;
       scanned_count += range.scanned_count_;
     }
-    offset += slice.locators_.count();
+    offset += locators.count();
+    if (OB_SUCC(ret)) { slice.locators_.reset(); }
   }
   if (OB_SUCC(ret)) { input_->replay_row_offsets_.at(slices_.count()) = offset; }
   for (int64_t i = 0; OB_SUCC(ret) && i < input_->source_tables_.get_count(); ++i) {
-    if (!static_cast<ObSSTable *>(input_->source_tables_.get_table(i))->is_empty() && raw_counts.at(i) == 0) {
+    const auto *table = static_cast<const ObIvfSSTable *>(input_->source_tables_.get_table(i));
+    if (input_->metadata_counts_valid_ && !table->is_empty()
+        && input_->prior_.segments_.at(i).live_vector_count_ != table->get_ivf_meta().vector_count_) {
+      input_->metadata_counts_valid_ = false;
+      LOG_INFO("IVF vector metadata requires scan-count fallback", K(i),
+          "metadata_count", table->get_ivf_meta().vector_count_,
+          "captured_count", input_->prior_.segments_.at(i).live_vector_count_);
+    }
+    if (!table->is_empty() && raw_counts.at(i) == 0) {
       ret = OB_INVALID_DATA;
       LOG_WARN("non-empty IVF input contains no RAW vectors", K(ret), K(i));
     } else if (input_->prior_.dominant_segment_ < 0 || input_->prior_.segments_.at(i).live_vector_count_
@@ -546,7 +576,8 @@ int ObIVFMergeCaptureCtx::finish()
     }
   }
   LOG_INFO("captured IVF merge input", K(ret), "input_table_count", input_ == nullptr ? 0 : input_->source_tables_.get_count(),
-      "scanned_row_count", scanned_count, "vector_count", count, "replay_capture", true,
+      "scanned_row_count", scanned_count, "vector_count", count,
+      "replay_capture", input_ != nullptr && !input_->lazy_raw_,
       "capture_task_count", slices_.count(), "seal_us", ObTimeUtility::current_time() - begin_ts);
   if (OB_SUCC(ret)) {
     is_finished_ = true;

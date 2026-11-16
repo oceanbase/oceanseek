@@ -649,6 +649,10 @@ int ObIVFDDLDagCtx::create_writer_(
     LOG_WARN("failed to allocate IVF DDL writer", K(ret), K(slice_idx));
   } else if (OB_FAIL(macro_writer->init(param))) {
     LOG_WARN("failed to initialize IVF DDL writer", K(ret), K(slice_idx));
+  } else if (slice_idx > 0 && slice_idx <= ObIVFMergeProcessor::MAX_POSTING_TASK_COUNT
+      && OB_FAIL(macro_writer->set_ivf_posting_counts(sstable_writer_->get_leaf_posting_counts(),
+          sstable_writer_->get_ivf_meta().leaf_cid_base()))) {
+    LOG_WARN("failed to set IVF DDL posting counts", K(ret), K(slice_idx));
   } else {
     writer = macro_writer;
     macro_writer = nullptr;
@@ -678,11 +682,12 @@ int ObIVFDDLDagCtx::create_raw_writer(
 }
 
 int ObIVFDDLDagCtx::create_posting_writer(
-    const int64_t task_idx, ObITabletSliceWriter *&writer)
+    const int64_t task_idx, const int64_t cid_begin, const int64_t cid_end, ObITabletSliceWriter *&writer)
 {
   int ret = OB_SUCCESS;
   writer = nullptr;
-  if (task_idx < 0 || task_idx >= ObIVFMergeProcessor::MAX_POSTING_TASK_COUNT) {
+  if (!runtime_initialized_ || cid_begin < 0 || cid_end <= cid_begin || task_idx < 0
+      || task_idx >= ObIVFMergeProcessor::MAX_POSTING_TASK_COUNT) {
     ret = OB_INVALID_ARGUMENT;
   } else {
     ret = create_writer_(task_idx + 1, writer);

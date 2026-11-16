@@ -17,6 +17,9 @@
 #include "share/vector_type/ob_vector_common_util.h"
 #include "share/vector_type/ob_vector_add.h"
 #include "share/vector_type/ob_vector_div.h"
+#include "share/vector_type/ob_vector_l2_distance.h"
+#include "share/vector_type/ob_vector_soar_distance.h"
+#include "share/vector_index/hca/ob_vector_hca_common.h"
 #include "share/scheduler/ob_tenant_dag_scheduler.h"
 #include <cmath>
 
@@ -50,12 +53,14 @@ int ObDiskBBQAlgorithm::assign_one(
     const share::ObVectorIndexDistAlgorithm distance,
     const float *vector,
     common::ObIAllocator &scratch_allocator,
-    int64_t &cid)
+    int64_t &cid,
+    int64_t &secondary_cid)
 {
   int ret = OB_SUCCESS;
   const float *assignment_vector = vector;
   float *normalized_vector = nullptr;
   cid = -1;
+  secondary_cid = -1;
   if (OB_UNLIKELY(centers.empty() || dim <= 0
       || distance >= share::VIDA_MAX) || OB_ISNULL(vector)) {
     ret = OB_INVALID_ARGUMENT;
@@ -106,6 +111,50 @@ int ObDiskBBQAlgorithm::assign_one(
     LOG_WARN("invalid Disk BBQ assignment result", K(ret), K(cid),
              "center_count", centers.count());
   }
+  if (OB_SUCC(ret) && centers.count() > 1) {
+    // Keep KMeans' primary assignment and use the same normalized coordinates
+    // for SOAR. RAW and both quantized postings still encode the original vector.
+    const share::ObHcaSoarParam param;
+    const float primary_distance = common::ObVectorL2Distance<float>::l2_square_flt_func(
+        assignment_vector, centers.at(cid), dim);
+    float *residual = nullptr;
+    if (!std::isfinite(primary_distance) || primary_distance <= param.min_primary_distance_) {
+      // SOAR divides by this value. Degenerate residuals keep only primary.
+    } else if (OB_ISNULL(residual = static_cast<float *>(scratch_allocator.alloc(dim * sizeof(float))))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate Disk BBQ SOAR residual", K(ret), K(dim));
+    } else {
+      for (int64_t d = 0; d < dim; ++d) {
+        residual[d] = assignment_vector[d] - centers.at(cid)[d];
+      }
+      float best_distance = FLT_MAX;
+      for (int64_t begin = 0; OB_SUCC(ret) && begin < centers.count(); begin += 4) {
+        float distances[4] = {};
+        const int64_t count = MIN(4, centers.count() - begin);
+        if (4 == count) {
+          common::ObVectorSoarDistance<float>::soar_distance_bulk4(
+              assignment_vector, centers.at(begin), centers.at(begin + 1),
+              centers.at(begin + 2), centers.at(begin + 3), residual, dim,
+              param.lambda_, primary_distance, distances);
+        } else {
+          for (int64_t j = 0; j < count; ++j) {
+            distances[j] = common::ObVectorSoarDistance<float>::soar_distance(
+                assignment_vector, centers.at(begin + j), residual, dim,
+                param.lambda_, primary_distance);
+          }
+        }
+        for (int64_t j = 0; OB_SUCC(ret) && j < count; ++j) {
+          if (begin + j == cid) {
+          } else if (!std::isfinite(distances[j])) {
+            // Finite input can still overflow the squared projection term.
+          } else if (secondary_cid < 0 || distances[j] < best_distance) {
+            secondary_cid = begin + j;
+            best_distance = distances[j];
+          }
+        }
+      }
+    }
+  }
   return ret;
 }
 
@@ -118,6 +167,7 @@ int ObDiskBBQAlgorithm::build_rows_with_centers(
     quantization::ObQuantizationEncoder &encoder,
     ObIVFBuildRowSink &row_sink,
     int64_t &materialized_vector_count,
+    int64_t &posting_count,
     share::ObIVFRefreshProgress *progress)
 {
   int ret = OB_SUCCESS;
@@ -128,6 +178,7 @@ int ObDiskBBQAlgorithm::build_rows_with_centers(
   common::ObArray<uint32_t, common::ObWrapperAllocator> counts;
   counts.set_block_allocator(common::ObWrapperAllocator(centroid_allocator));
   materialized_vector_count = 0;
+  posting_count = 0;
   if (nullptr != progress) {
     progress->begin_stage(share::ObIVFRefreshProgress::ASSIGN_ENCODE);
     progress->set_total(share::ObIVFRefreshProgress::ASSIGN_ENCODE, replay_input.get_row_count());
@@ -173,12 +224,11 @@ int ObDiskBBQAlgorithm::build_rows_with_centers(
       LOG_WARN("failed to read Disk BBQ input for materialization", K(ret));
     } else {
       int64_t cid = -1;
+      int64_t secondary_cid = -1;
       scratch_allocator.reuse();
       if (OB_FAIL(assign_one(centers, dim, distance, vector,
-                             scratch_allocator, cid))) {
+                             scratch_allocator, cid, secondary_cid))) {
         LOG_WARN("failed to assign Disk BBQ source vector", K(ret), K(vid));
-      } else if (OB_FAIL(blocksstable::ObIvfCentroidPayload::add_child_count(counts.at(cid), 1))) {
-        LOG_WARN("IVF refresh child count overflow", K(ret), K(cid));
       } else {
         uint8_t *code = static_cast<uint8_t *>(
             scratch_allocator.alloc_align(encoder.code_size(), alignof(float)));
@@ -186,35 +236,41 @@ int ObDiskBBQAlgorithm::build_rows_with_centers(
           ret = OB_ALLOCATE_MEMORY_FAILED;
           LOG_WARN("failed to allocate Disk BBQ RABITQ buffers", K(ret));
         }
-        if (OB_FAIL(ret)) {
-        } else if (OB_FAIL(encoder.encode(
-                       vector, centers.at(cid),
-                       {code, encoder.code_size()}))) {
-          LOG_WARN("failed to encode Disk BBQ RABITQ posting", K(ret),
-                   K(cid), K(vid));
-        } else {
-          ObIVFBuildRow row;
-          row.row_type_ =
-              blocksstable::IVF_ROW_TYPE_LOW_PRECISION_VECTOR;
-          row.cid_ = cid + 1;
-          row.vid_ = vid;
-          row.payload_.assign_ptr(reinterpret_cast<const char *>(code),
-                                  encoder.code_size());
-          if (OB_FAIL(row_sink.append_row(row))) {
-            LOG_WARN("failed to emit Disk BBQ RABITQ posting", K(ret), K(row));
+        const int64_t cids[] = {cid, secondary_cid};
+        for (int64_t i = 0; OB_SUCC(ret) && i < ARRAYSIZEOF(cids); ++i) {
+          if (cids[i] < 0) {
+          } else if (OB_UNLIKELY(posting_count == INT64_MAX)) {
+            ret = OB_SIZE_OVERFLOW;
+            LOG_WARN("IVF refresh posting count overflow", K(ret));
+          } else if (OB_FAIL(blocksstable::ObIvfCentroidPayload::add_child_count(counts.at(cids[i]), 1))) {
+            LOG_WARN("IVF refresh child count overflow", K(ret), K(cids[i]));
+          } else if (OB_FAIL(encoder.encode(vector, centers.at(cids[i]), {code, encoder.code_size()}))) {
+            LOG_WARN("failed to encode Disk BBQ RABITQ posting", K(ret), K(cids[i]), K(vid));
           } else {
-            row.row_type_ = blocksstable::IVF_ROW_TYPE_RAW_VECTOR;
-            row.cid_ = blocksstable::IVF_RAW_VECTOR_CID;
+            ObIVFBuildRow row;
+            row.row_type_ = blocksstable::IVF_ROW_TYPE_LOW_PRECISION_VECTOR;
+            row.cid_ = cids[i] + 1;
             row.vid_ = vid;
-            row.payload_.assign_ptr(reinterpret_cast<const char *>(vector),
-                                    vector_payload_size);
+            row.payload_.assign_ptr(reinterpret_cast<const char *>(code), encoder.code_size());
             if (OB_FAIL(row_sink.append_row(row))) {
-              LOG_WARN("failed to emit Disk BBQ full-precision vector", K(ret), K(row));
+              LOG_WARN("failed to emit Disk BBQ RABITQ posting", K(ret), K(row));
             } else {
-              ++materialized_vector_count;
-              if (nullptr != progress && 0 == materialized_vector_count % 1024) {
-                progress->add_completed(share::ObIVFRefreshProgress::ASSIGN_ENCODE, 1024);
-              }
+              ++posting_count;
+            }
+          }
+        }
+        if (OB_SUCC(ret)) {
+          ObIVFBuildRow row;
+          row.row_type_ = blocksstable::IVF_ROW_TYPE_RAW_VECTOR;
+          row.cid_ = blocksstable::IVF_RAW_VECTOR_CID;
+          row.vid_ = vid;
+          row.payload_.assign_ptr(reinterpret_cast<const char *>(vector), vector_payload_size);
+          if (OB_FAIL(row_sink.append_row(row))) {
+            LOG_WARN("failed to emit Disk BBQ full-precision vector", K(ret), K(row));
+          } else {
+            ++materialized_vector_count;
+            if (nullptr != progress && 0 == materialized_vector_count % 1024) {
+              progress->add_completed(share::ObIVFRefreshProgress::ASSIGN_ENCODE, 1024);
             }
           }
         }
@@ -350,10 +406,12 @@ int ObDiskBBQAlgorithm::build(
     blocksstable::ObIvfSSTableMeta &ivf_meta,
     int64_t &effective_center_count,
     int64_t &valid_vector_count,
+    int64_t &posting_count,
     share::ObIVFRefreshProgress *progress)
 {
   int ret = OB_SUCCESS;
   effective_center_count = 0;
+  posting_count = 0;
   valid_vector_count = replay_input.get_row_count();
   // Refresh produces a small FLAT segment; later merge/rebuild decides whether
   // its final leaf centers need a persistent parent routing layer.
@@ -525,7 +583,7 @@ int ObDiskBBQAlgorithm::build(
                    tenant_id, dim,
                    schema_ctx.get_vector_param().dist_algorithm_, centers,
                    replay_input, encoder, row_sink,
-                   materialized_vector_count, progress))) {
+                   materialized_vector_count, posting_count, progress))) {
       LOG_WARN("failed to materialize Disk BBQ physical rows", K(ret),
                K(valid_vector_count), K(effective_center_count));
     } else if (OB_UNLIKELY(materialized_vector_count != valid_vector_count)) {

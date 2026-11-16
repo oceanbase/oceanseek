@@ -18,7 +18,9 @@ namespace blocksstable
 class ObIvfMacroBlockWriter : public ObMacroBlockWriter
 {
 public:
-  ObIvfMacroBlockWriter();
+  // Pack small posting lists across CIDs at the schema target. Larger lists
+  // use a byte-based adaptive target, bounded by the storage/encoder limit.
+  explicit ObIvfMacroBlockWriter(int64_t posting_micro_block_size_limit = INT64_MAX);
   virtual ~ObIvfMacroBlockWriter();
   virtual void reset() override;
   int open(
@@ -47,16 +49,34 @@ public:
       const ObBatchDatumRows &datum_rows,
       const ObMacroBlockDesc *curr_macro_desc = nullptr) override;
   int flush_micro_block();
+  // Borrow counts through close/reset. Entries are indexed by storage CID
+  // minus first_cid, and include secondary postings. No cardinality prepass.
+  int set_posting_counts(const common::ObIArray<uint32_t> &counts, int64_t first_cid);
   int64_t get_appended_row_count() const { return appended_row_count_; }
 private:
   int inner_append_row(
       const ObDatumRow &row,
       const ObMacroBlockDesc *curr_macro_desc);
   int inner_flush_micro_block();
+  int64_t posting_size_limit() const;
+  int64_t get_posting_count(int64_t cid) const;
+  int64_t estimate_posting_target(int64_t row_count, int64_t row_size) const;
+  int64_t update_posting_target(const ObDatumRow &row, int64_t cid);
 private:
   ObIvfSSTableRowDesc row_desc_;
+  // Only the soft micro-block target varies; shared schema/physical identity
+  // remain borrowed from the caller for the lifetime of this writer.
+  ObDataStoreDesc ivf_data_store_desc_;
+  int64_t schema_micro_block_size_;
   int64_t previous_row_type_;
+  int64_t previous_posting_cid_;
   int64_t appended_row_count_;
+  const common::ObIArray<uint32_t> *posting_counts_;
+  int64_t first_posting_cid_;
+  int64_t posting_split_size_;
+  int64_t posting_cluster_payload_bytes_;
+  bool posting_cluster_is_large_;
+  const int64_t posting_micro_block_size_limit_;
 };
 
 } // namespace blocksstable

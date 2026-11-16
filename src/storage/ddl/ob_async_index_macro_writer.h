@@ -51,6 +51,10 @@ public:
   int append_row(const blocksstable::ObDatumRow &row) override;
   int append_batch(const blocksstable::ObBatchDatumRows &batch_rows) override;
   int64_t get_row_count() const override { return row_count_; }
+  int set_ivf_posting_counts(const common::ObIArray<uint32_t> &counts, int64_t first_cid)
+  {
+    return !is_disk_bbq_writer_ ? OB_STATE_NOT_MATCH : ivf_writer_.set_posting_counts(counts, first_cid);
+  }
   bool is_nested_key_aggregation_enabled() const
   {
     return inv_idx_row_desc_.nested_key_col_idx_ >= 0;

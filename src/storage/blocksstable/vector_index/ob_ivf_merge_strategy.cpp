@@ -79,16 +79,48 @@ ERRSIM_POINT_DEF(ERRSIM_IVF_FORCE_FULL_REBUILD, "When set, select full rebuild f
 ERRSIM_POINT_DEF(ERRSIM_IVF_FORCE_CONCAT, "When set, select concatenation for IVF compaction with reusable priors.");
 ERRSIM_POINT_DEF(ERRSIM_IVF_FORCE_INSERTION, "When set, select insertion for IVF compaction with complete membership.");
 
-bool ObIVFMergeStrategy::should_capture_prior(const int64_t vector_count, const int64_t cluster_size)
+bool ObIVFMergeStrategy::is_force_event_armed(const common::NamedEventItem &event)
 {
   // Inspect configuration without consuming occur or sampling frequency. Only
   // select() triggers the injection; even a one-shot selection needs priors.
-  const auto armed = [](const common::NamedEventItem &event) {
-    return event.item_.error_code_ != OB_SUCCESS
-        && (event.item_.occur_ > 0 || event.item_.trigger_freq_ > 0);
-  };
+  return event.item_.error_code_ != OB_SUCCESS
+      && (event.item_.occur_ > 0 || event.item_.trigger_freq_ > 0);
+}
+
+bool ObIVFMergeStrategy::should_capture_prior(const int64_t vector_count, const int64_t cluster_size)
+{
   return vector_count / SMALL_INPUT_CLUSTER_COUNT >= cluster_size
-      || OB_UNLIKELY(armed(ERRSIM_IVF_FORCE_CONCAT) || armed(ERRSIM_IVF_FORCE_INSERTION));
+      || OB_UNLIKELY(is_force_event_armed(ERRSIM_IVF_FORCE_CONCAT)
+          || is_force_event_armed(ERRSIM_IVF_FORCE_INSERTION));
+}
+
+bool ObIVFMergeStrategy::can_select_from_metadata()
+{
+  return !is_force_event_armed(ERRSIM_IVF_FORCE_FULL_REBUILD)
+      && !is_force_event_armed(ERRSIM_IVF_FORCE_CONCAT)
+      && !is_force_event_armed(ERRSIM_IVF_FORCE_INSERTION);
+}
+
+int ObIVFMergeStrategy::select_from_counts(int64_t vector_count, int64_t dominant_count,
+    int64_t centroid_count, int64_t dominant_centroid_count, int64_t cluster_size,
+    ObIVFProcessType &process_type)
+{
+  int ret = OB_SUCCESS;
+  process_type = ObIVFProcessType::FULL_REBUILD;
+  if (vector_count <= 0 || dominant_count < 0 || dominant_count > vector_count
+      || centroid_count < 0 || dominant_centroid_count < 0
+      || dominant_centroid_count > centroid_count || cluster_size <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid IVF merge strategy counts", K(ret), K(vector_count), K(dominant_count),
+        K(centroid_count), K(dominant_centroid_count), K(cluster_size));
+  } else if (vector_count / SMALL_INPUT_CLUSTER_COUNT < cluster_size) {
+  } else if (static_cast<double>(dominant_count) / vector_count >= INSERTION_DOMINANT_RATIO
+      && dominant_centroid_count >= MIN_PRIOR_COUNT) {
+    process_type = ObIVFProcessType::INSERTION;
+  } else if (centroid_count >= MIN_PRIOR_COUNT) {
+    process_type = ObIVFProcessType::CONCATENATION;
+  }
+  return ret;
 }
 
 int ObIVFMergeStrategy::select(const ObIVFMergePrior &prior, const int64_t cluster_size,
@@ -107,7 +139,11 @@ int ObIVFMergeStrategy::select(const ObIVFMergePrior &prior, const int64_t clust
     const bool force_rebuild = OB_UNLIKELY(ERRSIM_IVF_FORCE_FULL_REBUILD != OB_SUCCESS);
     const bool force_concat = OB_UNLIKELY(ERRSIM_IVF_FORCE_CONCAT != OB_SUCCESS);
     const bool force_insertion = OB_UNLIKELY(ERRSIM_IVF_FORCE_INSERTION != OB_SUCCESS);
-    const double ratio = static_cast<double>(dominant.live_vector_count_) / prior.vector_count_;
+    ObIVFProcessType candidate = ObIVFProcessType::FULL_REBUILD;
+    if (OB_FAIL(select_from_counts(prior.vector_count_, dominant.live_vector_count_,
+        prior.posting_mass_.count(), dominant.centroid_count_, cluster_size, candidate))) {
+      return ret;
+    }
     // Override heuristics only: malformed or missing algorithm inputs must not
     // silently turn a forced-strategy test into a full rebuild test.
     if (OB_UNLIKELY(force_rebuild + force_concat + force_insertion > 1)) {
@@ -129,15 +165,15 @@ int ObIVFMergeStrategy::select(const ObIVFMergePrior &prior, const int64_t clust
       } else {
         process_type = ObIVFProcessType::INSERTION;
       }
-    } else if (prior.vector_count_ / SMALL_INPUT_CLUSTER_COUNT < cluster_size) {
+    } else if (candidate == ObIVFProcessType::FULL_REBUILD) {
       // Full rebuilding a small selected range does not expand its version range.
-    } else if (ratio >= INSERTION_DOMINANT_RATIO && dominant.centroid_count_ >= MIN_PRIOR_COUNT) {
+    } else if (candidate == ObIVFProcessType::INSERTION) {
       // Insertion retains immutable centers. Missing membership requires a rebuild,
       // never the retired warm-start insertion implementation.
       if (prior.postings_complete_) {
         process_type = ObIVFProcessType::INSERTION;
       }
-    } else if (prior.posting_mass_.count() >= MIN_PRIOR_COUNT && prior.can_concatenate()) {
+    } else if (candidate == ObIVFProcessType::CONCATENATION && prior.can_concatenate()) {
       process_type = ObIVFProcessType::CONCATENATION;
     }
   }

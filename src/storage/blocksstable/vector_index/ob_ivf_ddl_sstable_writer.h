@@ -34,8 +34,8 @@ public:
   { writer = nullptr; return OB_NOT_SUPPORTED; }
   virtual int create_raw_writer(
       const int64_t task_idx, storage::ObITabletSliceWriter *&writer) = 0;
-  virtual int create_posting_writer(int64_t task_idx, storage::ObITabletSliceWriter *&writer)
-  { UNUSED(task_idx); writer = nullptr; return OB_NOT_SUPPORTED; }
+  virtual int create_posting_writer(int64_t task_idx, int64_t cid_begin, int64_t cid_end, storage::ObITabletSliceWriter *&writer)
+  { UNUSEDx(task_idx, cid_begin, cid_end); writer = nullptr; return OB_NOT_SUPPORTED; }
   // The default is for externally owned sinks, such as compaction output.
   virtual void destroy_writer(storage::ObITabletSliceWriter *writer) { UNUSED(writer); }
 };
@@ -112,6 +112,7 @@ public:
   }
   int64_t get_one_bit_code_size() const { return one_bit_code_size_; }
   const ObIvfSSTableMeta &get_ivf_meta() const { return ivf_meta_; }
+  const common::ObIArray<uint32_t> &get_leaf_posting_counts() const { return leaf_posting_counts_; }
 
 private:
   int append_partitioned_rows_(const common::ObIArray<storage::ObIVFBuildRow> &rows);

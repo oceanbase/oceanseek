@@ -110,6 +110,7 @@ ob_set_subtarget(ob_storage blocksstable_vector_index
   blocksstable/vector_index/ob_ivf_merge_strategy.cpp
   blocksstable/vector_index/ob_ivf_ddl_sstable_writer.cpp
   blocksstable/vector_index/ob_ivf_merge_sstable_writer.cpp
+  blocksstable/vector_index/ob_ivf_block_reuse.cpp
   blocksstable/vector_index/ob_ivf_hca_algorithm_adapter.cpp
   blocksstable/vector_index/ob_ivf_merge_capture_pipeline.cpp
   blocksstable/vector_index/ob_ivf_merge_input.cpp

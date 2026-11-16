@@ -11,6 +11,8 @@
 
 namespace oceanbase
 {
+namespace common { struct NamedEventItem; }
+namespace blocksstable { struct ObIVFBlockReuseSource; }
 namespace storage
 {
 class ObIVFEncodedPostingSource;
@@ -43,8 +45,8 @@ struct ObIVFMergePrior
 {
   explicit ObIVFMergePrior(common::ObIAllocator &allocator)
     : dimension_(0), vector_count_(0), covered_vector_count_(0), dominant_segment_(-1),
-      segments_(), centroids_(), old_cids_(), posting_mass_(), postings_(), postings_complete_(false),
-      posting_source_(nullptr)
+      segments_(), centroids_(), old_cids_(), posting_mass_(), postings_(), postings_complete_(false), counts_complete_(false),
+      posting_source_(nullptr), routing_source_(nullptr)
   {
     segments_.set_block_allocator(common::ObWrapperAllocator(allocator));
     centroids_.set_block_allocator(common::ObWrapperAllocator(allocator));
@@ -68,8 +70,11 @@ struct ObIVFMergePrior
   common::ObArray<int64_t, common::ObWrapperAllocator> posting_mass_;
   common::ObArray<ObIVFPriorPosting, common::ObWrapperAllocator> postings_;
   bool postings_complete_;
+  // Counts can be certified from metadata without materializing memberships.
+  bool counts_complete_;
   // Borrowed for the DAG lifetime. Null preserves the original merge path.
   const ObIVFEncodedPostingSource *posting_source_;
+  const blocksstable::ObIVFBlockReuseSource *routing_source_; // Pinned dominant insertion source.
   TO_STRING_KV(K_(dimension), K_(vector_count), K_(covered_vector_count), K_(dominant_segment),
       K_(segments), "prior_count", posting_mass_.count());
 };
@@ -80,8 +85,14 @@ struct ObIVFMergeStrategy
   static constexpr int64_t SMALL_INPUT_CLUSTER_COUNT = 4;
   static constexpr double INSERTION_DOMINANT_RATIO = 0.8;
   static bool should_capture_prior(int64_t vector_count, int64_t cluster_size);
+  static bool can_select_from_metadata();
+  static int select_from_counts(int64_t vector_count, int64_t dominant_count,
+      int64_t centroid_count, int64_t dominant_centroid_count, int64_t cluster_size,
+      ObIVFProcessType &process_type);
   static int select(const ObIVFMergePrior &prior, const int64_t cluster_size,
       ObIVFProcessType &process_type);
+private:
+  static bool is_force_event_armed(const common::NamedEventItem &event);
 };
 
 } // namespace storage

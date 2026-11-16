@@ -65,6 +65,7 @@
 #include "storage/blocksstable/index_block/ob_index_block_macro_iterator.h"
 #include "storage/blocksstable/ob_data_store_desc.h"
 #include "storage/blocksstable/ob_macro_block_writer.h"
+#include "storage/blocksstable/vector_index/ob_ivf_macro_block_writer.h"
 #include "storage/blocksstable/ob_sstable_private_object_cleaner.h"
 #include "storage/blocksstable/ob_storage_cache_suite.h"
 #include "storage/blocksstable/vector_index/ob_ivf_centroid_iterator.h"
@@ -350,7 +351,7 @@ protected:
   TestIVFSSTableWriter()
     : table_param_(allocator_),
       sstable_builder_(false /*use_double_write_buffer*/),
-      corrupt_extended_msb_(false)
+      corrupt_extended_msb_(false), posting_layout_size_(0)
   {}
 
   virtual void SetUp() override
@@ -371,6 +372,7 @@ protected:
     object_cleaner_.reset();
     sstable_.reset();
     corrupt_extended_msb_ = false;
+    posting_layout_size_ = 0;
   }
 
   virtual void TearDown() override
@@ -850,11 +852,18 @@ protected:
       }
     }
 
-    ObMacroBlockWriter base_writer;
-    if (OB_SUCC(ret) && OB_FAIL(open_writer(
-        base_writer, 100, *low_precision_data_desc))) {
-      LOG_WARN("failed to open DiskBBQ low precision vector writer", K(ret));
-    }
+    ObMacroBlockWriter generic_writer;
+    ObIvfMacroBlockWriter cid_writer(posting_layout_size_ > 0 ? posting_layout_size_ : 128L * 1024);
+    ObMacroBlockWriter &base_writer = posting_layout_size_ > 0
+        ? static_cast<ObMacroBlockWriter &>(cid_writer) : generic_writer;
+    if (OB_SUCC(ret) && posting_layout_size_ > 0) {
+      ObIvfSSTableRowDesc rows;
+      ObMacroSeqParam seq; seq.seq_type_ = ObMacroSeqParam::SEQ_TYPE_INC; seq.start_ = 100;
+      ObPreWarmerParam warm(PRE_WARM_TYPE_NONE);
+      if (OB_FAIL(rows.init(IVF_SSTABLE_FORMAT_VERSION))) {
+      } else { ret = cid_writer.open(rows, *low_precision_data_desc, 0, seq, warm, object_cleaner_); }
+    } else if (OB_SUCC(ret)) { ret = open_writer(base_writer, 100, *low_precision_data_desc); }
+    if (OB_FAIL(ret)) { LOG_WARN("failed to open DiskBBQ low precision vector writer", K(ret)); }
     for (int64_t row = 0; OB_SUCC(ret) && row < vector_cnt; ++row) {
       const int64_t source_row = nullptr == low_precision_row_order
           ? row : low_precision_row_order[row];
@@ -1336,6 +1345,7 @@ protected:
   ObIvfSSTable sstable_;
   ObFixedArray<ObColDesc, ObIAllocator> schema_cols_;
   bool corrupt_extended_msb_;
+  int64_t posting_layout_size_; // Zero preserves the historical generic writer in existing fixtures.
 };
 
 

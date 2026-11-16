@@ -77,6 +77,7 @@ public:
   int configure_ddl_runtime(ObIVFDDLHcaAdapter &algorithm, int64_t parallelism);
   int export_centroid_layout(blocksstable::ObIvfCentroidLayout &layout) const;
   bool uses_prior_prefix() const;
+  bool centroid_route_reused() const;
   ObIVFProcessType get_process_type() const;
   virtual int prepare_step(
       const ObIVFMergeStage stage,

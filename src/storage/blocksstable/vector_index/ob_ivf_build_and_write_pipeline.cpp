@@ -29,20 +29,23 @@ namespace
 {
 int calc_ivf_physical_row_count(const int64_t center_count,
                                 const int64_t vector_count,
+                                const int64_t posting_count,
                                 int64_t &row_count)
 {
   int ret = OB_SUCCESS;
   row_count = 0;
-  if (OB_UNLIKELY(center_count < 0 || vector_count < 0)) {
+  if (OB_UNLIKELY(center_count < 0 || vector_count < 0
+      || posting_count < vector_count || posting_count - vector_count > vector_count)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid IVF physical row count input", K(ret),
-             K(center_count), K(vector_count));
-  } else if (OB_UNLIKELY(vector_count > (INT64_MAX - center_count) / 2)) {
+             K(center_count), K(vector_count), K(posting_count));
+  } else if (OB_UNLIKELY(vector_count > INT64_MAX - center_count
+      || posting_count > INT64_MAX - center_count - vector_count)) {
     ret = OB_SIZE_OVERFLOW;
     LOG_WARN("IVF physical row count overflow", K(ret),
-             K(center_count), K(vector_count));
+             K(center_count), K(vector_count), K(posting_count));
   } else {
-    row_count = center_count + 2 * vector_count;
+    row_count = center_count + vector_count + posting_count;
   }
   return ret;
 }
@@ -364,6 +367,7 @@ int ObIVFBuildOperator::execute(
     build_ctx_.ivf_meta_.set_empty();
     build_ctx_.center_count_ = 0;
     build_ctx_.vector_count_ = 0;
+    build_ctx_.posting_count_ = 0;
     if (OB_FAIL(tablet_context->ivf_ctx_->ivf_meta_.assign(
                    build_ctx_.allocator_, build_ctx_.ivf_meta_))) {
       LOG_WARN("failed to persist empty IVF meta in tablet context", K(ret));
@@ -385,7 +389,8 @@ int ObIVFBuildOperator::execute(
                  tablet_context->ivf_ctx_->get_rotator(),
                  build_ctx_.sample_refs_,
                  build_ctx_.sorter_, build_ctx_.ivf_meta_,
-                 build_ctx_.center_count_, build_ctx_.vector_count_, build_ctx_.refresh_monitor_))) {
+                 build_ctx_.center_count_, build_ctx_.vector_count_,
+                 build_ctx_.posting_count_, build_ctx_.refresh_monitor_))) {
     LOG_WARN("failed to build IVF physical rows", K(ret));
   } else if (FALSE_IT(nullptr != build_ctx_.refresh_monitor_
       ? (build_ctx_.refresh_monitor_->set_center_count(build_ctx_.center_count_),
@@ -393,7 +398,7 @@ int ObIVFBuildOperator::execute(
   } else if (OB_FAIL(build_ctx_.sorter_.finish())) {
     LOG_WARN("failed to finish IVF sorter", K(ret));
   } else if (OB_FAIL(calc_ivf_physical_row_count(
-                 build_ctx_.center_count_, build_ctx_.vector_count_,
+                 build_ctx_.center_count_, build_ctx_.vector_count_, build_ctx_.posting_count_,
                  expected_row_count))) {
     LOG_WARN("failed to calculate IVF physical row count", K(ret),
              K(build_ctx_.center_count_), K(build_ctx_.vector_count_));
@@ -401,7 +406,7 @@ int ObIVFBuildOperator::execute(
                          != expected_row_count)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("IVF physical row count violates disk contract", K(ret),
-             K(build_ctx_.center_count_), K(build_ctx_.vector_count_),
+             K(build_ctx_.center_count_), K(build_ctx_.vector_count_), K(build_ctx_.posting_count_),
              K(expected_row_count),
              "row_count", build_ctx_.sorter_.get_row_count());
   } else if (OB_FAIL(tablet_context->ivf_ctx_->ivf_meta_.assign(
@@ -411,7 +416,7 @@ int ObIVFBuildOperator::execute(
     build_ctx_.is_ready_ = true;
     output_chunk = input_chunk;
     LOG_INFO("IVF build operator completed", K(tablet_id_),
-             K(build_ctx_.center_count_), K(build_ctx_.vector_count_),
+             K(build_ctx_.center_count_), K(build_ctx_.vector_count_), K(build_ctx_.posting_count_),
              "row_count", build_ctx_.sorter_.get_row_count());
   }
   if (OB_SUCC(ret) && build_ctx_.is_ready_ && nullptr != tablet_context) {
@@ -482,6 +487,7 @@ int ObIVFWriteMacroOperator::execute(
     ObAsyncIndexMacroWriterAdapter writer;
     if (OB_UNLIKELY(0 != build_ctx_.center_count_
         || 0 != build_ctx_.vector_count_
+        || 0 != build_ctx_.posting_count_
         || !tablet_context->ivf_ctx_->ivf_meta_.is_empty())) {
       ret = OB_STATE_NOT_MATCH;
       LOG_WARN("invalid empty IVF output state", K(ret), K(tablet_id_),
@@ -541,7 +547,7 @@ int ObIVFWriteMacroOperator::execute(
       LOG_WARN("failed to calculate IVF RABITQ payload size", K(ret),
                K(dim), K(build_ctx_.ivf_meta_));
     } else if (OB_FAIL(calc_ivf_physical_row_count(
-                   build_ctx_.center_count_, build_ctx_.vector_count_,
+                   build_ctx_.center_count_, build_ctx_.vector_count_, build_ctx_.posting_count_,
                    expected_row_count))) {
       LOG_WARN("failed to calculate IVF writer row count", K(ret),
                K(build_ctx_.center_count_), K(build_ctx_.vector_count_));
@@ -643,13 +649,13 @@ int ObIVFWriteMacroOperator::execute(
       LOG_WARN("failed to close IVF macro writer", K(ret));
     } else if (OB_SUCC(ret)
                && OB_UNLIKELY(centroid_row_count != build_ctx_.center_count_
-                   || low_precision_vector_row_count != build_ctx_.vector_count_
+                   || low_precision_vector_row_count != build_ctx_.posting_count_
                    || full_precision_vector_row_count != build_ctx_.vector_count_)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("IVF row type counts violate disk contract", K(ret),
                K(centroid_row_count), K(low_precision_vector_row_count),
                K(full_precision_vector_row_count), K(build_ctx_.center_count_),
-               K(build_ctx_.vector_count_));
+               K(build_ctx_.vector_count_), K(build_ctx_.posting_count_));
     } else if (OB_SUCC(ret)
                && OB_UNLIKELY(writer.get_row_count() != expected_row_count
                    || build_ctx_.sorter_.get_row_count() != expected_row_count)) {
@@ -661,7 +667,7 @@ int ObIVFWriteMacroOperator::execute(
     } else if (OB_SUCC(ret)) {
       tablet_context->ivf_ctx_->is_built_ = true;
       LOG_INFO("IVF write operator completed", K(tablet_id_),
-               K(build_ctx_.center_count_), K(build_ctx_.vector_count_),
+               K(build_ctx_.center_count_), K(build_ctx_.vector_count_), K(build_ctx_.posting_count_),
                "row_count", writer.get_row_count());
     }
   }
