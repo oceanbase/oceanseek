@@ -898,6 +898,7 @@ ob_set_subtarget(ob_share object_storage
   object_storage/ob_device_config_mgr.cpp
   object_storage/ob_device_config_parser.cpp
   object_storage/ob_device_connectivity.cpp
+  object_storage/ob_object_storage_connectivity_check.cpp
   object_storage/ob_device_manifest.cpp
   object_storage/ob_device_manifest_task.cpp
   object_storage/ob_zone_storage_table_operation.cpp

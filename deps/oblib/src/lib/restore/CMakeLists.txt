@@ -17,6 +17,7 @@ oblib_add_library(restore OBJECT
   hdfs/ob_storage_hdfs_jni_base.cpp
   hdfs/ob_storage_hdfs_jni_base.h
   ob_object_device.cpp
+  ob_storage_condition_put_probe.cpp
   hmac_signature.cpp
   ob_object_device.h
   ob_object_storage_base.cpp

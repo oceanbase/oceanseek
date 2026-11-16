@@ -5,6 +5,7 @@
 
 #include "ob_admin_test_io_device_executor.h"
 #include "deps/oblib/src/lib/restore/ob_object_storage_base.h"
+#include "deps/oblib/src/lib/time/ob_time_utility.h"
 #include "src/logservice/archiveservice/ob_archive_file_utils.h"
 #include "src/share/io/ob_io_manager.h"
 #include "src/share/ob_device_manager.h"
@@ -16,6 +17,8 @@ namespace oceanbase {
 namespace tools {
 ObAdminTestIODeviceExecutor::ObAdminTestIODeviceExecutor() 
   : is_quiet_(false), 
+    is_old_test_(false),
+    is_test_if_match_(false),
     test_id_(1),
     allocator_()
 {
@@ -54,8 +57,10 @@ int ObAdminTestIODeviceExecutor::execute(int argc, char *argv[])
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(parse_cmd_(argc, argv))) {
-    OB_LOG(WARN, "failed to parse cmd", K(ret), K(argc), K(argv));
+    OB_LOG(WARN, "failed to parse cmd", K(ret), K(argc));
   } else {
+    printf("Test directory: %s\n\n", backup_path_);
+    fflush(stdout);
     lib::set_memory_limit(4 * 1024 * 1024 * 1024LL);
     lib::set_tenant_memory_limit(500, 4 * 1024 * 1024 * 1024LL);
 
@@ -91,7 +96,7 @@ int ObAdminTestIODeviceExecutor::execute(int argc, char *argv[])
     ObObjectStorageTenantGuard timeout_guard(OB_SERVER_TENANT_ID, IO_TIMEOUT_MS * 1000LL);
 
     if(OB_FAIL(ret)) {
-    } else if (OB_FAIL(run_all_tests_())) {
+    } else if (OB_FAIL(is_old_test_ ? run_all_tests_() : run_new_tests_())) {
       STORAGE_LOG(ERROR, "failed to pass all tests", K(ret), K_(backup_path));
     }
   }
@@ -103,30 +108,56 @@ int ObAdminTestIODeviceExecutor::parse_cmd_(int argc, char *argv[])
   int ret = OB_SUCCESS;
   int opt = 0;
   int index = -1;
-  const char *opt_str = "hd:s:q:e:f:i:a";
+  const int OLD_TEST_MODE = 1000;
+  const int IF_MATCH_TEST = 1001;
+  const int S3_SDK_MODE = 1002;
+  bool is_obdal_requested = false;
+  bool is_s3sdk_requested = false;
+  const char *opt_str = "hd:s:qe:f:i:a";
   struct option longopts[] = {{"help", 0, NULL, 'h'},
+      {"backup-file-path", 1, NULL, 'd'},
       {"backup_path", 1, NULL, 'd'},
+      {"storage-info", 1, NULL, 's'},
       {"storage_info", 1, NULL, 's'},
-      {"quiet", 0, NULL, 'q' },
-      {"s3_url_encode_type", 0, NULL, 'e'},
-      {"trigger_freq", 0, NULL, 'f'}, // used for internal testing only
-      {"sts_credential", 0, NULL, 'i'},
+      {"quiet", 0, NULL, 'q'},
+      {"s3-url-encode-type", 1, NULL, 'e'},
+      {"s3_url_encode_type", 1, NULL, 'e'},
+      {"trigger_freq", 1, NULL, 'f'}, // used for internal testing only
+      {"sts-credential", 1, NULL, 'i'},
+      {"sts_credential", 1, NULL, 'i'},
+      {"enable-obdal", 0, NULL, 'a'},
       {"enable_obdal", 0, NULL, 'a'},
+      {"s3sdk", 0, NULL, S3_SDK_MODE},
+      {"old", 0, NULL, OLD_TEST_MODE},
+      {"if-match", 0, NULL, IF_MATCH_TEST},
       {NULL, 0, NULL, 0}};
-  ObClusterStateBaseMgr::get_instance().set_enable_obdal(false);
-  while (OB_SUCC(ret) && -1 != (opt = getopt_long(argc, argv, opt_str, longopts, &index))) {
+  ObClusterStateBaseMgr::get_instance().set_enable_obdal(true);
+  optind = 1;
+  while (OB_SUCC(ret) && -1 != (opt = getopt_long(argc - 1, argv + 1, opt_str, longopts, &index))) {
     switch (opt) {
+      case S3_SDK_MODE: {
+        is_s3sdk_requested = true;
+        break;
+      }
+      case OLD_TEST_MODE: {
+        is_old_test_ = true;
+        break;
+      }
+      case IF_MATCH_TEST: {
+        is_test_if_match_ = true;
+        break;
+      }
       case 'h': {
         ret = OB_INVALID_ARGUMENT;
-        print_usage_();
         break;
       }
       case 'd': {
-        time_t timestamp = time(NULL);
-        struct tm *timeinfo = localtime(&timestamp);
-        char buffer[OB_MAX_TIME_STR_LENGTH];
-        strftime(buffer, sizeof(buffer), "%Y-%m-%d-%H:%M:%S", timeinfo);
-        if (OB_FAIL(databuff_printf(backup_path_, sizeof(backup_path_), "%s%s", optarg, buffer))) {
+        const int64_t parent_path_len = STRLEN(optarg);
+        if (0 == parent_path_len) {
+          ret = OB_INVALID_ARGUMENT;
+          fprintf(stderr, "Error: -d/--backup-file-path must not be empty.\n\n");
+        } else if (OB_FAIL(databuff_printf(backup_path_, sizeof(backup_path_), "%s%stest_io_device_%ld",
+            optarg, '/' == optarg[parent_path_len - 1] ? "" : "/", ObTimeUtility::current_time()))) {
           STORAGE_LOG_FILTER(ERROR, "failed to databuff printf", K(ret));
         }
         break;
@@ -168,15 +199,44 @@ int ObAdminTestIODeviceExecutor::parse_cmd_(int argc, char *argv[])
         break;
       }
       case 'a': {
-        ObClusterStateBaseMgr::get_instance().set_enable_obdal(true);
+        is_obdal_requested = true;
         break;
       }
       default: {
         ret = OB_INVALID_ARGUMENT;
-        print_usage_();
         break;
       }
     }
+  }
+  ObStorageType storage_type = OB_STORAGE_MAX_TYPE;
+  if (OB_SUCC(ret)) {
+    if (is_obdal_requested && is_s3sdk_requested) {
+      ret = OB_INVALID_ARGUMENT;
+      fprintf(stderr, "Error: --s3sdk cannot be combined with -a/--enable-obdal.\n\n");
+    } else if (is_old_test_ && is_test_if_match_) {
+      ret = OB_INVALID_ARGUMENT;
+      fprintf(stderr, "Error: --if-match is available only in the new test flow.\n\n");
+    } else if ('\0' == backup_path_[0]) {
+      ret = OB_INVALID_ARGUMENT;
+      fprintf(stderr, "Error: -d/--backup-file-path is required.\n\n");
+    } else if (optind < argc - 1) {
+      ret = OB_INVALID_ARGUMENT;
+      fprintf(stderr, "Error: unexpected positional arguments.\n\n");
+    } else if (OB_FAIL(get_storage_type_from_path(backup_path_, storage_type))) {
+      fprintf(stderr, "Error: unsupported storage URI.\n\n");
+    } else if (is_s3sdk_requested && OB_STORAGE_S3 != storage_type) {
+      ret = OB_INVALID_ARGUMENT;
+      fprintf(stderr, "Error: --s3sdk requires an s3:// URI.\n\n");
+    } else if (OB_STORAGE_FILE != storage_type && OB_STORAGE_HDFS != storage_type && '\0' == storage_info_[0]) {
+      ret = OB_INVALID_ARGUMENT;
+      fprintf(stderr, "Error: -s/--storage-info is required for object storage.\n\n");
+    }
+  }
+  if (OB_FAIL(ret)) {
+    print_usage_();
+  } else {
+    ObClusterStateBaseMgr::get_instance().set_enable_obdal(!is_s3sdk_requested);
+    ObClusterStateBaseMgr::get_instance().set_enable_object_storage_async_io(!is_s3sdk_requested);
   }
   return ret;
 }
@@ -482,14 +542,14 @@ int ObAdminTestIODeviceExecutor::test_clean_backup_file_()
   } else if (OB_FAIL(databuff_printf(check_file_path, OB_MAX_URI_LENGTH, "%s%s",
                      check_file_dir_path, check_file_name))) {
     STORAGE_LOG_FILTER(ERROR, "fail to databuff printf", K(ret));
-  } else if (OB_FAIL(util.del_file(check_file_path, &storage_info))) {
+  } else if (is_old_test_ && OB_FAIL(util.del_file(check_file_path, &storage_info))) {
     STORAGE_LOG_FILTER(ERROR, "failed to del normal check file", K(ret), K(check_file_path));
   } else if (OB_FAIL(databuff_printf(appendable_check_file_path, OB_MAX_URI_LENGTH, "%s%s",
                      check_file_dir_path, appendable_check_file_name))) {
     STORAGE_LOG_FILTER(ERROR, "fail to databuff printf", K(ret));
-  } else if (OB_FAIL(util.del_file(appendable_check_file_path, &storage_info))) {
+  } else if (is_old_test_ && OB_FAIL(util.adaptively_del_file(appendable_check_file_path, &storage_info))) {
     STORAGE_LOG_FILTER(ERROR, "failed to del appendable check file", K(ret), K(appendable_check_file_path));
-  } else if (OB_FAIL(util.del_dir(check_file_dir_path, &storage_info))) {
+  } else if (is_old_test_ && OB_FAIL(util.del_dir(check_file_dir_path, &storage_info))) {
     STORAGE_LOG_FILTER(ERROR, "failed to del check file dir", K(ret), K(check_file_dir_path));
   } else { // remove the whole test dir
     if (ObStorageType::OB_STORAGE_FILE == storage_info.get_type()) {
@@ -822,35 +882,74 @@ int ObAdminTestIODeviceExecutor::test_consume_clog_file_()
 
 int ObAdminTestIODeviceExecutor::print_usage_()
 {
-  int ret = OB_SUCCESS;
-  printf("\n");
-  printf("Usage: test_io_device command [command args] [options]\n");
-  printf("commands:\n");
-  printf(HELP_FMT, "-h,--help", "display this message.");
-  printf("options:\n");
-  printf(HELP_FMT, "-d,--backup-file-path", "absolute backup file path with file prefix");
-  printf(HELP_FMT, "-s,--storage-info", "s3 should provide storage info");
-  printf(HELP_FMT, "-i, --sts_credential", "set STS credential");
-  printf(HELP_FMT, "-e,--s3_url_encode_type", "set S3 protocol url encode type");
-  printf(HELP_FMT, "-a", "enable obdal");
-  printf("samples:\n");
-  printf("  test nfs device: \n");
-  printf("\tob_admin test_io_device -dfile:///home/admin/backup_info \n");
-  printf("  test object device: \n");
-  printf("\tob_admin test_io_device -d's3://home/admin/backup_info' "
-         "-s'host=xxx.com&access_id=111&access_key=222'\n");
-  printf("\tob_admin test_io_device -d's3://home/admin/backup_info' "
-         "-s'host=xxx.com&access_id=111&access_key=222&appid=333'\n");
-  printf("\tob_admin test_io_device -d's3://home/admin/backup_info' "
-         "-s'host=xxx.com&role_arn=xxx&appid=333'\n"
-         "-i'sts_url=xxx&sts_ak=aaa&sts_sk=bbb'");
-  printf("\tob_admin test_io_device -d's3://home/admin/backup_info' "
-         "-s'host=xxx.com&role_arn=xxx&external_id=xxx&appid=333'\n"
-         "-i'sts_url=xxx&sts_ak=aaa&sts_sk=bbb'");
-  printf("\tob_admin test_io_device -d's3://home/admin/backup_info' "
-         "-s'host=xxx.com&access_id=111&access_key=222&region=333'\n"
-         "-e'compliantRfc3986Encoding'");
-  return ret;
+  printf(
+      "Usage: ob_admin test_io_device -d <parent-uri> [-s '<key=value&...>'] [options]\n"
+      "\n"
+      "Test groups:\n"
+      "  Basic connectivity, shared storage (sync/async), backup and restore,\n"
+      "  and optional if-match checks. Use --old for the original seven groups.\n"
+      "\n"
+      "Options:\n"
+      "  -h, --help                     Show this help and exit.\n"
+      "  -d, --backup-file-path <uri>    Required parent directory for the test files.\n"
+      "                                 Creates test_io_device_<timestamp> below this URI.\n"
+      "                                 The timestamp is in microseconds; the URI is printed before testing.\n"
+      "  -s, --storage-info <key=value&...>\n"
+      "                                 Object storage configuration; quote the entire value.\n"
+      "  --old                          Run the original seven test groups.\n"
+      "  --if-match                     Probe optional if-match write support.\n"
+      "  --s3sdk                        Use the S3 SDK for synchronous S3 access.\n"
+      "  -a, --enable-obdal             Use OBDAL (default; retained for compatibility).\n"
+      "  -q, --quiet                    Limit file logging to WARN and ERROR.\n"
+      "  -i, --sts-credential <key=value&...>\n"
+      "                                 STS service credentials for role_arn authentication.\n"
+      "  -e, --s3-url-encode-type <type> S3 SDK only: default or compliantRfc3986Encoding.\n"
+      "\n"
+      "  --s3sdk and -a/--enable-obdal are mutually exclusive.\n"
+      "  Async checks are skipped with --s3sdk; optional if-match checks use OBDAL.\n"
+      "  Legacy aliases: --backup_path, --storage_info, --enable_obdal,\n"
+      "                  --sts_credential, --s3_url_encode_type.\n"
+      "\n"
+      "Storage info (-s):\n"
+      "  Separate fields with '&'. FILE paths do not require -s.\n"
+      "  S3 and S3-compatible services (s3://bucket/prefix):\n"
+      "    host=<endpoint>              Required service endpoint.\n"
+      "    access_id=<id>               Required access key ID for key authentication.\n"
+      "    access_key=<key>             Required secret access key for key authentication.\n"
+      "    s3_region=<region>           Optional S3 signing region.\n"
+      "    addressing_model=<model>     virtual_hosted_style (default) or path_style.\n"
+      "    checksum_type=<type>         no_checksum (default), md5 or crc32.\n"
+      "    delete_mode=<mode>           delete (default) or tagging.\n"
+      "    put_mode=<mode>              none (default); auto and if-match require OBDAL.\n"
+      "    role_arn=<arn>               Use STS instead of access_id/access_key; requires -i.\n"
+      "    external_id=<id>             Optional external ID for role_arn authentication.\n"
+      "  Azure Blob (azblob://container/prefix):\n"
+      "    host, access_id, access_key  Endpoint, account name and account key.\n"
+      "    checksum_type=<type>         no_checksum (default) or md5.\n"
+      "  STS credentials (-i):\n"
+      "    sts_url=<url>&sts_ak=<id>&sts_sk=<key>\n"
+      "\n"
+      "Examples:\n"
+      "  FILE / NFS:\n"
+      "    ob_admin test_io_device -d 'file:///home/admin/backup'\n"
+      "\n"
+      "  S3 with OBDAL (default):\n"
+      "    ob_admin test_io_device -d 's3://bucket/backup' \\\n"
+      "      -s 'host=endpoint.example.com&access_id=<ak>&access_key=<sk>'\n"
+      "\n"
+      "  S3 SDK:\n"
+      "    ob_admin test_io_device --s3sdk -d 's3://bucket/backup' \\\n"
+      "      -s 'host=endpoint.example.com&access_id=<ak>&access_key=<sk>'\n"
+      "\n"
+      "  Optional if-match checks:\n"
+      "    ob_admin test_io_device --if-match -d 's3://bucket/backup' \\\n"
+      "      -s 'host=endpoint.example.com&access_id=<ak>&access_key=<sk>'\n"
+      "\n"
+      "  STS authentication:\n"
+      "    ob_admin test_io_device -d 's3://bucket/backup' \\\n"
+      "      -s 'host=endpoint.example.com&role_arn=<arn>&external_id=<id>' \\\n"
+      "      -i 'sts_url=<url>&sts_ak=<ak>&sts_sk=<sk>'\n");
+  return OB_SUCCESS;
 }
 
 }   //tools 

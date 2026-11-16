@@ -4,6 +4,7 @@
  */
 
 #include "ob_object_device.h"
+#include "lib/restore/ob_storage_condition_put_probe.h"
 #include "lib/restore/ob_object_storage_base.h"
 
 namespace oceanbase
@@ -1127,75 +1128,13 @@ int ObObjectDevice::pread(const ObIOFd &fd, const int64_t offset, const int64_t 
   return ret;
 }
 
-int ObObjectDevice::build_if_match_detect_path_(
-    const char *pathname,
-    char *detect_path,
-    const int64_t detect_path_len)
-{
-  int ret = OB_SUCCESS;
-  const char *scheme = nullptr;
-  const char *last_slash = nullptr;
-  int64_t parent_len = 0;
-  uint64_t path_hash = 0;
-  if (OB_ISNULL(pathname) || OB_ISNULL(detect_path) || OB_UNLIKELY(detect_path_len <= 0)) {
-    ret = OB_INVALID_ARGUMENT;
-    OB_LOG(WARN, "invalid argument", K(ret), KP(pathname), KP(detect_path), K(detect_path_len));
-  } else if (OB_ISNULL(scheme = STRSTR(pathname, "://"))
-             || OB_ISNULL(last_slash = STRRCHR(pathname, '/'))
-             || OB_UNLIKELY(last_slash <= scheme + 2)) {
-    ret = OB_INVALID_ARGUMENT;
-    OB_LOG(WARN, "invalid object storage path", K(ret), KCSTRING(pathname));
-  } else {
-    parent_len = last_slash - pathname;
-    path_hash = murmurhash(pathname, static_cast<int32_t>(STRLEN(pathname)), 0);
-    if (OB_FAIL(databuff_printf(detect_path, detect_path_len, "%.*s/.ob_if_match_detect_%lu_%ld",
-                               static_cast<int32_t>(parent_len), pathname, path_hash,
-                               ObTimeUtility::fast_current_time()))) {
-      OB_LOG(WARN, "failed to build if-match detect path", K(ret), KCSTRING(pathname), K(detect_path_len));
-    }
-  }
-  return ret;
-}
-
 int ObObjectDevice::detect_if_match_capability_(const char *pathname, bool &is_supported)
 {
   int ret = OB_SUCCESS;
-  int tmp_ret = OB_SUCCESS;
-  const char first_data[] = "detect_content_v1";
-  const char second_data[] = "detect_content_v2";
-  const bool if_match = true;
-  const bool is_detect = true;
-  char detect_path[OB_MAX_URI_LENGTH] = {0};
-  bool is_opened = false;
-  ObStorageObDalWriter writer;
+  ObStorageConditionPutProbe probe;
   is_supported = false;
-  if (OB_FAIL(build_if_match_detect_path_(pathname, detect_path, sizeof(detect_path)))) {
-    OB_LOG(WARN, "failed to build if-match detect path", K(ret), KCSTRING(pathname));
-  } else if (OB_FAIL(writer.open(ObString::make_string(detect_path), &storage_info_))) {
-    OB_LOG(WARN, "failed to open if-match detect writer", K(ret), K(detect_path));
-  } else if (FALSE_IT(is_opened = true)) {
-  } else if (OB_FAIL(writer.write(first_data, STRLEN(first_data), if_match, is_detect))) {
-    OB_LOG(WARN, "failed to write first if-match detect object", K(ret), K(detect_path));
-  } else if (OB_FAIL(writer.write(second_data, STRLEN(second_data), if_match, is_detect))) {
-    if (OB_OBJECT_STORAGE_CONDITION_NOT_MATCH == ret) {
-      is_supported = true;
-      ret = OB_SUCCESS;
-    } else {
-      OB_LOG(WARN, "failed to write second if-match detect object", K(ret), K(detect_path));
-    }
-  }
-
-  if (ret == OB_NOT_SUPPORTED) {
-    ret = OB_SUCCESS;
-  }
-
-  if (is_opened && OB_TMP_FAIL(writer.close())) {
-    ret = COVER_SUCC(tmp_ret);
-    OB_LOG(WARN, "failed to close if-match detect writer", K(tmp_ret), K(ret), K(detect_path));
-  }
-  if ('\0' != detect_path[0] && ObStorageDeleteMode::STORAGE_TAGGING_MODE != storage_info_.get_delete_mode()
-      && OB_TMP_FAIL(util_.del_file(ObString::make_string(detect_path)))) {
-    OB_LOG(WARN, "failed to delete if-match detect object", K(tmp_ret), K(ret), K(detect_path));
+  if (OB_FAIL(probe.detect(pathname, storage_info_, is_supported))) {
+    OB_LOG(WARN, "failed to detect if-match capability", KR(ret), KCSTRING(pathname));
   }
   return ret;
 }

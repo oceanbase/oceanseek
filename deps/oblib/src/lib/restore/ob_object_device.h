@@ -322,7 +322,6 @@ protected:
       ObBaseDirEntryOperator &op, const bool is_adaptive = false);
   int resolve_condition_put_mode_(const char *pathname, bool &if_match);
   int detect_if_match_capability_(const char *pathname, bool &is_supported);
-  int build_if_match_detect_path_(const char *pathname, char *detect_path, const int64_t detect_path_len);
 
 protected:
   template<typename T>

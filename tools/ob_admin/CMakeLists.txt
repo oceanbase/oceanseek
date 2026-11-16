@@ -68,6 +68,7 @@ add_executable(ob_admin
 
   io_device/ob_admin_test_io_device_executor.h
   io_device/ob_admin_test_io_device_executor.cpp
+  io_device/ob_admin_test_io_device_connectivity.cpp
   io_device/ob_admin_test_object_storage_interface.cpp
 
   object_storage_driver_quality/ob_admin_object_storage_driver_quality.h
@@ -146,6 +147,7 @@ add_executable(ob_admin
 
   io_device/ob_admin_test_io_device_executor.h
   io_device/ob_admin_test_io_device_executor.cpp
+  io_device/ob_admin_test_io_device_connectivity.cpp
   io_device/ob_admin_test_object_storage_interface.cpp
 
   object_storage_driver_quality/ob_admin_object_storage_driver_quality.h

@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX SHARE
 
 #include "share/object_storage/ob_device_connectivity.h"
+#include "share/object_storage/ob_object_storage_connectivity_check.h"
 #include "share/config/ob_server_config.h"
 #include "share/backup/ob_backup_io_adapter.h"
 #include "lib/restore/ob_i_storage.h"
@@ -85,62 +86,17 @@ int ObDeviceCheckFile::delete_permission_check_file(const ObBackupDest &storage_
 int ObDeviceCheckFile::check_io_permission(const ObBackupDest &storage_dest)
 {
   int ret = OB_SUCCESS;
-  int tmp_ret = OB_SUCCESS;
-  ObBackupIoAdapter io_adapter;
-  const int64_t write_size = 64;
-  char buf_write[write_size];
-  char *buf_read = nullptr;
-  int64_t pos = 0;
-  int64_t file_len = 0;
-  int64_t read_size = 0;
-  char path[OB_MAX_BACKUP_DEST_LENGTH];
-  bool write_ok = false;
-  ObArenaAllocator allocator;
-  if (!storage_dest.is_valid()) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument", KR(ret), K(storage_dest));
-  } else if (OB_FAIL(get_permission_check_file_path_(storage_dest, false/*is_appender*/, path))) {
-      LOG_WARN("failed to get permission check file path", KR(ret), K(storage_dest));
-  } else if (OB_FAIL(databuff_printf(buf_write, write_size, "writer at %ld",
-                                     ObTimeUtility::current_time()))) {
-    LOG_WARN("fail to set buf_write", KR(ret));
-  } else if (OB_FAIL(io_adapter.write_single_file(path, storage_dest.get_storage_info(),
-                     buf_write, write_size, ObStorageIdMod::get_default_id_mod()))) {
-    if (is_permission_error_(ret)) {
-      ret = OB_OBJECT_STORAGE_PERMISSION_DENIED;
-    }
-    LOG_WARN("fail to write single file", KR(ret), K(path), K(storage_dest));
-  } else if (FALSE_IT(write_ok = true)
-      || OB_FAIL(io_adapter.adaptively_get_file_length(path, storage_dest.get_storage_info(), file_len))) {
-    if (is_permission_error_(ret)) {
-      ret = OB_OBJECT_STORAGE_PERMISSION_DENIED;
-    }
-    LOG_WARN("fail to get file length", KR(ret), K(path), K(storage_dest));
-  } else if (OB_ISNULL(buf_read = reinterpret_cast<char*>(allocator.alloc(file_len)))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-    LOG_WARN("failed to alloc buf_read", KR(ret), K(file_len));
-  } else if (OB_FAIL(io_adapter.adaptively_read_single_file(path, storage_dest.get_storage_info(), buf_read,
-                     file_len, read_size, ObStorageIdMod::get_default_id_mod()))) {
-    if (is_permission_error_(ret)) {
-      ret = OB_OBJECT_STORAGE_PERMISSION_DENIED;
-    }
-    LOG_WARN("fail to read single file", KR(ret), K(path), K(storage_dest));
+  const int64_t timeout_us = 240L * 1000 * 1000;
+  const int64_t start_ts_us = ObTimeUtility::current_monotonic_time();
+  ObObjectStorageConnectivityCheck check;
+  if (OB_FAIL(check.check_shared_storage(storage_dest, timeout_us))) {
+    LOG_WARN("shared storage connectivity failed", K(ret));
   }
-  if (write_ok && (OB_SUCCESS != (tmp_ret = io_adapter.adaptively_del_file(path, storage_dest.get_storage_info())))) {
-    if (is_permission_error_(tmp_ret)) {
-      tmp_ret = OB_OBJECT_STORAGE_PERMISSION_DENIED;
-    }
-    ret = (OB_SUCCESS == ret) ? tmp_ret : ret;
-    LOG_WARN("fail to del file", KR(tmp_ret), KR(ret), K(path), K(storage_dest));
+  if (is_permission_error_(ret)) {
+    ret = OB_OBJECT_STORAGE_PERMISSION_DENIED;
   }
-  if (OB_FAIL(ret)) {
-  } else if (OB_FAIL(check_appender_permission_(storage_dest))) {
-    if (is_permission_error_(ret)) {
-      ret = OB_OBJECT_STORAGE_PERMISSION_DENIED;
-    }
-    LOG_WARN("fail to check appender permission", KR(ret), K(storage_dest));
-  }
-
+  const int64_t elapsed_us = ObTimeUtility::current_monotonic_time() - start_ts_us;
+  LOG_INFO("device connectivity checks finished", KR(ret), K(elapsed_us), K(storage_dest.get_root_path()));
   return ret;
 }
 

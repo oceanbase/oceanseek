@@ -1549,12 +1549,10 @@ int is_tagging_helper(
     value.data = nullptr;
     value.len = 0;
     value.capacity = 0;
+    // A missing delete_mode tag is a valid result for an untagged object.
     if (OB_FAIL(ObDalAccessor::obdal_object_tagging_get(tagging, "delete_mode", value))) {
       OB_LOG(WARN, "failed to get object tagging value", K(ret), K(path));
-    } else if (OB_ISNULL(value.data)) {
-      ret = OB_OBJECT_STORAGE_IO_ERROR;
-      OB_LOG(WARN, "failed to get object tagging value without errmsg", K(ret), K(path));
-    } else {
+    } else if (OB_NOT_NULL(value.data)) {
       if (STRNCMP(reinterpret_cast<char *>(value.data), "tagging", value.len) == 0) {
         is_tagging = true;
       }

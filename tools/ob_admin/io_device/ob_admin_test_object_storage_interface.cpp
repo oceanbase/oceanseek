@@ -22,12 +22,20 @@ TestExecGuard::TestExecGuard(const char *title, int64_t &test_id, int &ret)
   if (OB_ISNULL(title_)) {
     title_ = "";
   }
+  if (is_test_io_device_report_enabled()) {
+    return;
+  }
   std::cout << LIGHT_GREEN << "[RUN TEST" << test_id << "] " << NONE_COLOR << title_ << std::endl;
 }
 
 TestExecGuard::~TestExecGuard()
 {
   const int64_t cost_time_ms = (ObTimeUtility::current_time() - start_time_us_) / 1000;
+  if (is_test_io_device_report_enabled()) {
+    report_test_io_device_subtest(title_, ret_, cost_time_ms);
+    ++test_id_;
+    return;
+  }
   if (ret_ == OB_SUCCESS) {
     std::cout << LIGHT_GREEN << "[       OK] " << NONE_COLOR << title_ << " (" << cost_time_ms << " ms)" << std::endl; 
   } else {
@@ -67,9 +75,9 @@ int ObAdminTestIODeviceExecutor::test_object_storage_interface_()
   } else if (OB_FAIL(test_object_storage_interface_read_(ctx))) {
     STORAGE_LOG_FILTER(ERROR, "failed to test object storage interface read", K(ret));
   } else if (!(ctx.storage_info_.is_enable_worm() 
-                && ObStorageDeleteMode::STORAGE_DELETE_MODE == ctx.storage_info_.get_delete_mode()) 
+                || ObStorageDeleteMode::STORAGE_TAGGING_MODE == ctx.storage_info_.get_delete_mode())
                 && OB_FAIL(test_object_storage_interface_del_(ctx))) {
-    STORAGE_LOG_FILTER(ERROR, "failed to test object storage interface del", K(ret));
+    STORAGE_LOG_FILTER(ERROR, "failed to test object storage interface del", K(ret), K(ctx.storage_info_));
   } 
   return ret; 
 }
@@ -105,6 +113,12 @@ int ObAdminTestIODeviceExecutor::test_object_storage_interface_prepare_(TestObje
     STORAGE_LOG_FILTER(ERROR, "failed to set upload file path", K(ret), K(ctx.test_dir_path_), K(ctx.upload_file_name_));
   } else if (OB_FAIL(generate_random_str_(ctx.upload_file_content_, ctx.UPLOAD_FILE_LENGTH))) {
     STORAGE_LOG_FILTER(ERROR, "failed to generate random str", K(ret), K(ctx.UPLOAD_FILE_LENGTH));
+  } else if (OB_STORAGE_S3 == ctx.storage_info_.get_type()
+      && !ObClusterStateBaseMgr::get_instance().is_enable_obdal()) {
+    if (OB_FAIL(ctx.util_.write_single_file(ctx.upload_file_path_, &ctx.storage_info_,
+        ctx.upload_file_content_, ctx.UPLOAD_FILE_LENGTH, ObStorageIdMod::get_default_id_mod()))) {
+      STORAGE_LOG_FILTER(ERROR, "failed to write upload fixture with S3 SDK", KR(ret), K(ctx.upload_file_path_));
+    }
   } else if (OB_FAIL(test_object_storage_interface_async_upload_(ctx))) {
     STORAGE_LOG_FILTER(ERROR, "failed to exec async upload", K(ret), K(ctx.upload_file_path_), K(ctx.UPLOAD_FILE_LENGTH));
   }
@@ -409,7 +423,8 @@ int ObAdminTestIODeviceExecutor::test_object_storage_interface_read_(TestObjectS
   }
 
   // test async_pread
-  if (OB_SUCC(ret)) {
+  if (OB_SUCC(ret) && (OB_STORAGE_S3 != ctx.storage_info_.get_type()
+      || ObClusterStateBaseMgr::get_instance().is_enable_obdal())) {
     if (OB_ISNULL(async_pread_buf = static_cast<char *>(allocator_.alloc(async_pread_read_size)))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       STORAGE_LOG_FILTER(ERROR, "failed to allocate buf", K(ret), K(async_pread_read_size));

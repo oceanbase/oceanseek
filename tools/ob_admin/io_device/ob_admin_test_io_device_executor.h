@@ -15,10 +15,16 @@
 namespace oceanbase {
 namespace tools {
 
+struct ObAdminTestIODeviceContext;
+
+bool is_test_io_device_report_enabled();
+bool record_test_io_device_message(const char *message);
+void report_test_io_device_subtest(const char *title, const int ret, const int64_t elapsed_ms);
+
 #define STORAGE_LOG_FILTER(level, info_string, args...) \
   STORAGE_LOG(level, info_string, ##args); \
-  if (strcmp(#level, "ERROR") == 0) {                  \
-    std::cout << LIGHT_RED << "ERROR INFO: " << info_string << NONE_COLOR << std::endl;  \
+  if (strcmp(#level, "ERROR") == 0 && !oceanbase::tools::record_test_io_device_message(info_string)) { \
+    std::cout << LIGHT_RED << "ERROR INFO: " << info_string << NONE_COLOR << std::endl; \
   }
 
 struct TestObjectStorageInterfaceContext
@@ -72,6 +78,12 @@ public:
 private:
   int parse_cmd_(int argc, char *argv[]);
   int run_all_tests_();
+  int run_new_tests_();
+  int run_test_groups_(ObAdminTestIODeviceContext &ctx);
+  int test_basic_connectivity_(ObAdminTestIODeviceContext &ctx);
+  int test_shared_storage_connectivity_(ObAdminTestIODeviceContext &ctx);
+  int test_backup_restore_connectivity_(ObAdminTestIODeviceContext &ctx);
+  int test_if_match_write_(ObAdminTestIODeviceContext &ctx);
   int test_backup_dest_connectivity_();
   int test_normal_check_file_(const char* check_file_dir);
   int test_appendable_check_file_(const char* check_file_dir);
@@ -102,11 +114,12 @@ private:
   char backup_path_[common::OB_MAX_URI_LENGTH];
   char storage_info_[common::OB_MAX_BACKUP_STORAGE_INFO_LENGTH];
   bool is_quiet_;
+  bool is_old_test_;
+  bool is_test_if_match_;
   int64_t test_id_;
   common::ObArenaAllocator allocator_;
 
 private:
-  static constexpr char* HELP_FMT = const_cast<char*>("\t%-30s%-12s\n");
   static const int64_t MIN_PART_SIZE = 1024 * 1024;
   static const int64_t MAX_PART_SIZE = 2 * 1024 * 1024;
   static const int64_t MIN_APPEND_SIZE = 5 * 1024 * 1024;
