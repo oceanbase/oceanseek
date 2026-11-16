@@ -1755,6 +1755,53 @@ bool ObStorageCachePolicyService::is_scp_candidate_table(
 }
 
 namespace {
+// Owns only the scalar fields needed to replay a wanted parent or subpartition.
+// Iterator rows and their string storage are reused on next(), so none are borrowed here.
+struct ObScpLitePartRow
+{
+  ObScpLitePartRow()
+    : table_id_(OB_INVALID_ID),
+      part_id_(OB_INVALID_PARTITION_ID),
+      sub_part_id_(OB_INVALID_PARTITION_ID),
+      tablet_id_(ObTabletID::INVALID_TABLET_ID),
+      part_schema_version_(OB_INVALID_VERSION),
+      policy_type_(ObStorageCachePolicyType::MAX_POLICY)
+  {}
+
+  explicit ObScpLitePartRow(const ObSchemaLiteJoinRow &row)
+    : table_id_(row.table_id_),
+      part_id_(row.part_id_),
+      sub_part_id_(row.sub_part_id_),
+      tablet_id_(row.tablet_id_.id()),
+      part_schema_version_(row.part_schema_version_),
+      policy_type_(row.part_storage_cache_policy_type_)
+  {}
+
+  // Resets the output before restoring the scalar fields used by the existing handlers.
+  void restore(ObSchemaLiteJoinRow &row) const
+  {
+    row.reuse();
+    row.table_id_ = table_id_;
+    row.part_id_ = part_id_;
+    row.sub_part_id_ = sub_part_id_;
+    row.tablet_id_ = ObTabletID(tablet_id_);
+    row.part_schema_version_ = part_schema_version_;
+    row.part_storage_cache_policy_type_ = policy_type_;
+  }
+
+  TO_STRING_KV(K(table_id_), K(part_id_), K(sub_part_id_), K(tablet_id_),
+      K(part_schema_version_), K(policy_type_));
+
+  uint64_t table_id_;
+  int64_t part_id_;
+  int64_t sub_part_id_;
+  uint64_t tablet_id_;
+  int64_t part_schema_version_;
+  ObStorageCachePolicyType policy_type_;
+};
+static_assert(sizeof(ObScpLitePartRow) <= 6 * sizeof(uint64_t),
+    "SCP replay rows must not retain full schema or iterator storage");
+
 struct ObScpLiteWantedTable
 {
   int64_t table_schema_version_;
@@ -1914,9 +1961,13 @@ struct ObStorageCachePolicyService::ObScpLiteScanCtx
       stub_allocator_(ObMemAttr(tenant_id, "SCPLiteStub")),
       wanted_tables_(),
       level2_part_ctx_(),
+      part_rows_(),
+      subpart_rows_(),
       time_policy_tables_(),
       unserviceable_table_ids_()
   {
+    part_rows_.set_attr(ObMemAttr(tenant_id, "SCPPartRows"));
+    subpart_rows_.set_attr(ObMemAttr(tenant_id, "SCPSubPartRows"));
     time_policy_tables_.set_attr(ObMemAttr(tenant_id, "SCPTimePol"));
     unserviceable_table_ids_.set_attr(ObMemAttr(tenant_id, "SCPUnsvcTbl"));
   }
@@ -1928,6 +1979,8 @@ struct ObStorageCachePolicyService::ObScpLiteScanCtx
   ObArenaAllocator stub_allocator_;
   hash::ObHashMap<uint64_t, ObScpLiteWantedTable> wanted_tables_;
   hash::ObHashMap<ObScpLitePartKey, ObScpLiteLevel2PartCtx> level2_part_ctx_;
+  ObArray<ObScpLitePartRow> part_rows_;
+  ObArray<ObScpLitePartRow> subpart_rows_;
   ObArray<ObScpLiteTimePolicyTable> time_policy_tables_;
   ObArray<uint64_t> unserviceable_table_ids_;
 };
@@ -2189,84 +2242,60 @@ int ObStorageCachePolicyService::handle_scp_lite_time_policy_tables_(
   return ret;
 }
 
-int ObStorageCachePolicyService::scan_scp_lite_partitions_(
-    ObSchemaGetterGuard &schema_guard,
-    const ObStorageCachePolicyRefreshType &refresh_type,
-    ObScpLiteScanCtx &ctx)
+// Collects partition or subpartition metadata for tables in ctx.wanted_tables_.
+// Saves the required fields for policy processing after scanning finishes.
+int ObStorageCachePolicyService::collect_scp_lite_part_rows_(
+    ObSchemaGetterGuard &schema_guard, const bool is_subpart, ObScpLiteScanCtx &ctx)
 {
   int ret = OB_SUCCESS;
   ObSchemaLiteScanSpec spec;
   spec.table_spec_.tenant_id_ = tenant_id_;
   spec.table_spec_.kind_ = ObSchemaScanKind::BY_TENANT;
   spec.table_spec_.select_flags_ = OB_SCHEMA_SCAN_SELECT_TABLE_ID;
-  spec.part_flags_ = OB_SCHEMA_LITE_PART_PART_ID
-      | OB_SCHEMA_LITE_PART_TABLET_ID
-      | OB_SCHEMA_LITE_PART_SCHEMA_VERSION
-      | OB_SCHEMA_LITE_PART_STORAGE_CACHE_POLICY;
   spec.caller_tag_ = "SCPGenTabletTasks";
-  ObSchemaLitePartJoinIterator part_iter;
+  if (is_subpart) {
+    spec.subpart_flags_ = OB_SCHEMA_LITE_SUBPART_PART_ID
+        | OB_SCHEMA_LITE_SUBPART_SUB_PART_ID
+        | OB_SCHEMA_LITE_SUBPART_TABLET_ID
+        | OB_SCHEMA_LITE_SUBPART_SCHEMA_VERSION
+        | OB_SCHEMA_LITE_SUBPART_STORAGE_CACHE_POLICY;
+  } else {
+    spec.part_flags_ = OB_SCHEMA_LITE_PART_PART_ID
+        | OB_SCHEMA_LITE_PART_TABLET_ID
+        | OB_SCHEMA_LITE_PART_SCHEMA_VERSION
+        | OB_SCHEMA_LITE_PART_STORAGE_CACHE_POLICY;
+  }
+  const ObSchemaLiteJoinSide join_side =
+      ((is_subpart) ? ObSchemaLiteJoinSide::SUBPART : ObSchemaLiteJoinSide::PART);
+  ObArray<ObScpLitePartRow> &rows = ((is_subpart) ? ctx.subpart_rows_ : ctx.part_rows_);
+  ObSchemaLitePartJoinIterator iter;
   const ObSchemaLiteJoinRow *join_row = nullptr;
-  if (OB_FAIL(schema_guard.scan_lite_part_rows(
-          spec, ObSchemaLiteJoinSide::PART, part_iter))) {
-    LOG_WARN("fail to scan lite part rows for scp", KR(ret), K_(tenant_id));
+  if (OB_FAIL(schema_guard.scan_lite_part_rows(spec, join_side, iter))) {
+    LOG_WARN("fail to open scp lite part scan", KR(ret), K(tenant_id_), K(is_subpart));
   }
   while (OB_SUCC(ret)) {
     ObScpLiteWantedTable wanted_table;
     int tmp_ret = OB_SUCCESS;
-    if (OB_FAIL(part_iter.get_next(join_row))) {
+    if (OB_FAIL(iter.get_next(join_row))) {
       if (OB_ITER_END != ret) {
-        LOG_WARN("fail to get next lite part row", KR(ret), K_(tenant_id));
+        LOG_WARN("fail to get next scp lite part row", KR(ret), K(is_subpart));
       }
     } else if (OB_ISNULL(join_row)) {
       ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("lite part join row is null", KR(ret), K_(tenant_id));
-    } else if (OB_SUCCESS != (tmp_ret = ctx.wanted_tables_.get_refactored(
+      LOG_WARN("scp lite part row is null", KR(ret), K(is_subpart));
+    } else if (OB_TMP_FAIL(ctx.wanted_tables_.get_refactored(
         join_row->table_id_, wanted_table))) {
       if (OB_HASH_NOT_EXIST != tmp_ret) {
         ret = tmp_ret;
-        LOG_WARN("get wanted table failed", KR(ret), KPC(join_row));
+        LOG_WARN("fail to get wanted scp table", KR(ret), KPC(join_row));
       }
-    } else {
-      ObPartition part;
-      ObStorageCachePolicy resolved_policy;
-      PolicyStatus partition_policy_status = PolicyStatus::MAX_STATUS;
-      bool partition_policy_need_calc = wanted_table.table_policy_need_calc_;
-      const ObPartitionLevel table_part_level = wanted_table.part_level_;
-      fill_partition_from_lite_join(*join_row, part);
-      if (OB_FAIL(resolved_policy.set_global_policy(wanted_table.resolved_policy_type_))) {
-        LOG_WARN("fail to restore resolved table policy", KR(ret), K(wanted_table), KPC(join_row));
-      } else if (!partition_policy_need_calc
-          && OB_FAIL(check_part_policy_need_recaculate(
-              &part, part.get_part_id(), partition_policy_need_calc))) {
-        LOG_WARN("fail to check partition policy need recaculate", KR(ret), K(part), KPC(join_row));
-      } else if (OB_FAIL(handle_partition(
-          &part, resolved_policy, partition_policy_need_calc,
-          table_part_level, refresh_type, partition_policy_status))) {
-        LOG_WARN("fail to handle partition from lite", KR(ret), K(part), KPC(join_row));
-      } else if (PARTITION_LEVEL_TWO == table_part_level) {
-        if (!partition_policy_need_calc) {
-          if (OB_FAIL(cal_partition_policy_status(
-              &part, resolved_policy, partition_policy_status))) {
-            LOG_WARN("fail to cal partition policy status for level2", KR(ret), K(part));
-          } else if (PolicyStatus::MAX_STATUS == partition_policy_status) {
-            ret = OB_ERR_UNEXPECTED;
-            LOG_WARN("unexpected partition policy status", KR(ret), K(partition_policy_status), K(part));
-          }
-        }
-        if (OB_SUCC(ret)) {
-          ObScpLiteLevel2PartCtx lv2_ctx;
-          lv2_ctx.partition_policy_status_ = partition_policy_status;
-          lv2_ctx.partition_policy_need_calc_ = partition_policy_need_calc;
-          if (OB_FAIL(ctx.level2_part_ctx_.set_refactored(
-              ObScpLitePartKey(join_row->table_id_, join_row->part_id_), lv2_ctx))) {
-            LOG_WARN("fail to record level2 part ctx", KR(ret), KPC(join_row));
-          }
-        }
-      }
-      if (OB_FAIL(ret)) {
-        handle_scp_lite_part_row_error_(*join_row, ret, ctx);
-        ret = OB_SUCCESS;
-      }
+    } else if (is_subpart && PARTITION_LEVEL_TWO != wanted_table.part_level_) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("fail to collect scp subpart row: unexpected table partition level",
+          KR(ret), K(tenant_id_), K(is_subpart), K(wanted_table), KPC(join_row));
+    } else if (OB_FAIL(rows.push_back(ObScpLitePartRow(*join_row)))) {
+      LOG_WARN("fail to buffer scp lite part row",
+          KR(ret), K(tenant_id_), K(is_subpart), K(rows.count()), KPC(join_row));
     }
   }
   if (OB_ITER_END == ret) {
@@ -2275,58 +2304,111 @@ int ObStorageCachePolicyService::scan_scp_lite_partitions_(
   return ret;
 }
 
-int ObStorageCachePolicyService::scan_scp_lite_subpartitions_(
-    ObSchemaGetterGuard &schema_guard,
-    const ObStorageCachePolicyRefreshType &refresh_type,
-    ObScpLiteScanCtx &ctx)
+// Processes buffered first-level partition rows after scanning finishes.
+// For two-level tables, saves parent policy results in ctx.level2_part_ctx_.
+int ObStorageCachePolicyService::handle_scp_lite_partitions_(
+    const ObStorageCachePolicyRefreshType &refresh_type, ObScpLiteScanCtx &ctx)
 {
   int ret = OB_SUCCESS;
-  ObSchemaLiteScanSpec spec;
-  spec.table_spec_.tenant_id_ = tenant_id_;
-  spec.table_spec_.kind_ = ObSchemaScanKind::BY_TENANT;
-  spec.table_spec_.select_flags_ = OB_SCHEMA_SCAN_SELECT_TABLE_ID;
-  spec.subpart_flags_ = OB_SCHEMA_LITE_SUBPART_PART_ID
-      | OB_SCHEMA_LITE_SUBPART_SUB_PART_ID
-      | OB_SCHEMA_LITE_SUBPART_TABLET_ID
-      | OB_SCHEMA_LITE_SUBPART_SCHEMA_VERSION
-      | OB_SCHEMA_LITE_SUBPART_STORAGE_CACHE_POLICY;
-  spec.caller_tag_ = "SCPGenTabletTasks";
-  ObSchemaLitePartJoinIterator subpart_iter;
-  const ObSchemaLiteJoinRow *join_row = nullptr;
-  if (OB_FAIL(schema_guard.scan_lite_part_rows(
-          spec, ObSchemaLiteJoinSide::SUBPART, subpart_iter))) {
-    LOG_WARN("fail to scan lite subpart rows for scp", KR(ret), K_(tenant_id));
+  if (OB_UNLIKELY(!is_valid_scp_refresh_type(refresh_type))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("fail to handle scp lite partitions: invalid refresh type",
+        KR(ret), K(tenant_id_), K_SCP_REFRESH_TYPE(refresh_type));
   }
-  while (OB_SUCC(ret)) {
+  for (int64_t i = 0; OB_SUCC(ret) && i < ctx.part_rows_.count(); ++i) {
+    ObSchemaLiteJoinRow join_row;
+    ctx.part_rows_.at(i).restore(join_row);
+    ObScpLiteWantedTable wanted_table;
+    int tmp_ret = OB_SUCCESS;
+    if (OB_TMP_FAIL(ctx.wanted_tables_.get_refactored(join_row.table_id_, wanted_table))) {
+      if (OB_HASH_NOT_EXIST != tmp_ret) {
+        ret = tmp_ret;
+        LOG_WARN("fail to get wanted scp table", KR(ret), K(join_row));
+      }
+    } else {
+      ObPartition part;
+      ObStorageCachePolicy resolved_policy;
+      PolicyStatus partition_policy_status = PolicyStatus::MAX_STATUS;
+      bool partition_policy_need_calc = wanted_table.table_policy_need_calc_;
+      const ObPartitionLevel table_part_level = wanted_table.part_level_;
+      fill_partition_from_lite_join(join_row, part);
+      if (OB_FAIL(resolved_policy.set_global_policy(wanted_table.resolved_policy_type_))) {
+        LOG_WARN("fail to restore resolved table policy", KR(ret), K(wanted_table), K(join_row));
+      } else if (!partition_policy_need_calc
+          && OB_FAIL(check_part_policy_need_recaculate(
+              &part, part.get_part_id(), partition_policy_need_calc))) {
+        LOG_WARN("fail to check partition policy need recaculate", KR(ret), K(part));
+      } else if (OB_FAIL(handle_partition(
+          &part, resolved_policy, partition_policy_need_calc,
+          table_part_level, refresh_type, partition_policy_status))) {
+        LOG_WARN("fail to handle buffered scp partition", KR(ret), K(part));
+      } else if (PARTITION_LEVEL_TWO == table_part_level) {
+        if (!partition_policy_need_calc) {
+          if (OB_FAIL(cal_partition_policy_status(
+              &part, resolved_policy, partition_policy_status))) {
+            LOG_WARN("fail to cal partition policy status for level2", KR(ret), K(part));
+          } else if (PolicyStatus::MAX_STATUS == partition_policy_status) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("unexpected partition policy status", KR(ret), K(partition_policy_status));
+          }
+        }
+        if (OB_SUCC(ret)) {
+          ObScpLiteLevel2PartCtx lv2_ctx;
+          lv2_ctx.partition_policy_status_ = partition_policy_status;
+          lv2_ctx.partition_policy_need_calc_ = partition_policy_need_calc;
+          if (OB_FAIL(ctx.level2_part_ctx_.set_refactored(
+              ObScpLitePartKey(join_row.table_id_, join_row.part_id_), lv2_ctx))) {
+            LOG_WARN("fail to record level2 part ctx", KR(ret), K(join_row));
+          }
+        }
+      }
+      if (OB_FAIL(ret)) {
+        handle_scp_lite_part_row_error_(join_row, ret, ctx);
+        ret = OB_SUCCESS;
+      }
+    }
+  }
+  ctx.part_rows_.reset();
+  return ret;
+}
+
+// Processes buffered subpartition rows after their parent partitions have been handled.
+// Uses the parent policy results saved in ctx.level2_part_ctx_.
+int ObStorageCachePolicyService::handle_scp_lite_subpartitions_(
+    const ObStorageCachePolicyRefreshType &refresh_type, ObScpLiteScanCtx &ctx)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!is_valid_scp_refresh_type(refresh_type))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("fail to handle scp lite subpartitions: invalid refresh type",
+        KR(ret), K(tenant_id_), K_SCP_REFRESH_TYPE(refresh_type));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < ctx.subpart_rows_.count(); ++i) {
+    ObSchemaLiteJoinRow join_row;
+    ctx.subpart_rows_.at(i).restore(join_row);
     ObScpLiteWantedTable wanted_table;
     ObScpLiteLevel2PartCtx lv2_ctx;
     int tmp_ret = OB_SUCCESS;
-    if (OB_FAIL(subpart_iter.get_next(join_row))) {
-      if (OB_ITER_END != ret) {
-        LOG_WARN("fail to get next lite subpart row", KR(ret), K_(tenant_id));
-      }
-    } else if (OB_ISNULL(join_row)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("lite subpart join row is null", KR(ret), K_(tenant_id));
-    } else if (OB_SUCCESS != (tmp_ret = ctx.wanted_tables_.get_refactored(
-        join_row->table_id_, wanted_table))) {
+    if (OB_TMP_FAIL(ctx.wanted_tables_.get_refactored(join_row.table_id_, wanted_table))) {
       if (OB_HASH_NOT_EXIST != tmp_ret) {
         ret = tmp_ret;
-        LOG_WARN("get wanted table failed", KR(ret), KPC(join_row));
+        LOG_WARN("fail to get wanted scp table", KR(ret), K(join_row));
       }
     } else if (PARTITION_LEVEL_TWO != wanted_table.part_level_) {
-      // skip level1 leftover
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("fail to handle scp subpart row: unexpected table partition level",
+          KR(ret), K(tenant_id_), K(wanted_table), K(join_row));
     } else {
       if (OB_FAIL(ctx.level2_part_ctx_.get_refactored(
-          ObScpLitePartKey(join_row->table_id_, join_row->part_id_), lv2_ctx))) {
-        LOG_WARN("level2 part ctx not found", KR(ret), KPC(join_row));
+          ObScpLitePartKey(join_row.table_id_, join_row.part_id_), lv2_ctx))) {
+        LOG_WARN("level2 part ctx not found", KR(ret), K(join_row));
       } else {
         ObSubPartition subpart;
         ObStorageCachePolicy resolved_policy;
         bool sub_partition_policy_need_calc = lv2_ctx.partition_policy_need_calc_;
-        fill_subpartition_from_lite_join(*join_row, subpart);
+        fill_subpartition_from_lite_join(join_row, subpart);
         if (OB_FAIL(resolved_policy.set_global_policy(wanted_table.resolved_policy_type_))) {
-          LOG_WARN("fail to restore resolved table policy", KR(ret), K(wanted_table), KPC(join_row));
+          LOG_WARN("fail to restore resolved table policy", KR(ret), K(wanted_table), K(join_row));
         } else if (!sub_partition_policy_need_calc
             && OB_FAIL(check_part_policy_need_recaculate(
                 &subpart, subpart.get_sub_part_id(), sub_partition_policy_need_calc))) {
@@ -2334,18 +2416,16 @@ int ObStorageCachePolicyService::scan_scp_lite_subpartitions_(
         } else if (OB_FAIL(handle_subpartitions(
             &subpart, resolved_policy, lv2_ctx.partition_policy_status_,
             refresh_type, sub_partition_policy_need_calc))) {
-          LOG_WARN("fail to handle subpartition from lite", KR(ret), K(subpart), KPC(join_row));
+          LOG_WARN("fail to handle buffered scp subpartition", KR(ret), K(subpart), K(join_row));
         }
       }
       if (OB_FAIL(ret)) {
-        handle_scp_lite_part_row_error_(*join_row, ret, ctx);
+        handle_scp_lite_part_row_error_(join_row, ret, ctx);
         ret = OB_SUCCESS;
       }
     }
   }
-  if (OB_ITER_END == ret) {
-    ret = OB_SUCCESS;
-  }
+  ctx.subpart_rows_.reset();
   return ret;
 }
 
@@ -2479,19 +2559,32 @@ int ObStorageCachePolicyService::check_and_generate_tablet_tasks(
     if (OB_FAIL(scan_scp_lite_tables_(schema_guard, refresh_type, ctx))) {
       LOG_WARN("fail to scan scp lite tables", KR(ret), K_(tenant_id));
     }
-    if (OB_SUCC(ret) && OB_FAIL(handle_scp_lite_time_policy_tables_(
-        schema_guard, refresh_type, ctx))) {
-      LOG_WARN("fail to handle scp lite time policy tables", KR(ret), K_(tenant_id));
-    }
     if (OB_SUCC(ret) && ctx.wanted_tables_.size() > 0
-        && OB_FAIL(scan_scp_lite_partitions_(schema_guard, refresh_type, ctx))) {
-      LOG_WARN("fail to scan scp lite partitions", KR(ret), K_(tenant_id));
+        && OB_FAIL(collect_scp_lite_part_rows_(schema_guard, false /*is_subpart*/, ctx))) {
+      LOG_WARN("fail to collect scp lite partitions", KR(ret), K(tenant_id_));
     }
     if (OB_SUCC(ret) && ctx.need_subpart_scan_ && ctx.wanted_tables_.size() > 0
-        && OB_FAIL(scan_scp_lite_subpartitions_(schema_guard, refresh_type, ctx))) {
-      LOG_WARN("fail to scan scp lite subpartitions", KR(ret), K_(tenant_id));
+        && OB_FAIL(collect_scp_lite_part_rows_(schema_guard, true /*is_subpart*/, ctx))) {
+      LOG_WARN("fail to collect scp lite subpartitions", KR(ret), K(tenant_id_));
     }
-    if (OB_SUCC(ret) && OB_FAIL(update_scp_lite_partitioned_table_policies_(ctx))) {
+    time_guard.click("finish_collect_scp_lite_rows");
+    LOG_INFO("finish collecting scp lite partition rows", KR(ret), K(tenant_id_),
+        K(ctx.part_rows_.count()), K(ctx.subpart_rows_.count()));
+    // Both collectors have destroyed their iterators, including on error. Release the shared
+    // connection before time-policy lookups or expensive follow-partition processing begins.
+    int tmp_ret = OB_SUCCESS;
+    if (OB_TMP_FAIL(schema_guard.finish_lite_scan())) {
+      LOG_WARN("fail to end scp schema scan transaction", KR(tmp_ret), KR(ret), K(tenant_id_));
+      ret = COVER_SUCC(tmp_ret);
+    }
+
+    if (FAILEDx(handle_scp_lite_time_policy_tables_(schema_guard, refresh_type, ctx))) {
+      LOG_WARN("fail to handle scp lite time policy tables", KR(ret), K_(tenant_id));
+    } else if (OB_FAIL(handle_scp_lite_partitions_(refresh_type, ctx))) {
+      LOG_WARN("fail to handle buffered scp partitions", KR(ret), K(tenant_id_));
+    } else if (OB_FAIL(handle_scp_lite_subpartitions_(refresh_type, ctx))) {
+      LOG_WARN("fail to handle buffered scp subpartitions", KR(ret), K(tenant_id_));
+    } else if (OB_FAIL(update_scp_lite_partitioned_table_policies_(ctx))) {
       LOG_WARN("fail to update scp lite partitioned table policies", KR(ret), K_(tenant_id));
     }
   }
