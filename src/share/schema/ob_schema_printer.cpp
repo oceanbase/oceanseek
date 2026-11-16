@@ -348,7 +348,23 @@ int ObSchemaPrinter::print_table_definition_columns(const ObTableSchema &table_s
                   ObObj default_value = col->get_cur_default_value();
                   default_value.set_scale(col->get_data_scale());
                   if (ob_is_enum_or_set_type(default_value.get_type())) {
-                    if (OB_FAIL(default_value.print_varchar_literal(col->get_extended_type_info(), buf, buf_len, pos))) {
+                    ObArenaAllocator type_info_allocator(ObModIds::OB_SCHEMA);
+                    ObSEArray<ObString, 4> converted_type_infos;
+                    const ObIArray<ObString> &type_infos = col->get_extended_type_info();
+                    // Convert members before printing: SET joins them with a single-byte comma.
+                    for (int64_t i = 0; OB_SUCC(ret) && i < type_infos.count(); ++i) {
+                      ObString converted_type_info;
+                      if (OB_FAIL(ObCharset::charset_convert(type_info_allocator,
+                                                            type_infos.at(i),
+                                                            col->get_collation_type(),
+                                                            ObCharset::get_system_collation(),
+                                                            converted_type_info))) {
+                        SHARE_SCHEMA_LOG(WARN, "fail to convert enum or set member charset", K(ret), KPC(col), K(i));
+                      } else if (OB_FAIL(converted_type_infos.push_back(converted_type_info))) {
+                        SHARE_SCHEMA_LOG(WARN, "fail to append converted enum or set member", K(ret), K(i));
+                      }
+                    }
+                    if (OB_SUCC(ret) && OB_FAIL(default_value.print_varchar_literal(converted_type_infos, buf, buf_len, pos))) {
                       SHARE_SCHEMA_LOG(WARN, "fail to print sql literal", KPC(col), K(buf), K(buf_len), K(pos), K(ret));
                     }
                   } else if (ob_is_string_tc(default_value.get_type())) {
