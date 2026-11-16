@@ -445,7 +445,9 @@ int ObFtsForwardInvertSampleOperator::convert_keys_to_vectors(
 
       for (int64_t row_idx = 0; OB_SUCC(ret) && row_idx < total_rows; ++row_idx) {
         const sql::ObDatum &datum = key_refs.at(row_idx)->at(col_idx);
-        if (OB_UNLIKELY(datum.len_ != fixed_len)) {
+        if (datum.is_null()) {
+          fixed_vec->set_null(row_idx);
+        } else if (OB_UNLIKELY(datum.len_ != fixed_len)) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("datum length mismatch", K(ret), K(datum.len_), K(fixed_len));
         } else {
@@ -459,12 +461,16 @@ int ObFtsForwardInvertSampleOperator::convert_keys_to_vectors(
 
       for (int64_t row_idx = 0; OB_SUCC(ret) && row_idx < total_rows; ++row_idx) {
         const sql::ObDatum &datum = key_refs.at(row_idx)->at(col_idx);
-        char *buf = static_cast<char *>(allocator.alloc(datum.len_));
-        if (OB_ISNULL(buf)) {
+        char *buf = nullptr;
+        if (datum.is_null()) {
+          discrete_vec->set_null(row_idx);
+        } else if (OB_ISNULL(buf = static_cast<char *>(allocator.alloc(datum.len_ > 0 ? datum.len_ : 1)))) {
           ret = OB_ALLOCATE_MEMORY_FAILED;
           LOG_WARN("fail to alloc memory", K(ret), K(datum.len_));
         } else {
-          MEMCPY(buf, datum.ptr_, datum.len_);
+          if (datum.len_ > 0) {
+            MEMCPY(buf, datum.ptr_, datum.len_);
+          }
           lens[row_idx] = datum.len_;
           ptrs[row_idx] = buf;
         }
