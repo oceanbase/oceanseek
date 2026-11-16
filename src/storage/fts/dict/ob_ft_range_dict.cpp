@@ -156,6 +156,10 @@ int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_co
        OB_SUCC(ret) && iter != range_container.get_handles().end();
        iter++) {
     ObFTCacheRangeHandle *ptr = *iter;
+    if (0 == ptr->key_.get_range_id() && 0 == ptr->value_->get_range_count()) {
+      // Range 0 is an empty-dictionary marker; its header is not a readable DAT.
+      continue;
+    }
     ObFTCacheDict *dict = nullptr;
     const ObFTDAT *dat = ptr->value_->dat_block_;
     if (OB_ISNULL(dict = OB_NEWx(ObFTCacheDict, &range_alloc_, ObCollationType::CS_TYPE_UTF8MB4_BIN, dat))) {

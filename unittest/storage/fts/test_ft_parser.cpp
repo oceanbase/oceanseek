@@ -11,6 +11,9 @@
 #include "lib/charset/ob_charset.h"
 #include "lib/ob_errno.h"
 #include "lib/worker.h"
+#include "lib/mysqlclient/ob_isql_result_handler.h"
+#include "lib/mysqlclient/ob_mysql_result_impl.h"
+#include "lib/mysqlclient/ob_mysql_statement.h"
 #include "share/ob_tenant_mem_limit_getter.h"
 #include "share/inner_table/ob_inner_table_schema_constants.h"
 #include "lib/allocator/ob_allocator.h"
@@ -79,6 +82,9 @@ public:
   using ObFTDictCacheLoaderBase::build_ranges;
   using ObFTDictCacheLoaderBase::collect_missing_ranges;
   using ObFTDictCacheLoaderBase::handle_missing_ranges;
+  using ObFTDictCacheLoaderBase::try_load_cache;
+  using ObFTDictCacheLoaderBase::update_snapshot_version;
+  using ObFTDictCacheLoaderBase::validate_by_load;
   
   int load_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &range_container) override
   {
@@ -251,6 +257,88 @@ static bool is_range_dict_sorted_by_start_token(const ObFTRangeDict &range_dict)
   return true;
 }
 
+class FTDictReadResult : public sqlclient::ObMySQLResultImpl
+{
+public:
+  FTDictReadResult(sqlclient::ObMySQLStatement &statement, const char *word,
+                  const bool statistics, const int next_ret)
+      : ObMySQLResultImpl(statement), word_(word), statistics_(statistics),
+        next_ret_(next_ret), pos_(-1) {}
+  int next() override
+  {
+    return OB_SUCCESS != next_ret_ ? next_ret_
+        : (++pos_ < (statistics_ || nullptr != word_ ? 1 : 0) ? OB_SUCCESS : OB_ITER_END);
+  }
+  using ObMySQLResultImpl::get_varchar;
+  int get_varchar(const char *column, ObString &value) const override
+  {
+    EXPECT_STREQ("word", column);
+    value = ObString::make_string(word_);
+    return OB_SUCCESS;
+  }
+  using ObMySQLResultImpl::get_int;
+  int get_int(const char *column, int64_t &value) const override
+  {
+    int ret = OB_SUCCESS;
+    if (0 == strcmp(column, "cnt")) {
+      value = nullptr == word_ ? 0 : 1;
+    } else if (0 == strcmp(column, "max_version")) {
+      if (nullptr == word_) {
+        ret = OB_ERR_NULL_VALUE;
+      } else {
+        value = 100;
+      }
+    } else {
+      ret = OB_ERR_COLUMN_NOT_FOUND;
+    }
+    return ret;
+  }
+private:
+  const char *word_;
+  bool statistics_;
+  int next_ret_;
+  int64_t pos_;
+};
+
+class FTDictReadResultHandler : public sqlclient::ObISQLResultHandler
+{
+public:
+  FTDictReadResultHandler(const char *word, const bool statistics, const int next_ret)
+      : result_(statement_, word, statistics, next_ret) {}
+  sqlclient::ObMySQLResult *mysql_result() override { return &result_; }
+private:
+  sqlclient::ObMySQLStatement statement_;
+  FTDictReadResult result_;
+};
+
+class FTDictReadProxy : public ObMySQLProxy
+{
+public:
+  int read(ReadResult &result, const uint64_t tenant_id, const char *sql) override
+  {
+    EXPECT_EQ(MTL_ID(), tenant_id);
+    EXPECT_NE(nullptr, strstr(sql, " AS OF SNAPSHOT "));
+    const bool statistics = nullptr != strstr(sql, "MAX(ORA_ROWSCN)");
+    const bool partial = nullptr != strstr(sql, " WHERE ");
+    if (statistics) {
+      ++statistics_reads_;
+    } else if (partial) {
+      ++partial_reads_;
+    } else {
+      ++full_reads_;
+    }
+    const char *word = partial ? nullptr : word_;
+    const int next_ret = partial ? partial_ret_ : OB_SUCCESS;
+    FTDictReadResultHandler *handler = nullptr;
+    return result.create_handler(handler, word, statistics, next_ret);
+  }
+  const char *word_ = nullptr;
+  int partial_ret_ = OB_ITER_END;
+  int full_reads_ = 0;
+  int partial_reads_ = 0;
+  int statistics_reads_ = 0;
+};
+
 class FTParserTest : public ::testing::Test
 {
 protected:
@@ -387,6 +475,304 @@ TEST_F(FTParserTest, test_cache)
 
   ASSERT_EQ(OB_SUCCESS, ret);
   ASSERT_EQ(new_value->dat_block_->mem_block_size_, dat.mem_block_size_);
+}
+
+TEST_F(FTParserTest, dict_loader_handles_empty_word)
+{
+  // Dictionary words are unique and sorted, with at most one empty word first.
+  std::vector<std::vector<const char *>> cases = {
+      {""}, {"", "hello", "world"}, {"hello", "world"}};
+  for (auto &words : cases) {
+    ObArenaAllocator alloc(ObModIds::TEST);
+    ObFTDictDesc desc(ObCharsetType::CHARSET_UTF8MB4,
+                      ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                      share::OB_FT_DICT_IK_UTF8_TID,
+                      ObString(ObFTSLiteral::FT_DEFAULT_IK_DICT_UTF8_TABLE));
+    ObIKDictIterator iter({words.data(), static_cast<int64_t>(words.size())});
+    ASSERT_EQ(OB_SUCCESS, iter.init());
+    TestFTDictCacheLoaderExec loader;
+    ObFTCacheRangeContainer container(alloc);
+    ASSERT_EQ(OB_SUCCESS, loader.build_ranges(desc, iter, container, 1));
+    const bool empty_dict = 1 == words.size();
+    ASSERT_EQ(1, container.get_handles().size());
+    const ObFTCacheRangeHandle *handle = find_handle_by_range_id(container, 0);
+    ASSERT_NE(nullptr, handle);
+    ASSERT_EQ(empty_dict ? 0 : 1, handle->value_->get_range_count());
+    ObFTRangeDict dict(&container, desc);
+    ASSERT_EQ(OB_SUCCESS, dict.init());
+    for (const char *word : {"hello", "world"}) {
+      bool is_match = true;
+      ASSERT_EQ(OB_SUCCESS, dict.match(ObString::make_string(word), is_match));
+      ASSERT_EQ(!empty_dict, is_match) << word;
+    }
+    bool is_match = true;
+    ASSERT_EQ(OB_SUCCESS, dict.match(ObString("missing"), is_match));
+    ASSERT_FALSE(is_match);
+  }
+}
+
+TEST_F(FTParserTest, empty_dict_cache_overwrites_old_ranges)
+{
+  ObArenaAllocator alloc(ObModIds::TEST);
+  ObFTDictDesc desc(ObCharsetType::CHARSET_UTF8MB4,
+                    ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                    share::OB_FT_DICT_IK_UTF8_TID,
+                    ObString(ObFTSLiteral::FT_DEFAULT_IK_DICT_UTF8_TABLE));
+  TestFTDictCacheLoaderExec loader;
+  ObFTCacheRangeContainer old_container(alloc);
+  const char *old_words[] = {"hello", "world"};
+  // Pin two old ranges. Non-first ranges also have range_count=0, but are data.
+  for (int32_t range_id = 0; range_id < 2; ++range_id) {
+    ObFTTrie<void> trie(alloc, desc.coll_type_);
+    ASSERT_EQ(OB_SUCCESS, trie.insert(ObString::make_string(old_words[range_id]), {}));
+    ObFTDATBuilder<void> builder(alloc);
+    ASSERT_EQ(OB_SUCCESS, builder.init(trie));
+    ASSERT_EQ(OB_SUCCESS, builder.build_from_trie(trie));
+    ObFTDAT *dat = nullptr;
+    builder.get_mem_block(dat);
+    ObFTCacheRangeHandle *handle = nullptr;
+    ASSERT_EQ(OB_SUCCESS, old_container.fetch_info_for_dict(handle));
+    ASSERT_EQ(OB_SUCCESS, ObFTCacheDict::put_and_fetch_cache_entry(
+        desc.table_id_, MTL_ID(), range_id, dat, 10, 0 == range_id ? 2 : 0, *handle));
+  }
+  {
+    ObFTCacheRangeContainer loaded(alloc);
+    ASSERT_EQ(OB_SUCCESS, loader.try_load_cache(desc, loaded));
+    ASSERT_EQ(2, loaded.get_handles().size());
+    ObFTRangeDict dict(&loaded, desc);
+    ASSERT_EQ(OB_SUCCESS, dict.init());
+    bool is_match = false;
+    ASSERT_EQ(OB_SUCCESS, dict.match(ObString("world"), is_match));
+    ASSERT_TRUE(is_match);
+  }
+
+  // The same table now contains only an empty word: publish its empty result.
+  const char *empty_words[] = {""};
+  ObIKDictIterator iter({empty_words, 1});
+  ASSERT_EQ(OB_SUCCESS, iter.init());
+  ObFTCacheRangeContainer empty_container(alloc);
+  ASSERT_EQ(OB_SUCCESS, loader.try_load_cache(desc, empty_container));
+  ASSERT_EQ(2, empty_container.get_handles().size());
+  ASSERT_EQ(OB_SUCCESS, loader.build_ranges(desc, iter, empty_container, 20));
+  ASSERT_EQ(1, empty_container.get_handles().size());
+  for (int i = 0; i < 2; ++i) {
+    ObFTCacheRangeContainer loaded(alloc);
+    ObArray<ObMissingRangeInfo> missing;
+    ASSERT_EQ(OB_SUCCESS, loader.try_load_cache(desc, loaded, &missing));
+    ASSERT_EQ(1, loaded.get_handles().size());
+    ASSERT_TRUE(missing.empty());
+    const ObFTCacheRangeHandle *handle = find_handle_by_range_id(loaded, 0);
+    ASSERT_NE(nullptr, handle);
+    ASSERT_EQ(0, handle->value_->get_range_count());
+    ASSERT_EQ(20, handle->value_->get_snapshot_version());
+    ObFTRangeDict dict(&loaded, desc);
+    ASSERT_EQ(OB_SUCCESS, dict.init());
+    for (const char *word : old_words) {
+      bool is_match = true;
+      ASSERT_EQ(OB_SUCCESS, dict.match(ObString::make_string(word), is_match));
+      ASSERT_FALSE(is_match) << word;
+    }
+  }
+
+  // Old range 1 is still resident, but range 0 makes it unreachable to new loads.
+  ObDictCacheKey old_key(desc.table_id_, MTL_ID(), 1);
+  const ObDictCacheValue *old_value = nullptr;
+  ObKVCacheHandle old_handle;
+  ASSERT_EQ(OB_SUCCESS, ObDictCache::get_instance().get_dict(old_key, old_value, old_handle));
+  const char *new_words[] = {"newword"};
+  ObIKDictIterator new_iter({new_words, 1});
+  ASSERT_EQ(OB_SUCCESS, new_iter.init());
+  ObFTCacheRangeContainer rebuilt(alloc);
+  ASSERT_EQ(OB_SUCCESS, loader.build_ranges(desc, new_iter, rebuilt, 30));
+  ObFTCacheRangeContainer reloaded(alloc);
+  ObFTDictCacheLoaderExec exec_loader;
+  ASSERT_EQ(OB_SUCCESS, exec_loader.load_cache(desc, reloaded));
+  ASSERT_EQ(1, reloaded.get_handles().size());
+  ObFTRangeDict dict(&reloaded, desc);
+  ASSERT_EQ(OB_SUCCESS, dict.init());
+  bool is_match = false;
+  ASSERT_EQ(OB_SUCCESS, dict.match(ObString("newword"), is_match));
+  ASSERT_TRUE(is_match);
+  ASSERT_EQ(OB_SUCCESS, dict.match(ObString("world"), is_match));
+  ASSERT_FALSE(is_match);
+}
+
+TEST_F(FTParserTest, empty_dict_cache_load_and_update_snapshot)
+{
+  ObArenaAllocator alloc(ObModIds::TEST);
+  ObFTDictDesc desc(ObCharsetType::CHARSET_UTF8MB4,
+                    ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                    share::OB_FT_DICT_IK_UTF8_TID,
+                    ObString(ObFTSLiteral::FT_DEFAULT_IK_DICT_UTF8_TABLE));
+  TestFTDictCacheLoaderExec loader;
+  ObFTCacheRangeContainer container(alloc);
+  const char *words[] = {""};
+  ObIKDictIterator iter({words, 1});
+  ASSERT_EQ(OB_SUCCESS, iter.init());
+  ASSERT_EQ(OB_SUCCESS, loader.build_ranges(desc, iter, container, 1));
+  ASSERT_EQ(1, container.get_handles().size());
+  ObFTDictCacheLoaderExec exec_loader;
+  for (int i = 0; i < 2; ++i) {
+    ObFTCacheRangeContainer loaded(alloc);
+    ASSERT_EQ(OB_SUCCESS, exec_loader.load_cache(desc, loaded));
+    ASSERT_EQ(1, loaded.get_handles().size());
+    ObFTRangeDict dict(&loaded, desc);
+    ASSERT_EQ(OB_SUCCESS, dict.init());
+    bool is_match = true;
+    ASSERT_EQ(OB_SUCCESS, dict.match(ObString("hello"), is_match));
+    ASSERT_FALSE(is_match);
+  }
+  ObFTCacheRangeContainer validated(alloc);
+  bool is_valid = false;
+  ASSERT_EQ(OB_SUCCESS, loader.validate_by_load(desc, validated, is_valid));
+  ASSERT_TRUE(is_valid);
+  ASSERT_EQ(OB_SUCCESS, loader.update_snapshot_version(desc, 20, validated));
+  ObFTCacheRangeContainer reloaded(alloc);
+  ASSERT_EQ(OB_SUCCESS, loader.try_load_cache(desc, reloaded));
+  const ObFTCacheRangeHandle *handle = find_handle_by_range_id(reloaded, 0);
+  ASSERT_NE(nullptr, handle);
+  ASSERT_EQ(0, handle->value_->get_range_count());
+  ASSERT_EQ(20, handle->value_->get_snapshot_version());
+  ASSERT_EQ(sizeof(ObFTDAT), handle->value_->get_dat_block()->mem_block_size_);
+}
+
+TEST_F(FTParserTest, zero_row_dictionary_refresh_publishes_empty_cache)
+{
+  FTDictReadProxy proxy;
+  auto *saved_proxy = GCTX.sql_proxy_;
+  GCTX.sql_proxy_ = &proxy;
+  DEFER(GCTX.sql_proxy_ = saved_proxy);
+  transaction::ObTransService tx_service;
+  auto *saved_tx_service = MTL(transaction::ObTransService *);
+  tx_service.tenant_id_ = MTL_ID();
+  tx_service.ts_mgr_ = &transaction::ObTsMgr::get_instance();
+  ObTenantEnv::get_tenant_local()->set(&tx_service);
+  DEFER(ObTenantEnv::get_tenant_local()->set(saved_tx_service));
+
+  ObArenaAllocator alloc(ObModIds::TEST);
+  ObFTDictDesc desc(ObCharsetType::CHARSET_UTF8MB4,
+                    ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                    share::OB_FT_DICT_IK_UTF8_TID,
+                    ObString(ObFTSLiteral::FT_DEFAULT_IK_DICT_UTF8_TABLE));
+  TestFTDictCacheLoaderExec loader;
+  const char *words[] = {"hello"};
+  ObIKDictIterator iter({words, 1});
+  ASSERT_EQ(OB_SUCCESS, iter.init());
+  ObFTCacheRangeContainer old_container(alloc);
+  ASSERT_EQ(OB_SUCCESS, loader.build_ranges(desc, iter, old_container, 10));
+  ObFTDictMgr::DictTableSnapshot snapshot;
+  snapshot.snapshot_version_ = 10;
+  snapshot.row_scn_ = 100;
+  snapshot.row_count_ = 1;
+  ASSERT_EQ(OB_SUCCESS, MTL(ObFTDictMgr *)->update_table_snapshot(desc.table_id_, snapshot));
+
+  // The SQL result is empty; exercise the real refresh and table-iterator path.
+  ObFTDictCacheLoaderRefresh refresh_loader;
+  ASSERT_EQ(OB_SUCCESS, refresh_loader.load_cache(desc));
+  ASSERT_EQ(1, proxy.full_reads_);
+  ASSERT_EQ(2, proxy.statistics_reads_);
+  ASSERT_EQ(OB_SUCCESS, MTL(ObFTDictMgr *)->get_table_snapshot(desc.table_id_, snapshot));
+  ASSERT_EQ(0, snapshot.row_count_);
+  ASSERT_EQ(0, snapshot.row_scn_);
+  ASSERT_GT(snapshot.snapshot_version_, 10);
+
+  ObFTDictCacheLoaderExec exec_loader;
+  for (int i = 0; i < 2; ++i) {
+    ObFTCacheRangeContainer loaded(alloc);
+    ASSERT_EQ(OB_SUCCESS, exec_loader.load_cache(desc, loaded));
+    ASSERT_EQ(1, loaded.get_handles().size());
+    const ObFTCacheRangeHandle *handle = find_handle_by_range_id(loaded, 0);
+    ASSERT_NE(nullptr, handle);
+    ASSERT_EQ(0, handle->value_->get_range_count());
+    ASSERT_EQ(snapshot.snapshot_version_, handle->value_->get_snapshot_version());
+    ObFTRangeDict dict(&loaded, desc);
+    ASSERT_EQ(OB_SUCCESS, dict.init());
+    bool is_match = true;
+    ASSERT_EQ(OB_SUCCESS, dict.match(ObString("hello"), is_match));
+    ASSERT_FALSE(is_match);
+  }
+  ASSERT_EQ(1, proxy.full_reads_);
+  ASSERT_EQ(2, proxy.statistics_reads_);
+  ASSERT_EQ(OB_SUCCESS, refresh_loader.load_cache(desc));
+  ASSERT_EQ(1, proxy.full_reads_);
+  ASSERT_EQ(3, proxy.statistics_reads_);
+}
+
+TEST_F(FTParserTest, empty_partial_dictionary_rebuild_falls_back_to_full)
+{
+  FTDictReadProxy proxy;
+  auto *saved_proxy = GCTX.sql_proxy_;
+  GCTX.sql_proxy_ = &proxy;
+  DEFER(GCTX.sql_proxy_ = saved_proxy);
+  transaction::ObTransService tx_service;
+  auto *saved_tx_service = MTL(transaction::ObTransService *);
+  tx_service.tenant_id_ = MTL_ID();
+  tx_service.ts_mgr_ = &transaction::ObTsMgr::get_instance();
+  ObTenantEnv::get_tenant_local()->set(&tx_service);
+  DEFER(ObTenantEnv::get_tenant_local()->set(saved_tx_service));
+
+  ObArenaAllocator alloc(ObModIds::TEST);
+  ObFTDictDesc desc(ObCharsetType::CHARSET_UTF8MB4,
+                    ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                    share::OB_FT_DICT_IK_UTF8_TID,
+                    ObString(ObFTSLiteral::FT_DEFAULT_IK_DICT_UTF8_TABLE));
+  TestFTDictCacheLoaderExec loader;
+  const struct { int partial_ret; const char *word; } cases[] = {
+      {OB_ITER_END, "remaining"}, {OB_ITER_END, nullptr}, {OB_TIMEOUT, "remaining"}};
+  for (const auto &test_case : cases) {
+    const int partial_ret = test_case.partial_ret;
+    proxy.word_ = test_case.word;
+    proxy.partial_ret_ = partial_ret;
+    proxy.full_reads_ = proxy.partial_reads_ = proxy.statistics_reads_ = 0;
+    const char *words[] = {"hello"};
+    ObIKDictIterator iter({words, 1});
+    ASSERT_EQ(OB_SUCCESS, iter.init());
+    ObFTCacheRangeContainer old_container(alloc);
+    ASSERT_EQ(OB_SUCCESS, loader.build_ranges(desc, iter, old_container, 10));
+    const ObFTCacheRangeHandle *old_handle = find_handle_by_range_id(old_container, 0);
+    ASSERT_NE(nullptr, old_handle);
+    // Keep range 0 and its metadata, with range 1 missing from the cache.
+    ObFTCacheRangeHandle first_handle;
+    ASSERT_EQ(OB_SUCCESS, ObFTCacheDict::put_and_fetch_cache_entry(
+        desc.table_id_, MTL_ID(), 0, old_handle->value_->get_dat_block(), 10, 2, first_handle));
+    ObFTDictMgr::DictTableSnapshot snapshot;
+    snapshot.snapshot_version_ = 10;
+    snapshot.row_scn_ = 100;
+    snapshot.row_count_ = 2;
+    ASSERT_EQ(OB_SUCCESS, MTL(ObFTDictMgr *)->update_table_snapshot(desc.table_id_, snapshot));
+
+    ObFTDictCacheLoaderExec exec_loader;
+    ObFTCacheRangeContainer loaded(alloc);
+    ASSERT_EQ(OB_ITER_END == partial_ret ? OB_SUCCESS : partial_ret,
+              exec_loader.load_cache(desc, loaded));
+    ASSERT_EQ(1, proxy.partial_reads_);
+    if (OB_ITER_END == partial_ret) {
+      ASSERT_EQ(1, proxy.full_reads_);
+      ASSERT_EQ(1, proxy.statistics_reads_);
+      ASSERT_EQ(1, loaded.get_handles().size());
+      const ObFTCacheRangeHandle *handle = find_handle_by_range_id(loaded, 0);
+      ASSERT_NE(nullptr, handle);
+      ASSERT_EQ(nullptr == proxy.word_ ? 0 : 1, handle->value_->get_range_count());
+      ASSERT_EQ(OB_SUCCESS, MTL(ObFTDictMgr *)->get_table_snapshot(desc.table_id_, snapshot));
+      ASSERT_EQ(nullptr == proxy.word_ ? 0 : 1, snapshot.row_count_);
+      ASSERT_EQ(snapshot.snapshot_version_, handle->value_->get_snapshot_version());
+      ASSERT_GT(snapshot.snapshot_version_, 10);
+      ObFTRangeDict dict(&loaded, desc);
+      ASSERT_EQ(OB_SUCCESS, dict.init());
+      bool is_match = false;
+      ASSERT_EQ(OB_SUCCESS, dict.match(ObString("remaining"), is_match));
+      ASSERT_EQ(nullptr != proxy.word_, is_match);
+      ASSERT_EQ(OB_SUCCESS, dict.match(ObString("hello"), is_match));
+      ASSERT_FALSE(is_match);
+    } else {
+      ASSERT_EQ(0, proxy.full_reads_);
+      ASSERT_EQ(0, proxy.statistics_reads_);
+      ASSERT_TRUE(loaded.get_handles().empty());
+      ASSERT_EQ(OB_SUCCESS, MTL(ObFTDictMgr *)->get_table_snapshot(desc.table_id_, snapshot));
+      ASSERT_EQ(10, snapshot.snapshot_version_);
+      ASSERT_EQ(2, snapshot.row_count_);
+    }
+  }
 }
 
 TEST_F(FTParserTest, long_word_dat_expand)
