@@ -1381,7 +1381,8 @@ int ObVecIdxAsyncTaskScheduler::check_ls_in_vector_migration(storage::ObLS *ls, 
   return ret;
 }
 
-int ObVecIdxAsyncTaskScheduler::check_need_maintenance(ObPluginVectorIndexMgr *mgr)
+int ObVecIdxAsyncTaskScheduler::check_need_maintenance(
+    ObPluginVectorIndexMgr *mgr, const bool need_check_transfer_scn)
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(check_need_maintenance_ls_adapter_binding(mgr))) {
@@ -1390,7 +1391,7 @@ int ObVecIdxAsyncTaskScheduler::check_need_maintenance(ObPluginVectorIndexMgr *m
     LOG_WARN("fail to check exist vector index adapter", KR(ret));
   } else if (OB_FAIL(check_need_maintenance_ls_follower(mgr))) {
     LOG_WARN("fail to check need maintenance ls follower", KR(ret));
-  } else if (OB_FAIL(check_transfer_scn(mgr))) {
+  } else if (need_check_transfer_scn && OB_FAIL(check_transfer_scn(mgr))) {
     LOG_WARN("fail to check transfer scn", KR(ret));
   }
   return ret;
@@ -2014,6 +2015,10 @@ int ObVecIdxAsyncTaskScheduler::check_and_execute_adapter_maintenance_tasks()
   } else if (OB_FAIL(check_schema_version(schema_version_changed))) {
     LOG_WARN("fail to check schema version", K(ret), K_(tenant_id));
   } else {
+    // Avoid scanning every tablet in a tenant without vector indexes or adaptors.
+    // Keep checking while dropped indexes still have adaptors awaiting cleanup.
+    const bool need_check_transfer_scn = !vec_table_id_array.empty()
+        || !service_->get_tenant_adaptor_map().empty();
     ObSEArray<share::ObLSID, DEFAULT_LS_EXECUTOR_MAP_SIZE> ls_ids_to_maintain;
     {
       common::ObSpinLockGuard guard(ls_executor_lock_);
@@ -2027,7 +2032,7 @@ int ObVecIdxAsyncTaskScheduler::check_and_execute_adapter_maintenance_tasks()
           LOG_WARN("mgr is null", K(ret), K(iter->first));
         } else if (schema_version_changed) {
           set_need_maintenance(mgr);
-        } else if(OB_FAIL(check_need_maintenance(mgr))) {
+        } else if (OB_FAIL(check_need_maintenance(mgr, need_check_transfer_scn))) {
           LOG_WARN("fail to check need maintenance", K(ret), K(iter->first));
         }
         if (OB_SUCC(ret) && !iter->first.is_sys_ls() && mgr->need_maintenance()) {
@@ -2070,7 +2075,7 @@ int ObVecIdxAsyncTaskScheduler::check_and_execute_adapter_maintenance_tasks()
       // Sync last_transfer_scn regardless of maintenance result: the transfer event has
       // already occurred, and keeping mgr out of sync would re-trigger maintenance every
       // tick even when maintenance failed for unrelated reasons.
-      if (OB_NOT_NULL(mgr) && OB_NOT_NULL(ls_handle.get_ls())
+      if (need_check_transfer_scn && OB_NOT_NULL(mgr) && OB_NOT_NULL(ls_handle.get_ls())
           && !ls_handle.get_ls()->is_logonly_replica()) {
         share::SCN current_transfer_scn;
         int tmp_ret = OB_SUCCESS;

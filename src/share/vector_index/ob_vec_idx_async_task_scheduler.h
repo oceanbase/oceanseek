@@ -297,7 +297,7 @@ private:
   int check_need_maintenance_ls_adapter_binding(ObPluginVectorIndexMgr *mgr);
   int check_transfer_scn(ObPluginVectorIndexMgr *mgr);
   int check_ls_in_vector_migration(storage::ObLS *ls, bool &is_in_migration);
-  int check_need_maintenance(ObPluginVectorIndexMgr *mgr);
+  int check_need_maintenance(ObPluginVectorIndexMgr *mgr, const bool need_check_transfer_scn);
   void set_need_maintenance(ObPluginVectorIndexMgr *mgr);
   int execute_adapter_maintenance_for_ls(storage::ObLS *ls,
                                          ObPluginVectorIndexMgr *mgr,
