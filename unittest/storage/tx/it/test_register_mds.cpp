@@ -145,14 +145,6 @@ public:
   MsgBus bus_;
 };
 
-#define GC_MDS_RETAIN_CTX(node)                                                                    \
-  {                                                                                                \
-    ObLSTxCtxMgr *ls_tx_ctx_mgr1 = nullptr;                                                        \
-    ASSERT_EQ(OB_SUCCESS, node->txs_.tx_ctx_mgr_.get_ls_tx_ctx_mgr(node->ls_id_, ls_tx_ctx_mgr1)); \
-    ls_tx_ctx_mgr1->get_retain_ctx_mgr().try_gc_retain_ctx(&node->fake_ls_);                       \
-    ASSERT_EQ(OB_SUCCESS, node->txs_.tx_ctx_mgr_.revert_ls_tx_ctx_mgr(ls_tx_ctx_mgr1));            \
-  }
-
 TEST_F(ObTestRegisterMDS, basic)
 {
   START_TWO_TX_NODE_WITH_LSID(n1, n2, 2001);
@@ -170,10 +162,8 @@ TEST_F(ObTestRegisterMDS, basic)
   ReplayLogEntryFunctor functor(n2);
   ASSERT_EQ(OB_SUCCESS, n2->fake_tx_log_adapter_->replay_all(functor));
 
-  GC_MDS_RETAIN_CTX(n1)
   ASSERT_EQ(OB_SUCCESS, n1->wait_all_tx_ctx_is_destoryed());
 
-  GC_MDS_RETAIN_CTX(n2)
   ASSERT_EQ(OB_SUCCESS, n2->wait_all_tx_ctx_is_destoryed());
 }
 
@@ -199,10 +189,8 @@ TEST_F(ObTestRegisterMDS, basic_big_mds)
   ReplayLogEntryFunctor functor(n2);
   ASSERT_EQ(OB_SUCCESS, n2->fake_tx_log_adapter_->replay_all(functor));
 
-  GC_MDS_RETAIN_CTX(n1)
   ASSERT_EQ(OB_SUCCESS, n1->wait_all_tx_ctx_is_destoryed());
 
-  GC_MDS_RETAIN_CTX(n2)
   ASSERT_EQ(OB_SUCCESS, n2->wait_all_tx_ctx_is_destoryed());
 }
 
@@ -260,10 +248,8 @@ TEST_F(ObTestRegisterMDS, merge_mds_log)
   ReplayLogEntryFunctor functor(n2);
   ASSERT_EQ(OB_SUCCESS, n2->fake_tx_log_adapter_->replay_all(functor));
 
-  GC_MDS_RETAIN_CTX(n1)
   ASSERT_EQ(OB_SUCCESS, n1->wait_all_tx_ctx_is_destoryed());
 
-  GC_MDS_RETAIN_CTX(n2)
   ASSERT_EQ(OB_SUCCESS, n2->wait_all_tx_ctx_is_destoryed());
 
 }
@@ -289,10 +275,8 @@ TEST_F(ObTestRegisterMDS, notify_mds_error)
   ReplayLogEntryFunctor functor(n2);
   ASSERT_EQ(OB_SUCCESS, n2->fake_tx_log_adapter_->replay_all(functor));
 
-  GC_MDS_RETAIN_CTX(n1)
   ASSERT_EQ(OB_SUCCESS, n1->wait_all_tx_ctx_is_destoryed());
 
-  GC_MDS_RETAIN_CTX(n2)
   ASSERT_EQ(OB_SUCCESS, n2->wait_all_tx_ctx_is_destoryed());
 }
 } // namespace oceanbase

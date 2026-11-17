@@ -244,12 +244,9 @@ int ObMvccValueIterator::lock_for_read_inner_(const ObQueryFlag &flag,
                                                               lfr_result.trans_version_);
     ObReCheckOp *recheck_op = &recheck_tx_node_op;
 
-    // MDS read_uncommitted bypasses tx_data caches to avoid acting on a stale
-    // COMMIT decision left in the tenant-wide TX_DATA_KV_CACHE from before this
-    // LS was rebuilt. With the cache skipped, lock_for_read consults
-    // tx_ctx_table_ / tx_data_table_ directly (per-LS, fresh post-rebuild) and
-    // either returns the genuine in-flight state or OB_TRANS_CTX_NOT_EXIST.
-    const bool skip_tx_data_cache = is_mds_tablet_read && read_uncommitted && flag.is_select_follower();
+    // The shared TX_DATA_KV_CACHE key includes the LS creation and tx-table
+    // online generations, so a decision cached before this LS was rebuilt can
+    // never be observed here. Reading through the cache is therefore safe.
     ObLockForReadArg lock_for_read_arg(*ctx_,
                                        data_tx_id,
                                        iter->get_seq_no(),
@@ -258,7 +255,6 @@ int ObMvccValueIterator::lock_for_read_inner_(const ObQueryFlag &flag,
                                        scn,
                                        flag.skip_lock_for_read(),
                                        !is_mds_tablet_read,
-                                       skip_tx_data_cache,
                                        is_mds_tablet_read /*skip_check_for_standby*/);
 
     if (OB_FAIL(ctx_->get_tx_table_guards().lock_for_read(lock_for_read_arg,

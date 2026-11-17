@@ -2248,7 +2248,6 @@ int ObMultiVersionMicroBlockRowScanner::check_trans_version(
           sstable_->get_end_scn(),
           context_->query_flag_.skip_lock_for_read(),
           !context_->tablet_id_.is_ls_mds_tablet(),
-          false /*skip_cache*/,
           context_->tablet_id_.is_ls_mds_tablet() /*skip_check_for_standby*/);
 
         if (OB_FAIL(lock_for_read(lock_for_read_arg,

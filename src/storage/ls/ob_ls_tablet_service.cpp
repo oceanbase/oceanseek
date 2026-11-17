@@ -7275,8 +7275,12 @@ int ObLSTabletService::get_ls_min_end_scn(
         }
       }
     }
-    // now tx_data contains mds tx_op to remove retain_ctx
-    // so we need wait ls_checkpoint advance to recycle tx_data
+    // Cap the tx_data recycle bound at the LS checkpoint: below the checkpoint
+    // every tablet's data is durable, so no memtable row depends on the tx_data
+    // of that range; above it rows may still live in a memtable (or need to be
+    // replayed after a restart) and are resolved through tx_data, so their
+    // tx_data must be kept. The per-tablet bound only describes how far the
+    // dumped sstables have been filled, which does not cover the memtable side.
     if (ls_checkpoint < min_end_scn_from_latest_tablets) {
       min_end_scn_from_latest_tablets = ls_checkpoint;
     }

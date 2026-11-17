@@ -228,7 +228,6 @@ void ObLSTxCtxMgr::reset()
   txs_ = NULL;
   ts_mgr_ = NULL;
   tx_ls_state_mgr_.reset();
-  ls_retain_ctx_mgr_.reset();
 
   ObRemoveAllTxCtxFunctor fn;
   ls_tx_ctx_map_.remove_if(fn);
@@ -1003,9 +1002,7 @@ int ObLSTxCtxMgr::stop(const bool graceful)
       if (OB_SUCC(ret)) {
         KillTxCtxFunctor fn(arg, cb_list);
         fn.set_release_audit_mgr_lock(true);
-        if (OB_FAIL(ls_retain_ctx_mgr_.force_gc_retain_ctx())) {
-          TRANS_LOG(WARN, "force gc retain ctx mgr", K(ret));
-        } else if (OB_FAIL(ls_tx_ctx_map_.for_each(fn))) {
+        if (OB_FAIL(ls_tx_ctx_map_.for_each(fn))) {
           TRANS_LOG(WARN, "for each transaction context error", KR(ret), "manager", *this);
         }
         if (OB_FAIL(ret)) {
@@ -1032,9 +1029,7 @@ int ObLSTxCtxMgr::kill_all_tx(const bool graceful, bool &is_all_tx_cleaned_up)
     WLockGuardWithRetryInterval guard(rwlock_, TRY_THRESOLD_US, RETRY_INTERVAL_US);
     const int64_t total_active_readonly_request_count = get_total_active_readonly_request_count();
     KillTxCtxFunctor fn(arg, cb_list);
-    if (OB_FAIL(ls_retain_ctx_mgr_.force_gc_retain_ctx())) {
-      TRANS_LOG(WARN, "force gc retain ctx mgr", K(ret));
-    } else if (OB_FAIL(ls_tx_ctx_map_.for_each(fn))) {
+    if (OB_FAIL(ls_tx_ctx_map_.for_each(fn))) {
       TRANS_LOG(WARN, "for each transaction context error", KR(ret), "manager", *this);
     }
     is_all_tx_cleaned_up = (get_tx_ctx_count_() == 0);
@@ -1356,9 +1351,6 @@ int ObLSTxCtxMgr::del_tx_ctx(ObTransCtx *ctx)
   } else if (OB_ISNULL(ctx)) {
     TRANS_LOG(WARN, "invalid argument", KP(ctx));
     ret = OB_INVALID_ARGUMENT;
-  } else if ((static_cast<ObPartTransCtx *>(ctx))->get_retain_cause() != RetainCause::UNKOWN) {
-    ret = OB_SUCCESS;
-    TRANS_LOG(INFO, "can not del a retain ctx", KPC(ctx));
   } else {
     ls_tx_ctx_map_.del(ctx->get_trans_id(), ctx);
   }

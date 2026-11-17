@@ -51,8 +51,11 @@ int ObTxTableGuard::check_row_locked(const transaction::ObTransID &read_tx_id,
 int ObTxTableGuard::load_tx_op(const transaction::ObTransID &tx_id, ObTxData &tx_data)
 {
   /*
-   * when we load tx_op from tx_data just skip tx_data cache
-   * read tx_data from tx_data_sstable promise tx_op is complete (undo_action/mds etc)
+   * Skipping the caches here is about tx_op completeness, not about isolating
+   * LS generations (that is handled by the ls_epoch_/tx_table_epoch_ part of
+   * the cache key). A cached value only promises the tx state, while undo
+   * actions / mds data can still be missing, so read the tx data SSTable and
+   * resolve the complete tx_op from tx_ctx_table_ / tx_data_table_.
    */
   if (OB_NOT_NULL(tx_table_)) {
     ObReadTxDataArg arg(tx_id,
@@ -136,8 +139,7 @@ int ObTxTableGuard::lock_for_read(const transaction::ObLockForReadArg &lock_for_
                                   ObReCheckOp &recheck_op)
 {
   if (OB_NOT_NULL(tx_table_)) {
-    ObReadTxDataArg read_tx_data_arg(lock_for_read_arg.data_trans_id_, epoch_, mini_cache_,
-                                     lock_for_read_arg.skip_cache_);
+    ObReadTxDataArg read_tx_data_arg(lock_for_read_arg.data_trans_id_, epoch_, mini_cache_);
     return tx_table_->lock_for_read(read_tx_data_arg,
                                     lock_for_read_arg,
                                     can_read,

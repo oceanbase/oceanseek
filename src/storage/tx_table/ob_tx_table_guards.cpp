@@ -164,7 +164,7 @@ int ObTxTableGuards::lock_for_read(
                         recheck_op);
 
   if (!src_tx_table_guard_.is_valid()) {
-    ret = check_with_tx_data(lock_for_read_arg.data_trans_id_, fn, lock_for_read_arg.skip_cache_);
+    ret = check_with_tx_data(lock_for_read_arg.data_trans_id_, fn);
 
     if (OB_SUCC(ret)) {
       if (cleanout_op.need_cleanout()) {
@@ -184,8 +184,7 @@ int ObTxTableGuards::lock_for_read(
     ret = check_with_tx_data(lock_for_read_arg.data_trans_id_,
                              fn,
                              src_fn,
-                             use_dest,
-                             lock_for_read_arg.skip_cache_);
+                             use_dest);
 
     if (OB_SUCC(ret)) {
       if (!use_dest) {
@@ -273,8 +272,7 @@ int ObTxTableGuards::check_with_tx_data(
   const transaction::ObTransID &data_tx_id,
   ObITxDataCheckFunctor &functor,
   ObITxDataCheckFunctor &src_functor,
-  bool &use_dst,
-  const bool skip_cache)
+  bool &use_dst)
 {
   int ret = OB_SUCCESS;
   bool need_src = false;
@@ -282,8 +280,7 @@ int ObTxTableGuards::check_with_tx_data(
 
   ObReadTxDataArg arg(data_tx_id,
                       tx_table_guard_.get_epoch(),
-                      tx_table_guard_.get_mini_cache(),
-                      skip_cache);
+                      tx_table_guard_.get_mini_cache());
 
   if (!is_valid()) {
     ret = OB_INVALID_ARGUMENT;
@@ -309,8 +306,7 @@ int ObTxTableGuards::check_with_tx_data(
   } else if (need_src) {
     ObReadTxDataArg src_arg(data_tx_id,
                             src_tx_table_guard_.get_epoch(),
-                            src_tx_table_guard_.get_mini_cache(),
-                            skip_cache);
+                            src_tx_table_guard_.get_mini_cache());
 
     if (OB_FAIL(src_tx_table_guard_.check_with_tx_data(src_arg,
                                                        src_functor))) {
@@ -339,14 +335,12 @@ int ObTxTableGuards::check_with_tx_data(
 
 int ObTxTableGuards::check_with_tx_data(
   const transaction::ObTransID &data_tx_id,
-  ObITxDataCheckFunctor &functor,
-  const bool skip_cache)
+  ObITxDataCheckFunctor &functor)
 {
   int ret = OB_SUCCESS;
   ObReadTxDataArg arg(data_tx_id,
                       tx_table_guard_.get_epoch(),
-                      tx_table_guard_.get_mini_cache(),
-                      skip_cache);
+                      tx_table_guard_.get_mini_cache());
 
   if (!is_valid()) {
     ret = OB_INVALID_ARGUMENT;

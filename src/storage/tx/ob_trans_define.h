@@ -233,7 +233,6 @@ struct ObLockForReadArg
                    share::SCN scn,
                    const bool skip_lock = false,
                    const bool read_elr = true,
-                   const bool skip_cache = false,
                    const bool skip_check_for_standby = false)
     : mvcc_acc_ctx_(acc_ctx),
     data_trans_id_(data_trans_id),
@@ -243,7 +242,6 @@ struct ObLockForReadArg
     scn_(scn),
     skip_lock_(skip_lock),
     read_elr_(read_elr),
-    skip_cache_(skip_cache),
     skip_check_for_standby_(skip_check_for_standby) {}
 
   DECLARE_TO_STRING;
@@ -257,11 +255,6 @@ struct ObLockForReadArg
   share::SCN scn_;
   bool skip_lock_;
   bool read_elr_;
-  // When true, lock_for_read bypasses the tenant-wide TX_DATA_KV_CACHE (and the
-  // per-context mini cache) and queries tx_ctx_table_ / tx_data_table_ directly.
-  // MDS read_uncommitted paths use this to resolve the local transaction state
-  // directly. The shared cache also isolates LS creation and online generations.
-  bool skip_cache_;
   // When set, lock_for_read never infers the tx state from remote participants
   // (check_for_standby) on a standby/restore replica. If the state is locally
   // undecidable, OB_EAGAIN is returned instead so that the read stays
@@ -1099,7 +1092,6 @@ class ObTransRetryTaskType
 public:
   static const int64_t UNKNOWN = -1;
   static const int64_t END_TRANS_CB_TASK = 0;
-  static const int64_t ADVANCE_LS_CKPT_TASK = 1;
   static const int64_t STANDBY_CLEANUP_TASK = 2;
   static const int64_t DUP_TABLE_TX_REDO_SYNC_RETRY_TASK = 3;
   static const int64_t PALF_KV_GC_TASK = 4;
@@ -1676,14 +1668,6 @@ static const char * to_str_ctx_source(const PartCtxSource & ctx_src)
 }
 
 bool is_transfer_ctx(PartCtxSource ctx_source);
-
-
-enum class RetainCause : int16_t
-{
-  UNKOWN = -1,
-  MDS_WAIT_GC_COMMIT_LOG = 0,
-  MAX = 1
-};
 
 class ObTxMDSCache;
 

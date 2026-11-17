@@ -2718,7 +2718,7 @@ int ObTransferHandler::offline()
     if (lock_succ) {
       int64_t tmp_ret = OB_SUCCESS;
       if (OB_TMP_FAIL(transfer_handler_lock_.unlock())) {
-        LOG_WARN("[RetainCtxMgr] unlock retain_ctx_mgr failed", K(tmp_ret));
+        LOG_WARN("unlock transfer_handler_lock_ failed", K(tmp_ret));
       }
     }
 

@@ -314,7 +314,7 @@ TEST_F(TestAsyncIndexRefreshInfoMds, basic_register_and_read)
   EQ(OB_SUCCESS, arg.serialize(buf, sizeof(buf), pos));
 
   // 3. Register MDS via a transaction and commit
-  //    Pattern mirrors test_tx_data.cpp::retain_ctx2
+  //    Pattern mirrors test_tx_data.cpp::mds_tx_ls_reboot2
   ObMySQLTransaction trans;
   EQ(0, trans.start(GCTX.sql_proxy_, R.tenant_id_));
   observer::ObInnerSQLConnection *conn =

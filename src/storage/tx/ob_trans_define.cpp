@@ -666,7 +666,7 @@ DEF_TO_STRING(ObLockForReadArg)
 {
   int64_t pos = 0;
   J_OBJ_START();
-  J_KV(K(mvcc_acc_ctx_), K(data_trans_id_), K(data_sql_sequence_), K(read_latest_), K(read_uncommitted_), K(scn_), K(skip_lock_), K(read_elr_), K(skip_cache_), K(skip_check_for_standby_));
+  J_KV(K(mvcc_acc_ctx_), K(data_trans_id_), K(data_sql_sequence_), K(read_latest_), K(read_uncommitted_), K(scn_), K(skip_lock_), K(read_elr_), K(skip_check_for_standby_));
   J_OBJ_END();
   return pos;
 }

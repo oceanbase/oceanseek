@@ -300,7 +300,7 @@ TEST_F(ObTxDataTest, rollback_to_with_ls_replay_from_middle)
   EQ(100, val);
 }
 
-TEST_F(ObTxDataTest, retain_ctx)
+TEST_F(ObTxDataTest, mds_tx_ls_reboot)
 {
   common::ObMySQLProxy &sql_proxy = get_curr_simple_server().get_sql_proxy2();
   int64_t affected_rows = 0;
@@ -338,7 +338,7 @@ TEST_F(ObTxDataTest, retain_ctx)
   EQ(0, SSH::ls_reboot(R.tenant_id_, ls_id2));
 }
 
-TEST_F(ObTxDataTest, retain_ctx2)
+TEST_F(ObTxDataTest, mds_tx_ls_reboot2)
 {
   common::ObMySQLProxy &sql_proxy = get_curr_simple_server().get_sql_proxy2();
   int64_t affected_rows = 0;

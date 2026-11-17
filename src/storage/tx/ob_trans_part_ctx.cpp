@@ -268,12 +268,6 @@ void ObPartTransCtx::destroy()
       FORCE_PRINT_TRACE(tlog_, "[missing callback scheduler] ");
     }
 
-    if (OB_NOT_NULL(retain_ctx_func_ptr_)) {
-      TRANS_LOG(INFO, "the memory of retain_ctx_func_ptr is active, need free", K(ret),
-                KP(retain_ctx_func_ptr_), KPC(retain_ctx_func_ptr_), KPC(this));
-    }
-    (void)try_gc_retain_ctx_func_();
-
     exec_info_.destroy(mds_cache_);
 
     mds_cache_.destroy();
@@ -336,7 +330,6 @@ void ObPartTransCtx::default_init_()
   trans_expired_time_ = INT64_MAX;
   stmt_expired_time_ = INT64_MAX;
   cur_query_start_time_ = 0;
-  clean_retain_cause_();
 
   upstream_state_ = ObTxState::INIT;
   msg_2pc_cache_ = nullptr;
@@ -353,7 +346,6 @@ void ObPartTransCtx::default_init_()
   big_segment_info_.reset();
   is_ctx_table_merged_ = false;
   mds_cache_.reset();
-  retain_ctx_func_ptr_ = nullptr;
   create_ctx_scn_.reset();
   ctx_source_ = PartCtxSource::UNKNOWN;
   replay_completeness_.reset();
@@ -447,10 +439,6 @@ int ObPartTransCtx::trans_clear_(const share::SCN log_ts)
   //    removed from ctx_mgr(in trans_clear_)
   // 2. We must disallow dump tx_ctx_table after we already push rec_log_ts(in
   //    get_tx_ctx_table_info)
-  //
-  // What's more, we need not to care about the retain tx_ctx, because it has
-  // already meet the durability requirement and is just used for multi-source
-  // data.
   share::SCN rec_log_ts = get_rec_log_ts_() == share::SCN::max_scn() ?
     log_ts : get_rec_log_ts_();
 
@@ -1639,24 +1627,6 @@ int ObPartTransCtx::recover_tx_ctx_table_info(ObTxCtxTableInfo &ctx_info)
     }
 
 
-    // insert into retain ctx mgr if it will not replay commit or abort log
-    if (OB_FAIL(ret)) {
-      // do nothing
-    } else if (exec_info_.multi_data_source_.count() > 0
-               && (ObTxState::COMMIT == exec_info_.state_ || ObTxState::ABORT == exec_info_.state_
-                   || ObTxState::CLEAR == exec_info_.state_)) {
-      if (OB_FAIL(try_alloc_retain_ctx_func_())) {
-        TRANS_LOG(WARN, "alloc retain ctx func failed", K(ret), KPC(this));
-      } else if (OB_FAIL(insert_into_retain_ctx_mgr_(RetainCause::MDS_WAIT_GC_COMMIT_LOG,
-                                                     exec_info_.max_applying_log_ts_,
-                                                     exec_info_.max_durable_lsn_, false))) {
-        TRANS_LOG(WARN, "insert into retain ctx mgr failed", K(ret), KPC(this));
-      }
-      if (OB_SUCC(ret)) {
-        TRANS_LOG(INFO, "recover retain ctx into mgr success", K(ret), K(trans_id_), K(ls_id_));
-      }
-    }
-
     if (exec_info_.is_dup_tx_ && get_downstream_state() == ObTxState::REDO_COMPLETE
         && exec_info_.max_applying_log_ts_ == exec_info_.max_applied_log_ts_) {
       if (OB_FAIL(ret)) {
@@ -1733,9 +1703,7 @@ int ObPartTransCtx::serialize_tx_ctx_to_buffer(ObTxLocalBuffer &buffer, int64_t 
   CtxLockGuard guard(lock_);
   // 1. Tx ctx has already exited, so it means that it may have no chance to
   //    push its rec_log_ts to aggre_rec_log_ts, so we must not persist it
-  // NB: You need take note that retained tx ctx should be dumped due to
-  //     multi-source data.
-  if (is_exiting_ && get_retain_cause() == RetainCause::UNKOWN) {
+  if (is_exiting_) {
     ret = OB_TRANS_CTX_NOT_EXIST;
     TRANS_LOG(INFO, "tx ctx has exited", K(ret), KPC(this));
   // 2. Tx ctx has no persisted log, so donot need persisting
@@ -2784,13 +2752,6 @@ int ObPartTransCtx::on_success_ops_(ObTxLogCb *log_cb)
         }
       } else if (ObTxLogType::TX_COMMIT_LOG == log_type) {
         if (OB_SUCC(ret)) {
-          if (exec_info_.multi_data_source_.count() > 0 && get_retain_cause() == RetainCause::UNKOWN
-              && OB_FAIL(insert_into_retain_ctx_mgr_(RetainCause::MDS_WAIT_GC_COMMIT_LOG, log_ts, log_lsn,
-                                                     false))) {
-            TRANS_LOG(WARN, "insert into retain_ctx_mgr failed", K(ret), KPC(log_cb), KPC(this));
-          }
-        }
-        if (OB_SUCC(ret)) {
           if (is_local_tx_()) {
             if (OB_FAIL(ctx_tx_data_.set_end_log_ts(log_ts))) {
               TRANS_LOG(WARN, "set end log ts failed", K(ret));
@@ -2824,13 +2785,6 @@ int ObPartTransCtx::on_success_ops_(ObTxLogCb *log_cb)
           }
         }
       } else if (ObTxLogType::TX_ABORT_LOG == log_type) {
-        if (OB_SUCC(ret)) {
-          if (exec_info_.multi_data_source_.count() > 0 && get_retain_cause() == RetainCause::UNKOWN
-              && OB_FAIL(insert_into_retain_ctx_mgr_(RetainCause::MDS_WAIT_GC_COMMIT_LOG, log_ts, log_lsn,
-                                                     false))) {
-            TRANS_LOG(WARN, "insert into retain_ctx_mgr failed", K(ret), KPC(log_cb), KPC(this));
-          }
-        }
         if (OB_SUCC(ret)) {
           if (is_local_tx_() || sub_state_.is_force_abort()) {
             if (OB_FAIL(ctx_tx_data_.set_end_log_ts(log_ts))) {
@@ -3938,9 +3892,6 @@ int ObPartTransCtx::submit_commit_log_()
         TRANS_LOG(WARN, "set start scn in commit log failed", K(ret), K(commit_log));
       } else if (OB_FAIL(check_dli_batch_completed_(ObTxLogType::TX_COMMIT_LOG))) {
         TRANS_LOG(WARN, "check dli batch completed error", KR(ret), K(*this));
-      } else if ((exec_info_.multi_data_source_.count() > 0 || mds_cache_.count() > 0)
-                 && OB_FAIL(try_alloc_retain_ctx_func_())) {
-        TRANS_LOG(WARN, "alloc retain ctx func for mds trans failed", K(ret), K(mds_cache_), KPC(this));
       } else if (OB_FAIL(decide_state_log_barrier_type_(ObTxLogType::TX_COMMIT_LOG, commit_log_barrier_type))) {
         TRANS_LOG(WARN, "decide commit log barrier type failed", K(ret), K(commit_log_barrier_type),
                   KPC(this));
@@ -4104,13 +4055,6 @@ int ObPartTransCtx::submit_abort_log_()
   ObTxAbortLog abort_log(mds_cache_.get_final_notify_array());
 
   if (OB_SUCC(ret)) {
-    if ((exec_info_.multi_data_source_.count() > 0 || mds_cache_.count() > 0)) {
-      if (OB_FAIL(try_alloc_retain_ctx_func_())) {
-        TRANS_LOG(WARN, "alloc retain ctx func for mds trans failed", K(ret), K(mds_cache_),
-                  KPC(this));
-      }
-    }
-
     if (OB_FAIL(ret)) {
       // do nothing
     } else if (OB_FAIL(abort_log.init_tx_data_backup(ctx_tx_data_.get_start_log_ts()))) {
@@ -6272,17 +6216,6 @@ int ObPartTransCtx::replay_commit(const ObTxCommitLog &commit_log,
       }
     }
     if (OB_SUCC(ret)) {
-      if (exec_info_.multi_data_source_.count() > 0 && get_retain_cause() == RetainCause::UNKOWN) {
-        if (OB_FAIL(try_alloc_retain_ctx_func_())) {
-          TRANS_LOG(WARN, "alloc retain ctx func failed", K(ret), K(commit_log), K(timestamp),
-                    K(offset), KPC(this));
-        } else if (OB_FAIL(insert_into_retain_ctx_mgr_(RetainCause::MDS_WAIT_GC_COMMIT_LOG, timestamp,
-                                                       offset, true))) {
-          TRANS_LOG(WARN, "insert into retain_ctx_mgr failed", K(ret), KPC(this));
-        }
-      }
-    }
-    if (OB_SUCC(ret)) {
       if (is_local_tx_()) {
         set_durable_state_(ObTxState::COMMIT);
         set_upstream_state(ObTxState::COMMIT);
@@ -6482,17 +6415,6 @@ int ObPartTransCtx::replay_abort(const ObTxAbortLog &abort_log,
         // ret = OB_ERR_UNEXPECTED;
         TRANS_LOG(WARN, "mds part_ctx can not replay from the middle", K(ret), K(timestamp), K(offset),
                   K(abort_log), KPC(this));
-      }
-    }
-    if (OB_SUCC(ret)) {
-      if (exec_info_.multi_data_source_.count() > 0 && get_retain_cause() == RetainCause::UNKOWN) {
-        if (OB_FAIL(try_alloc_retain_ctx_func_())) {
-          TRANS_LOG(WARN, "alloc retain ctx func failed", K(ret), K(abort_log), K(timestamp),
-                    K(offset), KPC(this));
-        } else if (OB_FAIL(insert_into_retain_ctx_mgr_(RetainCause::MDS_WAIT_GC_COMMIT_LOG, timestamp,
-                                                       offset, true))) {
-          TRANS_LOG(WARN, "insert into retain_ctx_mgr failed", K(ret), KPC(this));
-        }
       }
     }
     if (OB_SUCC(ret)) {
@@ -6859,7 +6781,7 @@ int ObPartTransCtx::switch_to_leader(const SCN &start_working_ts)
     ret = OB_NOT_INIT;
   } else if (OB_UNLIKELY(is_exiting_)) {
     TRANS_LOG(DEBUG, "transaction is exiting", "context", *this);
-  } else if (OB_UNLIKELY(replay_completeness_.is_incomplete()) && (get_retain_cause() == RetainCause::UNKOWN)) {
+  } else if (OB_UNLIKELY(replay_completeness_.is_incomplete())) {
     ret = OB_ERR_UNEXPECTED;
     TRANS_LOG(ERROR, "incomplete replayed ctx should not switch to leader", K(ret), KPC(this));
     print_trace_log_();
@@ -8317,74 +8239,6 @@ int ObPartTransCtx::register_multi_data_source(const ObTxDataSourceType data_sou
   return ret;
 }
 
-int ObPartTransCtx::del_retain_ctx()
-{
-  int ret = OB_SUCCESS;
-  bool need_del = false;
-
-  {
-    CtxLockGuard guard(lock_);
-
-    if (RetainCause::UNKOWN == get_retain_cause()) {
-      ret = OB_ERR_UNEXPECTED;
-      TRANS_LOG(WARN, "can not del a normal ctx by retain inerface", K(ret), KPC(this));
-    } else if (is_exiting_) {
-      // +-----------------------------------------------+
-      // |                tx ctx exiting                 |
-      // |      but be retained because of MDS buf       |
-      // +-----------------------------------------------+
-      //   |
-      //   | stop server and recover
-      //   | ls_ckpt_ts < ctx_ckpt_ts
-      //   v
-      // +-----------------------------------------------+
-      // |          recover from exiting state           |
-      // +-----------------------------------------------+
-      //   |
-      //   | start replay from ls_ckpt_ts
-      //   v
-      // +-----------------------------------------------+
-      // |        replay redo in the exiting ctx         |
-      // +-----------------------------------------------+
-      //   |
-      //   |
-      //   v
-      // +-----------------------------------------------+
-      // |               froce kill tx ctx               |
-      // +-----------------------------------------------+
-      //   |
-      //   |
-      //   v
-      // +-----------------------------------------------+
-      // | need clear memtable_ctx even if it is exiting |
-      // +-----------------------------------------------+
-      trans_kill_();  // clear memtable calliback for replay
-
-      clean_retain_cause_();
-      print_trace_log_if_necessary_();
-
-      const int64_t ctx_ref = get_ref();
-      if (NULL == ls_tx_ctx_mgr_) {
-        TRANS_LOG(ERROR, "ls_tx_ctx_mgr_ is null, unexpected error", KP(ls_tx_ctx_mgr_), "context",
-                  *this);
-      } else {
-        need_del = true;
-        FLOG_INFO("del retain ctx after exiting", K(ctx_ref), KPC(this));
-      }
-    } else {
-      // MDS trans : allowed gc before clear log on_success
-      // del ctx by set_exiting_()
-      clean_retain_cause_();
-      FLOG_INFO("del retain ctx before exiting", KPC(this));
-    }
-  }
-  if (need_del && NULL != ls_tx_ctx_mgr_) {
-    ls_tx_ctx_mgr_->del_tx_ctx(this);
-  }
-  // TRANS_LOG(INFO, "after del retain ctx", K(ret), KPC(this));
-  return ret;
-}
-
 int ObPartTransCtx::search_unsubmitted_dup_table_redo_()
 {
   int ret = OB_SUCCESS;
@@ -9567,98 +9421,6 @@ int ObPartTransCtx::tx_keepalive_response_(const int64_t status)
   } else {
     TRANS_LOG(TRACE, "tx is alive", KPC(this));
   }
-  return ret;
-}
-
-int ObPartTransCtx::try_alloc_retain_ctx_func_()
-{
-  int ret = OB_SUCCESS;
-
-  if (is_support_tx_op_()) {
-    // do nothing
-  } else if (OB_ISNULL(retain_ctx_func_ptr_)) {
-
-    if (OB_ISNULL(retain_ctx_func_ptr_ = static_cast<ObMDSRetainCtxFunctor *>(
-                      ObTxRetainCtxMgr::alloc_object(sizeof(ObMDSRetainCtxFunctor))))) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
-      TRANS_LOG(WARN, "alloc memory failed", K(ret), KPC(retain_ctx_func_ptr_), KPC(this));
-
-    } else if (OB_FALSE_IT(new (retain_ctx_func_ptr_) ObMDSRetainCtxFunctor())) {
-    }
-
-  } else if (!is_follower_()) {
-    TRANS_LOG(INFO, "no need to alloc a new retain_ctx_func", K(ret), KP(retain_ctx_func_ptr_),
-              KPC(retain_ctx_func_ptr_), KPC(this));
-  }
-
-  return ret;
-}
-
-int ObPartTransCtx::try_gc_retain_ctx_func_()
-{
-  int ret = OB_SUCCESS;
-
-  if(OB_NOT_NULL(retain_ctx_func_ptr_))
-  {
-    ObTxRetainCtxMgr::free_object(retain_ctx_func_ptr_);
-    retain_ctx_func_ptr_ = nullptr;
-  }
-
-  return ret;
-}
-
-int ObPartTransCtx::insert_into_retain_ctx_mgr_(RetainCause cause,
-                                                const SCN &log_ts,
-                                                palf::LSN lsn,
-                                                bool for_replay)
-{
-  int ret = OB_SUCCESS;
-  int64_t retain_lock_timeout = INT64_MAX;
-  if (for_replay) {
-    retain_lock_timeout = 10 * 1000;
-  }
-  bool need_retain_ctx = !is_support_tx_op_();
-  if (need_retain_ctx) {
-    TRANS_LOG(INFO, "insert into retain_ctx", KPC(this), K(for_replay), K(log_ts));
-  }
-
-  ObTxRetainCtxMgr &retain_ctx_mgr = ls_tx_ctx_mgr_->get_retain_ctx_mgr();
-  if (!need_retain_ctx) {
-    // do nothing
-  } else if (OB_ISNULL(ls_tx_ctx_mgr_) || RetainCause::UNKOWN == cause) {
-    ret = OB_INVALID_ARGUMENT;
-    TRANS_LOG(WARN, "invalid argument", K(ret), K(cause), KP(ls_tx_ctx_mgr_), KPC(this));
-  } else if (OB_ISNULL(retain_ctx_func_ptr_)) {
-    ret = OB_ERR_UNEXPECTED;
-    TRANS_LOG(ERROR, "unexpectd retain ctx function ptr error", K(cause), K(log_ts), K(lsn),
-              K(for_replay), KPC(retain_ctx_func_ptr_), KPC(this));
-  } else {
-
-    ObMDSRetainCtxFunctor *mds_retain_func_ptr =
-        static_cast<ObMDSRetainCtxFunctor *>(retain_ctx_func_ptr_);
-
-    if (OB_FAIL(ret)) {
-      // do nothing
-    } else if (OB_FAIL(mds_retain_func_ptr->init(this, cause, log_ts))) {
-      TRANS_LOG(WARN, "init retain ctx functor failed", K(ret), KPC(this));
-    } else if (OB_FAIL(retain_ctx_mgr.push_retain_ctx(retain_ctx_func_ptr_, retain_lock_timeout))) {
-      TRANS_LOG(WARN, "push into retain_ctx_mgr failed", K(ret), KPC(this));
-    }
-  }
-
-  if (OB_FAIL(ret)) {
-    clean_retain_cause_();
-    if (!(OB_EAGAIN == ret && for_replay)) {
-      TRANS_LOG(ERROR,
-                "insert into retain_ctx_mgr error, retain ctx will not be retained in ctx_mgr",
-                K(ret), KPC(this));
-      // ob_abort();
-    }
-  } else {
-    // insert into retain_ctx_mgr successfully, no need to gc memory
-    retain_ctx_func_ptr_ = nullptr;
-  }
-
   return ret;
 }
 
@@ -11326,8 +11088,7 @@ int ObPartTransCtx::move_tx_op(const ObTransferMoveTxParam &move_tx_param,
       // replay do nothing
     } else if (exec_info_.state_ >= ObTxState::ABORT) {
       // this ctx may be recycled soon
-      // a. RetainCtx recycle
-      // b. get_tx_ctx and abort/clear log callback concurrent
+      // get_tx_ctx and abort/clear log callback may be concurrent
       if (ctx_tx_data_.get_state() != ObTxData::ABORT) {
         ret = OB_ERR_UNEXPECTED;
         TRANS_LOG(ERROR, "tx trans state unexpected", KR(ret), KPC(this));
@@ -11336,9 +11097,7 @@ int ObPartTransCtx::move_tx_op(const ObTransferMoveTxParam &move_tx_param,
         ret = OB_NEED_RETRY;
         TRANS_LOG(WARN, "tx ctx has end need retry", KR(ret), KPC(this));
       } else {
-        // ctx enter retain
-        // TODO when ctx entery retain, it will be recycled delay
-        // leader and follower will see different state
+        // ctx has ended but its mds data is still being cleaned up
         ret = OB_OP_NOT_ALLOW;
         TRANS_LOG(WARN, "tx ctx has end", KR(ret), KPC(this));
       }
@@ -11780,11 +11539,6 @@ int ObPartTransCtx::set_replay_completeness_(const bool complete, const SCN repl
 inline bool ObPartTransCtx::is_support_parallel_replay_() const
 {
   return cluster_version_accurate_ && cluster_version_ >= MOCK_CLUSTER_VERSION_4_2_4_0;
-}
-
-inline bool ObPartTransCtx::is_support_tx_op_() const
-{
-  return cluster_version_accurate_ && cluster_version_ >= CLUSTER_VERSION_4_3_2_0;
 }
 
 inline int ObPartTransCtx::switch_to_parallel_logging_(const share::SCN serial_final_scn,

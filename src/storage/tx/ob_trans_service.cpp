@@ -576,19 +576,6 @@ void ObTransService::handle(void *task)
       } else {
         // do nothing
       }
-    } else if (ObTransRetryTaskType::ADVANCE_LS_CKPT_TASK == trans_task->get_task_type()) {
-      ObAdvanceLSCkptTask *advance_ckpt_task = static_cast<ObAdvanceLSCkptTask *>(trans_task);
-      if (OB_ISNULL(advance_ckpt_task)) {
-        // ignore ret
-        TRANS_LOG(WARN, "advance ckpt task is null", KP(advance_ckpt_task));
-      } else if (OB_FAIL(advance_ckpt_task->try_advance_ls_ckpt_ts())) {
-        TRANS_LOG(WARN, "advance ls ckpt ts failed", K(ret));
-      }
-
-      if (OB_NOT_NULL(advance_ckpt_task)) {
-        mtl_free(advance_ckpt_task);
-        advance_ckpt_task = nullptr;
-      }
     } else if (ObTransRetryTaskType::STANDBY_CLEANUP_TASK == trans_task->get_task_type()) {
       ObTxStandbyCleanupTask *standby_cleanup_task =
           static_cast<ObTxStandbyCleanupTask *>(trans_task);

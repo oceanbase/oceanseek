@@ -13,7 +13,6 @@
 #include "storage/tx/ob_trans_ctx.h"
 #include "storage/tx/ob_tx_ls_log_writer.h"
 #include "storage/tx/ob_tx_ls_state_mgr.h"
-#include "storage/tx/ob_tx_retain_ctx_mgr.h"
 #include "storage/tx/ob_tx_log_cb_mgr.h"
 #include "storage/tablelock/ob_lock_table.h"
 #include "storage/tx/ob_keep_alive_ls_handler.h"
@@ -546,7 +545,6 @@ public:
   transaction::ObTransService *get_trans_service() { return txs_; }
 
   ObTxLogCbPoolMgr &get_log_cb_pool_mgr() { return log_cb_pool_mgr_;}
-  ObTxRetainCtxMgr &get_retain_ctx_mgr() { return ls_retain_ctx_mgr_; }
 
   // Get the tenant_id corresponding to this ObLSTxCtxMgr;
   uint64_t get_tenant_id() { return tenant_id_; }
@@ -593,7 +591,6 @@ public:
                K_(total_tx_ctx_count),
                K_(active_tx_count),
                K_(max_clear_scn),
-               K_(ls_retain_ctx_mgr),
                K_(aggre_rec_scn),
                K_(prev_aggre_rec_scn),
                "uref",
@@ -683,8 +680,6 @@ private:
   ObLSTxLogAdapter log_adapter_def_;
 
   ObTxLogCbPoolMgr log_cb_pool_mgr_;
-
-  ObTxRetainCtxMgr ls_retain_ctx_mgr_;
 
   mutable RWLock rwlock_;
   // lock for concurrency between minor merge and remove / rebuild this LS

@@ -31,7 +31,7 @@ static int turn = 0;
 static ObTxData src_tx_data;
 static ObTxData dst_tx_data;
 static bool capture_read_args = false;
-static bool observed_skip_cache[2] = {false, false};
+static bool observed_cache_bypass[2] = {false, false};
 static int dest_read_ret = OB_SUCCESS;
 
 namespace storage {
@@ -45,7 +45,7 @@ int ObTxTable::check_with_tx_data(ObReadTxDataArg &read_tx_data_arg,
     if (turn >= 2) {
       return OB_ERR_UNEXPECTED;
     }
-    observed_skip_cache[turn] = read_tx_data_arg.skip_cache_;
+    observed_cache_bypass[turn] = read_tx_data_arg.skip_cache_;
     return turn++ == 0 ? dest_read_ret : OB_SUCCESS;
   }
   if (turn == 0) {
@@ -126,7 +126,7 @@ TEST_F(TestTxTableGuards, follower_mds_missing_tx_state_is_temporarily_invisible
   scanner.context_ = &context;
   scanner.sstable_ = &sstable;
   ObLockForReadArg arg(store_ctx.mvcc_acc_ctx_, ObTransID(1), ObTxSEQ(), false,
-                      false, SCN::min_scn(), true, false, true, true);
+                      false, SCN::min_scn(), true, false, true);
   bool can_read = false;
   int64_t version = 0;
   int64_t prepare_version = 0;
@@ -205,7 +205,7 @@ TEST_F(TestTxTableGuards, latest_committed_read_skips_prepared_and_aborted_write
   ObCleanoutNothingOperation cleanout;
   ObReCheckNothingOperation recheck;
   ObLockForReadArg arg(acc_ctx, data.tx_id_, ObTxSEQ(1, 0), false,
-                      false, SCN::min_scn(), true, false, true, true);
+                      false, SCN::min_scn(), true, false, true);
   for (const int64_t prepare_version : {int64_t(100), INT64_MAX}) {
     ASSERT_EQ(OB_SUCCESS, ctx.prepare_version_.convert_for_tx(prepare_version));
     ObLockForReadResult result;
@@ -241,7 +241,7 @@ TEST_F(TestTxTableGuards, running_without_ctx_filters_known_undo)
   for (const bool read_uncommitted : {false, true}) {
     for (const int64_t sequence : {10, 15, 20, 21}) {
       ObLockForReadArg arg(acc_ctx, ObTransID(1), ObTxSEQ(sequence, 0), false,
-                          read_uncommitted, SCN::min_scn(), true, false, true, true);
+                          read_uncommitted, SCN::min_scn(), true, false, true);
       ObLockForReadResult result;
       LockForReadFunctor fn(arg, result, ObLSID(1), cleanout, recheck);
       ASSERT_EQ(OB_SUCCESS, fn(tx_data));
@@ -374,7 +374,7 @@ TEST_F(TestTxTableGuards, known_commit_keeps_snapshot_visibility)
     turn = 0;
     ASSERT_EQ(OB_SUCCESS, acc_ctx.snapshot_.version_.convert_for_tx(snapshot));
     ObLockForReadArg arg(acc_ctx, ObTransID(1), ObTxSEQ(), false, false,
-                        SCN::min_scn(), true, false, true, true);
+                        SCN::min_scn(), true, false, true);
     ObLockForReadResult result;
     ASSERT_EQ(OB_SUCCESS, guards.lock_for_read(arg, result));
     EXPECT_EQ(snapshot >= 160, result.can_read_);
@@ -383,33 +383,33 @@ TEST_F(TestTxTableGuards, known_commit_keeps_snapshot_visibility)
   }
 }
 
-TEST_F(TestTxTableGuards, lock_for_read_preserves_skip_cache) {
+TEST_F(TestTxTableGuards, lock_for_read_uses_cache_on_all_routes) {
   // Single guard, dual guards with undecided dest, and missing-dest fallback.
+  // The lock path always reads through the tx data caches now that the key
+  // carries the LS / tx-table generations.
   for (int route = 0; route < 3; ++route) {
-    for (int skip_cache = 0; skip_cache < 2; ++skip_cache) {
-      SCOPED_TRACE(::testing::Message() << "route=" << route << ", skip_cache=" << skip_cache);
-      ObTxTable dst_tx_table;
-      ObTxTable src_tx_table;
-      ObTxTableGuards guards;
-      guards.tx_table_guard_.tx_table_ = &dst_tx_table;
-      if (route != 0) {
-        guards.src_tx_table_guard_.tx_table_ = &src_tx_table;
-      }
-      memtable::ObMvccAccessCtx acc_ctx;
-      ObLockForReadArg arg(acc_ctx, ObTransID(1), ObTxSEQ(), false, true,
-                          SCN::min_scn(), true, false, skip_cache != 0, true);
-      ObLockForReadResult result;
-      turn = 0;
-      capture_read_args = true;
-      dest_read_ret = route == 2 ? OB_TRANS_CTX_NOT_EXIST : OB_SUCCESS;
-      observed_skip_cache[0] = observed_skip_cache[1] = (skip_cache == 0);
+    SCOPED_TRACE(::testing::Message() << "route=" << route);
+    ObTxTable dst_tx_table;
+    ObTxTable src_tx_table;
+    ObTxTableGuards guards;
+    guards.tx_table_guard_.tx_table_ = &dst_tx_table;
+    if (route != 0) {
+      guards.src_tx_table_guard_.tx_table_ = &src_tx_table;
+    }
+    memtable::ObMvccAccessCtx acc_ctx;
+    ObLockForReadArg arg(acc_ctx, ObTransID(1), ObTxSEQ(), false, true,
+                        SCN::min_scn(), true, false, true);
+    ObLockForReadResult result;
+    turn = 0;
+    capture_read_args = true;
+    dest_read_ret = route == 2 ? OB_TRANS_CTX_NOT_EXIST : OB_SUCCESS;
+    observed_cache_bypass[0] = observed_cache_bypass[1] = true;
 
-      ASSERT_EQ(OB_SUCCESS, guards.lock_for_read(arg, result));
-      ASSERT_EQ(route == 0 ? 1 : 2, turn);
-      EXPECT_EQ(skip_cache != 0, observed_skip_cache[0]);
-      if (route != 0) {
-        EXPECT_EQ(skip_cache != 0, observed_skip_cache[1]);
-      }
+    ASSERT_EQ(OB_SUCCESS, guards.lock_for_read(arg, result));
+    ASSERT_EQ(route == 0 ? 1 : 2, turn);
+    EXPECT_FALSE(observed_cache_bypass[0]);
+    if (route != 0) {
+      EXPECT_FALSE(observed_cache_bypass[1]);
     }
   }
 }

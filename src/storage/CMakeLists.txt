@@ -609,7 +609,6 @@ ob_set_subtarget(ob_storage tx
   tx/ob_trans_stat.cpp
   tx/ob_tx_seq.cpp
   tx/ob_tx_stat.cpp
-  tx/ob_tx_retain_ctx_mgr.cpp
   tx/ob_direct_load_tx_ctx_define.cpp
   tx/ob_ls_tx_ctx_mgr_stat.cpp
   tx/ob_trans_submit_log_cb.cpp

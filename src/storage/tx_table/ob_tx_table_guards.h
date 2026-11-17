@@ -136,13 +136,11 @@ public:
     const transaction::ObTransID &data_tx_id,
     ObITxDataCheckFunctor &dst_functor,
     ObITxDataCheckFunctor &src_functor,
-    bool &use_dst,
-    const bool skip_cache = false);
+    bool &use_dst);
 
   int check_with_tx_data(
     const transaction::ObTransID &data_tx_id,
-    ObITxDataCheckFunctor &functor,
-    const bool skip_cache = false);
+    ObITxDataCheckFunctor &functor);
 
   bool check_ls_offline();
 

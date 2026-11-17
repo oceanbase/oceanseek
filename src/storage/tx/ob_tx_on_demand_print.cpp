@@ -104,8 +104,6 @@ IMPL_ON_DEMAND_PRINT_FUNC(ObPartTransCtx)
   TX_KV_PRINT_WITH_ERR(!coord_prepare_info_arr_.empty(), coord_prepare_info_arr_,
                        coord_prepare_info_arr_, ", ");
 
-  TX_KV_PRINT_WITH_ERR(get_retain_cause() != RetainCause::UNKOWN, retain_cause, retain_cause_, ", ");
-
   TX_KV_PRINT_WITH_ERR(!state_info_array_.empty(), state_info_array, state_info_array_, ", ");
 
   // TX_KV_PRINT_WITH_ERR(OB_NOT_NULL(block_frozen_memtable_), block_frozen_memtable,

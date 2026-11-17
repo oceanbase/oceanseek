@@ -60,7 +60,6 @@ class ObTxPrepareLog;
 class ObTxCommitLog;
 class ObTxAbortLog;
 class ObTxClearLog;
-class ObIRetainCtxCheckFunctor;
 struct ObTxMsg;
 }
 namespace palf
@@ -162,7 +161,6 @@ class ObPartTransCtx : public ObTransCtx,
   friend class StandbyCleanUpFunctor;
   friend class MockObTxCtx;
   friend class ObTxELRHandler;
-  friend class ObIRetainCtxCheckFunctor;
   friend class memtable::ObRedoLogGenerator;
   template<typename T>
   friend class ObTxCtxLogOperator;
@@ -602,15 +600,6 @@ public:
     return ctx_tx_data_.get_end_log_ts();
   }
 
-  void set_retain_cause(RetainCause cause)
-  {
-    ATOMIC_CAS(&retain_cause_, static_cast<int16_t>(RetainCause::UNKOWN),
-               static_cast<int16_t>(cause));
-  }
-  RetainCause get_retain_cause() const { return static_cast<RetainCause>(ATOMIC_LOAD(&retain_cause_)); };
-
-  int del_retain_ctx();
-
   int collect_mview_mds_op(bool &need_collect, ObMViewOpArg &arg);
 
   // ========================================================
@@ -784,17 +773,6 @@ private:
   bool is_contain_durable_mds_type_(const ObTxDataSourceType target_type) const;
   int submit_multi_data_source_();
   int submit_multi_data_source_(ObTxLogBlock &log_block);
-  void clean_retain_cause_()
-  {
-    ATOMIC_STORE(&retain_cause_, static_cast<int16_t>(RetainCause::UNKOWN));
-  }
-
-  int try_alloc_retain_ctx_func_();
-  int try_gc_retain_ctx_func_();
-  int insert_into_retain_ctx_mgr_(RetainCause cause,
-                                  const share::SCN &log_ts,
-                                  palf::LSN lsn,
-                                  bool for_replay);
 
   int prepare_mul_data_source_tx_end_(bool is_commit);
 
@@ -809,7 +787,6 @@ private:
   int detect_and_set_replay_incomplete_();
   int get_ls_replay_progress_(share::SCN &min_unreplayed_scn);
   int errsim_notify_mds_();
-  bool is_support_tx_op_() const;
 protected:
   virtual int get_gts_(share::SCN &gts);
   virtual int wait_gts_elapse_commit_version_(bool &need_wait);
@@ -1174,7 +1151,6 @@ private:
   // it is transfered to exec_info_.multi_source_data_ when corresponding
   // redo log callbacked.
   ObTxMDSCache mds_cache_;
-  ObIRetainCtxCheckFunctor *retain_ctx_func_ptr_;
   // sub_state_ is volatile
   ObTxSubState sub_state_;
   
@@ -1232,8 +1208,6 @@ private:
   share::SCN start_working_log_ts_;
 
   share::SCN dup_table_follower_max_read_version_;
-
-  int16_t retain_cause_;
 
   ObTxState upstream_state_;
   const ObTxMsg * msg_2pc_cache_;

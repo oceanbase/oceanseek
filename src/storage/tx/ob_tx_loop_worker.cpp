@@ -74,7 +74,6 @@ void ObTxLoopWorker::destroy()
 void ObTxLoopWorker::reset()
 {
   last_tx_gc_ts_ = 0;
-  last_retain_ctx_gc_ts_ = 0;
   last_check_start_working_retry_ts_ = 0;
   last_log_cb_pool_adjust_ts_ = 0;
   last_tenant_config_refresh_ts_ = 0;
@@ -88,7 +87,6 @@ void ObTxLoopWorker::run1()
   int64_t time_used = 0;
   lib::set_thread_name("TxLoopWorker");
   bool can_gc_tx = false;
-  bool can_gc_retain_ctx = false;
   bool can_check_and_retry_start_working = false;
   bool can_adjust_log_cb_pool =  false;
   bool can_gc_palf_kv = false;
@@ -109,13 +107,6 @@ void ObTxLoopWorker::run1()
       can_gc_tx = true;
     }
     
-    //retain ctx gc, interval = 5s
-    if (common::ObClockGenerator::getClock() - last_retain_ctx_gc_ts_ > TX_RETAIN_CTX_GC_INTERVAL) {
-      TRANS_LOG(INFO, "try gc retain ctx");
-      last_retain_ctx_gc_ts_ = common::ObClockGenerator::getClock();
-      can_gc_retain_ctx = true;
-    }
-
     if (common::ObClockGenerator::getClock() - last_check_start_working_retry_ts_
         > TX_START_WORKING_RETRY_INTERVAL) {
       TRANS_LOG(INFO, "try to retry start_working");
@@ -143,7 +134,7 @@ void ObTxLoopWorker::run1()
       can_gc_palf_kv = true;
     }
 
-    (void)scan_all_ls_(can_gc_tx, can_gc_retain_ctx, can_check_and_retry_start_working, can_adjust_log_cb_pool, can_gc_palf_kv);
+    (void)scan_all_ls_(can_gc_tx, can_check_and_retry_start_working, can_adjust_log_cb_pool, can_gc_palf_kv);
 
     // TODO shanyan.g
     // 1) We use max(max_commit_ts, gts_cache) as read snapshot,
@@ -157,7 +148,6 @@ void ObTxLoopWorker::run1()
       ob_usleep(KEEPALIVE_INTERVAL - time_used, true/*is_idle_sleep*/);
     }
     can_gc_tx = false;
-    can_gc_retain_ctx = false;
     can_check_and_retry_start_working = false;
     can_adjust_log_cb_pool = false;
     can_gc_palf_kv = false;
@@ -165,7 +155,6 @@ void ObTxLoopWorker::run1()
 }
 
 int ObTxLoopWorker::scan_all_ls_(bool can_tx_gc,
-                                 bool can_gc_retain_ctx,
                                  bool can_check_and_retry_start_working,
                                  bool can_adjust_log_cb_pool,
                                  bool can_gc_palf_kv)
@@ -261,10 +250,6 @@ int ObTxLoopWorker::scan_all_ls_(bool can_tx_gc,
         // keep alive, interval = 100ms
         do_keep_alive_(cur_ls_ptr, min_start_scn, status);
 
-        if (can_gc_retain_ctx) {
-          do_retain_ctx_gc_(cur_ls_ptr);
-        }
-
         if (can_check_and_retry_start_working) {
           do_start_working_retry_(cur_ls_ptr);
         }
@@ -353,30 +338,6 @@ void ObTxLoopWorker::update_max_commit_ts_()
     }
   } while (OB_EAGAIN == ret);
   // TODO, sys tenant
-}
-
-void ObTxLoopWorker::do_retain_ctx_gc_(ObLS *ls_ptr)
-{
-  int ret = OB_SUCCESS;
-
-  ObTxRetainCtxMgr *retain_ctx_mgr = ls_ptr->get_tx_svr()->get_retain_ctx_mgr();
-  if (OB_ISNULL(retain_ctx_mgr)) {
-    // ignore ret
-    TRANS_LOG(WARN, "[Tx Loop Worker] retain_ctx_mgr  is not inited", K(ret), K(MTL_ID()),
-              K(*ls_ptr));
-
-  } else if (OB_FAIL(retain_ctx_mgr->try_gc_retain_ctx(ls_ptr))) {
-    TRANS_LOG(WARN, "[Tx Loop Worker] retain_ctx_mgr try to gc retain ctx failed", K(ret),
-              K(MTL_ID()), K(*ls_ptr));
-  } else {
-    TRANS_LOG(DEBUG, "[Tx Loop Worker] retain_ctx_mgr try to gc retain ctx success", K(ret),
-              K(MTL_ID()), K(*ls_ptr));
-  }
-
-  retain_ctx_mgr->print_retain_ctx_info(ls_ptr->get_ls_id());
-  retain_ctx_mgr->try_advance_retain_ctx_gc(ls_ptr->get_ls_id());
-
-  UNUSED(ret);
 }
 
 void ObTxLoopWorker::do_start_working_retry_(ObLS *ls_ptr)

@@ -845,17 +845,6 @@ SCN ObLSTxService::get_ls_weak_read_ts() {
   return parent_->get_ls_wrs_handler()->get_ls_weak_read_ts();
 }
 
-ObTxRetainCtxMgr *ObLSTxService::get_retain_ctx_mgr()
-{
-  ObTxRetainCtxMgr *retain_ptr = nullptr;
-  if (OB_ISNULL(mgr_)) {
-    retain_ptr = nullptr;
-  } else {
-    retain_ptr = &mgr_->get_retain_ctx_mgr();
-  }
-  return retain_ptr;
-}
-
 ObTxLogCbPoolMgr *ObLSTxService::get_log_cb_pool_mgr()
 {
   ObTxLogCbPoolMgr *log_cb_pool_mgr_ptr = nullptr;
