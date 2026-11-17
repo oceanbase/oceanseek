@@ -1058,8 +1058,21 @@ int ObTabletMdsRelocHelper::check_tablet_mds_reloc_done(
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ls service should not be NULL", K(ret), K(dest_ls_id), K(tablet_id));
   } else if (OB_FAIL(ls_service->get_ls(dest_ls_id, dest_ls_handle, ObLSGetMod::HA_MOD))) {
-    LOG_WARN("failed to get local dest ls when checking mds reloc done",
-        K(ret), K(dest_ls_id), K(tablet_id), K(transfer_scn));
+    if (OB_LS_NOT_EXIST == ret) {
+      // The destination ls has no replica on this server, which is a legal
+      // layout: the source ls leader is not required to host a destination ls
+      // replica. The reloc marker can only be read from the local destination
+      // ls, so an unreadable marker means "relocation not done yet" rather than
+      // an error. Reporting an error here aborted the caller's whole tablet
+      // batch and the relocation was never submitted.
+      LOG_INFO("dest ls is not local, treat mds reloc as not done",
+          K(ret), K(dest_ls_id), K(tablet_id), K(transfer_scn));
+      is_done = false;
+      ret = OB_SUCCESS;
+    } else {
+      LOG_WARN("failed to get local dest ls when checking mds reloc done",
+          K(ret), K(dest_ls_id), K(tablet_id), K(transfer_scn));
+    }
   } else if (OB_ISNULL(dest_ls = dest_ls_handle.get_ls())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("dest ls should not be NULL", K(ret), K(dest_ls_id), K(tablet_id));

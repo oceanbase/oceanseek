@@ -1175,7 +1175,9 @@ TEST_F(TestMdsTransaction, tablet_reloc_persisted_uses_marker_redo_scn)
     ASSERT_EQ(OB_SUCCESS, ObTabletMdsRelocHelper::check_tablet_mds_reloc_done(
         ls_id, tablet_id, transfer_scn, is_done));
     EXPECT_TRUE(is_done);
-    EXPECT_EQ(OB_LS_NOT_EXIST, ObTabletMdsRelocHelper::check_tablet_mds_reloc_done(
+    // A destination ls without a local replica cannot be inspected, which means
+    // "relocation not done yet" instead of an error.
+    ASSERT_EQ(OB_SUCCESS, ObTabletMdsRelocHelper::check_tablet_mds_reloc_done(
         ObLSID(999999), tablet_id, transfer_scn, is_done));
     EXPECT_FALSE(is_done);
 
