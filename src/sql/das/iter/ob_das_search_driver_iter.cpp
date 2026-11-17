@@ -9,6 +9,7 @@
 #include "sql/das/iter/ob_das_profile_iter.h"
 #include "sql/das/search/ob_i_das_search_op.h"
 #include "sql/das/search/ob_das_scalar_scan_op.h"
+#include "sql/das/search/ob_das_async_segment_group_merge_op.h"
 #include "sql/das/search/ob_das_search_context.h"
 #include "sql/das/search/ob_das_search_utils.h"
 #include "sql/ob_sql_context.h"
@@ -101,6 +102,8 @@ int ObDASSearchDriverIter::inner_init(ObDASIterParam &param)
 int ObDASSearchDriverIter::inner_reuse()
 {
   int ret = OB_SUCCESS;
+  ordinary_read_started_ = false;
+  cursor_read_started_ = false;
   profile_ = nullptr;
   // no need to reuse search op, processed in rescan logic
   scores_.clear();
@@ -143,6 +146,8 @@ int ObDASSearchDriverIter::inner_release()
 int ObDASSearchDriverIter::do_table_scan()
 {
   int ret = OB_SUCCESS;
+  ordinary_read_started_ = false;
+  cursor_read_started_ = false;
   if (OB_ISNULL(root_op_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected nullptr root op", KR(ret));
@@ -173,6 +178,8 @@ int ObDASSearchDriverIter::rescan_for_next_candidates()
 int ObDASSearchDriverIter::do_rescan(const bool reset_filter_providers)
 {
   int ret = OB_SUCCESS;
+  ordinary_read_started_ = false;
+  cursor_read_started_ = false;
   bool is_vec_index_search = false;
   // for vector index search, in post-iterative filter mode, we can reuse the old profile in the same tablet execution
   // otherwise, every iteration will create a new profile, which will overwhelm the profile output
@@ -208,11 +215,103 @@ int ObDASSearchDriverIter::inner_get_next_row()
 int ObDASSearchDriverIter::inner_get_next_rows(int64_t &count, int64_t capacity)
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(process_rows_func_)) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("process rows func not init", K(ret));
+  if (cursor_read_started_) {
+    count = 0;
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("ordinary hybrid search reads cannot follow candidate cursor reads", K(ret), K(capacity));
   } else {
-    ret = (this->*process_rows_func_)(count, capacity);
+    ordinary_read_started_ = true;
+    if (OB_ISNULL(process_rows_func_)) {
+      ret = OB_NOT_INIT;
+      LOG_WARN("process rows func not init", K(ret));
+    } else {
+      ret = (this->*process_rows_func_)(count, capacity);
+    }
+  }
+  return ret;
+}
+
+int ObDASSearchDriverIter::get_current_candidate_raw_score(int64_t index, double &score) const
+{
+  int ret = OB_SUCCESS;
+  if (index < 0 || index >= scores_.count()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid hybrid sort candidate score position", K(ret), K(index), "score_count", scores_.count());
+  } else {
+    score = scores_.at(index);
+  }
+  return ret;
+}
+
+int ObDASSearchDriverIter::read_candidate_batch(int64_t capacity, const ObDatum *sort_bottom,
+                                               int64_t &count, ObDASGroupBatchInfo &info)
+{
+  int ret = OB_SUCCESS;
+  common::ObProfileSwitcher switcher(profile_);
+  common::ScopedTimer total_timer(common::ObMetricId::HS_TOTAL_TIME);
+  common::ScopedTimer read_timer(common::ObMetricId::HS_NEXT_ROWIDS_TIME);
+  INC_METRIC_VAL(common::ObMetricId::HS_NEXT_ROWIDS_COUNT, 1);
+  count = 0;
+  info = ObDASGroupBatchInfo();
+  if (OB_FAIL(ret)) {
+  } else if (ordinary_read_started_ || nullptr == root_op_ || nullptr == search_ctx_
+      || capacity <= 0 || !search_ctx_->is_sort_topn_enabled()) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("invalid hybrid sort candidate read state", K(ret), K(capacity),
+             K_(ordinary_read_started), KP_(root_op), KP_(search_ctx));
+  } else {
+    cursor_read_started_ = true;
+    // Keep async segment-group boundaries visible to TopN so a new competitive bottom can be observed
+    // before the next group starts. Other search roots expose a single stream with only a terminal boundary.
+    if (DAS_SEARCH_OP_ASYNC_SEGMENT_GROUP_MERGE == root_op_->get_op_type()) {
+      ObArenaAllocator batch(ObMemAttr(MTL_ID(), "HSortRead"));
+      uint64_t *ids = static_cast<uint64_t *>(batch.alloc(sizeof(uint64_t) * capacity));
+      double *scores = static_cast<double *>(batch.alloc(sizeof(double) * capacity));
+      row_ids_.reuse();
+      scores_.reuse();
+      if (nullptr == ids || nullptr == scores) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to allocate hybrid sort candidate batch", K(ret), K(capacity), KP(ids), KP(scores));
+      } else if (OB_FAIL(static_cast<ObDASAsyncSegmentGroupMergeOp *>(root_op_)->drain_current_group(
+                            capacity, ids, scores, sort_bottom, count, info))) {
+        LOG_WARN("failed to drain hybrid sort group batch", K(ret));
+      } else {
+        if (OB_SUCC(ret)) {
+          if (OB_FAIL(row_ids_.prepare_allocate(count))) {
+            LOG_WARN("failed to allocate hybrid sort candidate rowids", K(ret), K(count));
+          } else if (OB_FAIL(scores_.prepare_allocate(count))) {
+            LOG_WARN("failed to allocate hybrid sort candidate scores", K(ret), K(count));
+          }
+        }
+        for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+          row_ids_.at(i).set_uint64(ids[i]);
+          scores_.at(i) = scores[i];
+        }
+      }
+    } else {
+      if (OB_FAIL(fill_rowids_and_scores(capacity, count))) {
+        if (OB_ITER_END == ret) {
+          ret = OB_SUCCESS;
+          info.group_end_ = true;
+          info.all_end_ = true;
+        } else {
+          LOG_WARN("failed to read hybrid sort candidate rowids and scores", K(ret), K(capacity));
+        }
+      }
+    }
+    if (OB_SUCC(ret) && (count < 0 || count > capacity)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected hybrid sort candidate batch size", K(ret), K(count), K(capacity));
+    }
+    if (OB_SUCC(ret) && count > 0) {
+      if (OB_SUCC(ret) && OB_FAIL(project_rowid_and_score_to_expr(count))) {
+        LOG_WARN("failed to project hybrid sort candidate rowid and score", K(ret));
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    // Complete query candidates before main-table lookup, search-after and the wrapper's TopN selection.
+    INC_METRIC_VAL(common::ObMetricId::HS_OUTPUT_ROW_COUNT, count);
   }
   return ret;
 }
@@ -299,13 +398,13 @@ int ObDASSearchDriverIter::project_rowid_and_score_to_expr(
       } else if (OB_NOT_NULL(score_vec)) {
         score_vec->set_double(i, scores_.at(idx));
       }
-      if (OB_SUCC(ret) && search_ctx_->has_shard_doc()) {
+      if (OB_SUCC(ret) && search_ctx_->get_sort_info().has_shard_doc()) {
         if (search_ctx_->get_rowid_type() != DAS_ROWID_TYPE_UINT64) {
           ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("unsupported hybrid search rowid type for __shard_doc", K(ret), K(i), K(count),
+          LOG_WARN("unsupported hybrid sort candidate rowid type", K(ret), K(i), K(count),
                    "rowid_type", search_ctx_->get_rowid_type());
-        } else if (OB_FAIL(search_ctx_->project_shard_doc(row_ids_.at(idx).get_uint64(), i, count))) {
-          LOG_WARN("failed to project hybrid search __shard_doc", K(ret), K(i), K(count));
+        } else if (OB_FAIL(search_ctx_->project_sort_shard_doc(row_ids_.at(idx).get_uint64(), i, count))) {
+          LOG_WARN("failed to project hybrid sort candidate __shard_doc", K(ret), K(i), K(count));
         }
       }
     }
@@ -398,8 +497,7 @@ int ObDASSearchDriverIter::init_search_type()
     search_type_ = DAS_SEARCH_TYPE_POST_FILTER;
   } else if (ObVecFilterMode::VEC_FILTER_MODE_EXPR_FILTER == vec_filter_mode_) {
     search_type_ = DAS_SEARCH_TYPE_EXPR_FILTER;
-  } else if (search_ctx_->has_search_after()) {
-    // SQL needs every matching document before applying the previous page's boundary.
+  } else if (search_ctx_->is_sort_topn_enabled() || search_ctx_->use_sql_after_fallback()) {
     search_type_ = DAS_SEARCH_TYPE_COMPLETE_DOCS;
   } else if (OB_NOT_NULL(score_expr_) && top_k_limit_param_.is_valid()) {
     search_type_ = DAS_SEARCH_TYPE_TOP_SCORES;

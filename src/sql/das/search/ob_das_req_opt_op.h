@@ -40,6 +40,8 @@ public:
     return OB_NOT_NULL(required_)
         && required_->can_enumerate_rowids();
   }
+  // Preserve optional score contributions while pruning the required branch.
+  virtual int try_apply_sort_bottom(const common::ObDatum &sort_bottom, bool &applied) override;
 
 private:
   int do_init(const ObIDASSearchOpParam &op_param) override;

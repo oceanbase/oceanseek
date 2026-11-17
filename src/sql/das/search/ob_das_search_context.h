@@ -19,6 +19,7 @@
 #define OBDEV_SRC_SQL_DAS_SEARCH_OB_DAS_SEARCH_CONTEXT_H_
 
 #include "common/ob_range.h"
+#include "lib/container/ob_fixed_array.h"
 #include "sql/das/ob_das_scan_op.h"
 #include "sql/das/search/ob_das_logical_bm25_scan_host.h"
 #include "sql/das/search/ob_das_logical_bm25_stats.h"
@@ -45,6 +46,7 @@ class ObIDASSearchOp;
 class RowIDStore;
 class ObDASAsyncIndexQueryCtx;
 class ObDASAsyncBindingGuard;
+class ObDASFusionParallelCoordinator;
 struct ObAsyncIndexPartitionSegCtx;
 struct ObDASScalarScanCtDef;
 struct ObDASScalarScanRtDef;
@@ -78,6 +80,52 @@ struct ObLogicalTableSearchCtx
   void reset() { new (this) ObLogicalTableSearchCtx(); }
   TO_STRING_KV(K_(is_enabled), K_(namespace_id), K_(logical_table_id),
                K_(physical_data_table_id), K_(logical_table_aux_type), K_(physical_tablet_id));
+};
+
+/**
+ * @brief Holds the evaluated pagination and scoring parameters for one hybrid sort execution.
+ *
+ * Definition pointers borrow the Fusion plan/runtime lifetime. Cursor datums are deep-copied into
+ * allocator_ so expression-vector reuse cannot change the search-after boundary between batches.
+ */
+struct ObDASSortRuntimeInfo
+{
+  /** @brief Creates unbound sort state with an arena for owned search-after values. */
+  ObDASSortRuntimeInfo()
+    : sort_ctdef_(nullptr),
+      fusion_ctdef_(nullptr),
+      scan_template_(nullptr),
+      allocator_(common::ObMemAttr(MTL_ID(), "SearchAfterData")),
+      after_values_(allocator_)
+  {}
+  /**
+   * @brief Re-evaluates bound sort expressions for an open or rescan and owns the resulting cursor values.
+   * @param[in] ctx Expression context containing this execution's parameters.
+   * @return OB_SUCCESS on success; an error for invalid pagination, inconsistent definitions or evaluation failure.
+   */
+  int evaluate(ObEvalCtx &ctx);
+  /** @brief Releases evaluated values and restores defaults while preserving borrowed definition pointers. */
+  void reset_values();
+  /** @brief Release the cursor arena and borrowed definitions at query/task teardown. */
+  void reset();
+  /** @brief Reports whether the plan executes field sorting and TopN selection inside DAS. */
+  bool enabled() const { return sort_ctdef_ != nullptr && sort_ctdef_->das_sort_topn_enable_; }
+  /** @brief Reports whether the request supplies a search-after boundary. */
+  bool has_after() const { return sort_ctdef_ != nullptr && sort_ctdef_->has_after(); }
+  /** @brief Reports whether sort keys include the unique __shard_doc tie-breaker. */
+  bool has_shard_doc() const { return sort_ctdef_ != nullptr && sort_ctdef_->has_unique_shard_doc(); }
+  const ObDASHybridSearchSortCtDef *sort_ctdef_; // Borrowed sort expressions and comparison metadata.
+  const ObDASFusionCtDef *fusion_ctdef_; // Borrowed Fusion definition supplying execution mode and min_score.
+  const ObDASScanRtDef *scan_template_; // Borrowed lookup template; NULL when sort values need no main-table lookup.
+  // One tuple per open/rescan. Discard the array before reusing/freeing its arena.
+  common::ObArenaAllocator allocator_;
+  common::ObFixedArray<common::ObDatum, common::ObIAllocator> after_values_;
+  int64_t page_size_ = 0; // Number of rows requested after applying the offset or cursor boundary.
+  int64_t offset_ = 0; // Rows to discard from the sorted result; must be zero when search-after is present.
+  int64_t capacity_ = 0; // TopN retention limit, equal to page_size_ + offset_.
+  double weight_ = 1.0; // Single-query weight applied to full-recall scores before filtering and sorting.
+  double min_score_ = 0.0; // Minimum weighted score accepted by the full-recall sort path.
+  bool apply_min_score_ = false; // Whether this execution mode requires the minimum-score predicate.
 };
 
 class ObDASSearchCtx : public ObILogicalBm25ScanHost
@@ -131,8 +179,7 @@ public:
       filter_bitmap_providers_(),
       inv_iter_pool_(nullptr),
       enable_inv_iter_pool_(false),
-      posting_table_cache_(),
-      fusion_ctdef_(nullptr)
+      posting_table_cache_()
   { }
 
   ~ObDASSearchCtx() { reset(); }
@@ -199,12 +246,22 @@ public:
   { return root_das_task_.get_scan_param().tablet_id_; }
   virtual ObEvalCtx *get_eval_ctx() override { return eval_ctx_; }
   bool is_serial_fusion_plan() const;
-  /** @brief Bind the Fusion definition that owns this task's pagination metadata. */
-  void set_fusion_ctdef(const ObDASFusionCtDef *ctdef) { fusion_ctdef_ = ctdef; }
-  /** @brief Whether TableScan must apply search_after after the main-table lookup. */
-  bool has_search_after() const { return fusion_ctdef_ != nullptr && fusion_ctdef_->has_search_after_; }
-  /** @brief Whether DAS must supply __shard_doc for SQL sorting or __sort output. */
-  bool has_shard_doc() const { return fusion_ctdef_ != nullptr && fusion_ctdef_->shard_doc_expr_ != nullptr; }
+  /**
+   * @brief Bind the sort child and its runtime to this search task.
+   * @param[in] sort_ctdef Sort child definition; must outlive this binding.
+   * @param[in] rtdef Sort child runtime supplying the value-scan settings.
+   * @return OB_SUCCESS on success; validation failure preserves the previous binding.
+   */
+  int bind_sort(const ObDASHybridSearchSortCtDef &sort_ctdef, const ObDASHybridSearchSortRtDef &rtdef,
+                const ObDASFusionCtDef &fusion);
+  /** @brief Reports whether the bound plan performs field TopN selection inside DAS. */
+  bool is_sort_topn_enabled() const { return sort_info_.enabled(); }
+  /** @brief Reports whether SQL operators must apply the search-after predicate above DAS. */
+  bool use_sql_after_fallback() const { return sort_info_.has_after() && !sort_info_.enabled(); }
+  /** @brief Exposes bound definitions and evaluated values for sort execution setup. */
+  ObDASSortRuntimeInfo &get_sort_info() { return sort_info_; }
+  /** @brief Provides read-only access to pagination and scoring values for this execution. */
+  const ObDASSortRuntimeInfo &get_sort_info() const { return sort_info_; }
   /**
    * @brief Projects __shard_doc into one row of the sort expression vector.
    * @param[in] increment Document increment paired with the current partition's main tablet ID.
@@ -212,9 +269,17 @@ public:
    * @param[in] count Number of rows in the output batch.
    * @return OB_SUCCESS, including when no __shard_doc key is required; an error for invalid state or allocation failure.
    */
-  int project_shard_doc(uint64_t increment, int64_t index, int64_t count);
+  int project_sort_shard_doc(uint64_t increment, int64_t index, int64_t count);
   /** @brief Return the sync task's main tablet or the bound async partition's main tablet. */
   common::ObTabletID get_main_tablet_id() const;
+  /** @brief Supplies the existing transaction to sort-value lookups without transferring ownership. */
+  transaction::ObTxDesc *get_sort_tx_desc() const { return tx_desc_; }
+  /** @brief Supplies the remote cursor's expression-frame layout for private sort-value lookup frames. */
+  const ObExprFrameInfo *get_sort_remote_frame_info() const { return root_das_task_.get_cursor_frame_info(); }
+  /** @brief Borrows the parallel coordinator so sort consumers can observe failures from sibling work. */
+  void set_sort_coordinator(const ObDASFusionParallelCoordinator *coordinator) { sort_coordinator_ = coordinator; }
+  /** @brief Returns the coordinator's first failure, or OB_SUCCESS when no coordinator is bound. */
+  int get_sort_first_error() const;
   OB_INLINE const share::ObLSID &get_ls_id() const { return ls_id_; }
   OB_INLINE void set_ls_id(const share::ObLSID &ls_id) { ls_id_ = ls_id; }
   void reset();
@@ -487,7 +552,8 @@ private:
   storage::ObAsyncInvIteratorPool *inv_iter_pool_;
   bool enable_inv_iter_pool_;
   blocksstable::ObInvPostingTableCache posting_table_cache_;
-  const ObDASFusionCtDef *fusion_ctdef_; // Borrowed pagination metadata; owned by the DAS task's plan.
+  ObDASSortRuntimeInfo sort_info_; // Sort configuration and evaluated parameters owned by this search context.
+  const ObDASFusionParallelCoordinator *sort_coordinator_ = nullptr; // Borrowed parallel error source.
 
 private:
   struct EstimateScanInput

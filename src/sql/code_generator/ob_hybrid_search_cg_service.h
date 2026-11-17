@@ -102,8 +102,32 @@ public:
                                   ObDASBaseCtDef &search_ctdef,
                                   ObDASBaseCtDef *&root_ctdef);
   int generate_main_scan_ctdef(ObLogTableScan &op, ObDASScanCtDef *&main_scan_ctdef);
-  /** @brief Carry __shard_doc and the search_after flag through DAS lookup. */
-  int generate_search_after_ctdef(const ObFusionNode &node, ObDASFusionCtDef &fusion);
+  /**
+   * @brief Build the main-table point-get definition for sort values that need table columns.
+   *
+   * The scan reads the columns required by sort expressions and the rowkey. Sorts using only
+   * __shard_doc, __score, or constants do not need this scan. Query filters, search_after, and
+   * pagination limits are applied outside this lookup so they cannot truncate the candidate batch.
+   *
+   * @param[in] op Logical scan supplying the table, rowkey, and sort-column metadata.
+   * @param[out] scan_ctdef Value-scan definition owned by the hybrid sort child.
+   * @return OB_SUCCESS on success, otherwise an OceanBase error code.
+   */
+  int generate_sort_value_scan_ctdef(ObLogTableScan &op, ObDASScanCtDef &scan_ctdef);
+  // Allocate a sort child and place the original query below it.
+  int generate_hybrid_sort_ctdef(ObLogTableScan &op, const ObFusionNode &node, ObDASFusionCtDef &fusion);
+  // Generate sort fields for hybrid search without changing ordinary DAS Sort construction.
+  int generate_hybrid_sort_fields(const ObIArray<OrderItem> &sort_keys, ObDASHybridSearchSortCtDef &sort_ctdef);
+  /**
+   * @brief Generate main-table access expressions and classify filters for hybrid lookup.
+   * @param[in] sort_topn_lookup Whether this scan fetches sort-column dependencies and rowkeys
+   *                            before DAS sort/TopN.
+   */
+  int prepare_main_scan_access_ctdef(ObLogTableScan &op,
+                                     ObDASScanCtDef &scan_ctdef,
+                                     ObIArray<ObRawExpr *> &non_pushdown_filters,
+                                     ObIArray<ObRawExpr *> &lookup_pushdown_filters,
+                                     bool sort_topn_lookup = false);
   /** @brief Return DSL search_after filters for evaluation after lookup. */
   static int extract_dsl_nonpushdown_filters(const ObLogTableScan &op,
                                              ObIArray<ObRawExpr *> &filters);
@@ -111,11 +135,6 @@ public:
   static int extract_filter_input_exprs(const ObLogTableScan &op,
                                         const ObIArray<ObRawExpr *> &filters,
                                         ObIArray<ObRawExpr *> &inputs);
-  /** @brief Prepare lookup columns and keep search_after filtering above lookup. */
-  int prepare_main_scan_access_ctdef(ObLogTableScan &op,
-                                     ObDASScanCtDef &scan_ctdef,
-                                     ObIArray<ObRawExpr *> &non_pushdown_filters,
-                                     ObIArray<ObRawExpr *> &lookup_pushdown_filters);
   int extract_column_ids(const ObIArray<ObRawExpr *> &column_exprs, ObIArray<uint64_t> &column_ids);
 
   // [LT plain MATCH] Apply hybrid's FTS-aux KV rewrite to the IR scan ctdef sub-tree

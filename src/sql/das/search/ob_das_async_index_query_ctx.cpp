@@ -57,7 +57,8 @@ static bool is_async_domain_transparent_op(const ObDASOpType op_type)
       || DAS_OP_INDEX_PROJ_LOOKUP == op_type
       || DAS_OP_INDEX_MERGE == op_type
       || DAS_OP_DOC_ID_MERGE == op_type
-      || DAS_OP_DOMAIN_ID_MERGE == op_type;
+      || DAS_OP_DOMAIN_ID_MERGE == op_type
+      || DAS_OP_HYBRID_SEARCH_SORT == op_type;
 }
 
 static bool is_async_domain_ignored_op(const ObDASOpType op_type)

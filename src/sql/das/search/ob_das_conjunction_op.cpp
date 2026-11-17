@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX SQL_DAS
 #include "ob_das_conjunction_op.h"
+#include "common/ob_smart_call.h"
 #include <cmath>
 #include "sql/das/ob_das_def_reg.h"
 #include "storage/tx_storage/ob_access_service.h"
@@ -115,6 +116,23 @@ int ObDASConjunctionOp::init_fixed_score_bound()
   if (OB_SUCC(ret) && known) {
     fixed_score_bound_ = max_score;
     is_fixed_score_ = true;
+  }
+  return ret;
+}
+
+int ObDASConjunctionOp::try_apply_sort_bottom(const common::ObDatum &sort_bottom, bool &applied)
+{
+  int ret = OB_SUCCESS;
+  applied = false;
+  for (int64_t i = 0; OB_SUCC(ret) && i < children_cnt_; ++i) {
+    bool child_applied = false;
+    if (OB_ISNULL(children_) || OB_ISNULL(children_[i])) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("sort bottom conjunction child is null", K(ret), K(i));
+    } else if (OB_FAIL(SMART_CALL(children_[i]->try_apply_sort_bottom(sort_bottom, child_applied)))) {
+      LOG_WARN("failed to apply sort bottom to conjunction child", K(ret), K(i));
+    }
+    applied = applied || child_applied;
   }
   return ret;
 }

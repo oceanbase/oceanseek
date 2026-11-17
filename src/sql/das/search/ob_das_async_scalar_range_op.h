@@ -87,7 +87,8 @@ public:
       curr_nested_doc_id_(0),
       nested_row_ready_(false),
       inv_idx_scan_param_inited_(false),
-      is_inited_(false)
+      is_inited_(false),
+      sort_ranges_(OB_MALLOC_NORMAL_BLOCK_SIZE, sort_range_allocator_)
   {
     op_type_ = DAS_SEARCH_OP_ASYNC_SCALAR_RANGE;
   }
@@ -107,6 +108,18 @@ public:
   static int project_term_range(const common::ObNewRange &range,
                                 common::ObIAllocator &allocator,
                                 blocksstable::ObDatumRange &term_range);
+  /**
+   * @brief Use the first bottom value to narrow an unread main-document range scan.
+   *
+   * Example: price ASC, bottom=30, original 10<price<100 -> private range 10<price<=30.
+   * For DESC, the same original range becomes 30<=price<100. Equal prices remain for later sort keys.
+   * Composite operators select eligible branches; this method checks the leaf and column/path/value match.
+   * @param[in] sort_bottom Borrowed leading key of a full TopN; never retained after this call.
+   * @param[out] applied True if new ranges were installed, including an empty set; false if skipped.
+   * Installed ranges own their encoded bounds independently of the borrowed key.
+   * Unsupported bounds leave the original scan unchanged. Allocation, evaluation and reopen errors propagate.
+   */
+  virtual int try_apply_sort_bottom(const common::ObDatum &sort_bottom, bool &applied) override;
 
 private:
   int do_init(const ObIDASSearchOpParam &op_param) override;
@@ -128,6 +141,12 @@ private:
     return common::OB_NOT_SUPPORTED;
   }
   int do_next_rowids(int64_t capacity, int64_t &count) override;
+  // cut_objects is caller-owned and must remain valid while cut is used to bind the new ranges.
+  int check_sort_range_change_scalar_range(int64_t column, const common::ObObj &path,
+      const common::ObObj &value, bool ascending, common::ObObj *cut_objects,
+      common::ObRowkey &cut, bool &changed);
+  int bind_new_range_for_scalar_range(int64_t column, const common::ObObj &path,
+      bool ascending, const common::ObRowkey &cut, bool &applied);
   int init_inv_idx_scan_param();
   int init_range_scan_param();
   int open_range_iter_from_tablet();
@@ -135,13 +154,38 @@ private:
   // On storage EOF: open the next SQL range, or return OB_ITER_END when exhausted.
   int advance_range_on_iter_end();
   void close_range_iter();
-  void release_scan_resources() override { close_range_iter(); }
+  void release_scan_resources() override
+  {
+    close_range_iter();
+    // Keep read/pruning flags until open/rescan restores the original query ranges.
+    sort_ranges_.reset();
+    sort_range_allocator_.reset();
+  }
   void reset_nested_cursor();
   bool has_current_range() const
   {
     return OB_NOT_NULL(scalar_rtdef_)
         && current_range_idx_ >= 0
-        && current_range_idx_ < scalar_rtdef_->key_ranges_.count();
+        && current_range_idx_ < active_ranges().count();
+  }
+  /** @brief Returns private pruned ranges when installed, otherwise the borrowed runtime query ranges. */
+  const common::ObIArray<common::ObNewRange> &active_ranges() const
+  {
+    const common::ObIArray<common::ObNewRange> *ranges = nullptr;
+    if (has_sort_ranges_) {
+      ranges = &sort_ranges_;
+    } else {
+      ranges = &scalar_rtdef_->key_ranges_;
+    }
+    return *ranges;
+  }
+  /** @brief Discards pruning state so an open or rescan starts from the original runtime ranges. */
+  void reset_sort_ranges()
+  {
+    has_sort_ranges_ = false;
+    read_started_ = false;
+    sort_ranges_.reset();
+    sort_range_allocator_.reuse();
   }
   int position_next_nested_posting();
   int get_output_exprs(const common::ObIArray<ObExpr *> *&output_exprs);
@@ -169,6 +213,12 @@ private:
   bool nested_row_ready_;
   bool inv_idx_scan_param_inited_;
   bool is_inited_;
+  // Private ranges survive range scans and are released when the Group stops using this leaf.
+  // Reset the array before reusing its boundary-storage arena.
+  common::ObArenaAllocator sort_range_allocator_{common::ObMemAttr(MTL_ID(), "SortPruneRanges")};
+  common::ObSEArray<common::ObNewRange, 4, common::ObIAllocator &> sort_ranges_;
+  bool has_sort_ranges_ = false; // Selects private ranges even when pruning has made the range set empty.
+  bool read_started_ = false; // Prevents hybrid search sort-topN bottom pruning from reopening ranges after reading starts.
   DISALLOW_COPY_AND_ASSIGN(ObDASAsyncScalarRangeOp);
 };
 

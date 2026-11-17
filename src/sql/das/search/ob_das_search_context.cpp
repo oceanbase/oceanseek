@@ -18,11 +18,152 @@
 #include "share/logical_table/ob_logical_table_range_builder.h"
 #include "observer/omt/ob_tenant_config_mgr.h"
 #include "sql/engine/expr/ob_expr_hybrid_search_sort.h"
+#include "sql/das/iter/ob_das_fusion_parallel.h"
 
 namespace oceanbase
 {
 namespace sql
 {
+
+void ObDASSortRuntimeInfo::reset_values()
+{
+  after_values_.reset();
+  allocator_.reuse();
+  capacity_ = 0;
+  offset_ = 0;
+  page_size_ = 0;
+  weight_ = 1.0;
+  min_score_ = 0.0;
+  apply_min_score_ = false;
+}
+
+void ObDASSortRuntimeInfo::reset()
+{
+  reset_values();
+  allocator_.reset();
+  sort_ctdef_ = nullptr;
+  fusion_ctdef_ = nullptr;
+  scan_template_ = nullptr;
+}
+
+int ObDASSortRuntimeInfo::evaluate(ObEvalCtx &ctx)
+{
+  int ret = OB_SUCCESS;
+  reset_values();
+  if (!enabled() || fusion_ctdef_ == nullptr) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("hybrid sort runtime is not bound or enabled", K(ret), KP_(sort_ctdef), KP_(fusion_ctdef),
+             "enabled", enabled());
+  } else if (OB_FAIL(sort_ctdef_->validate())) {
+    LOG_WARN("failed to validate hybrid sort definition", K(ret));
+  } else {
+    ObDatum *size = nullptr;
+    ObDatum *offset = nullptr;
+    if (OB_SUCC(ret) && OB_FAIL(sort_ctdef_->limit_expr_->eval(ctx, size))) {
+      LOG_WARN("failed to evaluate hybrid sort page size", K(ret));
+    }
+    if (sort_ctdef_->offset_expr_ != nullptr) {
+      if (OB_SUCC(ret) && OB_FAIL(sort_ctdef_->offset_expr_->eval(ctx, offset))) {
+        LOG_WARN("failed to evaluate hybrid sort offset", K(ret));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (size == nullptr || size->is_null() || size->get_int() < 0) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("invalid hybrid sort page size", K(ret), KP(size),
+                 "is_null", size != nullptr && size->is_null(),
+                 "page_size", size != nullptr && !size->is_null() ? size->get_int() : 0);
+      } else {
+        page_size_ = size->get_int();
+        offset_ = offset == nullptr || offset->is_null() ? 0 : offset->get_int();
+        if (has_after()) {
+          if (-1 == offset_) {
+            // Normalize search_after's from=-1 before computing TopN capacity.
+            offset_ = 0;
+          } else if (0 != offset_) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_WARN("offset with search_after must be 0 or -1", K(ret), K_(offset));
+          }
+        } else if (offset_ < 0) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_WARN("offset without search_after must be non-negative", K(ret), K_(offset));
+        }
+        if (OB_SUCC(ret)) {
+          if (page_size_ > INT64_MAX - offset_) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_WARN("TopN capacity overflow", K(ret), K(page_size_), K(offset_));
+          } else {
+            capacity_ = page_size_ + offset_;
+          }
+        }
+      }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(after_values_.init(sort_ctdef_->after_exprs_.count()))) {
+      LOG_WARN("failed to initialize fixed search_after tuple", K(ret));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < sort_ctdef_->after_exprs_.count(); ++i) {
+      ObDatum *value = nullptr;
+      ObDatum copy;
+      if (OB_SUCC(ret)) {
+        if (OB_FAIL(sort_ctdef_->after_exprs_.at(i)->eval(ctx, value))) {
+          LOG_WARN("failed to evaluate search_after key", K(ret), "key_index", i);
+        } else if (OB_FAIL(copy.deep_copy(*value, allocator_))) {
+          LOG_WARN("failed to copy search_after key", K(ret), "key_index", i);
+        } else if (OB_FAIL(after_values_.push_back(copy))) {
+          LOG_WARN("failed to append search_after key", K(ret), "key_index", i);
+        }
+      }
+    }
+    if (OB_SUCC(ret) && fusion_ctdef_->fusion_iter_exec_mode_ == ObFusionIterExecMode::ROWKEY_SCORE_FULL_RECALL) {
+      ObDatum *weight = nullptr;
+      ObDatum *minimum = nullptr;
+      if (sort_ctdef_->single_query_weight_expr_ == nullptr || fusion_ctdef_->min_score_expr_ == nullptr) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("hybrid sort scoring expressions are missing", K(ret),
+                 KP(sort_ctdef_->single_query_weight_expr_), KP(fusion_ctdef_->min_score_expr_));
+      } else {
+        if (OB_SUCC(ret)) {
+          if (OB_FAIL(sort_ctdef_->single_query_weight_expr_->eval(ctx, weight))) {
+            LOG_WARN("failed to evaluate hybrid sort query weight", K(ret));
+          } else if (OB_FAIL(fusion_ctdef_->min_score_expr_->eval(ctx, minimum))) {
+            LOG_WARN("failed to evaluate hybrid sort minimum score", K(ret));
+          }
+        }
+        if (OB_SUCC(ret)) {
+          if (weight->is_null() || minimum->is_null()) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("hybrid sort query weight or minimum score is null", K(ret),
+                     "weight_is_null", weight->is_null(), "min_score_is_null", minimum->is_null());
+          } else {
+            weight_ = weight->get_double();
+            min_score_ = minimum->get_double();
+            apply_min_score_ = true;
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDASSearchCtx::bind_sort(const ObDASHybridSearchSortCtDef &sort_ctdef,
+                             const ObDASHybridSearchSortRtDef &rtdef,
+                             const ObDASFusionCtDef &fusion)
+{
+  int ret = OB_SUCCESS;
+  if (rtdef.ctdef_ != &sort_ctdef || rtdef.op_type_ != DAS_OP_HYBRID_SEARCH_SORT) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("hybrid sort runtime does not match its definition", K(ret), K(rtdef.op_type_),
+             KP(rtdef.ctdef_), KP(&sort_ctdef));
+  } else if (OB_FAIL(sort_ctdef.validate())) {
+    LOG_WARN("failed to validate hybrid sort definition before binding", K(ret));
+  } else {
+    sort_info_.sort_ctdef_ = &sort_ctdef;
+    sort_info_.fusion_ctdef_ = &fusion;
+    sort_info_.scan_template_ = sort_ctdef.has_sort_value_lookup_ ? &rtdef.sort_value_scan_rtdef_ : nullptr;
+  }
+  return ret;
+}
 
 ObTabletID ObDASSearchCtx::get_main_tablet_id() const
 {
@@ -32,17 +173,17 @@ ObTabletID ObDASSearchCtx::get_main_tablet_id() const
   return current_async_partition_ == nullptr ? ObTabletID() : current_async_partition_->main_tablet_id_;
 }
 
-int ObDASSearchCtx::project_shard_doc(uint64_t increment, int64_t index, int64_t count)
+int ObDASSearchCtx::project_sort_shard_doc(uint64_t increment, int64_t index, int64_t count)
 {
   int ret = OB_SUCCESS;
   const ObTabletID main_tablet_id = get_main_tablet_id();
-  if (!has_shard_doc()) {
+  if (!sort_info_.has_shard_doc()) {
   } else if (index < 0 || index >= count || !main_tablet_id.is_valid()) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid hybrid sort shard document projection state", K(ret), K(index), K(count),
              K(main_tablet_id));
   } else {
-    ObExpr *expr = fusion_ctdef_->shard_doc_expr_;
+    ObExpr *expr = sort_info_.sort_ctdef_->sort_exprs_.at(sort_info_.sort_ctdef_->unique_shard_doc_index());
     ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx_);
     guard.set_batch_size(count);
     guard.set_batch_idx(index);
@@ -65,6 +206,11 @@ int ObDASSearchCtx::project_shard_doc(uint64_t increment, int64_t index, int64_t
   return ret;
 }
 
+int ObDASSearchCtx::get_sort_first_error() const
+{
+  return sort_coordinator_ == nullptr ? OB_SUCCESS : sort_coordinator_->get_first_error();
+}
+
 bool ObDASSearchCtx::is_serial_fusion_plan() const
 {
   const ObDASBaseCtDef *ctdef = nullptr;
@@ -77,7 +223,8 @@ bool ObDASSearchCtx::is_serial_fusion_plan() const
 
 void ObDASSearchCtx::reset()
 {
-  fusion_ctdef_ = nullptr;
+  sort_coordinator_ = nullptr;
+  sort_info_.reset();
   for (int64_t i = 0; i < op_store_.count(); ++i) {
     if (OB_NOT_NULL(op_store_.at(i))) {
       op_store_.at(i)->close();

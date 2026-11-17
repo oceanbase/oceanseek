@@ -5273,7 +5273,7 @@ TEST_F(ObDASFusionTaskExecEnvTest, create_parallel_iter_null_contexts)
   runtime.child_eval_ctx_ = nullptr;
   runtime.child_search_ctx_ = nullptr;
 
-  EXPECT_EQ(OB_ERR_UNEXPECTED, runtime.create_parallel_iter(-1));
+  EXPECT_EQ(OB_ERR_UNEXPECTED, runtime.create_parallel_iter(-1, false /* consume_candidates */));
 }
 
 // ============================================================================

@@ -105,6 +105,8 @@ public:
     return can_enumerate;
   }
 
+  virtual int try_apply_sort_bottom(const common::ObDatum &sort_bottom, bool &applied) override;
+
 protected:
   int init_nested_key_cursor();
   int do_init(const ObIDASSearchOpParam &op_param) override;

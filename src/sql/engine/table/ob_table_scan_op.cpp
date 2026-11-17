@@ -1351,6 +1351,20 @@ int ObTableScanOp::init_attach_scan_rtdef(const ObDASBaseCtDef *attach_ctdef,
       attach_rtdef->ctdef_ = attach_ctdef;
       attach_rtdef->children_cnt_ = attach_ctdef->children_cnt_;
       attach_rtdef->eval_ctx_ = &eval_ctx_;
+      if (attach_ctdef->op_type_ == DAS_OP_HYBRID_SEARCH_SORT) {
+        const ObDASHybridSearchSortCtDef &sort_ctdef = *static_cast<const ObDASHybridSearchSortCtDef *>(attach_ctdef);
+        ObDASHybridSearchSortRtDef &runtime = *static_cast<ObDASHybridSearchSortRtDef *>(attach_rtdef);
+        if (sort_ctdef.has_sort_value_lookup_) {
+          // This embedded scan is not an attach child. Initialize its main-table location and
+          // execution settings here; candidate fetchers clone them into private lookup state.
+          const ObDASTableLocMeta *loc_meta = MY_CTDEF.das_dppr_tbl_ != nullptr
+              ? &MY_CTDEF.das_dppr_tbl_->get_loc_meta() : nullptr;
+          if (OB_FAIL(init_das_scan_rtdef(sort_ctdef.sort_value_scan_ctdef_,
+                                         runtime.sort_value_scan_rtdef_, loc_meta))) {
+            LOG_WARN("failed to initialize hybrid sort value scan runtime", K(ret));
+          }
+        }
+      }
       if (attach_ctdef->children_cnt_ > 0) {
         if (OB_ISNULL(attach_rtdef->children_ = OB_NEW_ARRAY(ObDASBaseRtDef*,
                                                              &ctx_.get_allocator(),

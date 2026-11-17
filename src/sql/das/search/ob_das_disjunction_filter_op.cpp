@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX SQL_DAS
 #include <algorithm>
 #include "ob_das_disjunction_filter_op.h"
+#include "common/ob_smart_call.h"
 #include "sql/das/ob_das_def_reg.h"
 
 namespace oceanbase
@@ -456,6 +457,28 @@ int ObDASDisjunctionFilterOp::open_children(bool &can_batch_merge)
       if (OB_FAIL(children_[i]->open())) {
         LOG_WARN("failed to open child", KR(ret));
       }
+    }
+  }
+  return ret;
+}
+
+int ObDASDisjunctionFilterOp::try_apply_sort_bottom(const common::ObDatum &sort_bottom, bool &applied)
+{
+  int ret = OB_SUCCESS;
+  applied = false;
+  if (min_should_match_ <= 0) {
+    INC_METRIC_VAL(common::ObMetricId::HS_SORT_BOTTOM_BLOCKED, 1);
+    LOG_TRACE("hybrid sort bottom skipped disjunction", "reason", "candidate-relative filter");
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < children_cnt_; ++i) {
+      bool child_applied = false;
+      if (OB_ISNULL(children_) || OB_ISNULL(children_[i])) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("sort bottom disjunction child is null", K(ret), K(i));
+      } else if (OB_FAIL(SMART_CALL(children_[i]->try_apply_sort_bottom(sort_bottom, child_applied)))) {
+        LOG_WARN("failed to apply sort bottom to disjunction child", K(ret), K(i));
+      }
+      applied = applied || child_applied;
     }
   }
   return ret;

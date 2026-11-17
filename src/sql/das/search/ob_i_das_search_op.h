@@ -451,6 +451,14 @@ public:
   // Resource-owning operators override this; composite operators forward to children.
   virtual void release_scan_resources();
 
+  /**
+   * @brief Try to narrow required filter ranges with the leading TopN sort value.
+   * Composite operators select eligible inputs; range leaves check their own read state.
+   * The value is borrowed only for this call. Unsupported operators return success without changes.
+   * applied reports whether any descendant installed a tighter range, including an empty range set.
+   */
+  virtual int try_apply_sort_bottom(const common::ObDatum &sort_bottom, bool &applied);
+
   /*
    * Advances to the next rowid that is greater than or equal to the target rowid.
    * @in param target: The target rowid to advance to.

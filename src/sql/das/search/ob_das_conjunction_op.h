@@ -67,6 +67,7 @@ public:
     }
     return has_driver && can_enumerate;
   }
+  virtual int try_apply_sort_bottom(const common::ObDatum &sort_bottom, bool &applied) override;
   
 private:
   int do_init(const ObIDASSearchOpParam &op_param) override;

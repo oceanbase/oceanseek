@@ -201,6 +201,7 @@ public:
       const uint64_t *&doc_ids,
       int64_t &count);
   bool can_forward_raw_doc_ids() const;
+  virtual int try_apply_sort_bottom(const common::ObDatum &sort_bottom, bool &applied) override;
   bool supports_direct_rowid_drain() const override
   { return direct_drain_enabled_; }
   bool can_enumerate_rowids() const override

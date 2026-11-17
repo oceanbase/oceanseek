@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX SQL_DAS
 #include "sql/das/search/ob_das_req_opt_op.h"
+#include "common/ob_smart_call.h"
 
 namespace oceanbase
 {
@@ -43,6 +44,19 @@ ObDASReqOptOp::ObDASReqOptOp(ObDASSearchCtx &search_ctx)
     iter_end_(false),
     is_inited_(false)
 {}
+
+int ObDASReqOptOp::try_apply_sort_bottom(const common::ObDatum &sort_bottom, bool &applied)
+{
+  int ret = OB_SUCCESS;
+  applied = false;
+  if (OB_ISNULL(required_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("sort bottom required input is null", K(ret));
+  } else if (OB_FAIL(SMART_CALL(required_->try_apply_sort_bottom(sort_bottom, applied)))) {
+    LOG_WARN("failed to prune required input ranges", K(ret));
+  }
+  return ret;
+}
 
 int ObDASReqOptOp::do_open()
 {

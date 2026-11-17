@@ -958,6 +958,10 @@ public:
   int get_hybrid_search_exprs(ObIArray<ObRawExpr *> &all_exprs);
   /** @brief Get this scan's ObFusionNode; return nullptr for other scans. */
   ObFusionNode *get_hybrid_sort_node() const;
+  /** @brief Ask ObFusionNode to prepare sort/search_after, then attach its lookup columns and filter. */
+  int prepare_hybrid_sort_after();
+  /** @brief Check __shard_doc support; append it only when append_shard_doc_key is true. eg. "sort": ["priority", "id"], append to ["priority", "id",  "__shard_doc"] */
+  int prepare_hybrid_sort_shard_doc(bool append_shard_doc_key, bool &supports_shard_doc_key);
   int get_hybrid_search_index_name_list(ObIArray<ObString> &name_list);
   int prepare_vector_node_access_exprs();
   int add_rerank_field_access_expr();

@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX SQL_DAS
 #include "sql/das/iter/ob_das_iter_utils.h"
+#include "sql/das/iter/ob_das_sort_topn_iter.h"
 #include "sql/das/iter/ob_das_text_retrieval_eval_node.h"
 #include "sql/das/iter/ob_das_hnsw_scan_iter.h"
 #include "sql/das/iter/ob_das_hnsw_lookup_streaming_iter.h"
@@ -4891,6 +4892,10 @@ int ObDASIterUtils::create_das_iter_tree_without_fusion_iter(DAS_ITER_TREE_SIGNA
       LOG_WARN("failed to create search driver iter", K(ret), K(path_desc));
     } else {
       index_iter = search_iter;
+      if (OB_FAIL(try_create_sort_topn_iter(alloc, fusion_ctdef->get_sort_ctdef(),
+                                           fusion_rtdef->get_sort_rtdef(), *search_ctx, search_iter, index_iter))) {
+        LOG_WARN("failed to create hybrid sort TopN wrapper", K(ret));
+      }
     }
   } else if (fusion_ctdef->has_vector_subquery_) {
     const int64_t vec_idx = 0;
@@ -4913,6 +4918,32 @@ int ObDASIterUtils::create_das_iter_tree_without_fusion_iter(DAS_ITER_TREE_SIGNA
 
 int ObDASIterUtils::create_hybrid_search_tree(DAS_ITER_TREE_SIGNATURE, ObDASIter *&iter_tree)
 {
+  /*
+   * Serial early TopN without ObDASFusionIter (ObDASProfileIter omitted):
+   * SQL Sort / Limit
+   * └─ ObTableScanOp
+   *    └─ Original final Lookup (if needed)
+   *       └─ ObDASSortTopNIter <- for early sort TopN and search_after filtering
+   *          └─ ObDASSearchDriverIter
+   *             └─ Full original query tree (e.g. Bool)
+   *
+   * Serial early TopN with ObDASFusionIter (ObDASProfileIter omitted):
+   * SQL Sort / Limit
+   * └─ ObTableScanOp
+   *    └─ Original final Lookup (if needed)
+   *       └─ ObDASFusionIter
+   *          └─ ObDASSortTopNIter <- for early sort TopN and search_after filtering
+   *             └─ ObDASSearchDriverIter
+   *                └─ Full original query tree (e.g. Bool)
+   *
+   * Serial without early TopN (sort configuration retained; ObDASProfileIter omitted):
+   * SQL Sort / Limit
+   * └─ ObTableScanOp (search_after filtering if needed)
+   *    └─ Original final Lookup (if needed)
+   *       └─ ObDASFusionIter
+   *          └─ ObDASSearchDriverIter
+   *             └─ Full original query tree (e.g. Bool)
+   */
   int ret = OB_SUCCESS;
   const bool has_lookup = OB_NOT_NULL(attach_ctdef) &&
       (attach_ctdef->op_type_ == DAS_OP_INDEX_PROJ_LOOKUP || attach_ctdef->op_type_ == DAS_OP_TABLE_LOOKUP);
@@ -4969,6 +5000,10 @@ int ObDASIterUtils::create_hybrid_search_tree(DAS_ITER_TREE_SIGNATURE, ObDASIter
       LOG_WARN("failed to create search driver iter", K(ret));
     } else {
       index_iter = search_iter;
+      if (OB_FAIL(try_create_sort_topn_iter(alloc, fusion_ctdef->get_sort_ctdef(),
+                                           fusion_rtdef->get_sort_rtdef(), *search_ctx, search_iter, index_iter))) {
+        LOG_WARN("failed to create hybrid sort TopN wrapper", K(ret));
+      }
     }
   } else if (OB_FAIL(create_fusion_iter_tree(DAS_ITER_TREE_ARGS, fusion_ctdef, fusion_rtdef, index_iter))) {
     LOG_WARN("failed to create fusion iter", K(ret));
@@ -5087,7 +5122,7 @@ int ObDASIterUtils::create_fusion_iter_tree(DAS_ITER_TREE_SIGNATURE,
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("child ctdef is null", K(ret), K(i));
       } else if (fusion_ctdef->is_search_index(i)) {
-        ObIDASSearchRtDef *search_rtdef = static_cast<ObIDASSearchRtDef *>(fusion_rtdef->children_[i]);
+        ObIDASSearchRtDef *search_rtdef = fusion_rtdef->get_search_rtdef();
         top_k_limit_param.limit_ = fusion_ctdef->fusion_iter_exec_mode_ != ObFusionIterExecMode::SCORE_TOP_K_QUERY_HITS ? -1 : fusion_param.rank_window_size_;
         if (OB_ISNULL(search_rtdef)) {
           ret = OB_ERR_UNEXPECTED;
@@ -5096,6 +5131,10 @@ int ObDASIterUtils::create_fusion_iter_tree(DAS_ITER_TREE_SIGNATURE,
           LOG_WARN("failed to create search driver iter", K(ret));
         } else {
           children[i] = search_iter;
+          if (OB_FAIL(try_create_sort_topn_iter(alloc, fusion_ctdef->get_sort_ctdef(),
+                                               fusion_rtdef->get_sort_rtdef(), *search_ctx, search_iter, children[i]))) {
+            LOG_WARN("failed to create hybrid sort TopN wrapper", K(ret));
+          }
         }
       } else if (fusion_ctdef->is_vector_index(i)) {
         const ObDASVecIndexDriverCtDef *vec_index_driver_ctdef = static_cast<const ObDASVecIndexDriverCtDef *>(child_ctdef);
@@ -5124,6 +5163,61 @@ int ObDASIterUtils::create_fusion_iter_tree(DAS_ITER_TREE_SIGNATURE,
     fusion_iter = iter;
   } else {
     fusion_iter = nullptr;
+  }
+  return ret;
+}
+
+int ObDASIterUtils::try_create_sort_topn_iter(ObIAllocator &alloc,
+                                            const ObDASHybridSearchSortCtDef *sort_ctdef,
+                                            const ObDASHybridSearchSortRtDef *sort_rtdef,
+                                            ObDASSearchCtx &ctx,
+                                            ObDASSearchDriverIter *driver, ObDASIter *&execution_root)
+{
+  /*
+   * Early TopN enabled:
+   * ObDASSortTopNIter
+   * └─ ObDASSearchDriverIter
+   *    └─ Full original query tree
+   *
+   * Early TopN disabled (sort and __shard_doc configuration retained):
+   * ObDASSearchDriverIter
+   * └─ Full original query tree
+   */
+  int ret = OB_SUCCESS;
+  execution_root = driver;
+  const ObDASSortRuntimeInfo &sort_info = ctx.get_sort_info();
+  if (OB_ISNULL(sort_ctdef) && OB_ISNULL(sort_rtdef)) {
+  } else if (OB_ISNULL(sort_ctdef) || OB_ISNULL(sort_rtdef) || sort_rtdef->ctdef_ != sort_ctdef) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("missing or mismatched hybrid sort child definitions", K(ret), KP(sort_ctdef), KP(sort_rtdef));
+  } else if (OB_FAIL(sort_ctdef->validate())) {
+    LOG_WARN("invalid hybrid sort iterator definition", K(ret));
+  } else if (OB_ISNULL(driver) || driver->get_type() != DAS_ITER_SEARCH_DRIVER
+             || sort_info.sort_ctdef_ != sort_ctdef
+             || sort_info.scan_template_ != (sort_ctdef->has_sort_value_lookup_
+                 ? &sort_rtdef->sort_value_scan_rtdef_ : nullptr)) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("hybrid sort iterator bindings do not match its task", K(ret), KP(driver),
+             KP(sort_ctdef), KP(sort_info.sort_ctdef_), KP(sort_info.scan_template_),
+             "needs_value_lookup", sort_ctdef->has_sort_value_lookup_);
+  } else if (!sort_ctdef->das_sort_topn_enable_) {
+    // SQL fallback keeps the bound sort configuration and uses the driver directly.
+  } else {
+    ObDASSortTopNIter *sort_iter = nullptr;
+    ObDASIterGuard<ObDASSortTopNIter> guard(sort_iter, ret);
+    ObDASSortTopNIterParam param(*sort_ctdef, ctx, driver);
+    param.eval_ctx_ = ctx.get_eval_ctx();
+    param.exec_ctx_ = &param.eval_ctx_->exec_ctx_;
+    param.max_size_ = param.eval_ctx_->max_batch_size_;
+    param.output_ = &sort_ctdef->result_output_;
+    if (OB_FAIL(create_das_iter(alloc, param, sort_iter))) {
+      LOG_WARN("failed to create hybrid sort TopN iterator", K(ret));
+    } else if (OB_FAIL(create_iter_children_array(1, alloc, sort_iter))) {
+      LOG_WARN("failed to allocate hybrid sort child iterator array", K(ret));
+    } else {
+      sort_iter->get_children()[0] = driver;
+      execution_root = sort_iter;
+    }
   }
   return ret;
 }
@@ -5165,9 +5259,10 @@ int ObDASIterUtils::create_search_driver_iter(common::ObIAllocator &alloc,
     LOG_WARN("failed to generate search operator", K(ret));
   } else {
     ObLimitParam effective_limit = top_k_limit_param;
-    // SQL applies search_after after main-table lookup. Do not truncate matching rows before
-    // that filter, since the rows following the previous page may lie beyond a score-based prefix.
-    if (vec_filter_mode == ObVecFilterMode::VEC_FILTER_MODE_INVALID && search_ctx->has_search_after()) {
+    // Field ordering and search-after can select documents outside a score-based prefix. Preserve the full
+    // candidate stream so the TopN wrapper or SQL fallback applies the final ordering and page boundaries.
+    if (vec_filter_mode == ObVecFilterMode::VEC_FILTER_MODE_INVALID
+        && (search_ctx->is_sort_topn_enabled() || search_ctx->use_sql_after_fallback())) {
       effective_limit.limit_ = -1;
       effective_limit.offset_ = 0;
     }

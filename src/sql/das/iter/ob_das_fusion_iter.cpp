@@ -19,6 +19,8 @@
 #include <cmath>
 #define USING_LOG_PREFIX SQL_DAS
 #include "sql/das/iter/ob_das_fusion_iter.h"
+#include "sql/das/iter/ob_das_sort_topn_iter.h"
+#include "sql/das/search/ob_das_search_utils.h"
 #include "sql/das/iter/ob_das_profile_iter.h"
 
 namespace oceanbase
@@ -95,13 +97,18 @@ int ObDASFusionIter::inner_init(ObDASIterParam &param)
       } else if (OB_FAIL(set_rowkey_is_uint64_flag())) {
         LOG_WARN("failed to check rowkey type", K(ret));
       } else {
+        // Bind result storage once, after its owning context has been created.
+        field_page_results_.set_block_allocator(
+            ModulePageAllocator(fusion_memctx_->get_arena_allocator(), "PartTopNResult"));
         const int64_t children_cnt = fusion_ctdef_->children_cnt_;
         const int64_t default_capacity = OB_MAX(rank_window_size_ * children_cnt, 64);
         const int64_t fusion_docs_capacity = OB_MAX(expected_doc_count_, default_capacity);
         const int64_t sorted_indices_capacity = fusion_iter_exec_mode_ == ObFusionIterExecMode::SCORE_TOP_K_QUERY_HITS
                                                   ? OB_MAX(rank_window_size_, 64L)
                                                   : fusion_docs_capacity;
-        if (OB_FAIL(fusion_docs_.reserve(fusion_docs_capacity))) {
+        if (fusion_ctdef_->is_sort_topn_enabled()) {
+          // Optimized paths only allocate finite sort entries, not legacy hits.
+        } else if (OB_FAIL(fusion_docs_.reserve(fusion_docs_capacity))) {
           LOG_WARN("failed to reserve fusion_docs_", K(ret), K(fusion_docs_capacity));
         } else if (OB_FAIL(sorted_doc_indices_.reserve(sorted_indices_capacity))) {
           LOG_WARN("failed to reserve sorted_doc_indices_", K(ret), K(sorted_indices_capacity));
@@ -125,6 +132,8 @@ int ObDASFusionIter::inner_init(ObDASIterParam &param)
 int ObDASFusionIter::inner_reuse()
 {
   int ret = OB_SUCCESS;
+  field_page_results_.reset();
+  field_page_output_pos_ = 0;
 
   for (int64_t i = 0; OB_SUCC(ret) && i < children_cnt_; ++i) {
     if (OB_NOT_NULL(children_[i])) {
@@ -168,6 +177,8 @@ int ObDASFusionIter::inner_reuse()
 int ObDASFusionIter::inner_release()
 {
   int ret = OB_SUCCESS;
+  field_page_results_.reset();
+  field_page_output_pos_ = 0;
 
   for (int64_t i = 0; i < fusion_docs_.count(); ++i) {
     fusion_docs_.at(i).reset();
@@ -264,7 +275,6 @@ int ObDASFusionIter::do_table_scan()
   int ret = OB_SUCCESS;
   bool use_parallel = false;
   common::ObOpProfile<common::ObMetric> *fusion_profile = nullptr;
-
   if (OB_FAIL(ObDASProfileIter::init_runtime_profile(
           common::ObProfileId::HYBRID_SEARCH_FUSION_ITER, fusion_profile))) {
     LOG_WARN("failed to init runtime profile", KR(ret));
@@ -331,7 +341,12 @@ int ObDASFusionIter::inner_get_next_row()
   int ret = OB_SUCCESS;
   common::ObProfileSwitcher switcher(fusion_profile_);
   common::ScopedTimer total_timer(common::ObMetricId::HS_TOTAL_TIME);
-  if (limit_param_.limit_ >= 0 && output_row_cnt_ >= limit_param_.limit_) {
+  if (OB_NOT_NULL(search_ctx_) && search_ctx_->is_sort_topn_enabled()) {
+    // The original SearchDriver and its TopN wrapper consume vector batches.
+    // Do not read the legacy fusion store after producing field_page_results_.
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("hybrid sort fusion requires batch reads", K(ret));
+  } else if (limit_param_.limit_ >= 0 && output_row_cnt_ >= limit_param_.limit_) {
     ret = OB_ITER_END;
   } else if (!fusion_finished_ && OB_FAIL(do_fusion(false /* is_vectorized */))) {
     LOG_WARN("failed to do fusion", K(ret));
@@ -355,7 +370,35 @@ int ObDASFusionIter::inner_get_next_rows(int64_t &count, int64_t capacity)
   common::ObProfileSwitcher switcher(fusion_profile_);
   common::ScopedTimer total_timer(common::ObMetricId::HS_TOTAL_TIME);
   count = 0;
-  if (fusion_iter_exec_mode_ == ObFusionIterExecMode::SCORE_TOP_K_QUERY_HITS && rank_window_size_ == 0) {
+  if (search_ctx_ != nullptr && search_ctx_->is_sort_topn_enabled()) {
+    if (!fusion_finished_) {
+      if (OB_SUCC(ret) && OB_FAIL(do_sort_fusion())) {
+        LOG_WARN("failed to merge hybrid sort results", K(ret), K_(parallel_execution_used));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      count = MIN(capacity, field_page_results_.count() - field_page_output_pos_);
+      if (count > 0) {
+        if (OB_SUCC(ret) && OB_FAIL(ObDASSearchUtils::project_hybrid_sort_entries(
+              field_page_results_, field_page_output_pos_, count, *search_ctx_))) {
+          LOG_WARN("failed to project hybrid sort entries", K(ret));
+        }
+        if (OB_SUCC(ret)) {
+          field_page_output_pos_ += count;
+          input_row_cnt_ += count;
+          output_row_cnt_ += count;
+          // Count the final nonempty batch before reporting EOF.
+          INC_METRIC_VAL(common::ObMetricId::HS_OUTPUT_ROW_COUNT, count);
+        }
+      }
+      if (OB_SUCC(ret) && field_page_output_pos_ == field_page_results_.count()) {
+        ret = OB_ITER_END;
+      }
+    }
+    if (ret != OB_SUCCESS && ret != OB_ITER_END) {
+      count = 0;
+    }
+  } else if (fusion_iter_exec_mode_ == ObFusionIterExecMode::SCORE_TOP_K_QUERY_HITS && rank_window_size_ == 0) {
     ret = OB_ITER_END;
   } else if (!fusion_finished_ && OB_FAIL(do_fusion(true /* is_vectorized */))) {
     LOG_WARN("failed to do fusion", K(ret));
@@ -757,9 +800,7 @@ int ObDASFusionIter::do_parallel_table_scan()
              KP(fusion_rtdef_));
   } else {
     ObIAllocator &alloc = fusion_memctx_->get_arena_allocator();
-    if (OB_FAIL(parallel_ctx_.prepare_works(
-                   alloc, *fusion_ctdef_, *search_ctx_,
-                   *exec_ctx_, *eval_ctx_))) {
+    if (OB_FAIL(parallel_ctx_.prepare_works(alloc, *fusion_ctdef_, *search_ctx_, *exec_ctx_, *eval_ctx_))) {
       LOG_WARN("failed to prepare fusion parallel works",
                KR(ret), K(children_cnt_));
     } else if (OB_FAIL(parallel_coordinator_.init(
@@ -1060,86 +1101,179 @@ int ObDASFusionIter::create_parallel_task_profiles()
   return ret;
 }
 
+int ObDASFusionIter::do_sort_fusion()
+{
+  int ret = OB_SUCCESS;
+  const ObDASSortRuntimeInfo &info = search_ctx_->get_sort_info();
+  field_page_results_.reset();
+  field_page_output_pos_ = 0;
+  if (0 == info.page_size_) {
+    fusion_finished_ = true;
+  } else {
+    ObIAllocator &heap_allocator = fusion_memctx_->get_malloc_allocator();
+    ObDASSortTopNHeap heap(heap_allocator);
+    if (OB_FAIL(heap.init(*info.sort_ctdef_, info.capacity_, heap_allocator))) {
+      LOG_WARN("failed to initialize hybrid sort heap", K(ret));
+    }
+    // Slice wrappers already retain their local best capacity rows. Merging only those bounded results is
+    // sufficient to obtain the partition TopN; the same heap also deduplicates overlapping source results.
+    if (parallel_execution_used_) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < parallel_ctx_.get_path_slice_work_count(); ++i) {
+        const ObDASFusionPathSliceWork *task = parallel_ctx_.get_path_slice_work(i);
+        if (OB_ISNULL(task)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("hybrid sort task is null during fusion", K(ret), K(i));
+        } else {
+          const ObIArray<ObDASSortTopNEntry> &sort_rows = task->get_sort_rows();
+          const int64_t legacy_row_count = task->get_rows().count();
+          if (legacy_row_count != 0 || sort_rows.count() > info.capacity_) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("invalid hybrid sort task result for fusion", K(ret), K(i), KP(task), K(info.capacity_),
+                     K(legacy_row_count), "sort_row_count", sort_rows.count());
+          } else {
+            for (int64_t j = 0; OB_SUCC(ret) && j < sort_rows.count(); ++j) {
+              if (OB_FAIL(heap.offer(sort_rows.at(j)))) {
+                LOG_WARN("failed to merge hybrid sort task row", K(ret), "task_index", i, "row_index", j);
+              }
+            }
+          }
+        }
+      }
+    } else {
+      for (int64_t child = 0; OB_SUCC(ret) && child < children_cnt_; ++child) {
+        bool end = false;
+        while (OB_SUCC(ret) && !end) {
+          int64_t count = 0;
+          children_[child]->clear_evaluated_flag();
+          if (OB_FAIL(children_[child]->get_next_rows(count, max_size_))) {
+            if (OB_ITER_END == ret) {
+              end = true;
+              ret = OB_SUCCESS;
+            } else {
+              LOG_WARN("failed to read hybrid sort child batch", K(ret), K(child), K(count));
+            }
+          }
+          if (OB_SUCC(ret)) {
+            if (0 == count && !end) {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("hybrid sort fusion child made no progress", K(ret), K(child), K(count), K_(max_size));
+            }
+            for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+              ObDASSortTopNEntry entry;
+              if (OB_SUCC(ret)) {
+                if (OB_FAIL(ObDASSearchUtils::capture_hybrid_sort_entry(*search_ctx_, i, count, entry, nullptr /* deep_copy = false*/))) {
+                  LOG_WARN("failed to capture hybrid sort child row", K(ret), K(child), "row_index", i, K(count));
+                } else if (OB_FAIL(heap.offer(entry))) {
+                  LOG_WARN("failed to merge hybrid sort child row", K(ret), K(child), "row_index", i);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(heap.drain_sorted(
+        field_page_results_, fusion_memctx_->get_arena_allocator()))) {
+      LOG_WARN("failed to drain hybrid sort heap", K(ret));
+    }
+    if (OB_SUCC(ret)) {
+      // Match the existing Fusion metric: retained results before output pagination.
+      SET_METRIC_VAL(common::ObMetricId::HS_FUSION_INPUT_ROW_COUNT,
+                     static_cast<uint64_t>(field_page_results_.count()));
+    }
+    if (OB_SUCC(ret)) {
+      fusion_finished_ = true;
+    }
+  }
+  return ret;
+}
+
 int ObDASFusionIter::do_fusion(bool is_vectorized)
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(fusion_ctdef_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("fusion_ctdef is null", K(ret));
-  } else if (parallel_execution_used_) {
-    {
-      common::ScopedTimer merge_timer(
-          common::ObMetricId::HS_PARALLEL_RESULT_MERGE_TIME);
-      if (OB_FAIL(merge_parallel_results())) {
-        LOG_WARN("failed to merge parallel fusion results", KR(ret));
-      }
+  if (search_ctx_ != nullptr && search_ctx_->is_sort_topn_enabled()) {
+    if (OB_FAIL(do_sort_fusion())) {
+      LOG_WARN("failed to merge hybrid sort results", K(ret), K_(parallel_execution_used));
     }
-  } else if (OB_LIKELY(is_vectorized)) {
-    for (int64_t path_idx = 0; OB_SUCC(ret) && path_idx < children_cnt_; ++path_idx) {
-      ObDASIter *child = children_[path_idx];
-      if (OB_ISNULL(child)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("child is null", K(ret), K(path_idx));
-      } else {
-        while (OB_SUCC(ret)) {
-          child->clear_evaluated_flag();
-          int64_t read_count = 0;
-          if (OB_FAIL(child->get_next_rows(read_count, max_size_))) {
-            if (OB_UNLIKELY(OB_ITER_END != ret)) {
-              LOG_WARN("failed to get next rows from child", K(ret), K(path_idx));
-            } else if (read_count > 0) {
-              if (OB_FAIL(add_batch(path_idx, fusion_row_, read_count))) {
-                LOG_WARN("failed to add batch", K(ret), K(path_idx), K(read_count));
+  } else {
+    if (OB_ISNULL(fusion_ctdef_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("fusion_ctdef is null", K(ret));
+    } else if (parallel_execution_used_) {
+      {
+        common::ScopedTimer merge_timer(
+            common::ObMetricId::HS_PARALLEL_RESULT_MERGE_TIME);
+        if (OB_FAIL(merge_parallel_results())) {
+          LOG_WARN("failed to merge parallel fusion results", KR(ret));
+        }
+      }
+    } else if (OB_LIKELY(is_vectorized)) {
+      for (int64_t path_idx = 0; OB_SUCC(ret) && path_idx < children_cnt_; ++path_idx) {
+        ObDASIter *child = children_[path_idx];
+        if (OB_ISNULL(child)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("child is null", K(ret), K(path_idx));
+        } else {
+          while (OB_SUCC(ret)) {
+            child->clear_evaluated_flag();
+            int64_t read_count = 0;
+            if (OB_FAIL(child->get_next_rows(read_count, max_size_))) {
+              if (OB_UNLIKELY(OB_ITER_END != ret)) {
+                LOG_WARN("failed to get next rows from child", K(ret), K(path_idx));
+              } else if (read_count > 0) {
+                if (OB_FAIL(add_batch(path_idx, fusion_row_, read_count))) {
+                  LOG_WARN("failed to add batch", K(ret), K(path_idx), K(read_count));
+                } else {
+                  ret = OB_SUCCESS;
+                  break;
+                }
               } else {
                 ret = OB_SUCCESS;
                 break;
               }
-            } else {
-              ret = OB_SUCCESS;
-              break;
+            } else if (OB_FAIL(add_batch(path_idx, fusion_row_, read_count))) {
+              LOG_WARN("failed to add batch", K(ret), K(path_idx), K(read_count));
             }
-          } else if (OB_FAIL(add_batch(path_idx, fusion_row_, read_count))) {
-            LOG_WARN("failed to add batch", K(ret), K(path_idx), K(read_count));
+          }
+        }
+      }
+    } else {
+      for (int64_t path_idx = 0; OB_SUCC(ret) && path_idx < children_cnt_; ++path_idx) {
+        ObDASIter *child = children_[path_idx];
+        if (OB_ISNULL(child)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("child is null", K(ret), K(path_idx));
+        } else {
+          while (OB_SUCC(ret)) {
+            child->clear_evaluated_flag();
+            if (OB_FAIL(child->get_next_row())) {
+              if (OB_UNLIKELY(OB_ITER_END != ret)) {
+                LOG_WARN("failed to get next row from child", K(ret), K(path_idx));
+              } else {
+                ret = OB_SUCCESS;
+                break;
+              }
+            } else if (OB_FAIL(add_row(path_idx, fusion_row_))) {
+              LOG_WARN("failed to add row", K(ret), K(path_idx));
+            }
           }
         }
       }
     }
-  } else {
-    for (int64_t path_idx = 0; OB_SUCC(ret) && path_idx < children_cnt_; ++path_idx) {
-      ObDASIter *child = children_[path_idx];
-      if (OB_ISNULL(child)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("child is null", K(ret), K(path_idx));
-      } else {
-        while (OB_SUCC(ret)) {
-          child->clear_evaluated_flag();
-          if (OB_FAIL(child->get_next_row())) {
-            if (OB_UNLIKELY(OB_ITER_END != ret)) {
-              LOG_WARN("failed to get next row from child", K(ret), K(path_idx));
-            } else {
-              ret = OB_SUCCESS;
-              break;
-            }
-          } else if (OB_FAIL(add_row(path_idx, fusion_row_))) {
-            LOG_WARN("failed to add row", K(ret), K(path_idx));
-          }
+
+    if (OB_SUCC(ret)) {
+      {
+        common::ScopedTimer finalize_timer(
+            common::ObMetricId::HS_FUSION_FINALIZE_TIME);
+        if (OB_FAIL(finish_fusion())) {
+          LOG_WARN("failed to finish fusion", K(ret));
+        } else {
+          fusion_finished_ = true;
         }
       }
     }
-  }
 
-  if (OB_SUCC(ret)) {
-    {
-      common::ScopedTimer finalize_timer(
-          common::ObMetricId::HS_FUSION_FINALIZE_TIME);
-      if (OB_FAIL(finish_fusion())) {
-        LOG_WARN("failed to finish fusion", K(ret));
-      } else {
-        fusion_finished_ = true;
-      }
-    }
   }
-
   return ret;
 }
 
@@ -1680,10 +1814,9 @@ int ObDASFusionIter::set_rowkeys_batch_non_rich_format<uint64_t>(int64_t start_i
             } else {
               uint64_t rowkey_val = doc.get_uint64_rowkey();
               rowkey_datums[i].set_uint(rowkey_val);
-              // SQL pagination uses this matching row's physical key after main-table lookup.
-              if (search_ctx_ != nullptr && search_ctx_->has_shard_doc()) {
-                if (OB_FAIL(search_ctx_->project_shard_doc(rowkey_val, i, batch_size))) {
-                  LOG_WARN("failed to project hybrid search __shard_doc", K(ret));
+              if (OB_NOT_NULL(search_ctx_) && search_ctx_->get_sort_info().has_shard_doc()) {
+                if (OB_FAIL(search_ctx_->project_sort_shard_doc(rowkey_val, i, batch_size))) {
+                  LOG_WARN("failed to project hybrid sort __shard_doc", K(ret));
                 }
               }
             }
@@ -1788,10 +1921,9 @@ int ObDASFusionIter::set_rowkeys_batch_rich_format<uint64_t>(int64_t start_idx,
             } else {
               uint64_t rowkey_val = doc.get_uint64_rowkey();
               rowkey_vec->set_uint(i, rowkey_val);
-              // SQL pagination uses this matching row's physical key after main-table lookup.
-              if (search_ctx_ != nullptr && search_ctx_->has_shard_doc()) {
-                if (OB_FAIL(search_ctx_->project_shard_doc(rowkey_val, i, batch_size))) {
-                  LOG_WARN("failed to project hybrid search __shard_doc", K(ret));
+              if (OB_NOT_NULL(search_ctx_) && search_ctx_->get_sort_info().has_shard_doc()) {
+                if (OB_FAIL(search_ctx_->project_sort_shard_doc(rowkey_val, i, batch_size))) {
+                  LOG_WARN("failed to project hybrid sort __shard_doc", K(ret));
                 }
               }
             }
@@ -2014,9 +2146,9 @@ int ObDASFusionIter::set_rowkey_and_score_to_exprs(int64_t doc_idx)
         LOG_WARN("failed to set rowkey to exprs", K(ret));
       } else if (OB_FAIL(set_score_to_expr(doc))) {
         LOG_WARN("failed to set score to expr", K(ret));
-      } else if (search_ctx_ != nullptr && search_ctx_->has_shard_doc()
-                 && OB_FAIL(search_ctx_->project_shard_doc(doc.get_uint64_rowkey(), 0, 1))) {
-        LOG_WARN("failed to project hybrid search __shard_doc", K(ret));
+      } else if (OB_NOT_NULL(search_ctx_) && search_ctx_->get_sort_info().has_shard_doc()
+                 && OB_FAIL(search_ctx_->project_sort_shard_doc(doc.get_uint64_rowkey(), 0, 1))) {
+        LOG_WARN("failed to project hybrid sort __shard_doc", K(ret));
       }
     } else {
       if (OB_FAIL(set_rowkey_to_exprs(doc.rowkey_union_.rowkey_, rowkey_exprs))) {

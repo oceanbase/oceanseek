@@ -515,6 +515,7 @@ public:
   int64_t advance_count() const { return advance_count_; }
   int64_t drain_count() const { return drain_count_; }
   int64_t max_drain_capacity() const { return max_drain_capacity_; }
+  bool has_read() const { return pos_ >= 0; }
   void set_advance_ret(const int advance_ret) { advance_ret_ = advance_ret; }
   void set_next_ret(const int ret) { next_ret_ = ret; }
   void set_drain_ret(const int ret) { drain_ret_ = ret; }
@@ -679,6 +680,22 @@ private:
   int shallow_ret_;
   ObDASRowID last_advance_target_;
   bool in_shallow_status_;
+};
+
+class MockSortRangeSegmentOp final : public MockSegmentOp
+{
+public:
+  using MockSegmentOp::MockSegmentOp;
+  int64_t sort_bottom_calls() const { return sort_bottom_calls_; }
+  virtual int try_apply_sort_bottom(const ObDatum &sort_bottom, bool &applied) override
+  {
+    UNUSED(sort_bottom);
+    ++sort_bottom_calls_;
+    applied = !has_read();
+    return OB_SUCCESS;
+  }
+private:
+  int64_t sort_bottom_calls_ = 0;
 };
 
 class MockProbeSegmentOp : public MockSegmentOp
@@ -4931,6 +4948,171 @@ TEST_F(TestDASAsyncSegmentMerge, group_merge_propagates_batch_capacity)
     EXPECT_DOUBLE_EQ(static_cast<double>(i + 32), batch_scores[i]);
   }
   EXPECT_TRUE(next_id_after.is_max());
+}
+
+TEST_F(TestDASAsyncSegmentMerge, group_topn_drain_opens_lazily_and_releases_at_group_boundaries)
+{
+  ObDASAsyncIndexQueryCtx catalog;
+  build_catalog(catalog, {3});
+  MockSegmentOp *empty_group = create_child({}, {});
+  MockSegmentOp *full_group = create_child({11, 12}, {1.5, 2.5});
+  MockSegmentOp *last_group = create_child({21}, {3.5});
+  ASSERT_NE(nullptr, empty_group);
+  ASSERT_NE(nullptr, full_group);
+  ASSERT_NE(nullptr, last_group);
+  ObArray<ObIDASSearchOp *> groups;
+  ASSERT_EQ(OB_SUCCESS, groups.push_back(empty_group));
+  ASSERT_EQ(OB_SUCCESS, groups.push_back(full_group));
+  ASSERT_EQ(OB_SUCCESS, groups.push_back(last_group));
+  ObDASAsyncSegmentGroupMergeOpParam param(groups);
+  ObDASAsyncSegmentGroupMergeOp *merge = nullptr;
+  ASSERT_EQ(OB_SUCCESS, search_ctx_.create_op(param, merge));
+  ASSERT_EQ(OB_SUCCESS, merge->open());
+  EXPECT_EQ(0, empty_group->open_count());
+  EXPECT_EQ(0, full_group->open_count());
+  EXPECT_EQ(0, last_group->open_count());
+
+  uint64_t ids[2];
+  double scores[2];
+  int64_t count = 0;
+  ObDASGroupBatchInfo info;
+  ASSERT_EQ(OB_SUCCESS, merge->drain_current_group(2, ids, scores, nullptr, count, info));
+  EXPECT_EQ(0, count);
+  EXPECT_TRUE(info.group_end_);
+  EXPECT_FALSE(info.all_end_);
+  EXPECT_EQ(1, empty_group->open_count());
+  EXPECT_EQ(1, empty_group->release_count());
+  EXPECT_EQ(0, full_group->open_count());
+  EXPECT_EQ(0, merge->current_group_idx_);
+
+  ASSERT_EQ(OB_SUCCESS, merge->drain_current_group(2, ids, scores, nullptr, count, info));
+  ASSERT_EQ(2, count);
+  EXPECT_EQ(11U, ids[0]);
+  EXPECT_EQ(12U, ids[1]);
+  EXPECT_DOUBLE_EQ(1.5, scores[0]);
+  EXPECT_DOUBLE_EQ(2.5, scores[1]);
+  EXPECT_FALSE(info.group_end_);
+  EXPECT_FALSE(info.all_end_);
+  EXPECT_EQ(1, full_group->open_count());
+  EXPECT_EQ(0, full_group->release_count());
+  EXPECT_EQ(0, last_group->open_count());
+  EXPECT_EQ(1, merge->current_group_idx_);
+
+  // A full batch carries no EOF lookahead; this call discovers exhaustion.
+  ASSERT_EQ(OB_SUCCESS, merge->drain_current_group(2, ids, scores, nullptr, count, info));
+  EXPECT_EQ(0, count);
+  EXPECT_TRUE(info.group_end_);
+  EXPECT_FALSE(info.all_end_);
+  EXPECT_EQ(1, full_group->open_count());
+  EXPECT_EQ(1, full_group->release_count());
+  EXPECT_EQ(0, last_group->open_count());
+  EXPECT_EQ(1, merge->current_group_idx_);
+
+  ASSERT_EQ(OB_SUCCESS, merge->drain_current_group(2, ids, scores, nullptr, count, info));
+  ASSERT_EQ(1, count);
+  EXPECT_EQ(21U, ids[0]);
+  EXPECT_DOUBLE_EQ(3.5, scores[0]);
+  EXPECT_TRUE(info.group_end_);
+  EXPECT_TRUE(info.all_end_);
+  EXPECT_EQ(1, last_group->open_count());
+  EXPECT_EQ(1, last_group->release_count());
+  ASSERT_EQ(OB_SUCCESS, merge->drain_current_group(2, ids, scores, nullptr, count, info));
+  EXPECT_EQ(0, count);
+  EXPECT_TRUE(info.all_end_);
+  EXPECT_EQ(1, last_group->release_count());
+}
+
+TEST_F(TestDASAsyncSegmentMerge, group_topn_drain_rescans_only_current_partition_children)
+{
+  ObDASAsyncIndexQueryCtx catalog;
+  build_catalog(catalog, {2, 1});
+  MockSegmentOp *first = create_child({11}, {1.5});
+  MockSegmentOp *second = create_child({21}, {2.5});
+  ASSERT_NE(nullptr, first);
+  ASSERT_NE(nullptr, second);
+  ObArray<ObIDASSearchOp *> groups;
+  ASSERT_EQ(OB_SUCCESS, groups.push_back(first));
+  ASSERT_EQ(OB_SUCCESS, groups.push_back(second));
+  ObDASAsyncSegmentGroupMergeOpParam param(groups);
+  ObDASAsyncSegmentGroupMergeOp *merge = nullptr;
+  ASSERT_EQ(OB_SUCCESS, search_ctx_.create_op(param, merge));
+  ASSERT_EQ(OB_SUCCESS, merge->open());
+  uint64_t ids[2];
+  double scores[2];
+  int64_t count = 0;
+  ObDASGroupBatchInfo info;
+  ASSERT_EQ(OB_SUCCESS, merge->drain_current_group(2, ids, scores, nullptr, count, info));
+  ASSERT_EQ(1, count);
+  EXPECT_TRUE(info.group_end_);
+  EXPECT_FALSE(info.all_end_);
+  EXPECT_EQ(1, first->release_count());
+
+  // Reset while the old group boundary is pending; no child is opened eagerly.
+  select_partition(catalog, 2);
+  ASSERT_EQ(OB_SUCCESS, merge->rescan());
+  EXPECT_EQ(2, first->release_count());
+  EXPECT_EQ(0, first->rescan_count());
+  EXPECT_EQ(0, second->open_count());
+  EXPECT_FALSE(merge->pending_group_end_);
+  EXPECT_EQ(-1, merge->bottom_checked_group_);
+  ASSERT_EQ(OB_SUCCESS, merge->drain_current_group(2, ids, scores, nullptr, count, info));
+  ASSERT_EQ(1, count);
+  EXPECT_EQ(11U, ids[0]);
+  EXPECT_DOUBLE_EQ(1.5, scores[0]);
+  EXPECT_TRUE(info.all_end_);
+  EXPECT_EQ(1, first->open_count());
+  EXPECT_EQ(1, first->rescan_count());
+  EXPECT_EQ(0, second->open_count());
+
+  select_partition(catalog, 1);
+  ASSERT_EQ(OB_SUCCESS, merge->rescan());
+  EXPECT_EQ(1, first->rescan_count());
+  EXPECT_EQ(0, second->open_count());
+  ASSERT_EQ(OB_SUCCESS, merge->drain_current_group(2, ids, scores, nullptr, count, info));
+  ASSERT_EQ(1, count);
+  EXPECT_EQ(11U, ids[0]);
+  EXPECT_EQ(2, first->rescan_count());
+  EXPECT_FALSE(info.all_end_);
+  EXPECT_EQ(0, second->open_count());
+  ASSERT_EQ(OB_SUCCESS, merge->drain_current_group(2, ids, scores, nullptr, count, info));
+  ASSERT_EQ(1, count);
+  EXPECT_EQ(21U, ids[0]);
+  EXPECT_DOUBLE_EQ(2.5, scores[0]);
+  EXPECT_TRUE(info.all_end_);
+  EXPECT_EQ(1, second->open_count());
+  EXPECT_EQ(0, second->rescan_count());
+  EXPECT_EQ(1, second->release_count());
+}
+
+TEST_F(TestDASAsyncSegmentMerge, group_topn_drain_preserves_child_errors)
+{
+  ObDASAsyncIndexQueryCtx catalog;
+  build_catalog(catalog, {2});
+  MockSegmentOp *first = create_child({11}, {1.5});
+  MockSegmentOp *second = create_child({21}, {2.5});
+  ASSERT_NE(nullptr, first);
+  ASSERT_NE(nullptr, second);
+  first->set_drain_ret(OB_TIMEOUT);
+  ObArray<ObIDASSearchOp *> groups;
+  ASSERT_EQ(OB_SUCCESS, groups.push_back(first));
+  ASSERT_EQ(OB_SUCCESS, groups.push_back(second));
+  ObDASAsyncSegmentGroupMergeOpParam param(groups);
+  ObDASAsyncSegmentGroupMergeOp *merge = nullptr;
+  ASSERT_EQ(OB_SUCCESS, search_ctx_.create_op(param, merge));
+  ASSERT_EQ(OB_SUCCESS, merge->open());
+  uint64_t ids[2];
+  double scores[2];
+  int64_t count = 99;
+  ObDASGroupBatchInfo info;
+  EXPECT_EQ(OB_TIMEOUT, merge->drain_current_group(2, ids, scores, nullptr, count, info));
+  EXPECT_EQ(0, count);
+  EXPECT_FALSE(info.group_end_);
+  EXPECT_FALSE(info.all_end_);
+  EXPECT_FALSE(merge->pending_group_end_);
+  EXPECT_EQ(0, merge->current_group_idx_);
+  EXPECT_EQ(1, first->open_count());
+  EXPECT_EQ(0, first->release_count());
+  EXPECT_EQ(0, second->open_count());
 }
 
 TEST_F(TestDASAsyncSegmentMerge, catalog_is_immutable_and_worker_selects_partition)
@@ -11022,8 +11204,8 @@ TEST_F(TestDASAsyncSegmentMerge, ordered_concat_propagates_child_read_errors)
 
 TEST_F(TestDASAsyncSegmentMerge, uint64_disjunction_defers_child_reads_until_iteration)
 {
-  MockSegmentOp first_child(search_ctx_, {1, 3}, {1.0, 1.0});
-  MockSegmentOp second_child(search_ctx_, {2, 4}, {2.0, 2.0});
+  MockSortRangeSegmentOp first_child(search_ctx_, {1, 3}, {1.0, 1.0});
+  MockSortRangeSegmentOp second_child(search_ctx_, {2, 4}, {2.0, 2.0});
   MockSegmentOpParam child_param;
   ASSERT_EQ(OB_SUCCESS, first_child.init(child_param));
   ASSERT_EQ(OB_SUCCESS, second_child.init(child_param));
@@ -11039,6 +11221,13 @@ TEST_F(TestDASAsyncSegmentMerge, uint64_disjunction_defers_child_reads_until_ite
   // An enclosing async segment merge binds its concrete version range after
   // opening the query tree, so opening this operator must not read children.
   EXPECT_TRUE(disjunction.use_batch_merge_);
+  int64_t bottom_value = 30;
+  ObDatum bottom;
+  bottom.ptr_ = reinterpret_cast<const char *>(&bottom_value);
+  bottom.set_int(bottom_value);
+  bool applied = false;
+  ASSERT_EQ(OB_SUCCESS, disjunction.try_apply_sort_bottom(bottom, applied));
+  EXPECT_TRUE(applied);
   EXPECT_FALSE(disjunction.batch_cursor_primed_);
   EXPECT_EQ(0, first_child.drain_count());
   EXPECT_EQ(0, second_child.drain_count());
@@ -11048,10 +11237,93 @@ TEST_F(TestDASAsyncSegmentMerge, uint64_disjunction_defers_child_reads_until_ite
   ASSERT_EQ(OB_SUCCESS, disjunction.next_rowid(rowid, score));
   EXPECT_EQ(1, rowid.get_uint64());
   EXPECT_TRUE(disjunction.batch_cursor_primed_);
+  ASSERT_EQ(OB_SUCCESS, disjunction.try_apply_sort_bottom(bottom, applied));
+  EXPECT_FALSE(applied);
+  EXPECT_EQ(2, first_child.sort_bottom_calls());
+  EXPECT_EQ(2, second_child.sort_bottom_calls());
   EXPECT_EQ(2, first_child.drain_count());
   EXPECT_EQ(1, second_child.drain_count());
   EXPECT_EQ(1, first_child.max_drain_capacity());
   EXPECT_EQ(1, second_child.max_drain_capacity());
+  ASSERT_EQ(OB_SUCCESS, disjunction.rescan());
+  ASSERT_EQ(OB_SUCCESS, disjunction.try_apply_sort_bottom(bottom, applied));
+  EXPECT_TRUE(applied);
+  ASSERT_EQ(OB_SUCCESS, disjunction.next_rowid(rowid, score));
+  EXPECT_EQ(1, rowid.get_uint64());
+  ASSERT_EQ(OB_SUCCESS, disjunction.try_apply_sort_bottom(bottom, applied));
+  EXPECT_FALSE(applied);
+  EXPECT_EQ(4, first_child.sort_bottom_calls());
+  EXPECT_EQ(4, second_child.sort_bottom_calls());
+}
+
+TEST_F(TestDASAsyncSegmentMerge, sort_bottom_reaches_unread_segment_after_another_segment_was_read)
+{
+  MockSortRangeSegmentOp first_child(search_ctx_, {1}, {1.0});
+  MockSortRangeSegmentOp second_child(search_ctx_, {2}, {2.0});
+  MockSegmentOpParam child_param;
+  ASSERT_EQ(OB_SUCCESS, first_child.init(child_param));
+  ASSERT_EQ(OB_SUCCESS, second_child.init(child_param));
+  ASSERT_EQ(OB_SUCCESS, first_child.open());
+  ASSERT_EQ(OB_SUCCESS, second_child.open());
+  ObDASRowID rowid;
+  double score = 0.0;
+  ASSERT_EQ(OB_SUCCESS, first_child.next_rowid(rowid, score));
+
+  ObIDASSearchOp *children[] = {&first_child, &second_child};
+  ObDASAsyncSegmentMergeOp merge(search_ctx_);
+  merge.children_ = children;
+  merge.children_cnt_ = ARRAYSIZEOF(children);
+  merge.active_segment_cnt_ = ARRAYSIZEOF(children);
+  merge.mode_ = ObDASAsyncSegmentMergeMode::DIRECT_MERGE;
+  merge.current_batch_child_idx_ = 1;
+  int64_t bottom_value = 30;
+  ObDatum bottom;
+  bottom.ptr_ = reinterpret_cast<const char *>(&bottom_value);
+  bottom.set_int(bottom_value);
+  bool applied = false;
+  ASSERT_EQ(OB_SUCCESS, merge.try_apply_sort_bottom(bottom, applied));
+  EXPECT_TRUE(applied);
+  EXPECT_EQ(1, first_child.sort_bottom_calls());
+  EXPECT_EQ(1, second_child.sort_bottom_calls());
+  EXPECT_EQ(1, merge.current_batch_child_idx_);
+  EXPECT_TRUE(first_child.has_read());
+  EXPECT_FALSE(second_child.has_read());
+  EXPECT_EQ(OB_SUCCESS, first_child.close());
+  EXPECT_EQ(OB_SUCCESS, second_child.close());
+}
+
+TEST_F(TestDASAsyncSegmentMerge, materialized_private_bitmap_delegates_bottom_to_its_source)
+{
+  MockSortRangeSegmentOp source(search_ctx_, {1, 2}, {1.0, 2.0});
+  MockSegmentOpParam source_param;
+  ASSERT_EQ(OB_SUCCESS, source.init(source_param));
+  ASSERT_EQ(OB_SUCCESS, source.open());
+  ObDASRowID rowid;
+  double score = 0.0;
+  ASSERT_EQ(OB_SUCCESS, source.next_rowid(rowid, score));
+
+  ObDASBitmapOp bitmap(search_ctx_);
+  bitmap.input_op_ = &source;
+  bitmap.owns_bitmap_ = true;
+  bitmap.bitmap_built_ = true;
+  bitmap.has_pending_first_ = true;
+  int64_t bottom_value = 30;
+  ObDatum bottom;
+  bottom.ptr_ = reinterpret_cast<const char *>(&bottom_value);
+  bottom.set_int(bottom_value);
+  bool applied = true;
+  ASSERT_EQ(OB_SUCCESS, bitmap.try_apply_sort_bottom(bottom, applied));
+  EXPECT_FALSE(applied);
+  EXPECT_EQ(1, source.sort_bottom_calls());
+  EXPECT_TRUE(bitmap.bitmap_built_);
+  EXPECT_TRUE(bitmap.has_pending_first_);
+
+  // An external/shared bitmap must not pass a consumer's bound to the source.
+  bitmap.owns_bitmap_ = false;
+  ASSERT_EQ(OB_SUCCESS, bitmap.try_apply_sort_bottom(bottom, applied));
+  EXPECT_FALSE(applied);
+  EXPECT_EQ(1, source.sort_bottom_calls());
+  EXPECT_EQ(OB_SUCCESS, source.close());
 }
 
 TEST_F(TestDASAsyncSegmentMerge, uint64_disjunction_batch_merges_refills_and_copies_runs)
@@ -11390,7 +11662,7 @@ TEST_F(TestDASAsyncSegmentMerge, uint64_disjunction_drain_falls_back_for_min_sho
 
 TEST_F(TestDASAsyncSegmentMerge, uint64_disjunction_falls_back_for_candidate_relative_child)
 {
-  MockSegmentOp leaf(search_ctx_, {100}, {1.0});
+  MockSortRangeSegmentOp leaf(search_ctx_, {100}, {1.0});
   MockSegmentOpParam child_param;
   ASSERT_EQ(OB_SUCCESS, leaf.init(child_param));
 
@@ -11410,6 +11682,12 @@ TEST_F(TestDASAsyncSegmentMerge, uint64_disjunction_falls_back_for_candidate_rel
   ASSERT_EQ(OB_SUCCESS, outer.open());
 
   EXPECT_FALSE(candidate_relative.can_enumerate_rowids());
+  ObDatum sort_bottom;
+  sort_bottom.set_null();
+  bool applied = true;
+  ASSERT_EQ(OB_SUCCESS, candidate_relative.try_apply_sort_bottom(sort_bottom, applied));
+  EXPECT_FALSE(applied);
+  EXPECT_EQ(0, leaf.sort_bottom_calls());
   EXPECT_FALSE(outer.use_batch_merge_);
   ObDASRowID target;
   ObDASRowID rowid;

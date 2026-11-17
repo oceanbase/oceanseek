@@ -304,6 +304,11 @@ protected:
 private:
   int init_fusion_row();
   int do_fusion(bool is_vectorized);
+  /**
+   * @brief Merge serial child batches or parallel slice results into this partition's field-sort TopN.
+   * Materialize retained keys in fusion_memctx_ so parent projection can outlive source batches.
+   */
+  int do_sort_fusion();
   int finish_fusion();
   int plan_parallel_execution(bool &use_parallel);
   int do_parallel_table_scan();
@@ -434,6 +439,10 @@ private:
   ObDASFusionScoreMinHeapCmp heap_cmp_;
   ObDASFusionScoreHeap *fusion_score_heap_;
   common::ObSEArray<int64_t, 64> sorted_doc_indices_;
+  // Partition-result lifetime: array and copied payloads belong to fusion_memctx_.
+  // Filled after merging; discard the array before Fusion reuse/release resets the arena.
+  common::ObArray<ObDASSortTopNEntry> field_page_results_;
+  int64_t field_page_output_pos_ = 0; // Next retained row to project for the parent iterator.
 
   // Row ID to doc_idx mapping
   static const int64_t MAP_EXTEND_RATIO = 2;

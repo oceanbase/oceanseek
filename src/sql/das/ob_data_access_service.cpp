@@ -7,6 +7,7 @@
 #include <algorithm>
 #include "observer/ob_srv_network_frame.h"
 #include "sql/das/ob_data_access_service.h"
+#include "sql/das/search/ob_das_search_define.h"
 #include "sql/das/ob_das_rpc_processor.h"
 #include "sql/das/ob_das_utils.h"
 #include "sql/das/ob_das_dml_ctx_define.h"
@@ -927,6 +928,16 @@ int ObDataAccessService::collect_das_task_attach_info(ObDASRemoteInfo &remote_in
       remote_info.has_expr_ |= attach_rtdef->ctdef_->has_expr();
       remote_info.need_calc_expr_ |= attach_rtdef->ctdef_->has_pdfilter_or_calc_expr();
       remote_info.need_calc_udf_ |= attach_rtdef->ctdef_->has_pl_udf();
+      if (attach_rtdef->op_type_ == DAS_OP_HYBRID_SEARCH_SORT) {
+        const ObDASHybridSearchSortCtDef &sort_ctdef = *static_cast<const ObDASHybridSearchSortCtDef *>(attach_rtdef->ctdef_);
+        if (sort_ctdef.has_sort_value_lookup_) {
+          const ObDASScanCtDef &scan = sort_ctdef.sort_value_scan_ctdef_;
+          remote_info.has_expr_ |= scan.has_expr();
+          remote_info.need_calc_expr_ |= scan.has_pdfilter_or_calc_expr();
+          // The scan definition is serialized inside the sort child; only propagate its expression
+          // requirements here, since registering it again would duplicate the remote definition.
+        }
+      }
       if (OB_FAIL(add_var_to_array_no_dup(remote_info.ctdefs_, attach_rtdef->ctdef_))) {
         LOG_WARN("store remote ctdef failed", K(ret));
       }

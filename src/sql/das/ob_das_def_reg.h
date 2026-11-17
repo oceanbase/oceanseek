@@ -179,6 +179,10 @@ struct ObDASFusionCtDef;
 struct ObDASFusionRtDef;
 REGISTER_DAS_ATTACH_OP(DAS_OP_FUSION_QUERY, ObDASFusionCtDef, ObDASFusionRtDef);
 
+struct ObDASHybridSearchSortCtDef;
+struct ObDASHybridSearchSortRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_HYBRID_SEARCH_SORT, ObDASHybridSearchSortCtDef, ObDASHybridSearchSortRtDef);
+
 struct ObDASBooleanQueryCtDef;
 struct ObDASBooleanQueryRtDef;
 REGISTER_DAS_ATTACH_OP(DAS_OP_BOOLEAN_QUERY, ObDASBooleanQueryCtDef, ObDASBooleanQueryRtDef);

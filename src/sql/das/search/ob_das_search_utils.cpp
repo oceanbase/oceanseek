@@ -5,6 +5,9 @@
 
 #define USING_LOG_PREFIX SQL_DAS
 #include "sql/das/search/ob_das_search_utils.h"
+#include "sql/das/iter/ob_das_search_driver_iter.h"
+#include "sql/das/iter/ob_das_sort_topn_iter.h"
+#include "share/vector/ob_i_vector.h"
 #include "sql/das/ob_das_ir_define.h"
 #include "sql/das/search/ob_das_async_index_query_ctx.h"
 #include "sql/das/search/ob_das_async_segment_merge_op.h"
@@ -216,6 +219,186 @@ bool is_closed_async_scalar_boundary(
           : objs[ASYNC_SCALAR_RANGE_TERM_COLUMN_CNT].is_max_value());
 }
 } // namespace
+
+int ObDASSearchUtils::compare_hybrid_sort_values(
+    const ObDASHybridSearchSortCtDef &sort_ctdef,
+    const common::ObIArray<common::ObDatum> &left,
+    const common::ObIArray<common::ObDatum> &right, int &cmp)
+{
+  int ret = OB_SUCCESS;
+  cmp = 0;
+  if (left.count() != sort_ctdef.sort_exprs_.count() || right.count() != left.count()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("hybrid sort tuple widths do not match", K(ret), "left_count", left.count(),
+             "right_count", right.count(), "sort_count", sort_ctdef.sort_exprs_.count());
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && cmp == 0 && i < left.count(); ++i) {
+    if (OB_FAIL(sort_ctdef.sort_cmp_funcs_.at(i).cmp_func_(left.at(i), right.at(i), cmp))) {
+      LOG_WARN("failed to compare hybrid sort key", K(ret), "key_index", i, "key_count", left.count());
+    } else if (!sort_ctdef.sort_collations_.at(i).is_ascending_) {
+      cmp = cmp > 0 ? -1 : cmp < 0 ? 1 : 0;
+    }
+  }
+  return ret;
+}
+
+int ObDASSearchUtils::deep_copy_hybrid_sort_entry(
+    const ObDASSortTopNEntry &source, ObDASSortTopNEntry &target, common::ObIAllocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  target.rowid_ = source.rowid_;
+  target.raw_score_ = source.raw_score_;
+  target.final_score_ = source.final_score_;
+  for (int64_t i = 0; OB_SUCC(ret) && i < source.sort_values_.count(); ++i) {
+    common::ObDatum copy;
+    if (OB_FAIL(copy.deep_copy(source.sort_values_.at(i), allocator))) {
+      LOG_WARN("failed to copy hybrid sort entry key", K(ret), "key_index", i);
+    } else if (OB_FAIL(target.sort_values_.push_back(copy))) {
+      LOG_WARN("failed to append copied hybrid sort value", K(ret), K(i));
+      if (!copy.is_null()) {
+        allocator.free(const_cast<char *>(copy.ptr_));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDASSearchUtils::capture_hybrid_sort_entry(
+    ObDASSearchCtx &ctx, int64_t index, int64_t count, ObDASSortTopNEntry &entry,
+    common::ObIAllocator *allocator, bool deep_copy)
+{
+  int ret = OB_SUCCESS;
+  const ObDASSortRuntimeInfo &info = ctx.get_sort_info();
+  const common::ObIArray<ObExpr *> &rowid_exprs = ctx.get_rowid_exprs();
+  ObEvalCtx &eval = *ctx.get_eval_ctx();
+  ObEvalCtx::BatchInfoScopeGuard guard(eval);
+  guard.set_batch_size(count);
+  guard.set_batch_idx(index);
+  common::ObDatum *rowid = nullptr;
+  common::ObDatum *score = nullptr;
+  if (deep_copy && OB_ISNULL(allocator)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("hybrid sort capture deep copy requires an allocator", K(ret), K(index), K(count));
+  } else if (rowid_exprs.count() != 1 || OB_ISNULL(info.sort_ctdef_) || OB_ISNULL(info.fusion_ctdef_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid hybrid sort capture metadata", K(ret), K(index), K(count),
+             "rowid_expr_count", rowid_exprs.count(), KP(info.sort_ctdef_), KP(info.fusion_ctdef_));
+  } else {
+    if (OB_FAIL(rowid_exprs.at(0)->eval(eval, rowid))) {
+      LOG_WARN("failed to capture hybrid sort __pk_increment", K(ret), K(index), K(count),
+               "main_tablet_id", ctx.get_main_tablet_id());
+    }
+    if (OB_SUCC(ret)) {
+      entry.rowid_.set_uint64(rowid->get_uint());
+    }
+    if (OB_SUCC(ret) && OB_FAIL(info.fusion_ctdef_->get_search_score_expr()->eval(eval, score))) {
+      LOG_WARN("failed to capture hybrid sort raw score", K(ret), K(index), K(count));
+    }
+    if (OB_SUCC(ret)) {
+      entry.raw_score_ = score->get_double();
+    }
+    if (OB_SUCC(ret) && OB_FAIL(info.fusion_ctdef_->get_fusion_score_expr()->eval(eval, score))) {
+      LOG_WARN("failed to capture hybrid sort final score", K(ret), K(index), K(count));
+    }
+    if (OB_SUCC(ret)) {
+      entry.final_score_ = score->get_double();
+    }
+    for (int64_t k = 0; OB_SUCC(ret) && k < info.sort_ctdef_->sort_exprs_.count(); ++k) {
+      common::ObDatum *value = nullptr;
+      if (OB_FAIL(info.sort_ctdef_->sort_exprs_.at(k)->eval(eval, value))) {
+        LOG_WARN("failed to capture hybrid sort key", K(ret), K(index), K(count), "key_index", k);
+      } else if (deep_copy) {
+        common::ObDatum captured;
+        if (OB_FAIL(captured.deep_copy(*value, *allocator))) {
+          LOG_WARN("failed to copy captured hybrid sort key", K(ret), K(index), "key_index", k);
+        } else if (OB_FAIL(entry.sort_values_.push_back(captured))) {
+          LOG_WARN("failed to append captured hybrid sort key", K(ret), K(index), "key_index", k);
+          if (!captured.is_null()) {
+            allocator->free(const_cast<char *>(captured.ptr_));
+          }
+        }
+      } else if (OB_FAIL(entry.sort_values_.push_back(*value))) {
+        LOG_WARN("failed to append captured hybrid sort key", K(ret), K(index), "key_index", k);
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDASSearchUtils::project_hybrid_sort_entries(
+    const common::ObIArray<ObDASSortTopNEntry> &rows, int64_t begin, int64_t count, ObDASSearchCtx &ctx)
+{
+  int ret = OB_SUCCESS;
+  const ObDASSortRuntimeInfo &info = ctx.get_sort_info();
+  const common::ObIArray<ObExpr *> &rowid_exprs = ctx.get_rowid_exprs();
+  ObEvalCtx &eval = *ctx.get_eval_ctx();
+  if (OB_ISNULL(info.sort_ctdef_) || OB_ISNULL(info.fusion_ctdef_) || begin < 0 || count <= 0
+      || begin + count > rows.count() || rowid_exprs.count() != 1) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid hybrid sort projection range or metadata", K(ret), K(begin), K(count),
+             "row_count", rows.count(), "rowid_expr_count", rowid_exprs.count(),
+             KP(info.sort_ctdef_), KP(info.fusion_ctdef_));
+  } else {
+    ObExpr *rowid = rowid_exprs.at(0);
+    if (OB_FAIL(rowid->init_vector_for_write(eval, rowid->get_default_res_format(), count))) {
+      LOG_WARN("failed to initialize hybrid sort __pk_increment vector", K(ret), K(count),
+               "main_tablet_id", ctx.get_main_tablet_id());
+    }
+    for (int64_t k = 0; OB_SUCC(ret) && k < info.fusion_ctdef_->score_exprs_.count(); ++k) {
+      ObExpr *score = info.fusion_ctdef_->score_exprs_.at(k);
+      if (OB_FAIL(score->init_vector_for_write(eval, score->get_default_res_format(), count))) {
+        LOG_WARN("failed to initialize hybrid sort score vector", K(ret), K(count), "score_index", k);
+      }
+    }
+    for (int64_t k = 0; OB_SUCC(ret) && k < info.sort_ctdef_->sort_exprs_.count(); ++k) {
+      ObExpr *expr = info.sort_ctdef_->sort_exprs_.at(k);
+      if (OB_FAIL(expr->init_vector_for_write(eval, expr->get_default_res_format(), count))) {
+        LOG_WARN("failed to initialize hybrid sort key vector", K(ret), K(count), "key_index", k);
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+      const ObDASSortTopNEntry &row = rows.at(begin + i);
+      rowid->get_vector(eval)->set_uint(i, row.rowid_.get_uint64());
+      for (int64_t k = 0; k < info.fusion_ctdef_->score_exprs_.count(); ++k) {
+        ObExpr *score = info.fusion_ctdef_->score_exprs_.at(k);
+        score->get_vector(eval)->set_double(i, k + 1 == info.fusion_ctdef_->score_exprs_.count()
+            ? row.final_score_ : row.raw_score_);
+        score->set_evaluated_projected(eval);
+      }
+      for (int64_t k = 0; k < row.sort_values_.count(); ++k) {
+        ObExpr *expr = info.sort_ctdef_->sort_exprs_.at(k);
+        const common::ObDatum &datum = row.sort_values_.at(k);
+        common::ObIVector *vector = expr->get_vector(eval);
+        // Retained output rows own these payloads until the page is reset, allowing shallow batch projection.
+        if (datum.is_null()) {
+          vector->set_null(i);
+        } else {
+          vector->set_payload_shallow(i, datum.ptr_, datum.len_);
+        }
+        expr->set_evaluated_projected(eval);
+      }
+    }
+    if (OB_SUCC(ret)) {
+      rowid->set_evaluated_projected(eval);
+    }
+  }
+  return ret;
+}
+
+ObDASSearchDriverIter *ObDASSearchUtils::find_search_driver_iter(ObDASIter *root)
+{
+  ObDASSearchDriverIter *driver = nullptr;
+  if (OB_NOT_NULL(root) && root->get_type() == DAS_ITER_SEARCH_DRIVER) {
+    driver = static_cast<ObDASSearchDriverIter *>(root);
+  } else if (OB_NOT_NULL(root) && root->get_type() == DAS_ITER_SORT_TOPN) {
+    ObDASSortTopNIter *sort = static_cast<ObDASSortTopNIter *>(root);
+    ObDASSearchDriverIter *sort_driver = sort->get_driver();
+    if (sort->get_children_cnt() == 1 && sort->get_children()[0] == sort_driver) {
+      driver = sort_driver;
+    }
+  }
+  return driver;
+}
 
 int ObDASSearchUtils::eval_and_tokenize_query_text(
     common::ObIAllocator &allocator,

@@ -143,7 +143,7 @@ public:
     contains_vec_node_(false), search_index_(-1), has_search_subquery_(false), has_vector_subquery_(false),
     is_top_k_query_(true), has_hybrid_fusion_op_(false), query_dop_(0), track_score_(true),
     fusion_iter_exec_mode_(ObFusionIterExecMode::SCORE_TOP_K_QUERY_HITS), is_single_partition_(true),
-    sort_items_(allocator), search_after_values_(allocator)
+    sort_items_(allocator), search_after_values_(allocator), das_sort_topn_enable_(false)
     { node_type_ = INDEX_MERGE_HYBRID_FUSION_SEARCH; }
   virtual ~ObFusionNode() {}
   virtual inline bool contains_vector_node() const { return contains_vec_node_; }
@@ -162,10 +162,14 @@ public:
   int replace_sort_exprs(ObRawExprReplacer &replacer, ObSQLSessionInfo *session);
   /** @brief Collect sort keys, search_after values and lookup columns without duplicates. */
   int collect_sort_calc_exprs(ObIArray<ObRawExpr *> &exprs) const;
-  /** @brief Check the query path, collect lookup columns and build the search_after filter. */
+  /** @brief Check DAS TopN support; when requested, append __shard_doc and copy it into this node. eg. "sort": ["priority", "id"], append to ["priority", "id",  "__shard_doc"] */
+  int prepare_sort_shard_doc(ObSelectStmt &stmt, const TableItem &table,
+                            ObRawExprFactory &factory, ObSQLSessionInfo &session,
+                            bool append_shard_doc_key, bool &supports_shard_doc_key);
+  /** @brief Prepare DAS TopN and lookup columns; return an after filter when SQL must handle search_after. */
   int prepare_sort_after(const ObSelectStmt &stmt, const ObDSLQueryInfo &info,
                          ObRawExprFactory &factory, ObSQLSessionInfo &session,
-                         ObRawExpr *&after_filter);
+                         bool allow_das_sort_topn, ObRawExpr *&after_filter);
 
   ObFusionMethod method_;
   ObRawExpr *from_;
@@ -192,6 +196,7 @@ public:
   ObDSLRerankInfo rerank_info_;
   ObSqlArray<ObFusionSortItem> sort_items_; // Sort expressions and their order.
   ObSqlArray<ObRawExpr *> search_after_values_; // search_after values in sort order.
+  bool das_sort_topn_enable_; // Whether this plan uses DAS TopN.
 };
 
 class ObScalarQueryNode : public ObHybridSearchNodeBase

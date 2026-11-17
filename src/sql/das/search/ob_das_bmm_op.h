@@ -89,6 +89,9 @@ public:
       const bool supports_direct_drain,
       ObDASBMMBuildOptions &options);
 
+  // Only the required filter receives the bound; each leaf checks whether it is unread.
+  virtual int try_apply_sort_bottom(const common::ObDatum &sort_bottom, bool &applied) override;
+
 private:
   enum class FilterMergeMode {
     DENSE_WINDOW,

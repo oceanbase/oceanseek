@@ -694,6 +694,16 @@ private:
   static int create_iter_children_array(const int64_t children_cnt,
                                         common::ObIAllocator &alloc,
                                         ObDASIter *iter);
+  /**
+   * @brief Validate hybrid sort bindings and wrap the driver only when DAS TopN is enabled.
+   * @param [out] execution_root Root through which scan, fetch, and lifecycle operations must be dispatched.
+   * Without DAS TopN, the root remains the driver; otherwise the wrapper owns the driver as its sole child.
+   */
+  static int try_create_sort_topn_iter(common::ObIAllocator &alloc,
+                                      const ObDASHybridSearchSortCtDef *sort_ctdef,
+                                      const ObDASHybridSearchSortRtDef *sort_rtdef,
+                                      ObDASSearchCtx &ctx,
+                                      ObDASSearchDriverIter *driver, ObDASIter *&execution_root);
 
   template<class IterType, class IterParamType>
   static int create_das_iter(common::ObIAllocator &alloc, IterParamType &param, IterType *&result)

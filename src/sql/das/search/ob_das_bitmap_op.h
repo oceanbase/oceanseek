@@ -247,6 +247,7 @@ public:
   double get_constant_score() const override { return is_scoring_ ? boost_weight_ : 0.0; }
   int get_bitmap_input_range(bool &available, uint64_t &lo, uint64_t &hi,
                              int64_t &estimated_count) override;
+  virtual int try_apply_sort_bottom(const common::ObDatum &sort_bottom, bool &applied) override;
 
   // Must be called before do_open(). Caller retains ownership of bm.
   int set_external_bitmap(ObFastBitmap *bm);

@@ -93,6 +93,7 @@ ob_set_subtarget(ob_sql das
   das/iter/ob_das_hnsw_lookup_streaming_iter.cpp
   das/iter/ob_das_global_lookup_iter.cpp
   das/iter/ob_das_sort_iter.cpp
+  das/iter/ob_das_sort_topn_iter.cpp
   das/iter/ob_das_text_retrieval_eval_node.cpp
   das/iter/ob_das_iter_utils.cpp
   das/iter/ob_das_index_merge_iter.cpp

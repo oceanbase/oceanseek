@@ -51,6 +51,21 @@ public:
     op_type_ = DAS_SEARCH_OP_ASYNC_SEGMENT_GROUP_MERGE;
   }
   virtual ~ObDASAsyncSegmentGroupMergeOp() {}
+  /**
+   * @brief Emits one batch from the current group and preserves its boundary for TopN feedback.
+   *
+   * Group draining cannot be mixed with ordinary row-ID draining before a reset. A completed group
+   * advances on the next call, after the consumer has processed the batch and updated the TopN bound.
+   * @param[in] capacity Positive capacity of both output arrays.
+   * @param[out] ids Document IDs from one group only; the caller owns the array.
+   * @param[out] scores Scores paired with ids; the caller owns the array.
+   * @param[in] sort_bottom Borrowed leading key of a full TopN, or NULL; valid only for this call.
+   * @param[out] count Number of emitted rows, possibly zero at a group boundary.
+   * @param[out] info End flags for the current group and partition; exhaustion returns OB_SUCCESS.
+   * @return OB_SUCCESS on success; mode/buffer/capacity violations return OB_STATE_NOT_MATCH; child errors propagate.
+   */
+  int drain_current_group(int64_t capacity, uint64_t *ids, double *scores,
+                          const common::ObDatum *sort_bottom, int64_t &count, ObDASGroupBatchInfo &info);
 
 private:
   int do_init(const ObIDASSearchOpParam &op_param) override;
@@ -89,6 +104,24 @@ private:
   bool threshold_cached_;
   double cached_threshold_;
   bool iter_end_;
+  /**
+   * @brief Prevents mixing ordinary iteration with reads limited to the current group.
+   * Once selected, the read mode remains fixed until the partition state is reset.
+   */
+  enum DrainMode
+  {
+    // initial value
+    DRAIN_NONE,
+    // Use next_rowid()/drain_until(); group boundaries are handled internally.
+    DRAIN_ORDINARY,
+    // Use drain_current_group(); do not drain data over groups so TopN can update bottom before the next group.
+    DRAIN_GROUP
+  };
+  DrainMode drain_mode_ = DRAIN_NONE; // Read interface selected for the current partition binding.
+  bool pending_group_end_ = false; // Defers moving to the next group until the consumer processes the last batch.
+  int64_t bottom_checked_group_ = -1; // Last group considered for pruning; each group is checked before its first read.
+  /** @brief Applies the current TopN boundary to supported unread required inputs of the current group. */
+  int apply_sort_bottom(const common::ObDatum &sort_bottom);
   DISALLOW_COPY_AND_ASSIGN(ObDASAsyncSegmentGroupMergeOp);
 };
 

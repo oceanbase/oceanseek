@@ -578,6 +578,16 @@ int ObIDASSearchOp::prepare_parallel_work_estimate()
   return ret;
 }
 
+int ObIDASSearchOp::try_apply_sort_bottom(const common::ObDatum &sort_bottom, bool &applied)
+{
+  int ret = OB_SUCCESS;
+  UNUSED(sort_bottom);
+  applied = false;
+  INC_METRIC_VAL(common::ObMetricId::HS_SORT_BOTTOM_BLOCKED, 1);
+  LOG_TRACE("hybrid sort bottom unapplied", K(ret));
+  return ret;
+}
+
 int ObIDASSearchOp::do_rescan_segment(const common::ObNewVersionRange &range)
 {
   int ret = OB_SUCCESS;

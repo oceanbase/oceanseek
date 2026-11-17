@@ -577,7 +577,8 @@ int ObHybridSearchGenerator::init_fusion_node(const ObDSLQueryInfo *query_info, 
   }
   if (OB_SUCC(ret) && (query_info->has_unique_shard_doc() || query_info->has_search_after()
                       || !query_info->sort_lookup_base_columns_.empty())) {
-    // Preserve SQL ORDER BY expressions, directions and NULL placement for the search_after filter.
+    // Preserve the resolved key sequence and NULL ordering for DAS comparison. Boundary constants
+    // use the same positions, so copying only the expressions would lose cursor comparison semantics.
     for (int64_t i = 0; OB_SUCC(ret) && i < query_info->sort_items_.count(); ++i) {
       const ObDSLSortItem &item = query_info->sort_items_.at(i);
       ObFusionSortItem out;
@@ -2692,9 +2693,8 @@ int build_hybrid_after_filter(ObRawExprFactory &factory, const ObFusionNode &nod
   return ret;
 }
 
-
-/** @brief Check whether the chosen query path uses async indexes. */
-int inspect_hybrid_sort_query(const ObIndexMergeNode *node, bool &has_async_index)
+/** @brief Find async-index access and check whether any query child prevents full recall. */
+int inspect_hybrid_sort_query(const ObIndexMergeNode *node, bool &has_async_index, bool &supports_full_recall)
 {
   int ret = OB_SUCCESS;
   if (node == nullptr || !node->is_hybrid_search_node()) {
@@ -2704,9 +2704,14 @@ int inspect_hybrid_sort_query(const ObIndexMergeNode *node, bool &has_async_inde
     const ObHybridSearchNodeBase *search = static_cast<const ObHybridSearchNodeBase *>(node);
     // Async-index access carries the information needed to filter deleted rows.
     has_async_index |= search->get_async_delete_info() != nullptr;
+    if (node->node_type_ == INDEX_MERGE_HYBRID_KNN
+        || node->node_type_ == INDEX_MERGE_HYBRID_NESTED_QUERY) {
+      supports_full_recall = false;
+    }
+    // A nested condition can make early sorting unsupported even when the outer operation is supported.
     for (int64_t i = 0; OB_SUCC(ret) && i < node->children_.count(); ++i) {
       if (OB_FAIL(SMART_CALL(inspect_hybrid_sort_query(
-          node->children_.at(i), has_async_index)))) {
+          node->children_.at(i), has_async_index, supports_full_recall)))) {
         LOG_WARN("failed to inspect hybrid sort query child", K(ret), K(node->node_type_), K(i));
       }
     }
@@ -2718,7 +2723,7 @@ int inspect_hybrid_sort_query(const ObIndexMergeNode *node, bool &has_async_inde
       for (int64_t i = 0; OB_SUCC(ret) && i < ARRAYSIZEOF(clauses); ++i) {
         for (int64_t j = 0; OB_SUCC(ret) && j < clauses[i]->count(); ++j) {
           if (OB_FAIL(SMART_CALL(inspect_hybrid_sort_query(
-              clauses[i]->at(j), has_async_index)))) {
+              clauses[i]->at(j), has_async_index, supports_full_recall)))) {
             LOG_WARN("failed to inspect hybrid sort Boolean clause", K(ret), "clause_group", i, "clause_index", j);
           }
         }
@@ -2728,18 +2733,90 @@ int inspect_hybrid_sort_query(const ObIndexMergeNode *node, bool &has_async_inde
   return ret;
 }
 
+/** @brief Check whether this plan can keep TopN before SQL grouping, windows or other row processing. */
+bool can_push_hybrid_sort_topn(const ObSelectStmt &stmt, const ObDSLQueryInfo &info,
+                             const ObFusionNode &node, bool supports_full_recall)
+{
+  // Both synchronous and asynchronous candidates identify HEAP rows by __pk_increment.
+  bool supported = supports_full_recall && info.has_dsl_sort()
+      && info.rowkey_cols_.count() == 1 && OB_NOT_NULL(info.rowkey_cols_.at(0))
+      && info.rowkey_cols_.at(0)->get_column_id() == OB_HIDDEN_PK_INCREMENT_COLUMN_ID
+      // These query forms need further result processing before their final rows can be limited.
+      // A single Boolean query may still contain several must/filter conditions.
+      && node.children_.count() == 1 && !node.has_vector_subquery_
+      && !node.has_hybrid_fusion_op_ && !node.has_rerank()
+      && stmt.is_single_table_stmt() && !stmt.has_distinct() && !stmt.has_group_by()
+      && !stmt.has_having() && !stmt.has_window_function() && !stmt.has_window_function_filter()
+      && !stmt.is_calc_found_rows()
+      // Keep the existing supported fusion modes and missing-value behavior.
+      && !info.has_literal_sort_missing() && node.method_ == ObFusionMethod::WEIGHT_SUM
+      && (node.fusion_iter_exec_mode_ == ObFusionIterExecMode::ROWKEY_SCORE_FULL_RECALL
+          || node.fusion_iter_exec_mode_ == ObFusionIterExecMode::SKIP_FUSION_ITER);
+  for (int64_t i = 0; supported && i < info.sort_items_.count(); ++i) {
+    const ObDSLSortItem &item = info.sort_items_.at(i);
+    supported = OB_NOT_NULL(item.field_expr_)
+        // Score ordering must wait until the original query has produced the complete score.
+        && (!item.is_score_sort_
+            || node.fusion_iter_exec_mode_ == ObFusionIterExecMode::ROWKEY_SCORE_FULL_RECALL);
+  }
+  return supported;
+}
 } // namespace
 } // namespace sql
 } // namespace oceanbase
 
+int ObFusionNode::prepare_sort_shard_doc(ObSelectStmt &stmt, const TableItem &table,
+                                        ObRawExprFactory &factory, ObSQLSessionInfo &session,
+                                        bool append_shard_doc_key, bool &supports_shard_doc_key)
+{
+  int ret = OB_SUCCESS;
+  supports_shard_doc_key = false;
+  bool has_async_index = false;
+  bool supports_full_recall = true;
+  if (OB_ISNULL(table.dsl_query_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("hybrid search DSL is null", K(ret), K(table.table_id_));
+  } else if (OB_FAIL(inspect_hybrid_sort_query(this, has_async_index, supports_full_recall))) {
+    LOG_WARN("failed to inspect hybrid sort query", K(ret));
+  } else if (!can_push_hybrid_sort_topn(stmt, *table.dsl_query_, *this, supports_full_recall)) {
+    // Keep SQL sorting when this plan cannot use DAS TopN.
+  } else {
+    supports_shard_doc_key = true;
+    if (append_shard_doc_key && !has_unique_shard_doc()) {
+      ObDSLQueryInfo &info = *table.dsl_query_;
+      if (OB_FAIL(ObDSLResolver::append_shard_doc_sort_item_if_absent(info, stmt, table, factory, session))) {
+        LOG_WARN("failed to append hybrid __shard_doc", K(ret));
+      } else {
+        // Candidates share the DSL list; copy any key another candidate already appended.
+        for (int64_t i = sort_items_.count(); OB_SUCC(ret) && i < info.sort_items_.count(); ++i) {
+          const ObDSLSortItem &item = info.sort_items_.at(i);
+          ObFusionSortItem out;
+          const bool null_first = item.missing_mode_ == ObDSLSortItem::MissingMode::FIRST;
+          out.order_item_ = OrderItem(item.field_expr_, null_first
+              ? (item.is_asc_ ? NULLS_FIRST_ASC : NULLS_FIRST_DESC)
+              : (item.is_asc_ ? NULLS_LAST_ASC : NULLS_LAST_DESC));
+          out.is_score_sort_ = item.is_score_sort_;
+          out.is_unique_shard_doc_ = item.is_unique_shard_doc_;
+          if (OB_FAIL(sort_items_.push_back(out))) {
+            LOG_WARN("failed to append hybrid sort item", K(ret));
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObFusionNode::prepare_sort_after(const ObSelectStmt &stmt, const ObDSLQueryInfo &info,
                                     ObRawExprFactory &factory, ObSQLSessionInfo &session,
-                                    ObRawExpr *&after_filter)
+                                    bool allow_das_sort_topn, ObRawExpr *&after_filter)
 {
   int ret = OB_SUCCESS;
   bool has_async_index = false;
+  bool supports_full_recall = true;
   after_filter = nullptr;
-  if (OB_FAIL(inspect_hybrid_sort_query(this, has_async_index))) {
+  das_sort_topn_enable_ = false;
+  if (OB_FAIL(inspect_hybrid_sort_query(this, has_async_index, supports_full_recall))) {
     LOG_WARN("failed to inspect hybrid sort query", K(ret));
   } else if ((has_after() || has_unique_shard_doc() || !info.sort_lookup_base_columns_.empty())
              && (children_.count() != 1 || has_vector_subquery_
@@ -2749,10 +2826,14 @@ int ObFusionNode::prepare_sort_after(const ObSelectStmt &stmt, const ObDSLQueryI
     LOG_DEBUG("candidate query path does not support hybrid cursor sorting", K(ret), K(has_async_index),
               K(children_.count()), K_(has_vector_subquery), K_(has_hybrid_fusion_op), K(has_rerank()));
   } else {
+    // DAS TopN needs __shard_doc to define a stable total ordering of equal keys.
+    das_sort_topn_enable_ = allow_das_sort_topn && has_unique_shard_doc()
+        && can_push_hybrid_sort_topn(stmt, info, *this, supports_full_recall);
+    // Collect main-table columns needed by sort keys, including columns omitted from SELECT.
+    // A nonempty list requires a sort-value lookup when DAS TopN is enabled.
     for (int64_t i = 0; OB_SUCC(ret) && i < sort_items_.count(); ++i) {
       const ObFusionSortItem &item = sort_items_.at(i);
       if (!item.is_score_sort_ && !item.is_unique_shard_doc_) {
-        // For sort=doc.price, lookup must provide doc even when SELECT omits it.
         ObSEArray<ObRawExpr *, 4> columns;
         if (OB_FAIL(ObRawExprUtils::extract_column_exprs(item.order_item_.expr_, columns, false, false))) {
           LOG_WARN("failed to extract hybrid sort lookup columns", K(ret), K(i));
@@ -2761,8 +2842,8 @@ int ObFusionNode::prepare_sort_after(const ObSelectStmt &stmt, const ObDSLQueryI
         }
       }
     }
-    if (OB_SUCC(ret) && has_after()) {
-      // TableScan filters rows after lookup, before SQL sorting and LIMIT.
+    if (OB_SUCC(ret) && has_after() && !das_sort_topn_enable_) {
+      // TableScan evaluates this filter after lookup when DAS TopN is unavailable.
       if (OB_FAIL(build_hybrid_after_filter(factory, *this, after_filter))) {
         LOG_WARN("failed to build search_after filter", K(ret), K(sort_items_.count()));
       } else if (OB_FAIL(after_filter->formalize(&session))) {

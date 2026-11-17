@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX SQL_DAS
 
 #include "sql/das/search/ob_das_async_segment_merge_op.h"
+#include "common/ob_smart_call.h"
 #include <algorithm>
 #include <utility>
 #include "lib/utility/ob_sort.h"
@@ -870,6 +871,31 @@ int ObDASAsyncSegmentMergeOp::reset_children_for_partition(const bool open_child
   } else if (OB_SUCC(ret) && ObDASAsyncSegmentMergeMode::SORT_MERGE == mode_
              && OB_FAIL(bind_and_prime_active_children())) {
     LOG_WARN("failed to bind active sort async segment children", K(ret));
+  }
+  return ret;
+}
+
+int ObDASAsyncSegmentMergeOp::try_apply_sort_bottom(const common::ObDatum &sort_bottom, bool &applied)
+{
+  int ret = OB_SUCCESS;
+  applied = false;
+  if (mode_ != ObDASAsyncSegmentMergeMode::DIRECT_MERGE) {
+    INC_METRIC_VAL(common::ObMetricId::HS_SORT_BOTTOM_BLOCKED, 1);
+    LOG_TRACE("hybrid sort bottom skipped segment merge", "reason", "unsupported merge mode");
+  } else if (OB_UNLIKELY(active_segment_cnt_ < 0 || active_segment_cnt_ > children_cnt_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid sort bottom segment count", K(ret), K_(active_segment_cnt), K_(children_cnt));
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < active_segment_cnt_; ++i) {
+      bool child_applied = false;
+      if (OB_ISNULL(children_) || OB_ISNULL(children_[i])) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("sort bottom segment child is null", K(ret), K(i));
+      } else if (OB_FAIL(SMART_CALL(children_[i]->try_apply_sort_bottom(sort_bottom, child_applied)))) {
+        LOG_WARN("failed to apply sort bottom to segment child", K(ret), K(i));
+      }
+      applied = applied || child_applied;
+    }
   }
   return ret;
 }

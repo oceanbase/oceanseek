@@ -203,5 +203,73 @@ int ObDASFusionCtDef::init(
   return ret;
 }
 
+OB_SERIALIZE_MEMBER((ObDASHybridSearchSortCtDef, ObDASSortCtDef),
+    after_exprs_, score_sort_flags_, unique_shard_doc_flags_, single_query_weight_expr_,
+    final_score_expr_, main_ref_table_id_, sort_value_scan_ctdef_, has_sort_value_lookup_, das_sort_topn_enable_);
+
+OB_SERIALIZE_MEMBER((ObDASHybridSearchSortRtDef, ObDASSortRtDef), sort_value_scan_rtdef_);
+
+int64_t ObDASHybridSearchSortCtDef::unique_shard_doc_index() const
+{
+  int64_t result = -1;
+  for (int64_t i = 0; result < 0 && i < unique_shard_doc_flags_.count(); ++i) {
+    if (unique_shard_doc_flags_.at(i)) {
+      result = i;
+    }
+  }
+  return result;
+}
+
+int ObDASHybridSearchSortCtDef::validate() const
+{
+  int ret = OB_SUCCESS;
+  const int64_t count = sort_exprs_.count();
+  int64_t shard_doc_count = 0;
+  if (op_type_ != DAS_OP_HYBRID_SEARCH_SORT || get_query_ctdef() == nullptr || count <= 0) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid hybrid sort child definition", K(ret), K_(op_type), K_(children_cnt), K(count));
+  } else if (count != sort_collations_.count() || count != sort_cmp_funcs_.count()
+      || count != score_sort_flags_.count() || count != unique_shard_doc_flags_.count()
+      || (has_after() && count != after_exprs_.count())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("hybrid sort metadata array lengths do not match", K(ret), K(count),
+             K(sort_collations_.count()), K(sort_cmp_funcs_.count()), K(score_sort_flags_.count()),
+             K(unique_shard_doc_flags_.count()), K(after_exprs_.count()));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+    const ObExpr *expr = sort_exprs_.at(i);
+    if (expr == nullptr || sort_cmp_funcs_.at(i).cmp_func_ == nullptr
+        || (has_after() && after_exprs_.at(i) == nullptr)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("hybrid sort expression or comparison function is missing", K(ret), K(i), KP(expr),
+               "has_cmp_func", sort_cmp_funcs_.at(i).cmp_func_ != nullptr,
+               "has_after", has_after(),
+               "has_after_expr", has_after() && after_exprs_.at(i) != nullptr);
+    } else if (unique_shard_doc_flags_.at(i)) {
+      ++shard_doc_count;
+      if (score_sort_flags_.at(i) || expr->type_ != T_FUN_SYS_HYBRID_UNIQUE_SHARD_DOC
+          || expr->arg_cnt_ != 2 || expr->args_ == nullptr
+          || expr->args_[0] == nullptr || expr->args_[1] == nullptr
+          || expr->datum_meta_.cs_type_ != CS_TYPE_BINARY) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid hybrid __shard_doc sort expression", K(ret), K(i), K(score_sort_flags_.at(i)),
+                 K(expr->type_), K(expr->arg_cnt_), K(expr->datum_meta_.cs_type_),
+                 "has_tablet_expr", expr->args_ != nullptr && expr->arg_cnt_ > 0 && expr->args_[0] != nullptr,
+                 "has_increment_expr", expr->args_ != nullptr && expr->arg_cnt_ > 1 && expr->args_[1] != nullptr);
+      }
+    } else if (das_sort_topn_enable_ && !has_sort_value_lookup_
+               && !score_sort_flags_.at(i) && !expr->is_const_expr()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("hybrid sort field requires a sort value lookup", K(ret), K(i), K(expr->type_));
+    }
+  }
+  if (OB_SUCC(ret) && (shard_doc_count > 1 || ((has_after() || das_sort_topn_enable_) && shard_doc_count != 1))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid hybrid __shard_doc sort item count", K(ret), K(shard_doc_count),
+             "has_after", has_after(), K_(das_sort_topn_enable));
+  }
+  return ret;
+}
+
 } // namespace sql
 } // namespace oceanbase

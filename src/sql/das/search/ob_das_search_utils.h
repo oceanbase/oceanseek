@@ -30,6 +30,8 @@ enum class ObDASAsyncSegmentMergeMode
 };
 
 class ObDASSearchCtx;
+class ObDASIter;
+class ObDASSearchDriverIter;
 class ObDASAsyncBindingGuard;
 class ObIDASSearchOp;
 struct ObIDASSearchCtDef;
@@ -61,6 +63,45 @@ public:
   // Validate the selected index scans inside a nested query subtree.
   static int resolve_nested_index(const ObDASBaseCtDef *ctdef,
                                  uint64_t &index_table_id, bool &is_async);
+  /**
+   * @brief Compare complete sort tuples using compiled datum comparators and sort directions.
+   * @param[out] cmp Negative when left comes first, zero when equal, positive when right comes first.
+   * @return OB_SUCCESS on success; an error for inconsistent tuple widths or failed comparisons.
+   */
+  static int compare_hybrid_sort_values(
+      const ObDASHybridSearchSortCtDef &sort_ctdef,
+      const common::ObIArray<common::ObDatum> &left,
+      const common::ObIArray<common::ObDatum> &right, int &cmp);
+  /**
+   * @brief Copy document metadata and allocate independent payloads for every sort value.
+   * @param[out] target Empty destination; partially copied values remain owned by allocator on failure.
+   * @param[in] allocator Owner of copied payloads, which must outlive target's use.
+   */
+  static int deep_copy_hybrid_sort_entry(
+      const ObDASSortTopNEntry &source, ObDASSortTopNEntry &target, common::ObIAllocator &allocator);
+  /**
+   * @brief Capture one projected batch row for a subsequent TopN merge.
+   * @param[in] index Row position in the current batch of count rows.
+   * @param[out] entry Empty destination; values borrow the current batch unless deep_copy is true.
+   * @param[in] allocator Required for deep copies; copied payloads remain owned by it on failure.
+   * @param[in] deep_copy Whether to copy sort values into allocator instead of borrowing batch memory.
+   */
+  static int capture_hybrid_sort_entry(
+      ObDASSearchCtx &ctx, int64_t index, int64_t count, ObDASSortTopNEntry &entry,
+      common::ObIAllocator *allocator, bool deep_copy = false);
+  /**
+   * @brief Project retained rows into row-id, score, and sort value vectors for a parent DAS iterator.
+   * @param[in] begin First retained row to project; count must be positive and remain within rows.
+   * @param[in] rows Entries whose payloads must stay valid while the output vectors are consumed.
+   */
+  static int project_hybrid_sort_entries(
+      const common::ObIArray<ObDASSortTopNEntry> &rows, int64_t begin, int64_t count, ObDASSearchCtx &ctx);
+  /**
+   * @brief Find the driver in a bare search root or a valid one-child TopN wrapper.
+   * @return The borrowed driver for metadata inspection, or NULL for an unsupported or inconsistent root.
+   */
+  static ObDASSearchDriverIter *find_search_driver_iter(ObDASIter *root);
+
   // Owns the storage scan range and its rowkey objects for an async scalar SQL range.
   // range_ references the arrays in this object, so this object must outlive every use of range_.
   struct AsyncScalarTermRange

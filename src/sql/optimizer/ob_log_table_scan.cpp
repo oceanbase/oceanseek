@@ -1031,10 +1031,12 @@ int ObLogTableScan::has_nonpushdown_filter(bool &has_npd_filter)
   ObArray<ObRawExpr*> nonpushdown_filters;
   ObArray<ObRawExpr*> scan_pushdown_filters;
   ObArray<ObRawExpr*> lookup_pushdown_filters;
-  // search_after runs after lookup. Applying LIMIT first could leave a short page
-  // when this filter removes rows, so keep LIMIT above TableScan.
+  // When early sort + limit is unavailable, the next page is selected by filtering after main-table
+  // lookup, then sorting in SQL. Report that remaining filter to prevent LIMIT from running too soon:
+  // taking size rows first could leave a short page after search_after rejects some of them.
   const ObFusionNode *sort_node = nullptr;
-  if (OB_NOT_NULL(sort_node = get_hybrid_sort_node()) && sort_node->has_after()) {
+  if (OB_NOT_NULL(sort_node = get_hybrid_sort_node()) && sort_node->has_after()
+      && !sort_node->das_sort_topn_enable_) {
     has_npd_filter = true;
   } else if (OB_FAIL(extract_pushdown_filters(nonpushdown_filters,
                                        scan_pushdown_filters,
@@ -7602,6 +7604,56 @@ ObFusionNode *ObLogTableScan::get_hybrid_sort_node() const
     }
   }
   return node;
+}
+
+int ObLogTableScan::prepare_hybrid_sort_shard_doc(bool append_shard_doc_key, bool &supports_shard_doc_key)
+{
+  int ret = OB_SUCCESS;
+  supports_shard_doc_key = false;
+  ObFusionNode *node = get_hybrid_sort_node();
+  const ObDMLStmt *dml_stmt = get_stmt();
+  const TableItem *table = dml_stmt->get_table_item_by_id(get_table_id());
+  if (OB_NOT_NULL(node) && OB_NOT_NULL(table) && table->is_hybrid_search_table()
+      && OB_NOT_NULL(table->dsl_query_) && dml_stmt->is_select_stmt()) {
+    ObOptimizerContext &opt_ctx = get_plan()->get_optimizer_context();
+    ObSelectStmt &stmt = *const_cast<ObSelectStmt *>(static_cast<const ObSelectStmt *>(dml_stmt));
+    if (OB_FAIL(node->prepare_sort_shard_doc(stmt, *table, opt_ctx.get_expr_factory(),
+            *opt_ctx.get_session_info(), append_shard_doc_key, supports_shard_doc_key))) {
+      LOG_WARN("failed to prepare hybrid __shard_doc", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObLogTableScan::prepare_hybrid_sort_after()
+{
+  int ret = OB_SUCCESS;
+  ObFusionNode *node = get_hybrid_sort_node();
+  const ObDMLStmt *dml_stmt = get_stmt();
+  const TableItem *table = dml_stmt->get_table_item_by_id(get_table_id());
+  if (OB_ISNULL(node) || OB_ISNULL(table) || !table->is_hybrid_search_table()
+      || OB_ISNULL(table->dsl_query_) || node->sort_items_.empty()) {
+    // This scan has no hybrid sort to prepare.
+  } else {
+    const ObSelectStmt &stmt = *static_cast<const ObSelectStmt *>(dml_stmt);
+    ObOptimizerContext &opt_ctx = get_plan()->get_optimizer_context();
+    ObRawExpr *after_filter = nullptr;
+    // The sort-value lookup does not support logical-table KV rewriting yet.
+    // Keep its sort metadata and evaluate search_after after the existing final lookup.
+    if (OB_FAIL(node->prepare_sort_after(stmt, *table->dsl_query_, opt_ctx.get_expr_factory(),
+                                       *opt_ctx.get_session_info(), !is_logical_table(), after_filter))) {
+      LOG_WARN("failed to prepare hybrid sort and search_after", K(ret));
+    } else if (OB_FAIL(append_array_no_dup(access_exprs_, node->sort_lookup_access_exprs_))) {
+      LOG_WARN("failed to append hybrid sort lookup columns", K(ret));
+    } else if (after_filter != nullptr) {
+      if (OB_FAIL(get_filter_exprs().push_back(after_filter))) {
+        LOG_WARN("failed to append search_after filter", K(ret));
+      } else if (OB_FAIL(get_filter_before_index_flags().push_back(false))) {
+        LOG_WARN("failed to mark search_after filter for evaluation after lookup", K(ret));
+      }
+    }
+  }
+  return ret;
 }
 
 int ObLogTableScan::get_hybrid_search_exprs(ObIArray<ObRawExpr *> &all_exprs)

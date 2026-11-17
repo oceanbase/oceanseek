@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX SQL_DAS
 #include "ob_das_bitmap_op.h"
+#include "common/ob_smart_call.h"
 #include "lib/utility/ob_tracepoint.h"
 #include "sql/das/search/ob_das_async_segment_merge_op.h"
 #include "sql/das/search/ob_das_async_scalar_range_op.h"
@@ -818,6 +819,19 @@ int ObDASBitmapOp::set_external_bitmap(ObFastBitmap *bm)
   } else {
     bitmap_ = bm;
     owns_bitmap_ = false;
+  }
+  return ret;
+}
+
+int ObDASBitmapOp::try_apply_sort_bottom(const common::ObDatum &sort_bottom, bool &applied)
+{
+  int ret = OB_SUCCESS;
+  applied = false;
+  if (OB_NOT_NULL(provider_) || !owns_bitmap_ || OB_ISNULL(input_op_)) {
+    INC_METRIC_VAL(common::ObMetricId::HS_SORT_BOTTOM_BLOCKED, 1);
+    LOG_TRACE("hybrid sort bottom skipped bitmap", "reason", "shared or absent input");
+  } else if (OB_FAIL(SMART_CALL(input_op_->try_apply_sort_bottom(sort_bottom, applied)))) {
+    LOG_WARN("failed to prune unread bitmap input ranges", K(ret));
   }
   return ret;
 }

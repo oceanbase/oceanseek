@@ -96,6 +96,20 @@ public:
   void set_search_ctx(ObDASSearchCtx *search_ctx) { search_ctx_ = search_ctx; }
   void set_root_op(ObIDASSearchOp *root_op) { root_op_ = root_op; }
   int64_t get_top_k_limit() const { return top_k_limit_param_.limit_; }
+  /**
+   * @brief Read complete candidates for the TopN wrapper while preserving asynchronous group boundaries.
+   * @param [in] sort_bottom Borrowed first sort key of a full heap, or NULL; used only during this call.
+   * @param [out] count Projected candidate count, which may be zero at a group boundary.
+   * @param [out] info Group and stream exhaustion flags; stream end is reported here with OB_SUCCESS.
+   * Candidate reads and ordinary get_next_rows() reads must not be mixed before a scan restart or reuse.
+   */
+  int read_candidate_batch(int64_t capacity, const common::ObDatum *sort_bottom,
+                           int64_t &count, ObDASGroupBatchInfo &info);
+  /**
+   * @brief Obtain the unweighted score for a position in the most recently read candidate batch.
+   * @return OB_ERR_UNEXPECTED when index does not refer to a buffered candidate.
+   */
+  int get_current_candidate_raw_score(int64_t index, double &score) const;
 
 protected:
   virtual int inner_init(ObDASIterParam &param) override;
@@ -159,6 +173,8 @@ private:
 private:
   ObIDASSearchOp *root_op_;
   ObDASSearchCtx *search_ctx_;
+  bool cursor_read_started_ = false; // Reject ordinary batch reads after the TopN candidate cursor is used.
+  bool ordinary_read_started_ = false; // Reject candidate-cursor reads after ordinary batch consumption begins.
   ObArenaAllocator allocator_;
   // Allocator specifically for rowid deep copies.
   // Must be reset timely to prevent memory expansion since rowid memory is not reusable.

@@ -5,6 +5,7 @@
 #define USING_LOG_PREFIX SQL_DAS
 #include "sql/das/ob_das_attach_define.h"
 #include "sql/das/search/ob_das_scalar_define.h"
+#include "sql/das/search/ob_das_search_define.h"
 namespace oceanbase {
 namespace sql {
 
@@ -260,6 +261,14 @@ int ObDASAttachSpec::set_calc_exprs_tree(ObDASAttachCtDef *root,
   if (OB_ISNULL(root)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected null root attach ctdef", K(ret));
+  } else if (root->op_type_ == DAS_OP_HYBRID_SEARCH_SORT) {
+    // Set up the private value scan when visiting the sort child.
+    ObDASHybridSearchSortCtDef *sort_ctdef = static_cast<ObDASHybridSearchSortCtDef *>(root);
+    if (sort_ctdef->has_sort_value_lookup_) {
+      if (OB_FAIL(sort_ctdef->sort_value_scan_ctdef_.pd_expr_spec_.set_calc_exprs(calc_exprs, max_batch_size))) {
+        LOG_WARN("failed to set hybrid sort scan calculation expressions", K(ret));
+      }
+    }
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < root->children_cnt_; ++i) {
     ObDASBaseCtDef *child = root->children_[i];

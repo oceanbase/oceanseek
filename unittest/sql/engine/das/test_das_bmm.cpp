@@ -572,6 +572,15 @@ public:
 
   int64_t get_drain_count() const { return drain_count_; }
   bool saw_score_buffer() const { return saw_score_buffer_; }
+  int64_t get_sort_bottom_call_count() const { return sort_bottom_call_count_; }
+  virtual int try_apply_sort_bottom(const ObDatum &sort_bottom, bool &applied) override
+  {
+    UNUSED(sort_bottom);
+    ++sort_bottom_call_count_;
+    // Model a range leaf that rejects rebinding after its own first read.
+    applied = curr_idx_ < 0;
+    return OB_SUCCESS;
+  }
 
 private:
   int do_open() override
@@ -677,6 +686,7 @@ private:
   double max_score_;
   int64_t drain_count_;
   bool saw_score_buffer_;
+  int64_t sort_bottom_call_count_ = 0;
 };
 
 struct BitmapTransposeRun
@@ -2395,13 +2405,32 @@ TEST_F(TestDASBMM, dense_required_filter_cost_strategy_preserves_results)
   const double expected_scores[] = {2.0, 16.0, 18.0, 32.0, 40.0};
   ObDASRowID rowid;
   double score = 0.0;
+  int64_t bottom_value = 30;
+  ObDatum bottom;
+  bottom.ptr_ = reinterpret_cast<const char *>(&bottom_value);
+  bottom.set_int(bottom_value);
+  bool applied = false;
+  ASSERT_EQ(OB_SUCCESS, bmm.try_apply_sort_bottom(bottom, applied));
+  EXPECT_TRUE(applied);
   for (int64_t i = 0; i < ARRAYSIZEOF(expected_ids); ++i) {
     ASSERT_EQ(OB_SUCCESS, bmm.next_rowid(rowid, score));
+    ASSERT_EQ(OB_SUCCESS, bmm.try_apply_sort_bottom(bottom, applied));
+    EXPECT_FALSE(applied);
+    // BMM still delegates after reading; the filter leaf decides whether to rebind.
+    EXPECT_EQ(i + 2, filter_op.get_sort_bottom_call_count());
     EXPECT_EQ(expected_ids[i], rowid.get_uint64());
     EXPECT_DOUBLE_EQ(expected_scores[i], score);
   }
   EXPECT_EQ(OB_ITER_END, bmm.next_rowid(rowid, score));
   EXPECT_TRUE(bmm.filter_after_score_);
+  ASSERT_EQ(OB_SUCCESS, bmm.rescan());
+  ASSERT_EQ(OB_SUCCESS, bmm.try_apply_sort_bottom(bottom, applied));
+  EXPECT_TRUE(applied);
+  ASSERT_EQ(OB_SUCCESS, bmm.next_rowid(rowid, score));
+  EXPECT_EQ(expected_ids[0], rowid.get_uint64());
+  ASSERT_EQ(OB_SUCCESS, bmm.try_apply_sort_bottom(bottom, applied));
+  EXPECT_FALSE(applied);
+  EXPECT_EQ(0, scoring_op.get_sort_bottom_call_count());
   EXPECT_EQ(OB_SUCCESS, bmm.close());
 }
 

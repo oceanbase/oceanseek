@@ -11,6 +11,7 @@
 #include "lib/container/ob_se_array.h"
 #include "lib/container/ob_array_array.h"
 #include "common/ob_store_range.h"
+#include "sql/das/search/ob_das_search_define.h"
 #include "lib/allocator/ob_allocator.h"
 #include "lib/lock/ob_thread_cond.h"
 #include "observer/ob_srv_task.h"
@@ -562,7 +563,12 @@ struct ObDASFusionTaskExecEnv
   int create_fusion_child_search_ctx(common::ObIAllocator &alloc,
                                      ObEvalCtx &child_eval_ctx,
                                      ObDASSearchCtx *&child_search_ctx);
-  int create_parallel_iter(const int64_t path_top_k_limit);
+  /**
+   * @brief Build a task-local search iterator with the path's effective candidate limit.
+   * @param [in] consume_candidates Whether this environment executes a work slice; when enabled, a
+   * sort-enabled search driver is wrapped with TopN before its candidates are consumed.
+   */
+  int create_parallel_iter(const int64_t path_top_k_limit, bool consume_candidates);
 
   void destroy_rtdef_tree(ObDASBaseRtDef *rtdef);
   int deep_copy_rtdef_tree(common::ObIAllocator &alloc,
@@ -655,7 +661,8 @@ public:
       rowkey_expr_(nullptr),
       max_batch_size_(1),
       child_bitmap_ops_(),
-      rows_()
+      rows_(),
+      sort_rows_(OB_MALLOC_NORMAL_BLOCK_SIZE, sort_result_allocator_)
   {}
   ~ObDASFusionPathSliceWork() override = default;
 
@@ -685,7 +692,15 @@ public:
   {
     return rows_;
   }
-  void reset_result() { rows_.reset(); }
+  /** @brief Return the slice's retained sort rows, whose key payloads remain valid until reset_result(). */
+  const common::ObIArray<ObDASSortTopNEntry> &get_sort_rows() const { return sort_rows_; }
+  /** @brief Discard both result representations before reusing the storage that owns sort-key payloads. */
+  void reset_result()
+  {
+    rows_.reset();
+    sort_rows_.reset();
+    sort_result_allocator_.reuse();
+  }
   int execute(const int64_t timeout_ts,
               ObDASFusionParallelCoordinator &coordinator) override;
   void destroy() override { this->~ObDASFusionPathSliceWork(); }
@@ -707,6 +722,9 @@ private:
   int64_t max_batch_size_;
   common::ObSEArray<ObDASBitmapOp *, 4> child_bitmap_ops_;
   common::ObSEArray<ObDASFusionMaterializedRow, 256> rows_;
+  // Allocate memory for sort values in slice work
+  common::ObArenaAllocator sort_result_allocator_{common::ObMemAttr(MTL_ID(), "SliceTopNResult")};
+  common::ObSEArray<ObDASSortTopNEntry, 16, common::ObIAllocator &> sort_rows_;
 };
 
 class ObDASFusionParallelCtx

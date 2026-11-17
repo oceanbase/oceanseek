@@ -8,6 +8,7 @@
 #include <cfloat>
 #include <cmath>
 #include "sql/das/search/ob_das_bmm_op.h"
+#include "common/ob_smart_call.h"
 #include "sql/das/search/ob_das_bitmap_op.h"
 #include "sql/das/search/ob_disjunctive_daat_merger.h"
 #include "observer/omt/ob_tenant_config_mgr.h"
@@ -329,6 +330,19 @@ int ObDASBMMOp::do_init(const ObIDASSearchOpParam &op_param)
     is_inited_ = true;
     LOG_TRACE("initialized bmm cost metadata", K_(lead_cost), K_(filter_cost),
         K(score_op_costs_.count()), K(param.has_filter_op()), K_(vec_min_boundary_size));
+  }
+  return ret;
+}
+
+int ObDASBMMOp::try_apply_sort_bottom(const common::ObDatum &sort_bottom, bool &applied)
+{
+  int ret = OB_SUCCESS;
+  applied = false;
+  if (OB_ISNULL(filter_op_)) {
+    INC_METRIC_VAL(common::ObMetricId::HS_SORT_BOTTOM_BLOCKED, 1);
+    LOG_TRACE("hybrid sort bottom skipped BMM", "reason", "filter absent");
+  } else if (OB_FAIL(SMART_CALL(filter_op_->try_apply_sort_bottom(sort_bottom, applied)))) {
+    LOG_WARN("failed to prune BMM required filter", K(ret));
   }
   return ret;
 }

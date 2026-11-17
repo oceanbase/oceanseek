@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include "sql/das/iter/ob_das_fusion_parallel.h"
+#include "sql/das/search/ob_das_search_utils.h"
 #include "lib/ob_errno.h"
 #include "lib/time/ob_time_utility.h"
 #include "observer/omt/ob_th_worker.h"
@@ -115,11 +116,10 @@ static bool contains_segment_local_range_dfs(
 static bool contains_segment_local_range(const ObDASFusionLogicalPath &path)
 {
   bool found = false;
+  ObDASSearchDriverIter *search_iter = nullptr;
   if (ObDASFusionPathType::QUERY == path.type_
       && OB_NOT_NULL(path.child_iter_)
-      && ObDASIterType::DAS_ITER_SEARCH_DRIVER == path.child_iter_->get_type()) {
-    ObDASSearchDriverIter *search_iter =
-        static_cast<ObDASSearchDriverIter *>(path.child_iter_);
+      && OB_NOT_NULL(search_iter = ObDASSearchUtils::find_search_driver_iter(path.child_iter_))) {
     found = contains_segment_local_range_dfs(search_iter->get_root_op(), false);
   }
   return found;
@@ -140,16 +140,10 @@ static int collect_work_bitmap_ops(
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("task exec env child iter is null",
              KR(ret), K(exec_env.path_idx_));
-  } else if (OB_UNLIKELY(
-                 ObDASIterType::DAS_ITER_SEARCH_DRIVER
-                 != exec_env.child_iter_->get_type())) {
+  } else if (OB_ISNULL(search_iter = ObDASSearchUtils::find_search_driver_iter(exec_env.child_iter_))) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected child iter type for bitmap op collection",
-             KR(ret), K(exec_env.path_idx_),
-             "child_type", exec_env.child_iter_->get_type());
-  } else if (FALSE_IT(search_iter =
-                 static_cast<ObDASSearchDriverIter *>(
-                     exec_env.child_iter_))) {
+    LOG_WARN("unexpected null search driver iter",
+             KR(ret), K(exec_env.path_idx_));
   } else if (OB_ISNULL(root_op = search_iter->get_root_op())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("search root op is null for bitmap op collection",
@@ -264,8 +258,7 @@ int ObDASFusionPathAdapter::init(
   auto_fallback_to_serial_ = false;
   if (ObDASFusionPathType::QUERY == type
       && (OB_ISNULL(child_iter)
-          || ObDASIterType::DAS_ITER_SEARCH_DRIVER
-                 != child_iter->get_type())) {
+          || OB_ISNULL(ObDASSearchUtils::find_search_driver_iter(child_iter)))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid query path root iter",
              KR(ret), K(path_id), K(type), KP(child_iter));
@@ -620,7 +613,7 @@ int ObDASFusionTaskExecEnv::prepare_resources(
                     *work_slice, *child_search_ctx_))) {
     LOG_WARN("failed to bind fusion work slice",
              KR(ret), K(path_idx_), KPC(work_slice));
-  } else if (OB_FAIL(create_parallel_iter(path_top_k_limit))) {
+  } else if (OB_FAIL(create_parallel_iter(path_top_k_limit, work_slice != nullptr))) {
     LOG_WARN("failed to create parallel iter", KR(ret), K(path_idx_));
   }
   return ret;
@@ -863,16 +856,53 @@ int ObDASFusionTaskExecEnv::create_fusion_child_search_ctx(common::ObIAllocator 
       child_search_ctx->docid_range_lo_ = src_search_ctx_->docid_range_lo_;
       child_search_ctx->docid_range_hi_ = src_search_ctx_->docid_range_hi_;
       child_search_ctx->has_docid_range_ = src_search_ctx_->has_docid_range_;
-      // Each worker must preserve the SQL search_after requirement and project __shard_doc.
-      child_search_ctx->set_fusion_ctdef(fusion_ctdef_);
+      child_search_ctx->sort_info_.sort_ctdef_ = src_search_ctx_->sort_info_.sort_ctdef_;
+      child_search_ctx->sort_info_.fusion_ctdef_ = src_search_ctx_->sort_info_.fusion_ctdef_;
+      child_search_ctx->sort_info_.scan_template_ = src_search_ctx_->sort_info_.scan_template_;
     }
   }
   return ret;
 }
 
 int ObDASFusionTaskExecEnv::create_parallel_iter(
-    const int64_t path_top_k_limit)
+    const int64_t path_top_k_limit, bool consume_candidates)
 {
+  /*
+   * Parallel EXECUTE_PATH_SLICE with early TopN (ObDASProfileIter omitted):
+   * SQL Sort / Limit
+   * └─ ObTableScanOp
+   *    └─ Original final Lookup (if needed)
+   *       └─ ObDASFusionIter (merges task TopN results)
+   *          ├─ Task 0 (independent iterator tree)
+   *          │  └─ ObDASSortTopNIter <- for early sort TopN and search_after filtering
+   *          │     └─ ObDASSearchDriverIter
+   *          │        └─ Full original query tree (slice 0)
+   *          └─ Task N (independent iterator tree)
+   *             └─ ObDASSortTopNIter <- for early sort TopN and search_after filtering
+   *                └─ ObDASSearchDriverIter
+   *                   └─ Full original query tree (slice N)
+   *
+   * Parallel EXECUTE_PATH_SLICE without early TopN (ObDASProfileIter omitted):
+   * SQL Sort / Limit
+   * └─ ObTableScanOp (search_after filtering if needed)
+   *    └─ Original final Lookup (if needed)
+   *       └─ ObDASFusionIter (merges task results)
+   *          ├─ Task 0 (independent iterator tree)
+   *          │  └─ ObDASSearchDriverIter
+   *          │     └─ Full original query tree (slice 0)
+   *          └─ Task N (independent iterator tree)
+   *             └─ ObDASSearchDriverIter
+   *                └─ Full original query tree (slice N)
+   *
+   * Parallel PREPARE: shared Bitmap preparation, no result rows (ObDASProfileIter omitted):
+   * SQL Sort / Limit
+   * └─ ObTableScanOp
+   *    └─ Original final Lookup (if needed)
+   *       └─ ObDASFusionIter
+   *          └─ PREPARE task (independent iterator tree)
+   *             └─ ObDASSearchDriverIter
+   *                └─ Full original query tree
+   */
   int ret = OB_SUCCESS;
   if (OB_ISNULL(child_exec_ctx_) || OB_ISNULL(child_eval_ctx_) || OB_ISNULL(child_search_ctx_)) {
     ret = OB_ERR_UNEXPECTED;
@@ -892,11 +922,22 @@ int ObDASFusionTaskExecEnv::create_parallel_iter(
     } else if (OB_FAIL(swizzle_child_rtdef(*child_exec_ctx_, *child_eval_ctx_, *cloned_rtdef_root_))) {
       LOG_WARN("failed to prepare cloned rtdef tree", KR(ret), K(path_idx_));
     } else {
-      ObIDASSearchRtDef *search_rtdef = static_cast<ObIDASSearchRtDef *>(cloned_rtdef_root_);
+      ObDASHybridSearchSortRtDef *sort_rtdef = cloned_rtdef_root_->op_type_ == DAS_OP_HYBRID_SEARCH_SORT
+          ? static_cast<ObDASHybridSearchSortRtDef *>(cloned_rtdef_root_) : nullptr;
+      const ObDASHybridSearchSortCtDef *sort_ctdef = fusion_ctdef_->get_sort_ctdef();
+      ObIDASSearchRtDef *search_rtdef = OB_NOT_NULL(sort_rtdef) ? sort_rtdef->get_query_rtdef()
+          : static_cast<ObIDASSearchRtDef *>(cloned_rtdef_root_);
       ObDASSearchDriverIter *search_iter = nullptr;
       common::ObLimitParam top_k_limit_param;
       top_k_limit_param.limit_ = path_top_k_limit;
-      if (OB_FAIL(ObDASIterUtils::create_search_driver_iter(
+      if ((OB_NOT_NULL(sort_ctdef) && OB_ISNULL(sort_rtdef))
+          || (OB_ISNULL(sort_ctdef) && OB_NOT_NULL(sort_rtdef))
+          || OB_ISNULL(search_rtdef)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid hybrid sort path clone", K(ret), K(path_idx_));
+      } else if (OB_NOT_NULL(sort_ctdef) && OB_FAIL(child_search_ctx_->bind_sort(*sort_ctdef, *sort_rtdef, *fusion_ctdef_))) {
+        LOG_WARN("failed to bind cloned hybrid sort runtime", K(ret), K(path_idx_));
+      } else if (OB_FAIL(ObDASIterUtils::create_search_driver_iter(
               child_allocator_, search_rtdef, child_search_ctx_,
               top_k_limit_param, search_iter, score_expr_))) {
         LOG_WARN("failed to create search driver iter",
@@ -906,6 +947,12 @@ int ObDASFusionTaskExecEnv::create_parallel_iter(
         LOG_WARN("search iter is null after create", KR(ret), K(path_idx_));
       } else {
         child_iter_ = search_iter;
+        if (consume_candidates) {
+          if (OB_FAIL(ObDASIterUtils::try_create_sort_topn_iter(child_allocator_, sort_ctdef,
+                      sort_rtdef, *child_search_ctx_, search_iter, child_iter_))) {
+            LOG_WARN("failed to create hybrid sort TopN wrapper", K(ret));
+          }
+        }
 
         LOG_TRACE("[FUSION_TRACE] created parallel search driver iter",
                   K(path_idx_), K(path_top_k_limit), KP(search_iter));
@@ -1010,6 +1057,11 @@ int ObDASFusionTaskExecEnv::deep_copy_rtdef_tree(common::ObIAllocator &alloc,
         const ObDASScanRtDef *src_scan_rtdef = static_cast<const ObDASScanRtDef *>(src);
         ObDASScanRtDef *dst_scan_rtdef = static_cast<ObDASScanRtDef *>(dst);
         dst_scan_rtdef->lt_rt_ = src_scan_rtdef->lt_rt_;
+      }
+      if (src->op_type_ == DAS_OP_HYBRID_SEARCH_SORT) {
+        // This is a local copy; the RPC deadline was already converted on receipt.
+        static_cast<ObDASHybridSearchSortRtDef *>(dst)->sort_value_scan_rtdef_.timeout_ts_ =
+            static_cast<const ObDASHybridSearchSortRtDef *>(src)->sort_value_scan_rtdef_.timeout_ts_;
       }
       if (OB_NOT_NULL(src->ctdef_) && src->ctdef_->is_search_ctdef()) {
         ObIDASSearchRtDef *src_search_rtdef = static_cast<ObIDASSearchRtDef *>(src);
@@ -1333,56 +1385,76 @@ int ObDASFusionPathSliceWork::materialize_batch_result(
     const int64_t batch_size)
 {
   int ret = OB_SUCCESS;
-  ObEvalCtx *eval_ctx = exec_env_.child_eval_ctx_;
-  ObExpr *rowkey_expr = rowkey_expr_;
-  ObExpr *score_expr = exec_env_.score_expr_;
-  if (OB_ISNULL(eval_ctx) || OB_ISNULL(rowkey_expr) || OB_ISNULL(score_expr)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected null ptr when materializing fusion child batch",
-             KR(ret), KP(eval_ctx), KP(rowkey_expr), KP(score_expr),
-             "path_idx", get_path_id());
-  } else if (batch_size <= 0) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected batch size when materializing fusion child batch",
-             KR(ret), "path_idx", get_path_id(), K(batch_size));
-  } else if (score_expr->enable_rich_format() && is_valid_format(score_expr->get_format(*eval_ctx))) {
-    ObIVector *rowkey_vec = rowkey_expr->get_vector(*eval_ctx);
-    ObIVector *score_vec = score_expr->get_vector(*eval_ctx);
-    if (OB_ISNULL(rowkey_vec) || OB_ISNULL(score_vec)) {
+  if (exec_env_.child_search_ctx_ != nullptr && exec_env_.child_search_ctx_->is_sort_topn_enabled()) {
+    // A sort task publishes only its bounded TopN. Copy each key payload out of the child's expression
+    // frames so the coordinator can merge these rows after the child advances or releases its resources.
+    const ObDASSortRuntimeInfo &info = exec_env_.child_search_ctx_->get_sort_info();
+    if (!rows_.empty() || batch_size < 0 || sort_rows_.count() + batch_size > info.capacity_) {
       ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected null vector when materializing fusion child batch",
-               KR(ret), KP(rowkey_vec), KP(score_vec),
-               "path_idx", get_path_id(), K(batch_size));
-    } else {
-      for (int64_t row_idx = 0; OB_SUCC(ret) && row_idx < batch_size; ++row_idx) {
-        if (OB_FAIL(rows_.push_back(
-                ObDASFusionMaterializedRow(rowkey_vec->get_uint(row_idx),
-                                           score_vec->get_double(row_idx))))) {
-          LOG_WARN("failed to append fusion child materialized row",
-                   KR(ret), "path_idx", get_path_id(),
-                   K(row_idx), K(batch_size));
-        }
+      LOG_WARN("invalid hybrid sort task result batch", K(ret), K(batch_size), "path_id", get_path_id(),
+               "legacy_row_count", rows_.count(), "sort_row_count", sort_rows_.count(), K(info.capacity_));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < batch_size; ++i) {
+      ObDASSortTopNEntry entry;
+      if (OB_FAIL(ObDASSearchUtils::capture_hybrid_sort_entry(
+            *exec_env_.child_search_ctx_, i, batch_size, entry, &sort_result_allocator_, true /* deep_copy */))) {
+        LOG_WARN("failed to capture hybrid sort task row", K(ret), "path_id", get_path_id(), "row_index", i);
+      } else if (OB_FAIL(sort_rows_.push_back(entry))) {
+        LOG_WARN("failed to append hybrid sort task row", K(ret), "path_id", get_path_id(), "row_index", i);
       }
     }
   } else {
-    ObEvalCtx::BatchInfoScopeGuard batch_guard(*eval_ctx);
-    batch_guard.set_batch_size(batch_size);
-    ObDatum *rowkey_datums = rowkey_expr->locate_batch_datums(*eval_ctx);
-    ObDatum *score_datums = score_expr->locate_batch_datums(*eval_ctx);
-    if (OB_ISNULL(rowkey_datums) || OB_ISNULL(score_datums)) {
+    ObEvalCtx *eval_ctx = exec_env_.child_eval_ctx_;
+    ObExpr *rowkey_expr = rowkey_expr_;
+    ObExpr *score_expr = exec_env_.score_expr_;
+    if (OB_ISNULL(eval_ctx) || OB_ISNULL(rowkey_expr) || OB_ISNULL(score_expr)) {
       ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected null datum batch when materializing fusion child batch",
-               KR(ret), KP(rowkey_datums), KP(score_datums),
-               "path_idx", get_path_id(), K(batch_size));
+      LOG_WARN("unexpected null ptr when materializing fusion child batch",
+               KR(ret), KP(eval_ctx), KP(rowkey_expr), KP(score_expr),
+               "path_idx", get_path_id());
+    } else if (batch_size <= 0) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected batch size when materializing fusion child batch",
+               KR(ret), "path_idx", get_path_id(), K(batch_size));
+    } else if (score_expr->enable_rich_format() && is_valid_format(score_expr->get_format(*eval_ctx))) {
+      ObIVector *rowkey_vec = rowkey_expr->get_vector(*eval_ctx);
+      ObIVector *score_vec = score_expr->get_vector(*eval_ctx);
+      if (OB_ISNULL(rowkey_vec) || OB_ISNULL(score_vec)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected null vector when materializing fusion child batch",
+                 KR(ret), KP(rowkey_vec), KP(score_vec),
+                 "path_idx", get_path_id(), K(batch_size));
+      } else {
+        for (int64_t row_idx = 0; OB_SUCC(ret) && row_idx < batch_size; ++row_idx) {
+          if (OB_FAIL(rows_.push_back(
+                  ObDASFusionMaterializedRow(rowkey_vec->get_uint(row_idx),
+                                             score_vec->get_double(row_idx))))) {
+            LOG_WARN("failed to append fusion child materialized row",
+                     KR(ret), "path_idx", get_path_id(),
+                     K(row_idx), K(batch_size));
+          }
+        }
+      }
     } else {
-      for (int64_t row_idx = 0; OB_SUCC(ret) && row_idx < batch_size; ++row_idx) {
-        batch_guard.set_batch_idx(row_idx);
-        if (OB_FAIL(rows_.push_back(
-                ObDASFusionMaterializedRow(rowkey_datums[row_idx].get_uint64(),
-                                           score_datums[row_idx].get_double())))) {
-          LOG_WARN("failed to append fusion child datum row",
-                   KR(ret), "path_idx", get_path_id(),
-                   K(row_idx), K(batch_size));
+      ObEvalCtx::BatchInfoScopeGuard batch_guard(*eval_ctx);
+      batch_guard.set_batch_size(batch_size);
+      ObDatum *rowkey_datums = rowkey_expr->locate_batch_datums(*eval_ctx);
+      ObDatum *score_datums = score_expr->locate_batch_datums(*eval_ctx);
+      if (OB_ISNULL(rowkey_datums) || OB_ISNULL(score_datums)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected null datum batch when materializing fusion child batch",
+                 KR(ret), KP(rowkey_datums), KP(score_datums),
+                 "path_idx", get_path_id(), K(batch_size));
+      } else {
+        for (int64_t row_idx = 0; OB_SUCC(ret) && row_idx < batch_size; ++row_idx) {
+          batch_guard.set_batch_idx(row_idx);
+          if (OB_FAIL(rows_.push_back(
+                  ObDASFusionMaterializedRow(rowkey_datums[row_idx].get_uint64(),
+                                             score_datums[row_idx].get_double())))) {
+            LOG_WARN("failed to append fusion child datum row",
+                     KR(ret), "path_idx", get_path_id(),
+                     K(row_idx), K(batch_size));
+          }
         }
       }
     }
@@ -1592,20 +1664,17 @@ int ObDASFusionDocIdRangeSliceProvider::collect_ror_work_estimate(
   ror_work_row_count = -1;
   if (ObDASFusionPathType::QUERY != path.type_
              || OB_ISNULL(path.child_iter_)
-             || ObDASIterType::DAS_ITER_SEARCH_DRIVER
-                    != path.child_iter_->get_type()) {
+             || OB_ISNULL(search_iter = ObDASSearchUtils::find_search_driver_iter(path.child_iter_))) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_TRACE("invalid query path for docid range work estimate",
-              KR(ret), K(path));
-  } else if (FALSE_IT(search_iter =
-                 static_cast<ObDASSearchDriverIter *>(path.child_iter_))) {
+    LOG_TRACE("invalid query path for docid range work estimate", K(ret), K(path.path_id_), K(path.type_),
+             KP(path.child_iter_));
   } else if (OB_ISNULL(root_op = search_iter->get_root_op())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_TRACE("query search root is null for docid range work estimate",
-              KR(ret), K(path));
+              KR(ret), K(path.path_id_));
   } else if (OB_FAIL(root_op->prepare_parallel_work_estimate())) {
     LOG_TRACE("failed to prepare query path parallel work estimate",
-              KR(ret), K(path));
+              KR(ret), K(path.path_id_));
   } else {
     const ObDASSearchWorkEstimate work_estimate =
         root_op->get_parallel_work_estimate();
@@ -1898,7 +1967,7 @@ int ObDASFusionPathSliceWork::execute(
 {
   int ret = OB_SUCCESS;
   UNUSED(timeout_ts);
-  rows_.reset();
+  reset_result();
   if (OB_ISNULL(slice_provider_)
       || OB_ISNULL(parallel_ctx_)) {
     ret = OB_ERR_UNEXPECTED;
@@ -1921,6 +1990,7 @@ int ObDASFusionPathSliceWork::execute(
              && OB_FAIL(inject_shared_bitmaps())) {
     LOG_WARN("failed to inject shared bitmaps",
              KR(ret), K(get_path_id()), K(work_slice_));
+  } else if (FALSE_IT(exec_env_.child_search_ctx_->set_sort_coordinator(&coordinator))) {
   } else if (OB_FAIL(exec_env_.child_iter_->do_table_scan())) {
     LOG_WARN("failed to do table scan on fusion path slice",
              KR(ret), K(get_path_id()), K(work_slice_));
@@ -2105,17 +2175,15 @@ int ObDASFusionParallelCtx::build_path_adapters(
         : -1;
     int64_t path_top_k_limit = expr_path_top_k_limit;
     if (fusion_ctdef.is_search_index(path_id)) {
+      ObDASSearchDriverIter *search_iter = nullptr;
       path_type = ObDASFusionPathType::QUERY;
       configured_path_dop = fusion_ctdef.query_dop_;
       if (OB_NOT_NULL(children[path_id])
-          && ObDASIterType::DAS_ITER_SEARCH_DRIVER
-                 == children[path_id]->get_type()) {
+          && OB_NOT_NULL(search_iter = ObDASSearchUtils::find_search_driver_iter(children[path_id]))) {
         // SearchDriver has normalized the effective TopK according to the
         // Fusion execution mode. Full-recall mode uses -1 even when the
         // original path TopK expression is positive.
-        path_top_k_limit =
-            static_cast<ObDASSearchDriverIter *>(
-                children[path_id])->get_top_k_limit();
+        path_top_k_limit = search_iter->get_top_k_limit();
       }
       LOG_TRACE("[FUSION_TRACE] resolved query path top k limit",
                 K(path_id), K(expr_path_top_k_limit),
@@ -2524,80 +2592,85 @@ int ObDASFusionParallelCtx::discover_shared_bitmaps(
     // 没有切分路径或参数无效，无需发现共享 Bitmap。
   } else {
     // 遍历主线程 SearchDriverIter 的算子树以查找 BitmapOp。
-    ObDASSearchDriverIter *search_iter =
-        static_cast<ObDASSearchDriverIter *>(search_child_iter);
-    ObIDASSearchOp *root_op = search_iter->get_root_op();
-    ObDASSearchCtx *search_ctx = search_iter->get_search_ctx();
-    if (OB_ISNULL(root_op)) {
-      LOG_TRACE("[FUSION_TRACE] discover_shared_bitmaps: root_op is null, skip");
+    ObDASSearchDriverIter *search_iter = nullptr;
+    if (OB_ISNULL(search_iter = ObDASSearchUtils::find_search_driver_iter(search_child_iter))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("search driver is missing during shared bitmap discovery", K(ret));
     } else {
-      common::ObSEArray<ObDASBitmapOp *, 4> serial_bitmap_ops;
-      LOG_TRACE("[FUSION_TRACE] discover_shared_bitmaps: DFS walk start",
-               KP(root_op), K(root_op->get_op_type()), K(root_op->get_children_cnt()));
-      if (OB_FAIL(collect_bitmap_ops_dfs(root_op, search_ctx, serial_bitmap_ops))) {
-        LOG_WARN("failed to discover bitmap ops", KR(ret));
+      ObIDASSearchOp *root_op = search_iter->get_root_op();
+      ObDASSearchCtx *search_ctx = search_iter->get_search_ctx();
+      if (OB_ISNULL(root_op)) {
+        LOG_TRACE("[FUSION_TRACE] discover_shared_bitmaps: root_op is null, skip");
       } else {
-        LOG_TRACE("[FUSION_TRACE] discover_shared_bitmaps: DFS walk done",
-                 "bitmap_count", serial_bitmap_ops.count());
-      }
-      // 创建查询持有的只读 Bitmap Slot。独立 PREPARE WorkUnit 会先构造
-      // 所有 Slot，再提交依赖它的执行 Slice。
-      for (int64_t i = 0; OB_SUCC(ret) && i < serial_bitmap_ops.count(); ++i) {
-        ObSharedBitmapSlot *slot = nullptr;
-        void *slot_buf = nullptr;
-        if (OB_ISNULL(slot_buf = alloc.alloc(sizeof(ObSharedBitmapSlot)))) {
-          ret = OB_ALLOCATE_MEMORY_FAILED;
-          LOG_WARN("failed to allocate shared bitmap slot", KR(ret), K(i));
-        } else if (FALSE_IT(slot = new (slot_buf) ObSharedBitmapSlot())) {
+        common::ObSEArray<ObDASBitmapOp *, 4> serial_bitmap_ops;
+        serial_bitmap_ops.set_attr(ObMemAttr(MTL_ID(), "FusionBitmapOps"));
+        LOG_TRACE("[FUSION_TRACE] discover_shared_bitmaps: DFS walk start",
+                 KP(root_op), K(root_op->get_op_type()), K(root_op->get_children_cnt()));
+        if (OB_FAIL(collect_bitmap_ops_dfs(root_op, search_ctx, serial_bitmap_ops))) {
+          LOG_WARN("failed to discover bitmap ops", KR(ret));
         } else {
-          slot->bitmap_occurrence_idx_ = i;
-          if (OB_FAIL(shared_bitmap_slots_.push_back(slot))) {
-            LOG_WARN("failed to push shared bitmap slot", KR(ret), K(i));
-            slot->release();
-            slot->~ObSharedBitmapSlot();
+          LOG_TRACE("[FUSION_TRACE] discover_shared_bitmaps: DFS walk done",
+                   "bitmap_count", serial_bitmap_ops.count());
+        }
+        // 创建查询持有的只读 Bitmap Slot。独立 PREPARE WorkUnit 会先构造
+        // 所有 Slot，再提交依赖它的执行 Slice。
+        for (int64_t i = 0; OB_SUCC(ret) && i < serial_bitmap_ops.count(); ++i) {
+          ObSharedBitmapSlot *slot = nullptr;
+          void *slot_buf = nullptr;
+          if (OB_ISNULL(slot_buf = alloc.alloc(sizeof(ObSharedBitmapSlot)))) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+            LOG_WARN("failed to allocate shared bitmap slot", KR(ret), K(i));
+          } else if (FALSE_IT(slot = new (slot_buf) ObSharedBitmapSlot())) {
+          } else {
+            slot->bitmap_occurrence_idx_ = i;
+            if (OB_FAIL(shared_bitmap_slots_.push_back(slot))) {
+              LOG_WARN("failed to push shared bitmap slot", KR(ret), K(i));
+              slot->release();
+              slot->~ObSharedBitmapSlot();
+            }
           }
         }
-      }
-      const int64_t filter_provider_count = OB_NOT_NULL(search_ctx)
-          ? search_ctx->get_filter_bitmap_provider_count() : 0;
-      for (int64_t i = 0; OB_SUCC(ret) && i < filter_provider_count; ++i) {
-        ObSharedBitmapSlot *slot = nullptr;
-        void *slot_buf = nullptr;
-        ObDASFilterBitmapProvider *provider = search_ctx->get_filter_bitmap_provider(i);
-        const ObAsyncIndexPartitionSegCtx *partition =
-            search_ctx->get_current_async_partition();
-        if (OB_ISNULL(provider)) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("main filter bitmap provider is null", K(ret), K(i));
-        } else if (DAS_FILTER_BITMAP_GROUP_SCOPE == provider->get_scope()
-                   && OB_ISNULL(partition)) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("Group filter provider has no current partition", K(ret), K(i));
-        } else if (DAS_FILTER_BITMAP_GROUP_SCOPE == provider->get_scope()
-                   && provider->get_group_slot()
-                      >= partition->get_storage_group_ctx().get_group_count()) {
-          // The fixed template contains the maximum Group count across all
-          // candidate partitions. PREPARE must not open an inactive Group's
-          // source. Keep registry ordinals unchanged for clone injection.
-        } else if (OB_ISNULL(slot_buf = alloc.alloc(sizeof(ObSharedBitmapSlot)))) {
-          ret = OB_ALLOCATE_MEMORY_FAILED;
-          LOG_WARN("failed to allocate filter provider bitmap slot", K(ret), K(i));
-        } else if (FALSE_IT(slot = new (slot_buf) ObSharedBitmapSlot())) {
-        } else {
-          slot->filter_provider_idx_ = i;
-          if (OB_FAIL(shared_bitmap_slots_.push_back(slot))) {
-            LOG_WARN("failed to push filter provider bitmap slot", K(ret), K(i));
-            slot->release();
-            slot->~ObSharedBitmapSlot();
+        const int64_t filter_provider_count = OB_NOT_NULL(search_ctx)
+            ? search_ctx->get_filter_bitmap_provider_count() : 0;
+        for (int64_t i = 0; OB_SUCC(ret) && i < filter_provider_count; ++i) {
+          ObSharedBitmapSlot *slot = nullptr;
+          void *slot_buf = nullptr;
+          ObDASFilterBitmapProvider *provider = search_ctx->get_filter_bitmap_provider(i);
+          const ObAsyncIndexPartitionSegCtx *partition =
+              search_ctx->get_current_async_partition();
+          if (OB_ISNULL(provider)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("main filter bitmap provider is null", K(ret), K(i));
+          } else if (DAS_FILTER_BITMAP_GROUP_SCOPE == provider->get_scope()
+                     && OB_ISNULL(partition)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("Group filter provider has no current partition", K(ret), K(i));
+          } else if (DAS_FILTER_BITMAP_GROUP_SCOPE == provider->get_scope()
+                     && provider->get_group_slot()
+                        >= partition->get_storage_group_ctx().get_group_count()) {
+            // The fixed template contains the maximum Group count across all
+            // candidate partitions. PREPARE must not open an inactive Group's
+            // source. Keep registry ordinals unchanged for clone injection.
+          } else if (OB_ISNULL(slot_buf = alloc.alloc(sizeof(ObSharedBitmapSlot)))) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+            LOG_WARN("failed to allocate filter provider bitmap slot", K(ret), K(i));
+          } else if (FALSE_IT(slot = new (slot_buf) ObSharedBitmapSlot())) {
+          } else {
+            slot->filter_provider_idx_ = i;
+            if (OB_FAIL(shared_bitmap_slots_.push_back(slot))) {
+              LOG_WARN("failed to push filter provider bitmap slot", K(ret), K(i));
+              slot->release();
+              slot->~ObSharedBitmapSlot();
+            }
           }
         }
-      }
-      if (OB_SUCC(ret) && shared_bitmap_slots_.count() > 0) {
-        LOG_TRACE("[FUSION_TRACE] discovered shared bitmaps",
-                  K(shared_bitmap_slots_.count()),
-                  "bitmap_op_count", serial_bitmap_ops.count(),
-                  K(filter_provider_count),
-                  K(actual_slice_count));
+        if (OB_SUCC(ret) && shared_bitmap_slots_.count() > 0) {
+          LOG_TRACE("[FUSION_TRACE] discovered shared bitmaps",
+                    K(shared_bitmap_slots_.count()),
+                    "bitmap_op_count", serial_bitmap_ops.count(),
+                    K(filter_provider_count),
+                    K(actual_slice_count));
+        }
       }
     }
   }

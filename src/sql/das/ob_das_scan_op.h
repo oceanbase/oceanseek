@@ -429,6 +429,11 @@ public:
   virtual int assign_task_result(ObIDASTaskOp *other) override { return OB_SUCCESS; }
   storage::ObTableScanParam &get_scan_param() { return scan_param_; }
   const storage::ObTableScanParam &get_scan_param() const { return scan_param_; }
+  /**
+   * @brief Return the remote expression-frame layout used to allocate private sort-lookup frames.
+   * The pointer is borrowed from remote task metadata and is nullptr for local execution.
+   */
+  const ObExprFrameInfo *get_cursor_frame_info() const { return cursor_frame_info_; }
   storage::ObTableScanParam *get_local_lookup_param();
 
   int init_related_tablet_ids(ObDASRelatedTabletID &related_tablet_ids);
@@ -558,6 +563,8 @@ protected:
   ObDASSearchCtx *search_ctx_;
   ObDASAsyncIndexQueryCtx *async_query_ctx_; // async fulltext index segment ctx, survives across rescan
   bool own_async_query_ctx_; // false when the immutable catalog is owned by SQC or TableScanOp
+  // Borrowed remote frame layout for isolated sort-value evaluation; assigned on swizzling, not serialized.
+  const ObExprFrameInfo *cursor_frame_info_ = nullptr;
 };
 
 class ObDASScanResult : public ObIDASTaskResult, public common::ObNewRowIterator

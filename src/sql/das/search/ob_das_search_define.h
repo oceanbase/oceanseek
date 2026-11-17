@@ -87,7 +87,9 @@ struct ObDASRowIDScope
 
 class ObIDASSearchOp;
 class ObDASFilterBitmapProvider;
+class ObDASSearchCtx;
 struct ObCompactRow;
+class ObDASSearchUtils;
 
 /**
  * ObDASRowID - Unified rowid abstraction for hybrid search framework.
@@ -126,6 +128,9 @@ friend class ObDASMatchPhraseOp;
 friend class ObDASBMMOp;
 friend class ObDAATMergeIter;
 friend class ObDASSearchDriverIter;
+// Hybrid sort uses HEAP __pk_increment as the UINT64 row ID.
+friend class ObDASSortTopNIter;
+friend class ObDASSearchUtils;
 friend class ObDASScalarROROp;
 friend class ObDASAsyncScalarRorOp;
 friend class ObDASAsyncScalarRorUnionOp;
@@ -207,6 +212,36 @@ private:
     const ObCompactRow *ptr_rowid_;
   };
   uint16_t flags_;
+};
+
+/**
+ * @brief A row retained by hybrid sort TopN and passed to DAS merge iterators.
+ * Sort values may reference batch memory. Capture with deep_copy enabled or use
+ * ObDASSearchUtils::deep_copy_hybrid_sort_entry() to retain them after that batch is released.
+ */
+struct ObDASSortTopNEntry
+{
+  ObDASSortTopNEntry()
+    : sort_values_(sizeof(common::ObDatum))
+  {
+    sort_values_.set_attr(common::ObMemAttr(MTL_ID(), "SortResultVal"));
+  }
+
+  // OB containers construct the destination with its tenant attribute before calling assign().
+  int assign(const ObDASSortTopNEntry &other)
+  {
+    rowid_ = other.rowid_;
+    raw_score_ = other.raw_score_;
+    final_score_ = other.final_score_;
+    return sort_values_.assign(other.sort_values_);
+  }
+
+  ObDASRowID rowid_; // Main-table row ID used to fetch result columns.
+  double raw_score_ = 0; // Search-path score before applying the path weight.
+  double final_score_ = 0; // Weighted score used for sort and min_score filtering.
+  // Owns only datum headers. Payloads either borrow a source batch or are copied by the caller.
+  common::ObSEArray<common::ObDatum, 4> sort_values_;
+  TO_STRING_KV(K_(rowid), K_(raw_score), K_(final_score), K_(sort_values));
 };
 
 template <ObDASRowIDType RowIDType, bool HAS_MIN_MAX = false>
@@ -435,6 +470,83 @@ private:
 };
 
 /**
+ * @brief Report group and partition completion when reading candidates for TopN.
+ * Process returned rows before handling end flags, so the next group uses the updated TopN threshold.
+ */
+struct ObDASGroupBatchInfo
+{
+  bool group_end_ = false; // The current group is exhausted; any rows in this batch still belong to it.
+  bool all_end_ = false; // All groups in the current partition are exhausted.
+};
+
+/**
+ * @brief Hold sort, search_after, and main-table lookup settings between Fusion and the query in children_[0].
+ * With DAS TopN disabled, the search driver still uses this definition for sort and __shard_doc.
+ */
+struct ObDASHybridSearchSortCtDef : ObDASSortCtDef
+{
+  OB_UNIS_VERSION(1);
+public:
+  /** @brief Initialize sort metadata with DAS TopN and sort-value lookup disabled. */
+  explicit ObDASHybridSearchSortCtDef(common::ObIAllocator &alloc)
+    : ObDASSortCtDef(alloc), after_exprs_(alloc), score_sort_flags_(alloc),
+      unique_shard_doc_flags_(alloc), single_query_weight_expr_(nullptr),
+      final_score_expr_(nullptr), main_ref_table_id_(common::OB_INVALID_ID),
+      sort_value_scan_ctdef_(alloc), has_sort_value_lookup_(false), das_sort_topn_enable_(false)
+  {
+    op_type_ = DAS_OP_HYBRID_SEARCH_SORT;
+  }
+  bool has_expr() const override { return has_sort(); }
+  bool has_pdfilter_or_calc_expr() const override { return has_sort(); }
+  const ObIDASSearchCtDef *get_query_ctdef() const
+  {
+    return children_cnt_ == 1 && children_ != nullptr && children_[0] != nullptr
+        && children_[0]->is_search_ctdef()
+        ? static_cast<const ObIDASSearchCtDef *>(children_[0]) : nullptr;
+  }
+  /** @brief Whether sort expressions are present. */
+  bool has_sort() const { return !sort_exprs_.empty(); }
+  /** @brief Whether search_after values are present. */
+  bool has_after() const { return !after_exprs_.empty(); }
+  /** @brief Whether SQL operators must apply search_after because DAS TopN is disabled. */
+  bool use_sql_after_fallback() const { return has_after() && !das_sort_topn_enable_; }
+  /**
+   * @brief Check sort array lengths, required expressions, and __shard_doc settings.
+   * @return OB_SUCCESS if valid, or OB_ERR_UNEXPECTED for inconsistent sort metadata.
+   */
+  int validate() const;
+  /** @brief Return the __shard_doc sort position, or -1 if absent. */
+  int64_t unique_shard_doc_index() const;
+  /** @brief Whether sort includes __shard_doc to order rows with equal sort values. */
+  bool has_unique_shard_doc() const { return unique_shard_doc_index() >= 0; }
+
+  ExprFixedArray after_exprs_; // search_after values in sort item order; empty when absent.
+  common::ObFixedArray<bool, common::ObIAllocator> score_sort_flags_; // Marks sort items supplied by the search score.
+  common::ObFixedArray<bool, common::ObIAllocator> unique_shard_doc_flags_; // Marks the __shard_doc sort item.
+  ObExpr *single_query_weight_expr_; // Score weight applied before filtering in single-query full recall.
+  ObExpr *final_score_expr_; // Fusion score expression used when returning sorted rows.
+  uint64_t main_ref_table_id_; // Main table ID for fetching sort fields.
+  ObDASScanCtDef sort_value_scan_ctdef_; // Main-table scan settings for reading sort field values.
+  bool has_sort_value_lookup_; // Whether DAS TopN must fetch sort fields from the main table.
+  bool das_sort_topn_enable_; // Whether DAS executes sort and TopN.
+};
+
+/** @brief Runtime scan settings for fetching hybrid sort fields from the main table. */
+struct ObDASHybridSearchSortRtDef : ObDASSortRtDef
+{
+  OB_UNIS_VERSION(1);
+public:
+  ObDASHybridSearchSortRtDef() { op_type_ = DAS_OP_HYBRID_SEARCH_SORT; }
+  ObIDASSearchRtDef *get_query_rtdef()
+  {
+    return children_cnt_ == 1 && children_ != nullptr && children_[0] != nullptr
+        && children_[0]->ctdef_ != nullptr && children_[0]->ctdef_->is_search_ctdef()
+        ? static_cast<ObIDASSearchRtDef *>(children_[0]) : nullptr;
+  }
+  ObDASScanRtDef sort_value_scan_rtdef_; // Scan settings copied into each task's private sort-value lookup.
+};
+
+/**
  * @brief Defines Fusion across hybrid query paths and the ordering of its results.
  *
  * Non-vector queries are processed through search operator trees. Fusion combines their results with
@@ -521,6 +633,25 @@ public:
   OB_INLINE bool has_nested_paths() const { return has_nested_paths_; }
   OB_INLINE void set_has_nested_paths(bool v) { has_nested_paths_ = v; }
   OB_INLINE bool need_topk() const { return need_search_score() && nullptr != size_expr_ && nullptr != offset_expr_ && fusion_iter_exec_mode_ == ObFusionIterExecMode::SCORE_TOP_K_QUERY_HITS; }
+  /** @brief Whether Fusion uses DAS sort TopN. */
+  bool is_sort_topn_enabled() const
+  {
+    const ObDASHybridSearchSortCtDef *sort_ctdef = get_sort_ctdef();
+    return sort_ctdef != nullptr && sort_ctdef->das_sort_topn_enable_;
+  }
+  /** @brief Whether SQL operators apply search_after. */
+  bool use_sql_after_fallback() const
+  {
+    const ObDASHybridSearchSortCtDef *sort_ctdef = get_sort_ctdef();
+    return sort_ctdef != nullptr && sort_ctdef->use_sql_after_fallback();
+  }
+  const ObDASHybridSearchSortCtDef *get_sort_ctdef() const
+  {
+    return search_index_ >= 0 && search_index_ < children_cnt_ && children_ != nullptr
+        && children_[search_index_] != nullptr && children_[search_index_]->op_type_ == DAS_OP_HYBRID_SEARCH_SORT
+        ? static_cast<const ObDASHybridSearchSortCtDef *>(children_[search_index_]) : nullptr;
+  }
+
   OB_INLINE int64_t get_search_idx() const { return search_index_; }
   OB_INLINE void set_search_index(int64_t index) { search_index_ = index; }
 
@@ -532,7 +663,9 @@ public:
     const ObIDASSearchCtDef *search_ctdef = nullptr;
     int64_t search_idx = get_search_idx();
     if (search_idx >= 0 && search_idx < children_cnt_ && children_ != nullptr) {
-      search_ctdef = static_cast<const ObIDASSearchCtDef *>(children_[search_idx]);
+      const ObDASHybridSearchSortCtDef *sort_ctdef = get_sort_ctdef();
+      search_ctdef = sort_ctdef != nullptr ? sort_ctdef->get_query_ctdef()
+          : static_cast<const ObIDASSearchCtDef *>(children_[search_idx]);
     }
     return search_ctdef;
   }
@@ -575,6 +708,15 @@ public:
     : ObDASAttachRtDef(DAS_OP_FUSION_QUERY)
   {}
   ~ObDASFusionRtDef() {}
+  ObDASHybridSearchSortRtDef *get_sort_rtdef()
+  {
+    const ObDASFusionCtDef *fusion = static_cast<const ObDASFusionCtDef *>(ctdef_);
+    const int64_t index = fusion != nullptr ? fusion->get_search_idx() : -1;
+    return index >= 0 && index < children_cnt_ && children_ != nullptr && children_[index] != nullptr
+        && children_[index]->op_type_ == DAS_OP_HYBRID_SEARCH_SORT
+        ? static_cast<ObDASHybridSearchSortRtDef *>(children_[index]) : nullptr;
+  }
+
   ObIDASSearchRtDef *get_search_rtdef()
   {
     ObIDASSearchRtDef *search_rtdef = nullptr;
@@ -582,7 +724,9 @@ public:
       const ObDASFusionCtDef *ctdef = static_cast<const ObDASFusionCtDef *>(ctdef_);
       int64_t search_idx = ctdef->get_search_idx();
       if (search_idx >= 0 && search_idx < children_cnt_ && children_ != nullptr) {
-        search_rtdef = static_cast<ObIDASSearchRtDef *>(children_[search_idx]);
+        ObDASHybridSearchSortRtDef *sort = get_sort_rtdef();
+        search_rtdef = sort != nullptr ? sort->get_query_rtdef()
+            : static_cast<ObIDASSearchRtDef *>(children_[search_idx]);
       }
     }
     return search_rtdef;

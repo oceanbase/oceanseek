@@ -380,6 +380,23 @@ SQL_MONITOR_STATNAME_DEF(EXT_PLUGIN_COMPLETED_TASKS, metric::Unit::INT, "Complet
 SQL_MONITOR_STATNAME_DEF(EXT_PLUGIN_OUTPUT_ROWS, metric::Unit::INT, "Output Rows", "Output Rows", M_SUM, metric::Level::CRITICAL)
 SQL_MONITOR_STATNAME_DEF(EXT_PLUGIN_INIT_TIME, metric::Unit::TIME_NS, "Init Time", "Init Time", M_SUM | E_MAX, metric::Level::CRITICAL)
 SQL_MONITOR_STATNAME_DEF(EXT_PLUGIN_READ_TIME, metric::Unit::TIME_NS, "Read Time", "Read Time", M_SUM | E_MAX, metric::Level::CRITICAL)
+
+// Hybrid sort: use SortTopNIter profile
+SQL_MONITOR_STATNAME_DEF(HS_SORT_CANDIDATE_ROWS, metric::Unit::INT, "sort candidate rows", "driver candidates before lookup and cursor filtering", M_SUM, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(HS_SORT_LOOKUP_TIME, metric::Unit::TIME_NS, "sort lookup time", "time in the inherited lookup state machine", M_SUM, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(HS_SORT_LOOKUP_TIMES, metric::Unit::INT, "sort lookup times", "main-table scan or rescan requests", M_SUM, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(HS_SORT_LOOKUP_ROWS, metric::Unit::INT, "sort lookup requested rows", "point-get rowkeys submitted to storage, not physical versions examined", M_SUM, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(HS_SORT_LOOKUP_OUTPUT_ROWS, metric::Unit::INT, "sort lookup output rows", "visible rows returned by main-table lookup", M_SUM, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(HS_SORT_LOOKUP_MATCH_TIME, metric::Unit::TIME_NS, "sort lookup match time", "candidate copying, hash construction and returned-row matching", M_SUM, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(HS_SORT_AFTER_FILTER_TIME, metric::Unit::TIME_NS, "sort after filter time", "min_score and search_after filtering, including on-demand expressions", M_SUM, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(HS_SORT_ACCEPTED_ROWS, metric::Unit::INT, "sort eligible rows", "rows passing min_score and search_after, not heap insertions", M_SUM, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(HS_SORT_TOPN_TIME, metric::Unit::TIME_NS, "sort topn time", "existing sort add_batch, sort and output time, including expressions", M_SUM, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(HS_SORT_BOTTOM_ATTEMPTS, metric::Unit::INT, "sort bottom attempts", "unread scalar range leaves considered for a group bottom", M_SUM, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(HS_SORT_BOTTOM_APPLIED, metric::Unit::INT, "sort bottom applied", "scalar leaves whose ranges were narrowed, including empty intersections", M_SUM, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(HS_SORT_LOOKUP_SCAN_ROWS, metric::Unit::INT, "sort lookup scanned rows", "storage row_scan_cnt for main-table lookup, distinct from requested rowkeys and visible output", M_SUM, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(HS_SORT_BOTTOM_GROUPS, metric::Unit::INT, "sort bottom async segment groups", "async segment groups where the current TopN bottom is checked", M_SUM, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(HS_SORT_BOTTOM_BLOCKED, metric::Unit::INT, "sort bottom blocked subtrees", "subtrees skipped because their input is read, shared, or unsupported", M_SUM, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(HS_SORT_BOTTOM_RANGE_UNCHANGED, metric::Unit::INT, "sort bottom range unchanged", "visited scalar leaves for which the bound is inapplicable or already weaker", M_SUM, metric::Level::STANDARD)
 SQL_MONITOR_STATNAME_DEF(MONITOR_STATNAME_END, metric::Unit::INVALID, "monitor end", "monitor stat name end", E_MIN | E_MAX, metric::Level::AD_HOC)
 #endif
 

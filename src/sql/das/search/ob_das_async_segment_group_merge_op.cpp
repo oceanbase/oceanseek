@@ -75,6 +75,9 @@ int ObDASAsyncSegmentGroupMergeOp::reset_children_for_partition()
   active_group_cnt_ = 0;
   current_group_idx_ = 0;
   iter_end_ = false;
+  drain_mode_ = DRAIN_NONE;
+  pending_group_end_ = false;
+  bottom_checked_group_ = -1;
   for (int64_t i = 0; i < child_prepared_.count(); ++i) {
     if (child_opened_.at(i)) {
       children_[i]->release_scan_resources();
@@ -160,8 +163,15 @@ int ObDASAsyncSegmentGroupMergeOp::do_next_rowid(
     double &score)
 {
   int ret = OB_SUCCESS;
-  if (iter_end_) {
-    ret = OB_ITER_END;
+  if (drain_mode_ == DRAIN_GROUP) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("ordinary row reads cannot follow async group draining",
+             K(ret), K_(drain_mode), K_(current_group_idx), K_(active_group_cnt));
+  } else {
+    drain_mode_ = DRAIN_ORDINARY;
+    if (iter_end_) {
+      ret = OB_ITER_END;
+    }
   }
   while (OB_SUCC(ret) && current_group_idx_ < active_group_cnt_) {
     ObIDASSearchOp *child = children_[current_group_idx_];
@@ -201,55 +211,62 @@ int ObDASAsyncSegmentGroupMergeOp::do_drain_until(
     double &next_score_after)
 {
   int ret = OB_SUCCESS;
-  count = 0;
-  next_id_after.reset();
-  next_score_after = 0.0;
-  if (iter_end_) {
-    next_id_after.set_max();
-  } else if (!boundary.is_max()) {
-    // Group-slot order is not a globally sorted RowID order. Preserve the
-    // existing row-wise boundary semantics and only batch unbounded drains.
-    ret = ObIDASSearchOp::do_drain_until(
-        boundary, capacity, out_ids, out_scores, count,
-        next_id_after, next_score_after);
+  if (drain_mode_ == DRAIN_GROUP) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("ordinary batch reads cannot follow async group draining",
+             K(ret), K(capacity), K_(drain_mode), K_(current_group_idx), K_(active_group_cnt));
   } else {
-    while (OB_SUCC(ret) && count < capacity
-           && current_group_idx_ < active_group_cnt_) {
-      ObIDASSearchOp *child = children_[current_group_idx_];
-      const int64_t remaining_capacity = capacity - count;
-      int64_t child_count = 0;
-      ObDASRowID child_next_id;
-      double child_next_score = 0.0;
-      if (OB_ISNULL(child)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("null current async segment group child", K(ret),
-                 K_(current_group_idx));
-      } else if (OB_FAIL(ensure_child_ready(current_group_idx_))) {
-        LOG_WARN("failed to prepare batch async group", K(ret), K_(current_group_idx));
-      } else if (OB_FAIL(child->drain_until(
-          boundary, remaining_capacity, out_ids + count,
-          nullptr == out_scores ? nullptr : out_scores + count,
-          child_count, child_next_id, child_next_score))) {
-        LOG_WARN("failed to batch drain async segment group child", K(ret),
-                 K_(current_group_idx), K(remaining_capacity));
-      } else {
-        count += child_count;
-        if (child_count == remaining_capacity) {
-          // A full batch has no lookahead contract. Continue on the next call.
-        } else if (child_next_id.is_max()) {
-          child->release_scan_resources();
-          ++current_group_idx_;
-        } else {
+    drain_mode_ = DRAIN_ORDINARY;
+    count = 0;
+    next_id_after.reset();
+    next_score_after = 0.0;
+    if (iter_end_) {
+      next_id_after.set_max();
+    } else if (!boundary.is_max()) {
+      // Group-slot order is not a globally sorted RowID order. Preserve the
+      // existing row-wise boundary semantics and only batch unbounded drains.
+      ret = ObIDASSearchOp::do_drain_until(
+          boundary, capacity, out_ids, out_scores, count,
+          next_id_after, next_score_after);
+    } else {
+      while (OB_SUCC(ret) && count < capacity
+             && current_group_idx_ < active_group_cnt_) {
+        ObIDASSearchOp *child = children_[current_group_idx_];
+        const int64_t remaining_capacity = capacity - count;
+        int64_t child_count = 0;
+        ObDASRowID child_next_id;
+        double child_next_score = 0.0;
+        if (OB_ISNULL(child)) {
           ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("unexpected lookahead for unbounded async group drain", K(ret),
-                   K_(current_group_idx), K(child_count), K(remaining_capacity),
-                   K(child_next_id), K(child_next_score));
+          LOG_WARN("null current async segment group child", K(ret),
+                   K_(current_group_idx));
+        } else if (OB_FAIL(ensure_child_ready(current_group_idx_))) {
+          LOG_WARN("failed to prepare batch async group", K(ret), K_(current_group_idx));
+        } else if (OB_FAIL(child->drain_until(
+            boundary, remaining_capacity, out_ids + count,
+            nullptr == out_scores ? nullptr : out_scores + count,
+            child_count, child_next_id, child_next_score))) {
+          LOG_WARN("failed to batch drain async segment group child", K(ret),
+                   K_(current_group_idx), K(remaining_capacity));
+        } else {
+          count += child_count;
+          if (child_count == remaining_capacity) {
+            // A full batch has no lookahead contract. Continue on the next call.
+          } else if (child_next_id.is_max()) {
+            child->release_scan_resources();
+            ++current_group_idx_;
+          } else {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("unexpected lookahead for unbounded async group drain", K(ret),
+                     K_(current_group_idx), K(child_count), K(remaining_capacity),
+                     K(child_next_id), K(child_next_score));
+          }
         }
       }
-    }
-    if (OB_SUCC(ret) && current_group_idx_ >= active_group_cnt_) {
-      iter_end_ = true;
-      next_id_after.set_max();
+      if (OB_SUCC(ret) && current_group_idx_ >= active_group_cnt_) {
+        iter_end_ = true;
+        next_id_after.set_max();
+      }
     }
   }
   return ret;
@@ -319,6 +336,104 @@ int ObDASAsyncSegmentGroupMergeOp::do_calc_max_score(double &threshold)
     } else {
       threshold = MAX(threshold, child_max_score);
     }
+  }
+  return ret;
+}
+
+int ObDASAsyncSegmentGroupMergeOp::apply_sort_bottom(const ObDatum &sort_bottom)
+{
+  int ret = OB_SUCCESS;
+  bool applied = false;
+  if (search_ctx_.is_sort_topn_enabled()) {
+    if (current_group_idx_ < 0 || current_group_idx_ >= active_group_cnt_
+        || OB_ISNULL(children_[current_group_idx_])) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid async segment group index for hybrid sort pruning or child is null",
+               K(ret), K_(current_group_idx), K_(active_group_cnt));
+    } else if (OB_FAIL(children_[current_group_idx_]->try_apply_sort_bottom(sort_bottom, applied))) {
+      LOG_WARN("failed to rebind current group hybrid sort ranges", K(ret), K_(current_group_idx));
+    }
+  }
+  return ret;
+}
+
+int ObDASAsyncSegmentGroupMergeOp::drain_current_group(
+    int64_t capacity, uint64_t *ids, double *scores, const ObDatum *sort_bottom,
+    int64_t &count, ObDASGroupBatchInfo &info)
+{
+  int ret = OB_SUCCESS;
+  common::ObProfileSwitcher switcher(profile_);
+  common::ScopedTimer total_timer(common::ObMetricId::HS_TOTAL_TIME);
+  common::ScopedTimer read_timer(common::ObMetricId::HS_NEXT_ROWIDS_TIME);
+  INC_METRIC_VAL(common::ObMetricId::HS_NEXT_ROWIDS_COUNT, 1);
+  count = 0;
+  info = ObDASGroupBatchInfo();
+  if (OB_FAIL(ret)) {
+  } else if (drain_mode_ == DRAIN_ORDINARY || capacity <= 0 || ids == nullptr || scores == nullptr) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("invalid hybrid sort group read state", K(ret), K(capacity), KP(ids), KP(scores),
+             K_(drain_mode), K_(current_group_idx));
+  } else {
+    drain_mode_ = DRAIN_GROUP;
+    if (iter_end_) {
+      info.all_end_ = true;
+      info.group_end_ = true;
+    } else {
+      if (pending_group_end_) {
+        ++current_group_idx_;
+        pending_group_end_ = false;
+      }
+      if (current_group_idx_ >= active_group_cnt_) {
+        iter_end_ = true;
+        info.all_end_ = true;
+        info.group_end_ = true;
+      } else if (OB_FAIL(ensure_child_ready(current_group_idx_))) {
+        LOG_WARN("failed to prepare hybrid sort group", K(ret), K_(current_group_idx));
+      } else {
+        if (bottom_checked_group_ != current_group_idx_) {
+          INC_METRIC_VAL(common::ObMetricId::HS_SORT_BOTTOM_GROUPS, 1);
+          LOG_TRACE("hybrid sort bottom at group boundary", K_(current_group_idx),
+                    K_(active_group_cnt), "has_bottom", nullptr != sort_bottom);
+          if (OB_SUCC(ret) && sort_bottom != nullptr && OB_FAIL(apply_sort_bottom(*sort_bottom))) {
+            LOG_WARN("failed to apply TopN threshold to async segment group", K(ret), K_(current_group_idx));
+          }
+          if (OB_SUCC(ret)) {
+            bottom_checked_group_ = current_group_idx_;
+          }
+        }
+        ObDASRowID boundary;
+        ObDASRowID next;
+        double next_score = 0;
+        boundary.set_max();
+        if (OB_SUCC(ret) && OB_FAIL(children_[current_group_idx_]->drain_until(boundary, capacity, ids, scores, count, next, next_score))) {
+          LOG_WARN("failed to drain hybrid sort segment group", K(ret), K_(current_group_idx), K(count), K(capacity));
+        }
+        if (OB_SUCC(ret) && (count < 0 || count > capacity)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("unexpected hybrid sort group batch size", K(ret), K(count), K(capacity), K_(current_group_idx));
+        } else if (OB_SUCC(ret) && count < capacity) {
+          if (!next.is_max()) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("hybrid sort segment group returned a short batch before exhaustion", K(ret),
+                     K(count), K(capacity), K_(current_group_idx));
+          } else {
+            // ids/scores belong to the caller. Release the exhausted scan now,
+            // but enter the next group only after TopN processes this batch.
+            children_[current_group_idx_]->release_scan_resources();
+            pending_group_end_ = true;
+            info.group_end_ = true;
+            if (current_group_idx_ + 1 == active_group_cnt_) {
+              iter_end_ = true;
+              info.all_end_ = true;
+            }
+          }
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    // This entry returns no lookahead row. Empty groups count as calls, but contribute no output rows.
+    INC_METRIC_VAL(common::ObMetricId::HS_OUTPUT_ROW_COUNT, count);
   }
   return ret;
 }

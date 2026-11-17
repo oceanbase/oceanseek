@@ -328,6 +328,10 @@ int ObDASScanOp::swizzling_remote_task(ObDASRemoteInfo *remote_info)
   if (OB_FAIL(ObIDASTaskOp::swizzling_remote_task(remote_info))) {
     LOG_WARN("fail to swizzling remote task", K(ret));
   } else if (remote_info != nullptr) {
+    if (ObDASUtils::is_hybrid_search(attach_ctdef_)) {
+      // Only hybrid sorting needs this layout to create private frames for its sort-value lookup.
+      cursor_frame_info_ = remote_info->frame_info_;
+    }
     //DAS scan is executed remotely
     trans_desc_ = remote_info->trans_desc_;
     // Logical table ns/lt is NOT carried by rtdef: the runner resolves it in
@@ -895,6 +899,9 @@ int ObDASScanOp::create_das_search_context()
   const ObDASBaseCtDef *ctdef = nullptr;
   const ObDASFusionCtDef *fusion_ctdef = nullptr;
   ObDASScopeId nested_scope_id = DAS_SCOPE_MAX;
+  ObDASBaseRtDef *fusion_rtdef = nullptr;
+  const ObDASHybridSearchSortCtDef *sort_ctdef = nullptr;
+  ObDASHybridSearchSortRtDef *sort_rtdef = nullptr;
   if (OB_UNLIKELY(nullptr != search_ctx_) ||
       OB_ISNULL(scan_rtdef_) ||
       !scan_rtdef_->enable_rich_format()) {
@@ -906,6 +913,17 @@ int ObDASScanOp::create_das_search_context()
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected nullptr ctdef", K(ret));
   } else if (FALSE_IT(fusion_ctdef = static_cast<const ObDASFusionCtDef *>(ctdef))) {
+  } else if (OB_NOT_NULL(sort_ctdef = fusion_ctdef->get_sort_ctdef())
+             && OB_FAIL(ObDASUtils::find_child_das_rtdef(attach_rtdef_, DAS_OP_FUSION_QUERY, fusion_rtdef))) {
+    LOG_WARN("failed to find hybrid fusion runtime definition", K(ret));
+  } else if (OB_NOT_NULL(sort_ctdef) && OB_ISNULL(fusion_rtdef)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("hybrid fusion runtime definition is null", K(ret), KP_(attach_rtdef));
+  } else if (OB_NOT_NULL(sort_ctdef)
+             && OB_ISNULL(sort_rtdef = static_cast<ObDASFusionRtDef *>(fusion_rtdef)->get_sort_rtdef())) {
+    // Sort runtime is required even when search_after filtering falls back to SQL.
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("hybrid sort child runtime is missing", K(ret), KP(sort_ctdef), KP(fusion_rtdef));
   } else if (OB_ISNULL(search_ctx = OB_NEWx(ObDASSearchCtx, &op_alloc_, op_alloc_, *this))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("failed to allocate search ctx", K(ret));
@@ -916,7 +934,9 @@ int ObDASScanOp::create_das_search_context()
     fusion_ctdef->result_output_,
     true /* use dynamic pruning */))) {
     LOG_WARN("failed to init search ctx", K(ret));
-  } else if (FALSE_IT(search_ctx->set_fusion_ctdef(fusion_ctdef))) {
+  } else if (OB_NOT_NULL(sort_ctdef)
+             && OB_FAIL(search_ctx->bind_sort(*sort_ctdef, *sort_rtdef, *fusion_ctdef))) {
+    LOG_WARN("failed to bind hybrid sort child runtime", K(ret), KP(sort_ctdef), KP(sort_rtdef));
   } else if (fusion_ctdef->has_nested_paths() &&
              OB_FAIL(ObDASSearchUtils::resolve_nested_scope_id(fusion_ctdef, nested_scope_id))) {
     LOG_WARN("failed to resolve nested scope", K(ret));
@@ -1506,6 +1526,7 @@ int ObDASScanOp::set_hybrid_search_tablet_ids(ObDASIter *result)
       case DAS_ITER_SCAN:
       case DAS_ITER_SEARCH_DRIVER:
       case DAS_ITER_FUSION:
+      case DAS_ITER_SORT_TOPN:
       case DAS_ITER_PROFILE: {
         break;
       }

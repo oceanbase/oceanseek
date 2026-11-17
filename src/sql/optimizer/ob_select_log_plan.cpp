@@ -5942,30 +5942,32 @@ int ObSelectLogPlan::generate_raw_plan_for_plain_select()
   return ret;
 }
 
-/** @brief Attach hybrid sort lookup columns and the SQL search_after filter to one scan. */
-static int prepare_hybrid_sort_scan(ObLogTableScan &scan)
+/**
+ * @brief Check or append __shard_doc for hybrid scans in this plan.
+ * @param[in,out] supports_shard_doc_key Set false if any hybrid scan cannot provide __shard_doc.
+ */
+static int prepare_hybrid_sort_shard_doc_tree(ObLogicalOperator *op,
+                                            bool append_shard_doc_key,
+                                            bool &supports_shard_doc_key)
 {
   int ret = OB_SUCCESS;
-  ObFusionNode *node = scan.get_hybrid_sort_node();
-  const ObDMLStmt *dml_stmt = scan.get_stmt();
-  const TableItem *table = dml_stmt->get_table_item_by_id(scan.get_table_id());
-  if (OB_ISNULL(node) || OB_ISNULL(table) || !table->is_hybrid_search_table()
-      || node->sort_items_.empty()) {
-    // This scan has no hybrid sort to prepare.
+  if (op == nullptr) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("null plan node while preparing __shard_doc", K(ret), K(append_shard_doc_key));
+  } else if (op->get_type() == log_op_def::LOG_TABLE_SCAN) {
+    ObLogTableScan *scan = static_cast<ObLogTableScan *>(op);
+    if (scan->is_hybrid_search()) {
+      bool scan_supports_shard_doc_key = false;
+      if (OB_FAIL(scan->prepare_hybrid_sort_shard_doc(append_shard_doc_key, scan_supports_shard_doc_key))) {
+        LOG_WARN("failed to prepare hybrid __shard_doc", K(ret), K(append_shard_doc_key), K(scan->get_table_id()));
+      }
+      supports_shard_doc_key &= scan_supports_shard_doc_key;
+    }
   } else {
-    const ObSelectStmt &stmt = *static_cast<const ObSelectStmt *>(dml_stmt);
-    ObOptimizerContext &opt_ctx = scan.get_plan()->get_optimizer_context();
-    ObRawExpr *after_filter = nullptr;
-    if (OB_FAIL(node->prepare_sort_after(stmt, *table->dsl_query_, opt_ctx.get_expr_factory(),
-                                       *opt_ctx.get_session_info(), after_filter))) {
-      LOG_WARN("failed to prepare hybrid sort and search_after", K(ret));
-    } else if (OB_FAIL(append_array_no_dup(scan.get_access_exprs(), node->sort_lookup_access_exprs_))) {
-      LOG_WARN("failed to append hybrid sort lookup columns", K(ret));
-    } else if (OB_NOT_NULL(after_filter)) {
-      if (OB_FAIL(scan.get_filter_exprs().push_back(after_filter))) {
-        LOG_WARN("failed to append search_after filter", K(ret));
-      } else if (OB_FAIL(scan.get_filter_before_index_flags().push_back(false))) {
-        LOG_WARN("failed to mark search_after filter for evaluation after lookup", K(ret));
+    for (int64_t i = 0; OB_SUCC(ret) && i < op->get_num_of_child(); ++i) {
+      if (OB_FAIL(SMART_CALL(prepare_hybrid_sort_shard_doc_tree(
+              op->get_child(i), append_shard_doc_key, supports_shard_doc_key)))) {
+        LOG_WARN("failed to prepare __shard_doc for plan child", K(ret), K(i), K(append_shard_doc_key));
       }
     }
   }
@@ -5984,7 +5986,7 @@ static int prepare_hybrid_sort_tree(ObLogicalOperator *op)
     LOG_WARN("null plan node while preparing hybrid sort", K(ret));
   } else if (op->get_type() == log_op_def::LOG_TABLE_SCAN) {
     ObLogTableScan *scan = static_cast<ObLogTableScan *>(op);
-    if (scan->is_hybrid_search() && OB_FAIL(prepare_hybrid_sort_scan(*scan))) {
+    if (scan->is_hybrid_search() && OB_FAIL(scan->prepare_hybrid_sort_after())) {
       if (ret == OB_NOT_SUPPORTED) {
         LOG_DEBUG("hybrid cursor scan path is not supported", K(ret));
       } else {
@@ -6026,6 +6028,24 @@ int ObSelectLogPlan::candi_prepare_hybrid_sort()
     }
   }
   if (OB_SUCC(ret) && has_dsl_sort) {
+    // Check every candidate before changing the shared sort list.
+    bool all_plans_support_shard_doc_key = !candidates_.candidate_plans_.empty();
+    // First check if every candidate can provide __shard_doc for sort.
+    for (int64_t i = 0; OB_SUCC(ret) && all_plans_support_shard_doc_key
+         && i < candidates_.candidate_plans_.count(); ++i) {
+      if (OB_FAIL(prepare_hybrid_sort_shard_doc_tree(candidates_.candidate_plans_.at(i).plan_tree_,
+              false /* append_shard_doc_key */, all_plans_support_shard_doc_key))) {
+        LOG_WARN("failed to check __shard_doc support for candidate plan", K(ret), K(i));
+      }
+    }
+    // Append __shard_doc only when every candidate can provide it.
+    for (int64_t i = 0; OB_SUCC(ret) && all_plans_support_shard_doc_key
+         && i < candidates_.candidate_plans_.count(); ++i) {
+      if (OB_FAIL(prepare_hybrid_sort_shard_doc_tree(candidates_.candidate_plans_.at(i).plan_tree_,
+              true /* append_shard_doc_key */, all_plans_support_shard_doc_key))) {
+        LOG_WARN("failed to add __shard_doc to candidate plan", K(ret), K(i));
+      }
+    }
     // Prepare sort/search_after and discard unsupported candidate plans.
     ObSEArray<CandidatePlan, 4> supported;
     for (int64_t i = 0; OB_SUCC(ret) && i < candidates_.candidate_plans_.count(); ++i) {

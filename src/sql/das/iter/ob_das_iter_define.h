@@ -47,6 +47,7 @@ enum ObDASIterType : uint32_t
   DAS_ITER_ASYNC_IVF_SCAN,
   DAS_ITER_ASYNC_IVF_SEGMENT_MERGE,
   DAS_ITER_VEC_INDEX_ASYNC_IVF_SCAN,
+  DAS_ITER_SORT_TOPN, // Search-driver wrapper that retains a bounded set of complete documents in field-sort order.
   // append DASIterType before me
   DAS_ITER_MAX
 };

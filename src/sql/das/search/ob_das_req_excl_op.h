@@ -45,6 +45,8 @@ public:
     return OB_NOT_NULL(required_)
         && required_->can_enumerate_rowids();
   }
+  // Preserve the exclusion branch while pruning the required branch.
+  virtual int try_apply_sort_bottom(const common::ObDatum &sort_bottom, bool &applied) override;
 
 private:
   int init_nested_key_cursor();
