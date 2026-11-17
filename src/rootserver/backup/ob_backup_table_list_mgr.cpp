@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX RS
 
 #include "ob_backup_table_list_mgr.h"
+#include "lib/worker.h"
 
 namespace oceanbase 
 {
@@ -195,14 +196,15 @@ int ObBackupTableListMgr::backup_table_list_to_tmp_file_(int64_t &count, ObIArra
   int ret = OB_SUCCESS;
   int64_t offset = 0;
   ObSqlString sql;
-  int64_t query_timeout = 30 * 60 * 1000000L; //30min
-  if (OB_FAIL(sql.append_fmt("SELECT /* QUERY_TIMEOUT(%ld) */ t1.database_name, t2.table_name "
+  const int64_t query_timeout = 30 * 60 * 1000000L; //30min
+  lib::WorkerTimeoutGuard timeout_guard(ObTimeUtility::current_time() + query_timeout);
+  if (OB_FAIL(sql.append_fmt("SELECT t1.database_name, t2.table_name "
                             "FROM %s as of snapshot %lu AS t1 "
                             "JOIN %s as of snapshot %lu AS t2 "
                             "ON t1.database_id = t2.database_id "
                             "WHERE t2.table_type IN (%d, %d) "
                             "ORDER BY t1.database_name, t2.table_name ASC",
-      query_timeout, OB_ALL_DATABASE_TNAME, snapshot_point_.get_val_for_inner_table_field(), 
+      OB_ALL_DATABASE_TNAME, snapshot_point_.get_val_for_inner_table_field(),
       OB_ALL_TABLE_TNAME, snapshot_point_.get_val_for_inner_table_field(),
       share::schema::ObTableType::USER_TABLE, share::schema::ObTableType::MATERIALIZED_VIEW))) {
     LOG_WARN("failed to assign sql", K(ret), K_(snapshot_point));
