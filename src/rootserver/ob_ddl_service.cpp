@@ -41691,7 +41691,7 @@ int ObDDLService::check_index_status_for_drop(const ObTableSchema &index_schema)
   int ret = OB_SUCCESS;
   if (index_schema.is_unavailable_index()) {
     if (index_schema.is_search_def_index()) {
-      ObArenaAllocator allocator(lib::ObMemAttr(index_schema.get_tenant_id(), "DdlTaskRecord"));
+      ObArenaAllocator allocator(lib::ObLabel("DdlTaskRecord"));
       ObArray<ObDDLTaskRecord> task_records;
       if (OB_FAIL(ObDDLTaskRecordOperator::get_ddl_task_record_by_table_id(
           index_schema.get_tenant_id(), index_schema.get_data_table_id(), get_sql_proxy(), allocator, task_records))) {
