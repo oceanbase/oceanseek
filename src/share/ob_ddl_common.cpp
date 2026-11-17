@@ -7,6 +7,8 @@
 #define USING_LOG_PREFIX SHARE
 
 #include "ob_ddl_common.h"
+#include "lib/literals/ob_literals.h"
+#include "lib/utility/ob_tracepoint.h"
 #include "logservice/ob_log_service.h" // for ObLogService
 #include "share/ob_ddl_checksum.h"
 #include "share/ob_ddl_sim_point.h"
@@ -46,6 +48,8 @@ using namespace oceanbase::common;
 using namespace oceanbase::share::schema;
 using namespace oceanbase::obrpc;
 using namespace oceanbase::sql;
+
+ERRSIM_POINT_DEF(EN_DDL_AUTOINC_SEQ_GET_LEADER_ERROR);
 
 const char *oceanbase::share::get_ddl_type(ObDDLType ddl_type)
 {
@@ -5690,6 +5694,77 @@ int ObDDLUtil::set_tablet_autoinc_seq(const ObLSID &ls_id, const ObTabletID &tab
     } else if (OB_FAIL(res.autoinc_params_.at(0).ret_code_)) {
       LOG_WARN("sync tablet autoinc failed", K(ret), K(res.autoinc_params_.at(0)));
     }
+    if (OB_NOT_MASTER == ret) {
+      if (OB_FAIL(remote_set_tablet_autoinc_seq(arg))) {
+        LOG_WARN("remote set tablet autoinc seq failed", K(ret), K(arg));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDDLUtil::remote_set_tablet_autoinc_seq(const obrpc::ObBatchSetTabletAutoincSeqArg &arg)
+{
+  int ret = OB_SUCCESS;
+  constexpr int64_t RETRY_INTERVAL = 1_s;
+  const int64_t start_ts = ObTimeUtility::fast_current_time();
+  const int64_t RETRY_TIMEOUT = std::min<int64_t>(1_min, THIS_WORKER.get_timeout_remain());
+  if (OB_UNLIKELY(!arg.is_valid() || 1 != arg.autoinc_params_.count())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid sequence sync argument", K(ret), K(arg));
+  } else {
+    int64_t attempt_count = 0;
+    bool need_retry = false;
+    do {
+      need_retry = false;
+      if (OB_FAIL(THIS_WORKER.check_status())) {
+        LOG_WARN("sequence sync worker stopped", K(ret), K(arg));
+      } else {
+        ++attempt_count;
+        ObAddr leader;
+        obrpc::ObBatchSetTabletAutoincSeqRes res;
+        if (OB_ISNULL(GCTX.location_service_) || OB_ISNULL(GCTX.srv_rpc_proxy_)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("location service or rpc proxy is null", K(ret), K(arg));
+        } else if (OB_FAIL(EVENT_CALL(EN_DDL_AUTOINC_SEQ_GET_LEADER_ERROR))) {
+          LOG_WARN("failed to refresh sequence sync leader", K(ret), K(arg), "errsim", true);
+        } else if (OB_FAIL(GCTX.location_service_->get_leader(
+                       GCONF.cluster_id, arg.tenant_id_, arg.ls_id_,
+                       true /* force_renew */, leader))) {
+          LOG_WARN("failed to refresh sequence sync leader", K(ret), K(arg));
+        } else if (OB_UNLIKELY(!leader.is_valid())) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("invalid sequence sync leader", K(ret), K(leader), K(arg));
+        } else {
+          const int64_t remaining_us = RETRY_TIMEOUT - (ObTimeUtility::fast_current_time() - start_ts);
+          const int64_t rpc_timeout_us = std::min(get_default_ddl_rpc_timeout(), remaining_us);
+          if (0 >= rpc_timeout_us) {
+            ret = OB_TIMEOUT;
+            LOG_WARN("sequence sync budget exhausted before remote rpc", K(ret), K(arg), K(leader), K(rpc_timeout_us));
+          } else if (OB_FAIL(GCTX.srv_rpc_proxy_->to(leader)
+                                .by(arg.tenant_id_)
+                                .timeout(rpc_timeout_us)
+                                .set_tablet_autoinc_seq(arg, res))) {
+            LOG_WARN("remote sequence sync rpc failed", K(ret), K(leader), K(arg), K(rpc_timeout_us));
+          } else if (1 != res.autoinc_params_.count()) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("unexpected remote sequence sync result", K(ret), K(leader), K(arg), K(res));
+          } else if (OB_FAIL(res.autoinc_params_.at(0).ret_code_)) {
+            LOG_WARN("remote tablet sequence sync failed", K(ret), K(leader), K(arg), K(res));
+          } else {
+            const int64_t elapsed_us = ObTimeUtility::fast_current_time() - start_ts;
+            LOG_INFO("tablet sequence sync recovered on remote leader",
+                     K(ret), K(arg), K(leader), K(attempt_count), K(elapsed_us));
+          }
+        }
+        need_retry = (OB_NOT_MASTER == ret || is_location_service_renew_error(ret))
+            && ObTimeUtility::fast_current_time() - start_ts + RETRY_INTERVAL < RETRY_TIMEOUT;
+      }
+      if (need_retry) {
+        ob_usleep(RETRY_INTERVAL);
+      }
+    } while (need_retry
+             && ObTimeUtility::fast_current_time() - start_ts < RETRY_TIMEOUT);
   }
   return ret;
 }

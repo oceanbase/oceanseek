@@ -23,6 +23,7 @@ namespace oceanbase
 namespace obrpc
 {
 class ObSrvRpcProxy;
+struct ObBatchSetTabletAutoincSeqArg;
 struct ObPartitionSplitArg;
 struct ObAlterTableArg;
 struct ObDropDatabaseArg;
@@ -1776,6 +1777,8 @@ public:
       ObDDLWriteStat *&ddl_write_stat);
 
 private:
+  static int remote_set_tablet_autoinc_seq(
+      const obrpc::ObBatchSetTabletAutoincSeqArg &arg);
   static int fill_vector_index_schema_item(
       const uint64_t tenant_id,
       ObSchemaGetterGuard &schema_guard,
