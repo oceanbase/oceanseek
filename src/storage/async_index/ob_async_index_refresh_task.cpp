@@ -594,7 +594,9 @@ bool ObAsyncIndexRefreshTask::match(
     const common::ObTabletID &tablet_id,
     const share::SCN &target_scn) const
 {
-  return stat_.tablet_id_ == tablet_id && stat_.target_refresh_scn_ == target_scn;
+  ObRefreshTaskStat stat;
+  copy_stat(stat);
+  return stat.tablet_id_ == tablet_id && stat.target_refresh_scn_ == target_scn;
 }
 
 bool ObAsyncIndexRefreshTask::need_retry() const

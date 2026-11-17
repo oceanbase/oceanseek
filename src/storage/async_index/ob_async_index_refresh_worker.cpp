@@ -191,7 +191,11 @@ bool ObAsyncIndexRefreshWorker::has_in_flight_task(const common::ObTabletID &tab
     const common::ObTabletID &tablet_id_;
     explicit MatchTabletFn(const common::ObTabletID &tid) : tablet_id_(tid) {}
     bool operator()(const ObAsyncIndexRefreshTask &task) const
-    { return task.stat_.tablet_id_ == tablet_id_; }
+    {
+      ObRefreshTaskStat stat;
+      task.copy_stat(stat);
+      return stat.tablet_id_ == tablet_id_;
+    }
   };
   return task_pool_.find_in_use(MatchTabletFn(tablet_id));
 }
@@ -280,6 +284,7 @@ void ObAsyncIndexRefreshWorker::handle(void *task)
     }
 
     bool retried = false;
+    bool retry_failed = false;
     if (!abandon) {
       if (OB_FAIL(refresh_task->handle())) {
         LOG_WARN("refresh task handle failed", K(ret));
@@ -289,6 +294,7 @@ void ObAsyncIndexRefreshWorker::handle(void *task)
           // add_retry_task_ may reject the node when the per-LS retry list is
           // full (OB_SIZE_OVERFLOW); in that case the task is NOT retried and
           // falls through to the finished ring below (regenerated next round).
+          retry_failed = true;
           LOG_WARN("failed to add retry task", K(ret), K(refresh_task->stat_));
         } else {
           retried = true;
@@ -308,7 +314,16 @@ void ObAsyncIndexRefreshWorker::handle(void *task)
       // Only record tasks that have truly finished (success, or failure that
       // will not be retried) into the finished ring for observability.
       if (!retried) {
-        record_finished_task_(refresh_task->stat_);
+        ObRefreshTaskStat stat;
+        refresh_task->copy_stat(stat);
+        // A deferred task has no terminal stat yet. Retry rejection also
+        // supersedes any earlier execution error with the enqueue failure.
+        if (retry_failed || 0 == stat.end_time_) {
+          stat.result_ = ret;
+          stat.end_time_ = common::ObTimeUtility::current_time();
+          refresh_task->publish_stat(stat);
+        }
+        record_finished_task_(stat);
       }
     }
     // Release the liveness reference BEFORE returning the task to the pool. Any
@@ -371,6 +386,7 @@ int ObAsyncIndexRefreshWorker::add_retry_task_(const ObAsyncIndexRefreshTask &ta
             || task.stat_.leader_epoch_ != ls_scheduler->get_leader_epoch()) {
           // Scheduler already stopped or switched to follower; discard the retry
           // node to avoid leaking it into a list that nobody drains.
+          ret = ls_scheduler->is_stopped() ? OB_IN_STOP_STATE : OB_NOT_MASTER;
           node->~ObRetryTaskNode();
           ob_free(node);
           ATOMIC_INC(&dropped_retry_cnt_);
