@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include <gtest/gtest.h>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -11,6 +12,7 @@
 #include "share/scn.h"
 #include "share/vector_index/ob_vector_index_merge_policy.h"
 #include "share/vector_index/ob_plugin_vector_index_adaptor.h"
+#include "observer/omt/ob_tenant_config.h"
 #define protected public
 #include "share/vector_index/ob_vector_index_aux_table_handler.h"
 #undef protected
@@ -464,6 +466,23 @@ TEST(TestVectorIndexMergeConfig, CapacityRoundingAndConfigLimit)
       {49999999,59999998}, {50000000,60000000}}) {
     config.max_vectors_ = row.first;
     EXPECT_EQ(row.second, config.merge_capacity()) << row.first;
+  }
+}
+
+TEST(TestVectorIndexMergeConfig, TenantParameterDefaultAndRange)
+{
+  std::unique_ptr<omt::ObTenantConfig> tenant_config(new omt::ObTenantConfig());
+  auto &limit = tenant_config->vector_index_segment_max_vectors;
+  EXPECT_EQ(20000000, limit.get_value());
+  EXPECT_EQ(limit.get_value(), ObVecMergeConfig().max_vectors_);
+  EXPECT_EQ(24000000, ObVecMergeConfig().merge_capacity());
+  for (const char *value : {"100000", "20000000", "50000000"}) {
+    ASSERT_TRUE(limit.set_value(value));
+    EXPECT_TRUE(limit.check()) << value;
+  }
+  for (const char *value : {"-1", "0", "1", "99999", "50000001"}) {
+    ASSERT_TRUE(limit.set_value(value));
+    EXPECT_FALSE(limit.check()) << value;
   }
 }
 

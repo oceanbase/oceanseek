@@ -423,6 +423,73 @@ public:
   uint64_t used_ = 0;
 };
 
+TEST_F(TestVectorIndexMultiSegment, segment_capacity_uses_configured_value)
+{
+  EXPECT_EQ(100000, adaptor_->get_segment_max_vectors(100000));
+  EXPECT_EQ(20000000, adaptor_->get_segment_max_vectors(20000000));
+  EXPECT_EQ(50000000, adaptor_->get_segment_max_vectors(50000000));
+}
+
+TEST_F(TestVectorIndexMultiSegment, segment_capacity_override_is_tenant_scoped_and_resettable)
+{
+  const char *event_name = "ERRSIM_VEC_SEGMENT_MAX_VECTORS";
+  DEFER(EventTable::set_event(event_name, EventItem()));
+  EventItem event;
+  event.trigger_freq_ = 1;
+  event.error_code_ = -4;
+  event.cond_ = MTL_ID();
+  ASSERT_EQ(OB_SUCCESS, EventTable::set_event(event_name, event));
+  EXPECT_EQ(4, adaptor_->get_segment_max_vectors(20000000));
+  event.cond_ = MTL_ID() + 1;
+  ASSERT_EQ(OB_SUCCESS, EventTable::set_event(event_name, event));
+  EXPECT_EQ(20000000, adaptor_->get_segment_max_vectors(20000000));
+  event.cond_ = MTL_ID();
+  for (const int64_t value : {1, 8, 10001, 99999}) {
+    event.error_code_ = -value;
+    ASSERT_EQ(OB_SUCCESS, EventTable::set_event(event_name, event));
+    EXPECT_EQ(value, adaptor_->get_segment_max_vectors(20000000));
+  }
+  for (const int64_t value : {0, 1, -100000, -50000001}) {
+    event.error_code_ = value;
+    ASSERT_EQ(OB_SUCCESS, EventTable::set_event(event_name, event));
+    EXPECT_EQ(20000000, adaptor_->get_segment_max_vectors(20000000));
+  }
+  ASSERT_EQ(OB_SUCCESS, EventTable::set_event(event_name, EventItem()));
+  EXPECT_EQ(20000000, adaptor_->get_segment_max_vectors(20000000));
+}
+
+TEST_F(TestVectorIndexMultiSegment, ddl_and_merge_policy_share_segment_capacity_override)
+{
+  const char *event_name = "ERRSIM_VEC_SEGMENT_MAX_VECTORS";
+  DEFER(EventTable::set_event(event_name, EventItem()));
+  EventItem event;
+  event.trigger_freq_ = 1;
+  event.error_code_ = -4;
+  event.cond_ = MTL_ID();
+  ASSERT_EQ(OB_SUCCESS, EventTable::set_event(event_name, event));
+  init_adaptor();
+  // Let DDL sample the tenant-scoped override instead of setting the snapshot by hand.
+  ASSERT_EQ(OB_SUCCESS, append(1, 4));
+  ASSERT_TRUE(snapshot_data().enable_multi_segment_);
+  EXPECT_EQ(4, snapshot_data().segment_max_vectors_);
+  ASSERT_EQ(OB_SUCCESS, append(5, 2));
+  ASSERT_EQ(OB_SUCCESS, adaptor_->check_snap_index());
+  ASSERT_EQ(OB_SUCCESS, serialize_snapshot());
+  ASSERT_EQ(2, snapshot_data().meta_.bases_.count());
+  snapshot_data().set_inited();
+  snapshot_data().has_complete_ = true;
+  ObVectorIndexMeta source;
+  ObVecMergePolicyInput input;
+  ObVecMergeConfig config;
+  ASSERT_EQ(OB_SUCCESS, adaptor_->prepare_merge_policy_input(source, input, config));
+  EXPECT_EQ(4, config.max_vectors_);
+  ASSERT_EQ(OB_SUCCESS, EventTable::set_event(event_name, EventItem()));
+  omt::ObTenantConfigGuard tenant_config(TENANT_CONF(MTL_ID()));
+  ASSERT_TRUE(tenant_config.is_valid());
+  ASSERT_EQ(OB_SUCCESS, adaptor_->prepare_merge_policy_input(source, input, config));
+  EXPECT_EQ(tenant_config->vector_index_segment_max_vectors.get_value(), config.max_vectors_);
+}
+
 TEST_F(TestVectorIndexMultiSegment, empty_input_does_not_allocate_segment)
 {
   init_adaptor();

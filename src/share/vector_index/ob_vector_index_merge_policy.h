@@ -16,7 +16,7 @@ struct ObVecMergeConfig
 {
   static constexpr int64_t MERGE_CAPACITY_PERCENT = 120;
   static constexpr int64_t TARGET_MIN_GROWTH_PERCENT = 20;
-  int64_t max_vectors_ = 10000000; // Target size; ordinary merges may grow to merge_capacity().
+  int64_t max_vectors_ = 20000000; // Target size; ordinary merges may grow to merge_capacity().
   int64_t merge_factor_ = 2; // Tier logarithm base and minimum candidate positions, not a window limit.
   int64_t delete_percentage_ = 20;
   int64_t idle_us_ = 24L * 60 * 60 * 1000000;

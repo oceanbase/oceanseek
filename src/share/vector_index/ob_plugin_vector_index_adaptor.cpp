@@ -68,6 +68,21 @@ ERRSIM_POINT_DEF(ERRSIM_VEC_HNSW_BQ_RESET_INCR_DATA_BEFORE_QUERY,
                  "When set, reset HNSW_BQ incremental memory before query to test query-side completion.");
 ERRSIM_POINT_DEF(ERRSIM_VEC_HNSW_COMPLETE_DELETED_VIDS,
                  "When set, add historical deleted VIDs before filtering the query-side completion bitmap.");
+ERRSIM_POINT_DEF(ERRSIM_VEC_SEGMENT_MAX_VECTORS,
+                 "Override the segment vector limit for the matched tenant with -error_code (1..99999).");
+
+int64_t ObPluginVectorIndexAdaptor::get_segment_max_vectors(const int64_t configured_max_vectors) const
+{
+  int64_t max_vectors = configured_max_vectors;
+  // Share one test limit across DDL, active freeze and merge planning/output.
+  // Production parameter validation remains independent of this test override.
+  const int64_t test_max_vectors = -static_cast<int64_t>(EVENT_CALL(ERRSIM_VEC_SEGMENT_MAX_VECTORS, tenant_id_));
+  if (test_max_vectors > 0 && test_max_vectors < 100000) {
+    max_vectors = test_max_vectors;
+  }
+  return max_vectors;
+}
+
 ObVectorIndexInfo::ObVectorIndexInfo()
   : ls_id_(share::ObLSID::INVALID_LS_ID),
     rowkey_vid_table_id_(common::OB_INVALID_ID),
@@ -7373,7 +7388,7 @@ int ObPluginVectorIndexAdaptor::init_snap_data_for_build(
           LOG_WARN("tenant configuration is invalid", K(ret), K(tenant_id_));
         } else {
           // Publish the mode and capacity; switch_snap_builder creates the first builder on demand.
-          snap_data_->segment_max_vectors_ = config->vector_index_segment_max_vectors;
+          snap_data_->segment_max_vectors_ = get_segment_max_vectors(config->vector_index_segment_max_vectors);
           ATOMIC_STORE(&snap_data_->enable_multi_segment_, true);
         }
       }
@@ -7448,6 +7463,7 @@ int ObPluginVectorIndexAdaptor::check_need_freeze(const int64_t freeze_threshold
   int ret = OB_SUCCESS;
   int64_t active_segment_mem = 0;
   int64_t vec_cnt = 0;
+  int64_t segment_max_vectors = 0;
   need_freeze = false;
   int64_t amplification_factor = 1;
   omt::ObTenantConfigGuard tenant_config(TENANT_CONF(tenant_id_));
@@ -7472,10 +7488,10 @@ int ObPluginVectorIndexAdaptor::check_need_freeze(const int64_t freeze_threshold
     LOG_WARN("tenant configuration is invalid for freeze", K(ret), K(tenant_id_));
   } else if (OB_FAIL(incr_data_->segment_handle_->get_index_number(vec_cnt))) {
     LOG_WARN("failed to get index number.", K(ret), K(incr_data_));
-  } else if (vec_cnt > tenant_config->vector_index_segment_max_vectors) {
+  } else if (OB_FALSE_IT(segment_max_vectors = get_segment_max_vectors(tenant_config->vector_index_segment_max_vectors))) {
+  } else if (vec_cnt > segment_max_vectors) {
     need_freeze = true;
-    LOG_INFO("trigger freeze by active segment vector count", K(vec_cnt),
-        "segment_max_vectors", tenant_config->vector_index_segment_max_vectors.get_value());
+    LOG_INFO("trigger freeze by active segment vector count", K(vec_cnt), K(segment_max_vectors));
   } else if (OB_FALSE_IT(active_segment_mem = incr_data_->segment_handle_->get_mem_hold())) {
   // 如果超过3个, 说明合并慢了, 此时需要减缓冻结
   } else if (snap_data_.is_valid() && snap_data_->meta_.incrs_.count() > 3 && OB_FALSE_IT(amplification_factor = snap_data_->meta_.incrs_.count() - 3)) {
@@ -7759,7 +7775,7 @@ int ObPluginVectorIndexAdaptor::prepare_merge_policy_input(ObVectorIndexMeta &so
     ret = OB_EAGAIN;
     LOG_TRACE("merge snapshot is not ready", K(ret), K(tenant_id_), K(snap_data_));
   } else {
-    config.max_vectors_ = tenant_config->vector_index_segment_max_vectors;
+    config.max_vectors_ = get_segment_max_vectors(tenant_config->vector_index_segment_max_vectors);
     config.merge_factor_ = tenant_config->vector_index_merge_segment_threshold;
     config.delete_percentage_ = tenant_config->vector_index_delete_purge_threshold;
     TCRLockGuard guard(snap_data_->mem_data_rwlock_);

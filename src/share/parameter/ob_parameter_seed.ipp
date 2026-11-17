@@ -3637,7 +3637,7 @@ DEF_INT(ob_vector_index_merge_trigger_percentage, OB_TENANT_PARAMETER, "20", "[0
         "Maximum ratio of Incremental Segment memory usage to total partition index. "
         "When this value is exceeded, the system will automatically trigger a merge operation with the base segment.",
         ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE))
-DEF_INT(vector_index_segment_max_vectors, OB_TENANT_PARAMETER, "10000000", "[1, 50000000]",
+DEF_INT(vector_index_segment_max_vectors, OB_TENANT_PARAMETER, "20000000", "[100000, 50000000]",
         "Sets the maximum number of vectors in a vector index segment.",
         ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 DEF_INT(vector_index_merge_segment_threshold, OB_TENANT_PARAMETER, "2", "[2, 20]",

@@ -1281,6 +1281,7 @@ public:
               K_(identity_ts), K_(mig_state), K_(skip_merge_sched));
 
 private:
+  int64_t get_segment_max_vectors(const int64_t configured_max_vectors) const;
   int inner_add_snap_index(float *vectors, int64_t *vids, char *extra_info_buf,
       int num, uint32_t *lens, uint32_t *dims, float *vals);
   int create_snap_builder(ObVectorIndexParam &param, const bool is_buffer_mode,
