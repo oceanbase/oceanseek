@@ -31,6 +31,8 @@ static constexpr int64_t BMM_RANGE_MAX_MIN_DIM_COUNT = 3;
 static constexpr int64_t BMM_ACTIVE_PROBE_MAX_COUNT = 64;
 // Without a scalar filter, keep low-density postings on the sequential path.
 static constexpr int64_t BMM_ACTIVE_PROBE_POSTING_COST_DENOMINATOR = 8;
+// Limit direct drain after essential scoring to estimated filter matches below 1/8 of table rows.
+static constexpr int64_t DIRECT_DRAIN_AFTER_ESSENTIAL_COST_RATIO = 8;
 
 // The sole essential iterator produces unique, ordered candidates with partial scores.
 struct SingleEssentialCandidateSink
@@ -177,6 +179,8 @@ void ObDASBMMOp::select_filter_build_options(
   options = ObDASBMMBuildOptions(tenant_config.is_valid()
       && tenant_config->_enable_bmm_vectorized_merge);
   if (FilterMergeMode::DENSE_WINDOW == merge_mode
+      && (!filter_after_score
+          || filter_cost.cost() < search_ctx.get_row_count().cost() / DIRECT_DRAIN_AFTER_ESSENTIAL_COST_RATIO)
       && !query_optional && options.enable_vectorized_merge_
       && DAS_ROWID_TYPE_UINT64 == search_ctx.get_rowid_type()
       && !search_ctx.is_logical_table() && supports_direct_drain) {

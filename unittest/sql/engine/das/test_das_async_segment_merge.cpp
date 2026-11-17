@@ -6934,7 +6934,7 @@ TEST_F(TestDASAsyncSegmentMerge, async_bmm_direct_selection_preserves_candidate_
   ObBooleanSubClause<ObIDASSearchRtDef> filter_clauses(clauses, ARRAYSIZEOF(clauses));
   search_ctx_.table_row_count_ = ObDASSearchCost(1000);
   const ObDASSearchCost lead_cost(20);
-  const int64_t filter_costs[] = {61, 62, 900};
+  const int64_t filter_costs[] = {61, 62, 100, 124, 125, 200, 900};
 
   for (int64_t group_slot = -1; group_slot <= 0; ++group_slot) {
     search_ctx_.set_async_group_slot(group_slot);
@@ -6962,11 +6962,18 @@ TEST_F(TestDASAsyncSegmentMerge, async_bmm_direct_selection_preserves_candidate_
           ASSERT_TRUE(options.enable_vectorized_merge_);
           ASSERT_EQ(cost, filter_cost.cost());
           const bool expect_filter_after_score = cost >= 62;
-          EXPECT_EQ(expect_filter_after_score
-              ? ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN_AFTER_ESSENTIAL
-              : ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN, options.filter_mode_);
-          EXPECT_TRUE(filter_op->supports_direct_rowid_drain());
-          EXPECT_EQ(0 == group_slot && !new_false_range && 1 == rtdef.key_ranges_.count(),
+          const bool expect_direct_drain = cost < 125;
+          const auto expected_filter_mode = !expect_direct_drain
+              ? ObDASBMMBuildOptions::FilterMode::ORDERED
+              : (expect_filter_after_score
+                  ? ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN_AFTER_ESSENTIAL
+                  : ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN);
+          EXPECT_EQ(expected_filter_mode, options.filter_mode_);
+          if (expect_direct_drain) {
+            EXPECT_TRUE(filter_op->supports_direct_rowid_drain());
+          }
+          EXPECT_EQ(!expect_direct_drain
+              || (0 == group_slot && !new_false_range && 1 == rtdef.key_ranges_.count()),
               filter_op->can_enumerate_rowids());
 
           MockSegmentOp token(search_ctx_, {10}, {2.0});

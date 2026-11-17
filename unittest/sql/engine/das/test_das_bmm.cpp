@@ -1942,10 +1942,16 @@ TEST_F(TestDASBMM, direct_capability_preserves_filter_strategy_and_results)
   const StrategyCase cases[] = {
     {20, 61, false, ObDASBMMOp::FilterMergeMode::DENSE_WINDOW, false, true},
     {20, 62, false, ObDASBMMOp::FilterMergeMode::DENSE_WINDOW, true, true},
-    {20, 900, false, ObDASBMMOp::FilterMergeMode::DENSE_WINDOW, true, true},
+    {20, 100, false, ObDASBMMOp::FilterMergeMode::DENSE_WINDOW, true, true},
+    {20, 124, false, ObDASBMMOp::FilterMergeMode::DENSE_WINDOW, true, true},
+    {20, 125, false, ObDASBMMOp::FilterMergeMode::DENSE_WINDOW, true, false},
+    {20, 200, false, ObDASBMMOp::FilterMergeMode::DENSE_WINDOW, true, false},
+    {20, 900, false, ObDASBMMOp::FilterMergeMode::DENSE_WINDOW, true, false},
     {10, 61, false, ObDASBMMOp::FilterMergeMode::SPARSE_SEEK, false, false},
+    {10, 100, false, ObDASBMMOp::FilterMergeMode::SPARSE_SEEK, false, false},
     {10, 900, false, ObDASBMMOp::FilterMergeMode::SPARSE_SEEK, false, false},
     {20, 61, true, ObDASBMMOp::FilterMergeMode::DENSE_WINDOW, false, false},
+    {20, 100, true, ObDASBMMOp::FilterMergeMode::DENSE_WINDOW, false, false},
     {-1, -1, false, ObDASBMMOp::FilterMergeMode::DENSE_WINDOW, false, true},
   };
   const uint64_t score_ids[] = {5, 6, 7};
