@@ -235,7 +235,7 @@ int ObDeadLockInnerTableService::ObDeadLockEventHistoryTableOperator::async_dele
     DETECT_LOG(WARN, "get schema guard failed", KR(ret));
   } else if (CLICK() && OB_FAIL(schema_guard.get_tenant_ids(tenant_ids))) {
     DETECT_LOG(WARN, "get tenant ids failed", KR(ret));
-  } else if (CLICK() && OB_FAIL(sql.assign_fmt("DELETE FROM %s WHERE report_time < %ld LIMIT 1024",
+  } else if (CLICK() && OB_FAIL(sql.assign_fmt("DELETE FROM %s WHERE report_time < usec_to_time(%ld) LIMIT 1024",
                                                OB_ALL_DEADLOCK_EVENT_HISTORY_TNAME,
                                                rs_delete_timestap))) {
     DETECT_LOG(WARN, "assign_fmt failed", KR(ret));
