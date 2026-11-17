@@ -179,10 +179,21 @@ int64_t ObTenantVectorAllocator::get_left_pre_alloc_size()
 // so it can only be called within vsag and cannot be used elsewhere
 void *ObVsagMemContext::Allocate(size_t size) 
 {
+  void *ret_ptr = alloc_nothrow(size);
+  if (size != 0 && OB_ISNULL(ret_ptr)) {
+    // VSAG's standard containers require allocation failure to throw.
+    throw std::bad_alloc();
+  }
+  return ret_ptr;
+}
+
+void *ObVsagMemContext::alloc_nothrow(size_t size)
+{
   void *ret_ptr = nullptr;
-  int ret = OB_SUCCESS;
-  if (size != 0) {
-    int64_t actual_size = MEM_PTR_HEAD_SIZE + size;
+  if (size > static_cast<size_t>(INT64_MAX - MEM_PTR_HEAD_SIZE)) {
+    SHARE_LOG_RET(WARN, OB_SIZE_OVERFLOW, "allocation size exceeds int64 range", K(size));
+  } else if (size != 0) {
+    const int64_t actual_size = MEM_PTR_HEAD_SIZE + static_cast<int64_t>(size);
     void *ptr = ObVectorMemContext::alloc(actual_size);
     if (OB_NOT_NULL(ptr)) {
       ATOMIC_AAF(all_vsag_use_mem_, actual_size);
@@ -190,11 +201,7 @@ void *ObVsagMemContext::Allocate(size_t size)
       *(int64_t*)ptr = actual_size;
       ret_ptr = (char*)ptr + MEM_PTR_HEAD_SIZE;
     } else {
-      // NOTICE: ObVsagMemContext is used in vsag lib. And may be used for some c++ std container.
-      // For this scenario, if memory allocation fails, an exception should be thrown instead of returning a null pointer
-      // or will access null point in std container, eg std::vector
-      SHARE_LOG(WARN, "fail to allocate memory", K(size), K(actual_size), K(lbt()));
-      throw std::bad_alloc();
+      SHARE_LOG_RET(WARN, OB_ALLOCATE_MEMORY_FAILED, "fail to allocate memory", K(size), K(actual_size), K(lbt()));
     }
   }
   

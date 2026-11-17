@@ -93,6 +93,9 @@ public:
   }
   void* Allocate(size_t size) override;
 
+  // OB callers: return nullptr on failure; pair with Deallocate(), just like Allocate().
+  void *alloc_nothrow(size_t size);
+
   void Deallocate(void* p) override;
 
   void* Reallocate(void* p, size_t size) override;

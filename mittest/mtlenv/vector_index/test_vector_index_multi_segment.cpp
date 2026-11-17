@@ -2862,6 +2862,167 @@ TEST_F(TestVectorIndexMultiSegment, existing_snapshot_cleanup_resets_failed_buil
   EXPECT_EQ(0, used_);
 }
 
+TEST_F(TestVectorIndexMultiSegment, vsag_alloc_nothrow_preserves_accounting_and_release)
+{
+  uint64_t used = 0;
+  ObVsagMemContext mem_ctx(&used);
+  ASSERT_EQ(OB_SUCCESS, mem_ctx.init(context_, &used, MTL_ID()));
+  EXPECT_EQ(nullptr, mem_ctx.alloc_nothrow(0));
+  EXPECT_EQ(nullptr, mem_ctx.Allocate(0));
+  EXPECT_EQ(0, used);
+
+  void *buffer = mem_ctx.alloc_nothrow(64);
+  DEFER(mem_ctx.Deallocate(buffer));
+  ASSERT_NE(nullptr, buffer);
+  EXPECT_EQ(64 + sizeof(int64_t), used);
+  MEMSET(buffer, 0x5a, 64);
+
+  // A buffer allocated by the OB entry can use VSAG's existing reallocate/free path.
+  void *resized = mem_ctx.Reallocate(buffer, 128);
+  ASSERT_NE(nullptr, resized);
+  buffer = resized;
+  EXPECT_EQ(128 + sizeof(int64_t), used);
+  for (int64_t i = 0; i < 64; ++i) {
+    EXPECT_EQ(0x5a, static_cast<unsigned char *>(buffer)[i]);
+  }
+  mem_ctx.Deallocate(buffer);
+  buffer = nullptr;
+  EXPECT_EQ(0, used);
+
+  buffer = mem_ctx.Allocate(64);
+  ASSERT_NE(nullptr, buffer);
+  EXPECT_EQ(64 + sizeof(int64_t), used);
+  mem_ctx.Deallocate(buffer);
+  buffer = nullptr;
+  EXPECT_EQ(0, used);
+}
+
+TEST_F(TestVectorIndexMultiSegment, vsag_alloc_nothrow_failure_keeps_vsag_exception_contract)
+{
+  uint64_t used = 0;
+  ObVsagMemContext mem_ctx(&used);
+  ASSERT_EQ(OB_SUCCESS, mem_ctx.init(context_, &used, MTL_ID()));
+  const int64_t limit = mem_ctx.throttle_tool_->get_resource_limit<ObTenantVectorAllocator>();
+  ASSERT_GE(limit, 0);
+  ASSERT_LT(limit, INT64_MAX / 2);
+  // Reject at the tenant limit before attempting a large physical allocation.
+  const size_t over_limit = static_cast<size_t>(MAX(limit + 1, ObVectorMemContext::CHECK_RESOURCE_UNIT_SIZE));
+  EXPECT_EQ(nullptr, mem_ctx.alloc_nothrow(over_limit));
+  EXPECT_THROW(mem_ctx.Allocate(over_limit), std::bad_alloc);
+  EXPECT_EQ(0, used);
+
+  // Include both signed-size overflow after the header and unsigned addition overflow.
+  const size_t invalid_sizes[] = {static_cast<size_t>(INT64_MAX), static_cast<size_t>(-1)};
+  for (const size_t size : invalid_sizes) {
+    EXPECT_EQ(nullptr, mem_ctx.alloc_nothrow(size));
+    EXPECT_THROW(mem_ctx.Allocate(size), std::bad_alloc);
+    EXPECT_EQ(0, used);
+  }
+}
+
+TEST_F(TestVectorIndexMultiSegment, brute_force_single_segment_preserves_positions)
+{
+  init_adaptor();
+  ObVectorIndexParam *param = nullptr;
+  ASSERT_EQ(OB_SUCCESS, adaptor_->get_hnsw_param(param));
+  ASSERT_NE(nullptr, param);
+  ASSERT_EQ(OB_SUCCESS, adaptor_->init_incr_data(adaptor_->incr_data_, VIAT_HNSW, param));
+  auto &segment = adaptor_->incr_data_->segment_handle_;
+  int64_t vid = 21;
+  float vector[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  ASSERT_EQ(OB_SUCCESS, segment->add_index(vector, &vid, 8, nullptr, 1));
+  const int64_t candidates[] = {21, 2, 21, 100};
+  ObVecIdxQueryResult result;
+  DEFER(adaptor_->free_result(result));
+  ASSERT_EQ(OB_SUCCESS, adaptor_->vsag_query_vids(vector, candidates, 4, result, 0));
+  ASSERT_EQ(1, result.segments_.count());
+  ASSERT_EQ(1, result.distances_.count());
+  ASSERT_NE(nullptr, result.distances_.at(0));
+  const float *baseline = nullptr;
+  DEFER(segment->mem_ctx()->Deallocate(const_cast<float *>(baseline)));
+  ASSERT_EQ(OB_SUCCESS, segment->cal_distance_by_id(vector, candidates, 4, baseline));
+  ASSERT_NE(nullptr, baseline);
+  for (int64_t i = 0; i < 4; ++i) {
+    EXPECT_FLOAT_EQ(baseline[i], result.distances_.at(0)[i]);
+  }
+}
+
+TEST_F(TestVectorIndexMultiSegment, brute_force_grouped_vids_preserve_positions)
+{
+  prepare(2, "HNSW_SQ");
+  ObVectorIndexParam *param = nullptr;
+  ASSERT_EQ(OB_SUCCESS, adaptor_->get_hnsw_param(param));
+  ASSERT_NE(nullptr, param);
+  const int64_t build_vids[] = {1, 3, 3, 5, 9, 11};
+  for (int64_t i = 0; i < 6; ++i) {
+    ASSERT_EQ(OB_SUCCESS, append(build_vids[i], 1));
+  }
+  ASSERT_EQ(OB_SUCCESS, adaptor_->check_snap_index());
+  ObVecIdxSnapshotData &snap = snapshot_data();
+  ASSERT_EQ(2, snap.sealed_builders_.count());
+  ASSERT_NE(nullptr, snap.builder_);
+  ASSERT_TRUE(snap.builder_->segment_handle_.is_valid());
+  for (int64_t i = 0; i < 2; ++i) {
+    ASSERT_EQ(OB_SUCCESS, snap.append_base_meta(snap.meta_, *snap.sealed_builders_.at(i),
+        ObTabletID(200001), 123456789, i + 1, 1, adaptor_->index_param_));
+  }
+  ASSERT_EQ(OB_SUCCESS, snap.meta_.incrs_.push_back(snap.meta_.bases_.at(1)));
+  snap.meta_.bases_.pop_back();
+  snap.meta_.incrs_.at(0).seg_type_ = ObVectorIndexSegmentType::FREEZE_PERSIST;
+  // An absent range must still permit exact membership grouping.
+  snap.meta_.incrs_.at(0).segment_handle_->vid_bound_.reset();
+  snap.set_inited();
+  adaptor_->frozen_data_->segment_handle_ = snap.builder_->segment_handle_;
+  adaptor_->frozen_data_->set_has_frozen();
+  ASSERT_EQ(OB_SUCCESS, adaptor_->init_incr_data(
+      adaptor_->incr_data_, VIAT_HGRAPH, param));
+  int64_t active_vid = 21;
+  float vector[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  ASSERT_EQ(OB_SUCCESS, adaptor_->incr_data_->segment_handle_->add_index(vector, &active_vid, 8, nullptr, 1));
+  // Active bounds may lag insertion and must never exclude a present VID.
+  adaptor_->incr_data_->segment_handle_->set_read_vid_bound(ObVidBound(1, 1));
+  const int64_t candidates[][7] = {
+      {3, 2, 1, 3, 5, 100, 21}, // Overlap, holes, duplicate positions and an empty frozen group.
+      {3, 3, 3, 3, 3, 3, 3},   // Full groups can retain their VSAG output directly.
+      {2, 100, 2, 100, 2, 100, 2}};
+  for (int pass = 0; pass < 3; ++pass) {
+    // Frozen HGraph with an outstanding writer must use the safe fallback.
+    if (pass == 1) {
+      adaptor_->frozen_data_->segment_handle_->inc_write_ref();
+    } else if (pass == 2) {
+      ObVectorIndexSegmentHandle active;
+      ASSERT_EQ(OB_SUCCESS, ObVectorIndexSegment::create(active, MTL_ID(), *adaptor_->get_allocator(),
+          *param, VIAT_HNSW, 16, adaptor_));
+      ASSERT_EQ(OB_SUCCESS, active->add_index(vector, &active_vid, 8, nullptr, 1));
+      active->set_read_vid_bound(ObVidBound(1, 1));
+      adaptor_->incr_data_->segment_handle_ = active;
+    }
+    DEFER(if (pass == 1) { adaptor_->frozen_data_->segment_handle_->dec_write_ref(); });
+    for (int batch = 0; batch < 3; ++batch) {
+      // Cross multiple grouping batches and leave a partial final batch.
+      int64_t query_vids[519];
+      for (int64_t i = 0; i < 519; ++i) {
+        query_vids[i] = candidates[batch][i % 7];
+      }
+      ObVecIdxQueryResult result;
+      DEFER(adaptor_->free_result(result));
+      ASSERT_EQ(OB_SUCCESS, adaptor_->vsag_query_vids(vector, query_vids, 519, result, 0));
+      ASSERT_EQ(4, result.segments_.count());
+      ASSERT_EQ(4, result.distances_.count());
+      for (int64_t i = 0; i < result.segments_.count(); ++i) {
+        ASSERT_NE(nullptr, result.distances_.at(i));
+        const float *baseline = nullptr;
+        ASSERT_EQ(OB_SUCCESS, result.segments_.at(i)->cal_distance_by_id(vector, query_vids, 519, baseline));
+        ASSERT_NE(nullptr, baseline);
+        for (int j = 0; j < 519; ++j) {
+          EXPECT_FLOAT_EQ(baseline[j], result.distances_.at(i)[j]);
+        }
+        result.segments_.at(i)->mem_ctx()->Deallocate(const_cast<float *>(baseline));
+      }
+    }
+  }
+}
+
 TEST_F(TestVectorIndexMultiSegment, size_weighted_ef_search_and_bypass)
 {
   struct SwitchGuard

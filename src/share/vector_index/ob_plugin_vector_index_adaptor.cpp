@@ -5169,7 +5169,13 @@ int ObPluginVectorIndexAdaptor::vsag_query_vids(float *vector,
   uint32_t *sparse_dims = nullptr;
   float *sparse_vals = nullptr;
   const bool is_sparse = is_sparse_vector_index_type();
-  if (is_sparse_vector_index_type()) {
+  int64_t active_pos = -1;
+  int64_t frozen_pos = -1;
+  if (OB_ISNULL(vector) || OB_ISNULL(vids) || count <= 0
+      || count > INT64_MAX / static_cast<int64_t>(sizeof(float))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid brute force arguments", K(ret), KP(vector), KP(vids), K(count));
+  } else if (is_sparse) {
     if (OB_FAIL(parse_sparse_vector((char *)vector, 1, sparse_byte_lens, &tmp_allocator, 
                                     &sparse_lens, &sparse_dims, &sparse_vals))) {
       LOG_WARN("failed to parse sparse vector using parse_sparse_vector", K(ret));
@@ -5178,12 +5184,14 @@ int ObPluginVectorIndexAdaptor::vsag_query_vids(float *vector,
 
   if (OB_SUCC(ret) && is_mem_data_init_atomic(VIRT_INC)) {
     TCRLockGuard lock_guard(incr_data_->mem_data_rwlock_);
+    active_pos = result.segments_.count();
     if (OB_FAIL(result.segments_.push_back(incr_data_->segment_handle_))) {
       LOG_WARN("push back segment fail", K(ret), K(is_sparse), K(count));
     }
   }
   if (OB_SUCC(ret) && has_frozen()) {
     TCRLockGuard lock_guard(frozen_data_->mem_data_rwlock_);
+    frozen_pos = result.segments_.count();
     if (OB_FAIL(result.segments_.push_back(frozen_data_->segment_handle_))) {
       LOG_WARN("push back segment fail", K(ret), K(is_sparse), K(count));
     }
@@ -5209,20 +5217,111 @@ int ObPluginVectorIndexAdaptor::vsag_query_vids(float *vector,
     }
   }
 
-  for (int64_t i = 0; OB_SUCC(ret) && i < result.segments_.count(); ++i) {
-    ObVectorIndexSegmentHandle& segment_handle = result.segments_.at(i);
-    const float* distance = nullptr;
-    if (is_sparse) {
-      ret = segment_handle->cal_distance_by_id(*sparse_lens, sparse_dims, sparse_vals, vids, count, distance);
+  ObSEArray<ObSEArray<int64_t, 16>, 4> segment_vids;
+  ObSEArray<ObSEArray<int64_t, 16>, 4> segment_positions;
+  ObSEArray<ObVidBound, 4> segment_bounds;
+  ObSEArray<bool, 4> group_segments;
+  segment_vids.set_attr(ObMemAttr(tenant_id_, "VectorAdaptor"));
+  segment_positions.set_attr(ObMemAttr(tenant_id_, "VectorAdaptor"));
+  segment_bounds.set_attr(ObMemAttr(tenant_id_, "VectorAdaptor"));
+  group_segments.set_attr(ObMemAttr(tenant_id_, "VectorAdaptor"));
+  const int64_t segment_count = result.segments_.count();
+  if (OB_SUCC(ret) && segment_count > 1) {
+    if (OB_FAIL(segment_vids.prepare_allocate(segment_count))) {
+      LOG_WARN("failed to allocate segment vids", K(ret));
+    } else if (OB_FAIL(segment_positions.prepare_allocate(segment_count))) {
+      LOG_WARN("failed to allocate segment positions", K(ret));
+    } else if (OB_FAIL(segment_bounds.prepare_allocate(segment_count))) {
+      LOG_WARN("failed to allocate segment bounds", K(ret));
+    } else if (OB_FAIL(group_segments.prepare_allocate(segment_count))) {
+      LOG_WARN("failed to allocate segment flags", K(ret));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < segment_count; ++i) {
+      ObVectorIndexSegmentHandle &handle = result.segments_.at(i);
+      segment_vids.at(i).set_attr(ObMemAttr(tenant_id_, "VectorAdaptor"));
+      segment_positions.at(i).set_attr(ObMemAttr(tenant_id_, "VectorAdaptor"));
+      if (!handle.is_valid()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid brute force segment", K(ret), K(i));
+      } else {
+        // HNSW locks its member lookup. HGraph does not, so retain the original
+        // path while the segment can still be written. Frozen accepts no new writers.
+        const bool can_write = i == active_pos || (i == frozen_pos && handle->get_write_ref() > 0);
+        group_segments.at(i) = !can_write || handle->get_index_type() == VIAT_HNSW;
+        if (i != active_pos && !can_write) {
+          handle->get_read_bound_vid(segment_bounds.at(i).max_vid_, segment_bounds.at(i).min_vid_);
+        }
+      }
+    }
+    // Check a batch against each segment before advancing, preserving duplicate positions.
+    constexpr int64_t VID_BATCH_SIZE = 256;
+    for (int64_t batch_start = 0; OB_SUCC(ret) && batch_start < count; batch_start += VID_BATCH_SIZE) {
+      const int64_t batch_end = MIN(count, batch_start + VID_BATCH_SIZE);
+      for (int64_t j = 0; OB_SUCC(ret) && j < segment_count; ++j) {
+        const ObVidBound &bound = segment_bounds.at(j);
+        for (int64_t i = batch_start; OB_SUCC(ret) && group_segments.at(j) && i < batch_end; ++i) {
+          bool exists = false;
+          if (bound.is_valid() && (vids[i] < bound.min_vid_ || vids[i] > bound.max_vid_)) {
+          } else if (OB_FAIL(result.segments_.at(j)->check_id_exist(vids[i], exists))) {
+            if (OB_NOT_SUPPORTED == ret) {
+              group_segments.at(j) = false;
+              ret = OB_SUCCESS;
+            } else {
+              LOG_WARN("failed to check brute force vid", K(ret), K(j), K(vids[i]));
+            }
+          } else if (!exists) {
+          } else if (OB_FAIL(segment_vids.at(j).push_back(vids[i]))) {
+            LOG_WARN("failed to append segment vid", K(ret), K(j), K(i));
+          } else if (OB_FAIL(segment_positions.at(j).push_back(i))) {
+            LOG_WARN("failed to append segment position", K(ret), K(j), K(i));
+          }
+        }
+      }
+    }
+  }
+
+  for (int64_t i = 0; OB_SUCC(ret) && i < segment_count; ++i) {
+    ObVectorIndexSegmentHandle &segment_handle = result.segments_.at(i);
+    const bool grouped = segment_count > 1 && group_segments.at(i);
+    const int64_t query_count = grouped ? segment_vids.at(i).count() : count;
+    const int64_t *query_vids = grouped ? segment_vids.at(i).get_data() : vids;
+    const float *distance = nullptr;
+    float *full_distance = nullptr;
+    if (query_count == 0) {
+      // No distance calculation for an empty group.
+    } else if (is_sparse) {
+      ret = segment_handle->cal_distance_by_id(*sparse_lens, sparse_dims, sparse_vals,
+          query_vids, query_count, distance);
     } else {
-      ret = segment_handle->cal_distance_by_id(vector, vids, count, distance);
+      ret = segment_handle->cal_distance_by_id(vector, query_vids, query_count, distance);
     }
     if (OB_FAIL(ret)) {
-      LOG_WARN("cal_distance_by_id fail", K(ret), K(is_sparse), K(count));
-    } else if (OB_FAIL(result.distances_.push_back(distance))) {
-      LOG_WARN("push back distance fail", K(ret), K(is_sparse), K(count));
-      segment_handle->mem_ctx()->Deallocate(const_cast<float*>(distance));
+      LOG_WARN("cal_distance_by_id fail", K(ret), K(is_sparse), K(query_count));
+    } else if (query_count > 0 && OB_ISNULL(distance)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("null brute force distances", K(ret), K(i), K(query_count));
+    } else if (query_count < count) {
+      if (OB_ISNULL(full_distance = static_cast<float *>(segment_handle->mem_ctx()->alloc_nothrow(sizeof(float) * count)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to allocate brute force distances", K(ret), K(count));
+      } else {
+        std::fill_n(full_distance, count, -1.0f);
+        for (int64_t j = 0; j < query_count; ++j) {
+          full_distance[segment_positions.at(i).at(j)] = distance[j];
+        }
+        if (OB_NOT_NULL(distance)) {
+          segment_handle->mem_ctx()->Deallocate(const_cast<float *>(distance));
+        }
+        distance = full_distance;
+      }
     }
+    if (OB_SUCC(ret) && OB_FAIL(result.distances_.push_back(distance))) {
+      LOG_WARN("push back distance fail", K(ret), K(is_sparse), K(count));
+    }
+    if (OB_FAIL(ret) && OB_NOT_NULL(distance)) {
+      segment_handle->mem_ctx()->Deallocate(const_cast<float *>(distance));
+    }
+    LOG_TRACE("brute force segment vids", K(i), K(count), K(query_count), K(grouped));
   }
 
   return ret;
