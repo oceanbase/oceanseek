@@ -465,26 +465,30 @@ int ObSSAsyncIndexMergeCtx::init_tablet_merge_info()
     static_desc_.is_non_idem_major_ = is_non_idem_major;
     // 数据 writer 个数对应的序号段，再加 1 个索引树序号段。
     const int64_t seq_step_cnt = get_data_macro_seq_slot_count() + INDEX_TREE_MACRO_SEQ_SLOT_CNT;
-    // Each non-idempotent Major build gets its own op_id and dedicated object types.
-    if (is_inc_major_compaction
-        && OB_FAIL(SSCompactHelper::start_inc_major_compaction_task(
+    if (is_inc_major_compaction) {
+      if (OB_FAIL(SSCompactHelper::start_inc_major_compaction_task(
             get_ls_id(), get_tablet_id(), get_tablet()->get_reorganization_scn(),
             get_merge_version(), seq_step_cnt,
             0/*列组数*/, static_desc_.op_id_, sstable_protocol_))) {
-      LOG_WARN("start inc major compaction task fail", K(ret));
-    } else if (is_non_idem_major
-        && OB_FAIL(SSCompactHelper::start_non_idem_major_task(
+        LOG_WARN("start inc major compaction task fail", K(ret));
+      }
+    } else if (is_non_idem_major) {
+      // Each non-idempotent Major build gets its own op_id and dedicated object types.
+      if (OB_FAIL(SSCompactHelper::start_non_idem_major_task(
             get_ls_id(), get_tablet_id(), get_tablet()->get_reorganization_scn(),
             get_merge_version(), seq_step_cnt,
             0/*列组数*/, static_desc_.op_id_, sstable_protocol_))) {
-      LOG_WARN("start non-idempotent build task fail", K(ret));
-    } else if (!is_inc_major_compaction && !is_non_idem_major
-        && OB_FAIL(SSCompactHelper::start_major_task(
+        LOG_WARN("start non-idempotent build task fail", K(ret));
+      }
+    } else {
+      if (OB_FAIL(SSCompactHelper::start_major_task(
             get_ls_id(), get_tablet_id(), get_tablet()->get_reorganization_scn(),
             get_merge_version(), seq_step_cnt,
             0/*列组数*/, sstable_protocol_))) {
-      LOG_WARN("start major task fail", K(ret));
-    } else {
+        LOG_WARN("start major task fail", K(ret));
+      }
+    }
+    if (OB_SUCC(ret)) {
       LOG_INFO("async index init merge info succ");
     }
   }

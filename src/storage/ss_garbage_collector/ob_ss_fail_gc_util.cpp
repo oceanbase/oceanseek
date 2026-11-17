@@ -62,15 +62,16 @@ int ObSSFailGCUtil::detect_sstable_block_ids(
     const int64_t parallel_cnt = object_info.parallel_cnt_;
 
     if (blocksstable::ObStorageObjectType::SHARED_MAJOR_SSTABLE_CTRL == meta_type
-        || blocksstable::ObStorageObjectType::SHARED_NON_IDEM_MAJOR_SSTABLE_CTRL == meta_type) {
+        || blocksstable::ObStorageObjectType::SHARED_NON_IDEM_MAJOR_SSTABLE_CTRL == meta_type
+        || blocksstable::ObStorageObjectType::SHARED_INC_MAJOR_SSTABLE_CTRL == meta_type) {
       if (OB_UNLIKELY(object_info.cg_cnt_ < 0)
           || OB_UNLIKELY(!object_info.snapshot_version_.is_valid_and_not_min())) {
         ret = OB_INVALID_ARGUMENT;
         LOG_WARN("invalid major object_info", KR(ret), K(object_info));
       } else {
-        const int64_t fourth_id = object_info.is_non_idem_major()
-            ? op_id : static_cast<int64_t>(object_info.snapshot_version_.get_val_for_tx());
-        const int64_t physical_cg_cnt = 0 == object_info.cg_cnt_ ? 1 : object_info.cg_cnt_;
+        const int64_t fourth_id = (ObStorageObjectType::SHARED_MAJOR_SSTABLE_CTRL == meta_type)
+            ? static_cast<int64_t>(object_info.snapshot_version_.get_val_for_tx()) : op_id;
+        const int64_t physical_cg_cnt = (0 == object_info.cg_cnt_) ? 1 : object_info.cg_cnt_;
         for (int64_t cg_id = 0; OB_SUCC(ret) && cg_id < physical_cg_cnt; ++cg_id) {
           for (int64_t i = 0; OB_SUCC(ret) && i < parallel_cnt; ++i) {
             const int64_t slice_start_seq = i * seq_step;
@@ -79,31 +80,7 @@ int ObSSFailGCUtil::detect_sstable_block_ids(
                     data_obj_type, meta_obj_type, fourth_id, slice_start_seq, seq_step, cg_id,
                     sstable_block_ids))) {
               LOG_WARN("probe-build sstable slice failed", KR(ret), K(meta_type),
-                  K(ls_id), K(tablet_id), K(slice_start_seq), K(cg_id));
-            }
-          }
-        }
-      }
-    } else if (blocksstable::ObStorageObjectType::SHARED_INC_MAJOR_SSTABLE_CTRL == meta_type
-        && object_info.is_inc_major()) {
-      // inc-major compaction 宏块第四维使用本轮 op_id。
-      if (OB_UNLIKELY(object_info.cg_cnt_ < 0)
-          || OB_UNLIKELY(!object_info.snapshot_version_.is_valid_and_not_min())) {
-        ret = OB_INVALID_ARGUMENT;
-        LOG_WARN("invalid inc major compaction object_info", KR(ret), K(object_info));
-      } else {
-        const int64_t physical_cg_cnt = 0 == object_info.cg_cnt_ ? 1 : object_info.cg_cnt_;
-        for (int64_t cg_id = 0; OB_SUCC(ret) && cg_id < physical_cg_cnt; ++cg_id) {
-          for (int64_t i = 0; OB_SUCC(ret) && i < parallel_cnt; ++i) {
-            const int64_t slice_start_seq = i * seq_step;
-            if (OB_FAIL(detect_sstable_slice_block_ids_(
-                    ls_id, tablet_id, reorganization_scn.get_val_for_tx(),
-                    ObStorageObjectType::SHARED_INC_MAJOR_COMPACTION_DATA_MACRO,
-                    ObStorageObjectType::SHARED_INC_MAJOR_COMPACTION_META_MACRO,
-                    op_id, slice_start_seq, seq_step, cg_id,
-                    sstable_block_ids))) {
-              LOG_WARN("probe-build inc major compaction sstable slice failed", KR(ret),
-                  K(meta_type), K(ls_id), K(tablet_id), K(op_id), K(slice_start_seq), K(cg_id));
+                  K(ls_id), K(tablet_id), K(fourth_id), K(slice_start_seq), K(cg_id));
             }
           }
         }
