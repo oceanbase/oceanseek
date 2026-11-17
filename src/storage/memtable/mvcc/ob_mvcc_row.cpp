@@ -1252,5 +1252,13 @@ void ObMvccRow::print_row()
     }
   }
 }
+void ObMvccTransNode::release_lob_redo()
+{
+  ObMemtableDataHeader *mtd = reinterpret_cast<ObMemtableDataHeader *>(buf_);
+  if (mtd->with_lob_payload()) {
+    mtd->lob_redo_info()->release();
+  }
+}
+
 }; // end namespace mvcc
 }; // end namespace oceanbase

@@ -89,6 +89,7 @@ struct ObTTLFilterInfoArg;
 
 namespace storage
 {
+struct ObLobOutTableRedoCtx;
 class ObLS;
 struct ObMetaDiskAddr;
 class ObRowReshape;
@@ -1334,7 +1335,8 @@ private:
       const blocksstable::ObDatumRow &old_row,
       blocksstable::ObDatumRow &new_row,
       const ObIArray<transaction::ObEncryptMetaCache> *encrypt_meta_arr,
-      const common::ObIArray<int64_t> *old_row_log_column_idxs);
+      const common::ObIArray<int64_t> *old_row_log_column_idxs,
+      const ObLobOutTableRedoCtx *outtable_redo_ctx);
   static int update_rows_wrap(
       ObTabletHandle &tablet_handle,
       const blocksstable::ObDatumRow *data_row_for_lob,
@@ -1345,7 +1347,8 @@ private:
       const blocksstable::ObDatumRow *old_rows,
       const common::ObIArray<transaction::ObEncryptMetaCache> *encrypt_meta_arr,
       ObRowsInfo &rows_info,
-      const common::ObIArray<int64_t> *old_row_log_column_idxs);
+      const common::ObIArray<int64_t> *old_row_log_column_idxs,
+      const ObLobOutTableRedoCtx *outtable_redo_ctx);
   static int batch_calc_split_dst_rows(
       ObLS &ls,
       ObTabletHandle &tablet_handle,
@@ -1371,7 +1374,8 @@ private:
       const bool check_exists,
       const ObIArray<share::schema::ObColDesc> &col_descs,
       blocksstable::ObDatumRow &row,
-      const ObIArray<transaction::ObEncryptMetaCache> *encrypt_meta_arr);
+      const ObIArray<transaction::ObEncryptMetaCache> *encrypt_meta_arr,
+      const ObLobOutTableRedoCtx *outtable_redo_ctx);
   static int check_row_locked_by_myself_wrap(
       ObTabletHandle &tablet_handle,
       const blocksstable::ObDatumRow *data_row_for_lob,

@@ -12,6 +12,7 @@
 
 #include "lib/allocator/page_arena.h"
 #include "lib/checksum/ob_crc64.h"
+#include "lib/time/ob_time_utility.h"
 #include "storage/access/ob_dml_param.h"
 #include "storage/blocksstable/ob_storage_object_handle.h"
 #include "storage/lob/access/ob_lob_iterator.h"
@@ -19,6 +20,8 @@
 #include "storage/lob/ob_lob_manager.h"
 #include "storage/lob/store/ob_lob_persistent_iterator.h"
 #include "storage/lob/store/ob_lob_outtable_io.h"
+#include "storage/lob/store/ob_lob_outtable_redo_payload.h"
+#include "storage/lob/store/ob_lob_aux_manager.h"
 #include "storage/lob/store/ob_lob_meta.h"
 #include "storage/lob/store/ob_lob_store_common.h"
 
@@ -58,6 +61,10 @@ public:
     }
     return ret;
   }
+
+  void prepare_redo_context(ObLobInsertContext &ctx);
+
+  void prepare_redo_meta(ObIAllocator &allocator, const ObString &data, ObLobMetaInfo &meta);
 
   ObArenaAllocator external_info_allocator_;
   ObLobManager lob_manager_;
@@ -691,6 +698,7 @@ TEST_F(TestLobChunkSpliter, outtable_batch_preparation_preserves_chunks_and_erro
     ObLobAppendSourceIter query_iter;
     ASSERT_EQ(OB_SUCCESS, query_iter.open(&allocator, ObString(), data, CS_TYPE_BINARY));
     ObLobInsertContext insert_ctx;
+    ASSERT_NO_FATAL_FAILURE(prepare_redo_context(insert_ctx));
     insert_ctx.lob_meta_tablet_id_ = ObTabletID(1001);
     ObLobId lob_id;
     lob_id.assign(2, 1001, 2002);
@@ -714,7 +722,12 @@ TEST_F(TestLobChunkSpliter, outtable_batch_preparation_preserves_chunks_and_erro
     }
     ObArray<ObString> chunk_data;
     ObArray<ObOuttableLobControlKey> control_keys;
+    ObLobAppendSourceIter redo_iter;
+    ASSERT_EQ(OB_SUCCESS, redo_iter.open(&allocator, ObString(), data, CS_TYPE_BINARY));
+    ObLobMetaManager meta_manager;
+    ObArray<ObLobOutTableRedoPayload> payloads;
     for (int64_t batch = 0; batch < 2; ++batch) {
+      payloads.reuse();
       batch_allocator.reuse();
       const int ret = iter.prepare_batch_(batch_allocator, chunk_data, control_keys);
       if (missing_macro_id && 1 == batch) {
@@ -738,6 +751,23 @@ TEST_F(TestLobChunkSpliter, outtable_batch_preparation_preserves_chunks_and_erro
         ASSERT_EQ(expected_macro_id, control_keys.at(i).macro_id_);
         ASSERT_EQ(expected_crc, control_keys.at(i).hash_);
         ASSERT_EQ(expected_crc, static_cast<uint64_t>(expected_macro_id.fifth_id()));
+        ObLobOutTableRedoPayload payload;
+        ASSERT_EQ(OB_SUCCESS, meta_manager.prepare_outtable_redo_payload_(insert_ctx,
+            &redo_iter, metas.at(idx), 50001, true, batch_allocator, payload));
+        ASSERT_TRUE(payload.is_valid());
+        EXPECT_EQ(expected, payload.data_);
+        EXPECT_NE(redo_iter.buffer_.ptr(), payload.data_.ptr());
+        EXPECT_EQ(metas.at(idx).lob_col_idx_, payload.lob_col_idx_);
+        EXPECT_EQ(metas.at(idx).lob_id_, payload.lob_id_);
+        EXPECT_EQ(metas.at(idx).seq_id_, payload.seq_id_);
+        EXPECT_EQ(control_keys.at(i).macro_id_, payload.macro_id_);
+        EXPECT_EQ(insert_ctx.insert_lob_seq_no_, payload.lob_operation_seq_no_);
+        EXPECT_EQ(50001, payload.lob_piece_table_id_);
+        ASSERT_EQ(OB_SUCCESS, payloads.push_back(payload));
+      }
+      // Later source reads reuse their buffer; every payload must still own the matching bytes.
+      for (int64_t i = 0; i < payloads.count(); ++i) {
+        EXPECT_EQ(chunk_data.at(i), payloads.at(i).data_);
       }
       ASSERT_EQ((0 == batch) ? capacity : chunk_count, iter.idx_);
       ASSERT_EQ(iter.idx_, metas.count());
@@ -1401,6 +1431,144 @@ TEST_F(TestLobChunkSpliter, lob_write_iter_reset_clears_finished_state)
   ASSERT_FALSE(write_iter.is_finished());
   ASSERT_EQ(OB_NOT_INIT, write_iter.get_next_row(result));
   ASSERT_EQ(OB_NOT_INIT, write_iter.get_pending_locator(pending_locator));
+}
+
+TEST_F(TestLobChunkSpliter, outtable_redo_payload_preserves_append_prefix_and_tail)
+{
+  ObArenaAllocator allocator;
+  ObArenaAllocator payload_allocator;
+  const int64_t chunk_size = ObLobMetaUtil::LOB_OUTTABLE_BLOCK_DATA_SIZE;
+  const ObString prefix = make_data(allocator, "a", chunk_size - 17);
+  const ObString append_data = make_data(allocator, "b", 34);
+  ObString first_expected = make_data(allocator, "a", chunk_size);
+  MEMSET(first_expected.ptr() + prefix.length(), 'b', 17);
+  const ObString tail_expected(17, append_data.ptr() + 17);
+  ObLobAppendSourceIter source;
+  ASSERT_EQ(OB_SUCCESS, source.open(&allocator, prefix, append_data, CS_TYPE_BINARY));
+  ObLobInsertContext ctx;
+  ASSERT_NO_FATAL_FAILURE(prepare_redo_context(ctx));
+  ObLobMetaInfo first_meta;
+  ObLobMetaInfo tail_meta;
+  ASSERT_NO_FATAL_FAILURE(prepare_redo_meta(allocator, first_expected, first_meta));
+  ASSERT_NO_FATAL_FAILURE(prepare_redo_meta(allocator, tail_expected, tail_meta));
+  ASSERT_EQ(OB_SUCCESS, ObLobSeqId::get_seq_id(allocator, 2, tail_meta.seq_id_));
+  ObLobMetaManager manager;
+  ObLobOutTableRedoPayload first_payload;
+  ObLobOutTableRedoPayload tail_payload;
+  ASSERT_EQ(OB_SUCCESS, manager.prepare_outtable_redo_payload_(
+      ctx, &source, first_meta, 50001, true, payload_allocator, first_payload));
+  ASSERT_EQ(first_expected, first_payload.data_);
+  ASSERT_NE(source.buffer_.ptr(), first_payload.data_.ptr());
+  ASSERT_EQ(OB_SUCCESS, manager.prepare_outtable_redo_payload_(
+      ctx, &source, tail_meta, 50001, true, payload_allocator, tail_payload));
+  EXPECT_EQ(tail_expected, tail_payload.data_);
+  EXPECT_EQ(first_expected, first_payload.data_);
+  EXPECT_EQ(first_meta.seq_id_, first_payload.seq_id_);
+  EXPECT_EQ(tail_meta.seq_id_, tail_payload.seq_id_);
+  EXPECT_EQ(ctx.insert_lob_seq_no_, first_payload.lob_operation_seq_no_);
+  EXPECT_EQ(ctx.insert_lob_seq_no_, tail_payload.lob_operation_seq_no_);
+  EXPECT_TRUE(first_payload.is_valid());
+  EXPECT_TRUE(tail_payload.is_valid());
+}
+
+TEST_F(TestLobChunkSpliter, outtable_redo_payload_nologging_does_not_read_source)
+{
+  ObArenaAllocator allocator;
+  const ObString data = make_data(allocator, "a", 17);
+  ObLobInsertContext ctx;
+  ASSERT_NO_FATAL_FAILURE(prepare_redo_context(ctx));
+  ObLobMetaInfo meta;
+  ASSERT_NO_FATAL_FAILURE(prepare_redo_meta(allocator, data, meta));
+  ObLobMetaManager manager;
+  ObLobOutTableRedoPayload payload;
+  ASSERT_EQ(OB_SUCCESS, manager.prepare_outtable_redo_payload_(
+      ctx, nullptr, meta, 50001, false, allocator, payload));
+  EXPECT_TRUE(payload.is_valid());
+  EXPECT_FALSE(payload.is_logging_);
+  EXPECT_TRUE(payload.data_.empty());
+  EXPECT_EQ(17, payload.byte_len_);
+
+  ObLobAppendSourceIter source;
+  ASSERT_EQ(OB_SUCCESS, source.open(&allocator, ObString(), data, CS_TYPE_BINARY));
+  ASSERT_EQ(OB_SUCCESS, manager.prepare_outtable_redo_payload_(
+      ctx, &source, meta, 50001, false, allocator, payload));
+  EXPECT_EQ(0, source.first_buffer_pos_);
+  EXPECT_EQ(0, source.second_buffer_pos_);
+  ObLobChunk chunk;
+  ASSERT_EQ(OB_SUCCESS, source.get_next_chunk(chunk, ObLobMetaUtil::LOB_OUTTABLE_BLOCK_DATA_SIZE));
+  EXPECT_EQ(data, chunk.lob_data_);
+}
+
+TEST_F(TestLobChunkSpliter, outtable_redo_payload_rejects_short_source_and_summary)
+{
+  ObArenaAllocator allocator;
+  const ObString data = make_data(allocator, "a", 17);
+  ObLobInsertContext ctx;
+  ASSERT_NO_FATAL_FAILURE(prepare_redo_context(ctx));
+  ObLobMetaInfo meta;
+  ASSERT_NO_FATAL_FAILURE(prepare_redo_meta(allocator, data, meta));
+  ObLobMetaManager manager;
+  ObLobOutTableRedoPayload payload;
+  ObLobAppendSourceIter source;
+  ASSERT_EQ(OB_SUCCESS, source.open(&allocator, ObString(), data, CS_TYPE_BINARY));
+  ASSERT_EQ(OB_SUCCESS, manager.prepare_outtable_redo_payload_(
+      ctx, &source, meta, 50001, true, allocator, payload));
+  ASSERT_EQ(OB_ERR_UNEXPECTED, manager.prepare_outtable_redo_payload_(
+      ctx, &source, meta, 50001, true, allocator, payload));
+  EXPECT_FALSE(payload.is_valid());
+  EXPECT_TRUE(payload.data_.empty());
+
+  source.reset();
+  const ObString short_data(16, data.ptr());
+  ASSERT_EQ(OB_SUCCESS, source.open(&allocator, ObString(), short_data, CS_TYPE_BINARY));
+  ASSERT_EQ(OB_ERR_UNEXPECTED, manager.prepare_outtable_redo_payload_(
+      ctx, &source, meta, 50001, true, allocator, payload));
+  EXPECT_FALSE(payload.is_valid());
+  EXPECT_TRUE(payload.data_.empty());
+
+  ObLobMetaExtraInfo extra_info;
+  extra_info.extra_info_type_ = ObLobMetaExtraInfo::LOB_META_SUMMARY;
+  extra_info.lob_chunk_type_.set_out_table();
+  extra_info.compressed_len_ = data.length();
+  ASSERT_EQ(OB_SUCCESS, extra_info.serialize(allocator, meta.lob_extra_info_));
+  ASSERT_EQ(OB_INVALID_ARGUMENT, manager.prepare_outtable_redo_payload_(
+      ctx, nullptr, meta, 50001, false, allocator, payload));
+  EXPECT_FALSE(payload.is_valid());
+}
+
+void TestLobChunkSpliter::prepare_redo_context(ObLobInsertContext &ctx)
+{
+  ctx.timeout_ = ObTimeUtility::current_time_us() + 60L * 1000L * 1000L;
+  ctx.insert_lob_seq_no_ = transaction::ObTxSEQ(100, 0);
+}
+
+void TestLobChunkSpliter::prepare_redo_meta(ObIAllocator &allocator, const ObString &data, ObLobMetaInfo &meta)
+{
+  ObLobChunk chunk;
+  chunk.lob_col_idx_ = 2;
+  chunk.lob_id_.assign(2, 1001, 2002);
+  ASSERT_EQ(OB_SUCCESS, ObLobSeqId::get_seq_id(allocator, 1, chunk.seq_id_));
+  chunk.byte_len_ = data.length();
+  chunk.char_len_ = data.length();
+  chunk.lob_data_ = data;
+  chunk.lob_extra_info_.extra_info_type_ = ObLobMetaExtraInfo::LOB_DATA;
+  chunk.lob_extra_info_.lob_chunk_type_.set_out_table();
+  chunk.lob_extra_info_.has_crc_ = true;
+  chunk.lob_extra_info_.crc_ = ob_crc64(data.ptr(), data.length());
+  chunk.lob_extra_info_.compressed_len_ = data.length();
+  blocksstable::MacroBlockId macro_id;
+  macro_id.set_version_v1();
+  macro_id.set_id_mode(static_cast<uint64_t>(blocksstable::ObMacroBlockIdMode::ID_MODE_SHARE));
+  macro_id.set_storage_object_type(
+      static_cast<uint64_t>(blocksstable::ObStorageObjectType::SHARED_OUTTABLE_LOB_DATA_MACRO));
+  macro_id.set_location(blocksstable::ObMacroBlockIdLocation::OBJECT_STORAGE);
+  macro_id.set_second_id(100);
+  macro_id.set_third_id(1001);
+  macro_id.set_fourth_id(2002);
+  macro_id.set_fifth_id(static_cast<int64_t>(chunk.lob_extra_info_.crc_));
+  ASSERT_EQ(OB_SUCCESS,
+      ObLobOutTableIO::serialize_macro_id(allocator, macro_id, chunk.lob_block_id_));
+  ASSERT_EQ(OB_SUCCESS, chunk.to_meta(allocator, meta));
 }
 
 }  // end namespace unittest

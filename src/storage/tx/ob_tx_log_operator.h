@@ -913,31 +913,8 @@ OB_INLINE void ObTxCtxLogOperator<ObTxLobOutTableDataLog>::after_submit_log_succ
 template <>
 OB_INLINE int ObTxCtxLogOperator<ObTxLobOutTableDataLog>::replay_out_ctx_()
 {
-  int ret = OB_SUCCESS;
-  bool is_exist = false;
-  const blocksstable::MacroBlockId &macro_id = log_object_ptr_->get_macro_id();
-  const common::ObString &data = log_object_ptr_->get_data();
-  const bool is_logging = log_object_ptr_->is_logging();
-
-  if (OB_UNLIKELY(!macro_id.is_valid()
-                  || (is_logging && data.empty()) || (!is_logging && !data.empty()))) {
-    ret = OB_INVALID_ARGUMENT;
-    TRANS_LOG(WARN, "invalid lob outtable replay data", KR(ret), K(macro_id), K(data.length()),
-              K(is_logging), KPC(this));
-  } else if (is_logging) {
-    if (OB_FAIL(storage::ObLobOutTableIO::is_exist(macro_id, tx_ctx_->ls_id_.id(), is_exist))) {
-      TRANS_LOG(WARN, "head lob outtable object failed", KR(ret), K(macro_id), KPC(this));
-    } else if (!is_exist && OB_FAIL(storage::ObLobOutTableIO::write(macro_id, data))) {
-      TRANS_LOG(WARN, "write lob outtable replay object failed", KR(ret), K(macro_id));
-    }
-  }
-
-  if (OB_SUCCESS != ret && storage::ObLobOutTableIO::is_retryable_error(ret)) {
-    const int io_ret = ret;
-    ret = OB_EAGAIN;
-    TRANS_LOG(INFO, "rewrite retryable outtable replay error", KR(ret), KR(io_ret), K(macro_id));
-  }
-  return ret;
+  return storage::ObLobOutTableIO::replay_object(log_object_ptr_->get_macro_id(),
+      log_object_ptr_->get_data(), log_object_ptr_->is_logging(), tx_ctx_->ls_id_.id());
 }
 
 template <>

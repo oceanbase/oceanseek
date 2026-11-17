@@ -20,7 +20,10 @@ namespace oceanbase
 namespace storage
 {
 class ObPersistentLobAdaptor;
+class ObLobQueryIter;
 struct ObLobMetaScanResult;
+struct ObLobOutTableRedoCtx;
+struct ObLobOutTableRedoPayload;
 
 class ObLobMetaManager
 {
@@ -35,7 +38,15 @@ public:
   void reset();
   // write one lob meta row
   int insert(ObLobInsertContext &insert_ctx, ObLobMetaInfo &in_row);
-  int batch_insert(ObLobInsertContext &insert_ctx, blocksstable::ObDatumRowIterator &iter);
+  int batch_insert(
+      ObLobInsertContext &insert_ctx,
+      blocksstable::ObDatumRowIterator &iter,
+      const ObLobOutTableRedoCtx *outtable_redo_ctx = nullptr);
+  int batch_insert_outtable(
+      ObLobInsertContext &insert_ctx,
+      ObLobQueryIter *iter,
+      const common::ObIArray<ObLobMetaInfo> &metas,
+      const bool is_logging);
   int batch_delete(ObLobDeleteContext &delete_ctx, blocksstable::ObDatumRowIterator &iter);
   // scan raw lob meta
   int scan(ObLobReadContext &read_ctx, ObLobMetaTableIter *&iter);
@@ -44,6 +55,8 @@ public:
   int del(ObLobDeleteContext &delete_ctx, ObLobMetaInfo &in_row);
   // specified range update
   int update(ObLobUpdateContext &update_ctx, ObLobMetaInfo &old_row, ObLobMetaInfo &new_row);
+  int update_outtable(ObLobUpdateContext &update_ctx, ObLobMetaInfo &old_row,
+      ObLobMetaInfo &new_row, ObLobQueryIter *iter, const bool is_logging);
   ObPersistentLobAdaptor *get_adaptor() const { return adaptor_; }
 
   int get_byte_length(ObLobReadContext &read_ctx, uint64_t &byte_length);
@@ -53,6 +66,12 @@ public:
   int get_table_param(const ObTableParam *&table_param);
   int get_table_dml_param(const ObTableDMLParam *&table_dml_param);
   TO_STRING_KV("[LOB]", "meta mngr");
+
+private:
+  static constexpr int64_t REDO_BATCH_SIZE = 8;
+  int prepare_outtable_redo_payload_(const ObLobWriteContext &ctx, ObLobQueryIter *iter,
+      const ObLobMetaInfo &meta, const uint64_t lob_piece_table_id, const bool is_logging,
+      common::ObIAllocator &allocator, ObLobOutTableRedoPayload &payload);
 
 private:
   bool is_inited_;

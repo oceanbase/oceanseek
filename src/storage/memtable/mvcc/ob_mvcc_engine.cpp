@@ -257,8 +257,9 @@ int ObMvccEngine::mvcc_write(storage::ObStoreCtx &ctx,
   int ret = OB_SUCCESS;
   ObMvccTransNode *node = (ObMvccTransNode *)buf;
 
-  if (OB_FAIL(init_tx_node_(arg, node))) {
+  if (OB_FAIL(init_tx_node_for_write_(ctx, arg, node))) {
     TRANS_LOG(WARN, "build tx node failed", K(ret), K(ctx), K(arg));
+    node = nullptr; // Do not inspect an incomplete data header during cleanup.
   } else if (OB_FAIL(value.mvcc_write(ctx,
                                       *node,
                                       check_exist,
@@ -270,6 +271,9 @@ int ObMvccEngine::mvcc_write(storage::ObStoreCtx &ctx,
   } else {
     TRANS_LOG(DEBUG, "mvcc write succeed", K(ret), K(ctx), K(arg),
               KPC(node), K(value));
+  }
+  if (nullptr != node && (OB_SUCCESS != ret || !res.has_insert())) {
+    node->release_lob_redo();
   }
 
   return ret;
@@ -284,8 +288,9 @@ int ObMvccEngine::mvcc_write(storage::ObStoreCtx &ctx,
   int ret = OB_SUCCESS;
   ObMvccTransNode *node = nullptr;
 
-  if (OB_FAIL(build_tx_node_(arg, node))) {
+  if (OB_FAIL(build_tx_node_for_write_(ctx, arg, node))) {
     TRANS_LOG(WARN, "build tx node failed", K(ret), K(ctx), K(arg));
+    node = nullptr; // Do not inspect an incomplete data header during cleanup.
   } else if (OB_FAIL(value.mvcc_write(ctx,
                                       *node,
                                       check_exist,
@@ -298,6 +303,9 @@ int ObMvccEngine::mvcc_write(storage::ObStoreCtx &ctx,
     TRANS_LOG(DEBUG, "mvcc write succeed", K(ret), K(ctx), K(arg),
               KPC(node), K(value));
   }
+  if (nullptr != node && (OB_SUCCESS != ret || !res.has_insert())) {
+    node->release_lob_redo();
+  }
 
   return ret;
 }
@@ -306,7 +314,7 @@ int ObMvccEngine::mvcc_replay(const ObTxNodeArg &arg, ObMvccReplayResult &res)
 {
   int ret = OB_SUCCESS;
   ObMvccTransNode *node = NULL;
-  if (OB_FAIL(build_tx_node_(arg, node))) {
+  if (OB_FAIL(build_tx_node_for_replay_(arg, node))) {
     TRANS_LOG(WARN, "build tx node failed", K(ret), K(arg));
   } else {
     res.tx_node_ = node;
@@ -693,6 +701,64 @@ int ObMvccEngineWithoutHashIndex::create_btree_kv_(const ObMemtableKey *key,
     TRANS_LOG(WARN, "get NULL value", K(ret), K(key));
   }
 
+  return ret;
+}
+
+int ObMvccEngine::build_tx_node_for_write_(ObStoreCtx &ctx, const ObTxNodeArg &arg,
+    ObMvccTransNode *&node)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(build_tx_node_(arg, node))) {
+    TRANS_LOG(WARN, "failed to build write node", K(ret), K(arg));
+  } else if (OB_FAIL(prepare_lob_redo_(ctx, arg, *node))) {
+    TRANS_LOG(WARN, "failed to prepare LOB redo for write node", K(ret), K(arg));
+  }
+  return ret;
+}
+
+int ObMvccEngine::init_tx_node_for_write_(ObStoreCtx &ctx, const ObTxNodeArg &arg,
+    ObMvccTransNode *node)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(init_tx_node_(arg, node))) {
+    TRANS_LOG(WARN, "failed to initialize write node", K(ret), K(arg));
+  } else if (OB_FAIL(prepare_lob_redo_(ctx, arg, *node))) {
+    TRANS_LOG(WARN, "failed to prepare LOB redo for preallocated node", K(ret), K(arg));
+  }
+  return ret;
+}
+
+int ObMvccEngine::build_tx_node_for_replay_(const ObTxNodeArg &arg, ObMvccTransNode *&node)
+{
+  int ret = OB_SUCCESS;
+  if (nullptr != arg.lob_redo_payload_) {
+    ret = OB_INVALID_ARGUMENT;
+    TRANS_LOG(WARN, "replay node must carry a digest, not a write payload", K(ret), K(arg));
+  } else if (OB_FAIL(build_tx_node_(arg, node))) {
+    TRANS_LOG(WARN, "failed to build replay node", K(ret), K(arg));
+  }
+  return ret;
+}
+
+int ObMvccEngine::prepare_lob_redo_(ObStoreCtx &ctx, const ObTxNodeArg &arg, ObMvccTransNode &node)
+{
+  int ret = OB_SUCCESS;
+  ObMemtableDataHeader *header = reinterpret_cast<ObMemtableDataHeader *>(node.buf_);
+  const bool with_lob_payload = header->with_lob_payload();
+  if (nullptr == arg.lob_redo_payload_ && !with_lob_payload) {
+    // Ordinary rows have no LOB attachment.
+  } else if (nullptr == arg.lob_redo_payload_ || !with_lob_payload
+      || nullptr == ctx.mvcc_acc_ctx_.get_mem_ctx()) {
+    ret = OB_INVALID_ARGUMENT;
+    TRANS_LOG(WARN, "invalid LOB write node payload", K(ret), K(arg));
+  } else if (blocksstable::ObDmlFlag::DF_INSERT != header->dml_flag_
+        && blocksstable::ObDmlFlag::DF_UPDATE != header->dml_flag_
+        && blocksstable::ObDmlFlag::DF_PUT != header->dml_flag_) {
+    ret = OB_NOT_SUPPORTED;
+  } else if (OB_FAIL(header->lob_redo_info()->init(
+      ctx.mvcc_acc_ctx_.get_mem_ctx()->get_tenant_id(), *arg.lob_redo_payload_))) {
+    TRANS_LOG(WARN, "failed to build LOB redo in trans node", K(ret), K(arg));
+  }
   return ret;
 }
 

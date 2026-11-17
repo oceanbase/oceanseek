@@ -20,6 +20,7 @@ namespace storage
 
 class ObPersistentLobAdaptor;
 struct ObLobMetaScanResult;
+struct ObLobOutTableRedoCtx;
 
 class ObLobAuxTableBaseIterator;
 template<typename T>
@@ -73,11 +74,18 @@ public: // read
 public: // write
   int write_lob_meta(ObLobInsertContext &insert_ctx, ObLobMetaInfo &row_info);
   int delete_lob_meta(ObLobDeleteContext &delete_ctx, ObLobMetaInfo &row_info);
-  int update_lob_meta(ObLobUpdateContext &update_ctx, ObLobMetaInfo &old_row, ObLobMetaInfo &new_row);
+  int update_lob_meta(ObLobUpdateContext &update_ctx,
+                      ObLobMetaInfo &old_row,
+                      ObLobMetaInfo &new_row,
+                      const ObLobOutTableRedoCtx *outtable_redo_ctx = nullptr);
 
-  int write_lob_meta(ObLobInsertContext &insert_ctx, blocksstable::ObDatumRowIterator &row_iter);
+  int write_lob_meta(ObLobInsertContext &insert_ctx,
+                     blocksstable::ObDatumRowIterator &row_iter,
+                     const ObLobOutTableRedoCtx *outtable_redo_ctx = nullptr);
   int delete_lob_meta(ObLobDeleteContext &delete_ctx, blocksstable::ObDatumRowIterator &row_iter);
-  int update_lob_meta(ObLobUpdateContext &update_ctx, blocksstable::ObDatumRowIterator &row_iter);
+  int update_lob_meta(ObLobUpdateContext &update_ctx,
+                      blocksstable::ObDatumRowIterator &row_iter,
+                      const ObLobOutTableRedoCtx *outtable_redo_ctx = nullptr);
 
   // === piece DML ===
   int write_lob_piece(ObLobInsertContext &insert_ctx, ObLobPieceInfo &row_info);
@@ -141,13 +149,15 @@ private: // write
   // Unified implementations of write/erase/update_lob_{meta,piece}(ObDatumRowIterator&).
   int do_write_lob_aux(const LobAuxTarget target,
                        ObLobInsertContext &insert_ctx,
-                       blocksstable::ObDatumRowIterator &row_iter);
+                       blocksstable::ObDatumRowIterator &row_iter,
+                       const ObLobOutTableRedoCtx *outtable_redo_ctx = nullptr);
   int do_erase_lob_aux(const LobAuxTarget target,
                        ObLobDeleteContext &delete_ctx,
                        blocksstable::ObDatumRowIterator &row_iter);
   int do_update_lob_aux(const LobAuxTarget target,
                         ObLobUpdateContext &update_ctx,
-                        blocksstable::ObDatumRowIterator &row_iter);
+                        blocksstable::ObDatumRowIterator &row_iter,
+                        const ObLobOutTableRedoCtx *outtable_redo_ctx = nullptr);
 
   // Apply EN_LOB_META_DML_FAILED error injection on META write path.
   OB_NOINLINE int errsim_meta_dml_failed(ObLobInsertContext &insert_ctx,

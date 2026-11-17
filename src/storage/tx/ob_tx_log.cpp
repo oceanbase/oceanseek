@@ -4,6 +4,7 @@
  */
 
 #include "storage/tx/ob_tx_log.h"
+#include "lib/checksum/ob_crc64.h"
 #include "storage/ddl/ob_ddl_inc_clog.h"
 #include "storage/memtable/ob_memtable_mutator.h"
 
@@ -797,12 +798,24 @@ int ObTxRedoLog::ob_admin_dump(memtable::ObMemtableMutatorIterator *iter_ptr,
       arg.writer_ptr_->dump_string(helper.convert(iter_ptr->get_row_head()));
 
       switch (iter_ptr->get_row_head().mutator_type_) {
-        case memtable::MutatorType::MUTATOR_ROW: {
-          arg.writer_ptr_->dump_key("NORMAL_ROW");
+        case memtable::MutatorType::MUTATOR_ROW:
+        case memtable::MutatorType::MUTATOR_LOB_OUTTABLE_ROW: {
+          const bool with_lob_payload = memtable::MutatorType::MUTATOR_LOB_OUTTABLE_ROW
+              == iter_ptr->get_row_head().mutator_type_;
+          arg.writer_ptr_->dump_key(with_lob_payload ? "LOB_OUTTABLE_ROW" : "NORMAL_ROW");
           arg.writer_ptr_->start_object();
           arg.log_stat_->normal_row_count_++;
           if (OB_FAIL(format_mutator_row_(iter_ptr->get_mutator_row(), arg))) {
             TRANS_LOG(WARN, "format json mutator row failed", K(ret));
+          } else if (with_lob_payload) {
+            const ObString &payload_buf = iter_ptr->get_lob_outtable_payload_buf();
+            arg.writer_ptr_->dump_key("LobPayload");
+            helper.reset();
+            arg.writer_ptr_->dump_string(helper.convert(iter_ptr->get_lob_outtable_payload()));
+            arg.writer_ptr_->dump_key("LobPayloadLength");
+            arg.writer_ptr_->dump_int64(payload_buf.length());
+            arg.writer_ptr_->dump_key("LobPayloadCrc64");
+            arg.writer_ptr_->dump_uint64(ob_crc64(payload_buf.ptr(), payload_buf.length()));
           }
           arg.writer_ptr_->end_object();
           break;

@@ -5220,7 +5220,8 @@ int ObTablet::update_row(
     const blocksstable::ObDatumRow &old_row,
     blocksstable::ObDatumRow &new_row,
     const common::ObIArray<transaction::ObEncryptMetaCache> *encrypt_meta_arr,
-    const common::ObIArray<int64_t> *old_row_log_column_idxs)
+    const common::ObIArray<int64_t> *old_row_log_column_idxs,
+    const ObLobOutTableRedoCtx *outtable_redo_ctx)
 {
   int ret = OB_SUCCESS;
 
@@ -5264,7 +5265,8 @@ int ObTablet::update_row(
                                  old_row_log_column_idxs,
                                  1,     /*row_count*/
                                  false, /*check_exist*/
-                                 encrypt_meta);
+                                 encrypt_meta,
+                                 outtable_redo_ctx);
       if (OB_FAIL(prepare_param_ctx(allocator, relative_table, store_ctx, param, context))) {
         LOG_WARN("prepare param ctx fail, ", K(ret));
       } else if (OB_FAIL(write_memtable->set(param,
@@ -5285,7 +5287,8 @@ int ObTablet::update_rows(
     const blocksstable::ObDatumRow *old_rows,
     const common::ObIArray<transaction::ObEncryptMetaCache> *encrypt_meta_arr,
     ObRowsInfo &rows_info,
-    const common::ObIArray<int64_t> *old_row_log_column_idxs)
+    const common::ObIArray<int64_t> *old_row_log_column_idxs,
+    const ObLobOutTableRedoCtx *outtable_redo_ctx)
 {
   int ret = OB_SUCCESS;
   {
@@ -5323,7 +5326,8 @@ int ObTablet::update_rows(
                                  old_row_log_column_idxs,
                                  row_count,
                                  false/*check_exist*/,
-                                 encrypt_meta);
+                                 encrypt_meta,
+                                 outtable_redo_ctx);
       if (OB_FAIL(prepare_param(relative_table, param))) {
         LOG_WARN("Failed to prepare param ctx", K(ret));
       } else if (1 == row_count) {
@@ -5344,7 +5348,8 @@ int ObTablet::insert_rows(
     const bool check_exist,
     const ObColDescIArray &col_descs,
     const common::ObIArray<transaction::ObEncryptMetaCache> *encrypt_meta_arr,
-    ObRowsInfo &rows_info)
+    ObRowsInfo &rows_info,
+    const ObLobOutTableRedoCtx *outtable_redo_ctx)
 {
   int ret = OB_SUCCESS;
   {
@@ -5383,7 +5388,8 @@ int ObTablet::insert_rows(
                                  nullptr/*old_row_log_column_idxs*/,
                                  row_count,
                                  check_exist,
-                                 encrypt_meta);
+                                 encrypt_meta,
+                                 outtable_redo_ctx);
       if (OB_FAIL(prepare_param(relative_table, param))) {
         LOG_WARN("Failed to prepare param ctx", K(ret));
       } else if (1 == row_count) {
@@ -5407,7 +5413,8 @@ int ObTablet::insert_row(
     const bool check_exist,
     const common::ObIArray<share::schema::ObColDesc> &col_descs,
     blocksstable::ObDatumRow &row,
-    const common::ObIArray<transaction::ObEncryptMetaCache> *encrypt_meta_arr)
+    const common::ObIArray<transaction::ObEncryptMetaCache> *encrypt_meta_arr,
+    const ObLobOutTableRedoCtx *outtable_redo_ctx)
 {
   int ret = OB_SUCCESS;
   {
@@ -5467,7 +5474,8 @@ int ObTablet::insert_row(
                                  nullptr/*old_row_log_column_idxs*/,
                                  1,       /*row_count*/
                                  check_exist,
-                                 encrypt_meta);
+                                 encrypt_meta,
+                                 outtable_redo_ctx);
 
       if (OB_FAIL(prepare_param_ctx(allocator, relative_table, store_ctx, param, context))) {
         LOG_WARN("prepare param ctx fail, ", K(ret));

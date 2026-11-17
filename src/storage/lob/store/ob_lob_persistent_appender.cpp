@@ -98,7 +98,7 @@ int ObLobPersistentAppender::prepare_source_()
   int ret = OB_SUCCESS;
   source_iter_.reset();
 
-  // this function may be called repeatedly because outtable lob appender rereads the data when writing CLOG.
+  // OutTable appends reread the source when attaching object data to Meta row redo.
   // first_buffer_ does not need to be filled twice.
   if (first_buffer_.empty()) {
     if (ctx_->old_loc_.is_inrow()) {
@@ -302,10 +302,8 @@ int ObLobInTablePersistentAppender::read_last_chunk_()
 
 //==================== ObLobOutTablePersistentAppender ====================
 ObLobOutTablePersistentAppender::ObLobOutTablePersistentAppender()
-  : ObLobPersistentAppender(),
-    clog_metas_()
+  : ObLobPersistentAppender()
 {
-  clog_metas_.set_attr(ObMemAttr(MTL_ID(), "LobAppendClog"));
   reset();
 }
 
@@ -316,7 +314,6 @@ ObLobOutTablePersistentAppender::~ObLobOutTablePersistentAppender()
 
 void ObLobOutTablePersistentAppender::reset()
 {
-  clog_metas_.reset();
   ObLobPersistentAppender::reset();
 }
 
@@ -325,8 +322,8 @@ int ObLobOutTablePersistentAppender::write_data()
   int ret = OB_SUCCESS;
   ObArray<ObLobMetaInfo> metas;
   ObLobOutTableInsertIter write_iter;
+  ObLobQueryIter *redo_iter = is_no_logging_ ? nullptr : &source_iter_;
   metas.set_attr(ObMemAttr(MTL_ID(), "LobAppendOut"));
-  clog_metas_.reset();
   const int64_t chunk_size = ctx_->get_chunk_size(true/*is_outtable*/);
   const int64_t append_byte_len = ctx_->total_byte_length_ - ctx_->cur_byte_length_;
   int64_t mbmaxlen = 0;
@@ -354,12 +351,15 @@ int ObLobOutTablePersistentAppender::write_data()
   } else if (OB_UNLIKELY(metas.empty())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("outtable append generated no meta", KR(ret));
-  } else if (ctx_->update_first_) {
+  } else if (!is_no_logging_ && OB_FAIL(prepare_source_())) {
+    LOG_WARN("failed to prepare source for outtable meta redo", KR(ret), KPC(ctx_));
+  }
+
+  if (OB_SUCC(ret) && ctx_->update_first_) {
     ctx_->dml_op_ = ObLobDmlOp::UPDATE;
-    if (OB_FAIL(meta_mgr_->update(*ctx_, last_meta_info_, metas.at(0)))) {
+    if (OB_FAIL(meta_mgr_->update_outtable(
+        *ctx_, last_meta_info_, metas.at(0), redo_iter, !is_no_logging_))) {
       LOG_WARN("failed to update outtable tail meta", KR(ret), K(last_meta_info_), K(metas.at(0)));
-    } else if (OB_FAIL(clog_metas_.push_back(metas.at(0)))) {
-      LOG_WARN("failed to record appended outtable meta for clog", KR(ret), KPC(this));
     } else {
       metas.remove(0);
     }
@@ -367,18 +367,20 @@ int ObLobOutTablePersistentAppender::write_data()
 
   if (OB_FAIL(ret)) {
   } else if (!metas.empty()) {
-    ObLobMetaTableBatchInsertIter meta_iter;
     ctx_->dml_op_ = ObLobDmlOp::INSERT;
-    if (OB_FAIL(meta_iter.init(&metas))) {
-      LOG_WARN("failed to initialize appended meta iterator", KR(ret), KPC(this));
-    } else if (OB_FAIL(meta_mgr_->batch_insert(*ctx_, meta_iter))) {
+    if (OB_FAIL(meta_mgr_->batch_insert_outtable(*ctx_, redo_iter, metas, !is_no_logging_))) {
       LOG_WARN("failed to insert appended lob meta rows", KR(ret), KPC(this));
     }
-
-    for (int64_t i = 0; OB_SUCC(ret) && i < metas.count(); ++i) {
-      if (OB_FAIL(clog_metas_.push_back(metas.at(i)))) {
-        LOG_WARN("failed to record appended outtable meta for clog", KR(ret), K(i));
-      }
+  }
+  if (OB_SUCC(ret) && !is_no_logging_) {
+    ObLobChunk extra_chunk;
+    if (OB_ITER_END == (ret = redo_iter->get_next_chunk(extra_chunk, chunk_size))) {
+      ret = OB_SUCCESS;
+    } else if (OB_SUCC(ret)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("outtable append redo source has unconsumed data", KR(ret), KPC(ctx_));
+    } else {
+      LOG_WARN("failed to finish reading outtable append redo source", KR(ret), KPC(ctx_));
     }
   }
   return ret;
@@ -395,18 +397,6 @@ int ObLobOutTablePersistentAppender::read_last_chunk_()
     LOG_WARN("failed to read outtable tail block", KR(ret), K(last_meta_info_));
   } else if (OB_FAIL(ob_write_string(ctx_->own_allocator_, chunk_data, first_buffer_))) {
     LOG_WARN("failed to copy outtable tail block", KR(ret), K(last_meta_info_));
-  }
-  return ret;
-}
-
-int ObLobOutTablePersistentAppender::after_write_summary()
-{
-  int ret = OB_SUCCESS;
-  ObLobQueryIter *iter = is_no_logging_ ? nullptr : &source_iter_;
-  if (!is_no_logging_ && OB_FAIL(prepare_source_())) {
-    LOG_WARN("failed to prepare source for clog write", KR(ret), KPC(ctx_));
-  } else if (OB_FAIL(ObLobOutTableIO::write_clog(*ctx_, iter, clog_metas_, !is_no_logging_))) {
-    LOG_WARN("failed to write outtable clog", KR(ret), KPC(ctx_));
   }
   return ret;
 }

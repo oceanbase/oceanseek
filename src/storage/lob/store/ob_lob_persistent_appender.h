@@ -45,7 +45,7 @@ protected:
   // Split the append source into two parts:
   //   1. In-row data, or the tail chunk for OutRow/OutTable data.
   //   2. Appended data.
-  // This function may be called repeatedly because the OutTable append path rereads the data when writing CLOG.
+  // OutTable appends reread the source when attaching object data to Meta row redo.
   int prepare_source_();
   int validate_write_stats_(uint64_t &total_chunk_count);
   int write_meta_summary_(const uint64_t total_chunk_count);
@@ -94,12 +94,9 @@ public:
 protected:
   virtual bool is_outtable() override { return true; }
   virtual int write_data() override;
-  virtual int after_write_summary() override;
   virtual int read_last_chunk_() override;
 
 private:
-  common::ObArray<ObLobMetaInfo> clog_metas_;
-
   DISALLOW_COPY_AND_ASSIGN(ObLobOutTablePersistentAppender);
 };
 

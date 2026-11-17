@@ -96,6 +96,7 @@ void ObMemtableCtx::free_mvcc_row_callback(ObITransCallback *cb)
     TRANS_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "cb is null, unexpected error", KP(cb), K(*this));
   } else {
     callback_free_count_.inc();
+    cb->~ObITransCallback();
     std::free(cb);
     cb = NULL;
   }

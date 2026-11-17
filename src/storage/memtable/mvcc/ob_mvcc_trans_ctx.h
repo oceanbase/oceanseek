@@ -73,6 +73,8 @@ struct RedoDataNode
   ObITransCallback *callback_;
   common::ObTabletID tablet_id_;
   int64_t column_cnt_;
+  // Borrowed from the trans node until submission.
+  common::ObString outtable_redo_payload_buf_;
 };
 
 struct TableLockRedoDataNode
@@ -471,23 +473,7 @@ public:
       seq_no_(),
       column_cnt_(0)
   {}
-  ObMvccRowCallback(ObMvccRowCallback &cb, ObMemtable *memtable) :
-      ObITransCallback(cb.need_submit_log_, cb.is_mds_callback_),
-      ctx_(cb.ctx_),
-      value_(cb.value_),
-      tnode_(cb.tnode_),
-      data_size_(cb.data_size_),
-      memtable_(memtable),
-      is_link_(cb.is_link_),
-      not_calc_checksum_(cb.not_calc_checksum_),
-      is_non_unique_local_index_cb_(cb.is_non_unique_local_index_cb_),
-      mds_type_(cb.mds_type_),
-      seq_no_(cb.seq_no_),
-      column_cnt_(cb.column_cnt_)
-  {
-    (void)key_.encode(cb.key_.get_rowkey());
-  }
-  virtual ~ObMvccRowCallback() {}
+  virtual ~ObMvccRowCallback() { if (need_submit_log_) { release_lob_redo_(); } }
   int link_trans_node();
   void unlink_trans_node();
   void set_is_link() { is_link_ = true; }
@@ -513,6 +499,12 @@ public:
     seq_no_ = seq_no;
     if (tnode_) {
       tnode_->set_seq_no(seq_no_);
+      const ObMemtableDataHeader *mtd =
+          reinterpret_cast<const ObMemtableDataHeader *>(tnode_->buf_);
+      if (mtd->with_lob_payload()) {
+        data_size_ = sizeof(ObMemtableDataHeader) + mtd->row_serialized_len()
+            + mtd->lob_redo_info()->redo_size_;
+      }
     }
     column_cnt_ = column_cnt;
     is_non_unique_local_index_cb_ = is_non_unique_local_index_cb;
@@ -602,6 +594,8 @@ private:
   int dec_unsubmitted_cnt_();
   int wakeup_row_waiter_if_need_();
   int commit_trans_node_();
+  void release_lob_redo_();
+  DISALLOW_COPY_AND_ASSIGN(ObMvccRowCallback);
 private:
   ObIMvccCtx &ctx_;
   ObMemtableKey key_;

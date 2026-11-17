@@ -6,6 +6,7 @@
 
 #include "ob_memtable_mutator.h"
 #include "lib/atomic/atomic128.h"
+#include "storage/lob/store/ob_lob_outtable_redo_payload.h"
 
 #include "storage/memtable/ob_memtable_context.h"     // ObTransRowFlag
 
@@ -263,6 +264,10 @@ const char *get_mutator_type_str(MutatorType mutator_type)
   }
   case MutatorType::MUTATOR_MDS: {
     type_str = "MUTATOR_MDS";
+    break;
+  }
+  case MutatorType::MUTATOR_LOB_OUTTABLE_ROW: {
+    type_str = "MUTATOR_LOB_OUTTABLE_ROW";
     break;
   }
   default: {
@@ -882,6 +887,8 @@ int ObMutatorWriter::append_row_kv(
   const ObMemtableKey *mtk = &redo.key_;
   uint64_t cluster_version = 0;
   bool is_with_head = true;
+  const ObString &lob_payload_buf = redo.outtable_redo_payload_buf_;
+  const bool with_lob_payload = !lob_payload_buf.empty();
   if (OB_ISNULL(redo.callback_)) {
     is_with_head = false;
   } else if (OB_FAIL(redo.callback_->get_cluster_version(cluster_version))) {
@@ -898,9 +905,20 @@ int ObMutatorWriter::append_row_kv(
   } else if (!redo.tablet_id_.is_valid()) {
     ret = OB_ERR_UNEXPECTED;
     TRANS_LOG(WARN, "tablet_id is unexpected", K(ret), K(redo.tablet_id_));
+  } else if (with_lob_payload && !is_with_head) {
+    ret = OB_INVALID_ARGUMENT;
+    TRANS_LOG(WARN, "outtable lob redo requires a row header", K(ret));
+  } else if (with_lob_payload && is_big_row) {
+    ret = OB_NOT_SUPPORTED;
+    TRANS_LOG(WARN, "outtable lob redo does not support legacy big row framing", K(ret));
+  } else if (with_lob_payload && OB_NOT_NULL(encrypt_meta) && encrypt_meta->is_valid()) {
+    // Native row encryption does not cover the attachment.
+    ret = OB_NOT_SUPPORTED;
+    TRANS_LOG(WARN, "encrypted outtable lob mutator is not supported", K(ret));
   } else {
     ObMutatorRowHeader row_header;
-    row_header.mutator_type_ = MutatorType::MUTATOR_ROW;
+    row_header.mutator_type_ = with_lob_payload
+        ? MutatorType::MUTATOR_LOB_OUTTABLE_ROW : MutatorType::MUTATOR_ROW;
     row_header.tablet_id_ = redo.tablet_id_;
     //TODO: table_id is just used as encrypt_index, 
     //      if table_id is no longer used, we may rename it in the future
@@ -936,9 +954,15 @@ int ObMutatorWriter::append_row_kv(
       } else {
         ret = OB_BUF_NOT_ENOUGH;
       }
+    } else if (lob_payload_buf.length() > row_capacity - tmp_pos) {
+      ret = OB_BUF_NOT_ENOUGH;
     } else if (OB_FAIL(meta_.inc_row_count())) {
       TRANS_LOG(WARN, "meta inc_row_count failed", K(ret));
     } else {
+      if (with_lob_payload) {
+        MEMCPY(buf_.get_data() + tmp_pos, lob_payload_buf.ptr(), lob_payload_buf.length());
+        tmp_pos += lob_payload_buf.length();
+      }
       buf_.get_position() = tmp_pos;
       row_capacity_ = row_capacity;
     }
@@ -1266,6 +1290,8 @@ void ObMemtableMutatorIterator::reset()
   row_.reset();
   table_lock_.reset();
   row_seq_no_.reset();
+  lob_outtable_payload_.reset();
+  lob_outtable_payload_buf_.reset();
 }
 
 int ObMemtableMutatorIterator::deserialize(const char *buf, const int64_t data_len, int64_t &pos,
@@ -1274,13 +1300,18 @@ int ObMemtableMutatorIterator::deserialize(const char *buf, const int64_t data_l
   int ret = OB_SUCCESS;
   int64_t data_pos = pos;
   int64_t end_pos = pos;
+  lob_outtable_payload_.reset();
+  lob_outtable_payload_buf_.reset();
 
-  if (OB_ISNULL(buf) || (data_len - pos) <= 0 || data_len < 0) {
+  if (OB_ISNULL(buf) || data_len < 0 || pos < 0 || pos >= data_len) {
     TRANS_LOG(WARN, "invalid argument", KP(buf), K(data_len), K(pos));
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(meta_.deserialize(buf, data_len, data_pos))) {
     TRANS_LOG(WARN, "decode meta fail", K(ret), KP(buf), K(data_len), K(data_pos));
     ret = (OB_SUCCESS == ret) ? OB_INVALID_DATA : ret;
+  } else if (meta_.get_total_size() > data_len - pos) {
+    ret = OB_DESERIALIZE_ERROR;
+    TRANS_LOG(WARN, "truncated mutator data", K(ret), K(data_len), K(pos), K(meta_));
   } else if (!buf_.set_data(const_cast<char *>(buf + pos), meta_.get_total_size())) {
     TRANS_LOG(WARN, "set_data fail", KP(buf), K(pos), K(meta_.get_total_size()));
   } else if (FALSE_IT(end_pos += meta_.get_total_size())) {
@@ -1304,6 +1335,9 @@ int ObMemtableMutatorIterator::iterate_next_row(ObEncryptRowBuf &decrypt_buf,
     const transaction::ObCLogEncryptInfo &encrypt_info)
 {
   int ret = OB_SUCCESS;
+  const int64_t row_start = buf_.get_position();
+  lob_outtable_payload_.reset();
+  lob_outtable_payload_buf_.reset();
 
   if (OB_ISNULL(buf_.get_data())) {
     ret = OB_NOT_INIT;
@@ -1356,6 +1390,17 @@ int ObMemtableMutatorIterator::iterate_next_row(ObEncryptRowBuf &decrypt_buf,
       }
       break;
     }
+    case MutatorType::MUTATOR_LOB_OUTTABLE_ROW: {
+      if (OB_FAIL(deserialize_lob_outtable_row_(decrypt_buf, encrypt_info))) {
+        buf_.get_position() = row_start;
+        row_.reset();
+        row_seq_no_.reset();
+        lob_outtable_payload_.reset();
+        lob_outtable_payload_buf_.reset();
+        TRANS_LOG(WARN, "failed to deserialize outtable lob mutator", K(ret));
+      }
+      break;
+    }
     default: {
       ret = OB_ERR_UNEXPECTED;
       TRANS_LOG(WARN, "Unknown mutator_type", K(ret),K(row_header_.mutator_type_),K(buf_),K(meta_));
@@ -1375,6 +1420,67 @@ const ObMutatorRowHeader &ObMemtableMutatorIterator::get_row_head() { return row
 const ObMemtableMutatorRow &ObMemtableMutatorIterator::get_mutator_row() { return row_; }
 
 const ObMutatorTableLock &ObMemtableMutatorIterator::get_table_lock_row() { return table_lock_; }
+
+int ObMemtableMutatorIterator::deserialize_lob_outtable_row_(
+    ObEncryptRowBuf &decrypt_buf,
+    const transaction::ObCLogEncryptInfo &encrypt_info)
+{
+  int ret = OB_SUCCESS;
+  int64_t tmp_pos = buf_.get_position();
+  ObCLogEncryptStatMap unused_encrypt_stat_map;
+  ObEncryptMeta unused_encrypt_meta;
+  row_.reset();
+  if (OB_FAIL(row_.deserialize(buf_.get_data(), buf_.get_limit(), tmp_pos, decrypt_buf,
+      encrypt_info, false, unused_encrypt_meta, unused_encrypt_stat_map,
+      ObTransRowFlag::is_big_row(meta_.get_flags())))) {
+    TRANS_LOG(WARN, "failed to decode native lob meta row", K(ret));
+  } else if (!row_header_.tablet_id_.is_valid() || !row_.seq_no_.is_valid()
+      || (ObDmlFlag::DF_INSERT != row_.dml_flag_ && ObDmlFlag::DF_UPDATE != row_.dml_flag_)) {
+    ret = OB_INVALID_LOG;
+    TRANS_LOG(WARN, "invalid outtable lob mutator", K(ret), K(row_));
+  } else if (0 != row_.table_id_) {
+    ret = OB_NOT_SUPPORTED;
+    TRANS_LOG(WARN, "encrypted outtable lob mutator is not supported", K(ret));
+  } else {
+    const int64_t payload_start = tmp_pos;
+    int64_t payload_version = 0;
+    int64_t payload_len = 0;
+    // Bound the UNIS envelope before its decoder adds the declared length to the position.
+    if (OB_FAIL(decode_vi64(buf_.get_data(), buf_.get_limit(), tmp_pos, &payload_version))
+        || OB_FAIL(decode_vi64(buf_.get_data(), buf_.get_limit(), tmp_pos, &payload_len))) {
+      TRANS_LOG(WARN, "failed to decode outtable lob payload envelope", K(ret));
+    } else if (payload_len <= 0 || payload_len > buf_.get_limit() - tmp_pos
+        || payload_len > INT32_MAX - (tmp_pos - payload_start)) {
+      ret = OB_INVALID_LOG;
+      TRANS_LOG(WARN, "invalid outtable lob payload length", K(ret), K(payload_len), K(tmp_pos));
+    } else {
+      const int64_t payload_end = tmp_pos + payload_len;
+      tmp_pos = payload_start;
+      if (OB_FAIL(lob_outtable_payload_.deserialize(buf_.get_data(), payload_end, tmp_pos))) {
+        TRANS_LOG(WARN, "failed to decode outtable lob payload", K(ret));
+      } else if (tmp_pos != payload_end || !lob_outtable_payload_.is_valid()) {
+        ret = OB_INVALID_LOG;
+        TRANS_LOG(WARN, "invalid outtable lob payload", K(ret), K_(lob_outtable_payload));
+      } else {
+        lob_outtable_payload_buf_.assign_ptr(
+            buf_.get_data() + payload_start, payload_end - payload_start);
+        buf_.get_position() = tmp_pos;
+        row_seq_no_ = row_.seq_no_;
+      }
+    }
+  }
+  return ret;
+}
+
+const storage::ObLobOutTableRedoPayload &ObMemtableMutatorIterator::get_lob_outtable_payload() const
+{
+  return lob_outtable_payload_;
+}
+
+const common::ObString &ObMemtableMutatorIterator::get_lob_outtable_payload_buf() const
+{
+  return lob_outtable_payload_buf_;
+}
 
 }//namespace memtable
 }//namespace oceanbase

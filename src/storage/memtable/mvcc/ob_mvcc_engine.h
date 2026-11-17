@@ -138,9 +138,11 @@ protected:
 
   int try_compact_row_when_mvcc_read_(const share::SCN &snapshot_version, ObMvccRow &row);
 
-  int build_tx_node_(const ObTxNodeArg &arg, ObMvccTransNode *&node);
-
-  int init_tx_node_(const ObTxNodeArg &arg, ObMvccTransNode *node);
+  int build_tx_node_for_write_(storage::ObStoreCtx &ctx, const ObTxNodeArg &arg,
+      ObMvccTransNode *&node);
+  int init_tx_node_for_write_(storage::ObStoreCtx &ctx, const ObTxNodeArg &arg,
+      ObMvccTransNode *node);
+  int build_tx_node_for_replay_(const ObTxNodeArg &arg, ObMvccTransNode *&node);
 
   // MDS node alloc+construct helper. Sized via ObMdsTypeRegistry; builds
   // ObMemtableDataHeader at buf_ root and ObMdsTransNodeValue<V> at inner ptr.
@@ -155,6 +157,11 @@ protected:
                                 ObMvccRow *&row,
                                 ObMemtableKey *returned_key);
 
+private:
+  int build_tx_node_(const ObTxNodeArg &arg, ObMvccTransNode *&node);
+  int init_tx_node_(const ObTxNodeArg &arg, ObMvccTransNode *node);
+  static int prepare_lob_redo_(storage::ObStoreCtx &ctx,
+      const ObTxNodeArg &arg, ObMvccTransNode &node);
 protected:
   DISALLOW_COPY_AND_ASSIGN(ObMvccEngine);
   bool is_inited_;

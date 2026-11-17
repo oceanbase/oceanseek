@@ -14,12 +14,10 @@
 #include "storage/blocksstable/ob_storage_object_handle.h"
 #include "storage/blocksstable/ob_storage_object_type.h"
 #include "storage/lob/common/ob_lob_util.h"
-#include "storage/lob/access/ob_lob_iterator.h"
 #include "share/schema/ob_multi_version_schema_service.h"
 #include "share/schema/ob_tenant_schema_service.h"
 #include "storage/lob/store/ob_lob_store_common.h"
 #include "observer/omt/ob_tenant_config_mgr.h"
-#include "storage/tx/ob_trans_part_ctx.h"
 
 namespace oceanbase
 {
@@ -246,117 +244,6 @@ int ObLobOutTableIO::enable_outtable_clog(const uint64_t tenant_id, bool &is_wri
     is_write_clog = !tenant_config->_no_logging;
   }
   return ret;
-}
-
-static constexpr int64_t OUTTABLE_CLOG_MIN_RETRY_INTERVAL_US = 1000L;
-static constexpr int64_t OUTTABLE_CLOG_MAX_RETRY_INTERVAL_US = 100 * 1000L;
-
-static int submit_lob_outtable_data_log_with_retry(
-    ObLobWriteContext &ctx,
-    transaction::ObPartTransCtx &tx_ctx,
-    const uint64_t lob_aux_table_id,
-    const transaction::ObTxSEQ &lob_operation_seq_no,
-    const ObString &seq_id,
-    const ObLobId &lob_id,
-    const MacroBlockId &macro_id,
-    const bool is_logging,
-    const ObString &data,
-    share::SCN &scn)
-{
-  int ret = OB_SUCCESS;
-  int64_t retry_count = 0;
-  int64_t retry_interval_us = OUTTABLE_CLOG_MIN_RETRY_INTERVAL_US;
-  const int64_t timeout_ts_us = ctx.timeout_;
-  bool is_submitted = false;
-  while (OB_SUCC(ret) && !is_submitted) {
-    const int64_t current_ts_us = ObTimeUtility::current_time_us();
-    if (OB_FAIL(THIS_WORKER.check_status())) {
-      LOG_WARN("outtable lob data log submission is interrupted", KR(ret), K(retry_count), K(macro_id));
-    } else if (current_ts_us >= timeout_ts_us) {
-      ret = OB_TIMEOUT;
-      LOG_WARN("outtable lob data log submission timeout", KR(ret), K(retry_count), K(macro_id), K(timeout_ts_us));
-    } else if (OB_FAIL(tx_ctx.submit_lob_outtable_data_log(lob_aux_table_id, lob_operation_seq_no,
-                       seq_id, lob_id, macro_id, is_logging, data, scn))) {
-      if (OB_TX_NOLOGCB == ret) {
-        const int64_t wait_start_ts_us = ObTimeUtility::current_time_us();
-        if (wait_start_ts_us >= timeout_ts_us) {
-          ret = OB_TIMEOUT;
-          LOG_WARN("outtable lob data log retry timeout", KR(ret), K(retry_count), K(macro_id), K(timeout_ts_us));
-        } else {
-          const int64_t sleep_us = OB_MIN(retry_interval_us, timeout_ts_us - wait_start_ts_us);
-          ret = OB_SUCCESS;
-          ++retry_count;
-          THIS_WORKER.sched_wait();
-          ob_usleep(static_cast<uint32_t>(sleep_us));
-          THIS_WORKER.sched_run();
-          retry_interval_us = OB_MIN(retry_interval_us * 2, OUTTABLE_CLOG_MAX_RETRY_INTERVAL_US);
-        }
-      } else {
-        LOG_WARN("failed to submit outtable lob data log", KR(ret), K(retry_count), K(macro_id));
-      }
-    } else {
-      is_submitted = true;
-      if (retry_count > 0) {
-        LOG_INFO("submitted outtable lob data log after retry", K(retry_count), K(macro_id), K(scn));
-      }
-    }
-  }
-  return ret;
-}
-
-int ObLobOutTableIO::write_clog(
-    ObLobWriteContext &ctx,
-    ObLobQueryIter *iter,
-    const common::ObIArray<ObLobMetaInfo> &metas,
-    const bool is_logging)
-{
-  lib::ErrsimModuleGuard errsim_guard(ObErrsimModuleType::ERRSIM_MODULE_OUTTABLE_LOB);
-  int ret = OB_SUCCESS;
-  transaction::ObPartTransCtx *tx_ctx = nullptr;
-  uint64_t lob_piece_table_id = OB_INVALID_ID;
-  const int64_t chunk_size = ctx.get_chunk_size(true/*is_outtable*/);
-  if (OB_UNLIKELY(is_logging && nullptr == iter)) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("missing source iterator for outtable lob data log", KR(ret), K(ctx));
-  } else if (OB_FAIL(ObLobUtil::get_lob_piece_table_id(ctx, lob_piece_table_id))) {
-    LOG_WARN("failed to get lob piece table id", KR(ret), K(ctx));
-  } else if (OB_FAIL(ctx.get_trans_ctx(tx_ctx))) {
-    LOG_WARN("failed to get transaction context", KR(ret), K(ctx));
-  } else {
-    for (int64_t i = 0; OB_SUCC(ret) && i < metas.count(); ++i) {
-      const ObLobMetaInfo &meta = metas.at(i);
-      blocksstable::MacroBlockId macro_id;
-      ObLobChunk chunk;
-      share::SCN scn;
-      if (OB_FAIL(deserialize_macro_id(meta.lob_block_id_, macro_id))) {
-        LOG_WARN("failed to deserialize outtable lob macro id for clog", KR(ret), K(meta), K(i));
-      } else if (is_logging) {
-        if (OB_FAIL(iter->get_next_chunk(chunk, chunk_size))) {
-          LOG_WARN("failed to get next chunk", KR(ret), K(ctx), K(i));
-        } else if (OB_UNLIKELY(meta.byte_len_ != chunk.byte_len_
-                   || meta.byte_len_ != chunk.lob_data_.length())) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("outtable lob chunk size does not match meta", KR(ret), K(meta), K(chunk), K(i));
-        }
-      }
-
-      if (FAILEDx(submit_lob_outtable_data_log_with_retry(
-                     ctx, *tx_ctx, lob_piece_table_id, ctx.insert_lob_seq_no_, meta.seq_id_,
-                     meta.lob_id_, macro_id, is_logging, chunk.lob_data_, scn))) {
-        LOG_WARN("failed to submit outtable lob data log", KR(ret), K(ctx), K(i));
-      }
-    }
-  }
-  return ret;
-}
-
-bool ObLobOutTableIO::is_retryable_error(const int ret)
-{
-  return OB_IO_ERROR == ret
-      || OB_OBJECT_STORAGE_IO_ERROR == ret
-      || OB_TIMEOUT == ret
-      || OB_EAGAIN == ret
-      || OB_NEED_RETRY == ret;
 }
 
 int ObLobOutTableIO::is_exist(
@@ -720,6 +607,43 @@ int ObLobOutTableChunkReader::read(const ObLobMetaInfo &meta, ObString &data)
       LOG_WARN("unexpected outtable lob object size", KR(ret), K(macro_id),
                "expected_size", meta.byte_len_, "actual_size", object_handle.get_data_size());
     }
+  }
+  return ret;
+}
+
+bool ObLobOutTableIO::is_retryable_error(const int ret)
+{
+  return OB_IO_ERROR == ret
+      || OB_OBJECT_STORAGE_IO_ERROR == ret
+      || OB_TIMEOUT == ret
+      || OB_EAGAIN == ret
+      || OB_NEED_RETRY == ret;
+}
+
+int ObLobOutTableIO::replay_object(
+    const MacroBlockId &macro_id,
+    const ObString &data,
+    const bool is_logging,
+    const int64_t ls_id)
+{
+  int ret = OB_SUCCESS;
+  bool object_exists = false;
+  if (OB_UNLIKELY(!macro_id.is_valid()
+      || (is_logging && data.empty()) || (!is_logging && !data.empty()))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid lob outtable replay data",
+        KR(ret), K(macro_id), K(data.length()), K(is_logging));
+  } else if (is_logging) {
+    if (OB_FAIL(is_exist(macro_id, ls_id, object_exists))) {
+      LOG_WARN("head lob outtable replay object failed", KR(ret), K(macro_id), K(ls_id));
+    } else if (!object_exists && OB_FAIL(write(macro_id, data))) {
+      LOG_WARN("write lob outtable replay object failed", KR(ret), K(macro_id));
+    }
+  }
+  if (OB_SUCCESS != ret && is_retryable_error(ret)) {
+    const int io_ret = ret;
+    ret = OB_EAGAIN;
+    LOG_INFO("rewrite retryable outtable replay error", KR(ret), KR(io_ret), K(macro_id));
   }
   return ret;
 }

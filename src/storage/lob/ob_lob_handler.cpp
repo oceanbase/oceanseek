@@ -424,38 +424,18 @@ int ObLobInserter::insert()
           write_stats.chunk_count_, write_stats.compressed_len_, is_outtable))) {
         LOG_WARN("failed to write meta summary row", KR(ret), K(lob_id_),
             K(write_stats), KPC(this));
+      } else if (is_outtable) {
+        if (OB_FAIL(insert_outtable_meta_())) {
+          LOG_WARN("failed to insert outtable lob meta with redo payloads", KR(ret), KPC(this));
+        }
       } else if (OB_FAIL(meta_insert_iter.init(&metas_))) {
         LOG_WARN("failed to initialize meta insert iterator", KR(ret), KPC(this));
       } else if (OB_FAIL(meta_mgr_->batch_insert(*ctx_, meta_insert_iter))) {
         LOG_WARN("failed to batch insert meta info", KR(ret), KPC(this));
-      } else if (is_outtable && OB_FAIL(write_outtable_clog_())) {
-        LOG_WARN("failed to write outtable lob clog", KR(ret), K(lob_id_), KPC(this));
       }
     }
   }
   if (OB_NOT_NULL(query_iter)) {
-    OB_DELETE(ObLobQueryIter, "unused", query_iter);
-    query_iter = nullptr;
-  }
-  return ret;
-}
-
-int ObLobInserter::write_outtable_clog_()
-{
-  int ret = OB_SUCCESS;
-  ObLobQueryIter *query_iter = nullptr;
-  if (is_logging_) {
-    if (OB_FAIL(open_src_lob_query_(query_iter))) {
-      LOG_WARN("failed to open source lob query", KR(ret), KPC(this));
-    }
-  }
-
-  if (FAILEDx(ObLobOutTableIO::write_clog(*ctx_, query_iter, metas_, is_logging_))) {
-    LOG_WARN("failed to write outtable lob clog", KR(ret), K(lob_id_), K(metas_.count()), KPC(this));
-  }
-
-  if (OB_NOT_NULL(query_iter)) {
-    query_iter->reset();
     OB_DELETE(ObLobQueryIter, "unused", query_iter);
     query_iter = nullptr;
   }
@@ -1052,6 +1032,40 @@ int ObLobDeleter::del()
   return ret;
 }
 
+
+int ObLobInserter::insert_outtable_meta_()
+{
+  int ret = OB_SUCCESS;
+  ObLobQueryIter *query_iter = nullptr;
+  if (is_logging_) {
+    if (OB_FAIL(open_src_lob_query_(query_iter))) {
+      LOG_WARN("failed to open source lob query", KR(ret), KPC(this));
+    }
+  }
+
+  if (FAILEDx(meta_mgr_->batch_insert_outtable(*ctx_, query_iter, metas_, is_logging_))) {
+    LOG_WARN("failed to insert outtable lob meta with redo payloads", KR(ret), K(lob_id_));
+  }
+  if (OB_SUCC(ret) && is_logging_) {
+    ObLobChunk extra_chunk;
+    if (OB_ITER_END == (ret = query_iter->get_next_chunk(
+        extra_chunk, ctx_->get_chunk_size(true)))) {
+      ret = OB_SUCCESS;
+    } else if (OB_SUCC(ret)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("outtable lob redo source has unconsumed data", KR(ret), K(lob_id_));
+    } else {
+      LOG_WARN("failed to finish reading outtable lob redo source", KR(ret), K(lob_id_));
+    }
+  }
+
+  if (OB_NOT_NULL(query_iter)) {
+    query_iter->reset();
+    OB_DELETE(ObLobQueryIter, "unused", query_iter);
+    query_iter = nullptr;
+  }
+  return ret;
+}
 
 } // storage
 } // oceanbase

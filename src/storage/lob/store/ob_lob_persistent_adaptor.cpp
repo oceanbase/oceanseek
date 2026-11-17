@@ -343,7 +343,8 @@ int ObPersistentLobAdaptor::build_lob_aux_dml_common(
 int ObPersistentLobAdaptor::do_write_lob_aux(
     const LobAuxTarget target,
     ObLobInsertContext &insert_ctx,
-    blocksstable::ObDatumRowIterator &row_iter)
+    blocksstable::ObDatumRowIterator &row_iter,
+    const ObLobOutTableRedoCtx *outtable_redo_ctx)
 {
   int ret = OB_SUCCESS;
   int64_t affected_rows = 0;
@@ -351,18 +352,24 @@ int ObPersistentLobAdaptor::do_write_lob_aux(
   ObDMLBaseParam *dml = nullptr;
   ObSEArray<uint64_t, 8> column_ids;
   bool is_injected = false;
-  if (OB_FAIL(build_lob_aux_dml_common(target, insert_ctx, tablet_id, dml, column_ids))) {
+  if (OB_UNLIKELY(LobAuxTarget::META != target && nullptr != outtable_redo_ctx)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("outtable redo context only supports lob meta writes", KR(ret), K(target));
+  } else if (OB_FAIL(build_lob_aux_dml_common(target, insert_ctx, tablet_id, dml, column_ids))) {
     LOG_WARN("build_lob_aux_dml_common fail", K(ret), K(insert_ctx));
   } else if (OB_FAIL(errsim_meta_dml_failed(insert_ctx, row_iter, is_injected))) {
     LOG_WARN("errsim_meta_dml_failed fail", K(ret), K(insert_ctx));
   }
   if (OB_FAIL(ret)) {
   } else if (!is_injected) {
+    const ObLobOutTableRedoCtx *saved_redo_ctx = dml->outtable_redo_ctx_;
+    dml->outtable_redo_ctx_ = outtable_redo_ctx;
     if (OB_FAIL(MTL(ObAccessService*)->insert_rows(
           insert_ctx.ls_id_, tablet_id, *insert_ctx.tx_desc_, *dml,
           column_ids, &row_iter, affected_rows))) {
       LOG_WARN("insert_rows fail", K(ret), K(insert_ctx));
     }
+    dml->outtable_redo_ctx_ = saved_redo_ctx;
   }
   return ret;
 }
@@ -390,7 +397,8 @@ int ObPersistentLobAdaptor::do_erase_lob_aux(
 int ObPersistentLobAdaptor::do_update_lob_aux(
     const LobAuxTarget target,
     ObLobUpdateContext &update_ctx,
-    blocksstable::ObDatumRowIterator &row_iter)
+    blocksstable::ObDatumRowIterator &row_iter,
+    const ObLobOutTableRedoCtx *outtable_redo_ctx)
 {
   int ret = OB_SUCCESS;
   int64_t affected_rows = 0;
@@ -400,7 +408,10 @@ int ObPersistentLobAdaptor::do_update_lob_aux(
   ObSEArray<uint64_t, 8> update_column_ids;
   uint64_t column_cnt = 0;
   uint64_t rowkey_cnt = 0;
-  if (OB_FAIL(update_ctx.get_aux_column_cnt(target, column_cnt))) {
+  if (OB_UNLIKELY(LobAuxTarget::META != target && nullptr != outtable_redo_ctx)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("outtable redo context only supports lob meta updates", KR(ret), K(target));
+  } else if (OB_FAIL(update_ctx.get_aux_column_cnt(target, column_cnt))) {
     LOG_WARN("get_aux_column_cnt fail", K(ret), K(update_ctx));
   } else if (OB_FAIL(update_ctx.get_aux_rowkey_col_cnt(target, rowkey_cnt))) {
     LOG_WARN("get_aux_rowkey_col_cnt fail", K(ret), K(update_ctx));
@@ -413,10 +424,15 @@ int ObPersistentLobAdaptor::do_update_lob_aux(
       LOG_WARN("push update column ids failed", K(ret), K(i), K(update_ctx));
     }
   }
-  if (FAILEDx(MTL(ObAccessService*)->update_rows(
-              update_ctx.ls_id_, tablet_id, *update_ctx.tx_desc_, *dml,
-              column_ids, update_column_ids, &row_iter, affected_rows))) {
-    LOG_WARN("update_rows fail", K(ret), K(update_ctx));
+  if (OB_SUCC(ret)) {
+    const ObLobOutTableRedoCtx *saved_redo_ctx = dml->outtable_redo_ctx_;
+    dml->outtable_redo_ctx_ = outtable_redo_ctx;
+    if (OB_FAIL(MTL(ObAccessService*)->update_rows(
+            update_ctx.ls_id_, tablet_id, *update_ctx.tx_desc_, *dml,
+            column_ids, update_column_ids, &row_iter, affected_rows))) {
+      LOG_WARN("update_rows fail", K(ret), K(update_ctx));
+    }
+    dml->outtable_redo_ctx_ = saved_redo_ctx;
   }
   return ret;
 }
@@ -978,19 +994,25 @@ int ObPersistentLobAdaptor::delete_lob_meta(ObLobDeleteContext &delete_ctx, ObDa
   return ret;
 }
 
-int ObPersistentLobAdaptor::write_lob_meta(ObLobInsertContext &insert_ctx, ObDatumRowIterator &row_iter)
+int ObPersistentLobAdaptor::write_lob_meta(
+    ObLobInsertContext &insert_ctx,
+    ObDatumRowIterator &row_iter,
+    const ObLobOutTableRedoCtx *outtable_redo_ctx)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(do_write_lob_aux(LobAuxTarget::META, insert_ctx, row_iter))) {
+  if (OB_FAIL(do_write_lob_aux(LobAuxTarget::META, insert_ctx, row_iter, outtable_redo_ctx))) {
     LOG_WARN("do_write_lob_aux fail", K(ret), K(insert_ctx));
   }
   return ret;
 }
 
-int ObPersistentLobAdaptor::update_lob_meta(ObLobUpdateContext &update_ctx, ObDatumRowIterator &row_iter)
+int ObPersistentLobAdaptor::update_lob_meta(
+    ObLobUpdateContext &update_ctx,
+    ObDatumRowIterator &row_iter,
+    const ObLobOutTableRedoCtx *outtable_redo_ctx)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(do_update_lob_aux(LobAuxTarget::META, update_ctx, row_iter))) {
+  if (OB_FAIL(do_update_lob_aux(LobAuxTarget::META, update_ctx, row_iter, outtable_redo_ctx))) {
     LOG_WARN("do_update_lob_aux fail", K(ret), K(update_ctx));
   }
   return ret;
@@ -1028,9 +1050,11 @@ int ObPersistentLobAdaptor::delete_lob_meta(ObLobDeleteContext &delete_ctx, ObLo
   return ret;
 }
 
-int ObPersistentLobAdaptor::update_lob_meta(ObLobUpdateContext &update_ctx,
-                                            ObLobMetaInfo &old_row,
-                                            ObLobMetaInfo &new_row)
+int ObPersistentLobAdaptor::update_lob_meta(
+    ObLobUpdateContext &update_ctx,
+    ObLobMetaInfo &old_row,
+    ObLobMetaInfo &new_row,
+    const ObLobOutTableRedoCtx *outtable_redo_ctx)
 {
   int ret = OB_SUCCESS;
   ObDatumRow new_datum_row;
@@ -1044,7 +1068,7 @@ int ObPersistentLobAdaptor::update_lob_meta(ObLobUpdateContext &update_ctx,
   } else if (FALSE_IT(set_lob_meta_row(old_datum_row, old_row))) {
   } else if (OB_FAIL(upd_iter.init(&update_ctx, &old_datum_row, &new_datum_row))) {
     LOG_WARN("upd_iter init fail", K(ret));
-  } else if (OB_FAIL(update_lob_meta(update_ctx, upd_iter))) {
+  } else if (OB_FAIL(update_lob_meta(update_ctx, upd_iter, outtable_redo_ctx))) {
     LOG_WARN("update_lob_meta fail", K(ret));
   }
   return ret;

@@ -167,7 +167,7 @@ private:
   int insert_outrow_piece_(ObLobQueryIter *input_iter, ObLobWriteStats &write_stats);
   // Write OutTable chunks to object storage.
   int insert_outtable_piece_(ObLobQueryIter *input_iter, ObLobWriteStats &write_stats);
-  int write_outtable_clog_();
+  int insert_outtable_meta_();
 private:
   bool is_inited_;
   ObLobInsertContext *ctx_;

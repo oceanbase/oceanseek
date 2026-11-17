@@ -1103,6 +1103,10 @@ int ObMemtable::replay_row(ObStoreCtx &ctx,
   } else {
     lib::CompatModeGuard compat_guard(mode_);
     ObMemtableData mtd(dml_flag, row.size_, row.data_);
+    if (MutatorType::MUTATOR_LOB_OUTTABLE_ROW == mmi->get_row_head().mutator_type_) {
+      mtd.set_payload_kind(ObMemtablePayloadKind::ROW_WITH_LOB_REDO);
+      mtd.lob_redo_info()->init_replay(mmi->get_lob_outtable_payload_buf());
+    }
     ObMemtableKey mtk;
     ObRowData empty_old_row;
     const transaction::ObTransID tx_id = ctx.mvcc_acc_ctx_.tx_id_;
@@ -2721,6 +2725,8 @@ int ObMemtable::set_(
                     column_cnt                 /*column_cnt*/);
   }
   if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(bind_lob_redo_(memtable_set_arg, mtk, mtd, tx_node_arg))) {
+    TRANS_LOG(WARN, "failed to bind LOB redo to row", K(ret), K(mtk));
   } else if (OB_FAIL(mvcc_write_(ctx,
                                  mtk,
                                  tx_node_arg,
@@ -3056,6 +3062,9 @@ int ObMemtable::batch_mvcc_write_(const storage::ObTableIterParam &param,
                                             write_seq,                 /*seq_no*/
                                             write_epoch,               /*write_epoch*/
                                             column_cnt                 /*column_cnt*/))) {
+    } else if (OB_FAIL(bind_lob_redo_(
+        memtable_set_arg, mvcc_results[i].mtk_, mtd, tx_node_args[i]))) {
+      TRANS_LOG(WARN, "failed to bind LOB redo to batch row", K(ret), K(i));
     } else {
       // preallocate the memory for all ObMvccTransNode
       int64_t real_data_size = sizeof(ObMvccTransNode) + mtd.dup_size();
@@ -3539,7 +3548,8 @@ ObMemtableSetArg::ObMemtableSetArg(const blocksstable::ObDatumRow *new_row,
                                    const common::ObIArray<int64_t> *old_row_log_column_idxs,
                                    const int64_t row_count,
                                    const bool check_exist,
-                                   const share::ObEncryptMeta *encrypt_meta)
+                                   const share::ObEncryptMeta *encrypt_meta,
+                                   const storage::ObLobOutTableRedoCtx *outtable_redo_ctx)
   : new_row_(new_row),
     columns_(columns),
     update_idx_(update_idx),
@@ -3547,7 +3557,8 @@ ObMemtableSetArg::ObMemtableSetArg(const blocksstable::ObDatumRow *new_row,
     old_row_log_column_idxs_(old_row_log_column_idxs),
     row_count_(row_count),
     encrypt_meta_(encrypt_meta),
-    check_exist_(check_exist)
+    check_exist_(check_exist),
+    outtable_redo_ctx_(outtable_redo_ctx)
 {}
 
 bool ObMemtableSetArg::is_valid() const
@@ -3738,11 +3749,7 @@ void ObMemtable::mvcc_write_statistic_(const ObMvccWriteResults &mvcc_results)
 void ObMemtable::mvcc_undo_(ObMvccWriteResults &mvcc_results)
 {
   for (int64_t i = 0; i < mvcc_results.count(); ++i) {
-    ObMvccWriteResult res = mvcc_results[i];
-    if (res.has_insert()) {
-      (void)mvcc_engine_->mvcc_undo(res.value_);
-      res.is_mvcc_undo_ = true;
-    }
+    mvcc_undo_(mvcc_results[i]);
   }
 }
 
@@ -3751,6 +3758,10 @@ void ObMemtable::mvcc_undo_(ObMvccWriteResult &res)
   if (res.has_insert()) {
     (void)mvcc_engine_->mvcc_undo(res.value_);
     res.is_mvcc_undo_ = true;
+  }
+  // An inner failure path may already have undone the node without freeing its payload.
+  if (nullptr != res.tx_node_) {
+    res.tx_node_->release_lob_redo();
   }
 }
 
@@ -3861,6 +3872,27 @@ int ObMdsMemtable::finish_freeze()
 {
   report_memtable_diagnose_info(TabletMemtableUpdateFreezeInfo(*this));
   return OB_SUCCESS;
+}
+
+int ObMemtable::bind_lob_redo_(const ObMemtableSetArg &set_arg, const ObMemtableKey &key,
+    ObMemtableData &data, ObTxNodeArg &node_arg)
+{
+  int ret = OB_SUCCESS;
+  const storage::ObLobOutTableRedoPayload *payload = nullptr;
+  node_arg.lob_redo_payload_ = nullptr;
+  if (nullptr == set_arg.outtable_redo_ctx_) {
+    // Ordinary rows have no LOB attachment.
+  } else if (node_arg.is_mds_write_) {
+    ret = OB_NOT_SUPPORTED;
+  } else if (OB_ISNULL(key.get_rowkey())) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(set_arg.outtable_redo_ctx_->find_payload(*key.get_rowkey(), payload))) {
+    TRANS_LOG(WARN, "failed to find LOB redo for row key", K(ret), K(key));
+  } else {
+    data.set_payload_kind(ObMemtablePayloadKind::ROW_WITH_LOB_REDO);
+    node_arg.lob_redo_payload_ = payload;
+  }
+  return ret;
 }
 
 } // namespace memtable

@@ -43,6 +43,7 @@ void RedoDataNode::set(const ObMemtableKey *key,
   callback_ = NULL;
   tablet_id_ = tablet_id;
   column_cnt_ = column_cnt;
+  outtable_redo_payload_buf_.reset();
 }
 
 int TableLockRedoDataNode::set(
@@ -244,8 +245,10 @@ void ObTransCallbackMgr::free_mvcc_row_callback(ObITransCallback *cb)
   if (-1 == owner) {
     TRANS_LOG_RET(WARN, OB_ERR_UNEXPECTED, "callback free failed", KPC(cb));
   } else if (0 == owner) {
+    cb->~ObITransCallback();
     mem_ctx_obj_pool_.free<ObMvccRowCallback>(cb);
   } else if (1 == owner) {
+    cb->~ObITransCallback();
     cb_allocator_.free(cb);
   } else {
     TRANS_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "unexpected cb", KPC(cb));
@@ -1574,10 +1577,16 @@ void ObTransCallbackMgr::trans_start()
 int ObMvccRowCallback::before_append(const bool is_replay)
 {
   int ret = OB_SUCCESS;
+  const ObMemtableDataHeader *mtd = (nullptr == tnode_)
+      ? nullptr : reinterpret_cast<const ObMemtableDataHeader *>(tnode_->buf_);
 
   if (OB_ISNULL(memtable_)) {
     ret = OB_ERR_UNEXPECTED;
     TRANS_LOG(ERROR, "memtable is NULL", K(ret));
+  } else if (!is_replay && nullptr != mtd && mtd->with_lob_payload()
+      && nullptr == mtd->lob_redo_info()->redo_buf_) {
+    ret = OB_STATE_NOT_MATCH;
+    TRANS_LOG(WARN, "LOB trans node must own redo before publication", K(ret));
   } else if (!is_replay) {
     inc_unsubmitted_cnt_();
   } else if (is_mds_callback_ && OB_FAIL(invoke_mds_on_redo(scn_))) {
@@ -1605,6 +1614,10 @@ int ObMvccRowCallback::log_submitted(const SCN scn, storage::ObIMemtable *&last_
     (void)tnode_->fill_scn(scn);
     if (OB_FAIL(dec_unsubmitted_cnt_())) {
       TRANS_LOG(ERROR, "dec unsubmitted cnt failed", K(ret), K(*this));
+    } else {
+      // The submitted log owns the serialized bytes. Sync failure rolls back
+      // this node, so it cannot require another serialization of the payload.
+      release_lob_redo_();
     }
   }
   return ret;
@@ -1645,6 +1658,7 @@ int ObMvccRowCallback::clean()
 int ObMvccRowCallback::del()
 {
   int ret = OB_SUCCESS;
+  release_lob_redo_();
 
   if (NULL != old_row_.data_) {
     ctx_.old_row_free((void *)(old_row_.data_));
@@ -1787,8 +1801,12 @@ int ObMvccRowCallback::calc_checksum(const SCN checksum_scn,
                   K(*this), K(get_dml_flag()));
       }
     } else if (checksum_scn <= scn_) {
+      ObMemtableDataHeader *mtd = reinterpret_cast<ObMemtableDataHeader *>(tnode_->buf_);
       tnode_->checksum(*checksumer);
-      ((ObMemtableDataHeader *)tnode_->buf_)->checksum(*checksumer);
+      mtd->checksum(*checksumer);
+      if (mtd->with_lob_payload()) {
+        mtd->lob_redo_info()->checksum(*checksumer);
+      }
       checksumer->cnt_++;
       checksumer->scn_ = scn_;
     }
@@ -2059,6 +2077,7 @@ MutatorType ObMvccRowCallback::get_mutator_type() const
 int ObMvccRowCallback::get_redo(RedoDataNode &redo_node)
 {
   int ret = OB_SUCCESS;
+  redo_node.outtable_redo_payload_buf_.reset();
 
   ObRowLatchGuard guard(value_.latch_);
 
@@ -2079,7 +2098,7 @@ int ObMvccRowCallback::get_redo(RedoDataNode &redo_node)
     tnode_->cal_acc_checksum(last_acc_checksum);
     const ObMemtableDataHeader *mtd = reinterpret_cast<const ObMemtableDataHeader *>(tnode_->buf_);
     ObRowData new_row;
-    new_row.set(mtd->buf_, (int32_t)(data_size_ - sizeof(*mtd)));
+    new_row.set(mtd->row_serialized_ptr(), static_cast<int32_t>(mtd->row_serialized_len()));
     redo_node.set(&key_,
                   old_row_,
                   new_row,
@@ -2092,6 +2111,15 @@ int ObMvccRowCallback::get_redo(RedoDataNode &redo_node)
                   this->get_tablet_id(),
                   column_cnt_);
     redo_node.set_callback(this);
+    if (mtd->with_lob_payload()) {
+      const storage::ObLobOutTableRedoInfo &info = *mtd->lob_redo_info();
+      if (OB_ISNULL(info.redo_buf_)) {
+        ret = OB_STATE_NOT_MATCH;
+        TRANS_LOG(WARN, "LOB redo body is not available", K(ret), KPC(this));
+      } else {
+        redo_node.outtable_redo_payload_buf_.assign_ptr(info.redo_buf_, info.redo_size_);
+      }
+    }
   }
   return ret;
 }
@@ -2197,6 +2225,7 @@ int ObMvccRowCallback::clean_unlog_cb()
     if (nullptr != tnode_) {
       unlink_trans_node();
     }
+    release_lob_redo_();
     need_submit_log_ = false;
     dec_unsubmitted_cnt_();
   }
@@ -2556,6 +2585,13 @@ int64_t ObTransCallbackMgr::get_callback_list_length(const int16_t idx)
     length = lists[idx - 1].get_length();
   }
   return length;
+}
+
+void ObMvccRowCallback::release_lob_redo_()
+{
+  if (nullptr != tnode_) {
+    tnode_->release_lob_redo();
+  }
 }
 
 }; // end namespace mvcc

@@ -1047,6 +1047,7 @@ ob_set_subtarget(ob_storage memtable
   memtable/deadlock_adapter/ob_local_execution_deadlock_callback.cpp
   memtable/hash_holder/ob_row_hash_holder_map.cpp
   memtable/ob_memtable.cpp
+  memtable/ob_memtable_data.cpp
   memtable/ob_memtable_key.cpp
   memtable/ob_memtable_block_reader.cpp
   memtable/ob_memtable_block_row_scanner.cpp
@@ -1224,6 +1225,7 @@ ob_set_subtarget(ob_storage lob
   lob/store/ob_outtable_lob_control_page_iterator.cpp
   lob/store/ob_lob_store_common.cpp
   lob/store/ob_lob_outtable_io.cpp
+  lob/store/ob_lob_outtable_redo_payload.cpp
   lob/store/ob_lob_persistent_adaptor.cpp
   lob/store/ob_lob_persistent_appender.cpp
   lob/store/ob_lob_persistent_reader_cache.cpp

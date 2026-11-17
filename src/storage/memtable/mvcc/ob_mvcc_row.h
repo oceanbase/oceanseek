@@ -36,6 +36,7 @@ static const uint8_t NDT_COMPACT = 0x1;
 // inner value at header->mds_inner_value_ptr(). Datum decode uses
 // ObCompatRowReader::read_memtable_row_from_mvcc_trans_node (MDS via ObMdsTypeRegistry serialize).
 // Row-level routing uses ObMvccRow::is_ls_mds_memtable_row().
+// LOB row write: ordinary row bytes followed by an aligned ObLobOutTableRedoInfo.
 class ObIMvccCtx;
 class ObMemtable;
 class ObIMemtableCtx;
@@ -168,6 +169,7 @@ public:
   // ===================== ObMvccTransNode Operation Interface =====================
   // checksum the tx node into bc
   void checksum(common::ObBatchChecksum &bc) const;
+  void release_lob_redo();
 
   // calc/verify the tx node checksum
   uint32_t m_cal_acc_checksum(const uint32_t last_acc_checksum) const;

@@ -161,6 +161,8 @@ public:
   const int64_t row_count_;
   const share::ObEncryptMeta *encrypt_meta_;
   const bool check_exist_;
+  // Borrowed for this set/multi_set; each node copies its own payload before publication.
+  const storage::ObLobOutTableRedoCtx *outtable_redo_ctx_;
 
   // initializer for ObMemtable::set/multi_set
   ObMemtableSetArg(const blocksstable::ObDatumRow *new_row,
@@ -170,7 +172,8 @@ public:
                    const common::ObIArray<int64_t> *old_row_log_column_idxs,
                    const int64_t row_count,
                    const bool check_exist,
-                   const share::ObEncryptMeta *encrypt_meta);
+                   const share::ObEncryptMeta *encrypt_meta,
+                   const storage::ObLobOutTableRedoCtx *outtable_redo_ctx = nullptr);
 
   TO_STRING_KV(KPC_(new_row),
                KPC_(columns),
@@ -179,7 +182,8 @@ public:
                KPC_(old_row_log_column_idxs),
                K_(row_count),
                K_(encrypt_meta),
-               K_(check_exist));
+               K_(check_exist),
+               KP_(outtable_redo_ctx));
 
   // must ensure all or nothing at all.
   bool is_valid() const;
@@ -598,6 +602,8 @@ private:
                       ObRowData &old_row_data,
                       ObMemtableData &mtd);
   int report_residual_dml_stat_();
+  static int bind_lob_redo_(const ObMemtableSetArg &set_arg, const ObMemtableKey &key,
+      ObMemtableData &data, ObTxNodeArg &node_arg);
 
 
   OB_INLINE void cleanup_old_row_(ObIMemtableCtx *mem_ctx,

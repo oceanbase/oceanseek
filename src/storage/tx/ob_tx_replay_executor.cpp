@@ -10,6 +10,7 @@
 #include "storage/tx/ob_trans_service.h"
 #include "storage/tx/ob_tx_log_operator.h"
 #include "storage/tx/ob_tx_replay_executor.h"
+#include "storage/lob/store/ob_lob_outtable_io.h"
 #include "storage/tablelock/ob_lock_memtable.h"
 #include "logservice/replayservice/ob_tablet_replay_executor.h"
 
@@ -668,6 +669,7 @@ int ObTxReplayExecutor::replay_redo_in_memtable_(ObTxRedoLog &redo, const bool s
     CLICK();
     meta_flag = mmi_ptr_->get_meta().get_flags();
     ObEncryptRowBuf row_buf;
+    const storage::ObLobOutTableRedoPayload &payload = mmi_ptr_->get_lob_outtable_payload();
     while (OB_SUCC(ret)) {
       row_head.reset();
       if (OB_FAIL(mmi_ptr_->iterate_next_row(row_buf, encrypt_info))) {
@@ -682,6 +684,11 @@ int ObTxReplayExecutor::replay_redo_in_memtable_(ObTxRedoLog &redo, const bool s
           TRANS_LOG(INFO, "ext info redo log no need replay", K(row_head), K(redo));
         }
         TRANS_LOG(DEBUG, "ext info redo log no need replay", K(row_head), K(redo));
+      } else if (MutatorType::MUTATOR_LOB_OUTTABLE_ROW == row_head.mutator_type_
+          && OB_FAIL(storage::ObLobOutTableIO::replay_object(
+              payload.macro_id_, payload.data_, payload.is_logging_, ls_id_.id()))) {
+        // Do not replay the Meta row until its object is ready, even if the row may be skipped.
+        TRANS_LOG(WARN, "failed to restore outtable lob mutator object", K(ret), K(row_head));
       } else if (OB_FAIL(replay_one_row_in_memtable_(row_head, mmi_ptr_))) {
         if (OB_MINOR_FREEZE_NOT_ALLOW == ret) {
           if (TC_REACH_TIME_INTERVAL(1000 * 1000)) {
@@ -809,6 +816,7 @@ int ObTxReplayExecutor::replay_one_row_in_memtable_(ObMutatorRowHeader &row_head
 
     lib::CompatModeGuard compat_guard(mode);
     switch (row_head.mutator_type_) {
+    case MutatorType::MUTATOR_LOB_OUTTABLE_ROW:
     case MutatorType::MUTATOR_ROW: {
       if (OB_FAIL(replay_row_(storeCtx, tablet, mmi_ptr_)) && OB_ITER_END != ret) {
         if (OB_NO_NEED_UPDATE != ret && OB_MINOR_FREEZE_NOT_ALLOW != ret) {

@@ -85,6 +85,7 @@ class ObAllVirtualMdsNodeStat;
 namespace storage
 {
 enum class ObInvBM25StatKind : uint8_t;
+struct ObLobOutTableRedoCtx;
 class ObMdsTable;
 class ObIMemtable;
 class ObStoreCtx;
@@ -527,14 +528,16 @@ public:
       const bool check_exist,
       const ObColDescIArray &col_descs,
       const common::ObIArray<transaction::ObEncryptMetaCache> *encrypt_meta_arr,
-      ObRowsInfo &rows_info);
+      ObRowsInfo &rows_info,
+      const ObLobOutTableRedoCtx *outtable_redo_ctx = nullptr);
   int insert_row(
       ObRelativeTable &relative_table,
       ObStoreCtx &store_ctx,
       const bool check_exist,
       const ObColDescIArray &col_descs,
       blocksstable::ObDatumRow &row,
-      const common::ObIArray<transaction::ObEncryptMetaCache> *encrypt_meta_arr);
+      const common::ObIArray<transaction::ObEncryptMetaCache> *encrypt_meta_arr,
+      const ObLobOutTableRedoCtx *outtable_redo_ctx = nullptr);
   int update_row(
       ObRelativeTable &relative_table,
       ObStoreCtx &store_ctx,
@@ -543,7 +546,8 @@ public:
       const blocksstable::ObDatumRow &old_row,
       blocksstable::ObDatumRow &new_row,
       const common::ObIArray<transaction::ObEncryptMetaCache> *encrypt_meta_arr,
-      const common::ObIArray<int64_t> *old_row_log_column_idxs);
+      const common::ObIArray<int64_t> *old_row_log_column_idxs,
+      const ObLobOutTableRedoCtx *outtable_redo_ctx = nullptr);
   int update_rows(
       ObRelativeTable &relative_table,
       ObStoreCtx &store_ctx,
@@ -552,7 +556,8 @@ public:
       const blocksstable::ObDatumRow *old_rows,
       const common::ObIArray<transaction::ObEncryptMetaCache> *encrypt_meta_arr,
       ObRowsInfo &rows_info,
-      const common::ObIArray<int64_t> *old_row_log_column_idxs);
+      const common::ObIArray<int64_t> *old_row_log_column_idxs,
+      const ObLobOutTableRedoCtx *outtable_redo_ctx = nullptr);
   int lock_row(
       ObRelativeTable &relative_table,
       ObStoreCtx &store_ctx,

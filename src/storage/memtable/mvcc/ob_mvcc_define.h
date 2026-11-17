@@ -16,6 +16,7 @@ namespace oceanbase
 namespace storage
 {
 struct ObMdsValueMeta;
+struct ObLobOutTableRedoPayload;
 }
 namespace memtable
 {
@@ -30,6 +31,8 @@ struct ObTxNodeArg
   transaction::ObTransID tx_id_;
   // data_ is the new row of the modifiction
   const ObMemtableData *data_;
+  // Borrowed per-row input; the write builder copies it into the trans node.
+  const storage::ObLobOutTableRedoPayload *lob_redo_payload_;
   // old_row_ is the old row of the modificattion
   // NB: It is only used for liboblog
   ObRowData old_row_;
@@ -65,6 +68,7 @@ struct ObTxNodeArg
 
   TO_STRING_KV(K_(tx_id),
                KP_(data),
+               KP_(lob_redo_payload),
                K_(old_row),
                K_(modify_count),
                K_(acc_checksum),
@@ -82,6 +86,7 @@ struct ObTxNodeArg
   ObTxNodeArg()
     : tx_id_(),
     data_(nullptr),
+    lob_redo_payload_(nullptr),
     old_row_(),
     modify_count_(UINT32_MAX),
     acc_checksum_(0),
@@ -105,6 +110,7 @@ struct ObTxNodeArg
               const int64_t column_cnt)
     : tx_id_(tx_id),
     data_(data),
+    lob_redo_payload_(nullptr),
     old_row_(old_row),
     modify_count_(UINT32_MAX),
     acc_checksum_(0),
@@ -130,6 +136,7 @@ struct ObTxNodeArg
               const int64_t column_cnt)
     : tx_id_(tx_id),
     data_(data),
+    lob_redo_payload_(nullptr),
     old_row_(),
     modify_count_(modify_count),
     acc_checksum_(acc_checksum),
@@ -155,6 +162,7 @@ struct ObTxNodeArg
   {
     tx_id_ = tx_id;
     data_ = data;
+    lob_redo_payload_ = nullptr;
     old_row_ = old_row;
     modify_count_ = UINT32_MAX;
     acc_checksum_ = 0;
@@ -177,6 +185,7 @@ struct ObTxNodeArg
   {
     tx_id_ = tx_id;
     data_ = data;
+    lob_redo_payload_ = nullptr;
     old_row_.reset();
     modify_count_ = modify_count;
     acc_checksum_ = acc_checksum;
@@ -199,6 +208,7 @@ struct ObTxNodeArg
   {
     tx_id_ = tx_id;
     is_mds_write_ = true;
+    lob_redo_payload_ = nullptr;
     mds_type_ = mds_type;
     mds_value_ = mds_value;
     mds_meta_ = mds_meta;
@@ -222,6 +232,7 @@ struct ObTxNodeArg
   {
     tx_id_ = tx_id;
     is_mds_write_ = true;
+    lob_redo_payload_ = nullptr;
     mds_type_ = mds_type;
     mds_value_ = mds_value;
     mds_meta_ = mds_meta;

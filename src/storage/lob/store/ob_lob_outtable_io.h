@@ -40,6 +40,12 @@ public: // the function about macro id
 
 public: // the function about write and read
   static int write(const blocksstable::MacroBlockId &macro_id, const common::ObString &data);
+  // Restore a missing object before replaying its Meta row; NOLOGGING performs no object IO.
+  static int replay_object(
+      const blocksstable::MacroBlockId &macro_id,
+      const common::ObString &data,
+      const bool is_logging,
+      const int64_t ls_id);
   static int async_write(const blocksstable::MacroBlockId &macro_id,
                          const common::ObString &data,
                          blocksstable::ObStorageObjectHandle &object_handle);
@@ -63,10 +69,6 @@ public: // the function about write and read
                         common::ObString &data,
                         blocksstable::ObStorageObjectHandle &object_handle);
   static int enable_outtable_clog(const uint64_t tenant_id, bool &is_write_clog);
-  static int write_clog(ObLobWriteContext &ctx,
-                        ObLobQueryIter *iter,
-                        const common::ObIArray<ObLobMetaInfo> &metas,
-                        const bool is_logging);
   static bool is_retryable_error(const int ret);
   static int is_exist(const blocksstable::MacroBlockId &macro_id,
                       const int64_t ls_id,

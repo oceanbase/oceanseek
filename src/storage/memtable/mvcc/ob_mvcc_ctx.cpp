@@ -448,20 +448,6 @@ ObMvccRowCallback *ObIMvccCtx::alloc_row_callback(ObIMvccCtx &ctx, ObMvccRow &va
   return cb;
 }
 
-ObMvccRowCallback *ObIMvccCtx::alloc_row_callback(ObMvccRowCallback &cb, ObMemtable *memtable)
-{
-  int ret = OB_SUCCESS;
-  void *cb_buffer = NULL;
-  ObMvccRowCallback *new_cb = NULL;
-  if (NULL == (cb_buffer = alloc_mvcc_row_callback())) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-    TRANS_LOG(WARN, "alloc ObRowCB cb_buffer fail", K(ret));
-  } else if (NULL == (new_cb = new(cb_buffer) ObMvccRowCallback(cb, memtable))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-    TRANS_LOG(WARN, "construct ObRowCB object fail", K(ret), "cb_buffer", cb_buffer);
-  }
-  return new_cb;
-}
 }
 }
 

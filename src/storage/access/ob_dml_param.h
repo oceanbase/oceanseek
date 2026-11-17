@@ -42,6 +42,7 @@ namespace storage
 {
 class ObStoreCtxGuard;
 struct ObOuttableLobControlKey;
+struct ObLobOutTableRedoCtx;
 //
 // Project storage output row to expression array, the core project logic is:
 //
@@ -294,7 +295,8 @@ struct ObDMLBaseParam
         ctx_(),
         vec_index_acquire_ctxs_(nullptr),
         outtable_lob_control_keys_(nullptr),
-        allow_outtable_lob_(false)
+        allow_outtable_lob_(false),
+        outtable_redo_ctx_(nullptr)
   {
   }
 
@@ -336,6 +338,8 @@ struct ObDMLBaseParam
   common::ObIArray<share::ObVectorIndexAcquireCtx> *vec_index_acquire_ctxs_; // vector index auxiliary table info array for adaptor lookup (one per vector index)
   common::ObIArray<ObOuttableLobControlKey> *outtable_lob_control_keys_;
   bool allow_outtable_lob_;
+  // Borrowed only for this synchronous Meta DATA DML.
+  const ObLobOutTableRedoCtx *outtable_redo_ctx_;
   bool is_valid() const { return (timeout_ > 0 && schema_version_ >= 0) && nullptr != store_ctx_guard_; }
   DECLARE_TO_STRING;
 };

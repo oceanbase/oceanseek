@@ -17,6 +17,7 @@
 #include "storage/memtable/mvcc/ob_row_data.h"
 #include "storage/tx/ob_clog_encrypt_info.h"
 #include "storage/tablelock/ob_table_lock_common.h"
+#include "storage/lob/store/ob_lob_outtable_redo_payload.h"
 
 #include "share/ob_rpc_struct.h"
 
@@ -98,6 +99,7 @@ enum class MutatorType
   MUTATOR_TABLE_LOCK = 1,
   MUTATOR_ROW_EXT_INFO = 2,
   MUTATOR_MDS = 3,
+  MUTATOR_LOB_OUTTABLE_ROW = 4,
 };
 
 const char * get_mutator_type_str(MutatorType mutator_type);
@@ -335,10 +337,14 @@ public:
   const ObMutatorRowHeader &get_row_head();
   const ObMemtableMutatorRow &get_mutator_row();
   const ObMutatorTableLock &get_table_lock_row();
+  // Decoded metadata; string fields borrow the input log buffer until the next row or reset.
+  const storage::ObLobOutTableRedoPayload &get_lob_outtable_payload() const;
+  const common::ObString &get_lob_outtable_payload_buf() const;
   transaction::ObTxSEQ get_row_seq_no() const { return row_seq_no_; }
   TO_STRING_KV(K_(meta), K_(row_seq_no), K(buf_.get_position()),K(buf_.get_limit()));
 private:
-
+  int deserialize_lob_outtable_row_(ObEncryptRowBuf &decrypt_buf,
+      const transaction::ObCLogEncryptInfo &encrypt_info);
 private:
   ObMemtableMutatorMeta meta_;
   common::ObDataBuffer buf_;
@@ -346,6 +352,8 @@ private:
   ObMemtableMutatorRow row_;
   ObMutatorTableLock table_lock_;
   transaction::ObTxSEQ row_seq_no_;
+  storage::ObLobOutTableRedoPayload lob_outtable_payload_;
+  common::ObString lob_outtable_payload_buf_;
   DISALLOW_COPY_AND_ASSIGN(ObMemtableMutatorIterator);
 };
 }//namespace memtable
