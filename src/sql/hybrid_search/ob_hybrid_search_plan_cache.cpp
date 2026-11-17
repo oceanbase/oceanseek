@@ -7,6 +7,9 @@
 #include "ob_hybrid_search_plan_cache.h"
 #include "ob_hybrid_search_dsl_parameterizer.h"
 #include "sql/parser/ob_fast_parser.h"
+#include "sql/engine/ob_exec_context.h"
+#include "sql/engine/ob_physical_plan.h"
+#include "sql/resolver/ob_stmt.h"
 #include "sql/plan_cache/ob_plan_cache_struct.h"
 #include "sql/plan_cache/ob_plan_cache_value.h"
 #include "sql/plan_cache/ob_sql_parameterization.h"
@@ -415,6 +418,47 @@ bool ObHybridSearchPlanCache::can_add_plan(const ObFastParserResult &result)
         "reason", fallback_reason_name(DSL_FALLBACK_FAST_PARSER_DISABLED));
   }
   return request != nullptr && request->params_bound();
+}
+
+int ObHybridSearchPlanCache::can_add_plan(const ObPlanCacheCtx &ctx,
+                                        const ObPhysicalPlan &plan, bool &can_add)
+{
+  int ret = OB_SUCCESS;
+  const ObSQLSessionInfo *session = nullptr;
+  const ObStmtFactory *stmt_factory = nullptr;
+  const ObQueryCtx *query_ctx = nullptr;
+  can_add = can_add_plan(ctx.fp_result_);
+  if (!can_add) {
+    // Skip further checks when DSL parameters are not bound.
+  } else if (OB_ISNULL(session = ctx.exec_ctx_.get_my_session())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null session", K(ret));
+  } else if (ObSqlSchemaGuard::can_use_async_index(session)) {
+    // Async index access is not restricted by the transaction state.
+  } else if (OB_ISNULL(stmt_factory = ctx.exec_ctx_.get_stmt_factory())
+             || OB_ISNULL(query_ctx = stmt_factory->get_query_ctx())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null statement factory or query context", K(ret), KP(stmt_factory));
+  } else {
+    // Transaction fallback plans must not mask async candidates after the transaction ends.
+    const ObSqlSchemaGuard &schema_guard = query_ctx->sql_schema_guard_;
+    const DependenyTableStore &dependency_tables = plan.get_dependency_table();
+    for (int64_t i = 0; OB_SUCC(ret) && can_add && i < dependency_tables.count(); ++i) {
+      const share::schema::ObSchemaObjVersion &schema_obj = dependency_tables.at(i);
+      const share::schema::ObTableSchema *table_schema = nullptr;
+      if (!schema_obj.is_base_table()) {
+        // Only base tables need the async index check.
+      } else if (OB_FAIL(schema_guard.get_table_schema(schema_obj.get_object_id(), table_schema))) {
+        LOG_WARN("failed to get table schema", K(ret), K(schema_obj));
+      } else if (OB_ISNULL(table_schema)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected null table schema", K(ret), K(schema_obj));
+      } else if (table_schema->has_async_index()) {
+        can_add = false;
+      }
+    }
+  }
+  return ret;
 }
 
 int ObHybridSearchPlanCache::prepare_remote_sql(ObPlanCacheCtx &ctx, ObRemoteSqlInfo &remote_sql_info)

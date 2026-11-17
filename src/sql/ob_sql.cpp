@@ -5519,15 +5519,16 @@ int ObSql::need_add_plan(const ObPlanCacheCtx &pc_ctx,
     LOG_WARN("unexpected null ptr", K(ret), KP(result.get_exec_context().get_stmt_factory()));
   } else if (result.get_exec_context().get_stmt_factory()->get_query_ctx()->has_dblink()) {
     need_add_plan = false;
-  } else if (result.get_exec_context().get_stmt_factory()->get_query_ctx()->has_hybrid_search()
-             && !ObHybridSearchPlanCache::can_add_plan(pc_ctx.fp_result_)) {
-    need_add_plan = false;
   } else if (result.get_exec_context().get_stmt_factory()->get_query_ctx()
       ->has_dynamic_partition_tier()) {
     need_add_plan = false;
   } else if (result.get_exec_context().get_stmt_factory()->get_query_ctx()->has_odps_external_table()) {
     // odps session will not outlive its query, plan should not be cached
     need_add_plan = false;
+  } else if (result.get_exec_context().get_stmt_factory()->get_query_ctx()->has_hybrid_search()) {
+    if (OB_FAIL(ObHybridSearchPlanCache::can_add_plan(pc_ctx, *phy_plan, need_add_plan))) {
+      LOG_WARN("failed to check hybrid search plan cache admission", K(ret));
+    }
   }
   return ret;
 }

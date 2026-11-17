@@ -14,6 +14,7 @@
 #include "sql/ob_sql_init.h"
 #include "sql/code_generator/ob_static_engine_cg.h"
 #include "sql/engine/ob_physical_plan.h"
+#include "sql/hybrid_search/ob_hybrid_search_plan_cache.h"
 #include "sql/optimizer/ob_optimizer_context.h"
 #include "sql/plan_cache/ob_pcv_set.h"
 #include "sql/plan_cache/ob_plan_cache.h"
@@ -47,6 +48,48 @@ protected:
   {
     session_info_.get_tx_desc() = nullptr;
     TestSqlUtils::destroy();
+  }
+
+  void init_cache_table(ObTableSchema &table_schema, const char *table_name,
+                        const bool has_async_index)
+  {
+    table_schema.set_tenant_id(OB_SYS_TENANT_ID);
+    table_schema.set_database_id(OB_SYS_DATABASE_ID);
+    table_schema.set_table_type(USER_TABLE);
+    table_schema.set_index_type(INDEX_TYPE_IS_NOT);
+    table_schema.set_rowkey_column_num(1);
+    table_schema.set_max_used_column_id(OB_APP_MIN_COLUMN_ID);
+    ASSERT_EQ(OB_SUCCESS, table_schema.set_table_name(table_name));
+    table_schema.set_table_id(get_next_table_id(OB_SYS_TENANT_ID));
+    table_schema.set_tablet_id(get_next_tablet_id(OB_SYS_TENANT_ID));
+    if (has_async_index) {
+      table_schema.add_table_flag(HAS_ASYNC_INDEX_FLAG);
+    }
+    ObColumnSchemaV2 column;
+    column.set_tenant_id(OB_SYS_TENANT_ID);
+    column.set_table_id(table_schema.get_table_id());
+    column.set_column_id(OB_APP_MIN_COLUMN_ID);
+    column.set_data_type(ObIntType);
+    column.set_data_length(static_cast<int64_t>(sizeof(int64_t)));
+    column.set_rowkey_position(1);
+    column.set_nullable(false);
+    ASSERT_EQ(OB_SUCCESS, column.set_column_name("id"));
+    ASSERT_EQ(OB_SUCCESS, table_schema.add_column(column));
+    ASSERT_EQ(OB_SUCCESS, add_table_schema(table_schema));
+  }
+
+  void check_plan_admission(ObPhysicalPlan &plan, ObPlanCacheCtx &pc_ctx,
+                            const bool expected)
+  {
+    ObSql sql;
+    ObResultSet result(session_info_, allocator_);
+    result.set_exec_context(exec_ctx_);
+    // The result only borrows this stack plan for the admission check.
+    result.get_cache_obj_guard().cache_obj_ = &plan;
+    bool need_add = true;
+    EXPECT_EQ(OB_SUCCESS, sql.need_add_plan(pc_ctx, result, true, need_add));
+    EXPECT_EQ(expected, need_add);
+    result.get_cache_obj_guard().cache_obj_ = nullptr;
   }
 
   void set_current_constraints(ObSqlCtx &sql_ctx, ObQueryCtx &query_ctx)
@@ -383,6 +426,118 @@ protected:
 
   transaction::ObTxDesc tx_desc_;
 };
+
+TEST_F(TestAsyncIndexPlanConstraint, hybrid_transaction_plans_on_async_tables_are_not_cached)
+{
+  lib::CompatModeGuard compat_guard(lib::Worker::CompatMode::MYSQL);
+  ObTableSchema table_schema;
+  ASSERT_NO_FATAL_FAILURE(init_cache_table(table_schema, "txn_cache_async", true));
+  ASSERT_EQ(OB_SUCCESS, schema_service_->get_schema_guard(schema_guard_));
+  ObPhysicalPlan plan;
+  ASSERT_EQ(OB_SUCCESS, plan.init_dependency_table_store(1));
+  ASSERT_EQ(OB_SUCCESS, plan.get_dependency_table().push_back(ObSchemaObjVersion(
+      table_schema.get_table_id(), table_schema.get_schema_version(), DEPENDENCY_TABLE)));
+  // A fallback plan has a base-table dependency, but no async scan or transaction mask.
+  EXPECT_EQ(NO_SESSION_STATE_CONSTRAINT, sql_ctx_.session_state_constraints_);
+  ObPlanCacheCtx pc_ctx(ObString::make_string("select id from hybrid_search(table txn_cache_async, '{}')"),
+                        PC_TEXT_MODE, allocator_, sql_ctx_, exec_ctx_, OB_SYS_TENANT_ID);
+  ObHybridDslRequestInfo request(allocator_);
+  request.set_sql_raw_param_count(0);
+  request.set_params_bound(true);
+  pc_ctx.fp_result_.hybrid_dsl_request_ = &request;
+  stmt_factory_.get_query_ctx()->has_hybrid_search_ = true;
+  check_plan_admission(plan, pc_ctx, true);
+  tx_desc_.flags_.EXPLICIT_ = true;
+  session_info_.get_tx_desc() = &tx_desc_;
+  check_plan_admission(plan, pc_ctx, false);
+  // An implicit autocommit transaction does not exclude async candidates.
+  tx_desc_.flags_.EXPLICIT_ = false;
+  check_plan_admission(plan, pc_ctx, true);
+  session_info_.get_tx_desc() = nullptr;
+  check_plan_admission(plan, pc_ctx, true);
+  ASSERT_EQ(OB_SUCCESS, session_info_.set_autocommit(false));
+  check_plan_admission(plan, pc_ctx, false);
+  tx_desc_.flags_.EXPLICIT_ = true;
+  session_info_.get_tx_desc() = &tx_desc_;
+  check_plan_admission(plan, pc_ctx, false);
+  // COMMIT/ROLLBACK does not remove the autocommit=0 restriction.
+  session_info_.get_tx_desc() = nullptr;
+  check_plan_admission(plan, pc_ctx, false);
+  ASSERT_EQ(OB_SUCCESS, session_info_.set_autocommit(true));
+  check_plan_admission(plan, pc_ctx, true);
+}
+
+TEST_F(TestAsyncIndexPlanConstraint, hybrid_plan_admission_checks_all_base_table_dependencies)
+{
+  lib::CompatModeGuard compat_guard(lib::Worker::CompatMode::MYSQL);
+  ObTableSchema plain_table;
+  ObTableSchema async_table;
+  ASSERT_NO_FATAL_FAILURE(init_cache_table(plain_table, "cache_plain", false));
+  ASSERT_NO_FATAL_FAILURE(init_cache_table(async_table, "cache_async", true));
+  ASSERT_EQ(OB_SUCCESS, schema_service_->get_schema_guard(schema_guard_));
+  ASSERT_EQ(OB_SUCCESS, session_info_.set_autocommit(false));
+  ObPlanCacheCtx pc_ctx(ObString::make_string("select id from hybrid_search(table cache_plain, '{}')"),
+                        PC_TEXT_MODE, allocator_, sql_ctx_, exec_ctx_, OB_SYS_TENANT_ID);
+  ObHybridDslRequestInfo request(allocator_);
+  request.set_sql_raw_param_count(0);
+  request.set_params_bound(true);
+  pc_ctx.fp_result_.hybrid_dsl_request_ = &request;
+  ObQueryCtx *query_ctx = stmt_factory_.get_query_ctx();
+  query_ctx->has_hybrid_search_ = true;
+  ObPhysicalPlan plan;
+  ASSERT_EQ(OB_SUCCESS, plan.init_dependency_table_store(3));
+  check_plan_admission(plan, pc_ctx, true);
+  ASSERT_EQ(OB_SUCCESS, plan.get_dependency_table().push_back(ObSchemaObjVersion(
+      plain_table.get_table_id(), plain_table.get_schema_version(), DEPENDENCY_TABLE)));
+  check_plan_admission(plan, pc_ctx, true);
+  // Non-table dependencies must not be looked up as table schemas.
+  ASSERT_EQ(OB_SUCCESS, plan.get_dependency_table().push_back(ObSchemaObjVersion(
+      OB_INVALID_ID, 1, DEPENDENCY_FUNCTION)));
+  check_plan_admission(plan, pc_ctx, true);
+  // A later async-index table is enough to prevent caching the complete hybrid plan.
+  ASSERT_EQ(OB_SUCCESS, plan.get_dependency_table().push_back(ObSchemaObjVersion(
+      async_table.get_table_id(), async_table.get_schema_version(), DEPENDENCY_TABLE)));
+  check_plan_admission(plan, pc_ctx, false);
+  ASSERT_EQ(OB_SUCCESS, session_info_.set_autocommit(true));
+  check_plan_admission(plan, pc_ctx, true);
+  // Hybrid admission must not bypass other SQL admission conditions.
+  query_ctx->set_has_dynamic_partition_tier(true);
+  check_plan_admission(plan, pc_ctx, false);
+  query_ctx->set_has_dynamic_partition_tier(false);
+  query_ctx->set_has_odps_external_table(true);
+  check_plan_admission(plan, pc_ctx, false);
+  query_ctx->set_has_odps_external_table(false);
+  check_plan_admission(plan, pc_ctx, true);
+}
+
+TEST_F(TestAsyncIndexPlanConstraint, ordinary_sql_is_unchanged_and_hybrid_still_requires_bound_dsl)
+{
+  lib::CompatModeGuard compat_guard(lib::Worker::CompatMode::MYSQL);
+  ObTableSchema table_schema;
+  ASSERT_NO_FATAL_FAILURE(init_cache_table(table_schema, "plain_sql_async", true));
+  ASSERT_EQ(OB_SUCCESS, schema_service_->get_schema_guard(schema_guard_));
+  ASSERT_EQ(OB_SUCCESS, session_info_.set_autocommit(false));
+  ObPhysicalPlan plan;
+  ASSERT_EQ(OB_SUCCESS, plan.init_dependency_table_store(1));
+  ASSERT_EQ(OB_SUCCESS, plan.get_dependency_table().push_back(ObSchemaObjVersion(
+      table_schema.get_table_id(), table_schema.get_schema_version(), DEPENDENCY_TABLE)));
+  for (int64_t i = 0; i < 2; ++i) {
+    ObPlanCacheCtx pc_ctx(ObString::make_string("select id from plain_sql_async"),
+        0 == i ? PC_TEXT_MODE : PC_PS_MODE, allocator_, sql_ctx_, exec_ctx_, OB_SYS_TENANT_ID);
+    check_plan_admission(plan, pc_ctx, true);
+  }
+  ASSERT_EQ(OB_SUCCESS, session_info_.set_autocommit(true));
+  ObPlanCacheCtx pc_ctx(ObString::make_string("select id from hybrid_search(table plain_sql_async, '{}')"),
+                        PC_TEXT_MODE, allocator_, sql_ctx_, exec_ctx_, OB_SYS_TENANT_ID);
+  stmt_factory_.get_query_ctx()->has_hybrid_search_ = true;
+  check_plan_admission(plan, pc_ctx, false);
+  ObHybridDslRequestInfo request(allocator_);
+  pc_ctx.fp_result_.hybrid_dsl_request_ = &request;
+  request.set_sql_raw_param_count(0);
+  check_plan_admission(plan, pc_ctx, false);
+  request.set_params_bound(true);
+  check_plan_admission(plan, pc_ctx, true);
+}
 
 TEST_F(TestAsyncIndexPlanConstraint, async_index_registration_uses_current_request)
 {

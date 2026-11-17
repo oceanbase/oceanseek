@@ -18,6 +18,7 @@ struct ObFastParserResult;
 struct ObRemoteSqlInfo;
 struct SqlInfo;
 class ObSQLSessionInfo;
+class ObPhysicalPlan;
 
 // Recognizes the HYBRID_SEARCH carrier in tokens supplied by the SQL lexer.
 class ObHybridSearchTokenHandler
@@ -97,6 +98,7 @@ public:
   static ObHybridDslRequestInfo *get_request(ObHybridDslRequestInfo *request);
   static ObHybridDslRequestInfo *get_request(const ObFastParserResult &result);
   static bool can_add_plan(const ObFastParserResult &result);
+  static int can_add_plan(const ObPlanCacheCtx &ctx, const ObPhysicalPlan &plan, bool &can_add);
   // Prepare the hybrid-specific remote payload.
   static int prepare_remote_sql(ObPlanCacheCtx &ctx, ObRemoteSqlInfo &remote_sql_info);
   static int get_remote_sql(ObPlanCacheCtx &ctx, common::ObString &sql);

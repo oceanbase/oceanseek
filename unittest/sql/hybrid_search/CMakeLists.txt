@@ -1,1 +1,2 @@
 sql_unittest(test_hybrid_search_dsl_parameterization)
+sql_unittest(test_async_index_plan_constraint)
