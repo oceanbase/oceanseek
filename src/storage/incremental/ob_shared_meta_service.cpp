@@ -2246,37 +2246,43 @@ static int check_shared_meta_location_ready_before_create_inner_tablet(const ObL
         LOG_WARN("shared meta table has unexpected partition schema", KR(ret),
             K(meta_tenant_id), K(table_name), KPC(table_schema));
       } else {
+        // __all_shared_tiered_meta is always written with ls_id 0 (see ObTieredMetadataStore),
+        // other shared meta tables are written with the real LS id.
+        const ObLSID check_ls_id =
+            (0 == strcmp(table_name, OB_ALL_SHARED_TIERED_META_TNAME)) ? ObLSID(0) : target_ls_id;
         ObObj ls_id_obj;
         ObObjectID part_id = OB_INVALID_ID;
         ObTabletID tablet_id;
         ObLSID tablet_host_ls_id;
         ObAddr leader;
-        ls_id_obj.set_int(target_ls_id.id());
+        ls_id_obj.set_int(check_ls_id.id());
         ObNewRow partition_row(&ls_id_obj, 1);
         if (OB_FAIL(schema::ObPartitionUtils::get_tablet_and_part_id(
                 *table_schema, partition_row, tablet_id, part_id))) {
           LOG_WARN("failed to get shared meta tablet id by ls id", KR(ret),
-              K(meta_tenant_id), K(table_name), K(target_ls_id));
+              K(meta_tenant_id), K(table_name), K(check_ls_id));
         } else if (OB_UNLIKELY(!tablet_id.is_valid())) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("invalid shared meta tablet id calculated by ls id", KR(ret),
-              K(meta_tenant_id), K(table_name), K(target_ls_id), K(part_id));
+              K(meta_tenant_id), K(table_name), K(check_ls_id), K(part_id));
         } else if (OB_FAIL(GCTX.location_service_->nonblock_get(
                        meta_tenant_id, tablet_id, tablet_host_ls_id))) {
           LOG_WARN("shared meta tablet to ls cache is not ready", KR(ret),
-              K(user_tenant_id), K(meta_tenant_id), K(table_name), K(target_ls_id), K(tablet_id));
+              K(user_tenant_id), K(meta_tenant_id), K(table_name), K(check_ls_id), K(tablet_id));
         } else if (OB_FAIL(GCTX.location_service_->nonblock_get_leader(
                        GCONF.cluster_id, meta_tenant_id, tablet_host_ls_id, leader))) {
           LOG_WARN("shared meta ls leader cache is not ready", KR(ret),
-              K(user_tenant_id), K(meta_tenant_id), K(table_name), K(target_ls_id),
+              K(user_tenant_id), K(meta_tenant_id), K(table_name), K(check_ls_id),
               K(tablet_id), K(tablet_host_ls_id));
         } else if (OB_UNLIKELY(!leader.is_valid())) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("shared meta ls leader is invalid", KR(ret),
-              K(user_tenant_id), K(meta_tenant_id), K(table_name), K(target_ls_id),
+              K(user_tenant_id), K(meta_tenant_id), K(table_name), K(check_ls_id),
               K(tablet_id), K(tablet_host_ls_id), K(leader));
         } else {
           ++checked_tablet_count;
+          LOG_INFO("[ERRSIM] shared meta tablet location ready", K(meta_tenant_id),
+              K(table_name), "check_ls_id", check_ls_id.id(), K(tablet_id));
         }
       }
     }

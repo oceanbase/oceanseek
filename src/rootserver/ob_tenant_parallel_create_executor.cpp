@@ -631,6 +631,12 @@ int ObParallelCreateTenantExecutor::collect_shared_meta_tablet_ids_(
       LOG_WARN("meta tenant ls ids for tablet location cache warm-up are empty",
           KR(ret), K(meta_tenant_id));
     }
+    // __all_shared_tiered_meta 写入侧固定 ls_id=0（非租户 LS，不在 __all_ls_status 中），
+    // 这里单独补入预热集合，让 hash(0) 分区在建租户前完成预热。
+    if (OB_SUCC(ret) && OB_FAIL(warm_up_ls_ids.push_back(share::ObLSID(0)))) {
+      LOG_WARN("failed to append tiered meta reserved ls id for warm-up",
+          KR(ret), K(meta_tenant_id));
+    }
   }
 
   if (OB_FAIL(ret)) {
