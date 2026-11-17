@@ -5,6 +5,7 @@
 
 #include "ob_object_device.h"
 #include "lib/restore/ob_storage_condition_put_probe.h"
+#include "lib/ash/ob_ash_bkgd_sess_inactive_guard.h"
 #include "lib/restore/ob_object_storage_base.h"
 
 namespace oceanbase
@@ -189,7 +190,11 @@ int ObObjectDeviceAsyncContextForNoWait::async_callback(int ret_code, int64_t by
       do {
         if (OB_FAIL(device->push_io_event(io_event))) {
           if (ret == OB_SIZE_OVERFLOW) {
-            ::usleep(1000);
+            {
+              // Exclude time waiting for completion-queue space from ASH CPU time.
+              ObBKGDSessInActiveGuard inactive_guard;
+              ::usleep(1000);
+            }
             if (REACH_TIME_INTERVAL(10 * 1000 * 1000)) {
               OB_LOG(INFO, "there is no enough space to push io event", KR(ret), KP(io_event));
             }
@@ -1798,6 +1803,8 @@ int ObObjectDevice::io_getevents(ObIOContext *io_context, int64_t min_nr,
           const int64_t current_time_us = ObTimeUtility::current_time();
           if (current_time_us - start_time_us < timeout_us) {
             const int64_t sleep_time_us = min(1000, timeout_us - (current_time_us - start_time_us));
+            // Exclude empty-queue polling sleep from ASH CPU time.
+            ObBKGDSessInActiveGuard inactive_guard;
             ::usleep(sleep_time_us);
           }
           if (REACH_TIME_INTERVAL(10 * 1000 * 1000)) {

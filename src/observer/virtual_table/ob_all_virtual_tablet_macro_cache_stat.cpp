@@ -14,6 +14,7 @@
 #include "share/ob_share_util.h"
 #include "share/schema/ob_multi_version_schema_service.h"
 #include "share/schema/ob_schema_getter_guard.h"
+#include "share/schema/ob_schema_service.h"
 #include "share/schema/ob_table_schema.h"
 #include "share/tablet/ob_tablet_to_ls_operator.h"
 #include "storage/blocksstable/ob_ss_obj_util.h"
@@ -406,7 +407,7 @@ int ObAllVirtualTabletMacroCacheStat::prepare_curr_tenant_()
                   KR(ret), KR(prepare_ret), K(retry_count), K(index_type_));
             }
           }
-        } else {
+        } else if (OB_ITER_END != ret) {
           SERVER_LOG(WARN, "fail to prepare tablet macro cache tenant",
               KR(ret), K(index_type_));
         }
@@ -423,6 +424,7 @@ int ObAllVirtualTabletMacroCacheStat::prepare_curr_tenant_once_()
   int ret = OB_SUCCESS;
   ObMultiVersionSchemaService *schema_service = GCTX.schema_service_;
   ObSchemaGetterGuard schema_guard;
+  int64_t schema_version = OB_INVALID_VERSION;
   const ObMemAttr mem_attr(MTL_ID(), "VTTabCacheStat");
   reset_tenant_state_();
   tablet_ids_.set_attr(mem_attr);
@@ -434,6 +436,19 @@ int ObAllVirtualTabletMacroCacheStat::prepare_curr_tenant_once_()
     SERVER_LOG(WARN, "schema service is null", KR(ret));
   } else if (OB_FAIL(schema_service->get_tenant_schema_guard(MTL_ID(), schema_guard))) {
     SERVER_LOG(WARN, "fail to get tenant schema guard", KR(ret));
+  } else if (OB_FAIL(schema_guard.get_schema_version(MTL_ID(), schema_version))) {
+    SERVER_LOG(WARN, "fail to get tenant schema version",
+        KR(ret), "tenant_id", MTL_ID());
+  } else if (OB_UNLIKELY(schema_version <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    SERVER_LOG(WARN, "invalid tenant schema version",
+        KR(ret), "tenant_id", MTL_ID(), K(schema_version));
+  } else if (!ObSchemaService::is_formal_version(schema_version)) {
+    // A tenant being initialized may expose a guard with schema version 1.
+    // Skip its local rows before tablet-to-table mapping requires a formal version.
+    ret = OB_ITER_END;
+    SERVER_LOG(INFO, "skip tablet macro cache tenant with informal schema version",
+        "tenant_id", MTL_ID(), K(schema_version));
   } else if (INDEX_TYPE_TABLE == index_type_) {
     if (OB_FAIL(prepare_table_query_(schema_guard))) {
       if (OB_ITER_END != ret) {

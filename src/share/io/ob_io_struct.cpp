@@ -10,6 +10,7 @@
 #include "observer/ob_server.h"
 #include "common/storage/ob_fd_simulator.h"
 #include "lib/restore/ob_object_device.h"
+#include "lib/stat/ob_diagnose_info.h"
 
 #ifdef OB_BUILD_SHARED_STORAGE
 #include "storage/shared_storage/ob_file_manager.h"
@@ -2648,6 +2649,9 @@ int ObSyncIOChannel::do_sync_io(ObIORequest &req)
   } else if (FALSE_IT(io_offset = static_cast<int64_t>(req.io_result_->offset_))) {
   } else if (FALSE_IT(req.io_result_->time_log_.submit_ts_ = ObTimeUtility::fast_current_time())) {
   } else if (req.get_flag().is_read()) {
+    const int64_t event_no = ((device_handle->is_object_device())
+        ? ObWaitEventIds::OBJECT_STORAGE_READ : req.get_flag().get_wait_event());
+    ObWaitEventGuard wait_guard(event_no);
     const ObIOReadMode read_mode = req.get_flag().get_read_mode();
     char *io_buf = req.calc_io_buf();
     char *uri_cstr = req.get_uri_cstr();
@@ -2728,6 +2732,9 @@ int ObSyncIOChannel::do_sync_io(ObIORequest &req)
       LOG_WARN("not supported io read mode", K(ret), K(req));
     }
   } else if (req.get_flag().is_write()) {
+    const int64_t event_no = ((device_handle->is_object_device())
+        ? ObWaitEventIds::OBJECT_STORAGE_WRITE : req.get_flag().get_wait_event());
+    ObWaitEventGuard wait_guard(event_no);
     if (device_handle->is_local_device()) {
       if (OB_FAIL(check_io_hang_errsim())) {
       } else if (OB_FAIL(device_handle->pwrite(req.fd_, io_offset, req.io_result_->size_, req.calc_io_buf(), io_size))) {

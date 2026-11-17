@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "ob_local_cache_device.h"
+#include "lib/ash/ob_ash_bkgd_sess_inactive_guard.h"
 #include "share/ob_resource_limit.h"
 #include "share/ob_io_device_helper.h"
 #include "storage/shared_storage/ob_disk_space_manager.h"
@@ -897,6 +898,8 @@ int ObLocalCacheDevice::io_getevents(
     int sys_ret = 0;
     {
       oceanbase::lib::Thread::WaitGuard guard(oceanbase::lib::Thread::WAIT_FOR_IO_EVENT);
+      // Exclude time waiting for IO completions from ASH CPU time.
+      common::ObBKGDSessInActiveGuard inactive_guard;
       while ((sys_ret = ::io_getevents(
           local_cache_io_context->io_context_,
           min_nr,
