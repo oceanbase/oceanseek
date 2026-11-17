@@ -10,14 +10,21 @@
 #define protected public
 #define private public
 #include "lib/alloc/alloc_func.h"
+#include "lib/checksum/ob_crc64.h"
+#include "lib/literals/ob_literals.h"
 #include "lib/restore/ob_object_storage_base.h"
+#include "lib/resource/ob_resource_mgr.h"
+#include "lib/time/ob_time_utility.h"
 #include "lib/utility/ob_test_util.h"
+#include "share/cache/ob_kvcache_store.h"
 #include "mittest/mtlenv/mock_tenant_module_env.h"
 #include "mittest/shared_storage/clean_residual_data.h"
 #include "mittest/shared_storage/test_ss_common_util.h"
 #include "storage/shared_storage/macro_cache/ob_ss_macro_cache_mgr.h"
+#include "storage/shared_storage/macro_cache/macro_block_kvcache/ob_ss_global_macro_block_kvcache.h"
 #include "storage/shared_storage/macro_cache/macro_block_kvcache/ob_ss_macro_persist_worker.h"
 #include "storage/shared_storage/macro_cache/macro_block_kvcache/ob_ss_tenant_macro_block_kvcache_mgr.h"
+#include "storage/shared_storage/ob_ss_local_cache_service.h"
 #undef private
 #undef protected
 #include "mittest/shared_storage/test_ss_macro_cache_mgr_util.h"
@@ -327,6 +334,68 @@ TEST(TestSSMacroPersistPolicy, policy_parameters_change_monotonically)
   LOG_INFO("verified monotonic pressure policy", K(previous_batch), K(previous_inflight), K(previous_interval));
 }
 
+// ============================================================================
+// 共享预留量与动态内存水位（2 个用例）：预留公式边界、动态加速区间及规格回退。
+// ============================================================================
+
+// 公共预留量函数保留原 KVCACHE 的大小分段、字节取整和大租户计算结果。
+// 场景：覆盖非正限额、1 GiB 两侧及 10/100/128/1000 GiB 的不同租户规格。
+// 操作：调用公共 reserve 函数，与独立给定的字节数比较，不复写生产公式。
+// 校验：小规格和大规格均保持原结果；返回的是预留字节数，而非总内存触发线。
+TEST(TestSSMacroPersistMemory, shared_cache_reserve_bytes)
+{
+  LOG_INFO("========== shared cache reserve bytes begin ==========");
+  const int64_t limits[] = {-1, 0, 512_MB, 1_GB, 1_GB + 1, 10_GB, 100_GB, 128_GB, 1000_GB};
+  const int64_t expected_reserves[] = {
+      0, 0, 53687091, 107374182, 104857600, 641728512,
+      10842275840L, 14585494248L, 161166131200L};
+  for (int64_t i = 0; i < ARRAYSIZEOF(limits); ++i) {
+    SCOPED_TRACE(::testing::Message() << "limit_bytes=" << limits[i]);
+    const int64_t reserve_bytes = ObKVCacheStore::calc_tenant_cache_reserve_bytes(limits[i]);
+    LOG_INFO("verify shared reserve", K(i), "limit_bytes", limits[i], K(reserve_bytes));
+    ASSERT_EQ(expected_reserves[i], reserve_bytes);
+  }
+  LOG_INFO("========== shared cache reserve bytes end ==========");
+}
+
+// macro 落盘在 KVCACHE 的动态回收起点前达到全速，并保留十五个百分点的加速区间。
+// 场景：10 GiB 保留原 90% 上界，100/128/1000 GiB 提前加速，最后回到 10 GiB。
+// 操作：使用独立给定的水位，在起点两侧、中点和终点两侧计算策略；Ring 压力始终为零。
+// 校验：批量、并发和间隔均符合预期；规格变化每轮生效，不沿用上一次计算的水位。
+TEST(TestSSMacroPersistMemory, watermarks_follow_current_tenant_limit)
+{
+  LOG_INFO("========== dynamic memory watermarks begin ==========");
+  // 期望水位由已知规格独立给出，不使用生产 reserve 函数推导测试输入。
+  // 128 GiB 的对数有小数部分，独立给出字节水位以捕获过早截断的错误。
+  const int64_t limits[] = {10_GB, 100_GB, 128_GB, 1000_GB, 10_GB};
+  const int64_t starts[] = {
+      15_GB / 2, 75_GB - 100_MB, 102237616204L, 700_GB - 100_MB, 15_GB / 2};
+  const int64_t fulls[] = {
+      9_GB, 90_GB - 100_MB, 122853459224L, 850_GB - 100_MB, 9_GB};
+  const int64_t expected_batches[] = {2, 2, 33, 63, 64, 64};
+  const int64_t expected_inflights[] = {2, 2, 9, 15, 16, 16};
+  const int64_t expected_intervals[] = {100000, 100000, 55000, 10900, 10000, 10000};
+  for (int64_t i = 0; i < ARRAYSIZEOF(limits); ++i) {
+    const int64_t holds[] = {
+        starts[i] - 1, starts[i], (starts[i] + fulls[i]) / 2,
+        fulls[i] - 1, fulls[i], fulls[i] + 1};
+    for (int64_t j = 0; j < ARRAYSIZEOF(holds); ++j) {
+      SCOPED_TRACE(::testing::Message() << "limit_bytes=" << limits[i]
+          << ", hold_bytes=" << holds[j]);
+      const PressureSnapshot snapshot = make_pressure_snapshot(
+          0 /*ring_size*/, 100 /*ring_capacity*/, holds[j], limits[i]);
+      const DrainPolicy policy = calculate_drain_policy(snapshot, TEST_IO_DEPTH);
+      LOG_INFO("verify dynamic memory watermark", K(i), K(j),
+          "start_bytes", starts[i], "full_bytes", fulls[i], K(snapshot), K(policy));
+      ASSERT_TRUE(policy.is_valid(TEST_IO_DEPTH));
+      ASSERT_EQ(expected_batches[j], policy.scan_batch_size_);
+      ASSERT_EQ(expected_inflights[j], policy.target_inflight_count_);
+      ASSERT_EQ(expected_intervals[j], policy.min_batch_interval_us_);
+    }
+  }
+  LOG_INFO("========== dynamic memory watermarks end ==========");
+}
+
 // 场景：向 Ring 放入三条任务，快照应准确反映队列大小、容量和当前租户内存上限。
 TEST_F(TestSSMacroPersistWorker, pressure_snapshot_samples_ring_and_tenant_memory)
 {
@@ -343,6 +412,130 @@ TEST_F(TestSSMacroPersistWorker, pressure_snapshot_samples_ring_and_tenant_memor
   ASSERT_EQ(RING_CAPACITY, snapshot.ring_capacity_);
   ASSERT_GE(snapshot.tenant_memory_hold_, 0);
   ASSERT_EQ(lib::get_tenant_memory_limit(MTL_ID()), snapshot.tenant_memory_limit_);
+}
+
+// Meta 的持久化压力与 user 的 KVCache 淘汰记账一致，普通 user 仍使用自身数据。
+// 场景：独立资源对象分别构造 meta 高压/user 空闲及 user 高压/meta 空闲，不分配实际内存。
+// 操作：分别以 user 和 meta ID 采样；校验 hold、limit 和策略均取 user，Ring 和 worker ID 不变。
+TEST_F(TestSSMacroPersistWorker, pressure_snapshot_uses_user_memory_for_meta_tenant)
+{
+  LOG_INFO("========== mapped pressure snapshot begin ==========");
+  constexpr uint64_t USER_TENANT_ID = 910002;
+  const uint64_t meta_tenant_id = gen_meta_tenant_id(USER_TENANT_ID);
+  lib::ObTenantResourceMgrHandle user_resource;
+  lib::ObTenantResourceMgrHandle meta_resource;
+  OK(lib::ObResourceMgr::get_instance().get_tenant_resource_mgr(USER_TENANT_ID, user_resource));
+  OK(lib::ObResourceMgr::get_instance().get_tenant_resource_mgr(meta_tenant_id, meta_resource));
+  lib::ObTenantMemoryMgr *user_memory = user_resource.get_memory_mgr();
+  lib::ObTenantMemoryMgr *meta_memory = meta_resource.get_memory_mgr();
+  ASSERT_NE(nullptr, user_memory);
+  ASSERT_NE(nullptr, meta_memory);
+  user_memory->set_limit(1_GB /*limit*/);
+  meta_memory->set_limit(2_GB /*limit*/);
+  const uint64_t worker_tenant_ids[] = {USER_TENANT_ID, meta_tenant_id};
+  const int64_t user_holds[] = {0, 1000_MB};
+  const int64_t meta_holds[] = {1900_MB, 0};
+  const int64_t expected_batches[] = {2, 64};
+
+  // 只调整这些独立对象的计数；使用非致命断言，确保每轮归还模拟用量。
+  for (int64_t i = 0; i < ARRAYSIZEOF(user_holds); ++i) {
+    const bool user_acquired = user_memory->limiter_.acquire(user_holds[i]);
+    const bool meta_acquired = meta_memory->limiter_.acquire(meta_holds[i]);
+    EXPECT_TRUE(user_acquired);
+    EXPECT_TRUE(meta_acquired);
+    for (int64_t j = 0; j < ARRAYSIZEOF(worker_tenant_ids); ++j) {
+      worker_.tenant_id_ = worker_tenant_ids[j];
+      PressureSnapshot snapshot;
+      worker_.collect_pressure_snapshot_(snapshot);
+      const DrainPolicy policy = calculate_drain_policy(snapshot, IO_DEPTH);
+      LOG_INFO("verify mapped memory pressure", K(i), K(j), K(snapshot), K(policy),
+          "worker_tenant_id", worker_.tenant_id_);
+      EXPECT_EQ(user_holds[i], snapshot.tenant_memory_hold_);
+      EXPECT_EQ(1_GB, snapshot.tenant_memory_limit_);
+      EXPECT_EQ(0, snapshot.ring_size_);
+      EXPECT_EQ(RING_CAPACITY, snapshot.ring_capacity_);
+      EXPECT_EQ(worker_tenant_ids[j], worker_.tenant_id_);
+      EXPECT_EQ(expected_batches[i], policy.scan_batch_size_);
+    }
+    if (user_acquired) {
+      EXPECT_TRUE(user_memory->limiter_.acquire(-user_holds[i]));
+    }
+    if (meta_acquired) {
+      EXPECT_TRUE(meta_memory->limiter_.acquire(-meta_holds[i]));
+    }
+  }
+  LOG_INFO("========== mapped pressure snapshot end ==========");
+}
+
+// user 限额无效时使用 meta 自身采样，两边都无效才仅依据 Ring 压力。
+// 场景：独立资源对象构造 meta 高压，覆盖未设置、零、负限额及 user 恢复有效的情况。
+// 操作：分别在空、满 Ring 下校验 hold/limit 来源和策略，不启动线程或实际 IO。
+TEST_F(TestSSMacroPersistWorker, mapped_memory_limit_falls_back_to_meta_then_ring)
+{
+  LOG_INFO("========== mapped memory fallback begin ==========");
+  constexpr uint64_t USER_TENANT_ID = 910004;
+  constexpr int64_t META_HOLD_BYTES = 1000_MB;
+  const uint64_t meta_tenant_id = gen_meta_tenant_id(USER_TENANT_ID);
+  lib::ObTenantResourceMgrHandle user_resource;
+  lib::ObTenantResourceMgrHandle meta_resource;
+  OK(lib::ObResourceMgr::get_instance().get_tenant_resource_mgr(USER_TENANT_ID, user_resource));
+  OK(lib::ObResourceMgr::get_instance().get_tenant_resource_mgr(meta_tenant_id, meta_resource));
+  lib::ObTenantMemoryMgr *user_memory = user_resource.get_memory_mgr();
+  lib::ObTenantMemoryMgr *meta_memory = meta_resource.get_memory_mgr();
+  ASSERT_NE(nullptr, user_memory);
+  ASSERT_NE(nullptr, meta_memory);
+  ASSERT_EQ(INT64_MAX, user_memory->get_limit());
+  ASSERT_EQ(INT64_MAX, meta_memory->get_limit());
+  worker_.tenant_id_ = meta_tenant_id;
+  struct MemoryCase
+  {
+    int64_t user_limit_;
+    int64_t meta_limit_;
+    int64_t expected_hold_;
+    int64_t expected_limit_;
+    int64_t expected_empty_batch_;
+  };
+  const MemoryCase cases[] = {
+      {INT64_MAX, 1_GB, META_HOLD_BYTES, 1_GB, 64},
+      {0, 1_GB, META_HOLD_BYTES, 1_GB, 64},
+      {-1, 1_GB, META_HOLD_BYTES, 1_GB, 64},
+      {INT64_MAX, INT64_MAX, 0, 0, 2},
+      {0, 0, 0, 0, 2},
+      {-1, -1, 0, 0, 2},
+      {1_GB, 1_GB, 0, 1_GB, 2}};
+  const int64_t ring_sizes[] = {0, RING_CAPACITY};
+  for (int64_t i = 0; i < ARRAYSIZEOF(ring_sizes); ++i) {
+    while (worker_.ring_buffer_.size() < ring_sizes[i]) {
+      OK(push_entry_(BASE_MACRO_SEQ + worker_.ring_buffer_.size(),
+          ObTimeUtility::current_time_us()));
+    }
+    // 只模拟独立 meta 对象的计数；非致命断言保证每轮能归还模拟用量。
+    const bool meta_acquired = meta_memory->limiter_.acquire(META_HOLD_BYTES);
+    EXPECT_TRUE(meta_acquired);
+    for (int64_t j = 0; j < ARRAYSIZEOF(cases); ++j) {
+      const MemoryCase &test_case = cases[j];
+      user_memory->set_limit(test_case.user_limit_);
+      meta_memory->set_limit(test_case.meta_limit_);
+      PressureSnapshot snapshot = make_pressure_snapshot(
+          1 /*ring_size*/, 1 /*ring_capacity*/,
+          1 /*tenant_memory_hold*/, 1 /*tenant_memory_limit*/);
+      worker_.collect_pressure_snapshot_(snapshot);
+      const DrainPolicy policy = calculate_drain_policy(snapshot, IO_DEPTH);
+      const int64_t expected_batch = ((0 == ring_sizes[i]) ? test_case.expected_empty_batch_ : 64);
+      LOG_INFO("verify mapped memory fallback", K(i), K(j), K(snapshot), K(policy),
+          K(test_case.user_limit_), K(test_case.meta_limit_), K(expected_batch));
+      EXPECT_EQ(test_case.expected_hold_, snapshot.tenant_memory_hold_);
+      EXPECT_EQ(test_case.expected_limit_, snapshot.tenant_memory_limit_);
+      EXPECT_EQ(ring_sizes[i], snapshot.ring_size_);
+      EXPECT_EQ(RING_CAPACITY, snapshot.ring_capacity_);
+      EXPECT_EQ(meta_tenant_id, worker_.tenant_id_);
+      EXPECT_EQ(expected_batch, policy.scan_batch_size_);
+    }
+    if (meta_acquired) {
+      EXPECT_TRUE(meta_memory->limiter_.acquire(-META_HOLD_BYTES));
+    }
+  }
+  LOG_INFO("========== mapped memory fallback end ==========");
 }
 
 // ============================================================================
@@ -860,6 +1053,138 @@ TEST_F(TestSSMacroPersistWorker, manager_uses_sixty_four_persist_io_depth)
   ASSERT_EQ(64, configured_io_depth);
   ASSERT_EQ(configured_io_depth, runtime_io_depth);
   LOG_INFO("========== manager persist IO depth end ==========");
+}
+
+// ============================================================================
+// 临时文件下沉排队时长规则：准入判断和跳过后的 L1 保留（2 个用例）。
+// ============================================================================
+
+// 排队超过两分钟的 TMP_FILE 请求被拒绝下沉，其他对象不受该限制。
+// 场景：用同一个新 Value 搭配不同入队时间，验证依据是任务排队时长。
+// 操作：直接调用准入检查，覆盖一分钟、三分钟、未来时间和未初始化时间，不提交 IO。
+// 校验：一分钟的请求允许，三分钟的请求拒绝；不要求微秒级严格边界。
+TEST_F(TestSSMacroPersistWorker, tmp_file_persist_queue_age_and_object_type)
+{
+  LOG_INFO("========== tmp file persist queue age begin ==========");
+  ASSERT_FALSE(is_macro_read_cache_disabled());
+  worker_.set_cache_enabled(true);
+  constexpr uint64_t EFFECTIVE_TABLET_ID = 0;
+  char payload[DIO_ALIGN_SIZE] = {};
+  ObSSMacroBlockCacheValue value(EFFECTIVE_TABLET_ID, payload, sizeof(payload), 0 /*crc*/);
+  const MacroBlockId macro_id = TestSSCommonUtil::gen_macro_block_id(BASE_MACRO_SEQ);
+  MacroBlockId tmp_id = macro_id;
+  tmp_id.set_storage_object_type(static_cast<uint64_t>(ObStorageObjectType::TMP_FILE));
+  ASSERT_TRUE(tmp_id.is_valid());
+  ObSSMacroPersistEntry entry;
+
+  // 用独立的一分钟和三分钟输入验证两分钟规则；Value 始终不变。
+  const int64_t ages_us[] = {0, 1_min, 3_min, -static_cast<int64_t>(1_s)};
+  const bool expected_can_persist[] = {true, true, false, true};
+  for (int64_t i = 0; i < ARRAYSIZEOF(ages_us); ++i) {
+    SCOPED_TRACE(::testing::Message() << "index=" << i << ", age_us=" << ages_us[i]);
+    entry.macro_id_ = tmp_id;
+    entry.enqueue_ts_ = ObTimeUtility::current_time_us() - ages_us[i];
+    bool can_persist = true;
+    OK(worker_.check_can_persist_(entry, value, can_persist));
+    LOG_INFO("verify tmp file queue age admission", K(i), K(entry), K(can_persist));
+    ASSERT_EQ(expected_can_persist[i], can_persist);
+
+    // 保持入队时间不变，普通 macro 不应用临时文件的排队时长限制。
+    entry.macro_id_ = macro_id;
+    can_persist = false;
+    OK(worker_.check_can_persist_(entry, value, can_persist));
+    LOG_INFO("verify regular macro admission", K(i), K(entry), K(can_persist));
+    ASSERT_TRUE(can_persist);
+  }
+  // 未初始化时间不作为过期依据，保持原准入规则。
+  entry.macro_id_ = tmp_id;
+  entry.enqueue_ts_ = 0;
+  bool can_persist = false;
+  OK(worker_.check_can_persist_(entry, value, can_persist));
+  LOG_INFO("verify missing enqueue timestamp", K(entry), K(can_persist));
+  ASSERT_TRUE(can_persist);
+  LOG_INFO("========== tmp file persist queue age end ==========");
+}
+
+// 过期临时文件任务出队后不提交 L2 IO，也不删除 KVCACHE 中的数据。
+// 场景：同一份 L1 数据分别搭配一分钟和三分钟前的请求，再将旧请求加入 Ring。
+// 操作：先核对 prepare 的提交决策，再执行一批下沉任务，检查队列、在途 IO 和 L1。
+// 校验：仅旧请求不需要提交；出队后无 L2 写入、L1 数据保留，排除落盘失败的误通过。
+TEST_F(TestSSMacroPersistWorker, expired_tmp_file_skips_l2_and_keeps_l1)
+{
+  LOG_INFO("========== expired tmp file keeps L1 begin ==========");
+  ASSERT_FALSE(is_macro_read_cache_disabled());
+  worker_.set_cache_enabled(true);
+  MacroBlockId tmp_id = TestSSCommonUtil::gen_macro_block_id(BASE_MACRO_SEQ + RING_CAPACITY);
+  tmp_id.set_storage_object_type(static_cast<uint64_t>(ObStorageObjectType::TMP_FILE));
+  const ObSSMacroBlockCacheKey key(MTL_ID(), tmp_id);
+  DEFER(IGNORE_RETURN OB_GLOBAL_MACRO_BLOCK_KVCACHE.erase(key));
+
+  // 用固定大小、真实校验和的数据，避免其他准入或 CRC 失败掩盖过期分支。
+  char payload[DIO_ALIGN_SIZE];
+  MEMSET(payload, 't', sizeof(payload));
+  constexpr uint64_t EFFECTIVE_TABLET_ID = 0;
+  const uint32_t crc = static_cast<uint32_t>(ob_crc64(payload, sizeof(payload)));
+  ObSSMacroBlockCacheValue value(EFFECTIVE_TABLET_ID, payload, sizeof(payload), crc);
+  OK(OB_GLOBAL_MACRO_BLOCK_KVCACHE.put(key, value, false /*overwrite*/));
+  ObSSMacroCacheMgr *l2_mgr = MTL(ObSSMacroCacheMgr *);
+  ASSERT_NE(nullptr, l2_mgr);
+  bool l2_exist = true;
+  OK(l2_mgr->exist(tmp_id, l2_exist));
+  ASSERT_FALSE(l2_exist);
+  LOG_INFO("step 1: prepared fresh L1 value", K(tmp_id), K(value));
+
+  // 同一份缓存数据只改变任务年龄，直接确认跳过原因，不依赖 IO 成功或失败。
+  ObSSMacroPersistEntry entry;
+  entry.macro_id_ = tmp_id;
+  entry.enqueue_ts_ = ObTimeUtility::current_time_us() - 1_min;
+  const ObSSMacroBlockCacheValue *prepared_value = nullptr;
+  ObKVCacheHandle prepared_handle;
+  bool need_submit = false;
+  OK(worker_.prepare_persist_entry_(entry, prepared_value, prepared_handle, need_submit));
+  LOG_INFO("step 2: fresh request is eligible", K(entry), K(need_submit));
+  ASSERT_TRUE(need_submit);
+  prepared_handle.reset();
+
+  entry.enqueue_ts_ = ObTimeUtility::current_time_us() - 3_min;
+  need_submit = true;
+  OK(worker_.prepare_persist_entry_(entry, prepared_value, prepared_handle, need_submit));
+  LOG_INFO("step 2: stale request is skipped", K(entry), K(need_submit));
+  ASSERT_FALSE(need_submit);
+  prepared_handle.reset();
+
+  // 直接设置入队时间模拟积压，避免等待两分钟且不修改缓存 Value。
+  ObSSMacroPersistEntry *queued_entry = nullptr;
+  OK(worker_.ring_buffer_.free_queue_.pop(queued_entry));
+  ASSERT_NE(nullptr, queued_entry);
+  *queued_entry = entry;
+  OK(worker_.ring_buffer_.ready_queue_.push(queued_entry));
+  LOG_INFO("step 3: prepared stale persistence request", KPC(queued_entry));
+  ObSSMacroPersistStat before_stat;
+  worker_.get_persist_stat_snapshot(before_stat);
+  int64_t popped = 0;
+  const DrainPolicy policy = make_policy_(1 /*scan_batch_size*/, 1 /*target_inflight_count*/);
+  OK(worker_.execute_drain_policy_(policy, popped));
+  LOG_INFO("step 4: drained expired entry", K(popped),
+      "inflight", worker_.write_task_.inflight_count());
+  ASSERT_EQ(1, popped);
+  ASSERT_EQ(0, worker_.ring_buffer_.size());
+  ASSERT_EQ(0, worker_.write_task_.inflight_count());
+  ObSSMacroPersistStat after_stat;
+  worker_.get_persist_stat_snapshot(after_stat);
+  LOG_INFO("verify no failed IO submission", K(before_stat), K(after_stat));
+  ASSERT_EQ(before_stat.persist_submit_fail_cnt_, after_stat.persist_submit_fail_cnt_);
+  OK(l2_mgr->exist(tmp_id, l2_exist));
+  ASSERT_FALSE(l2_exist);
+
+  const ObSSMacroBlockCacheValue *cached = nullptr;
+  ObKVCacheHandle handle;
+  OK(OB_GLOBAL_MACRO_BLOCK_KVCACHE.peek(key, cached, handle));
+  ASSERT_NE(nullptr, cached);
+  LOG_INFO("step 5: verify retained L1", KPC(cached));
+  ASSERT_EQ(0, MEMCMP(payload, cached->data_, sizeof(payload)));
+  OK(cached->check_crc());
+  LOG_INFO("========== expired tmp file keeps L1 end ==========");
 }
 
 } // namespace macro_persist_test

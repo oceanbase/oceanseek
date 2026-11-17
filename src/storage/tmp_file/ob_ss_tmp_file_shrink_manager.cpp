@@ -31,6 +31,8 @@ int ObTmpFileShrinkWBPTask::init(ObSSTmpWriteBufferPool *wbp, ObSSTmpFileFlushMa
   return ret;
 }
 
+// Advances or cancels shrinking independently of IO submission.
+// Background flushing reads the pool's current shrinking context under its locks.
 void ObTmpFileShrinkWBPTask::runTimerTask()
 {
   int ret = OB_SUCCESS;
@@ -43,9 +45,6 @@ void ObTmpFileShrinkWBPTask::runTimerTask()
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected null ptr", KR(ret), KP(wbp_), KP(flush_mgr_));
   } else if (wbp_->need_to_shrink(is_auto)) {
-    int64_t wash_size = 0;
-    int64_t wbp_max_size = wbp_->get_memory_limit();
-    ObSSTmpFileAsyncFlushWaitTaskHandle task_handle;
     LOG_DEBUG("current wbp shrinking state", K(wbp_->get_shrink_ctx()));
     switch (wbp_->get_wbp_state()) {
       case WBPShrinkContext::INVALID:
@@ -61,9 +60,7 @@ void ObTmpFileShrinkWBPTask::runTimerTask()
         if (!wbp_->get_shrink_ctx().is_valid()) {
           ret = OB_ERR_UNEXPECTED;
           LOG_ERROR("shrink context is invalid", KR(ret));
-        } else if (OB_FAIL(flush_mgr_->wash(wbp_max_size, task_handle, wash_size))) {
-          LOG_WARN("fail to wash all pages", KR(ret), K(wbp_->get_shrink_ctx()));
-        } else {
+        } else if (!wbp_->should_abort_shrinking()) {
           wbp_->advance_shrink_state();
         }
         break;

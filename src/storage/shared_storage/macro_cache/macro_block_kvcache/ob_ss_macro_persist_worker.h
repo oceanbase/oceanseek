@@ -6,6 +6,7 @@
 #ifndef OCEANBASE_STORAGE_SHARED_STORAGE_MACRO_CACHE_MACRO_BLOCK_KVCACHE_OB_SS_MACRO_PERSIST_WORKER_H_
 #define OCEANBASE_STORAGE_SHARED_STORAGE_MACRO_CACHE_MACRO_BLOCK_KVCACHE_OB_SS_MACRO_PERSIST_WORKER_H_
 
+#include "lib/literals/ob_literals.h"
 #include "lib/restore/ob_object_storage_base.h"
 #include "lib/thread/thread_mgr_interface.h"
 #include "storage/shared_storage/macro_cache/macro_block_kvcache/ob_ss_macro_persist_policy_controller.h"
@@ -71,8 +72,9 @@ private:
       const int64_t last_drain_ts_us) const;
 
   int tenant_ctx_check_();
+  // Checks L2 admission, including the queue age of temporary-file entries.
   int check_can_persist_(
-      const blocksstable::MacroBlockId &macro_id,
+      const ObSSMacroPersistEntry &entry,
       const ObSSMacroBlockCacheValue &value,
       bool &can_persist) const;
   int prepare_persist_entry_(
@@ -83,6 +85,8 @@ private:
   int process_entry_(const ObSSMacroPersistEntry &entry);
 
 private:
+  // Skip L2 persistence for temporary-file entries queued longer than two minutes.
+  static constexpr int64_t TMP_FILE_PERSIST_MAX_AGE_US = 2_min;
   // 在途异步写达到并发上限时的完成轮询间隔。
   static constexpr int64_t INFLIGHT_POLL_INTERVAL_US = common::MS_US;
   // 有在途 IO 或压力批次尚未完成时的常规等待间隔。

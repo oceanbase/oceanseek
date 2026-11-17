@@ -4,6 +4,8 @@
  */
 
 #define USING_LOG_PREFIX STORAGE
+#include "share/ob_debug_sync.h"
+#include "share/config/ob_server_config.h"
 
 #include "observer/omt/ob_th_worker.h"
 #include "storage/shared_storage/ob_file_manager.h"
@@ -1335,8 +1337,11 @@ int ObSharedStorageTmpFile::swap_page_to_disk_(const ObTmpFileIOWriteCtx &io_ctx
     } else if (OB_UNLIKELY(is_deleting())) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("attempt to swap a deleting file", KR(ret), K(fd_));
-    } else if (OB_UNLIKELY(wbp_->get_free_data_page_num() > 0)) {
-      // do nothing
+    } else if (wbp_->is_shrink_aborting()) {
+      // Retry allocation after yielding to the shrink task. Do not start another washer here.
+      ob_usleep(MIN(int64_t(1_ms), remain_timeout_ms * 1000));
+    } else if (OB_UNLIKELY(wbp_->has_free_page())) {
+      // Retry allocation; it isolates pages forbidden by shrinking.
     } else if (OB_FAIL(flush_mgr_->wash(expected_wash_size, wait_task_handle, wash_size))) {
       LOG_WARN("fail to wash shared storage temporary file", KR(ret), KPC(this), K(wash_size), K(io_ctx));
     } else if (OB_UNLIKELY(0 == wash_size)) {
@@ -1795,6 +1800,9 @@ int ObSharedStorageTmpFile::flush(const bool flush_all_pages,
 {
   int ret = OB_SUCCESS;
   LOG_DEBUG("flush start", K(fd_));
+  if (OB_UNLIKELY(GCONF.is_debug_sync_enabled())) {
+    DEBUG_SYNC(common::TMP_FILE_FLUSH_BEFORE_FILE_LOCK);
+  }
   ObSpinLockGuard last_page_lock_guard(last_page_lock_);
   SpinRLockGuard guard(meta_lock_);
   flush_size = 0;

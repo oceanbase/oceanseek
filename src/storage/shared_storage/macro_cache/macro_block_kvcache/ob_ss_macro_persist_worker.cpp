@@ -8,6 +8,7 @@
 #include "lib/alloc/alloc_func.h"
 #include "lib/profile/ob_trace_id.h"
 #include "lib/utility/utility.h"
+#include "share/cache/ob_kvcache_inst_map.h"
 #include "share/config/ob_server_config.h"
 #include "share/io/ob_io_struct.h"
 #include "share/ob_thread_define.h"
@@ -222,8 +223,19 @@ void ObSSMacroPersistWorker::collect_pressure_snapshot_(
   snapshot.reset();
   snapshot.ring_size_ = ring_buffer_.size();
   snapshot.ring_capacity_ = ring_buffer_capacity_;
-  snapshot.tenant_memory_hold_ = lib::get_tenant_memory_hold(tenant_id_);
-  snapshot.tenant_memory_limit_ = lib::get_tenant_memory_limit(tenant_id_);
+  // Meta tenant cache entries are washed using the user tenant's memory pressure.
+  uint64_t memory_tenant_id = to_mb_list_tenant_id(tenant_id_);
+  int64_t memory_limit = lib::get_tenant_memory_limit(memory_tenant_id);
+  // Fall back to this tenant if the paired user tenant has no valid limit yet.
+  if (memory_tenant_id != tenant_id_ && (memory_limit <= 0 || INT64_MAX == memory_limit)) {
+    memory_tenant_id = tenant_id_;
+    memory_limit = lib::get_tenant_memory_limit(memory_tenant_id);
+  }
+  // INT64_MAX means the limit is unset. Keep only Ring pressure if no limit is usable.
+  if (memory_limit > 0 && INT64_MAX != memory_limit) {
+    snapshot.tenant_memory_hold_ = lib::get_tenant_memory_hold(memory_tenant_id);
+    snapshot.tenant_memory_limit_ = memory_limit;
+  }
 }
 
 int ObSSMacroPersistWorker::drain_one_batch_(
@@ -345,8 +357,9 @@ int ObSSMacroPersistWorker::tenant_ctx_check_()
   return ret;
 }
 
+// Skips L2 persistence for TMP_FILE entries queued longer than two minutes, without erasing L1.
 int ObSSMacroPersistWorker::check_can_persist_(
-    const MacroBlockId &macro_id,
+    const ObSSMacroPersistEntry &entry,
     const ObSSMacroBlockCacheValue &value,
     bool &can_persist) const
 {
@@ -360,10 +373,18 @@ int ObSSMacroPersistWorker::check_can_persist_(
   } else if (OB_UNLIKELY(
       !is_io_aligned(value.data_size_, DIO_ALIGN_SIZE))) {
     // L2 local cache uses direct IO and cannot persist unaligned data.
+  } else if (SSObjUtil::is_tmp_file(entry.macro_id_)
+      && entry.enqueue_ts_ > 0
+      && ObTimeUtility::current_time_us() - entry.enqueue_ts_ > TMP_FILE_PERSIST_MAX_AGE_US) {
+    // Temporary-file data in the macro block KVCache comes from prefetching.
+    // Temporary files are usually read sequentially. If persistence is delayed beyond
+    // TMP_FILE_PERSIST_MAX_AGE_US, the data has likely already been consumed,
+    // so skip writing it to L2.
+    // Leave L1 eviction to KVCACHE.
   } else if (OB_FAIL(ObSSObjectAccessUtil::check_if_cold_tablet(
       value.effective_tablet_id_, is_cold_tablet))) {
     LOG_WARN("fail to check persist entry tablet cache policy",
-        KR(ret), K(macro_id), K(value.effective_tablet_id_));
+        KR(ret), K(entry), K(value.effective_tablet_id_));
   } else if (is_cold_tablet) {
     // COLD tablet 的读缓存不写入 LCache。
   } else {
@@ -416,12 +437,11 @@ int ObSSMacroPersistWorker::prepare_persist_entry_(
     LOG_ERROR("invalid macro block KVCACHE value or handle",
         KR(ret), K_(tenant_id), K(entry.macro_id_),
         KP(value), K(kv_handle));
-  } else if (OB_FAIL(check_can_persist_(
-      entry.macro_id_, *value, can_persist))) {
+  } else if (OB_FAIL(check_can_persist_(entry, *value, can_persist))) {
     LOG_WARN("fail to check macro persist policy",
         KR(ret), K_(tenant_id), K(entry.macro_id_));
   } else if (!can_persist) {
-    // 缓存关闭或 COLD tablet 只跳过本次下沉，不重试、不删除 L1。
+    // Admission skips, including stale TMP_FILE requests, do not retry or erase L1.
   } else if (OB_FAIL(value->check_crc())) {
     ATOMIC_INC(&crc_fail_cnt_);
     LOG_WARN("fail to check macro block KVCACHE value crc",

@@ -4,6 +4,7 @@
  */
 
 #include "lib/ob_errno.h"
+#include "lib/literals/ob_literals.h"
 #include "share/cache/ob_kvcache_struct.h"
 #include <sched.h>
 #define USING_LOG_PREFIX COMMON
@@ -1357,6 +1358,23 @@ int64_t ObKVCacheStore::get_effective_tenant_upper_limit(
   return upper_limit;
 }
 
+// Uses the existing size-dependent reserve formula for a tenant's effective upper limit.
+// Nonpositive limits have no reserve. Both cache washing and persistence pressure use it.
+int64_t ObKVCacheStore::calc_tenant_cache_reserve_bytes(const int64_t upper_limit)
+{
+  int64_t reserve_bytes = 0;
+  if (upper_limit > 0) {
+    if (upper_limit <= 1_GB) {
+      reserve_bytes = upper_limit / 10;
+    } else {
+      reserve_bytes = static_cast<int64_t>(
+          log10(static_cast<double>(upper_limit) / static_cast<double>(1_GB))
+          * upper_limit / 20 + 100_MB);
+    }
+  }
+  return reserve_bytes;
+}
+
 bool ObKVCacheStore::compute_tenant_wash_size()
 {
   bool is_wash_valid = false;
@@ -1439,12 +1457,7 @@ bool ObKVCacheStore::compute_tenant_wash_size()
     lower_limit = tenant_wash_info->lower_limit_;
     mem_usage = lib::get_tenant_memory_hold(tenant_id);
     tenant_wash_info->mem_usage_ = mem_usage;
-    if (upper_limit <= 1024L * 1024L * 1024L) {
-      reserve_mem = upper_limit / 10;
-    } else {
-      reserve_mem = log10(static_cast<double>(upper_limit)/(1024.0 * 1024.0 * 1024.0)) * upper_limit / 20
-                    + 100L * 1024L * 1024L;
-    }
+    reserve_mem = calc_tenant_cache_reserve_bytes(upper_limit);
     tenant_wash_info->reserve_mem_ = reserve_mem;
 
     //identify min_wash_size

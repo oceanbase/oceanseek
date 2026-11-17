@@ -5,6 +5,8 @@
 
 #ifndef OB_SS_TMP_FILE_TEST_HELPER_
 #define OB_SS_TMP_FILE_TEST_HELPER_
+#include <atomic>
+#include <thread>
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 #include "mittest/mtlenv/storage/tmp_file/ob_tmp_file_test_helper.h"
@@ -12,6 +14,7 @@
 #define protected public
 #define private public
 #include "share/ob_thread_pool.h"
+#include "share/ob_debug_sync.h"
 #include "share/rc/ob_tenant_base.h"
 #include "storage/tmp_file/ob_tmp_file_io_info.h"
 #include "storage/tmp_file/ob_tmp_file_io_handle.h"
@@ -25,6 +28,127 @@ using namespace common;
 using namespace tmp_file;
 using namespace share;
 /* ------------------------------ Test Helper ------------------------------ */
+// Runs one callback with a thread-local sync action. Waiting checks the named event's
+// actual waiter count; destruction releases and joins the worker before restoring config.
+class TestTmpFileSyncGuard
+{
+public:
+  TestTmpFileSyncGuard()
+      : saved_timeout_us_(GCONF.debug_sync_timeout), result_(OB_EAGAIN),
+        finished_(false), released_(false) {}
+  ~TestTmpFileSyncGuard()
+  {
+    const int ret = release_and_join();
+    if (OB_SUCCESS != ret) {
+      LOG_WARN("fail to finish tmp file sync worker", KR(ret));
+    }
+  }
+
+  // The callback and its captured objects must outlive this guard's worker.
+  template <typename Function>
+  int start(const ObDebugSyncPoint point, const char *event_name, Function function)
+  {
+    int ret = OB_SUCCESS;
+    ObDebugSyncAction action;
+    if (worker_.joinable() || finished_.load()) {
+      ret = OB_INIT_TWICE;
+      LOG_WARN("tmp file sync guard already used", KR(ret));
+    } else if (OB_FAIL(resume_event_.assign(event_name))) {
+      LOG_WARN("fail to assign tmp file sync event", KR(ret));
+    } else {
+      action.sync_point_ = point;
+      action.wait_ = resume_event_;
+      action.timeout_ = 10_s;
+      action.execute_ = 1;
+      GCONF.debug_sync_timeout = action.timeout_;
+      const uint64_t tenant_id = MTL_ID();
+      worker_ = std::thread([this, action, function, tenant_id]() {
+        int ret = OB_TENANT_NOT_IN_SERVER;
+        MTL_SWITCH(tenant_id) {
+          ObDSActionArray *actions = GDS.thread_local_actions();
+          if (OB_ISNULL(actions)) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+            LOG_WARN("fail to get local tmp file sync actions", KR(ret));
+          } else if (OB_FAIL(actions->add_action(action))) {
+            LOG_WARN("fail to install local tmp file sync action", KR(ret), K(action));
+          } else {
+            if (OB_FAIL(function())) {
+              LOG_WARN("tmp file sync callback failed", KR(ret), K(action));
+            }
+            actions->clear(action.sync_point_);
+          }
+        }
+        result_.store(ret);
+        finished_.store(true);
+      });
+    }
+    return ret;
+  }
+
+  // A consumed action or a successful event wait alone does not prove the worker is paused.
+  int wait_until_paused()
+  {
+    int ret = OB_SUCCESS;
+    bool paused = false;
+    const int64_t deadline_us = ObTimeUtility::current_time_us() + 3_s;
+    while (OB_SUCC(ret) && !paused && !finished_.load()
+        && ObTimeUtility::current_time_us() < deadline_us) {
+      {
+        ObThreadCondGuard guard(GDS.event_control_.cond_);
+        ObDSEventControl::Event *event = nullptr;
+        const int find_ret = GDS.event_control_.find(resume_event_, event);
+        if (OB_ENTRY_NOT_EXIST != find_ret && OB_SUCCESS != find_ret) {
+          ret = find_ret;
+          LOG_WARN("fail to inspect tmp file sync waiter", KR(ret), K(resume_event_));
+        } else {
+          paused = nullptr != event && event->waiter_cnt_ > 0;
+        }
+      }
+      if (OB_SUCC(ret) && !paused) {
+        ob_usleep(1_ms);
+      }
+    }
+    if (OB_SUCC(ret) && !paused) {
+      ret = OB_TIMEOUT;
+      const int worker_ret = result_.load();
+      LOG_WARN("tmp file sync worker did not pause", KR(ret), K(resume_event_),
+          KR(worker_ret), "finished", finished_.load());
+    }
+    return ret;
+  }
+
+  // Signalling before the worker reaches its wait is safe: the event retains the signal.
+  int release_and_join()
+  {
+    int ret = OB_SUCCESS;
+    if (worker_.joinable()) {
+      if (!released_ && OB_FAIL(GDS.event_control_.signal(resume_event_))) {
+        LOG_WARN("fail to release tmp file sync worker", KR(ret), K(resume_event_));
+      }
+      released_ = true;
+      worker_.join();
+      if (OB_SUCC(ret)) {
+        ret = result_.load();
+      }
+      // Remove only this test's unused early-release signal; never reset global actions.
+      const int cleanup_ret = GDS.event_control_.wait(resume_event_, 1_us, true /*clear*/);
+      if (OB_SUCCESS != cleanup_ret) {
+        LOG_WARN("fail to clear tmp file sync event", KR(cleanup_ret), K(resume_event_));
+      }
+    }
+    GCONF.debug_sync_timeout = saved_timeout_us_;
+    return ret;
+  }
+
+private:
+  const int64_t saved_timeout_us_;
+  ObSyncEventName resume_event_;
+  std::thread worker_;
+  std::atomic<int> result_;
+  std::atomic<bool> finished_;
+  bool released_;
+};
+
 int set_ss_tmp_file_flushing(ObSharedStorageTmpFile &file)
 {
   int ret = OB_SUCCESS;

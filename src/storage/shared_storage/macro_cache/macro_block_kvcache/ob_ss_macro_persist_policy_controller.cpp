@@ -9,12 +9,14 @@
 
 #include "lib/ob_errno.h"
 #include "lib/oblog/ob_log.h"
+#include "share/cache/ob_kvcache_store.h"
 
 // 刷盘策略：持续低速刷盘，压力增大时逐步加速。
 //
 // 压力怎么算：
-//   Ring 使用率从 60% 开始加速，达到 90% 全速；租户内存对应的水位为 75% 和 90%。
-//   将这两条水位乘以各自容量，得到起始用量和全速用量。
+//   Ring usage ramps from 60% to full speed at 90%.
+//   Memory full speed = min(90% of the limit, limit - KVCACHE reserve); start is 15 points lower.
+//   The shared reserve formula is recalculated from each snapshot's memory limit.
 //   起始用量以下记 0 分，达到全速用量记 100 分，中间按下面的公式计算：
 //     压力分数 = (当前用量 - 起始用量) × 100 / (全速用量 - 起始用量)
 //   Ring 和内存分别计算，取较高的分数作为刷盘压力。
@@ -83,14 +85,9 @@ static bool is_sample_valid(const int64_t usage, const int64_t capacity)
 
 static int64_t calculate_score(
     const int64_t resource_usage,
-    const int64_t resource_capacity,
-    const int64_t start_percentage,
-    const int64_t full_speed_percentage)
+    const int64_t start_watermark,
+    const int64_t full_speed_watermark)
 {
-  // 将百分比换算成队列条数或内存字节数，小数部分向下取整。
-  // 调用方已保证使用量非负、容量大于 0。
-  const int64_t start_watermark = resource_capacity * start_percentage / 100;
-  const int64_t full_speed_watermark = resource_capacity * full_speed_percentage / 100;
   int64_t score = 0;
   if (resource_usage >= full_speed_watermark) {
     score = 100;
@@ -105,16 +102,26 @@ static int64_t calculate_ring_score(const ObSSMacroPersistPressureSnapshot &snap
 {
   const int64_t START_PERCENTAGE = 60;
   const int64_t FULL_SPEED_PERCENTAGE = 90;
-  return calculate_score(snapshot.ring_size_, snapshot.ring_capacity_,
-      START_PERCENTAGE, FULL_SPEED_PERCENTAGE);
+  const int64_t start_watermark = snapshot.ring_capacity_ * START_PERCENTAGE / 100;
+  const int64_t full_speed_watermark = snapshot.ring_capacity_ * FULL_SPEED_PERCENTAGE / 100;
+  return calculate_score(snapshot.ring_size_, start_watermark, full_speed_watermark);
 }
 
+// Accelerate persistence before KVCACHE eviction, keeping the original 90% ceiling.
+// Lower the full-speed watermark to the KVCACHE wash threshold when necessary.
+// Start 15 percentage points below full speed to retain the original gradual ramp.
 static int64_t calculate_memory_score(const ObSSMacroPersistPressureSnapshot &snapshot)
 {
-  const int64_t START_PERCENTAGE = 75;
-  const int64_t FULL_SPEED_PERCENTAGE = 90;
-  return calculate_score(snapshot.tenant_memory_hold_, snapshot.tenant_memory_limit_,
-      START_PERCENTAGE, FULL_SPEED_PERCENTAGE);
+  constexpr int64_t FULL_SPEED_PERCENTAGE = 90;
+  constexpr int64_t RAMP_PERCENTAGE = 15;
+  const int64_t memory_limit = snapshot.tenant_memory_limit_;
+  const int64_t reserve_bytes =
+      common::ObKVCacheStore::calc_tenant_cache_reserve_bytes(memory_limit);
+  const int64_t full_speed_watermark = MIN(
+      memory_limit * FULL_SPEED_PERCENTAGE / 100, memory_limit - reserve_bytes);
+  const int64_t start_watermark = MAX(
+      0L, full_speed_watermark - memory_limit * RAMP_PERCENTAGE / 100);
+  return calculate_score(snapshot.tenant_memory_hold_, start_watermark, full_speed_watermark);
 }
 
 static void build_drain_policy(

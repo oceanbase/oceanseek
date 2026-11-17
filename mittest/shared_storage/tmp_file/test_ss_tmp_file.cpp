@@ -2520,6 +2520,126 @@ TEST_F(TestTmpFile, test_background_flush_page_num_to_bytes)
   LOG_INFO("========== test_background_flush_page_num_to_bytes end ==========");
 }
 
+// 后台真实wash受控暂停时，缩容仍能取消，并恢复另一文件的实际写入。
+// 场景：三块小池，后台在取得文件句柄后、拿文件锁前暂停；前台填满保留区触发取消。
+// 校验：wash尚未返回时取消已完成，新文件可写；删除两个小文件再放行，避免提交真实IO。
+TEST_F(TestTmpFile, test_cancel_shrink_while_background_wash_is_paused)
+{
+  LOG_INFO("========== test_cancel_shrink_while_background_wash_is_paused begin ==========");
+  ObSSTenantTmpFileManager &mgr = MTL(ObTenantTmpFileManager *)->get_ss_file_manager();
+  ObSSTmpWriteBufferPool &wbp = mgr.wbp_;
+  constexpr int64_t RAW_FD = 1000000000;
+  uint32_t raw_ids[ObSSTmpWriteBufferPool::BLOCK_PAGE_NUMS];
+  int64_t raw_count = 0;
+  int64_t files[] = {-1, -1};
+  bool stopped = false;
+  ObSSTmpFileHandle target;
+  TestTmpFileSyncGuard sync;
+  NAMED_DEFER(cleanup, {
+    // 先标记删除再放行；remove会等句柄释放，不能在join前调用它。
+    for (int64_t i = 0; i < ARRAYSIZEOF(files); ++i) {
+      if (files[i] >= 0) {
+        ObSSTmpFileHandle handle;
+        const int ret = mgr.get_tmp_file(files[i], handle);
+        if (OB_SUCCESS == ret && nullptr != handle.get()) {
+          EXPECT_EQ(OB_SUCCESS, handle.get()->delete_file());
+        } else {
+          EXPECT_EQ(OB_SUCCESS, ret);
+        }
+      }
+    }
+    EXPECT_EQ(OB_SUCCESS, sync.release_and_join());
+    target.reset();
+    for (int64_t i = 0; i < ARRAYSIZEOF(files); ++i) {
+      if (files[i] >= 0) {
+        EXPECT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->remove(files[i]));
+      }
+    }
+    for (int64_t i = 0; i < raw_count; ++i) {
+      uint32_t next_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+      EXPECT_EQ(OB_SUCCESS, wbp.free_page(RAW_FD, raw_ids[i], ObTmpFilePageUniqKey(i), next_id));
+    }
+    if (wbp.shrink_ctx_.is_valid()) {
+      EXPECT_EQ(OB_SUCCESS, wbp.finish_shrinking());
+    }
+    if (stopped) {
+      EXPECT_EQ(OB_SUCCESS, mgr.flush_mgr_.start());
+      EXPECT_EQ(OB_SUCCESS, mgr.shrink_mgr_.start());
+    }
+  });
+
+  mgr.shrink_mgr_.stop();
+  mgr.flush_mgr_.stop();
+  stopped = true;
+  OK(mgr.shrink_mgr_.wait());
+  OK(mgr.flush_mgr_.wait());
+  ASSERT_EQ(0, wbp.get_used_page_num());
+  if (wbp.shrink_ctx_.is_valid()) {
+    OK(wbp.finish_shrinking());
+  }
+  while (wbp.capacity_ < SMALL_WBP_MEM_LIMIT) {
+    OK(wbp.expand_());
+  }
+  if (wbp.capacity_ > SMALL_WBP_MEM_LIMIT) {
+    OK(wbp.begin_shrinking(false /*is_auto*/));
+    OK(wbp.advance_shrink_state());
+    OK(wbp.advance_shrink_state());
+    OK(wbp.release_blocks_in_shrink_range());
+    OK(wbp.advance_shrink_state());
+    OK(wbp.finish_shrinking());
+  }
+  ASSERT_EQ(SMALL_WBP_MEM_LIMIT, wbp.capacity_);
+  int64_t dir = -1;
+  OK(MTL(ObTenantTmpFileManager *)->alloc_dir(dir));
+  OK(MTL(ObTenantTmpFileManager *)->open(files[0], dir, "" /*label*/));
+  char payload[ObTmpFileGlobal::PAGE_SIZE];
+  MEMSET(payload, 'p', sizeof(payload));
+  ObTmpFileIOInfo info;
+  info.fd_ = files[0];
+  info.buf_ = payload;
+  info.size_ = sizeof(payload);
+  info.io_timeout_ms_ = 1000;
+  info.io_desc_.set_wait_event(2 /*wait_event_id*/);
+  OK(MTL(ObTenantTmpFileManager *)->write(MTL_ID(), info));
+  OK(mgr.get_tmp_file(files[0], target));
+  ASSERT_NE(nullptr, target.get());
+  ASSERT_EQ(1, wbp.get_dirty_data_page_num());
+  wbp.max_used_watermark_after_shrinking_ = 8;
+  OK(wbp.begin_shrinking(true /*is_auto*/));
+  OK(wbp.advance_shrink_state());
+  ASSERT_EQ(ObSSTmpWriteBufferPool::BLOCK_PAGE_NUMS, wbp.shrink_ctx_.lower_page_id_);
+  OK(sync.start(TMP_FILE_FLUSH_BEFORE_FILE_LOCK, "wbp_background_wash", [&]() {
+    mgr.flush_mgr_.flush_timer_task_.runTimerTask();
+    return OB_SUCCESS;
+  }));
+  OK(sync.wait_until_paused());
+  ASSERT_TRUE(target.get()->is_flushing_());
+  LOG_INFO("background wash is paused before file locks", K(wbp.shrink_ctx_));
+
+  // 只有一个真实文件页；若它在保留区，需少分配一个raw页。
+  const int64_t kept_file_pages =
+      ((target.get()->begin_page_id_ < wbp.shrink_ctx_.lower_page_id_) ? 1 : 0);
+  const int64_t raw_target = wbp.shrink_ctx_.lower_page_id_ - kept_file_pages;
+  char *buf = nullptr;
+  for (int64_t i = 0; i < raw_target; ++i) {
+    OK(wbp.alloc_page(RAW_FD, ObTmpFilePageUniqKey(i), raw_ids[i], buf));
+    ++raw_count;
+  }
+  uint32_t failed_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  ASSERT_EQ(OB_ALLOCATE_TMP_FILE_PAGE_FAILED,
+      wbp.alloc_page(RAW_FD, ObTmpFilePageUniqKey(raw_target), failed_id, buf));
+  ASSERT_TRUE(wbp.is_shrink_aborting());
+  mgr.shrink_mgr_.shrink_wbp_task_.runTimerTask();
+  ASSERT_FALSE(wbp.shrink_ctx_.is_valid());
+  OK(MTL(ObTenantTmpFileManager *)->open(files[1], dir, "" /*label*/));
+  info.fd_ = files[1];
+  OK(MTL(ObTenantTmpFileManager *)->write(MTL_ID(), info));
+  OK(sync.wait_until_paused()); // 同一等待者仍在，不把已结束的wash误当作并发验证。
+  LOG_INFO("foreground write recovered while background wash remains paused");
+  cleanup.run_and_expire();
+  LOG_INFO("========== test_cancel_shrink_while_background_wash_is_paused end ==========");
+}
+
 } // namespace oceanbase
 
 int main(int argc, char **argv)

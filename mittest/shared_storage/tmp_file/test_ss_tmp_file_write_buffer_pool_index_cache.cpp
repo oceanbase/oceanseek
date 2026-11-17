@@ -4,6 +4,8 @@
  */
 
 #include <gmock/gmock.h>
+#include <atomic>
+#include <thread>
 #define USING_LOG_PREFIX STORAGE
 #define protected public
 #define private public
@@ -11,6 +13,7 @@
 #include "storage/tmp_file/ob_ss_tmp_file_shrink_manager.h"
 #include "lib/utility/ob_test_util.h"
 #include "lib/resource/ob_resource_mgr.h"
+#include "mittest/shared_storage/tmp_file/ob_ss_tmp_file_test_helper.h"
 
 namespace oceanbase
 {
@@ -257,7 +260,9 @@ void TestTmpFileWBPIndexCache::TearDown()
 void TestTmpFileWBPIndexCache::SetUpTestCase()
 {
   int ret = OB_SUCCESS;
+  GCTX.startup_mode_ = observer::ObServerMode::SHARED_STORAGE_MODE;
   ASSERT_EQ(OB_SUCCESS, MockTenantModuleEnv::get_instance().init());
+  ASSERT_TRUE(GCTX.is_shared_storage_mode());
 
   CHUNK_MGR.set_limit(TENANT_MEMORY);
   ObMallocAllocator::get_instance()->set_tenant_limit(1, TENANT_MEMORY);
@@ -863,7 +868,7 @@ TEST_F(TestTmpFileWBPIndexCache, test_search)
 }
 
 // ============================================================================
-// WBP 缩容策略回归：比例与目标 (A，3 个用例)，状态推进与保护 (B，7 个用例)。
+// WBP 缩容策略回归：比例与目标 (A，3 个用例)，状态推进与保护 (B，19 个用例)。
 // ============================================================================
 
 using common::ObTimeUtility;
@@ -1116,7 +1121,7 @@ TEST_F(TestTmpFileWBPIndexCache, test_empty_pool_shrinks_to_one_block)
   ASSERT_TRUE(wbp_.need_to_shrink(is_auto));
   ASSERT_TRUE(is_auto);
 
-  // 空池不需要真实 IO，直接验证原有逐页检查和释放路径。
+  // 空池不需要真实 IO，直接验证空闲判断和释放路径。
   OK(wbp_.begin_shrinking(is_auto));
   OK(wbp_.advance_shrink_state());
   OK(wbp_.advance_shrink_state());
@@ -1159,9 +1164,6 @@ TEST_F(TestTmpFileWBPIndexCache, test_shrink_aborts_when_target_is_full)
   const int64_t target_pages = wbp_.shrink_ctx_.lower_page_id_;
   const int64_t original_capacity = wbp_.capacity_;
   wbp_.default_wbp_memory_limit_ = 64 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
-  ASSERT_EQ(OB_OP_NOT_ALLOW, wbp_.expand_());
-  ASSERT_EQ(original_capacity, wbp_.capacity_);
-
   // 不模拟计数，真实分配以覆盖禁分配区间和缩容链表。
   uint32_t page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
   char *page_buf = nullptr;
@@ -1172,6 +1174,8 @@ TEST_F(TestTmpFileWBPIndexCache, test_shrink_aborts_when_target_is_full)
   OK(wbp_.alloc_page(fd, ObTmpFilePageUniqKey(0 /*tree_level*/, target_pages - 1),
       page_id, page_buf));
   ASSERT_FALSE(wbp_.need_to_shrink(is_auto));
+  ASSERT_EQ(OB_OP_NOT_ALLOW, wbp_.expand_());
+  ASSERT_EQ(original_capacity, wbp_.capacity_);
   ASSERT_GT(wbp_.shrink_ctx_.shrink_list_size_, 0);
   LOG_INFO("target filled before release", K(target_pages), K(wbp_.used_page_num_),
       K(wbp_.shrink_ctx_));
@@ -1218,6 +1222,7 @@ TEST_F(TestTmpFileWBPIndexCache, test_manual_shrink_and_execution_timeout)
   ASSERT_FALSE(is_auto);
   OK(wbp_.begin_shrinking(is_auto));
   ASSERT_EQ(1, wbp_.max_used_watermark_after_shrinking_);
+  ASSERT_EQ(1, wbp_.shrink_ctx_.used_page_num_in_range_);
   OK(wbp_.advance_shrink_state());
   ASSERT_EQ(16 * ObSSTmpWriteBufferPool::BLOCK_PAGE_NUMS, wbp_.shrink_ctx_.lower_page_id_);
 
@@ -1229,6 +1234,7 @@ TEST_F(TestTmpFileWBPIndexCache, test_manual_shrink_and_execution_timeout)
   OK(wbp_.finish_shrinking());
   ASSERT_EQ(original_capacity, wbp_.capacity_);
   ASSERT_FALSE(wbp_.shrink_ctx_.is_valid());
+  ASSERT_EQ(0, wbp_.shrink_ctx_.used_page_num_in_range_);
   ASSERT_EQ(1, wbp_.max_used_watermark_after_shrinking_);
   LOG_INFO("========== test_manual_shrink_and_execution_timeout end ==========");
 }
@@ -1412,6 +1418,674 @@ TEST_F(TestTmpFileWBPIndexCache, test_shrink_completion_reseeds_surviving_pages)
   OK(wbp_.advance_shrink_state());
   OK(wbp_.finish_shrinking());
   LOG_INFO("========== test_shrink_completion_reseeds_surviving_pages end ==========");
+}
+
+// B8. 缺页发出的取消不会因刷盘回收页面而丢失，收尾归还隔离页并恢复扩容。
+// 场景：四个块缩到一个块，配置仍允许扩到八个块。
+// 操作：真实分配填满保留区间并标脏一页，再申请失败；释放另一页后执行收尾。
+// 校验：用量回落后取消仍生效，剩余脏页不触发缩容刷盘；收尾恢复分配和扩容。
+TEST_F(TestTmpFileWBPIndexCache, test_shrink_abort_survives_usage_drop)
+{
+  LOG_INFO("========== test_shrink_abort_survives_usage_drop begin ==========");
+  constexpr int64_t INITIAL_BLOCKS = 4;
+  constexpr int64_t LIMIT_BLOCKS = 8;
+  wbp_.default_wbp_memory_limit_ = INITIAL_BLOCKS * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  while (wbp_.capacity_ < wbp_.default_wbp_memory_limit_) {
+    OK(wbp_.expand_());
+  }
+  wbp_.default_wbp_memory_limit_ = LIMIT_BLOCKS * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  wbp_.max_used_watermark_after_shrinking_ = 8;
+  OK(wbp_.begin_shrinking(true /*is_auto*/));
+  OK(wbp_.advance_shrink_state());
+  const int64_t target_pages = ObSSTmpWriteBufferPool::BLOCK_PAGE_NUMS;
+  ASSERT_EQ(target_pages, wbp_.shrink_ctx_.lower_page_id_);
+
+  // 禁分配页仍可作为重试候选，由真实分配流程隔离，提示接口不遍历链表。
+  LOG_INFO("free list has restricted candidates before allocation",
+      K(wbp_.first_free_page_id_), K(wbp_.shrink_ctx_));
+  ASSERT_TRUE(wbp_.shrink_ctx_.in_not_alloc_range(wbp_.first_free_page_id_));
+  ASSERT_TRUE(wbp_.has_free_page());
+
+  // 缺页必须来自真实申请，不能手工置标记代替前台路径。
+  uint32_t page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  char *page_buf = nullptr;
+  uint32_t first_page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  for (int64_t i = 0; i < target_pages; ++i) {
+    OK(wbp_.alloc_page(fd, ObTmpFilePageUniqKey(i), page_id, page_buf));
+    if (0 == i) {
+      first_page_id = page_id;
+    }
+  }
+  const uint32_t last_page_id = page_id;
+  OK(wbp_.notify_dirty(fd, first_page_id, ObTmpFilePageUniqKey(0 /*virtual_page_id*/)));
+  ASSERT_EQ(OB_ALLOCATE_TMP_FILE_PAGE_FAILED,
+      wbp_.alloc_page(fd, ObTmpFilePageUniqKey(target_pages), page_id, page_buf));
+  ASSERT_TRUE(wbp_.is_shrink_aborting());
+  ASSERT_FALSE(wbp_.has_free_page());
+  ASSERT_GT(wbp_.shrink_ctx_.shrink_list_size_, 0);
+  ASSERT_GT(wbp_.get_free_data_page_num(), 0); // 配置额度不能代替实际可分配页。
+
+  // 即使用量回落到目标以下，也不能重启本轮缩容。
+  uint32_t next_page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  OK(wbp_.free_page(fd, last_page_id,
+      ObTmpFilePageUniqKey(target_pages - 1), next_page_id));
+  LOG_INFO("usage dropped after shortage", K(wbp_.used_page_num_), K(wbp_.shrink_ctx_));
+  ASSERT_LT(wbp_.get_used_page_num(), target_pages);
+  bool is_auto = false;
+  ASSERT_FALSE(wbp_.need_to_shrink(is_auto));
+  ASSERT_TRUE(wbp_.should_abort_shrinking());
+  ASSERT_EQ(1, wbp_.get_dirty_data_page_num());
+  ASSERT_EQ(0, wbp_.get_background_flush_page_nums());
+
+  ObSSTmpFileFlushManager flush_mgr;
+  ObTmpFileShrinkWBPTask task;
+  OK(task.init(&wbp_, &flush_mgr));
+  task.runTimerTask(); // 取消应在调用未初始化的刷盘管理器前完成。
+  ASSERT_FALSE(wbp_.shrink_ctx_.is_valid());
+  ASSERT_FALSE(wbp_.is_shrink_aborting());
+  ASSERT_TRUE(wbp_.has_free_page());
+  ASSERT_EQ(INITIAL_BLOCKS * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE, wbp_.capacity_);
+  OK(wbp_.alloc_page(fd, ObTmpFilePageUniqKey(target_pages), page_id, page_buf));
+  OK(wbp_.expand_());
+  ASSERT_EQ(LIMIT_BLOCKS * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE, wbp_.capacity_);
+  LOG_INFO("========== test_shrink_abort_survives_usage_drop end ==========");
+}
+
+// B9. 后台直接读取缩容阶段，只在 SWAP 时绕过普通刷盘水位。
+// 场景：四个块中仅保留区有一页脏数据，使用未初始化的刷盘管理器。
+// 操作：依次调度启动、检查空闲范围、释放、完成四个步骤。
+// 校验：同一脏页仅在 SWAP 时触发刷盘，后续阶段恢复普通水位且缩到一个块。
+TEST_F(TestTmpFileWBPIndexCache, test_background_flush_tracks_shrink_state)
+{
+  LOG_INFO("========== test_background_flush_tracks_shrink_state begin ==========");
+  ASSERT_FALSE(wbp_.is_tenant_memory_under_pressure_());
+  wbp_.default_wbp_memory_limit_ = 4 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  // 先分配再扩容，使脏页留在第一个块，尾部回收范围全部空闲。
+  uint32_t page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  char *page_buf = nullptr;
+  const ObTmpFilePageUniqKey key(0 /*virtual_page_id*/);
+  OK(wbp_.alloc_page(fd, key, page_id, page_buf));
+  OK(wbp_.notify_dirty(fd, page_id, key));
+  ASSERT_LT(page_id, ObSSTmpWriteBufferPool::BLOCK_PAGE_NUMS);
+  while (wbp_.capacity_ < wbp_.default_wbp_memory_limit_) {
+    OK(wbp_.expand_());
+  }
+  ASSERT_EQ(0, wbp_.get_background_flush_page_nums());
+  wbp_.max_used_watermark_after_shrinking_ = 8;
+  wbp_.last_shrink_complete_ts_ = ObTimeUtility::current_time_us() - 1_min;
+  ObSSTmpFileFlushManager flush_mgr;
+  ObTmpFileShrinkWBPTask task;
+  OK(task.init(&wbp_, &flush_mgr));
+
+  // 缩容只推进上下文，后台查询会立即看到该阶段，无需同步第二份标记。
+  task.runTimerTask();
+  LOG_INFO("step 1: background observes shrink SWAP", K(wbp_.shrink_ctx_));
+  ASSERT_EQ(WBPShrinkContext::SHRINKING_SWAP, wbp_.get_wbp_state());
+  ASSERT_EQ(1, wbp_.get_background_flush_page_nums());
+
+  task.runTimerTask();
+  LOG_INFO("step 2: free range is ready for release", K(wbp_.shrink_ctx_));
+  ASSERT_EQ(WBPShrinkContext::SHRINKING_RELEASE_BLOCKS, wbp_.get_wbp_state());
+  ASSERT_EQ(0, wbp_.get_background_flush_page_nums());
+  task.runTimerTask();
+  ASSERT_EQ(WBPShrinkContext::SHRINKING_FINISH, wbp_.get_wbp_state());
+  ASSERT_EQ(0, wbp_.get_background_flush_page_nums());
+  task.runTimerTask();
+  LOG_INFO("step 3: shrink finished independently", K(wbp_.capacity_));
+  ASSERT_FALSE(wbp_.shrink_ctx_.is_valid());
+  ASSERT_EQ(0, wbp_.get_background_flush_page_nums());
+  ASSERT_EQ(ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE, wbp_.capacity_);
+  ASSERT_EQ(1, wbp_.get_dirty_data_page_num());
+  LOG_INFO("========== test_background_flush_tracks_shrink_state end ==========");
+}
+
+// B10. 扩容沿用有效缩容上下文检查，不在扩容循环中请求取消。
+// 场景：空池进入 SWAP，配置仍允许扩到当前容量的两倍。
+// 操作：直接尝试扩容，再主动收尾后重试。
+// 校验：有效缩容阻止扩容且不设置取消标记，收尾后扩容恢复。
+TEST_F(TestTmpFileWBPIndexCache, test_expansion_keeps_original_shrink_guard)
+{
+  LOG_INFO("========== test_expansion_keeps_original_shrink_guard begin ==========");
+  wbp_.default_wbp_memory_limit_ = 4 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  while (wbp_.capacity_ < wbp_.default_wbp_memory_limit_) {
+    OK(wbp_.expand_());
+  }
+  const int64_t original_capacity = wbp_.capacity_;
+  wbp_.max_used_watermark_after_shrinking_ = 8;
+  OK(wbp_.begin_shrinking(true /*is_auto*/));
+  OK(wbp_.advance_shrink_state());
+  ASSERT_TRUE(wbp_.shrink_ctx_.is_valid());
+  wbp_.default_wbp_memory_limit_ = 8 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  ASSERT_EQ(OB_OP_NOT_ALLOW, wbp_.expand_());
+  LOG_INFO("valid shrink blocked expansion without cancellation", K(wbp_.shrink_ctx_));
+  ASSERT_FALSE(wbp_.is_shrink_aborting());
+  ASSERT_EQ(original_capacity, wbp_.capacity_);
+  ASSERT_EQ(0, wbp_.get_used_page_num());
+  ASSERT_FALSE(wbp_.should_abort_shrinking());
+  OK(wbp_.finish_shrinking());
+  ASSERT_FALSE(wbp_.is_shrink_aborting());
+  OK(wbp_.expand_());
+  ASSERT_EQ(wbp_.default_wbp_memory_limit_, wbp_.capacity_);
+  LOG_INFO("========== test_expansion_keeps_original_shrink_guard end ==========");
+}
+
+// B11. 缩容绕过普通刷盘水位，已提交页面不重复计入需求，超时取消不等待 IO。
+// 场景：四个块中只有尾部一页脏数据，使用独立缩容任务和未初始化的刷盘管理器。
+// 操作：启动后模拟页面进入 WRITE_BACK，保持其在途，再推进五分钟超时。
+// 校验：请求量由零变为一再回到零；缩容取消时页面仍存活，随后可正常完成和释放。
+TEST_F(TestTmpFileWBPIndexCache, test_background_shrink_flush_excludes_inflight_pages)
+{
+  LOG_INFO("========== test_background_shrink_flush_excludes_inflight_pages begin ==========");
+  ASSERT_FALSE(wbp_.is_tenant_memory_under_pressure_());
+  wbp_.default_wbp_memory_limit_ = 4 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  while (wbp_.capacity_ < wbp_.default_wbp_memory_limit_) {
+    OK(wbp_.expand_());
+  }
+  uint32_t page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  char *page_buf = nullptr;
+  const ObTmpFilePageUniqKey key(0 /*virtual_page_id*/);
+  OK(wbp_.alloc_page(fd, key, page_id, page_buf));
+  page_buf[0] = 'b';
+  OK(wbp_.notify_dirty(fd, page_id, key));
+  ASSERT_EQ(1, wbp_.get_dirty_data_page_num());
+  ASSERT_EQ(0, wbp_.get_background_flush_page_nums());
+
+  // 尾部页面仍被占用，SWAP 必须等待后台，不能提前释放该块。
+  wbp_.max_used_watermark_after_shrinking_ = 8;
+  wbp_.last_shrink_complete_ts_ = ObTimeUtility::current_time_us() - 1_min;
+  ObSSTmpFileFlushManager flush_mgr;
+  ObTmpFileShrinkWBPTask task;
+  OK(task.init(&wbp_, &flush_mgr));
+  task.runTimerTask();
+  ASSERT_GE(page_id, wbp_.shrink_ctx_.lower_page_id_);
+  LOG_INFO("step 1: low-watermark dirty page requested", K(page_id), K(wbp_.shrink_ctx_));
+  ASSERT_EQ(1, wbp_.shrink_ctx_.used_page_num_in_range_);
+  ASSERT_EQ(1, wbp_.get_background_flush_page_nums());
+  task.runTimerTask();
+  ASSERT_EQ(WBPShrinkContext::SHRINKING_SWAP, wbp_.get_wbp_state());
+  ASSERT_EQ(1, wbp_.get_background_flush_page_nums());
+
+  // 后台仅查询超时，不需要等缩容线程执行清理就能停止额外刷盘。
+  wbp_.shrink_ctx_.shrink_begin_ts_ = ObTimeUtility::current_time_us() - 5_min - 1_us;
+  ASSERT_EQ(1, wbp_.get_dirty_data_page_num());
+  ASSERT_EQ(0, wbp_.get_background_flush_page_nums());
+  wbp_.shrink_ctx_.shrink_begin_ts_ = ObTimeUtility::current_time_us();
+
+  // 用真实页面状态转换模拟提交后尚未完成；不提交磁盘 IO。
+  OK(wbp_.notify_write_back(fd, page_id, key));
+  LOG_INFO("step 2: page remains in flight", K(wbp_.dirty_page_num_),
+      K(wbp_.write_back_data_cnt_), K(wbp_.used_page_num_));
+  ASSERT_EQ(0, wbp_.get_dirty_data_page_num());
+  ASSERT_EQ(1, ATOMIC_LOAD(&wbp_.write_back_data_cnt_));
+  ASSERT_EQ(0, wbp_.get_background_flush_page_nums());
+  ASSERT_EQ(1, wbp_.shrink_ctx_.used_page_num_in_range_);
+  wbp_.shrink_ctx_.shrink_begin_ts_ = ObTimeUtility::current_time_us() - 5_min - 1_us;
+  task.runTimerTask();
+  LOG_INFO("step 3: timeout canceled shrink with page still in flight", K(wbp_.capacity_));
+  ASSERT_FALSE(wbp_.shrink_ctx_.is_valid());
+  ASSERT_EQ(0, wbp_.shrink_ctx_.used_page_num_in_range_);
+  ASSERT_EQ(1, wbp_.get_used_page_num());
+  ASSERT_EQ(1, ATOMIC_LOAD(&wbp_.write_back_data_cnt_));
+  ASSERT_EQ('b', page_buf[0]);
+
+  // 独立完成原页面的回写与释放，验证取消未破坏其正常生命周期。
+  OK(wbp_.notify_write_back_succ(fd, page_id, key));
+  uint32_t next_page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  OK(wbp_.free_page(fd, page_id, key, next_page_id));
+  LOG_INFO("step 4: in-flight page reclaimed after cancellation", K(wbp_.used_page_num_));
+  ASSERT_EQ(0, wbp_.get_used_page_num());
+  ASSERT_EQ(0, ATOMIC_LOAD(&wbp_.write_back_data_cnt_));
+  ASSERT_EQ(0, wbp_.shrink_ctx_.used_page_num_in_range_);
+  // 同样的在途页改为回写失败，旧 IO 的失败通知也不能依赖已取消的上下文。
+  const ObTmpFilePageUniqKey failed_key(1 /*virtual_page_id*/);
+  OK(wbp_.alloc_page(fd, failed_key, page_id, page_buf));
+  OK(wbp_.notify_dirty(fd, page_id, failed_key));
+  OK(wbp_.notify_write_back(fd, page_id, failed_key));
+  OK(wbp_.begin_shrinking(true /*is_auto*/));
+  OK(wbp_.advance_shrink_state());
+  wbp_.shrink_ctx_.shrink_begin_ts_ = ObTimeUtility::current_time_us() - 5_min - 1_us;
+  task.runTimerTask();
+  OK(wbp_.notify_write_back_fail(fd, page_id, failed_key));
+  LOG_INFO("step 5: failed write-back returned to dirty after cancellation",
+      K(wbp_.dirty_page_num_), K(wbp_.write_back_data_cnt_), K(wbp_.shrink_ctx_));
+  ASSERT_EQ(1, wbp_.get_dirty_data_page_num());
+  ASSERT_EQ(0, ATOMIC_LOAD(&wbp_.write_back_data_cnt_));
+  OK(wbp_.free_page(fd, page_id, failed_key, next_page_id));
+  ASSERT_EQ(0, wbp_.get_used_page_num());
+  ASSERT_EQ(0, wbp_.get_dirty_data_page_num());
+  LOG_INFO("========== test_background_shrink_flush_excludes_inflight_pages end ==========");
+}
+
+// B12. 缩容计数包含范围内的数据页和元数据页，不包含保留区页面和原有空闲页。
+// 场景：四块池中保留区占一页，缩容范围占数据、元数据各一页，其余页仍在普通链表。
+// 操作：启动缩容，先释放保留区，再逐页释放缩容范围，推进状态并释放块。
+// 校验：范围计数依次为 2、2、1、0；最后一页归还前一直等待，归还后才进入释放。
+TEST_F(TestTmpFileWBPIndexCache, test_shrink_range_counts_data_and_meta_pages)
+{
+  LOG_INFO("========== test_shrink_range_counts_data_and_meta_pages begin ==========");
+  wbp_.default_wbp_memory_limit_ = 4 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  const ObTmpFilePageUniqKey kept_key(0 /*virtual_page_id*/);
+  const ObTmpFilePageUniqKey data_key(1 /*virtual_page_id*/);
+  const ObTmpFilePageUniqKey meta_key(0 /*tree_level*/, 0 /*level_page_index*/);
+  uint32_t kept_page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  uint32_t data_page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  uint32_t meta_page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  uint32_t next_page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  char *page_buf = nullptr;
+
+  // 扩容前分配的页留在第一块，扩容后分配的两页位于尾部。
+  OK(wbp_.alloc_page(fd, kept_key, kept_page_id, page_buf));
+  while (wbp_.capacity_ < wbp_.default_wbp_memory_limit_) {
+    OK(wbp_.expand_());
+  }
+  OK(wbp_.alloc_page(fd, data_key, data_page_id, page_buf));
+  OK(wbp_.alloc_page(fd, meta_key, meta_page_id, page_buf));
+  wbp_.max_used_watermark_after_shrinking_ = 8;
+  OK(wbp_.begin_shrinking(true /*is_auto*/));
+  LOG_INFO("step 1: range count seeded from existing free pages",
+      K(kept_page_id), K(data_page_id), K(meta_page_id),
+      K(wbp_.shrink_ctx_.used_page_num_in_range_), K(wbp_.shrink_ctx_));
+  ASSERT_LT(kept_page_id, wbp_.shrink_ctx_.lower_page_id_);
+  ASSERT_GE(data_page_id, wbp_.shrink_ctx_.lower_page_id_);
+  ASSERT_GE(meta_page_id, wbp_.shrink_ctx_.lower_page_id_);
+  ASSERT_EQ(2, wbp_.shrink_ctx_.used_page_num_in_range_);
+  ASSERT_EQ(0, wbp_.shrink_ctx_.shrink_list_size_);
+  OK(wbp_.advance_shrink_state());
+
+  // 范围外归还不改变计数；数据页和元数据页都必须真正归还后才减一。
+  OK(wbp_.free_page(fd, kept_page_id, kept_key, next_page_id));
+  ASSERT_EQ(2, wbp_.shrink_ctx_.used_page_num_in_range_);
+  OK(wbp_.advance_shrink_state());
+  ASSERT_EQ(WBPShrinkContext::SHRINKING_SWAP, wbp_.get_wbp_state());
+  OK(wbp_.free_page(fd, data_page_id, data_key, next_page_id));
+  LOG_INFO("step 2: metadata page still prevents release",
+      K(wbp_.shrink_ctx_.used_page_num_in_range_), K(wbp_.shrink_ctx_));
+  ASSERT_EQ(1, wbp_.shrink_ctx_.used_page_num_in_range_);
+  ASSERT_EQ(1, wbp_.shrink_ctx_.shrink_list_size_);
+  OK(wbp_.advance_shrink_state());
+  ASSERT_EQ(WBPShrinkContext::SHRINKING_SWAP, wbp_.get_wbp_state());
+  OK(wbp_.free_page(fd, meta_page_id, meta_key, next_page_id));
+  ASSERT_EQ(0, wbp_.shrink_ctx_.used_page_num_in_range_);
+  ASSERT_EQ(2, wbp_.shrink_ctx_.shrink_list_size_);
+
+  // 普通链表中原有的空闲页无需逐一隔离，范围计数归零即可推进释放。
+  OK(wbp_.advance_shrink_state());
+  ASSERT_EQ(WBPShrinkContext::SHRINKING_RELEASE_BLOCKS, wbp_.get_wbp_state());
+  OK(wbp_.release_blocks_in_shrink_range());
+  OK(wbp_.advance_shrink_state());
+  OK(wbp_.finish_shrinking());
+  LOG_INFO("step 3: range released and count reset", K(wbp_.capacity_),
+      K(wbp_.shrink_ctx_.used_page_num_in_range_));
+  ASSERT_EQ(ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE, wbp_.capacity_);
+  ASSERT_EQ(0, wbp_.shrink_ctx_.used_page_num_in_range_);
+  LOG_INFO("========== test_shrink_range_counts_data_and_meta_pages end ==========");
+}
+
+// B13. 初始化到 SWAP 之间的分配和归还也更新计数，取消后的存活页在下一轮重新统计。
+// 场景：四块空池刚初始化缩容，上下文尚未有效，普通分配仍可取得尾部页。
+// 操作：在该窗口分配两页、归还一页；进入 SWAP 后取消，重新初始化并归还存活页。
+// 校验：计数随实际占用变化；取消清零但不释放存活页，新一轮仍等待该页归还。
+TEST_F(TestTmpFileWBPIndexCache, test_shrink_range_count_before_swap_and_after_cancel)
+{
+  LOG_INFO("========== test_shrink_range_count_before_swap_and_after_cancel begin ==========");
+  wbp_.default_wbp_memory_limit_ = 4 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  while (wbp_.capacity_ < wbp_.default_wbp_memory_limit_) {
+    OK(wbp_.expand_());
+  }
+  const ObTmpFilePageUniqKey data_key(0 /*virtual_page_id*/);
+  const ObTmpFilePageUniqKey meta_key(0 /*tree_level*/, 0 /*level_page_index*/);
+  uint32_t data_page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  uint32_t meta_page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  uint32_t next_page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  char *page_buf = nullptr;
+
+  // begin_shrinking 只初始化范围，第一次 advance 才会进入 SWAP。
+  OK(wbp_.begin_shrinking(true /*is_auto*/));
+  ASSERT_TRUE(wbp_.shrink_ctx_.is_inited_);
+  ASSERT_FALSE(wbp_.shrink_ctx_.is_valid());
+  ASSERT_EQ(0, wbp_.shrink_ctx_.used_page_num_in_range_);
+  OK(wbp_.alloc_page(fd, data_key, data_page_id, page_buf));
+  OK(wbp_.alloc_page(fd, meta_key, meta_page_id, page_buf));
+  LOG_INFO("step 1: allocation counted before SWAP", K(data_page_id), K(meta_page_id),
+      K(wbp_.shrink_ctx_.used_page_num_in_range_));
+  ASSERT_GE(data_page_id, wbp_.shrink_ctx_.lower_page_id_);
+  ASSERT_GE(meta_page_id, wbp_.shrink_ctx_.lower_page_id_);
+  ASSERT_EQ(2, wbp_.shrink_ctx_.used_page_num_in_range_);
+  OK(wbp_.free_page(fd, data_page_id, data_key, next_page_id));
+  ASSERT_EQ(1, wbp_.shrink_ctx_.used_page_num_in_range_);
+  ASSERT_EQ(0, wbp_.shrink_ctx_.shrink_list_size_);
+
+  // 元数据页尚未归还，不能因普通空闲链表已有大量页面就提前进入释放。
+  OK(wbp_.advance_shrink_state());
+  OK(wbp_.advance_shrink_state());
+  ASSERT_EQ(WBPShrinkContext::SHRINKING_SWAP, wbp_.get_wbp_state());
+  ASSERT_TRUE(wbp_.request_auto_shrink_abort_());
+  OK(wbp_.finish_shrinking());
+  LOG_INFO("step 2: cancellation resets count while page survives", K(wbp_.used_page_num_),
+      K(wbp_.shrink_ctx_.used_page_num_in_range_));
+  ASSERT_FALSE(wbp_.shrink_ctx_.is_inited_);
+  ASSERT_EQ(0, wbp_.shrink_ctx_.used_page_num_in_range_);
+  ASSERT_EQ(1, wbp_.get_used_page_num());
+
+  // 下一轮从普通链表重建计数，再归还上一轮存活的页面。
+  OK(wbp_.begin_shrinking(true /*is_auto*/));
+  ASSERT_EQ(1, wbp_.shrink_ctx_.used_page_num_in_range_);
+  OK(wbp_.advance_shrink_state());
+  OK(wbp_.advance_shrink_state());
+  ASSERT_EQ(WBPShrinkContext::SHRINKING_SWAP, wbp_.get_wbp_state());
+  OK(wbp_.free_page(fd, meta_page_id, meta_key, next_page_id));
+  ASSERT_EQ(0, wbp_.shrink_ctx_.used_page_num_in_range_);
+  OK(wbp_.advance_shrink_state());
+  LOG_INFO("step 3: surviving page returned and range ready for release",
+      K(wbp_.shrink_ctx_.used_page_num_in_range_), K(wbp_.shrink_ctx_));
+  ASSERT_EQ(WBPShrinkContext::SHRINKING_RELEASE_BLOCKS, wbp_.get_wbp_state());
+  OK(wbp_.release_blocks_in_shrink_range());
+  OK(wbp_.advance_shrink_state());
+  OK(wbp_.finish_shrinking());
+  ASSERT_EQ(ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE, wbp_.capacity_);
+  LOG_INFO("========== test_shrink_range_count_before_swap_and_after_cancel end ==========");
+}
+
+// B14. 普通链表仅剩禁分配页时仍提示重试，真实分配隔离后才变为空链。
+// 场景：第一块占满，再扩到四块并手动缩回一块；普通链中的页全部禁止分配。
+// 校验：查询不摘页；分配失败后所有候选被隔离，取消可恢复这些页。
+TEST_F(TestTmpFileWBPIndexCache, test_free_hint_with_only_restricted_candidates)
+{
+  LOG_INFO("========== test_free_hint_with_only_restricted_candidates begin ==========");
+  constexpr int64_t PAGES = ObSSTmpWriteBufferPool::BLOCK_PAGE_NUMS;
+  uint32_t page_ids[PAGES];
+  char *buf = nullptr;
+  wbp_.default_wbp_memory_limit_ = ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  for (int64_t i = 0; i < PAGES; ++i) {
+    OK(wbp_.alloc_page(fd, ObTmpFilePageUniqKey(i), page_ids[i], buf));
+  }
+  wbp_.default_wbp_memory_limit_ = 4 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  while (wbp_.capacity_ < wbp_.default_wbp_memory_limit_) {
+    OK(wbp_.expand_());
+  }
+  wbp_.default_wbp_memory_limit_ = ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  OK(wbp_.begin_shrinking(false /*is_auto*/));
+  OK(wbp_.advance_shrink_state());
+  const uint32_t head = wbp_.first_free_page_id_;
+  LOG_INFO("only restricted candidates remain", K(head), K(wbp_.shrink_ctx_));
+  ASSERT_TRUE(wbp_.shrink_ctx_.in_not_alloc_range(head));
+  ASSERT_TRUE(wbp_.has_free_page());
+  ASSERT_EQ(head, wbp_.first_free_page_id_);
+  ASSERT_EQ(0, wbp_.shrink_ctx_.shrink_list_size_);
+  uint32_t page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  ASSERT_EQ(OB_ALLOCATE_TMP_FILE_PAGE_FAILED,
+      wbp_.alloc_page(fd, ObTmpFilePageUniqKey(PAGES), page_id, buf));
+  ASSERT_FALSE(wbp_.has_free_page());
+  ASSERT_FALSE(wbp_.is_shrink_aborting());
+  ASSERT_EQ(3 * PAGES, wbp_.shrink_ctx_.shrink_list_size_);
+  OK(wbp_.finish_shrinking());
+  ASSERT_TRUE(wbp_.has_free_page());
+  LOG_INFO("========== test_free_hint_with_only_restricted_candidates end ==========");
+}
+
+// B15. 有效 SWAP 的部分禁配范围仍可分配，计数归零也要等待整个范围禁止分配。
+// 场景：前三块700页脏数据，第四块空闲，手动缩到三块；初始边界为850。
+// 校验：范围内允许页分配/归还都计数；手动满目标不取消，脏页减少后才进入释放。
+TEST_F(TestTmpFileWBPIndexCache, test_partial_shrink_range_allocation_and_release_gate)
+{
+  LOG_INFO("========== test_partial_shrink_range_allocation_and_release_gate begin ==========");
+  constexpr int64_t LIVE_PAGES = 700;
+  constexpr uint32_t LOWER = 3 * ObSSTmpWriteBufferPool::BLOCK_PAGE_NUMS;
+  constexpr uint32_t INITIAL_BOUNDARY = 850;
+  constexpr int64_t RANGE_PAGES = INITIAL_BOUNDARY - LOWER + 1;
+  constexpr int64_t FREE_DIRTY_PAGES = 17;
+  uint32_t live_ids[LIVE_PAGES];
+  uint32_t range_ids[RANGE_PAGES];
+  char *buf = nullptr;
+  wbp_.default_wbp_memory_limit_ = 3 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  for (int64_t i = 0; i < LIVE_PAGES; ++i) {
+    OK(wbp_.alloc_page(fd, ObTmpFilePageUniqKey(i), live_ids[i], buf));
+    OK(wbp_.notify_dirty(fd, live_ids[i], ObTmpFilePageUniqKey(i)));
+  }
+  wbp_.default_wbp_memory_limit_ = 4 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  OK(wbp_.expand_());
+  wbp_.default_wbp_memory_limit_ = 3 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  OK(wbp_.begin_shrinking(false /*is_auto*/));
+  OK(wbp_.advance_shrink_state());
+  LOG_INFO("partial restriction initialized", K(wbp_.shrink_ctx_));
+  ASSERT_EQ(LOWER, wbp_.shrink_ctx_.lower_page_id_);
+  ASSERT_EQ(INITIAL_BOUNDARY, wbp_.shrink_ctx_.max_allow_alloc_page_id_);
+  ASSERT_EQ(0, wbp_.shrink_ctx_.used_page_num_in_range_);
+  OK(wbp_.advance_shrink_state());
+  ASSERT_EQ(WBPShrinkContext::SHRINKING_SWAP, wbp_.get_wbp_state());
+
+  // 依次分配允许范围直到恰好 lower，真实验证边界和计数增减。
+  for (int64_t i = 0; i < RANGE_PAGES; ++i) {
+    OK(wbp_.alloc_page(fd, ObTmpFilePageUniqKey(LIVE_PAGES + i), range_ids[i], buf));
+    ASSERT_GE(range_ids[i], LOWER);
+  }
+  ASSERT_EQ(LOWER, range_ids[RANGE_PAGES - 1]);
+  ASSERT_EQ(RANGE_PAGES, wbp_.shrink_ctx_.used_page_num_in_range_);
+  ASSERT_GE(wbp_.get_used_page_num(), LOWER);
+  ASSERT_FALSE(wbp_.should_abort_shrinking());
+  uint32_t next_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  for (int64_t i = 0; i < RANGE_PAGES; ++i) {
+    OK(wbp_.free_page(fd, range_ids[i], ObTmpFilePageUniqKey(LIVE_PAGES + i), next_id));
+  }
+  OK(wbp_.advance_shrink_state());
+  ASSERT_EQ(0, wbp_.shrink_ctx_.used_page_num_in_range_);
+  ASSERT_EQ(WBPShrinkContext::SHRINKING_SWAP, wbp_.get_wbp_state());
+
+  // 700降到683页，低于保留目标90%，边界收紧到lower-1后才能释放。
+  for (int64_t i = 0; i < FREE_DIRTY_PAGES; ++i) {
+    OK(wbp_.free_page(fd, live_ids[i], ObTmpFilePageUniqKey(i), next_id));
+  }
+  OK(wbp_.advance_shrink_state());
+  ASSERT_EQ(LOWER - 1, wbp_.shrink_ctx_.max_allow_alloc_page_id_);
+  ASSERT_EQ(WBPShrinkContext::SHRINKING_RELEASE_BLOCKS, wbp_.get_wbp_state());
+  OK(wbp_.release_blocks_in_shrink_range());
+  OK(wbp_.advance_shrink_state());
+  OK(wbp_.finish_shrinking());
+  ASSERT_EQ(3 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE, wbp_.capacity_);
+  LOG_INFO("========== test_partial_shrink_range_allocation_and_release_gate end ==========");
+}
+
+// B16. 清链前取消保留全部块，释放后的late abort必须走FINISH而不归并旧隔离链。
+// 场景：四块缩到三块，先真实隔离第四块，再分别在release前/后填满保留区触发缺页。
+// 校验：隔离链恢复或丢弃符合阶段；abort和FINISH下仍保留正常高水位刷盘。
+TEST_F(TestTmpFileWBPIndexCache, test_shrink_release_cancellation_boundaries)
+{
+  LOG_INFO("========== test_shrink_release_cancellation_boundaries begin ==========");
+  constexpr int64_t TARGET = 3 * ObSSTmpWriteBufferPool::BLOCK_PAGE_NUMS;
+  const bool after_release_cases[] = {false, true};
+  for (const bool after_release : after_release_cases) {
+    SCOPED_TRACE(::testing::Message() << "after_release=" << after_release);
+    // 每个分支独立创建池，避免重复初始化同一对象及继承上一轮链表顺序。
+    ObSSTmpWriteBufferPool wbp;
+    OK(wbp.init());
+    wbp.default_wbp_memory_limit_ = 4 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+    while (wbp.capacity_ < wbp.default_wbp_memory_limit_) {
+      OK(wbp.expand_());
+    }
+    wbp.max_used_watermark_after_shrinking_ = 39;
+    OK(wbp.begin_shrinking(true /*is_auto*/));
+    OK(wbp.advance_shrink_state());
+    uint32_t ids[TARGET];
+    char *buf = nullptr;
+    OK(wbp.alloc_page(fd, ObTmpFilePageUniqKey(0 /*virtual_page_id*/), ids[0], buf));
+    OK(wbp.notify_dirty(fd, ids[0], ObTmpFilePageUniqKey(0 /*virtual_page_id*/)));
+    ASSERT_EQ(ObSSTmpWriteBufferPool::BLOCK_PAGE_NUMS, wbp.shrink_ctx_.shrink_list_size_);
+    OK(wbp.advance_shrink_state());
+    ASSERT_EQ(WBPShrinkContext::SHRINKING_RELEASE_BLOCKS, wbp.get_wbp_state());
+    if (after_release) {
+      OK(wbp.release_blocks_in_shrink_range());
+    }
+    for (int64_t i = 1; i < TARGET; ++i) {
+      OK(wbp.alloc_page(fd, ObTmpFilePageUniqKey(i), ids[i], buf));
+      OK(wbp.notify_dirty(fd, ids[i], ObTmpFilePageUniqKey(i)));
+    }
+    uint32_t failed_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+    ASSERT_EQ(OB_ALLOCATE_TMP_FILE_PAGE_FAILED,
+        wbp.alloc_page(fd, ObTmpFilePageUniqKey(TARGET), failed_id, buf));
+    ASSERT_TRUE(wbp.is_shrink_aborting());
+    ASSERT_EQ(152, wbp.get_background_flush_page_nums());
+    LOG_INFO("cancellation reached release boundary", K(after_release), K(wbp.shrink_ctx_));
+    if (after_release) {
+      // 与同次生产回调一致：release后必须先advance到FINISH，才处理晚到取消。
+      OK(wbp.advance_shrink_state());
+      ASSERT_EQ(WBPShrinkContext::SHRINKING_FINISH, wbp.get_wbp_state());
+      ASSERT_EQ(152, wbp.get_background_flush_page_nums());
+    } else {
+      OK(wbp.release_blocks_in_shrink_range());
+      ASSERT_EQ(4 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE, wbp.capacity_);
+    }
+    OK(wbp.finish_shrinking());
+    ASSERT_FALSE(wbp.is_shrink_aborting());
+    ASSERT_EQ(!after_release, wbp.has_free_page());
+    uint32_t next_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+    for (int64_t i = 0; i < TARGET; ++i) {
+      OK(wbp.free_page(fd, ids[i], ObTmpFilePageUniqKey(i), next_id));
+    }
+    ASSERT_EQ(0, wbp.get_used_page_num());
+    ASSERT_EQ(0, wbp.get_dirty_data_page_num());
+  }
+  LOG_INFO("========== test_shrink_release_cancellation_boundaries end ==========");
+}
+
+// B17. 缩容刷盘裁剪到20%并排除在途页，后台首次发现满目标会锁存取消。
+// 场景：四块池第一块252页脏数据，缩到一块，随后60页进入WRITE_BACK。
+// 校验：请求202页再降到192页；分配最后一页后由后台发现取消，用量回落不重启。
+TEST_F(TestTmpFileWBPIndexCache, test_background_flush_cap_and_first_abort_detection)
+{
+  LOG_INFO("========== test_background_flush_cap_and_first_abort_detection begin ==========");
+  constexpr int64_t LIVE = ObSSTmpWriteBufferPool::BLOCK_PAGE_NUMS - 1;
+  constexpr int64_t INFLIGHT = 60;
+  uint32_t ids[LIVE];
+  char *buf = nullptr;
+  wbp_.default_wbp_memory_limit_ = 4 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  while (wbp_.capacity_ < wbp_.default_wbp_memory_limit_) {
+    OK(wbp_.expand_());
+  }
+  wbp_.max_used_watermark_after_shrinking_ = 8;
+  OK(wbp_.begin_shrinking(true /*is_auto*/));
+  OK(wbp_.advance_shrink_state());
+  ASSERT_EQ(ObSSTmpWriteBufferPool::BLOCK_PAGE_NUMS, wbp_.shrink_ctx_.lower_page_id_);
+  // 目标固定后再增加真实用量，避免当前25%使用率在初始化时把目标放大到两块。
+  for (int64_t i = 0; i < LIVE; ++i) {
+    OK(wbp_.alloc_page(fd, ObTmpFilePageUniqKey(i), ids[i], buf));
+    OK(wbp_.notify_dirty(fd, ids[i], ObTmpFilePageUniqKey(i)));
+  }
+  ASSERT_EQ(202, wbp_.get_background_flush_page_nums());
+  for (int64_t i = 0; i < INFLIGHT; ++i) {
+    OK(wbp_.notify_write_back(fd, ids[i], ObTmpFilePageUniqKey(i)));
+  }
+  LOG_INFO("mixed dirty and in-flight pages", K(wbp_.dirty_page_num_), K(wbp_.write_back_data_cnt_));
+  ASSERT_EQ(192, wbp_.get_background_flush_page_nums());
+  uint32_t last_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  OK(wbp_.alloc_page(fd, ObTmpFilePageUniqKey(LIVE), last_id, buf));
+  ASSERT_FALSE(wbp_.is_shrink_aborting());
+  ASSERT_EQ(0, wbp_.get_background_flush_page_nums());
+  ASSERT_TRUE(wbp_.is_shrink_aborting());
+  uint32_t next_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  OK(wbp_.free_page(fd, last_id, ObTmpFilePageUniqKey(LIVE), next_id));
+  ASSERT_EQ(0, wbp_.get_background_flush_page_nums());
+  ASSERT_TRUE(wbp_.is_shrink_aborting());
+  OK(wbp_.finish_shrinking());
+  for (int64_t i = 0; i < LIVE; ++i) {
+    OK(wbp_.free_page(fd, ids[i], ObTmpFilePageUniqKey(i), next_id));
+  }
+  ASSERT_EQ(0, ATOMIC_LOAD(&wbp_.write_back_data_cnt_));
+  LOG_INFO("========== test_background_flush_cap_and_first_abort_detection end ==========");
+}
+
+// B18. 释放线程停在清状态与入链之间，初始化和取消重建仍准确统计该页。
+// 场景：只在测试线程安装动作，明确观察到waiter后再初始化或结束旧轮次。
+// 校验：未发布页计为1，放行后归零；断言失败由guard放行并join，不等待真实IO。
+TEST_F(TestTmpFileWBPIndexCache, test_free_publication_across_shrink_windows)
+{
+  LOG_INFO("========== test_free_publication_across_shrink_windows begin ==========");
+  wbp_.default_wbp_memory_limit_ = 4 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  while (wbp_.capacity_ < wbp_.default_wbp_memory_limit_) {
+    OK(wbp_.expand_());
+  }
+  const bool cancel_cases[] = {false, true};
+  for (const bool cancel_old_round : cancel_cases) {
+    SCOPED_TRACE(::testing::Message() << "cancel_old_round=" << cancel_old_round);
+    const ObTmpFilePageUniqKey key(0 /*virtual_page_id*/);
+    uint32_t page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+    uint32_t next_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+    char *buf = nullptr;
+    OK(wbp_.alloc_page(fd, key, page_id, buf));
+    if (cancel_old_round) {
+      OK(wbp_.begin_shrinking(true /*is_auto*/));
+      OK(wbp_.advance_shrink_state());
+    }
+    TestTmpFileSyncGuard sync;
+    OK(sync.start(TMP_FILE_WBP_FREE_BEFORE_PUBLISH, "wbp_free_publish", [&]() {
+      int ret = OB_SUCCESS;
+      if (OB_FAIL(wbp_.free_page(fd, page_id, key, next_id))) {
+        LOG_WARN("fail to publish test free page", KR(ret), K(page_id));
+      }
+      return ret;
+    }));
+    OK(sync.wait_until_paused());
+    if (cancel_old_round) {
+      ASSERT_TRUE(wbp_.request_auto_shrink_abort_());
+      OK(wbp_.finish_shrinking());
+    }
+    OK(wbp_.begin_shrinking(true /*is_auto*/));
+    LOG_INFO("unpublished free remains in the new range count",
+        K(cancel_old_round), K(page_id), K(wbp_.shrink_ctx_));
+    ASSERT_EQ(1, wbp_.shrink_ctx_.used_page_num_in_range_);
+    OK(sync.release_and_join());
+    ASSERT_EQ(0, wbp_.shrink_ctx_.used_page_num_in_range_);
+    ASSERT_EQ(0, wbp_.get_used_page_num());
+    OK(wbp_.advance_shrink_state());
+    OK(wbp_.finish_shrinking());
+    uint32_t reused_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+    OK(wbp_.alloc_page(fd, key, reused_id, buf));
+    ASSERT_EQ(page_id, reused_id);
+    OK(wbp_.free_page(fd, reused_id, key, next_id));
+  }
+  LOG_INFO("========== test_free_publication_across_shrink_windows end ==========");
+}
+
+// B19. 同步guard不会把未命中当暂停，提前放行和作用域退出均能安全结束线程。
+// 操作：分别不执行同步点、立即放行、确认暂停后由析构放行，不依赖固定sleep。
+TEST_F(TestTmpFileWBPIndexCache, test_sync_guard_rejects_missing_and_stale_pause)
+{
+  LOG_INFO("========== test_sync_guard_rejects_missing_and_stale_pause begin ==========");
+  {
+    TestTmpFileSyncGuard sync;
+    OK(sync.start(TMP_FILE_WBP_FREE_BEFORE_PUBLISH, "wbp_sync_missing", []() {
+      return OB_SUCCESS;
+    }));
+    ASSERT_EQ(OB_TIMEOUT, sync.wait_until_paused());
+    OK(sync.release_and_join());
+    ASSERT_EQ(OB_TIMEOUT, sync.wait_until_paused());
+  }
+  {
+    TestTmpFileSyncGuard sync;
+    OK(sync.start(TMP_FILE_WBP_FREE_BEFORE_PUBLISH, "wbp_sync_early", []() {
+      int ret = OB_SUCCESS;
+      if (OB_FAIL(GDS.execute(TMP_FILE_WBP_FREE_BEFORE_PUBLISH))) {
+        LOG_WARN("fail to execute early-release sync", KR(ret));
+      }
+      return ret;
+    }));
+    OK(sync.release_and_join());
+  }
+  std::atomic<bool> completed(false);
+  {
+    TestTmpFileSyncGuard sync;
+    OK(sync.start(TMP_FILE_WBP_FREE_BEFORE_PUBLISH, "wbp_sync_scope", [&]() {
+      int ret = OB_SUCCESS;
+      if (OB_FAIL(GDS.execute(TMP_FILE_WBP_FREE_BEFORE_PUBLISH))) {
+        LOG_WARN("fail to execute scoped sync", KR(ret));
+      } else {
+        completed.store(true);
+      }
+      return ret;
+    }));
+    OK(sync.wait_until_paused());
+  }
+  ASSERT_TRUE(completed.load());
+  LOG_INFO("========== test_sync_guard_rejects_missing_and_stale_pause end ==========");
 }
 
 } // namespace oceanbase

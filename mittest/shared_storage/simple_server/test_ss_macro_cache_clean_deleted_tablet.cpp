@@ -483,15 +483,15 @@ public:
     return ret;
   }
 
-  int inject_stale_effective_owner_(
+  // 选定仍有缓存元数据的 private data macro，保持 owner 不变。
+  int select_private_data_macro_(
       ObSSMacroCacheMgr &macro_cache_mgr,
       const ObIArray<MacroBlockId> &private_macro_ids,
-      const ObTabletID &destination_tablet_id,
-      MacroBlockId &polluted_macro_id)
+      MacroBlockId &selected_macro_id)
   {
     int ret = OB_SUCCESS;
     bool found = false;
-    polluted_macro_id.reset();
+    selected_macro_id.reset();
     for (int64_t i = 0; OB_SUCC(ret) && !found && i < private_macro_ids.count(); ++i) {
       const MacroBlockId &macro_id = private_macro_ids.at(i);
       if (macro_id.is_data()) {
@@ -503,25 +503,21 @@ public:
         } else if (OB_SUCCESS != tmp_ret) {
           ret = tmp_ret;
           LOG_WARN("fail to get private macro cache meta", KR(ret), K(i),
-              K(macro_id), K(destination_tablet_id));
+              K(macro_id));
         } else if (OB_UNLIKELY(!meta_handle.is_valid())) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("private macro cache meta is invalid", KR(ret), K(i),
-              K(macro_id), K(destination_tablet_id));
+              K(macro_id));
         } else {
-          // Fork source reads now keep the source as the effective owner. Inject the
-          // legacy/stale owner state directly so this case remains focused on the
-          // cleanup fallback rather than relying on the old owner-drift behavior.
-          meta_handle()->set_effective_tablet_id(destination_tablet_id.id());
-          polluted_macro_id = macro_id;
+          selected_macro_id = macro_id;
           found = true;
         }
       }
     }
     if (OB_SUCC(ret) && !found) {
       ret = OB_HASH_NOT_EXIST;
-      LOG_WARN("no private data macro cache meta can be injected", KR(ret),
-          K(destination_tablet_id), K(private_macro_ids.count()));
+      LOG_WARN("no cached private data macro can be selected", KR(ret),
+          K(private_macro_ids.count()));
     }
     return ret;
   }
@@ -629,8 +625,8 @@ protected:
 // 场景：simple_server 通过 SQL 创建 source private MINI，暂停所在 LS 的普通
 //       SSTable upload 以保持 private 形态；等待 Fork 时定向推进 destination LS 的 MDS。
 //       卡住真实 Fork service 并创建 destination。
-//       当前 Fork source read 会保持 source owner，因此测试直接注入旧版本或异常状态下
-//       effective owner=destination 的 stale meta。
+//       当前 Fork source read 会保持 source owner，因此在两轮 cleanup 前分别注入
+//       旧版本或异常状态下 effective owner 漂移的 stale meta。
 // 操作：先删除 effective destination 并保留 born source，验证缓存保留；再创建一个 active
 //       effective owner 并删除 born source，验证缓存清理。两次均回拨访问时间后直接触发
 //       clean_deleted_tablet_，从而避免等待 30 分钟后台周期。
@@ -683,8 +679,8 @@ TEST_F(TestSSMacroCacheCleanDeletedTablet, private_macro_gc_uses_born_tablet_onl
   LOG_INFO("step 1: source private macro candidates are ready",
       K(source_tablet_id), K(source_ls_id), K(private_macro_ids));
 
-  // step 2：卡住真实 Fork service，创建 INCOMPLETE destination，并直接注入历史/异常的
-  // effective owner 漂移状态。生产读路径现在会保持 source owner，不能再依赖 DML 制造该状态。
+  // step 2：卡住真实 Fork service，创建 INCOMPLETE destination，并选定目标宏块。
+  // 暂不注入异常 owner，避免后续正常 Fork 读覆盖该状态。
   ForkServiceDebugSyncGuard debug_sync_guard;
   OK(debug_sync_guard.enable());
   OK(exe_sql("fork table mc_cleanup_src to mc_cleanup_dst"));
@@ -694,10 +690,9 @@ TEST_F(TestSSMacroCacheCleanDeletedTablet, private_macro_gc_uses_born_tablet_onl
   OK(get_tablet_and_ls_id_(
       "mc_cleanup_dst", destination_tablet_id, destination_ls_id));
   MacroBlockId polluted_macro_id;
-  OK(inject_stale_effective_owner_(
-      *macro_cache_mgr, private_macro_ids, destination_tablet_id, polluted_macro_id));
+  OK(select_private_data_macro_(*macro_cache_mgr, private_macro_ids, polluted_macro_id));
   ASSERT_EQ(source_tablet_id.id(), polluted_macro_id.second_id());
-  LOG_INFO("step 2: injected stale effective owner",
+  LOG_INFO("step 2: selected private macro for cleanup",
       K(polluted_macro_id), K(source_tablet_id), K(destination_tablet_id));
 
   // step 3：完成 Fork 并删除 destination，确保 cleanup 的真实 active set 只保留 source。
@@ -729,16 +724,25 @@ TEST_F(TestSSMacroCacheCleanDeletedTablet, private_macro_gc_uses_born_tablet_onl
       active_tablet_ids.exist_refactored(destination_tablet_id.id()));
 
   // step 4：不等待 30 分钟，回拨目标时间并执行完整 cleanup；active born 必须保留。
+  bool remote_exist = true;
+  OK(file_manager->is_exist_remote_file(
+      polluted_macro_id, 0 /*ls_epoch_id*/, remote_exist));
+  ASSERT_FALSE(remote_exist);
+  // 完成 Fork、DDL 和文件检查后再注入，避免跨越较长的准备流程。
+  LOG_INFO("step 4: inject stale owner for cleanup",
+      K(polluted_macro_id), K(destination_tablet_id));
+  {
+    ObSSMacroCacheMetaHandle meta_handle;
+    OK(macro_cache_mgr->meta_map_.get_refactored(polluted_macro_id, meta_handle));
+    ASSERT_TRUE(meta_handle.is_valid());
+    meta_handle()->set_effective_tablet_id(destination_tablet_id.id());
+  }
   OK(check_macro_owner_(
       *macro_cache_mgr,
       polluted_macro_id,
       source_tablet_id,
       destination_tablet_id));
   OK(backdate_macro_(*macro_cache_mgr, polluted_macro_id));
-  bool remote_exist = true;
-  OK(file_manager->is_exist_remote_file(
-      polluted_macro_id, 0 /*ls_epoch_id*/, remote_exist));
-  ASSERT_FALSE(remote_exist);
   OK(macro_cache_mgr->clean_deleted_tablet_());
   bool cache_exist = false;
   OK(macro_cache_mgr->exist(polluted_macro_id, cache_exist));
@@ -764,17 +768,6 @@ TEST_F(TestSSMacroCacheCleanDeletedTablet, private_macro_gc_uses_born_tablet_onl
   ObLSID active_effective_ls_id;
   OK(get_tablet_and_ls_id_(
       "mc_cleanup_dst", active_effective_tablet_id, active_effective_ls_id));
-  {
-    ObSSMacroCacheMetaHandle meta_handle;
-    OK(macro_cache_mgr->meta_map_.get_refactored(polluted_macro_id, meta_handle));
-    ASSERT_TRUE(meta_handle.is_valid());
-    meta_handle()->set_effective_tablet_id(active_effective_tablet_id.id());
-  }
-  OK(check_macro_owner_(
-      *macro_cache_mgr,
-      polluted_macro_id,
-      source_tablet_id,
-      active_effective_tablet_id));
   OK(tenant_kvcache_mgr->erase_macro_block(polluted_macro_id));
   OK(exe_sql("drop table mc_cleanup_src"));
   OK(remove_tablet_(source_ls_id, source_tablet_id));
@@ -796,6 +789,20 @@ TEST_F(TestSSMacroCacheCleanDeletedTablet, private_macro_gc_uses_born_tablet_onl
   OK(file_manager->is_exist_local_file(
       polluted_macro_id, 0 /*ls_epoch_id*/, local_exist_before_cleanup));
   ASSERT_TRUE(local_exist_before_cleanup);
+  // born 删除和缓存存在性检查完成后，对同一宏块注入仍存活的 effective owner。
+  LOG_INFO("step 5: inject active effective owner for cleanup",
+      K(polluted_macro_id), K(active_effective_tablet_id));
+  {
+    ObSSMacroCacheMetaHandle meta_handle;
+    OK(macro_cache_mgr->meta_map_.get_refactored(polluted_macro_id, meta_handle));
+    ASSERT_TRUE(meta_handle.is_valid());
+    meta_handle()->set_effective_tablet_id(active_effective_tablet_id.id());
+  }
+  OK(check_macro_owner_(
+      *macro_cache_mgr,
+      polluted_macro_id,
+      source_tablet_id,
+      active_effective_tablet_id));
   OK(backdate_macro_(*macro_cache_mgr, polluted_macro_id));
   OK(macro_cache_mgr->clean_deleted_tablet_());
 

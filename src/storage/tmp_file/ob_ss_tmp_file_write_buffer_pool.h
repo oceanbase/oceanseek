@@ -51,14 +51,18 @@ public:
            ObTimeUtility::current_time() - shrink_begin_ts_ > MAX_SHRINKING_DURATION;
   }
   OB_INLINE bool is_auto() const { return is_auto_; }
-  TO_STRING_KV(K(is_inited_), K(is_auto_),
+  TO_STRING_KV(K(is_inited_), K(is_auto_), K(need_abort_),
                K(lower_page_id_), K(max_allow_alloc_page_id_),
                K(upper_page_id_), K(wbp_shrink_state_),
-               K(shrink_list_head_), K(shrink_list_size_), K(shrink_begin_ts_));
+               K(shrink_list_head_), K(shrink_list_size_), K(used_page_num_in_range_),
+               K(shrink_begin_ts_));
 public:
   bool is_inited_;
   bool is_auto_;  // indicates whether current shrinking process is auto or manual.
                   // auto shrinking may be aborted if watermark increases.
+  // Set when allocation fails or used pages reach the automatic shrink target.
+  // Cancels this round and stays set until it ends, even if usage later drops.
+  bool need_abort_;
   int64_t shrink_begin_ts_;
   uint32_t max_allow_alloc_page_id_; // in the range between [lower_page_id_ - 1, upper_page_id_].
                                      // init as upper_page_id_ and will decrease towards lower_page_id_ - 1
@@ -70,6 +74,8 @@ public:
   uint32_t shrink_list_head_;       // tmp free_page_list when the new free page in the range [lower_page_id, upper_page_id]
                                     // these pages will not be used by alloc_page()
   int64_t shrink_list_size_;
+  // Pages in the shrinking range not yet returned to either free list.
+  int64_t used_page_num_in_range_;
   WBP_SHRINK_STATE wbp_shrink_state_;
 };
 
@@ -187,12 +193,17 @@ public:
   int64_t get_max_data_page_num();
   int64_t get_meta_page_num();
   int64_t get_free_data_page_num();
+  // Checks whether the free list has a candidate for allocation retry.
+  bool has_free_page();
   void print_page_entry(const uint32_t page_id);
   void print_statistics();
 public:
   // for shrinking
   // Checks whether to start a shrink round or continue the current round.
   bool need_to_shrink(bool &is_auto);
+  // Called by the shrink task to check usage, cancellation and the round timeout.
+  bool should_abort_shrinking();
+  bool is_shrink_aborting() const { return ATOMIC_LOAD(&shrink_ctx_.need_abort_); }
   // Selects and initializes the final target, then reseeds the automatic usage window.
   int init_shrink_context(const bool is_auto);
   int begin_shrinking(const bool is_auto);
@@ -203,6 +214,8 @@ public:
   OB_INLINE WBPShrinkContext &get_shrink_ctx() { return shrink_ctx_; }
 private:
   // for shrinking
+  // Requests that the current automatic shrink round stop.
+  bool request_auto_shrink_abort_();
   int remove_invalid_page_in_free_list_();
   bool is_shrink_range_all_free_();
   void insert_page_entry_to_free_list_(const uint32_t page_id, uint32_t &free_list_head);

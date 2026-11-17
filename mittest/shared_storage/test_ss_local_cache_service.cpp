@@ -13,6 +13,7 @@
 #include "mittest/shared_storage/test_ss_common_util.h"
 #include "lib/allocator/page_arena.h"
 #include "lib/checksum/ob_crc64.h"
+#include "lib/utility/ob_test_util.h"
 #include "storage/shared_storage/ob_ss_local_cache_service.h"
 #undef private
 #undef protected
@@ -302,10 +303,11 @@ TEST_F(TestSSLocalCacheService, unaligned_value_is_not_persisted)
   const ObSSMacroBlockCacheValue value(
       OB_INVALID_ID, data, sizeof(data) - 1,
       static_cast<uint32_t>(ob_crc64(data, sizeof(data) - 1)));
+  ObSSMacroPersistEntry entry;
+  entry.macro_id_ = macro_id;
+  entry.enqueue_ts_ = ObTimeUtility::current_time_us();
   bool can_persist = true;
-  ASSERT_EQ(OB_SUCCESS,
-      tenant_kvcache_mgr->persist_worker_.check_can_persist_(
-          macro_id, value, can_persist));
+  OK(tenant_kvcache_mgr->persist_worker_.check_can_persist_(entry, value, can_persist));
   ASSERT_FALSE(can_persist);
 }
 

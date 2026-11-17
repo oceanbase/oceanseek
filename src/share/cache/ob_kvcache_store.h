@@ -75,6 +75,8 @@ public:
   int get_avg_cache_item_size(const uint64_t tenant_id, const int64_t cache_id,
                               int64_t &avg_cache_item_size);
 
+  // Calculates the tenant memory reserve used by cache washing, in bytes.
+  static int64_t calc_tenant_cache_reserve_bytes(const int64_t upper_limit);
   int get_washable_size(const uint64_t tenant_id, int64_t &washable_size);
   int flush_washable_mbs();
   int flush_washable_mbs(const uint64_t tenant_id, const bool force_flush = false);

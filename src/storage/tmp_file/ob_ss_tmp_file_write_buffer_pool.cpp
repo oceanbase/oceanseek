@@ -6,6 +6,8 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "share/ob_server_struct.h"
+#include "share/ob_debug_sync.h"
+#include "share/config/ob_server_config.h"
 #include "lib/alloc/alloc_func.h"
 #include "storage/tmp_file/ob_ss_tmp_file_write_buffer_pool.h"
 
@@ -94,6 +96,7 @@ void ObSSTmpWriteBufferPool::destroy()
 // limit data pages to use a maximum of 90% of the total space in the write buffer pool;
 // considering that the total amount of meta pages for a single file accounts for less than 1% of data pages,
 // there is no limit set for meta pages when allocating pages.
+// A failed allocation requests automatic shrink cancellation.
 int ObSSTmpWriteBufferPool::inner_alloc_page_(const int64_t fd,
                                             const ObTmpFilePageUniqKey page_key,
                                             uint32_t &new_page_id,
@@ -138,6 +141,9 @@ int ObSSTmpWriteBufferPool::inner_alloc_page_(const int64_t fd,
       fat_[curr_first_free_page_id].switch_state(ObPageEntry::Ops::ALLOC);
       new_page_id = curr_first_free_page_id;
       new_page_buf = fat_[new_page_id].buf_;
+      if (shrink_ctx_.in_shrinking_range(new_page_id)) {
+        ++shrink_ctx_.used_page_num_in_range_;
+      }
       ATOMIC_INC(&used_page_num_);
       update_current_max_used_percent_();
     }
@@ -145,6 +151,10 @@ int ObSSTmpWriteBufferPool::inner_alloc_page_(const int64_t fd,
 
   if (ObTmpFileGlobal::INVALID_PAGE_ID == new_page_id) {
     ret = OB_SEARCH_NOT_FOUND;
+    if (request_auto_shrink_abort_()) {
+      // Let the caller wait for cancellation instead of repeatedly taking the expansion write lock.
+      ret = OB_OP_NOT_ALLOW;
+    }
   }
 
   return ret;
@@ -455,6 +465,9 @@ int ObSSTmpWriteBufferPool::free_page(
     fat_[page_id].switch_state(ObPageEntry::Ops::DELETE);
     fat_[page_id].page_key_.reset();
 
+    if (OB_UNLIKELY(GCONF.is_debug_sync_enabled())) {
+      DEBUG_SYNC(common::TMP_FILE_WBP_FREE_BEFORE_PUBLISH);
+    }
     {
       ObSpinLockGuard guard(free_list_lock_);
       if (!shrink_ctx_.is_valid() || !shrink_ctx_.in_not_alloc_range(page_id)) {
@@ -462,6 +475,9 @@ int ObSSTmpWriteBufferPool::free_page(
       } else {
         insert_page_entry_to_free_list_(page_id, shrink_ctx_.shrink_list_head_);
         ATOMIC_INC(&shrink_ctx_.shrink_list_size_);
+      }
+      if (shrink_ctx_.in_shrinking_range(page_id)) {
+        --shrink_ctx_.used_page_num_in_range_;
       }
     }
 
@@ -685,11 +701,29 @@ int ObSSTmpWriteBufferPool::init_shrink_context(const bool is_auto)
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected upper page id", K(ret), K(max_allow_alloc_page_id),
           K(lower_page_id), K(upper_page_id), K(fat_.size()));
-    } else if (OB_FAIL(shrink_ctx_.init(lower_page_id, max_allow_alloc_page_id,
-                                        upper_page_id, is_auto))) {
-      LOG_WARN("wbp fail to init shrink context", KR(ret), K(lower_page_id), K(upper_page_id));
     } else {
-      LOG_INFO("init shrinking context", KR(ret), K(shrink_ctx_));
+      // Count free-list entries.
+      int64_t used_page_num_in_range = upper_page_id - lower_page_id + 1;
+      uint32_t free_page_id = first_free_page_id_;
+      while (OB_SUCC(ret) && ObTmpFileGlobal::INVALID_PAGE_ID != free_page_id) {
+        if (!is_valid_page_id_(free_page_id)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_ERROR("invalid free page while initializing shrink context", KR(ret),
+              K(free_page_id), K(lower_page_id), K(upper_page_id), K(fat_.size()));
+        } else {
+          if (free_page_id >= lower_page_id && free_page_id <= upper_page_id) {
+            --used_page_num_in_range;
+          }
+          free_page_id = fat_[free_page_id].next_page_id_;
+        }
+      }
+      if (FAILEDx(shrink_ctx_.init(lower_page_id, max_allow_alloc_page_id,
+          upper_page_id, is_auto))) {
+        LOG_WARN("wbp fail to init shrink context", KR(ret), K(lower_page_id), K(upper_page_id));
+      } else {
+        shrink_ctx_.used_page_num_in_range_ = used_page_num_in_range;
+        LOG_INFO("init shrinking context", KR(ret), K(shrink_ctx_), K(used_page_num_in_range));
+      }
     }
   }
 
@@ -707,6 +741,8 @@ bool ObSSTmpWriteBufferPool::need_to_shrink(bool &is_auto)
 
   if (!ATOMIC_LOAD(&is_inited_)) {
     LOG_INFO("buffer pool is not init, no need to shrink", K(ATOMIC_LOAD(&is_inited_)));
+  } else if (should_abort_shrinking()) {
+    b_ret = false;
   } else if (current_capacity > memory_limit) {
     b_ret = true;
   } else if (current_capacity <= memory_limit) {
@@ -747,15 +783,41 @@ bool ObSSTmpWriteBufferPool::need_to_shrink(bool &is_auto)
   return b_ret;
 }
 
+// Sets need_abort_ for an initialized automatic shrink and returns true.
+// Returns false if no automatic shrink is initialized.
+bool ObSSTmpWriteBufferPool::request_auto_shrink_abort_()
+{
+  const bool requested = shrink_ctx_.is_inited_ && shrink_ctx_.is_auto();
+  if (requested) {
+    ATOMIC_STORE(&shrink_ctx_.need_abort_, true);
+  }
+  return requested;
+}
+
+bool ObSSTmpWriteBufferPool::should_abort_shrinking()
+{
+  bool need_abort = false;
+  if (shrink_ctx_.is_inited_) {
+    need_abort = (shrink_ctx_.is_execution_too_long()
+        || ATOMIC_LOAD(&shrink_ctx_.need_abort_)
+        || (shrink_ctx_.is_auto()
+            && ATOMIC_LOAD(&used_page_num_) >= shrink_ctx_.lower_page_id_
+            && request_auto_shrink_abort_()));
+  }
+  return need_abort;
+}
+
 WBPShrinkContext::WBPShrinkContext()
   : is_inited_(false),
     is_auto_(false),
+    need_abort_(false),
     shrink_begin_ts_(0),
     max_allow_alloc_page_id_(ObTmpFileGlobal::INVALID_PAGE_ID),
     lower_page_id_(ObTmpFileGlobal::INVALID_PAGE_ID),
     upper_page_id_(ObTmpFileGlobal::INVALID_PAGE_ID),
     shrink_list_head_(ObTmpFileGlobal::INVALID_PAGE_ID),
     shrink_list_size_(0),
+    used_page_num_in_range_(0),
     wbp_shrink_state_(WBP_SHRINK_STATE::INVALID)
 {}
 
@@ -775,12 +837,14 @@ int WBPShrinkContext::init(const uint32_t lower_page_id,
     LOG_WARN("invalid argument", K(ret), K(lower_page_id), K(upper_page_id));
   } else {
     is_auto_ = is_auto;
+    ATOMIC_STORE(&need_abort_, false);
     shrink_begin_ts_ = ObTimeUtility::current_time();
     lower_page_id_ = lower_page_id;
     upper_page_id_ = upper_page_id;
     max_allow_alloc_page_id_ = max_allow_alloc_page_id;
     shrink_list_head_ = ObTmpFileGlobal::INVALID_PAGE_ID;
     shrink_list_size_ = 0;
+    used_page_num_in_range_ = 0;
     is_inited_ = true;
   }
   return ret;
@@ -790,12 +854,14 @@ void WBPShrinkContext::reset()
 {
   is_inited_ = false;
   is_auto_ = false;
+  ATOMIC_STORE(&need_abort_, false);
   shrink_begin_ts_ = 0;
   max_allow_alloc_page_id_ = ObTmpFileGlobal::INVALID_PAGE_ID;
   lower_page_id_ = ObTmpFileGlobal::INVALID_PAGE_ID;
   upper_page_id_ = ObTmpFileGlobal::INVALID_PAGE_ID;
   shrink_list_head_ = ObTmpFileGlobal::INVALID_PAGE_ID;
   shrink_list_size_ = 0;
+  used_page_num_in_range_ = 0;
   wbp_shrink_state_ = WBP_SHRINK_STATE::INVALID;
 }
 
@@ -945,6 +1011,8 @@ int ObSSTmpWriteBufferPool::release_blocks_in_shrink_range()
   if (!shrink_ctx_.is_valid()) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("shrink_ctx_ is invalid", K(ret), K(shrink_ctx_));
+  } else if (should_abort_shrinking()) {
+    // skip
   } else if (OB_FAIL(remove_invalid_page_in_free_list_())) {
     LOG_WARN("fail to remove invalid page in free list", KR(ret), K(shrink_ctx_));
   } else {
@@ -989,6 +1057,7 @@ int ObSSTmpWriteBufferPool::release_blocks_in_shrink_range()
 int ObSSTmpWriteBufferPool::advance_shrink_state()
 {
   int ret = OB_SUCCESS;
+  common::TCRWLock::WLockGuard guard(lock_);
   switch (shrink_ctx_.wbp_shrink_state_) {
     case WBPShrinkContext::INVALID:
       shrink_ctx_.wbp_shrink_state_ = WBPShrinkContext::SHRINKING_SWAP;
@@ -1019,12 +1088,11 @@ int ObSSTmpWriteBufferPool::advance_shrink_state()
   return ret;
 }
 
+// Requires the caller to hold lock_ in write mode.
 bool ObSSTmpWriteBufferPool::is_shrink_range_all_free_()
 {
-  int ret = OB_SUCCESS;
   bool is_all_free = false;
 
-  common::TCRWLock::WLockGuard guard(lock_);
   uint32_t cur_max_allow_alloc_page_id =
       cal_max_allow_alloc_page_id_(shrink_ctx_.lower_page_id_, shrink_ctx_.upper_page_id_);
   shrink_ctx_.max_allow_alloc_page_id_ =
@@ -1032,18 +1100,9 @@ bool ObSSTmpWriteBufferPool::is_shrink_range_all_free_()
 
   // only after max_allow_alloc_page_id_ falls below lower_page_id_,
   // we can ensure that no newly allocated pages exist within the range of [lower_page_id_, upper_page_id_]
-  if (shrink_ctx_.max_allow_alloc_page_id_ < shrink_ctx_.lower_page_id_) {
-    is_all_free = true;
-    for (uint32_t i = shrink_ctx_.lower_page_id_; i <= shrink_ctx_.upper_page_id_; ++i) {
-      if (!is_valid_page_id_(i)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_ERROR("invalid page id in shrink range", K(ret), K(i), K(shrink_ctx_), K(fat_.size()));
-      } else if (ObPageEntry::State::INVALID != fat_[i].state_) {
-        is_all_free = false;
-        LOG_DEBUG("wbp shrink range is not all free", K(i), K(fat_[i]), K(shrink_ctx_));
-        break;
-      }
-    }
+  if (shrink_ctx_.max_allow_alloc_page_id_ < shrink_ctx_.lower_page_id_
+      && !should_abort_shrinking()) {
+    is_all_free = (0 >= shrink_ctx_.used_page_num_in_range_);
     if (is_all_free) {
       LOG_INFO("wbp shrinking range is free, start to release blocks mem",
                 K(fat_.size()), K(shrink_ctx_));
@@ -1582,11 +1641,37 @@ int64_t ObSSTmpWriteBufferPool::get_max_flush_page_nums()
              ObTmpFileGlobal::SS_BLOCK_PAGE_NUMS * ObTmpFileGlobal::MAX_FLUSHING_BLOCK_NUM);
 }
 
+// While shrinking waits for pages to be freed, request flushing of dirty data pages
+// even below the normal flush watermark.
 int64_t ObSSTmpWriteBufferPool::get_background_flush_page_nums()
 {
-  const int64_t exceed_page_num = MAX(0, get_dirty_page_num() - get_max_page_num() * BACKGROUND_FLUSH_WATERMARK / 100);
-  return MIN(exceed_page_num,
-             get_max_page_num() * BACKGROUND_FLUSH_PERCENT / 100);
+  const int64_t max_page_num = get_max_page_num();
+  bool flush_for_shrinking = false;
+  {
+    common::TCRWLock::RLockGuard guard(lock_);
+    ObSpinLockGuard list_guard(free_list_lock_);
+    flush_for_shrinking = shrink_ctx_.is_valid() &&
+        WBPShrinkContext::SHRINKING_SWAP == shrink_ctx_.wbp_shrink_state_ &&
+        !should_abort_shrinking();
+  }
+  int64_t flush_page_num = 0;
+  if (flush_for_shrinking) {
+    flush_page_num = get_dirty_data_page_num();
+  } else {
+    flush_page_num = MAX(0,
+        get_dirty_page_num() - max_page_num * BACKGROUND_FLUSH_WATERMARK / 100);
+  }
+  return MIN(flush_page_num, max_page_num * BACKGROUND_FLUSH_PERCENT / 100);
+}
+
+// Checks only the ordinary free-list head as a hint to retry allocation.
+bool ObSSTmpWriteBufferPool::has_free_page()
+{
+  common::TCRWLock::RLockGuard guard(lock_);
+  ObSpinLockGuard list_guard(free_list_lock_);
+  const uint32_t page_id = first_free_page_id_;
+  const bool has_page = is_valid_page_id_(page_id) && OB_NOT_NULL(fat_[page_id].buf_);
+  return has_page;
 }
 
 int64_t ObSSTmpWriteBufferPool::get_free_data_page_num()
