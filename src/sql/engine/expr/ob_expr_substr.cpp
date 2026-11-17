@@ -705,7 +705,7 @@ int ObExprSubstr::eval_substr(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &expr_
           LOG_WARN("invalid external lob substr position", K(ret), K(pos), K(len));
         } else if (OB_FAIL(ObTextStringHelper::build_text_iter(input_iter,
                                                                &ctx.exec_ctx_,
-                                                               NULL/*session*/,
+                                                               ctx.exec_ctx_.get_my_session(),
                                                                &calc_alloc))) {
           LOG_WARN("init input_iter failed ", K(ret), K(input_iter));
         } else if (OB_FAIL(input_iter.get_byte_len(total_byte_len))) {
@@ -826,7 +826,7 @@ int ObExprSubstr::eval_substr_batch(const ObExpr &expr, ObEvalCtx &ctx,
               LOG_WARN("invalid external lob substr position", K(ret), K(pos), K(len), K(j));
             } else if (OB_FAIL(ObTextStringHelper::build_text_iter(input_iter,
                                                                    &ctx.exec_ctx_,
-                                                                   NULL/*session*/,
+                                                                   ctx.exec_ctx_.get_my_session(),
                                                                    &calc_alloc))) {
               LOG_WARN("init input_iter failed ", K(ret), K(input_iter));
             } else if (OB_FAIL(input_iter.get_byte_len(total_byte_len))) {
@@ -952,7 +952,7 @@ int ObExprSubstr::vector_substr(VECTOR_EVAL_FUNC_ARG_DECL)
               LOG_WARN("invalid external lob substr position", K(ret), K(pos), K(len), K(idx));
             } else if (OB_FAIL(ObTextStringHelper::build_text_iter(input_iter,
                                                                    &ctx.exec_ctx_,
-                                                                   NULL/*session*/,
+                                                                   ctx.exec_ctx_.get_my_session(),
                                                                    &calc_alloc))) {
               LOG_WARN("init input_iter failed ", K(ret), K(input_iter));
             } else if (OB_FAIL(input_iter.get_byte_len(total_byte_len))) {

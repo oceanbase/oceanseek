@@ -104,7 +104,9 @@ int ObTextStringHelper::read_real_string_data(
       tmp_alloc_ptr = &tmp_allocator;
     }
     ObTextStringIter str_iter(type, cs_type, str);
-    if (OB_FAIL(build_text_iter(str_iter, exec_ctx, nullptr/*session*/, allocator, tmp_alloc_ptr))) {
+    const ObBasicSessionInfo *session = OB_NOT_NULL(exec_ctx) ? exec_ctx->get_my_session()
+                                                              : nullptr;
+    if (OB_FAIL(build_text_iter(str_iter, exec_ctx, session, allocator, tmp_alloc_ptr))) {
       LOG_WARN("Lob: init lob str iter failed ", K(ret), K(str_iter));
     } else if (OB_FAIL(str_iter.get_full_data(str))) {
       COMMON_LOG(WARN, "Lob: str iter get full data failed ", K(ret), K(str_iter));

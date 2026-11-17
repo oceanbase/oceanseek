@@ -424,14 +424,20 @@ int ObDMLService::create_rowkey_check_hashset(int64_t estimate_row,
   return ret;
 }
 
-// The caller verified both are Mem External; result is 0 for the same reference, 1 for a change.
-static int check_external_lob_column_changed(const ObLobLocatorV2 &old_lob,
-                                             const ObLobLocatorV2 &new_lob, int64_t &result)
+int ObDMLService::check_external_lob_column_changed(
+    const ObLobLocatorV2 &old_lob,
+    const ObLobLocatorV2 &new_lob,
+    int64_t &result)
 {
   int ret = OB_SUCCESS;
   ObExternalBlobInfo old_external_lob_info;
   ObExternalBlobInfo new_external_lob_info;
-  if (OB_FAIL(old_lob.get_external_lob_info(old_external_lob_info))) {
+  if (!old_lob.is_mem_external_lob() && !new_lob.is_mem_external_lob()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("using check_external_lob_column_changed for both of internal lob is unexpected", KR(ret));
+  } else if (!old_lob.is_mem_external_lob() || !new_lob.is_mem_external_lob()) {
+    result = 1;
+  } else if (OB_FAIL(old_lob.get_external_lob_info(old_external_lob_info))) {
     LOG_WARN("failed to get old external lob info", KR(ret), K(old_lob.size_));
   } else if (OB_FAIL(new_lob.get_external_lob_info(new_external_lob_info))) {
     LOG_WARN("failed to get new external lob info", KR(ret), K(new_lob.size_));
@@ -482,11 +488,9 @@ int ObDMLService::check_lob_column_changed(ObEvalCtx &eval_ctx,
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("failed to check lob locator", KR(ret), K(old_lob.size_), K(new_lob.size_));
     } else if (old_is_lob && new_is_lob) {
-      if(old_lob.is_mem_external_lob() && new_lob.is_mem_external_lob()) {
+      if(old_lob.is_mem_external_lob() || new_lob.is_mem_external_lob()) {
         // compare meta data for external lob
         ret = check_external_lob_column_changed(old_lob, new_lob, result);
-      } else if (old_lob.is_mem_external_lob() || new_lob.is_mem_external_lob()) {
-        result = 1;
       } else {
         // compare content for internal lob
         bool is_equal = false;

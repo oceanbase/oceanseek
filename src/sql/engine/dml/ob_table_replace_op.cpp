@@ -5,6 +5,7 @@
 
 #include "share/ob_fts_index_builder_util.h"
 #define USING_LOG_PREFIX SQL_ENG
+#include "common/object/ob_object.h"
 #include "sql/engine/dml/ob_table_replace_op.h"
 #include "sql/engine/dml/ob_dml_service.h"
 #include "sql/das/ob_das_insert_op.h"
@@ -1090,13 +1091,34 @@ int ObTableReplaceOp::check_values(bool &is_equal,
       } else if (MY_SPEC.hidden_ck_col_id_ == column_ids[i]) {
         // skip hidden clustering(sort) key
       } else {
+        const ObExpr &new_expr = *new_row.at(i);
         const ObDatum &insert_datum = replace_row->cells()[i];
         const ObDatum &del_datum = delete_row->cells()[i];
-        if (OB_FAIL(new_row.at(i)->basic_funcs_->null_first_cmp_(insert_datum, del_datum, cmp_ret))) {
-          LOG_WARN("compare failed", K(ret));
-        } else if (0 != cmp_ret) {
-          is_equal = false;
-          break;
+        bool compared = false;
+        if (ob_is_extblob(new_expr.datum_meta_.type_)
+            && !insert_datum.is_null() && !del_datum.is_null()) {
+          const ObLobLocatorV2 old_lob(del_datum.get_string());
+          const ObLobLocatorV2 new_lob(insert_datum.get_string());
+          if (old_lob.is_mem_external_lob() || new_lob.is_mem_external_lob()) {
+            int64_t changed = 0;
+            compared = true;
+            if (OB_FAIL(ObDMLService::check_external_lob_column_changed(old_lob, new_lob,
+                                                                        changed))) {
+              LOG_WARN("failed to compare external lob references", KR(ret),  K(column_ids[i]));
+            } else {
+              cmp_ret = static_cast<int>(changed);
+            }
+          }
+        }
+        // for usual comparsion
+        if (OB_SUCC(ret)) {
+          if (!compared
+             && OB_FAIL(new_expr.basic_funcs_->null_first_cmp_(insert_datum, del_datum, cmp_ret))) {
+            LOG_WARN("compare failed", KR(ret), K(column_ids[i]));
+          } else if (0 != cmp_ret) {
+            is_equal = false;
+            break;
+          }
         }
       }
     }

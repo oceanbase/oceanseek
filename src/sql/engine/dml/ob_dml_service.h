@@ -15,6 +15,10 @@
 
 namespace oceanbase
 {
+namespace common
+{
+struct ObLobLocatorV2;
+}
 namespace share
 {
 struct ObVectorIndexAcquireCtx;
@@ -58,6 +62,10 @@ public:
   static int check_table_cycle(const DASTableIdList* parent_table_set, 
                                const uint64_t table_id, bool &exist);
   static int delete_table_id_from_parent_table_set(ObDMLRtCtx &dml_rtctx, const ObDMLBaseCtDef &dml_ctdef);
+  // At least one locator is external. Result is 0 for the same reference and 1 for a change.
+  static int check_external_lob_column_changed(const common::ObLobLocatorV2 &old_lob,
+                                               const common::ObLobLocatorV2 &new_lob,
+                                               int64_t &result);
   static int check_lob_column_changed(ObEvalCtx &eval_ctx, 
               const ObExpr& old_expr, ObDatum& old_datum,
               const ObExpr& new_expr, ObDatum& new_datum,
