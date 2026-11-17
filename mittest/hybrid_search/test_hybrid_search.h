@@ -4,6 +4,10 @@
  */
 
 #define USING_LOG_PREFIX SQL_DAS
+#include <cstdio>
+#include <cstdlib>
+#include <unistd.h>
+
 #include <gtest/gtest.h>
 #define private public
 #define protected public
@@ -40,6 +44,9 @@
 #undef protected
 
 #include "mittest/env/ob_simple_server_helper.h"
+#include "sensitive_test/object_storage/object_storage_authorization_info.h"
+#include "share/backup/ob_backup_struct.h"
+#include "share/ob_server_struct.h"
 #include "simple_server/env/ob_simple_cluster_test_base.h"
 
 
@@ -49,6 +56,53 @@ using namespace oceanbase::unittest;
 using namespace oceanbase::share;
 using namespace oceanbase::share::schema;
 using namespace oceanbase::common;
+
+namespace oceanbase
+{
+namespace unittest
+{
+
+// Build an isolated Object Storage URI for a shared-storage bootstrap.
+// This helper is intentionally explicit-only: it has no static-initialization
+// side effect and does not touch GCONF or oceanbase::shared_storage_info, so
+// hybrid_search binaries that do not call it keep their original startup mode.
+// Each target must call it from main() before the simple server starts.
+inline int build_hybrid_search_shared_storage_info(const char *test_name,
+                                                   char *buf,
+                                                   const int64_t buf_len)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(test_name) || OB_ISNULL(buf) || buf_len <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    const char *s3_bucket = std::getenv("OB_MITTEST_S3_BUCKET");
+    const char *s3_endpoint = std::getenv("OB_MITTEST_S3_ENDPOINT");
+    const char *s3_access_id = std::getenv("OB_MITTEST_S3_ACCESS_ID");
+    const char *s3_access_key = std::getenv("OB_MITTEST_S3_ACCESS_KEY");
+    const char *s3_region = std::getenv("OB_MITTEST_S3_REGION");
+    s3_bucket = nullptr == s3_bucket ? S3_BUCKET : s3_bucket;
+    s3_endpoint = nullptr == s3_endpoint ? S3_ENDPOINT : s3_endpoint;
+    s3_access_id = nullptr == s3_access_id ? S3_AK : s3_access_id;
+    s3_access_key = nullptr == s3_access_key ? S3_SK : s3_access_key;
+    s3_region = nullptr == s3_region ? S3_REGION : s3_region;
+    const int length = snprintf(
+        buf, static_cast<size_t>(buf_len),
+        "%s/%s_%d_%lld?host=%s&access_id=%s&access_key=%s&s3_region=%s"
+        "&max_iops=10000&max_bandwidth=200000000B&scope=region",
+        s3_bucket, test_name, static_cast<int>(getpid()),
+        static_cast<long long>(oceanbase::common::ObTimeUtility::current_time_ns()),
+        s3_endpoint, s3_access_id, s3_access_key, s3_region);
+    if (length < 0 || static_cast<int64_t>(length) >= buf_len) {
+      // Never continue with a truncated URI.
+      buf[0] = '\0';
+      ret = OB_BUF_NOT_ENOUGH;
+    }
+  }
+  return ret;
+}
+
+} // namespace unittest
+} // namespace oceanbase
 
 class TestHybridSearch : public ObSimpleClusterTestBase {
 public:

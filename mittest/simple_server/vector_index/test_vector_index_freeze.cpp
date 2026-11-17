@@ -4,6 +4,9 @@
  */
 #define USING_LOG_PREFIX SERVER
 #include <gtest/gtest.h>
+#include <cstdio>
+#include <cstdlib>
+#include <unistd.h>
 #include <iostream>
 #include <atomic>
 #include <random>
@@ -25,8 +28,19 @@
 #include "storage/lob/common/ob_lob_util.h"
 #include "storage/tx/ob_trans_service.h"
 #include "lib/utility/ob_tracepoint.h"
+#include "lib/time/ob_time_utility.h"
+#include "sensitive_test/object_storage/object_storage_authorization_info.h"
+#include "share/backup/ob_backup_struct.h"
+#include "share/ob_server_struct.h"
+#include "unittest/storage/sslog/test_mock_palf_kv.h"
 
 namespace oceanbase {
+// Palf-KV belongs to the external control plane and is unavailable in mittest,
+// while SS bootstrap touches it through the rootserver paths below.
+OB_MOCK_PALF_KV_FOR_REPLACE_SYS_TENANT
+// Points to main()'s stack buffer, valid for the whole RUN_ALL_TESTS() call.
+char *shared_storage_info = nullptr;
+
 namespace unittest {
 class TestRunCtx {
 public:
@@ -43,13 +57,17 @@ public:
   static constexpr char tenant_name[] = "vdb";
 
   TestVectorIndexFreeze()
-      : TestVectorIndexBase()
+      // SS 模式下租户 vdb（12G 内存、10 核）默认需要 24G 本地数据盘，加上系统租户约 6G，
+      // 框架默认的 10G 放不下，按其他 SS mittest 的惯例设为 50G
+      : TestVectorIndexBase("50G")
   {
+    GCONF.ob_startup_mode.set_value("shared_storage");
   }
   virtual ~TestVectorIndexFreeze() = default;
   void SetUp() override
   {
     TestVectorIndexBase::SetUp();
+    ASSERT_TRUE(GCTX.is_shared_storage_mode());
   }
 
   int flush_with_cleanup_error(ObMySQLProxy &sql_proxy, const char *event_name, const int64_t tablet_id)
@@ -1303,6 +1321,31 @@ int main(int argc, char **argv)
   char *log_level = (char*)"INFO";
   oceanbase::unittest::init_log_and_gtest(argc, argv);
   OB_LOGGER.set_log_level(log_level);
+
+  char storage_info[oceanbase::share::OB_MAX_BACKUP_DEST_LENGTH] = {0};
+  const char *s3_bucket = std::getenv("OB_MITTEST_S3_BUCKET");
+  const char *s3_endpoint = std::getenv("OB_MITTEST_S3_ENDPOINT");
+  const char *s3_access_id = std::getenv("OB_MITTEST_S3_ACCESS_ID");
+  const char *s3_access_key = std::getenv("OB_MITTEST_S3_ACCESS_KEY");
+  const char *s3_region = std::getenv("OB_MITTEST_S3_REGION");
+  s3_bucket = nullptr == s3_bucket ? oceanbase::unittest::S3_BUCKET : s3_bucket;
+  s3_endpoint = nullptr == s3_endpoint ? oceanbase::unittest::S3_ENDPOINT : s3_endpoint;
+  s3_access_id = nullptr == s3_access_id ? oceanbase::unittest::S3_AK : s3_access_id;
+  s3_access_key = nullptr == s3_access_key ? oceanbase::unittest::S3_SK : s3_access_key;
+  s3_region = nullptr == s3_region ? oceanbase::unittest::S3_REGION : s3_region;
+  const int length = snprintf(
+      storage_info, sizeof(storage_info),
+      "%s/test_vector_index_freeze_%d_%lld?host=%s&access_id=%s&access_key=%s"
+      "&s3_region=%s&max_iops=10000&max_bandwidth=200000000B&scope=region",
+      s3_bucket, static_cast<int>(getpid()),
+      static_cast<long long>(oceanbase::common::ObTimeUtility::current_time_ns()),
+      s3_endpoint, s3_access_id, s3_access_key, s3_region);
+  if (length < 0 || static_cast<int64_t>(length) >= static_cast<int64_t>(sizeof(storage_info))) {
+    // Never continue with a truncated URI.
+    fprintf(stderr, "failed to format shared storage info\n");
+    return 1;
+  }
+  oceanbase::shared_storage_info = storage_info;
 
   LOG_INFO("main>>>");
   testing::InitGoogleTest(&argc, argv);

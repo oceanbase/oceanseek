@@ -4,13 +4,32 @@
  */
 
 #include "test_hybrid_search.h"
+#include "unittest/storage/sslog/test_mock_palf_kv.h"
+
+namespace oceanbase
+{
+// Palf-KV belongs to the external control plane and is unavailable in mittest,
+// while SS bootstrap touches it through the rootserver paths below.
+OB_MOCK_PALF_KV_FOR_REPLACE_SYS_TENANT
+// Shared-storage URI handed to ObSimpleServer::bootstrap(); points to main()'s
+// stack buffer so it stays valid for the whole RUN_ALL_TESTS() call.
+char *shared_storage_info = nullptr;
+} // namespace oceanbase
 
 class TestHybridSearchScalarQuery : public TestHybridSearch
 {
 public:
   TestHybridSearchScalarQuery()
     : TestHybridSearch("test_query")
-  {}
+  {
+    GCONF.ob_startup_mode.set_value("shared_storage");
+  }
+
+  void SetUp() override
+  {
+    TestHybridSearch::SetUp();
+    ASSERT_TRUE(GCTX.is_shared_storage_mode());
+  }
 };
 
 static void verify_rowids_by_driver_iter(ObDASSearchDriverIter &iter,
@@ -1603,5 +1622,13 @@ int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   OB_LOGGER.set_log_level("WDIAG");
   oceanbase::unittest::init_log_and_gtest(argc, argv);
+  char storage_info[oceanbase::share::OB_MAX_BACKUP_DEST_LENGTH] = {0};
+  const int ret = oceanbase::unittest::build_hybrid_search_shared_storage_info(
+      "test_scalar_query", storage_info, static_cast<int64_t>(sizeof(storage_info)));
+  if (OB_SUCCESS != ret) {
+    fprintf(stderr, "failed to build shared storage info, ret=%d\n", ret);
+    return 1;
+  }
+  oceanbase::shared_storage_info = storage_info;
   return RUN_ALL_TESTS();
 }

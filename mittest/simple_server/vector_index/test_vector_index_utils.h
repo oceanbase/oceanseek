@@ -30,8 +30,10 @@ protected:
   const static int kFreezeRowsPerWorker = 1000;
   const static int kFreezeSearchIters = 1000;
 public:
-  TestVectorIndexBase()
-      : ObSimpleClusterTestBase("test_vector_index", "20G", "20G")
+  // datafile_size 默认 10G，与原先使用 ObSimpleClusterTestBase 默认值时一致；
+  // SS 模式的用例需要更大的本地数据盘时可显式传入
+  explicit TestVectorIndexBase(const char *datafile_size = "10G")
+      : ObSimpleClusterTestBase("test_vector_index", "20G", "20G", datafile_size)
   {
   }
   virtual ~TestVectorIndexBase() = default;
