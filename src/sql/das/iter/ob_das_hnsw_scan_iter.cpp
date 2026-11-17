@@ -1477,11 +1477,15 @@ int ObDASHNSWScanIter::process_adaptor_state_hnsw(ObIAllocator &allocator, bool 
     if (OB_SUCC(ret)) {
       SCN replace_scn = adaptor->get_replace_scn();
       if (replace_scn.is_valid() && replace_scn > ada_ctx.get_scn()) {
-        // Adaptor is newer, return OB_SCHEMA_EAGAIN to retry
+        // RR/SERIALIZABLE retain the transaction snapshot across statement retries.
+        // Only RC can obtain a newer snapshot to use this adaptor.
         SET_METRIC_VAL(common::ObMetricId::VEC_RETRY_REASON,
                        static_cast<int64_t>(ObVecIdxSchemaRetryReason::VEC_SCHEMA_RETRY_ADAPTOR_REPLACE_SCN_AHEAD));
-        ret = OB_SCHEMA_EAGAIN;
-        LOG_INFO("adaptor replace scn is greater than query scn, retry", K(ret), K(replace_scn), K(ada_ctx.get_scn()));
+        ret = tx_desc_->is_RR_or_SERIAL_isolevel()
+            ? OB_TRANS_CANNOT_SERIALIZE : OB_SCHEMA_EAGAIN;
+        LOG_INFO("adaptor replace scn is greater than query scn", K(ret), K(replace_scn),
+                 K(ada_ctx.get_scn()), "isolation", tx_desc_->get_isolation_level(),
+                 K(ls_id_), K(index_ctx));
       }
     }
 

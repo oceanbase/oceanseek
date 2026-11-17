@@ -373,8 +373,16 @@ int ObDASVecIndexHNSWScanIter::process_adaptor_state(bool is_vectorized)
   } else if (OB_FALSE_IT(ada_ctx_.set_async_query(is_async_query))) {
   } else if (OB_FAIL(adaptor_->check_query_barrier_scn(
                  ls_id_, read_scn, is_async_query, query_barrier_scn))) {
+    // An async read snapshot can advance on retry, but never past the SQL
+    // snapshot. RR/SERIALIZABLE cannot refresh that transaction snapshot.
+    if (OB_SCHEMA_EAGAIN == ret && tx_desc_->is_RR_or_SERIAL_isolevel()
+        && query_barrier_scn > snapshot_->core_.version_) {
+      ret = OB_TRANS_CANNOT_SERIALIZE;
+    }
     LOG_INFO("vector query failed adaptor barrier check",
-             K(ret), K(read_scn), K(query_barrier_scn), K(is_async_query), KP(adaptor_));
+             K(ret), K(read_scn), K(query_barrier_scn), K(is_async_query),
+             "sql_snapshot", snapshot_->core_.version_,
+             "isolation", tx_desc_->get_isolation_level(), K(ls_id_), KP(adaptor_));
   } else if (!ls_leader) {
     omt::ObTenantConfigGuard tenant_config(TENANT_CONF(MTL_ID()));
     if (!tenant_config.is_valid()) {
