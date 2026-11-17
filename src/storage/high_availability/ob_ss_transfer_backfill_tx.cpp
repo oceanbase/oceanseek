@@ -1217,6 +1217,7 @@ int ObSSTransferReplaceMgr::get_need_replace_tablet_info_(
   ObLS *ls = nullptr;
   share::SCN ss_mds_clog_checkpoint_scn;
   bool mds_flush_requested = false;
+  bool need_mds_upload = false;
 
   // The authoritative SS LS_MDS_TABLET clog checkpoint is LS-wide.  Read it
   // once before the loop and reuse it for every tablet marker in this round;
@@ -1262,6 +1263,7 @@ int ObSSTransferReplaceMgr::get_need_replace_tablet_info_(
       } else if (!is_mds_reloc_persisted) {
         // Replace mutates shared state, so only the authoritative SS checkpoint
         // is the relevant persistence fence at this stage.
+        need_mds_upload = true;
         LOG_INFO("skip replace before mds relocation is persisted", K(tablet_info));
       } else if (OB_FAIL(check_local_tablet_ready_(tablet_info, ls, is_local_tablet_ready))) {
         LOG_WARN("failed to check local tablet ready", K(ret), K(tablet_info));
@@ -1290,6 +1292,14 @@ int ObSSTransferReplaceMgr::get_need_replace_tablet_info_(
         LOG_WARN("failed to push tablet info into array", K(ret), K(tablet_info));
       }
     } 
+  }
+  if (need_mds_upload) {
+    // Retry once after checking all tablets; an earlier SSTable may have
+    // prevented the initial upload from reaching the relocation marker.
+    int tmp_ret = OB_SUCCESS;
+    if (OB_TMP_FAIL(ls->get_inc_sstable_uploader().schedule_emergency_tablet_upload(common::LS_MDS_TABLET))) {
+      LOG_WARN("failed to schedule transfer mds emergency upload", K(tmp_ret), K(ls_id_));
+    }
   }
   return ret;
 }
