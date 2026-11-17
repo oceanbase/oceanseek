@@ -27,6 +27,7 @@ enum class ObSSLocalCachePrewarmType : uint8_t
   PREREAD_TASK = 5,
   SPLIT_PART = 6,
   TRY_WRITE_LCACHE = 7,
+  FORK_TABLE = 8,
   MAX,
 };
 

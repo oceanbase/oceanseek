@@ -6,8 +6,11 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "storage/shared_storage/prewarm/ob_macro_prewarm_struct.h"
+#include "lib/utility/utility.h"
 #include "share/io/ob_io_manager.h"
+#include "storage/ob_i_table.h"
 #include "storage/blocksstable/ob_sstable.h"
+#include "storage/column_store/ob_column_oriented_sstable.h"
 #include "storage/shared_storage/ob_disk_space_manager.h"
 #include "storage/shared_storage/ob_ss_local_cache_stat.h"
 #include "storage/shared_storage/ob_file_manager.h"
@@ -48,6 +51,105 @@ ObSSTableMacroPrewarmer::ObSSTableMacroPrewarmer(
 ObSSTableMacroPrewarmer::~ObSSTableMacroPrewarmer()
 {
   reset_io_resources();
+}
+
+int ObSSTableMacroPrewarmer::prewarm_sstable_(
+    const ObTabletHandle &tablet_handle,
+    const ObSSTable &sstable,
+    const ObSSLocalCachePrewarmType prewarm_type,
+    volatile bool &is_stop)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(tablet_handle.get_obj()) || OB_UNLIKELY(!tablet_handle.is_valid()
+      || ObSSLocalCachePrewarmType::MAX == prewarm_type)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid arguments for batch sstable prewarm",
+        KR(ret), K(tablet_handle), K(sstable), K(prewarm_type));
+  } else if (!sstable.is_co_sstable()) {
+    ObSSTableMacroPrewarmer prewarmer(&sstable, is_stop, prewarm_type);
+    if (OB_FAIL(prewarmer.do_prewarm(tablet_handle))) {
+      LOG_WARN("fail to prewarm sstable", KR(ret), K(tablet_handle), K(sstable));
+    }
+  } else {
+    ObArray<ObSSTableWrapper> cg_table_wrappers;
+    cg_table_wrappers.set_attr(ObMemAttr(MTL_ID(), "SSTPrewarmCG"));
+    const ObCOSSTableV2 &co_sstable = static_cast<const ObCOSSTableV2 &>(sstable);
+    if (OB_FAIL(co_sstable.get_all_tables(cg_table_wrappers))) {
+      LOG_WARN("fail to get all column store sstables for prewarm",
+          KR(ret), K(tablet_handle), K(sstable));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && !is_stop && i < cg_table_wrappers.count(); ++i) {
+      ObSSTableWrapper &cg_wrapper = cg_table_wrappers.at(i);
+      ObSSTable *cg_sstable = cg_wrapper.get_sstable();
+      if (OB_ISNULL(cg_sstable)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("column store sstable is null",
+            KR(ret), K(i), K(cg_table_wrappers), K(tablet_handle));
+      } else if (cg_sstable == &sstable) {
+        // The top-level SSTable can load its meta directly through get_meta().
+      } else if (OB_FAIL(cg_wrapper.get_loaded_column_store_sstable(cg_sstable))) {
+        LOG_WARN("fail to load column group sstable for prewarm",
+            KR(ret), K(i), K(cg_table_wrappers), K(tablet_handle));
+      }
+      if (OB_FAIL(ret)) {
+      } else if (OB_ISNULL(cg_sstable) || OB_UNLIKELY(!cg_sstable->is_column_store_sstable())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected column store sstable for prewarm",
+            KR(ret), K(i), KPC(cg_sstable), K(tablet_handle));
+      } else {
+        ObSSTableMacroPrewarmer prewarmer(cg_sstable, is_stop, prewarm_type);
+        if (OB_FAIL(prewarmer.do_prewarm(tablet_handle))) {
+          LOG_WARN("fail to prewarm column store sstable",
+              KR(ret), K(i), K(tablet_handle), KPC(cg_sstable));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObSSTableMacroPrewarmer::prewarm_sstables(
+    const ObTabletHandle &tablet_handle,
+    const ObTablesHandleArray &sstable_handles,
+    const ObSSLocalCachePrewarmType prewarm_type,
+    volatile bool &is_stop)
+{
+  int ret = OB_SUCCESS;
+  ObTimePiece time_piece;
+  bool need_prewarm = true;
+  ObStorageCachePolicyService *storage_cache_policy_service = nullptr;
+  if (OB_ISNULL(tablet_handle.get_obj()) || OB_UNLIKELY(!tablet_handle.is_valid()
+      || sstable_handles.empty()
+      || ObSSLocalCachePrewarmType::MAX == prewarm_type)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid arguments for batch sstable prewarm",
+        KR(ret), K(tablet_handle), K(sstable_handles), K(prewarm_type));
+  } else if (ObSSLocalCachePrewarmType::FORK_TABLE == prewarm_type) {
+    if (OB_ISNULL(storage_cache_policy_service = MTL(ObStorageCachePolicyService *))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("storage cache policy service is null for fork prewarm",
+          KR(ret), K(tablet_handle), K(prewarm_type));
+    } else if (OB_FAIL(storage_cache_policy_service->is_hot_tablet(
+        tablet_handle.get_obj()->get_tablet_id().id(), need_prewarm))) {
+      LOG_WARN("fail to check fork destination tablet policy",
+          KR(ret), K(tablet_handle), K(prewarm_type));
+    }
+  }
+  for (int64_t i = 0;
+      OB_SUCC(ret) && need_prewarm && !is_stop && i < sstable_handles.get_count(); ++i) {
+    ObITable *table = sstable_handles.get_table(i);
+    if (OB_ISNULL(table) || OB_UNLIKELY(!table->is_sstable())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected table for batch sstable prewarm",
+          KR(ret), K(i), KPC(table), K(sstable_handles));
+    } else if (OB_FAIL(prewarm_sstable_(
+        tablet_handle, *(static_cast<ObSSTable *>(table)), prewarm_type, is_stop))) {
+      LOG_WARN("fail to prewarm sstable in batch", KR(ret), K(i), K(tablet_handle), KPC(table));
+    }
+  }
+  LOG_INFO("finish to prewarm sstable batch", KR(ret), K(time_piece), K(prewarm_type),
+      K(need_prewarm), "sstable_count", sstable_handles.get_count(), K(tablet_handle));
+  return ret;
 }
 
 int ObSSTableMacroPrewarmer::do_prewarm(const ObTabletHandle &tablet_handle)
@@ -410,7 +512,8 @@ int ObSSTableMacroPrewarmer::check_if_need_prewarm_(
   } else if (is_exist) {
     is_need_prewarm = false;
   } else if (PolicyStatus::HOT == policy_status || PolicyStatus::AUTO == policy_status) {
-    if (ObPrewarmMacroType::DATA_MACRO == type) {
+    if (ObPrewarmMacroType::DATA_MACRO == type
+        && ObSSLocalCachePrewarmType::FORK_TABLE != prewarm_type_) {
       bool is_in_one_day = false;
       if (OB_FAIL(check_if_logic_version_in_one_day(
           data_macro_block_meta.get_logic_id().logic_version_, is_in_one_day))) {
@@ -503,13 +606,13 @@ int ObSSTableMacroPrewarmer::batch_write_to_local_cache(
   }
 
 
-  // althouth OB_SUCCESS != ret, batch wait write handles here. try best to wait previous successful
-  // aio_write, so as to decrease .tmp.seq files (reset write_handle will cancel io).
+  // Drain issued writes on ordinary IO errors to reduce temporary files. A stop
+  // request skips further waits; the caller resets handles and cancels outstanding IO.
   int tmp_ret = OB_SUCCESS;
   bool has_failed_io = false;
-  for (int64_t i = 0; (i <= write_handle_idx_); ++i) {
+  for (int64_t i = 0; (i <= write_handle_idx_) && !is_stop_; ++i) {
     if (OB_TMP_FAIL(single_wait_write_handle(i, prewarm_info))) {
-      ret = (OB_SUCC(ret) ? tmp_ret : ret);
+      ret = COVER_SUCC(tmp_ret);
       has_failed_io = true;
       LOG_WARN("failed to do wait write_handle", KR(tmp_ret), KR(ret), K(i));
     }

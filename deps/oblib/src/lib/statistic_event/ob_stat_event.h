@@ -968,6 +968,9 @@ STAT_EVENT_ADD_DEF(TABLEGROUP_TABLE_ID_CACHE_HIT, "tablegroup table id cache hit
 STAT_EVENT_ADD_DEF(SERVER_TENANT_KVCACHE_FALLBACK_COUNT, "server tenant kvcache fallback count", ObStatClassIds::CACHE, 240229, false, true, true, "Number of business-tenant allocation failures caused by global memory exhaustion that attempted to synchronously reclaim tenant 500 KV cache before reclaiming business-tenant cache.") // FARM COMPAT WHITELIST
 STAT_EVENT_ADD_DEF(SERVER_TENANT_KVCACHE_FALLBACK_SUCCESS_COUNT, "server tenant kvcache fallback success count", ObStatClassIds::CACHE, 240230, false, true, true, "Number of allocations that succeeded after the tenant 500 synchronous KV cache fallback was attempted.") // FARM COMPAT WHITELIST
 
+STAT_EVENT_ADD_DEF(LOCAL_CACHE_FORK_PREWARM, "local_cache fork prewarm count", ObStatClassIds::CACHE, 240231, true, true, true, "Number of macro blocks successfully added to the local cache during fork-table prewarming.")
+STAT_EVENT_ADD_DEF(LOCAL_CACHE_FORK_PREWARM_BYTES, "local_cache fork prewarm bytes", ObStatClassIds::CACHE, 240232, true, true, true, "Total size in bytes of macro blocks successfully added to the local cache during fork-table prewarming.")
+
 //end
 STAT_EVENT_ADD_DEF(STAT_EVENT_ADD_END, "event add end", ObStatClassIds::DEBUG, 1, false, false, true, "")
 

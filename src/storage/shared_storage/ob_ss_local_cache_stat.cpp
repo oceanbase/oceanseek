@@ -259,6 +259,11 @@ void inc_local_cache_prewarm_stat(
       bytes_id = ObStatEventIds::LOCAL_CACHE_TRY_WRITE_LCACHE_PREWARM_BYTES;
       break;
     }
+    case ObSSLocalCachePrewarmType::FORK_TABLE: {
+      cnt_id = ObStatEventIds::LOCAL_CACHE_FORK_PREWARM;
+      bytes_id = ObStatEventIds::LOCAL_CACHE_FORK_PREWARM_BYTES;
+      break;
+    }
     default: {
       break;
     }

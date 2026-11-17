@@ -44,7 +44,7 @@
 #include "share/compaction/ob_shared_storage_compaction_util.h"
 #include "src/storage/compaction_v2/ob_ss_compact_helper.h"
 #include "src/storage/ddl/ob_ss_ddl_util.h"
-#include "storage/shared_storage/storage_cache_policy/ob_storage_cache_service.h"
+#include "storage/shared_storage/prewarm/ob_macro_prewarm_struct.h"
 #include "storage/incremental/ob_shared_meta_service.h"
 #include "storage/incremental/ss_meta_ctrl/ob_ss_meta_ctrl_define.h"
 #include "storage/incremental/ssmeta/ob_ss_meta_iter_wrapper.h"
@@ -1793,7 +1793,6 @@ int ObForkTableDataDag::land_fork_tables_to_local_(const ObForkTableDataParam &p
     const share::SCN &reorg_scn)
 {
   int ret = OB_SUCCESS;
-  int tmp_ret = OB_SUCCESS;
   ObLS *ls = ls_handle.get_ls();
   ObArenaAllocator tmp_arena("ForkLandLoc", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
   ObTabletHandle ss_tablet_handle;
@@ -1836,7 +1835,6 @@ int ObForkTableDataDag::land_fork_tables_to_local_(const ObForkTableDataParam &p
     LOG_INFO("[FORKTABLE] reached before fork local land replace",
         "dest_tablet_id", param.dest_tablet_id_.id(), K(reorg_scn), K(fork_snapshot_scn),
         "table_count", local_sstables_handle.get_count());
-    DEBUG_SYNC(BEFORE_FORK_LOCAL_LAND_REPLACE);
 #ifdef ERRSIM
     if (OB_UNLIKELY(EN_FORK_TABLE_BLOCK_LOCAL_LAND)) {
       ret = OB_EAGAIN;
@@ -1849,20 +1847,20 @@ int ObForkTableDataDag::land_fork_tables_to_local_(const ObForkTableDataParam &p
     }
 #endif
     if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(ObSSTableMacroPrewarmer::prewarm_sstables(
+        ss_tablet_handle,
+        marked_local_sstables_handle,
+        ObSSLocalCachePrewarmType::FORK_TABLE,
+        is_stop_))) {
+      LOG_WARN("[FORKTABLE] fail to prewarm fork sstables before local publish",
+          KR(ret), K(param), K(reorg_scn));
+    } else {
+      DEBUG_SYNC(BEFORE_FORK_LOCAL_LAND_REPLACE);
+    }
+    if (OB_FAIL(ret)) {
     } else if (OB_FAIL(ls->build_tablet_with_batch_tables(param.dest_tablet_id_, local_param))) {
       LOG_WARN("[FORKTABLE] failed to replace fork tables to local tablet", K(ret), K(param));
     } else {
-      ObStorageCachePolicyService *storage_cache_policy_service = MTL(ObStorageCachePolicyService *);
-      if (OB_ISNULL(storage_cache_policy_service)) {
-        tmp_ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("[FORKTABLE] fail to get storage cache policy service after local land",
-            KR(tmp_ret), K(param), K(reorg_scn));
-      // TODO @fangdan: master上改成同步接口
-      } else if (OB_TMP_FAIL(storage_cache_policy_service->async_prewarm_tablet(
-          param.dest_tablet_id_.id(), PolicyStatus::HOT))) {
-        LOG_WARN("[FORKTABLE] fail to trigger hot tablet prewarm after local land",
-            KR(tmp_ret), K(param), K(reorg_scn));
-      }
       LOG_INFO("[FORKTABLE] replaced fork tables to local tablet", K(param), K(reorg_scn),
           "table_count", local_sstables_handle.get_count());
 #ifdef ERRSIM

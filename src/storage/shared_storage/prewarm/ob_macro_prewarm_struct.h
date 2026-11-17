@@ -31,6 +31,7 @@ namespace compaction
 namespace storage
 {
 class ObTabletHandle;
+class ObTablesHandleArray;
 
 struct ObSSTableMacroPrewarmInfo final
 {
@@ -82,11 +83,22 @@ public:
       const blocksstable::ObSSTable *sstable, volatile bool &is_stop,
       const ObSSLocalCachePrewarmType prewarm_type);
   virtual ~ObSSTableMacroPrewarmer();
+  // Prewarms a batch synchronously; FORK_TABLE skips targets that are not HOT.
+  static int prewarm_sstables(
+      const ObTabletHandle &tablet_handle,
+      const ObTablesHandleArray &sstable_handles,
+      const ObSSLocalCachePrewarmType prewarm_type,
+      volatile bool &is_stop);
   int do_prewarm(const ObTabletHandle &tablet_handle);
   int prewarm_single_macro(const blocksstable::MacroBlockId &macro_id, const uint64_t effective_tablet_id);
   TO_STRING_KV(KP_(sstable), K_(effective_tablet_id), K(prewarm_type_), K_(parallelism));
 
 private:
+  static int prewarm_sstable_(
+      const ObTabletHandle &tablet_handle,
+      const blocksstable::ObSSTable &sstable,
+      const ObSSLocalCachePrewarmType prewarm_type,
+      volatile bool &is_stop);
   int handle_hot_tablet(const compaction::ObSSMajorPrewarmLevel prewarm_level,
                         const ObTabletHandle &tablet_handle);
   int handle_non_hot_tablet(const compaction::ObSSMajorPrewarmLevel prewarm_level,
