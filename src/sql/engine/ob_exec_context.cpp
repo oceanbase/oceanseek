@@ -110,6 +110,7 @@ ObExecContext::ObExecContext(ObIAllocator &allocator)
     task_executor_ctx_(*this),
     my_session_(NULL),
     outtable_lob_control_owned_tx_(nullptr),
+    outtable_lob_control_ctx_(),
     sql_proxy_(NULL),
     stmt_factory_(NULL),
     expr_factory_(NULL),
@@ -345,6 +346,7 @@ void ObExecContext::reset_op_ctx()
 void ObExecContext::reset_op_env()
 {
   outtable_lob_control_owned_tx_ = nullptr;
+  outtable_lob_control_ctx_.reuse();
   reset_op_ctx();
   op_kit_store_.reset();
   phy_op_size_ = 0;
@@ -360,6 +362,44 @@ void ObExecContext::reset_op_env()
     udf_ctx_mgr_->reset();
   }
 }
+int ObExecContext::append_outtable_lob_control_keys(
+    const ObIArray<storage::ObOuttableLobControlKey> &keys)
+{
+  int ret = OB_SUCCESS;
+  if (keys.empty()) {
+  } else if (OB_FAIL(outtable_lob_control_ctx_.init(allocator_))) {
+    LOG_WARN("failed to initialize remote outtable lob control keys", K(ret));
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < keys.count(); ++i) {
+      if (OB_UNLIKELY(!keys.at(i).is_valid())) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("invalid remote outtable lob control key", K(ret), K(i));
+      } else if (OB_FAIL(outtable_lob_control_ctx_.get_keys()->push_back(keys.at(i)))) {
+        LOG_WARN("failed to retain remote outtable lob control key", K(ret), K(i));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObExecContext::complete_outtable_lob_control_keys()
+{
+  int ret = OB_SUCCESS;
+  if (outtable_lob_control_ctx_.empty()) {
+  } else if (OB_ISNULL(my_session_) || OB_ISNULL(my_session_->get_tx_desc())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("transaction is missing for remote control completion", K(ret));
+  } else if (my_session_->get_tx_desc()->is_shadow()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("remote control completion requires the transaction owner", K(ret));
+  } else if (OB_FAIL(outtable_lob_control_ctx_.complete(*this))) {
+    LOG_WARN("failed to complete remote outtable lob control keys", K(ret));
+  } else {
+    outtable_lob_control_ctx_.reuse();
+  }
+  return ret;
+}
+
 int ObExecContext::init_phy_op(const uint64_t phy_op_size)
 {
   int ret = OB_SUCCESS;

@@ -6,7 +6,34 @@
 #include "share/ob_scanner.h"
 #include <gtest/gtest.h>
 #include "lib/utility/ob_test_util.h"
+#include "storage/lob/common/ob_outtable_lob_control_key.h"
 using namespace oceanbase::common;
+using oceanbase::storage::ObOuttableLobControlKey;
+
+namespace
+{
+ObOuttableLobControlKey make_control_key(const int64_t sequence)
+{
+  ObOuttableLobControlKey key;
+  key.macro_id_ = oceanbase::blocksstable::MacroBlockId(
+      oceanbase::blocksstable::MacroBlockId::DEFAULT_FIRST_ID, sequence, 0, 0, 0);
+  key.hash_ = sequence * 3;
+  return key;
+}
+
+void expect_control_keys(const ObScanner &scanner, const int64_t count, const int64_t sequence)
+{
+  const ObIArray<ObOuttableLobControlKey> *keys = scanner.get_outtable_lob_control_keys();
+  ASSERT_NE(nullptr, keys);
+  ASSERT_EQ(count, keys->count());
+  for (int64_t i = 0; i < count; ++i) {
+    const ObOuttableLobControlKey expected = make_control_key(sequence + i);
+    EXPECT_EQ(expected.macro_id_, keys->at(i).macro_id_);
+    EXPECT_EQ(expected.hash_, keys->at(i).hash_);
+  }
+}
+}
+
 class TestScanner: public ::testing::Test
 {
 public:
@@ -135,6 +162,124 @@ TEST_F(TestScanner, serialization)
     ObCStringHelper helper;
     _OB_LOG(INFO, "row=%s", helper.convert(row2));
   }
+}
+
+TEST_F(TestScanner, outtable_control_keys_round_trip_without_rows)
+{
+  ObScanner source;
+  EXPECT_EQ(nullptr, source.get_outtable_lob_control_keys());
+  ASSERT_EQ(OB_SUCCESS, source.init());
+  source.set_affected_rows(2);
+  ASSERT_EQ(OB_SUCCESS, source.set_row_matched_count(2));
+  ASSERT_EQ(OB_SUCCESS, source.add_outtable_lob_control_key(make_control_key(2026111701)));
+  ASSERT_EQ(OB_SUCCESS, source.add_outtable_lob_control_key(make_control_key(2026111702)));
+  EXPECT_EQ(0, source.get_row_count());
+
+  ObArenaAllocator allocator("ScannerLobTest");
+  const int64_t size = source.get_serialize_size();
+  char *buf = static_cast<char *>(allocator.alloc(size));
+  ASSERT_NE(nullptr, buf);
+  int64_t pos = 0;
+  ASSERT_EQ(OB_SUCCESS, source.serialize(buf, size, pos));
+  ASSERT_EQ(size, pos);
+  ObScanner target;
+  int64_t decoded_pos = 0;
+  ASSERT_EQ(OB_SUCCESS, target.deserialize(buf, size, decoded_pos));
+  EXPECT_EQ(size, decoded_pos);
+  EXPECT_EQ(0, target.get_row_count());
+  EXPECT_EQ(2, target.get_affected_rows());
+  EXPECT_EQ(2, target.get_row_matched_count());
+  expect_control_keys(target, 2, 2026111701);
+}
+
+TEST_F(TestScanner, outtable_control_keys_empty_packet_clears_previous_keys)
+{
+  ObScanner source;
+  ASSERT_EQ(OB_SUCCESS, source.init());
+  source.set_affected_rows(3);
+  // Reusing the receiver for an empty result must discard keys from the preceding response.
+  ObArenaAllocator allocator("ScannerEmptyLob");
+  const int64_t size = source.get_serialize_size();
+  char *buf = static_cast<char *>(allocator.alloc(size));
+  ASSERT_NE(nullptr, buf);
+  int64_t pos = 0;
+  ASSERT_EQ(OB_SUCCESS, source.serialize(buf, size, pos));
+  ASSERT_EQ(size, pos);
+
+  ObScanner target;
+  ASSERT_EQ(OB_SUCCESS, target.add_outtable_lob_control_key(make_control_key(2026111703)));
+  int64_t decoded_pos = 0;
+  ASSERT_EQ(OB_SUCCESS, target.deserialize(buf, size, decoded_pos));
+  EXPECT_EQ(size, decoded_pos);
+  EXPECT_EQ(3, target.get_affected_rows());
+  const ObIArray<ObOuttableLobControlKey> *keys = target.get_outtable_lob_control_keys();
+  EXPECT_TRUE(nullptr == keys || keys->empty());
+}
+
+TEST_F(TestScanner, outtable_control_keys_reuse_and_reset)
+{
+  ObScanner scanner;
+  ASSERT_EQ(OB_SUCCESS, scanner.init());
+  const int64_t empty_size = scanner.get_serialize_size();
+  ASSERT_EQ(OB_SUCCESS, scanner.add_outtable_lob_control_key(make_control_key(2026111704)));
+  EXPECT_GT(scanner.get_serialize_size(), empty_size);
+  scanner.reuse();
+  const ObIArray<ObOuttableLobControlKey> *keys = scanner.get_outtable_lob_control_keys();
+  EXPECT_TRUE(nullptr == keys || keys->empty());
+  EXPECT_EQ(empty_size, scanner.get_serialize_size());
+
+  ASSERT_EQ(OB_SUCCESS, scanner.add_outtable_lob_control_key(make_control_key(2026111705)));
+  expect_control_keys(scanner, 1, 2026111705);
+  scanner.reset();
+  keys = scanner.get_outtable_lob_control_keys();
+  EXPECT_TRUE(nullptr == keys || keys->empty());
+  ASSERT_EQ(OB_SUCCESS, scanner.add_outtable_lob_control_key(make_control_key(2026111706)));
+  expect_control_keys(scanner, 1, 2026111706);
+}
+
+TEST_F(TestScanner, outtable_control_keys_assign_owns_copy_and_clears_old_keys)
+{
+  ObScanner source;
+  ObScanner target;
+  ASSERT_EQ(OB_SUCCESS, source.init());
+  ASSERT_EQ(OB_SUCCESS, source.add_outtable_lob_control_key(make_control_key(2026111707)));
+  ASSERT_EQ(OB_SUCCESS, target.add_outtable_lob_control_key(make_control_key(2026111708)));
+  ASSERT_EQ(OB_SUCCESS, target.assign(source));
+  source.reset_outtable_lob_control_keys();
+  expect_control_keys(target, 1, 2026111707);
+  ASSERT_EQ(OB_SUCCESS, target.assign(source));
+  const ObIArray<ObOuttableLobControlKey> *keys = target.get_outtable_lob_control_keys();
+  EXPECT_TRUE(nullptr == keys || keys->empty());
+}
+
+TEST_F(TestScanner, outtable_control_keys_large_result_round_trip)
+{
+  const int64_t key_count = 90000;
+  const int64_t first_sequence = 2026111800;
+  ObArenaAllocator allocator("ScannerLargeLob");
+  ObScanner source;
+  ObScanner target;
+  ASSERT_EQ(OB_SUCCESS, source.init());
+  source.set_affected_rows(key_count);
+  ASSERT_EQ(OB_SUCCESS, source.set_row_matched_count(key_count));
+  for (int64_t i = 0; i < key_count; ++i) {
+    ASSERT_EQ(OB_SUCCESS,
+        source.add_outtable_lob_control_key(make_control_key(first_sequence + i)));
+  }
+  const int64_t size = source.get_serialize_size();
+  ASSERT_GT(size, 4L * 1024L * 1024L);
+  char *buf = static_cast<char *>(allocator.alloc(size));
+  ASSERT_NE(nullptr, buf);
+  int64_t pos = 0;
+  ASSERT_EQ(OB_SUCCESS, source.serialize(buf, size, pos));
+  ASSERT_EQ(size, pos);
+  int64_t decoded_pos = 0;
+  ASSERT_EQ(OB_SUCCESS, target.deserialize(buf, size, decoded_pos));
+  EXPECT_EQ(size, decoded_pos);
+  EXPECT_EQ(0, target.get_row_count());
+  EXPECT_EQ(key_count, target.get_affected_rows());
+  EXPECT_EQ(key_count, target.get_row_matched_count());
+  expect_control_keys(target, key_count, first_sequence);
 }
 
 int main(int argc, char **argv)

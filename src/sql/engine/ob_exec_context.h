@@ -28,6 +28,7 @@
 #include "sql/engine/ob_diagnosis_manager.h"
 #include "sql/optimizer/file_prune/ob_lake_table_file_map.h"
 #include "storage/lob/store/ob_lob_persistent_reader_cache.h"
+#include "storage/lob/store/ob_outtable_lob_control_ctx.h"
 
 #define GET_PHY_PLAN_CTX(ctx) ((ctx).get_physical_plan_ctx())
 #define GET_MY_SESSION(ctx) ((ctx).get_my_session())
@@ -264,6 +265,13 @@ public:
   {
     return outtable_lob_control_owned_tx_;
   }
+  int append_outtable_lob_control_keys(
+      const common::ObIArray<storage::ObOuttableLobControlKey> &keys);
+  const common::ObIArray<storage::ObOuttableLobControlKey> *get_outtable_lob_control_keys() const
+  {
+    return outtable_lob_control_ctx_.get_keys();
+  }
+  int complete_outtable_lob_control_keys();
   //get the parent execute context in nested sql
   ObExecContext *get_parent_ctx() { return parent_ctx_; }
   int64_t get_nested_level() const { return nested_level_; }
@@ -718,6 +726,8 @@ protected:
   ObSQLSessionInfo *my_session_;
   // Local proof of transaction ownership; never serialize it to remote or PX workers.
   transaction::ObTxDesc *outtable_lob_control_owned_tx_;
+  // Allocated only for ordinary remote DML; pending keys belong to this execution attempt.
+  storage::ObOuttableLobControlCtx outtable_lob_control_ctx_;
   common::ObMySQLProxy *sql_proxy_;
   ObExecStatCollector exec_stat_collector_;
   ObStmtFactory *stmt_factory_;

@@ -1100,6 +1100,15 @@ OB_INLINE int ObResultSet::do_close_plan(int errcode, ObExecContext &ctx,
     } else {
       err_ignored = plan_ctx->is_error_ignored();
     }
+    if (OB_SUCC(ret) && !err_ignored && OB_SUCCESS == close_ret
+        && OB_SUCCESS == exec_result_close_ret
+        && (OB_SUCCESS == errcode || OB_ITER_END == errcode)) {
+      if (OB_FAIL(ctx.complete_outtable_lob_control_keys())) {
+        errcode_ = ret;
+        errcode = ret;
+        LOG_WARN("failed to complete remote outtable lob control rows", K(ret));
+      }
+    }
     bool rollback = need_rollback(ret, errcode, err_ignored);
     get_exec_context().set_errcode(errcode);
     sret = end_stmt(rollback || OB_SUCCESS != pret);

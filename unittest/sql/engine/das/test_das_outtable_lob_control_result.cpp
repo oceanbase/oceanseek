@@ -759,6 +759,32 @@ TEST_F(TestDASOuttableLobControlResult, collector_default_lifecycle_owns_grown_k
   ASSERT_NO_FATAL_FAILURE(expect_keys(collector.get_keys(), 1, 10000));
 }
 
+TEST_F(TestDASOuttableLobControlResult, remote_exec_context_owns_keys_until_retry_reset)
+{
+  ObArenaAllocator allocator("RemoteLobKeys");
+  ObExecContext ctx(allocator);
+  EXPECT_EQ(nullptr, ctx.get_outtable_lob_control_keys());
+  {
+    ObSEArray<ObOuttableLobControlKey, 4> keys;
+    ASSERT_EQ(OB_SUCCESS, ctx.append_outtable_lob_control_keys(keys));
+    EXPECT_EQ(nullptr, ctx.get_outtable_lob_control_keys());
+    for (int64_t i = 0; i < 65; ++i) {
+      ASSERT_EQ(OB_SUCCESS, keys.push_back(make_key(11000 + i, 11000 + i * 3)));
+    }
+    ASSERT_EQ(OB_SUCCESS, ctx.append_outtable_lob_control_keys(keys));
+  }
+  ASSERT_NO_FATAL_FAILURE(expect_keys(ctx.get_outtable_lob_control_keys(), 65, 11000));
+
+  // Packet retries must not carry Control keys from the failed attempt into the next statement.
+  ctx.reset_op_env();
+  const ObIArray<ObOuttableLobControlKey> *keys = ctx.get_outtable_lob_control_keys();
+  EXPECT_TRUE(nullptr == keys || keys->empty());
+  ObSEArray<ObOuttableLobControlKey, 1> next_keys;
+  ASSERT_EQ(OB_SUCCESS, next_keys.push_back(make_key(12000, 12000)));
+  ASSERT_EQ(OB_SUCCESS, ctx.append_outtable_lob_control_keys(next_keys));
+  ASSERT_NO_FATAL_FAILURE(expect_keys(ctx.get_outtable_lob_control_keys(), 1, 12000));
+}
+
 TEST_F(TestDASOuttableLobControlResult, outtable_permission_survives_ctdef_serialization)
 {
   ObArenaAllocator allocator("DASLobCtrlFlag");

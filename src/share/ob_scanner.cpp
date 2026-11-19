@@ -45,7 +45,8 @@ ObScanner::ObScanner(const char *label /*= ObModIds::OB_NEW_SCANNER*/,
       rcode_(),
       fb_info_(),
       memstore_read_row_count_(0),
-      ssstore_read_row_count_(0)
+      ssstore_read_row_count_(0),
+      outtable_lob_control_keys_(nullptr)
 {
   UNUSED(allocator);
 }
@@ -77,13 +78,57 @@ ObScanner::ObScanner(ObIAllocator &allocator,
       rcode_(),
       fb_info_(),
       memstore_read_row_count_(0),
-      ssstore_read_row_count_(0)
+      ssstore_read_row_count_(0),
+      outtable_lob_control_keys_(nullptr)
 {
 }
 
 ObScanner::~ObScanner()
 {
-  // empty
+  reset_outtable_lob_control_keys();
+}
+
+int ObScanner::init_outtable_lob_control_keys_()
+{
+  int ret = OB_SUCCESS;
+  const int64_t INITIAL_KEY_CAPACITY = 4;
+  void *buf = nullptr;
+  if (OB_NOT_NULL(outtable_lob_control_keys_)) {
+  } else {
+    inner_allocator_.set_tenant_id(tenant_id_);
+    if (OB_ISNULL(buf = inner_allocator_.alloc(sizeof(OuttableLobControlKeys)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate scanner outtable lob control keys", K(ret));
+    } else {
+      outtable_lob_control_keys_ = new (buf) OuttableLobControlKeys(
+          sizeof(storage::ObOuttableLobControlKey) * INITIAL_KEY_CAPACITY,
+          ModulePageAllocator(inner_allocator_, lib::ObLabel()));
+    }
+  }
+  return ret;
+}
+
+int ObScanner::add_outtable_lob_control_key(const storage::ObOuttableLobControlKey &key)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!key.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid scanner outtable lob control key", K(ret), K(key));
+  } else if (OB_FAIL(init_outtable_lob_control_keys_())) {
+    LOG_WARN("failed to initialize scanner outtable lob control keys", K(ret));
+  } else if (OB_FAIL(outtable_lob_control_keys_->push_back(key))) {
+    LOG_WARN("failed to append scanner outtable lob control key", K(ret), K(key));
+  }
+  return ret;
+}
+
+void ObScanner::reset_outtable_lob_control_keys()
+{
+  if (OB_NOT_NULL(outtable_lob_control_keys_)) {
+    outtable_lob_control_keys_->~OuttableLobControlKeys();
+    inner_allocator_.free(outtable_lob_control_keys_);
+    outtable_lob_control_keys_ = nullptr;
+  }
 }
 
 int ObScanner::set_extend_info(const ObString &extend_info)
@@ -110,6 +155,7 @@ void ObScanner::reuse()
   row_matched_count_ = 0;
   row_duplicated_count_ = 0;
   extend_info_.reset();
+  reset_outtable_lob_control_keys();
   inner_allocator_.reuse();
   table_row_counts_.reset();
   is_result_accurate_ = true;
@@ -157,6 +203,7 @@ void ObScanner::reset()
   row_matched_count_ = 0;
   row_duplicated_count_ = 0;
   extend_info_.reset();
+  reset_outtable_lob_control_keys();
   inner_allocator_.reset();
   table_row_counts_.reset();
   is_result_accurate_ = true;
@@ -261,6 +308,15 @@ int ObScanner::assign(const ObScanner &other)
   OZ(fb_info_.assign(other.fb_info_));
   memstore_read_row_count_ = other.memstore_read_row_count_;
   ssstore_read_row_count_ = other.ssstore_read_row_count_;
+  if (OB_SUCC(ret) && this != &other) {
+    reset_outtable_lob_control_keys();
+    if (OB_ISNULL(other.outtable_lob_control_keys_) || other.outtable_lob_control_keys_->empty()) {
+    } else if (OB_FAIL(init_outtable_lob_control_keys_())) {
+      LOG_WARN("failed to initialize scanner outtable lob control keys", K(ret));
+    } else if (OB_FAIL(outtable_lob_control_keys_->assign(*other.outtable_lob_control_keys_))) {
+      LOG_WARN("failed to assign scanner outtable lob control keys", K(ret));
+    }
+  }
   return ret;
 }
 
@@ -386,6 +442,9 @@ OB_DEF_SERIALIZE(ObScanner)
               fb_info_,
               memstore_read_row_count_,
               ssstore_read_row_count_);
+  if (OB_NOT_NULL(outtable_lob_control_keys_) && !outtable_lob_control_keys_->empty()) {
+    OB_UNIS_ENCODE(*outtable_lob_control_keys_);
+  }
   return ret;
 }
 
@@ -416,6 +475,9 @@ OB_DEF_SERIALIZE_SIZE(ObScanner)
               fb_info_,
               memstore_read_row_count_,
               ssstore_read_row_count_);
+  if (OB_NOT_NULL(outtable_lob_control_keys_) && !outtable_lob_control_keys_->empty()) {
+    OB_UNIS_ADD_LEN(*outtable_lob_control_keys_);
+  }
   return len;
 }
 
@@ -423,6 +485,8 @@ OB_DEF_DESERIALIZE(ObScanner)
 {
   int ret = OB_SUCCESS;
   ObString extend_info;
+  // Older scanners have no key tail; never retain keys from the preceding response.
+  reset_outtable_lob_control_keys();
   LST_DO_CODE(OB_UNIS_DECODE,
               row_store_,
               mem_size_limit_,
@@ -463,6 +527,13 @@ OB_DEF_DESERIALIZE(ObScanner)
               fb_info_,
               memstore_read_row_count_,
               ssstore_read_row_count_);
+  if (OB_SUCC(ret) && pos < data_len) {
+    if (OB_FAIL(init_outtable_lob_control_keys_())) {
+      LOG_WARN("failed to initialize scanner outtable lob control keys", K(ret));
+    } else {
+      OB_UNIS_DECODE(*outtable_lob_control_keys_);
+    }
+  }
   return ret;
 }
 

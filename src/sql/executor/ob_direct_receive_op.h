@@ -40,6 +40,7 @@ public:
 
 private:
   int setup_next_scanner();
+  int collect_outtable_lob_control_result_(const common::ObScanner &scanner);
   int get_next_row_from_cur_scanner();
   int update_user_var();
   // clear dynamic const expr parent evaluate flag, because when dynmaic param datum

@@ -7,6 +7,7 @@
 
 #include "sql/executor/ob_direct_receive_op.h"
 #include "sql/engine/ob_exec_context.h"
+#include "storage/tx/ob_trans_service.h"
 using namespace oceanbase::common;
 
 namespace oceanbase
@@ -269,11 +270,37 @@ int ObDirectReceiveOp::setup_next_scanner()
     }
   }
   if (OB_SUCC(ret)) {
-    if (OB_FAIL(my_session->replace_user_variables(ctx_, scanner_->get_session_var_map()))) {
+    if (OB_FAIL(collect_outtable_lob_control_result_(*scanner_))) {
+      LOG_WARN("failed to collect remote outtable lob control result", K(ret));
+    } else if (OB_FAIL(my_session->replace_user_variables(ctx_, scanner_->get_session_var_map()))) {
       LOG_WARN("replace user variables failed", K(ret));
     }
   }
 
+  return ret;
+}
+
+int ObDirectReceiveOp::collect_outtable_lob_control_result_(const ObScanner &scanner)
+{
+  int ret = OB_SUCCESS;
+  const ObIArray<storage::ObOuttableLobControlKey> *keys = scanner.get_outtable_lob_control_keys();
+  ObSQLSessionInfo *session = ctx_.get_my_session();
+  transaction::ObTransService *tx_service = nullptr;
+  if (OB_ISNULL(keys) || keys->empty()) {
+  } else if (OB_ISNULL(session) || OB_ISNULL(session->get_tx_desc())
+      || session->get_tx_desc()->is_shadow()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("remote outtable lob control keys have no local transaction owner", K(ret));
+  } else if (OB_ISNULL(tx_service = MTL(transaction::ObTransService *))) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("transaction service is not initialized", K(ret));
+  } else if (OB_FAIL(tx_service->add_tx_exec_result(
+      *session->get_tx_desc(), scanner.get_trans_result()))) {
+    session->get_trans_result().set_incomplete();
+    LOG_WARN("failed to merge remote outtable lob transaction result", K(ret));
+  } else if (OB_FAIL(ctx_.append_outtable_lob_control_keys(*keys))) {
+    LOG_WARN("failed to retain remote outtable lob control keys", K(ret));
+  }
   return ret;
 }
 

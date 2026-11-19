@@ -15,6 +15,8 @@
 #include "sql/plan_cache/ob_plan_cache_util.h"
 #include "sql/ob_sql_trans_util.h"
 #include "sql/engine/ob_exec_feedback_info.h"
+#include "lib/container/ob_array_serialization.h"
+#include "storage/lob/common/ob_outtable_lob_control_key.h"
 namespace oceanbase
 {
 namespace sql
@@ -120,6 +122,10 @@ public:
   void log_user_error_and_warn() const;
   const transaction::ObTxExecResult &get_trans_result() const { return trans_result_; }
   transaction::ObTxExecResult &get_trans_result() { return trans_result_; }
+  int add_outtable_lob_control_key(const storage::ObOuttableLobControlKey &key);
+  const ObIArray<storage::ObOuttableLobControlKey> *get_outtable_lob_control_keys() const
+  { return outtable_lob_control_keys_; }
+  void reset_outtable_lob_control_keys();
   /**
    * set error message
    * @param msg [in]
@@ -161,7 +167,8 @@ public:
                K_(implicit_cursors),
                K_(rcode),
                K_(memstore_read_row_count),
-               K_(ssstore_read_row_count));
+               K_(ssstore_read_row_count),
+               KPC_(outtable_lob_control_keys));
 protected:
   ObRowStore row_store_;
   int64_t mem_size_limit_;  /**< memory size of row store */
@@ -192,6 +199,10 @@ protected:
   int64_t ssstore_read_row_count_;
 
 private:
+  int init_outtable_lob_control_keys_();
+
+  typedef ObSArray<storage::ObOuttableLobControlKey> OuttableLobControlKeys;
+  OuttableLobControlKeys *outtable_lob_control_keys_;
   DISALLOW_COPY_AND_ASSIGN(ObScanner);
 };
 

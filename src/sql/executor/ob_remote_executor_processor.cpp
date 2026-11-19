@@ -873,6 +873,19 @@ int ObRemoteBaseExecuteP<T>::base_before_response(common::ObScanner &scanner)
     ObExecFeedbackInfo &fb_info = scanner.get_feedback_info();
     exec_errcode_ = fb_info.assign(exec_ctx_.get_feedback_info());
   }
+  const ObIArray<storage::ObOuttableLobControlKey> *control_keys =
+      exec_ctx_.get_outtable_lob_control_keys();
+  if (OB_SUCCESS == exec_errcode_ && OB_NOT_NULL(control_keys)) {
+    // Return all pending keys with the final execution status, after operators have closed.
+    int tmp_ret = OB_SUCCESS;
+    for (int64_t i = 0; OB_SUCCESS == exec_errcode_ && i < control_keys->count(); ++i) {
+      if (OB_TMP_FAIL(scanner.add_outtable_lob_control_key(control_keys->at(i)))) {
+        exec_errcode_ = tmp_ret;
+        scanner.reset_outtable_lob_control_keys();
+        LOG_WARN("failed to return remote outtable lob control keys", K(tmp_ret), K(i));
+      }
+    }
+  }
   exec_ctx_.hide_session();
   // return a scanner no matter success or fail, set err_code to scanner
   if (OB_SUCCESS != exec_errcode_) {

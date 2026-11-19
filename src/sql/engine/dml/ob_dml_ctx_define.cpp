@@ -34,10 +34,9 @@ int ObDMLRtCtx::complete_outtable_lob_control_keys()
 {
   int ret = OB_SUCCESS;
   ObPxSqcHandler *sqc_handler = exec_ctx_.get_sqc_handler();
+  ObSQLSessionInfo *session = exec_ctx_.get_my_session();
   if (outtable_lob_control_ctx_.empty()) {
-  } else if (OB_ISNULL(sqc_handler)) {
-    ret = outtable_lob_control_ctx_.complete(exec_ctx_);
-  } else {
+  } else if (OB_NOT_NULL(sqc_handler)) {
     ObPxTask *task = nullptr;
     if (OB_FAIL(sqc_handler->get_sqc_ctx().get_task(exec_ctx_.get_px_task_id(), task))) {
       LOG_WARN("failed to get px task for outtable lob control keys", K(ret));
@@ -51,6 +50,19 @@ int ObDMLRtCtx::complete_outtable_lob_control_keys()
       // The QC completes these rows in T1 after every SQC has finished successfully.
       outtable_lob_control_ctx_.reuse();
     }
+  } else if (OB_ISNULL(session) || OB_ISNULL(session->get_tx_desc())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("transaction is missing for outtable lob control completion", K(ret));
+  } else if (session->is_remote_session() && session->get_tx_desc()->is_shadow()) {
+    if (OB_FAIL(exec_ctx_.append_outtable_lob_control_keys(
+        *outtable_lob_control_ctx_.get_keys()))) {
+      LOG_WARN("failed to retain remote outtable lob control keys", K(ret));
+    } else {
+      // The controller completes these keys in the original transaction after remote success.
+      outtable_lob_control_ctx_.reuse();
+    }
+  } else if (OB_FAIL(outtable_lob_control_ctx_.complete(exec_ctx_))) {
+    LOG_WARN("failed to complete outtable lob control keys", K(ret));
   }
   return ret;
 }
