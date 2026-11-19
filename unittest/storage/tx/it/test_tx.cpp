@@ -2767,7 +2767,10 @@ TEST_F(ObTestTx, distributed_tx_coordinator_switch_to_follower_forcedly_in_parti
   ASSERT_NE(i, 101);
   ASSERT_EQ(OB_SUCCESS, n1->revert_tx_ctx(n1_ctx));
 
-  n1->fake_tx_log_adapter_->set_log_drop();
+  // Keep the coordinator's COMMIT log unsubmitted. set_log_drop() reports
+  // success without ever completing its callback, violating the callback drain
+  // required before a forced role switch.
+  n1->fake_tx_log_adapter_->push_back_block_log_type(ObTxLogType::TX_COMMIT_LOG);
   n1->del_drop_msg_type(TX_2PC_PRE_COMMIT_RESP);
 
   ObPartTransCtx *n2_ctx = NULL;
@@ -2782,7 +2785,7 @@ TEST_F(ObTestTx, distributed_tx_coordinator_switch_to_follower_forcedly_in_parti
   ObLSTxCtxMgr *ls_tx_ctx_mgr1 = NULL;
   ASSERT_EQ(OB_SUCCESS, n1->txs_.tx_ctx_mgr_.get_ls_tx_ctx_mgr(n1->ls_id_, ls_tx_ctx_mgr1));
   ASSERT_EQ(OB_SUCCESS, ls_tx_ctx_mgr1->switch_to_follower_forcedly());
-  n1->fake_tx_log_adapter_->clear_log_drop();
+  n1->fake_tx_log_adapter_->clear_block_log_type();
 
   ReplayLogEntryFunctor functor(n3);
   ASSERT_EQ(OB_SUCCESS, n3->fake_tx_log_adapter_->replay_all(functor));

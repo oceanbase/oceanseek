@@ -1962,7 +1962,9 @@ int ObPartTransCtx::check_can_submit_redo_()
   bool is_tx_committing = ObTxState::INIT != get_downstream_state();
   bool final_log_submitting =
       sub_state_.is_state_log_submitting() || sub_state_.is_state_log_submitted();
-  if (is_tx_committing
+  if (is_follower_()) {
+    ret = OB_NOT_MASTER;
+  } else if (is_tx_committing
       ||final_log_submitting
       || is_force_abort_logging_()) {
     ret = OB_TRANS_HAS_DECIDED;
@@ -6796,6 +6798,14 @@ int ObPartTransCtx::switch_to_leader(const SCN &start_working_ts)
     // Reclaim entry numbers that were allocated by the old leader but never
     // became durable. Old checkpoints have no applied anchor and keep the
     // recovered cursor as a compatibility fallback.
+    if (OB_UNLIKELY(!busy_cbs_.is_empty())) {
+      // Defensive check: all logs submitted before takeover should have got their callbacks.
+      TRANS_LOG(ERROR, "[switch_to_leader] busy log callbacks should be empty",
+                K_(trans_id), K_(ls_id), "busy_cbs_cnt", busy_cbs_.get_size(),
+                "max_applied_entry_no", exec_info_.max_applied_entry_no_,
+                "next_log_entry_no", exec_info_.next_log_entry_no_, KPC(this));
+      OB_SAFE_ABORT();
+    }
     if (INT64_MIN != exec_info_.max_applied_entry_no_) {
       exec_info_.next_log_entry_no_ = exec_info_.max_applied_entry_no_ + 1;
     }
@@ -6954,6 +6964,14 @@ int ObPartTransCtx::switch_to_follower_forcedly(ObTxCommitCallback *&cb_list_hea
   } else if (OB_FAIL(state_helper.switch_state(TxCtxOps::REVOKE))) {
     TRANS_LOG(WARN, "switch role state error", KR(ret), K(*this));
   } else {
+    if (OB_UNLIKELY(!busy_cbs_.is_empty())) {
+      // All logs submitted before the forced switch should have got their callbacks.
+      TRANS_LOG(ERROR, "[switch_to_follower] busy log callbacks should be empty",
+                K_(trans_id), K_(ls_id), "busy_cbs_cnt", busy_cbs_.get_size(),
+                "max_applied_entry_no", exec_info_.max_applied_entry_no_,
+                "next_log_entry_no", exec_info_.next_log_entry_no_, KPC(this));
+      OB_SAFE_ABORT();
+    }
     (void)unregister_timeout_task_();
     if (!has_persisted_log_() && !is_logging_()) {
       // has not persisted any log, exit here
@@ -7763,7 +7781,15 @@ int ObPartTransCtx::submit_multi_data_source_()
 {
   int ret = OB_SUCCESS;
   ObTxLogBlock log_block;
-  if (OB_FAIL(init_log_block_(log_block))) {
+  if (is_follower_()) {
+    // Covers the retry path in on_success (and any other standalone submit): the ctx
+    // may have been switched to FOLLOWER after the lock was released, so a stale
+    // next_log_entry_no_ must not be used to append MDS logs. The bundle path
+    // submit_multi_data_source_(log_block) stays unchecked on purpose so that
+    // graceful switch can still drain TX_ACTIVE_INFO_LOG/TX_COMMIT_INFO_LOG.
+    ret = OB_NOT_MASTER;
+    TRANS_LOG(WARN, "can not submit mds log on a follower", KR(ret), K_(trans_id), K_(ls_id));
+  } else if (OB_FAIL(init_log_block_(log_block))) {
     TRANS_LOG(WARN, "init log block failed", KR(ret), K(*this));
   } else {
     ret = submit_multi_data_source_(log_block);

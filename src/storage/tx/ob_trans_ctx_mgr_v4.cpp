@@ -1363,8 +1363,10 @@ int ObLSTxCtxMgr::traverse_tx_to_submit_redo_log(ObTransID &fail_tx_id, const ui
   int ret = OB_SUCCESS;
   RLockGuard guard(rwlock_);
   ObTxSubmitLogFunctor fn(ObTxSubmitLogFunctor::SUBMIT_REDO_LOG, freeze_clock);
-  if (is_follower_()) {
-    // quit submit log because this is a follower
+  // is_follower_() is too weak: during takeover (T_SYNC_PENDING/T_APPLY_PENDING) the
+  // tx ctxs are still FOLLOWER, so only submit when L_WORKING.
+  if (!is_master_()) {
+    // only submit logs when this LS tx state is L_WORKING (all ctxs taken over)
   } else if (OB_FAIL(ls_tx_ctx_map_.for_each(fn))) {
     if (OB_SUCCESS != fn.get_result()) {
       // get real ret code
@@ -1385,7 +1387,8 @@ int ObLSTxCtxMgr::traverse_tx_to_submit_next_log()
   int ret = OB_SUCCESS;
   RLockGuard guard(rwlock_);
   ObTxSubmitLogFunctor fn(ObTxSubmitLogFunctor::SUBMIT_NEXT_LOG);
-  if (!is_follower_() && OB_FAIL(ls_tx_ctx_map_.for_each(fn))) {
+  // Same reason as traverse_tx_to_submit_redo_log: only submit when L_WORKING.
+  if (is_master_() && OB_FAIL(ls_tx_ctx_map_.for_each(fn))) {
     if (OB_SUCCESS != fn.get_result()) {
       // get real ret code
       ret = fn.get_result();
