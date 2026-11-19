@@ -105,6 +105,51 @@ int ObDasVecScanUtils::get_distance_threshold_hnsw(ObVectorIndexDistAlgorithm di
   return ret;
 }
 
+int ObDasVecScanUtils::check_IP_distance(const share::ObVecIdxQueryResult &dist_result,
+                                         const int64_t vid,
+                                         const common::ObString &query_vector,
+                                         double &distance,
+                                         int64_t &segment_idx,
+                                         bool &is_valid)
+{
+  int ret = OB_SUCCESS;
+  is_valid = false;
+  DEBUG_SYNC(BEFORE_IP_BRUTE_FORCE_CHECK_ID);
+  for (int64_t i = 0; OB_SUCC(ret) && i < dist_result.segments_.count(); ++i) {
+    bool exists = false;
+    share::ObVectorIndexSegment *segment =
+        const_cast<share::ObVectorIndexSegment *>(dist_result.segments_.at(i).get());
+    if (OB_ISNULL(segment)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("null vector index segment", K(ret), K(vid), K(i));
+    } else if (!segment->is_base() && segment->get_index_type() != share::VIAT_HNSW) {
+    } else if (OB_FAIL(segment->check_id_exist(vid, exists))) {
+      LOG_WARN("failed to check vector id for ambiguous IP distance", K(ret), K(vid), K(i));
+    } else if (exists) {
+      const float *recomputed_distances = nullptr;
+      if (OB_ISNULL(query_vector.ptr())) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("null query vector for IP distance recomputation", K(ret), K(vid), K(i));
+      } else if (OB_FAIL(segment->cal_distance_by_id(
+          reinterpret_cast<const float *>(query_vector.ptr()), &vid, 1, recomputed_distances))) {
+        LOG_WARN("failed to recompute ambiguous IP distance", K(ret), K(vid), K(i));
+      } else if (OB_ISNULL(recomputed_distances)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("null recomputed IP distances", K(ret), K(vid), K(i));
+      } else {
+        distance = recomputed_distances[0];
+        segment_idx = i;
+        is_valid = true;
+      }
+      if (OB_NOT_NULL(recomputed_distances)) {
+        segment->mem_ctx()->Deallocate(const_cast<float *>(recomputed_distances));
+      }
+      break;
+    }
+  }
+  return ret;
+}
+
 int ObDasVecScanUtils::check_ivf_support_similarity_threshold(ObExpr &expr)
 {
   int ret = OB_SUCCESS;

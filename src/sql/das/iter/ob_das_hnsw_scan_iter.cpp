@@ -1689,8 +1689,15 @@ int ObDASHNSWScanIter::process_adaptor_state_pre_filter_brute_force_not_bq(
     ObVectorIndexSegmentHandle &segment = dist_result.segments_.at(0);
     for (int i = 0; i < brute_cnt && OB_SUCC(ret) && !need_complete_data; ++i) {
       double distance = distances[i];
-      // if distances == -1, means vid not exist
-      if (distance != -1 && distance <= distance_threshold_ && distance > query_cond_.last_distance_) {
+      int64_t segment_idx = 0;
+      bool is_valid = distance != -1;
+      if (!is_valid && ObVectorIndexDistAlgorithm::VIDA_IP == search_param_.dist_algorithm_) {
+        ret = ObDasVecScanUtils::check_IP_distance(
+            dist_result, brute_vids[i], query_cond_.query_vector_, distance, segment_idx, is_valid);
+      }
+      if (OB_FAIL(ret)) {
+        LOG_WARN("failed to validate brute force distance", K(ret), K(distance), K(i));
+      } else if (is_valid && distance <= distance_threshold_ && distance > query_cond_.last_distance_) {
         max_heap.push(brute_vids[i], distance, segment.get());
       } else {
         need_complete_data = check_need_complete_data ? true : false;
@@ -1703,8 +1710,14 @@ int ObDASHNSWScanIter::process_adaptor_state_pre_filter_brute_force_not_bq(
       int64_t k = 0;
       for (; k < segment_cnt && (distance = dist_result.distances_.at(k)[i]) == -1; ++k);
 
-      // if distances == -1, means vid not exist
-      if (distance != -1 && distance <= distance_threshold_ && distance > query_cond_.last_distance_) {
+      bool is_valid = distance != -1;
+      if (!is_valid && ObVectorIndexDistAlgorithm::VIDA_IP == search_param_.dist_algorithm_) {
+        ret = ObDasVecScanUtils::check_IP_distance(
+            dist_result, brute_vids[i], query_cond_.query_vector_, distance, k, is_valid);
+      }
+      if (OB_FAIL(ret)) {
+        LOG_WARN("failed to validate brute force distance", K(ret), K(distance), K(i));
+      } else if (is_valid && distance <= distance_threshold_ && distance > query_cond_.last_distance_) {
         max_heap.push(brute_vids[i], distance, dist_result.segments_.at(k).get());
       } else {
         need_complete_data = check_need_complete_data ? true : false;
@@ -1853,7 +1866,14 @@ int ObDASHNSWScanIter::merge_and_sort_brute_force_results_bq(const ObVecIdxQuery
         int64_t k = 0;
         for (; k < segment_cnt && (distance = dist_result.distances_.at(k)[i]) == -1; ++k);
         
-        if (distance == -1) {
+        bool is_valid = distance != -1;
+        if (!is_valid && ObVectorIndexDistAlgorithm::VIDA_IP == search_param_.dist_algorithm_) {
+          ret = ObDasVecScanUtils::check_IP_distance(
+              dist_result, brute_vids[i], query_cond_.query_vector_, distance, k, is_valid);
+        }
+        if (OB_FAIL(ret)) {
+          LOG_WARN("failed to validate brute force distance", K(ret), K(distance), K(i));
+        } else if (!is_valid) {
           need_complete_data = check_need_complete_data ? true : false;
         } else if (distance <= query_cond_.last_distance_) {
           // skip: within last_distance range

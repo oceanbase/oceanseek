@@ -6,13 +6,17 @@
 #define USING_LOG_PREFIX SQL_DAS
 
 #include <gtest/gtest.h>
+#include <cstdlib>
+#include <thread>
 #include <vector>
+#include "lib/utility/ob_defer.h"
 #define private public
 #define protected public
 #include "share/rc/ob_tenant_base.h"
 #include "sql/das/iter/ob_das_vec_index_hnsw_scan_iter.h"
 #undef protected
 #undef private
+#include "sql/das/iter/ob_das_vec_scan_utils.h"
 
 using namespace oceanbase;
 using namespace oceanbase::common;
@@ -21,6 +25,15 @@ using namespace oceanbase::sql;
 
 namespace
 {
+
+class PreBruteVsagAllocator : public ObVsagMemContext
+{
+public:
+  PreBruteVsagAllocator() : ObVsagMemContext(nullptr) {}
+  void *Allocate(size_t size) override { return std::malloc(size); }
+  void Deallocate(void *ptr) override { std::free(ptr); }
+  void *Reallocate(void *ptr, size_t size) override { return std::realloc(ptr, size); }
+};
 
 class TestVecIndexPreBrute : public ::testing::Test
 {
@@ -141,6 +154,128 @@ TEST_F(TestVecIndexPreBrute, all_bitmap_types_enter_hnsw_bq_pre_brute)
   check_pre_brute_dispatch(ObVecIndexBitmap::VIDS, VIAT_HNSW_BQ);
   check_pre_brute_dispatch(ObVecIndexBitmap::BYTE_ARRAY, VIAT_HNSW_BQ);
   check_pre_brute_dispatch(ObVecIndexBitmap::ROARING_BITMAP, VIAT_HNSW_BQ);
+}
+
+TEST_F(TestVecIndexPreBrute, recompute_ip_distance_after_concurrent_append)
+{
+  for (const auto index_type : {VIAT_HNSW, VIAT_HGRAPH}) {
+    SCOPED_TRACE(::testing::Message() << "index type=" << index_type);
+    ObArenaAllocator allocator("VecPreBruteUT");
+    ObVectorIndexSegmentHandle handle;
+    auto *segment = OB_NEWx(ObVectorIndexSegment, &allocator, &allocator);
+    ASSERT_NE(nullptr, segment);
+    ASSERT_EQ(OB_SUCCESS, handle.set_segment(segment));
+    segment->mem_ctx_ = OB_NEWx(PreBruteVsagAllocator, &allocator);
+    ASSERT_NE(nullptr, segment->mem_ctx_);
+    ASSERT_EQ(OB_SUCCESS, obvectorutil::create_index(
+        segment->index_, index_type, "float32", "ip", 4, 16, 64, 16, segment->mem_ctx_));
+    segment->is_inited_ = true;
+    segment->tenant_id_ = MTL_ID();
+
+    float query[] = {1, 0, 0, 0};
+    float existing_vector[] = {1.5, 0, 0, 0};
+    int64_t existing_vid = 2;
+    int64_t vids[] = {1, existing_vid};
+    ASSERT_EQ(OB_SUCCESS, segment->add_index(existing_vector, &existing_vid, 4, nullptr, 1));
+
+    ObVecIdxQueryResult result;
+    ASSERT_EQ(OB_SUCCESS, result.segments_.push_back(handle));
+    const float *distances = nullptr;
+    ASSERT_EQ(OB_SUCCESS, segment->cal_distance_by_id(query, vids, ARRAYSIZEOF(vids), distances));
+    DEFER(segment->mem_ctx()->Deallocate(const_cast<float *>(distances)));
+    ASSERT_EQ(OB_SUCCESS, result.distances_.push_back(distances));
+    ASSERT_FLOAT_EQ(-1, distances[0]);
+    ASSERT_FLOAT_EQ(-0.5, distances[1]);
+
+    float appended_vector[] = {1, 0, 0, 0};
+    int append_ret = OB_SUCCESS;
+    std::thread append_thread([&]() {
+      append_ret = segment->add_index(appended_vector, vids, 4, nullptr, 1);
+    });
+    append_thread.join();
+    ASSERT_EQ(OB_SUCCESS, append_ret);
+
+    ObDASVecIndexHNSWScanIter iter;
+    iter.search_param_.dist_algorithm_ = VIDA_IP;
+    iter.distance_threshold_ = 1;
+    iter.query_cond_.query_vector_.assign_ptr(reinterpret_cast<char *>(query), sizeof(query));
+    bool need_complete_data = false;
+    if (index_type == VIAT_HGRAPH) {
+      ObSimpleMaxHeap skipped_heap(&allocator, 1);
+      ASSERT_EQ(OB_SUCCESS, skipped_heap.init());
+      ASSERT_EQ(OB_SUCCESS, iter.merge_brute_force_results(
+          result, vids, 1, skipped_heap, need_complete_data, true));
+      EXPECT_TRUE(need_complete_data);
+      EXPECT_EQ(0, skipped_heap.get_size());
+
+      need_complete_data = false;
+      ASSERT_EQ(OB_SUCCESS, iter.merge_brute_force_results(
+          result, vids, 1, skipped_heap, need_complete_data, false));
+      EXPECT_FALSE(need_complete_data);
+      EXPECT_EQ(0, skipped_heap.get_size());
+      segment->set_is_base();
+    }
+
+    ObSimpleMaxHeap heap(&allocator, 1);
+    ASSERT_EQ(OB_SUCCESS, heap.init());
+    ASSERT_EQ(OB_SUCCESS, iter.merge_brute_force_results(
+        result, vids, ARRAYSIZEOF(vids), heap, need_complete_data, true));
+    EXPECT_FALSE(need_complete_data);
+    ASSERT_EQ(1, heap.get_size());
+    EXPECT_EQ(existing_vid, heap.at(0));
+    EXPECT_DOUBLE_EQ(-0.5, heap.value_at(0));
+
+    double distance = -1;
+    int64_t segment_idx = -1;
+    bool is_valid = true;
+    ASSERT_EQ(OB_SUCCESS, ObDasVecScanUtils::check_IP_distance(
+        result, vids[0], iter.query_cond_.query_vector_, distance, segment_idx, is_valid));
+    EXPECT_DOUBLE_EQ(0, distance);
+    EXPECT_TRUE(is_valid);
+    iter.distance_threshold_ = -0.25;
+    ObSimpleMaxHeap filtered_heap(&allocator, 1);
+    ASSERT_EQ(OB_SUCCESS, filtered_heap.init());
+    ASSERT_EQ(OB_SUCCESS, iter.merge_brute_force_results(
+        result, vids, ARRAYSIZEOF(vids), filtered_heap, need_complete_data, false));
+    EXPECT_FALSE(need_complete_data);
+    ASSERT_EQ(1, filtered_heap.get_size());
+    EXPECT_EQ(existing_vid, filtered_heap.at(0));
+    EXPECT_DOUBLE_EQ(-0.5, filtered_heap.value_at(0));
+
+    query[0] = 2;
+    distance = -1;
+    ASSERT_EQ(OB_SUCCESS, ObDasVecScanUtils::check_IP_distance(
+        result, vids[0], iter.query_cond_.query_vector_, distance, segment_idx, is_valid));
+    EXPECT_DOUBLE_EQ(-1, distance);
+    EXPECT_TRUE(is_valid);
+    EXPECT_EQ(0, segment_idx);
+
+    iter.distance_threshold_ = -1.5;
+    ObSimpleMaxHeap snap_heap(&allocator, 1);
+    ObSimpleMaxHeap incr_heap(&allocator, 1);
+    ASSERT_EQ(OB_SUCCESS, snap_heap.init());
+    ASSERT_EQ(OB_SUCCESS, incr_heap.init());
+    ASSERT_EQ(OB_SUCCESS, iter.merge_and_sort_brute_force_results_bq(
+        result, vids, 1, snap_heap, incr_heap, need_complete_data, true));
+    EXPECT_FALSE(need_complete_data);
+    EXPECT_EQ(0, snap_heap.get_size());
+    EXPECT_EQ(0, incr_heap.get_size());
+
+    query[0] = 3;
+    distance = -1;
+    ASSERT_EQ(OB_SUCCESS, ObDasVecScanUtils::check_IP_distance(
+        result, vids[0], iter.query_cond_.query_vector_, distance, segment_idx, is_valid));
+    EXPECT_DOUBLE_EQ(-2, distance);
+    EXPECT_TRUE(is_valid);
+
+    const int64_t missing_vid = 3;
+    distance = -1;
+    segment_idx = -1;
+    ASSERT_EQ(OB_SUCCESS, ObDasVecScanUtils::check_IP_distance(
+        result, missing_vid, iter.query_cond_.query_vector_, distance, segment_idx, is_valid));
+    EXPECT_FALSE(is_valid);
+    EXPECT_EQ(-1, segment_idx);
+  }
 }
 
 } // namespace

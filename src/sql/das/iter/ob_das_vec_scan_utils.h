@@ -103,6 +103,12 @@ public:
   static int get_distance_threshold_hnsw(ObVectorIndexDistAlgorithm dist_algorithm,
                                          float &similarity_threshold,
                                          float &distance_threshold);
+  static int check_IP_distance(const share::ObVecIdxQueryResult &dist_result,
+                               const int64_t vid,
+                               const common::ObString &query_vector,
+                               double &distance,
+                               int64_t &segment_idx,
+                               bool &is_valid);
   static int check_ivf_support_similarity_threshold(ObExpr &expr);
   static int64_t calc_heap_size(int64_t limit_k, double select_ratio);
   static int get_main_rowkey(const ObDASScanCtDef *ctdef, ObEvalCtx *eval_ctx, ObRowkey &main_rowkey);
