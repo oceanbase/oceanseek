@@ -48,21 +48,19 @@ int ObSSIOCommonOp::get_object_device_and_fd(
     LOG_WARN("fail to open device and fd", KR(ret), K(io_info), K(macro_id),
              K(ls_epoch_id), K(storage_dest), K(access_type));
   } else {
-    const int64_t DEFAULT_OBJECT_STORAGE_IO_TIMEOUT_US = OB_IO_MANAGER.get_object_storage_io_timeout_ms(io_info.tenant_id_) * 1000L;
-    if (io_info.flag_.is_read()) { // 1. read io
-      if ((io_info.timeout_us_ == GCONF._data_storage_io_timeout) || (io_info.timeout_us_ <= 0)) {
-        // 1.1 (a) BlockCache's load_block interface use GCONF._data_storage_io_timeout as io timeout,
-        // and does not use THIS_WORKER.get_timeout_remain as io timeout. (b) timeout <= 0 is a defence.
-        // use DEFAULT_OBJECT_STORAGE_IO_TIMEOUT_US as io timeout in these senarios.
-        io_info.timeout_us_ = DEFAULT_OBJECT_STORAGE_IO_TIMEOUT_US;
-      } else {
-        // 1.2 BlockCache's prefetch interface use THIS_WORKER.get_timeout_remain as io timeout.
-        // we should obtain MIN(THIS_WORKER.get_timeout_remain, DEFAULT_OBJECT_STORAGE_IO_TIMEOUT_US)
-        // as io timeout.
-        io_info.timeout_us_ = MIN(io_info.timeout_us_, DEFAULT_OBJECT_STORAGE_IO_TIMEOUT_US);
-      }
-    } else { // 2. write io
+    const int64_t DEFAULT_OBJECT_STORAGE_IO_TIMEOUT_US =
+        OB_IO_MANAGER.get_object_storage_io_timeout_ms(io_info.tenant_id_) * 1000L;
+    if ((io_info.timeout_us_ == GCONF._data_storage_io_timeout) || (io_info.timeout_us_ <= 0)) {
+      // 1.1 (a) BlockCache's load_block interface use GCONF._data_storage_io_timeout as io timeout,
+      // and does not use THIS_WORKER.get_timeout_remain as io timeout.
+      // (b) timeout <= 0 is a defence. use DEFAULT_OBJECT_STORAGE_IO_TIMEOUT_US as io timeout
+      // in these senarios.
       io_info.timeout_us_ = DEFAULT_OBJECT_STORAGE_IO_TIMEOUT_US;
+    } else {
+      // 1.2 BlockCache's prefetch interface use THIS_WORKER.get_timeout_remain as io timeout.
+      // we should obtain MIN(THIS_WORKER.get_timeout_remain, DEFAULT_OBJECT_STORAGE_IO_TIMEOUT_US)
+      // as io timeout.
+      io_info.timeout_us_ = MIN(io_info.timeout_us_, DEFAULT_OBJECT_STORAGE_IO_TIMEOUT_US);
     }
     io_info.fd_ = fd;
     if ((ObStorageAccessType::OB_STORAGE_ACCESS_DIRECT_MULTIPART_WRITER != access_type)
