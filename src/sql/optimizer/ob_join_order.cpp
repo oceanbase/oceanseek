@@ -26401,12 +26401,12 @@ int ObJoinOrder::set_search_index_access_info(AccessPath &ap, const QueryRangeIn
     LOG_WARN("search data index table schema is null", K(ret), K(search_data_index_id));
   } else {
     ap.search_data_index_id_ = search_data_index_id;
-    // A point term scan must remain a point scan after rebinding parameters.
-    // Equal values for independent range bounds do not establish that contract.
+    // Independent bounds can diverge when a cached plan is reused.
     const ObQueryRangeProvider *range_provider = range_info.get_query_range_provider();
     ap.is_index_term_point_scan_ = OB_NOT_NULL(range_provider)
-        && range_provider->is_equal_range()
-        && range_info.get_equal_prefix_count() >= SEARCH_INDEX_DOC_ID;
+        && range_info.get_equal_prefix_count() >= SEARCH_INDEX_DOC_ID
+        && (range_provider->is_equal_range() || range_provider->is_search_terms_range());
+    // Global RowID order requires at most one range on every execution.
     ap.is_ordered_by_pk_ = ap.is_index_term_point_scan_
         && range_provider->is_standard_range()
         && 1 >= range_info.get_range_count();

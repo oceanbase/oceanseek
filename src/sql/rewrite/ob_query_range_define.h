@@ -491,6 +491,7 @@ public:
   virtual bool is_precise_get() const { return is_precise_get_; }
   bool is_standard_range() const override { return is_standard_range_; }
   bool is_equal_range() const override { return is_equal_range_; }
+  bool is_search_terms_range() const override;
   virtual int64_t get_column_count() const { return column_count_; }
   virtual bool has_exec_param() const { return contain_exec_param_; }
   virtual bool has_fake_const_udf() const { return cnt_fake_const_udf_; }

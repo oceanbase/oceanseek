@@ -930,6 +930,31 @@ int ObPreRangeGraph::fill_column_metas(const ObIArray<ColumnItem> &range_columns
   return ret;
 }
 
+bool ObPreRangeGraph::is_search_terms_range() const
+{
+  const ObFixedArray<ObRangeMap::ExprFinalInfo, ObIAllocator> &exprs = range_map_.expr_final_infos_;
+  bool all_point_ranges = node_head_ != nullptr;
+  for (const ObRangeNode *node = node_head_; all_point_ranges && node != nullptr; node = node->or_next_) {
+    if (!node->is_search_node_ || !node->is_domain_node_ || node->and_next_ != nullptr) {
+      all_point_ranges = false;
+      break;
+    }
+    const ObDomainOpType op = static_cast<ObDomainOpType>(node->domain_extra_.domain_releation_type_);
+    if (op == ObDomainOpType::T_JSON_CONTAINS || op == ObDomainOpType::T_JSON_IN_QUERY) {
+      // Range extraction already guarantees a scalar candidate for CONTAINS.
+      continue;
+    }
+    // A whole-array parameter can rebind to [], which produces a full range.
+    const int64_t value_idx = node->start_keys_[SEARCH_INDEX_VALUE];
+    const ObRawExpr *list = value_idx >= 0 && value_idx < exprs.count()
+                            ? exprs.at(value_idx).related_raw_expr_ : nullptr;
+    all_point_ranges = list != nullptr && list->get_param_count() > 0
+        && ((op == ObDomainOpType::T_JSON_OVERLAPS && list->get_expr_type() == T_FUN_SYS_JSON_ARRAY)
+            || (op == ObDomainOpType::T_ARRAY_OVERLAPS && list->get_expr_type() == T_FUN_SYS_ARRAY));
+  }
+  return all_point_ranges;
+}
+
 int ObPreRangeGraph::get_prefix_info(int64_t &equal_prefix_count,
                                      int64_t &range_prefix_count,
                                      int64_t &ss_range_prefix_count,

@@ -88,6 +88,7 @@ public:
   virtual bool enable_new_false_range() const = 0;
   virtual bool is_equal_range() const = 0;
   virtual bool is_standard_range() const = 0;
+  virtual bool is_search_terms_range() const = 0;
 };
 
 }

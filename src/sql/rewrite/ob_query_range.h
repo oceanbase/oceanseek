@@ -563,6 +563,7 @@ public:
                                     int32_t &pattern_prefix_len);
   bool is_equal_range() const override { return table_graph_.is_equal_range_; }
   bool is_standard_range() const override { return table_graph_.is_standard_range_; }
+  bool is_search_terms_range() const override { return false; }
 private:
 
   int init_query_range_ctx(common::ObIAllocator &allocator,
