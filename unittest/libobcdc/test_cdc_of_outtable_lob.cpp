@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 #include <gtest/gtest.h>
+#include "outtable_lob_test_helper.h"
 
 #include "lib/alloc/ob_malloc_allocator.h"
 #include "lib/allocator/page_arena.h"
@@ -22,12 +23,14 @@
 #include "logservice/libobcdc/src/ob_cdc_lob_aux_storager.h"
 #include "logservice/libobcdc/src/ob_cdc_lob_data_merger.h"
 #include "logservice/libobcdc/src/ob_log_part_trans_parser.h"
+#include "logservice/libobcdc/src/ob_log_dml_parser.h"
 #undef private
 #include "logservice/libobcdc/src/ob_log_instance.h"
 #include "logservice/libobcdc/src/ob_log_formatter.h"
 #include "logservice/libobcdc/src/ob_log_meta_manager.h"
 #include "logservice/libobcdc/src/ob_log_store_service.h"
 #include "logservice/libobcdc/src/ob_log_tenant_mgr.h"
+#include "logservice/libobcdc/src/ob_log_resource_collector.h"
 #include "storage/blocksstable/ob_storage_object_type.h"
 #include "storage/lob/common/ob_lob_locator.h"
 #include "storage/lob/ob_ext_info_callback.h"
@@ -135,6 +138,19 @@ public:
   std::string expected_key_;
   int64_t get_count_ = 0;
   std::function<void()> on_get_;
+};
+
+class EmptyEntryCollector final : public ObLogResourceCollector
+{
+public:
+  int revert_log_entry_task(ObLogEntryTask *entry) override
+  {
+    ++revert_count_;
+    EXPECT_TRUE(entry->get_redo_log_node()->is_formatted());
+    delete entry;
+    return OB_SUCCESS;
+  }
+  int64_t revert_count_ = 0;
 };
 
 class TestCDCOfOuttableLob : public ::testing::Test
@@ -538,76 +554,45 @@ protected:
     return macro_id;
   }
 
-  // The fixture acts as the producer: preserve its wire bytes and overwrite them
-  // immediately after ingestion to verify the owning DML/DDL node boundary.
-  int push_outtable_body(
-      PartTransTask &task,
-      const palf::LSN &log_lsn,
-      const transaction::ObTxLobOutTableDataLog &log,
-      const bool append_compat_tail)
+  // Exercise normal mutator ingestion; the node owns the row/header/payload bytes.
+  int push_outtable_body(PartTransTask &task, const palf::LSN &log_lsn,
+      const OuttableTestPayload &payload, const bool append_compat_tail)
   {
-    std::vector<char> body(log.get_serialize_size() + (append_compat_tail ? 1 : 0));
-    int64_t body_len = 0;
-    int ret = log.serialize(body.data(), body.size(), body_len);
-    LOG_INFO("raw body step 1: producer serialized LOB", KR(ret), K(log_lsn), K(body_len),
-        K(append_compat_tail), "is_sys_ls", task.is_sys_ls_part_trans());
-    if (OB_SUCC(ret) && append_compat_tail) {
-      // Include an unknown trailing field inside the UNIS envelope. Re-serializing
-      // the known fields would drop this byte, whereas copying the raw slice must retain it.
-      int64_t header_pos = 0;
-      int64_t version = 0;
-      int64_t payload_len = 0;
-      if (OB_FAIL(serialization::decode_vi64(body.data(), body_len, header_pos, &version))) {
-        LOG_WARN("decode version failed", KR(ret), K(body_len), K(header_pos));
-      } else {
-        const int64_t length_pos = header_pos;
-        if (OB_FAIL(serialization::decode_vi64(body.data(), body_len, header_pos, &payload_len))) {
-          LOG_WARN("decode payload length failed", KR(ret), K(body_len), K(header_pos));
-        } else {
-          EXPECT_EQ(body_len, header_pos + payload_len);
-          body[body_len++] = 'T';
-          int64_t rewrite_pos = length_pos;
-          ret = serialization::encode_fixed_bytes_i64(
-              body.data(), body.size(), rewrite_pos, payload_len + 1 /*val*/);
-        }
-      }
-      LOG_INFO("raw body step 1: extended compatible envelope", KR(ret), K(version),
-          K(payload_len), K(body_len));
+    std::string raw;
+    std::string mutator;
+    int ret = serialize_outtable_test_row(payload, raw, append_compat_tail);
+    if (OB_SUCC(ret)) { ret = wrap_outtable_test_mutator(raw, mutator); }
+    if (OB_SUCC(ret)) {
+      ret = task.push_redo_log(task.get_trans_id(), log_lsn, 1, mutator.data(), mutator.size());
+      mutator.assign(mutator.size(), 'x');
     }
     if (OB_SUCC(ret)) {
-      const std::vector<char> expected_body(body);
-      ret = task.push_lob_outtable_data_log(log_lsn, log, body.data(), body_len);
-      // Invalidate the caller-owned wire bytes before inspecting the node.
-      MEMSET(body.data(), 0, body.size());
-      LOG_INFO("raw body step 2: ingress returned and source was overwritten", KR(ret), K(log_lsn),
-          K(body_len), "node_count", task.get_sorted_redo_list().get_node_number());
-      if (OB_SUCC(ret)) {
-        RedoLogMetaNode *node = nullptr;
-        for (RedoNodeIterator it = task.get_sorted_redo_list().redo_iter_begin();
-            it != task.get_sorted_redo_list().redo_iter_end(); it++) {
-          if ((*it).get_start_log_lsn() == log_lsn) {
-            node = &*it;
-            break;
-          }
-        }
-        EXPECT_NE(nullptr, node);
-        if (nullptr != node) {
-          EXPECT_NE(nullptr, node->get_data());
-          EXPECT_NE(body.data(), node->get_data());
-          EXPECT_EQ(body_len, node->get_data_len());
-          if (nullptr != node->get_data() && body_len == node->get_data_len()) {
-            const int body_compare = MEMCMP(expected_body.data(), node->get_data(), body_len);
-            LOG_INFO("raw body step 3: compare owning node bytes", K(log_lsn), K(body_len),
-                K(body_compare), "is_sys_ls", task.is_sys_ls_part_trans());
-            EXPECT_EQ(0, body_compare);
-          }
-          if (task.is_sys_ls_part_trans()) {
-            EXPECT_TRUE(static_cast<DdlRedoLogNode *>(node)->is_lob_outtable_data_log());
-          } else {
-            EXPECT_TRUE(static_cast<DmlRedoLogNode *>(node)->is_lob_outtable_data_log());
-          }
-        }
+      RedoLogMetaNode *node = nullptr;
+      for (RedoNodeIterator it = task.get_sorted_redo_list().redo_iter_begin();
+          it != task.get_sorted_redo_list().redo_iter_end(); it++) {
+        if ((*it).get_start_log_lsn() == log_lsn) { node = &*it; break; }
       }
+      EXPECT_NE(nullptr, node);
+      if (nullptr != node) {
+        EXPECT_EQ(raw.size(), node->get_data_len());
+        EXPECT_EQ(raw, std::string(node->get_data(), node->get_data_len()));
+      }
+    }
+    return ret;
+  }
+
+  int parse_outtable_node(ObLogPartTransParser &parser, ObLogTenant *tenant,
+      const RedoLogMetaNode &node, PartTransTask &task, bool baseline = false)
+  {
+    int64_t pos = 0;
+    memtable::ObMutatorRowHeader header;
+    int ret = header.deserialize(node.get_data(), node.get_data_len(), pos);
+    bool published = false;
+    if (OB_SUCC(ret)) {
+      EXPECT_EQ(memtable::MutatorType::MUTATOR_LOB_OUTTABLE_ROW, header.mutator_type_);
+      ret = parser.parse_lob_outtable_mutator_row_(tenant, node.get_data(), node.get_data_len(),
+          pos, baseline, task, published);
+      if (OB_SUCC(ret)) { EXPECT_EQ(node.get_data_len(), pos); }
     }
     return ret;
   }
@@ -682,11 +667,11 @@ protected:
           std::string source = pieces[i];
           std::string source_seq(seq_id.ptr(), seq_id.length());
           const blocksstable::MacroBlockId macro_id = make_outtable_macro_id(i);
-          const transaction::ObTxLobOutTableDataLog::ConstructArg arg(
+          const OuttableTestPayload arg(
               LOB_PIECE_TABLE_ID, operation_seq,
               ObString(source_seq.length(), source_seq.data()), expected_lob_id_,
               macro_id, true /*is_logging*/, ObString(source.length(), source.data()));
-          const transaction::ObTxLobOutTableDataLog log(arg);
+          const OuttableTestPayload log(arg);
           ret = push_outtable_body(
               task, palf::LSN(i + 1 /*offset*/), log, false /*append_compat_tail*/);
           source.assign(source.length(), 'x');
@@ -713,13 +698,11 @@ protected:
         } else if (OB_ISNULL(node)) {
           ret = OB_ERR_UNEXPECTED;
         } else {
-          EXPECT_TRUE(node->is_lob_outtable_data_log());
           EXPECT_FALSE(node->is_direct_load_inc_log());
           EXPECT_EQ(i + 1 == pieces.size(), is_last);
-          transaction::ObTxLobOutTableDataLog::ConstructArg empty_arg;
-          transaction::ObTxLobOutTableDataLog decoded(empty_arg);
+          OuttableTestPayload decoded;
           int64_t pos = 0;
-          if (OB_FAIL(decoded.deserialize(node->get_data(), node->get_data_len(), pos))) {
+          if (OB_FAIL(decode_outtable_test_row(node->get_data(), node->get_data_len(), pos, decoded))) {
           } else {
             LOG_INFO("pipeline step 3: verify serialized redo fields", K(commit_version), K(i),
                 "body_len", node->get_data_len(), K(pos), K(is_last),
@@ -731,7 +714,7 @@ protected:
             EXPECT_TRUE(make_outtable_macro_id(i) == decoded.get_macro_id());
             EXPECT_EQ(0, seq_ids[i].compare(decoded.get_seq_id()));
             EXPECT_EQ(pieces[i], std::string(decoded.get_data().ptr(), decoded.get_data().length()));
-            ret = parser.parse_lob_outtable_data_log_(&tenant, *node, task);
+            ret = parse_outtable_node(parser, &tenant, *node, task);
             // The cache must survive release/reuse of the serialized redo body.
             MEMSET(const_cast<char *>(node->get_data()), 0, node->get_data_len());
           }
@@ -935,41 +918,41 @@ protected:
     return ret;
   }
 
-  int parse_outtable_body(
-      const transaction::ObTxLobOutTableDataLog::ConstructArg &arg,
-      PartTransTask &task,
-      ObLogTenant *tenant,
-      const int64_t length_adjustment = 0)
+  int parse_outtable_body(const OuttableTestPayload &payload, PartTransTask &task,
+      ObLogTenant *tenant, const int64_t length_adjustment = 0)
   {
-    // Preserve the production wire format while allowing truncated or trailing-byte scenarios.
-    transaction::ObTxLobOutTableDataLog log(arg);
-    std::vector<char> body(log.get_serialize_size() + 1, '\0');
-    int64_t pos = 0;
-    LOG_INFO("body parser step 1: serialize input", "commit_version", task.get_trans_commit_version(),
-        "table_id", arg.lob_aux_table_id_, "piece_len", arg.data_.length(),
-        K(length_adjustment), "is_sys_ls", task.is_sys_ls_part_trans());
-    int ret = log.serialize(body.data(), body.size(), pos);
-    LOG_INFO("body parser step 1 complete: serialized body", KR(ret), K(pos),
-        "supplied_body_len", pos + length_adjustment);
+    std::string raw;
+    int ret = serialize_outtable_test_row(payload, raw);
     if (OB_SUCC(ret)) {
-      // Exercise the same typed payload parser through the node class used by each LS.
-      ObLogPartTransParser parser;
-      if (task.is_sys_ls_part_trans()) {
-        DdlRedoLogNode node;
-        node.reset(palf::LSN(1/*offset*/), body.data(), pos + length_adjustment/*size*/,
-            pos + length_adjustment/*pos*/, DdlRedoLogNode::LogType::LOB_OUTTABLE_DATA);
-        ret = parser.parse_lob_outtable_data_log_(tenant, node, task);
-      } else {
-        DmlRedoLogNode node;
-        node.init_for_data_memory(palf::LSN(1/*offset*/), body.data(),
-            pos + length_adjustment/*size*/, pos + length_adjustment/*pos*/);
-        node.set_lob_outtable_data_log();
-        ret = parser.parse_lob_outtable_data_log_(tenant, node, task);
+      // Corrupt the payload frame itself, never publish bytes from a truncated frame.
+      memtable::ObMutatorRowHeader header;
+      int64_t pos = 0;
+      ret = header.deserialize(raw.data(), raw.size(), pos);
+      if (OB_SUCC(ret) && length_adjustment > 0) {
+        int32_t row_size = 0;
+        int64_t native_pos = pos;
+        ret = serialization::decode_i32(raw.data(), raw.size(), native_pos, &row_size);
+        int64_t frame_pos = pos + row_size;
+        int64_t version = 0;
+        int64_t frame_len = 0;
+        if (OB_SUCC(ret)) { ret = serialization::decode_vi64(raw.data(), raw.size(), frame_pos, &version); }
+        const int64_t length_pos = frame_pos;
+        if (OB_SUCC(ret)) { ret = serialization::decode_vi64(raw.data(), raw.size(), frame_pos, &frame_len); }
+        if (OB_SUCC(ret)) {
+          int64_t rewrite_pos = length_pos;
+          ret = serialization::encode_fixed_bytes_i64(&raw[0], raw.size(), rewrite_pos,
+              frame_len + length_adjustment);
+        }
+      }
+      if (OB_SUCC(ret)) {
+        ObLogPartTransParser parser;
+        bool published = false;
+        const int64_t data_len = raw.size() + (length_adjustment < 0 ? length_adjustment : 0);
+        ret = parser.parse_lob_outtable_mutator_row_(tenant, raw.data(), data_len,
+            pos, false, task, published);
+        if (OB_SUCC(ret)) { EXPECT_EQ(data_len, pos); }
       }
     }
-    LOG_INFO("body parser step 2 complete: typed payload parse result", KR(ret),
-        "commit_version", task.get_trans_commit_version(), K(length_adjustment),
-        "cache_count", nullptr == instance_ ? -1 : instance_->lob_aux_storager_.lob_aux_map_.count());
     return ret;
   }
 
@@ -1183,9 +1166,9 @@ TEST_F(TestCDCOfOuttableLob, outtable_merger_checks_chunk_and_summary_lengths)
 
 // B1. Invalid fields, empty/oversized payloads and invalid serialized lengths must not populate the LOB cache.
 // Scenario: Corrupt the table ID, operation seq, LOB ID, macro ID, piece seq_id or data in a valid body.
-// Steps: Construct and parse each variant; also increase and decrease the serialized body length by one byte.
-// Checks: Serializing an invalid macro ID returns OB_INVALID_ARGUMENT; other invalid fields and trailing bytes
-//         return OB_INVALID_DATA. A truncated body fails to parse, and the cache always stays empty.
+// Steps: Construct and parse each variant; also overstate the payload frame length and truncate its bytes.
+// Checks: Serializing an invalid macro ID returns OB_INVALID_ARGUMENT; other invalid fields return
+//         OB_INVALID_DATA. Frame length errors fail to parse, and the cache always stays empty.
 // Scope: Change one field at a time; an invalid macro ID is rejected during serialization, before Parser.
 TEST_F(TestCDCOfOuttableLob, outtable_parser_rejects_invalid_body_without_cache_entries)
 {
@@ -1202,16 +1185,16 @@ TEST_F(TestCDCOfOuttableLob, outtable_parser_rejects_invalid_body_without_cache_
       false /*enable_oracle_mode_match_case_sensitive*/, false /*enable_white_black_list*/, gi_cache));
   ObString seq_id;
   OK(ObLobSeqId::get_seq_id(allocator, 1 /*idx*/, seq_id));
-  const transaction::ObTxLobOutTableDataLog::ConstructArg valid_arg(
+  const OuttableTestPayload valid_arg(
       LOB_PIECE_TABLE_ID, transaction::ObTxSEQ(10 /*seq*/, 3 /*branch*/), seq_id, expected_lob_id_,
       make_outtable_macro_id(0 /*chunk_index*/), true /*is_logging*/, ObString::make_string("payload"));
 
-  LOG_INFO("step 1: valid reference body prepared", K(valid_arg.lob_aux_table_id_),
+  LOG_INFO("step 1: valid reference body prepared", K(valid_arg.lob_piece_table_id_),
       K(valid_arg.lob_operation_seq_no_), "data_length", valid_arg.data_.length());
-  auto expect_invalid = [&](const transaction::ObTxLobOutTableDataLog::ConstructArg &arg,
+  auto expect_invalid = [&](const OuttableTestPayload &arg,
       const int expected_ret) {
     const int ret = parse_outtable_body(arg, task, &tenant);
-    LOG_INFO("step 2: invalid body validation completed", K(ret), K(expected_ret), K(arg.lob_aux_table_id_),
+    LOG_INFO("step 2: invalid body validation completed", K(ret), K(expected_ret), K(arg.lob_piece_table_id_),
         K(arg.lob_operation_seq_no_), K(arg.lob_id_), K(arg.macro_id_),
         "seq_id_length", arg.seq_id_.length(), "data_length", arg.data_.length(),
         "cache_count", instance_->lob_aux_storager_.lob_aux_map_.count());
@@ -1220,7 +1203,7 @@ TEST_F(TestCDCOfOuttableLob, outtable_parser_rejects_invalid_body_without_cache_
   };
   // Reset to the valid reference before corrupting the next field.
   auto arg = valid_arg;
-  arg.lob_aux_table_id_ = OB_INVALID_ID;
+  arg.lob_piece_table_id_ = OB_INVALID_ID;
   expect_invalid(arg, OB_INVALID_DATA);
   arg = valid_arg;
   arg.lob_operation_seq_no_.reset();
@@ -1228,12 +1211,26 @@ TEST_F(TestCDCOfOuttableLob, outtable_parser_rejects_invalid_body_without_cache_
   arg = valid_arg;
   arg.lob_id_.reset();
   expect_invalid(arg, OB_INVALID_DATA);
+  arg = valid_arg;
+  ++arg.lob_col_idx_;
+  expect_invalid(arg, OB_INVALID_DATA);
+  arg = valid_arg;
+  arg.byte_len_ = 0;
+  expect_invalid(arg, OB_INVALID_DATA);
+  arg = valid_arg;
+  ++arg.byte_len_;
+  expect_invalid(arg, OB_INVALID_DATA);
   // MacroBlockId::serialize rejects the invalid ID before the CDC parser runs.
   arg = valid_arg;
   arg.macro_id_.reset();
   expect_invalid(arg, OB_INVALID_ARGUMENT);
   arg = valid_arg;
   arg.seq_id_.reset();
+  expect_invalid(arg, OB_INVALID_DATA);
+  arg = valid_arg;
+  arg.seq_id_ = ObString::make_string("invalid_seq_id");
+  ASSERT_TRUE(arg.is_valid()); // Non-empty alone does not make a valid piece sequence.
+  ASSERT_FALSE(ObLobSeqId(arg.seq_id_).is_valid());
   expect_invalid(arg, OB_INVALID_DATA);
   arg = valid_arg;
   arg.data_.reset();
@@ -1244,9 +1241,9 @@ TEST_F(TestCDCOfOuttableLob, outtable_parser_rejects_invalid_body_without_cache_
   expect_invalid(arg, OB_INVALID_DATA);
   // Serialized-body boundaries must fail without publishing partial data.
   int ret = parse_outtable_body(valid_arg, task, &tenant, 1 /*length_adjustment*/);
-  LOG_INFO("step 3: body with trailing byte parsed", K(ret), "length_adjustment", 1,
+  LOG_INFO("step 3: payload frame exceeds available bytes", K(ret), "length_adjustment", 1,
       "cache_count", instance_->lob_aux_storager_.lob_aux_map_.count());
-  EXPECT_EQ(OB_INVALID_DATA, ret);
+  EXPECT_NE(OB_SUCCESS, ret);
   ret = parse_outtable_body(valid_arg, task, &tenant, -1 /*length_adjustment*/);
   LOG_INFO("step 4: truncated body parsed", K(ret), "length_adjustment", -1,
       "cache_count", instance_->lob_aux_storager_.lob_aux_map_.count());
@@ -1272,7 +1269,7 @@ TEST_F(TestCDCOfOuttableLob, outtable_parser_rollback_retains_transaction_branch
       transaction::ObTxSEQ(20 /*seq*/, 3 /*branch*/), transaction::ObTxSEQ(5 /*seq*/, 3 /*branch*/)));
   ObString seq_id;
   OK(ObLobSeqId::get_seq_id(allocator, 1 /*idx*/, seq_id));
-  transaction::ObTxLobOutTableDataLog::ConstructArg arg(
+  OuttableTestPayload arg(
       LOB_PIECE_TABLE_ID, transaction::ObTxSEQ(10 /*seq*/, 3 /*branch*/), seq_id, expected_lob_id_,
       make_outtable_macro_id(0 /*chunk_index*/), true /*is_logging*/, ObString::make_string("payload"));
   // No tenant is needed for a rolled-back chunk: filtering/publication is skipped.
@@ -1331,7 +1328,7 @@ TEST_F(TestCDCOfOuttableLob, outtable_parser_filters_unsubscribed_data)
       false /*enable_oracle_mode_match_case_sensitive*/, true /*enable_white_black_list*/, gi_cache));
   ObString seq_id;
   OK(ObLobSeqId::get_seq_id(allocator, 1 /*idx*/, seq_id));
-  const transaction::ObTxLobOutTableDataLog::ConstructArg arg(
+  const OuttableTestPayload arg(
       LOB_PIECE_TABLE_ID, transaction::ObTxSEQ(10 /*seq*/, 3 /*branch*/), seq_id, expected_lob_id_,
       make_outtable_macro_id(0 /*chunk_index*/), true /*is_logging*/, ObString::make_string("payload"));
   int ret = parse_outtable_body(arg, task, &tenant);
@@ -1355,10 +1352,10 @@ TEST_F(TestCDCOfOuttableLob, outtable_parser_filters_unsubscribed_data)
   EXPECT_EQ(OB_SUCCESS, ret);
 }
 
-// B4. Valid no-logging TX markers reach filtering; only consumed markers report unsupported CDC.
+// B4. Valid no-logging mutator markers reach filtering; only consumed markers report unsupported CDC.
 // Scenario: A marker has a valid identity and no payload; malformed variants invert the flag/data relation.
 // Steps: Enqueue the marker, reject malformed variants, then exercise subscription and rollback decisions.
-// Checks: Task owns one marker node; malformed bodies return OB_INVALID_DATA; filtered markers succeed;
+// Checks: Mutator ingress owns marker nodes; Parser rejects malformed bodies; filtered markers succeed;
 //         ERROR rejects a consumed marker; PADDING stores a typed marker with no payload.
 TEST_F(TestCDCOfOuttableLob, outtable_no_logging_marker_respects_filtering)
 {
@@ -1375,28 +1372,29 @@ TEST_F(TestCDCOfOuttableLob, outtable_no_logging_marker_respects_filtering)
       false /*enable_oracle_mode_match_case_sensitive*/, true /*enable_white_black_list*/, gi_cache));
   ObString seq_id;
   OK(ObLobSeqId::get_seq_id(allocator, 1 /*idx*/, seq_id));
-  const transaction::ObTxLobOutTableDataLog::ConstructArg marker(
+  const OuttableTestPayload marker(
       LOB_PIECE_TABLE_ID, transaction::ObTxSEQ(10 /*seq*/, 3 /*branch*/), seq_id, expected_lob_id_,
       make_outtable_macro_id(0 /*chunk_index*/), false /*is_logging*/, ObString());
   LOG_INFO("step 1: enqueue marker without payload", K(marker));
   OK(push_outtable_body(task, palf::LSN(1 /*offset*/),
-      transaction::ObTxLobOutTableDataLog(marker), false /*append_compat_tail*/));
+      OuttableTestPayload(marker), false /*append_compat_tail*/));
   ASSERT_EQ(1, task.get_sorted_redo_list().get_node_number());
 
-  // A no-logging flag with data, or a logging flag without data, is corruption even before filtering.
+  // Mutator ingress retains bytes; Parser rejects malformed marker bodies before filtering.
+  int invalid_index = 0;
   for (const bool is_logging : {false, true}) {
     auto invalid_arg = marker;
     invalid_arg.is_logging_ = is_logging;
     invalid_arg.data_ = is_logging ? ObString() : ObString::make_string("unexpected payload");
-    const int push_ret = push_outtable_body(task, palf::LSN(2 /*offset*/),
-        transaction::ObTxLobOutTableDataLog(invalid_arg), false /*append_compat_tail*/);
+    const int push_ret = push_outtable_body(task, palf::LSN(2 + invalid_index++),
+        OuttableTestPayload(invalid_arg), false /*append_compat_tail*/);
     const int parse_ret = parse_outtable_body(invalid_arg, task, &tenant);
     LOG_INFO("step 2: malformed marker checked at ingress and parser", K(is_logging),
         K(push_ret), K(parse_ret), "node_count", task.get_sorted_redo_list().get_node_number(),
         "cache_count", instance_->lob_aux_storager_.lob_aux_map_.count());
-    EXPECT_EQ(OB_INVALID_DATA, push_ret);
+    EXPECT_EQ(OB_SUCCESS, push_ret); // Mutator ingress owns bytes; semantic checks run in Parser.
     EXPECT_EQ(OB_INVALID_DATA, parse_ret);
-    EXPECT_EQ(1, task.get_sorted_redo_list().get_node_number());
+    EXPECT_EQ(1 + invalid_index, task.get_sorted_redo_list().get_node_number());
     EXPECT_EQ(0, instance_->lob_aux_storager_.lob_aux_map_.count());
   }
 
@@ -1435,13 +1433,15 @@ TEST_F(TestCDCOfOuttableLob, outtable_no_logging_marker_respects_filtering)
 
 // B5. No-logging ExtInfo markers fail explicitly only after their table passes subscription filtering.
 // Scenario: An old-image marker carries a valid piece identity and an empty payload.
-// Steps: Parse it before and after subscribing the PIECE table, then parse inconsistent flag/data pairs.
-// Checks: Filtering succeeds; ERROR rejects a consumed marker; PADDING stores a typed marker;
-//         DDL stays strict, and inconsistent bodies return OB_INVALID_DATA.
+// Steps: Parse the marker before and after subscription, round-trip logged binary data,
+//        then check PADDING and inconsistent flag/data pairs.
+// Checks: Filtering succeeds; ERROR accepts logged data and rejects a consumed marker;
+//         PADDING stores a typed marker, DDL stays strict, and inconsistent bodies return OB_INVALID_DATA.
 TEST_F(TestCDCOfOuttableLob, lob_data_ext_info_no_logging_marker_respects_filtering)
 {
   // Use the production ExtInfo decoder and publisher without constructing unrelated mutator rows.
   OK(init_merger_environment());
+  instance_->unsupported_lob_handling_mode_ = ObUnsupportedLobHandlingMode::ERROR;
   ObArenaAllocator allocator;
   PartTransTask task;
   task.set_allocator(OB_MALLOC_NORMAL_BLOCK_SIZE, allocator);
@@ -1482,10 +1482,25 @@ TEST_F(TestCDCOfOuttableLob, lob_data_ext_info_no_logging_marker_respects_filter
   EXPECT_EQ(OB_NOT_SUPPORTED, ret);
   EXPECT_EQ(0, instance_->lob_aux_storager_.lob_aux_map_.count());
 
-  instance_->unsupported_lob_handling_mode_ = ObUnsupportedLobHandlingMode::PADDING;
-  OK(parse_ext_info());
   const ObLobAuxKey marker_key(2005, TENANT_ID, task.get_trans_id(), LOB_PIECE_TABLE_ID,
       expected_lob_id_, log.lob_operation_seq_no_, log.seq_id_);
+  // ERROR mode still publishes a logged old image through the real ExtInfo decoder.
+  const char binary_data[] = {'o', 'l', 'd', 0, 'd', 'a', 't', 'a'};
+  const ObString binary_payload(sizeof(binary_data), binary_data);
+  log.is_logging_ = true;
+  log.lob_data_ = binary_payload;
+  ASSERT_TRUE(log.is_valid());
+  OK(parse_ext_info());
+  ObLobAuxReadValue cached_data;
+  OK(instance_->lob_aux_storager_.get(allocator, marker_key, cached_data));
+  EXPECT_FALSE(cached_data.is_no_logging());
+  EXPECT_EQ(binary_payload, cached_data.payload_);
+  OK(instance_->lob_aux_storager_.del(marker_key));
+
+  log.is_logging_ = false;
+  log.lob_data_.reset();
+  instance_->unsupported_lob_handling_mode_ = ObUnsupportedLobHandlingMode::PADDING;
+  OK(parse_ext_info());
   ObLobAuxReadValue cached_marker;
   OK(instance_->lob_aux_storager_.get(allocator, marker_key, cached_marker));
   EXPECT_TRUE(cached_marker.is_no_logging());
@@ -1649,7 +1664,7 @@ TEST_F(TestCDCOfOuttableLob, ddl_outtable_filters_piece_table_and_full_rollback_
   OK(prepare_ddl_part_trans_task(task, 3001 /*commit_version*/));
   ObString seq_id;
   OK(ObLobSeqId::get_seq_id(allocator, 1 /*idx*/, seq_id));
-  transaction::ObTxLobOutTableDataLog::ConstructArg arg(
+  OuttableTestPayload arg(
       share::OB_ALL_DDL_OPERATION_AUX_LOB_PIECE_TID, transaction::ObTxSEQ(10 /*seq*/, 3 /*branch*/),
       seq_id, expected_lob_id_, make_outtable_macro_id(0 /*chunk_index*/), true /*is_logging*/,
       ObString::make_string("ddl chunk"));
@@ -1658,18 +1673,18 @@ TEST_F(TestCDCOfOuttableLob, ddl_outtable_filters_piece_table_and_full_rollback_
   const uint64_t filtered_tables[] = {LOB_PIECE_TABLE_ID,
       share::OB_ALL_DDL_OPERATION_TID, share::OB_ALL_DDL_OPERATION_AUX_LOB_META_TID};
   for (const uint64_t table_id : filtered_tables) {
-    arg.lob_aux_table_id_ = table_id;
+    arg.lob_piece_table_id_ = table_id;
     const int ret = parse_outtable_body(arg, task, nullptr /*tenant*/);
     LOG_INFO("step 1: unrelated SYS LS table filtered", K(ret), K(table_id),
         "cache_count", instance_->lob_aux_storager_.lob_aux_map_.count());
     EXPECT_EQ(OB_SUCCESS, ret);
     EXPECT_EQ(0, instance_->lob_aux_storager_.lob_aux_map_.count());
   }
-  arg.lob_aux_table_id_ = share::OB_ALL_DDL_OPERATION_AUX_LOB_PIECE_TID;
+  arg.lob_piece_table_id_ = share::OB_ALL_DDL_OPERATION_AUX_LOB_PIECE_TID;
   // The PIECE table alone is insufficient when the transaction is not DDL.
   task.set_type(PartTransTask::TASK_TYPE_DML_TRANS);
   int ret = parse_outtable_body(arg, task, nullptr /*tenant*/);
-  LOG_INFO("step 2: non-DDL SYS LS transaction filtered", K(ret), K(arg.lob_aux_table_id_),
+  LOG_INFO("step 2: non-DDL SYS LS transaction filtered", K(ret), K(arg.lob_piece_table_id_),
       "is_ddl_trans", task.is_ddl_trans(),
       "cache_count", instance_->lob_aux_storager_.lob_aux_map_.count());
   EXPECT_EQ(OB_SUCCESS, ret);
@@ -1690,7 +1705,7 @@ TEST_F(TestCDCOfOuttableLob, ddl_outtable_filters_piece_table_and_full_rollback_
   LOG_INFO("step 4: other DDL branch published", K(ret), K(arg.lob_operation_seq_no_),
       "cache_count", instance_->lob_aux_storager_.lob_aux_map_.count());
   OK(ret);
-  const ObLobAuxKey key(3001 /*commit_version*/, TENANT_ID, task.get_trans_id(), arg.lob_aux_table_id_,
+  const ObLobAuxKey key(3001 /*commit_version*/, TENANT_ID, task.get_trans_id(), arg.lob_piece_table_id_,
       expected_lob_id_, arg.lob_operation_seq_no_, seq_id);
   ObLobAuxReadValue cached_value;
   ret = instance_->lob_aux_storager_.get(allocator, key, cached_value);
@@ -1721,13 +1736,13 @@ TEST_F(TestCDCOfOuttableLob, ddl_outtable_unreferenced_chunks_use_commit_version
   OK(prepare_ddl_part_trans_task(task, 3003 /*commit_version*/));
   ObString seq_id;
   OK(ObLobSeqId::get_seq_id(allocator, 1 /*idx*/, seq_id));
-  const transaction::ObTxLobOutTableDataLog::ConstructArg arg(
+  const OuttableTestPayload arg(
       share::OB_ALL_DDL_OPERATION_AUX_LOB_PIECE_TID, transaction::ObTxSEQ(10 /*seq*/, 3 /*branch*/),
       seq_id, expected_lob_id_, make_outtable_macro_id(0 /*chunk_index*/), true /*is_logging*/,
       ObString::make_string("orphan"));
   OK(push_outtable_body(task, palf::LSN(1 /*offset*/),
-      transaction::ObTxLobOutTableDataLog(arg), true /*append_compat_tail*/));
-  LOG_INFO("step 1: unreferenced DDL piece enqueued", K(arg.lob_aux_table_id_),
+      OuttableTestPayload(arg), true /*append_compat_tail*/));
+  LOG_INFO("step 1: unreferenced DDL piece enqueued", K(arg.lob_piece_table_id_),
       K(arg.lob_operation_seq_no_), "data_length", arg.data_.length(), "commit_version", 3003);
   ObLogMetaManager meta_manager;
   ObLogPartTransParser parser;
@@ -1868,12 +1883,12 @@ TEST_F(TestCDCOfOuttableLob, ddl_main_row_before_summary_and_two_megabyte_chunks
         "log_lsn", palf::LSN(10 - i /*offset*/));
     ObString seq_id;
     OK(ObLobSeqId::get_seq_id(allocator, i + 1, seq_id));
-    const transaction::ObTxLobOutTableDataLog::ConstructArg arg(
+    const OuttableTestPayload arg(
         share::OB_ALL_DDL_OPERATION_AUX_LOB_PIECE_TID, operation_seq, seq_id,
         expected_lob_id_, make_outtable_macro_id(i), true /*is_logging*/,
         ObString(pieces[i].length(), pieces[i].data()));
     OK(push_outtable_body(task, palf::LSN(10 - i /*offset*/),
-        transaction::ObTxLobOutTableDataLog(arg), false /*append_compat_tail*/));
+        OuttableTestPayload(arg), false /*append_compat_tail*/));
   }
   // The parser must copy piece bytes before the serialized redo buffer is reused.
   LOG_INFO("step 5: parse queued pieces and overwrite their source buffers");
@@ -1882,10 +1897,8 @@ TEST_F(TestCDCOfOuttableLob, ddl_main_row_before_summary_and_two_megabyte_chunks
       it != task.get_sorted_redo_list().redo_iter_end(); it++) {
     DdlRedoLogNode &node = static_cast<DdlRedoLogNode &>(*it);
     LOG_INFO("step 5: publish one typed redo body", "log_lsn", node.get_start_log_lsn(),
-        "body_len", node.get_data_len(), "is_lob_log", node.is_lob_outtable_data_log());
-    ASSERT_TRUE(node.is_lob_outtable_data_log());
-    OK(parser.parse_lob_outtable_data_log_(
-        nullptr /*tenant*/, node, task));
+        "body_len", node.get_data_len());
+    OK(parse_outtable_node(parser, nullptr /*tenant*/, node, task));
     MEMSET(const_cast<char *>(node.get_data()), 0, node.get_data_len());
   }
   LOG_INFO("step 5 complete: summary and both pieces are cached",
@@ -1940,16 +1953,16 @@ TEST_F(TestCDCOfOuttableLob, ddl_outtable_no_logging_marker_respects_filtering)
   OK(prepare_ddl_part_trans_task(task, 3005 /*commit_version*/));
   ObString seq_id;
   OK(ObLobSeqId::get_seq_id(allocator, 1 /*idx*/, seq_id));
-  transaction::ObTxLobOutTableDataLog::ConstructArg marker(
+  OuttableTestPayload marker(
       LOB_PIECE_TABLE_ID, transaction::ObTxSEQ(10 /*seq*/, 3 /*branch*/), seq_id, expected_lob_id_,
       make_outtable_macro_id(0 /*chunk_index*/), false /*is_logging*/, ObString());
   int ret = parse_outtable_body(marker, task, nullptr /*tenant*/);
-  LOG_INFO("step 1: unrelated system LS marker filtered", K(ret), K(marker.lob_aux_table_id_),
+  LOG_INFO("step 1: unrelated system LS marker filtered", K(ret), K(marker.lob_piece_table_id_),
       "cache_count", instance_->lob_aux_storager_.lob_aux_map_.count());
   OK(ret);
   EXPECT_EQ(0, instance_->lob_aux_storager_.lob_aux_map_.count());
 
-  marker.lob_aux_table_id_ = share::OB_ALL_DDL_OPERATION_AUX_LOB_PIECE_TID;
+  marker.lob_piece_table_id_ = share::OB_ALL_DDL_OPERATION_AUX_LOB_PIECE_TID;
   task.set_type(PartTransTask::TASK_TYPE_DML_TRANS);
   ret = parse_outtable_body(marker, task, nullptr /*tenant*/);
   LOG_INFO("step 2: non-DDL system LS marker filtered", K(ret),
@@ -1960,7 +1973,7 @@ TEST_F(TestCDCOfOuttableLob, ddl_outtable_no_logging_marker_respects_filtering)
   // Preserve the marker through DDL ingestion and exercise error propagation through the DDL scan.
   task.set_type(PartTransTask::TASK_TYPE_DDL_TRANS);
   OK(push_outtable_body(task, palf::LSN(1 /*offset*/),
-      transaction::ObTxLobOutTableDataLog(marker), false /*append_compat_tail*/));
+      OuttableTestPayload(marker), false /*append_compat_tail*/));
   ObLogMetaManager meta_manager;
   ObLogPartTransParser parser;
   parser.meta_manager_ = &meta_manager;
@@ -1975,6 +1988,204 @@ TEST_F(TestCDCOfOuttableLob, ddl_outtable_no_logging_marker_respects_filtering)
       "cache_count", instance_->lob_aux_storager_.lob_aux_map_.count());
   EXPECT_EQ(OB_NOT_SUPPORTED, ret);
   EXPECT_EQ(0, instance_->lob_aux_storager_.lob_aux_map_.count());
+}
+
+
+// Real statement-loop dispatch must consume the payload without manufacturing a Meta statement.
+TEST_F(TestCDCOfOuttableLob, outtable_mutators_and_native_ddl_row_keep_statement_order)
+{
+  OK(init_merger_environment());
+  ObArenaAllocator allocator;
+  PartTransTask task;
+  task.set_allocator(OB_MALLOC_NORMAL_BLOCK_SIZE, allocator);
+  OK(prepare_ddl_part_trans_task(task, 4001));
+  ObString seq_id;
+  OK(ObLobSeqId::get_seq_id(allocator, 1, seq_id));
+  OuttableTestPayload payload(share::OB_ALL_DDL_OPERATION_AUX_LOB_PIECE_TID,
+      transaction::ObTxSEQ(10, 3), seq_id, expected_lob_id_, make_outtable_macro_id(0),
+      true, ObString::make_string("first"));
+  std::string first;
+  std::string native;
+  std::string last;
+  OK(serialize_outtable_test_row(payload, first, true /*compatible tail*/));
+  OK(serialize_outtable_test_row(payload, native, false, false /*normal row*/,
+      share::OB_ALL_DDL_OPERATION_TID));
+  OK(ObLobSeqId::get_seq_id(allocator, 2, payload.seq_id_));
+  OK(serialize_outtable_test_row(payload, last));
+  std::string raw = first + native + last;
+  DdlRedoLogNode node;
+  node.reset(palf::LSN(1), &raw[0], raw.size(), raw.size());
+  ObLogEntryTask entry(task);
+  ObLogPartTransParser parser;
+  parser.inited_ = true;
+  ObLogTenant tenant;
+  ObSEArray<DdlStmtTask *, 16> pending;
+  uint64_t row_index = 7;
+  volatile bool stop = false;
+  OK(parser.parse_stmts_(&tenant, node, false, entry, task, row_index, &pending, stop));
+  EXPECT_EQ(8, row_index); // Only the ordinary DDL row gets a statement index.
+  EXPECT_EQ(0, parser.remaining_log_size_); // SYS LS payloads do not count as DML bytes.
+  ASSERT_EQ(1, pending.count());
+  EXPECT_EQ(7, pending.at(0)->get_row_index());
+  EXPECT_EQ(2, instance_->lob_aux_storager_.lob_aux_map_.count());
+  parser.release_pending_ddl_stmts_(pending, task);
+}
+
+TEST_F(TestCDCOfOuttableLob, payload_only_entry_has_no_statements_and_cache_owns_bytes)
+{
+  OK(init_merger_environment());
+  ObArenaAllocator allocator;
+  PartTransTask task;
+  task.set_allocator(OB_MALLOC_NORMAL_BLOCK_SIZE, allocator);
+  OK(prepare_part_trans_task(task, transaction::ObTransID(4002), 4002));
+  ObLogTenant tenant;
+  GIndexCache gi_cache;
+  ObLogPartMgr &mgr = static_cast<ObLogPartMgr &>(tenant.get_part_mgr());
+  OK(mgr.init(TENANT_ID, 1, false, false, gi_cache));
+  ObString seq_id;
+  OK(ObLobSeqId::get_seq_id(allocator, 1, seq_id));
+  OuttableTestPayload payload(LOB_PIECE_TABLE_ID, transaction::ObTxSEQ(10, 3), seq_id,
+      expected_lob_id_, make_outtable_macro_id(0), true, ObString::make_string("owned payload"));
+  std::string raw;
+  OK(serialize_outtable_test_row(payload, raw));
+  DmlRedoLogNode node;
+  node.init_for_data_memory(palf::LSN(1), &raw[0], raw.size(), raw.size());
+  {
+    ObLogEntryTask *entry = new ObLogEntryTask(task);
+    OK(entry->init(task.get_tls_id(), "1002_1001", task.get_trans_id(), &node));
+    ObLogPartTransParser parser;
+    uint64_t row_index = 9;
+    volatile bool stop = false;
+    OK(parser.parse_stmts_(&tenant, node, false, *entry, task, row_index, nullptr, stop));
+    EXPECT_EQ(0, entry->get_stmt_num());
+    EXPECT_EQ(9, row_index);
+    EXPECT_EQ(static_cast<int64_t>(raw.size()), parser.remaining_log_size_);
+    EmptyEntryCollector collector;
+    IObLogResourceCollector *saved_collector = instance_->resource_collector_;
+    instance_->resource_collector_ = &collector;
+    ObLogDmlParser dml_parser;
+    const int dispatch_ret = dml_parser.dispatch_task_(*entry, task, stop);
+    instance_->resource_collector_ = saved_collector;
+    EXPECT_EQ(OB_SUCCESS, dispatch_ret);
+    EXPECT_EQ(1, collector.revert_count_);
+    EXPECT_TRUE(node.is_formatted());
+    if (0 == collector.revert_count_) { delete entry; }
+  }
+  raw.assign(raw.size(), 'x');
+  ObLobAuxReadValue value;
+  const ObLobAuxKey key(4002, TENANT_ID, task.get_trans_id(), LOB_PIECE_TABLE_ID,
+      expected_lob_id_, payload.lob_operation_seq_no_, seq_id);
+  OK(instance_->lob_aux_storager_.get(allocator, key, value));
+  EXPECT_EQ(payload.data_, value.payload_);
+  OK(instance_->lob_aux_storager_.del(key));
+}
+
+TEST_F(TestCDCOfOuttableLob, baseline_consumes_payloads_without_tenant_or_publication)
+{
+  OK(init_merger_environment());
+  instance_->unsupported_lob_handling_mode_ = ObUnsupportedLobHandlingMode::ERROR;
+  ObArenaAllocator allocator;
+  PartTransTask task;
+  task.set_allocator(OB_MALLOC_NORMAL_BLOCK_SIZE, allocator);
+  OK(prepare_ddl_part_trans_task(task, 4003));
+  ObString seq_id;
+  OK(ObLobSeqId::get_seq_id(allocator, 1, seq_id));
+  OuttableTestPayload payload(share::OB_ALL_DDL_OPERATION_AUX_LOB_PIECE_TID,
+      transaction::ObTxSEQ(10, 3), seq_id, expected_lob_id_, make_outtable_macro_id(0),
+      false, ObString());
+  std::string first;
+  OK(serialize_outtable_test_row(payload, first, true /*compatible tail*/));
+  std::string raw = first + first; // Baseline consumes both markers without a tenant.
+  DdlRedoLogNode node;
+  node.reset(palf::LSN(1), &raw[0], raw.size(), raw.size());
+  ObLogEntryTask entry(task);
+  ObLogPartTransParser parser;
+  ObSEArray<DdlStmtTask *, 16> pending;
+  uint64_t row_index = 5;
+  volatile bool stop = false;
+  OK(parser.parse_stmts_(nullptr, node, true, entry, task, row_index, &pending, stop));
+  EXPECT_EQ(5, row_index);
+  EXPECT_EQ(0, parser.remaining_log_size_);
+  EXPECT_EQ(0, pending.count());
+  EXPECT_EQ(0, instance_->lob_aux_storager_.lob_aux_map_.count());
+
+  // Ignoring LOB publication must still preserve the ordinary DDL row between payloads.
+  std::string native;
+  OK(serialize_outtable_test_row(payload, native, false, false /*normal row*/,
+      share::OB_ALL_DDL_OPERATION_TID));
+  OK(ObLobSeqId::get_seq_id(allocator, 2, payload.seq_id_));
+  payload.is_logging_ = true;
+  payload.data_ = ObString::make_string("baseline payload");
+  payload.byte_len_ = payload.data_.length();
+  std::string last;
+  OK(serialize_outtable_test_row(payload, last));
+  raw = first + native + last;
+  node.reset(palf::LSN(2), &raw[0], raw.size(), raw.size());
+  parser.inited_ = true;
+  ObLogTenant tenant;
+  OK(parser.parse_stmts_(&tenant, node, true, entry, task, row_index, &pending, stop));
+  EXPECT_EQ(6, row_index);
+  EXPECT_EQ(0, parser.remaining_log_size_);
+  ASSERT_EQ(1, pending.count());
+  EXPECT_EQ(5, pending.at(0)->get_row_index());
+  EXPECT_EQ(0, instance_->lob_aux_storager_.lob_aux_map_.count());
+  parser.release_pending_ddl_stmts_(pending, task);
+}
+
+TEST_F(TestCDCOfOuttableLob, malformed_native_lengths_and_payload_frames_do_not_publish)
+{
+  OK(init_merger_environment());
+  ObArenaAllocator allocator;
+  PartTransTask task;
+  task.set_allocator(OB_MALLOC_NORMAL_BLOCK_SIZE, allocator);
+  OK(prepare_part_trans_task(task, transaction::ObTransID(4004), 4004));
+  ObLogTenant tenant;
+  GIndexCache gi_cache;
+  ObLogPartMgr &mgr = static_cast<ObLogPartMgr &>(tenant.get_part_mgr());
+  OK(mgr.init(TENANT_ID, 1, false, false, gi_cache));
+  ObString seq_id;
+  OK(ObLobSeqId::get_seq_id(allocator, 1, seq_id));
+  OuttableTestPayload payload(LOB_PIECE_TABLE_ID, transaction::ObTxSEQ(10, 3), seq_id,
+      expected_lob_id_, make_outtable_macro_id(0), true, ObString::make_string("data"));
+  // The same context must accept a valid body, so subscription failures cannot mask decoder bugs.
+  OK(parse_outtable_body(payload, task, &tenant));
+  ASSERT_EQ(1, instance_->lob_aux_storager_.lob_aux_map_.count());
+  const ObLobAuxKey key(4004, TENANT_ID, task.get_trans_id(), LOB_PIECE_TABLE_ID,
+      expected_lob_id_, payload.lob_operation_seq_no_, seq_id);
+  OK(instance_->lob_aux_storager_.del(key));
+  std::string valid;
+  OK(serialize_outtable_test_row(payload, valid));
+  memtable::ObMutatorRowHeader header;
+  int64_t native_start = 0;
+  OK(header.deserialize(valid.data(), valid.size(), native_start));
+  auto expect_failure = [&](const std::string &raw, const int expected_ret) {
+    int64_t pos = native_start;
+    bool published = true;
+    ObLogPartTransParser parser;
+    const int ret = parser.parse_lob_outtable_mutator_row_(&tenant, raw.data(), raw.size(),
+        pos, false, task, published);
+    EXPECT_EQ(expected_ret, ret);
+    EXPECT_EQ(native_start, pos);
+    EXPECT_FALSE(published);
+    EXPECT_EQ(0, instance_->lob_aux_storager_.lob_aux_map_.count());
+  };
+  for (const int32_t row_size : {-1, 0, 1, 4, INT32_MAX}) {
+    std::string raw = valid;
+    int64_t pos = native_start;
+    OK(serialization::encode_i32(&raw[0], raw.size(), pos, row_size));
+    expect_failure(raw, OB_INVALID_DATA);
+  }
+  int64_t pos = native_start;
+  int32_t row_size = 0;
+  OK(serialization::decode_i32(valid.data(), valid.size(), pos, &row_size));
+  const int64_t payload_start = native_start + row_size;
+  expect_failure(valid.substr(0, payload_start), OB_INVALID_ARGUMENT);
+  // Keep the complete UNIS header; its declared body no longer fits the supplied buffer.
+  expect_failure(valid.substr(0, valid.size() - 1), OB_DESERIALIZE_ERROR);
+  std::string bad_body;
+  payload.byte_len_++;
+  OK(serialize_outtable_test_row(payload, bad_body));
+  expect_failure(bad_body, OB_INVALID_DATA);
 }
 
 } // namespace libobcdc

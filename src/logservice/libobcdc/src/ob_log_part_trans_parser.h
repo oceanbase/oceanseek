@@ -16,11 +16,16 @@
 
 namespace oceanbase
 {
+namespace storage
+{
+struct ObLobOutTableRedoPayload;
+}
 namespace libobcdc
 {
 class PartTransTask;
 class DdlStmtTask;
 class RedoLogMetaNode;
+struct ObLobAuxKey;
 enum class ObCDCLobAuxTableType;
 
 class IObLogPartTransParser
@@ -74,10 +79,30 @@ private:
       const PartTransTask &part_trans_task,
       const transaction::ObTxSEQ &seq_no,
       bool &need_rollback);
-  int parse_lob_outtable_data_log_(
+  int parse_lob_outtable_mutator_row_(
       ObLogTenant *tenant,
-      const RedoLogMetaNode &redo_log_node,
-      PartTransTask &part_trans_task);
+      const char *buf,
+      const int64_t buf_len,
+      int64_t &pos,
+      const bool is_build_baseline,
+      PartTransTask &part_trans_task,
+      bool &published);
+  int deserialize_lob_outtable_payload_(
+      const char *buf,
+      const int64_t buf_len,
+      int64_t &pos,
+      storage::ObLobOutTableRedoPayload &payload);
+  int publish_lob_outtable_payload_(
+      ObLogTenant *tenant,
+      const storage::ObLobOutTableRedoPayload &payload,
+      PartTransTask &part_trans_task,
+      bool &published);
+  int publish_lob_data_(
+      const ObLobAuxKey &key,
+      const bool is_logging,
+      const common::ObString &lob_data,
+      const bool is_ddl_trans,
+      const char *label);
   int parse_ddl_redo_log_(PartTransTask &task, const bool is_build_baseline, volatile bool &stop_flag);
   int parse_stmts_(
       ObLogTenant *tenant,

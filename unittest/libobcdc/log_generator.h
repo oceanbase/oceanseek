@@ -21,6 +21,7 @@
 #include "logservice/palf/log_define.h"
 #include "logservice/palf/log_entry_header.h"
 #include "storage/memtable/utils_rowkey_builder.h"
+#include "outtable_lob_test_helper.h"
 
 namespace oceanbase
 {
@@ -41,6 +42,7 @@ public:
   public:
   int next_log_block();
   int fill_redo(ObTxRedoLog &redo_log);
+  int fill_mutator_rows(const std::string &raw);
   template <typename T> int fill_tx_log_except_redo(T &tx_log_body)
   {
     return tx_log_block_.add_new_log(tx_log_body);
@@ -190,9 +192,12 @@ public:
   }
 
   void gen_redo_log();
-  int gen_lob_outtable_data_log(ObTxLobOutTableDataLog &log)
+  int gen_lob_outtable_redo(const storage::ObLobOutTableRedoPayload &payload)
   {
-    return block_builder_.fill_tx_log_except_redo(log);
+    std::string raw;
+    int ret = serialize_outtable_test_row(payload, raw);
+    if (OB_SUCC(ret)) { ret = block_builder_.fill_mutator_rows(raw); }
+    return ret;
   }
   void gen_rollback_to_log();
   void gen_mds_log();
@@ -265,6 +270,32 @@ int ObTxLogBlockBuilder::fill_redo(ObTxRedoLog &redo_log)
   return ret;
 }
 
+
+int ObTxLogBlockBuilder::fill_mutator_rows(const std::string &raw)
+{
+  int ret = OB_SUCCESS;
+  ObTxRedoLog redo_log(DATA_CURRENT_VERSION);
+  ObCLogEncryptInfo encrypt_info;
+  if (OB_FAIL(encrypt_info.init())) {
+  } else if (OB_FAIL(tx_log_block_.prepare_mutator_buf(redo_log))) {
+  } else {
+    // Follow the producer's adaptive buffer retry, retaining NORMAL_ROW framing.
+    if (raw.size() + 1024 > redo_log.get_mutator_size()) {
+      if (OB_FAIL(tx_log_block_.finish_mutator_buf(redo_log, 0))) {
+      } else if (OB_FAIL(tx_log_block_.extend_log_buf())) {
+      } else { ret = tx_log_block_.prepare_mutator_buf(redo_log); }
+    }
+    if (OB_SUCC(ret)) {
+      ObMutatorWriter writer;
+      int64_t size = 0;
+      if (OB_FAIL(writer.set_buffer(redo_log.get_mutator_buf(), redo_log.get_mutator_size()))) {
+      } else if (OB_FAIL(writer.append_row_buf(raw.data(), raw.size()))) {
+      } else if (OB_FAIL(writer.serialize(ObTransRowFlag::NORMAL_ROW, size, encrypt_info))) {
+      } else { ret = tx_log_block_.finish_mutator_buf(redo_log, size); }
+    }
+  }
+  return ret;
+}
 
 void ObTxLogGenerator::gen_redo_log()
 {
