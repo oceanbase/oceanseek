@@ -97,7 +97,7 @@ TEST(TestExternalLobPieceIterator, clipped_first_and_last_piece)
   const int64_t expected_sizes[] = {1, 2, 2, 2, 2, 1};
   ObExternalLobMacroIterator iter;
   MacroBlockId id;
-  ASSERT_EQ(OB_SUCCESS, iter.init(1001, 77, 3 * mib, 10 * mib));
+  ASSERT_EQ(OB_SUCCESS, iter.init(1001, 77, 3 * mib, 10 * mib, 0));
   for (int64_t i = 0; i < 6; ++i) {
     ASSERT_EQ(OB_SUCCESS, iter.get_next(id));
     EXPECT_TRUE(id.is_valid());
@@ -119,13 +119,13 @@ TEST(TestExternalLobPieceIterator, boundary_and_single_piece)
   ObExternalLobMacroIterator iter;
   MacroBlockId id;
   EXPECT_EQ(OB_NOT_INIT, iter.get_next(id));
-  ASSERT_EQ(OB_SUCCESS, iter.init(1001, 1, size, size));
+  ASSERT_EQ(OB_SUCCESS, iter.init(1001, 1, size, size, 0));
   ASSERT_EQ(OB_SUCCESS, iter.get_next(id));
   EXPECT_EQ(size, static_cast<uint64_t>(id.fourth_id()));
   EXPECT_EQ(size, static_cast<uint64_t>(id.fifth_id()));
   EXPECT_EQ(OB_ITER_END, iter.get_next(id));
   iter.reset();
-  ASSERT_EQ(OB_SUCCESS, iter.init(1001, 1, 7, 3));
+  ASSERT_EQ(OB_SUCCESS, iter.init(1001, 1, 7, 3, 0));
   ASSERT_EQ(OB_SUCCESS, iter.get_next(id));
   EXPECT_EQ(7, id.fourth_id());
   EXPECT_EQ(3, id.fifth_id());
@@ -140,9 +140,9 @@ TEST(TestExternalLobPieceIterator, stable_id_and_distinct_insert_identity)
   MacroBlockId first_id;
   MacroBlockId reread_id;
   MacroBlockId copied_id;
-  ASSERT_EQ(OB_SUCCESS, first.init(1001, 7, 3, 10));
-  ASSERT_EQ(OB_SUCCESS, reread.init(1001, 7, 3, 10));
-  ASSERT_EQ(OB_SUCCESS, copied.init(1001, 8, 3, 10));
+  ASSERT_EQ(OB_SUCCESS, first.init(1001, 7, 3, 10, 0));
+  ASSERT_EQ(OB_SUCCESS, reread.init(1001, 7, 3, 10, 0));
+  ASSERT_EQ(OB_SUCCESS, copied.init(1001, 8, 3, 10, 0));
   ASSERT_EQ(OB_SUCCESS, first.get_next(first_id));
   ASSERT_EQ(OB_SUCCESS, reread.get_next(reread_id));
   ASSERT_EQ(OB_SUCCESS, copied.get_next(copied_id));
@@ -150,33 +150,61 @@ TEST(TestExternalLobPieceIterator, stable_id_and_distinct_insert_identity)
   EXPECT_FALSE(first_id == copied_id);
 }
 
-TEST(TestExternalLobPieceIterator, piece_count_limit_includes_clipped_edges)
+TEST(TestExternalLobPieceIterator, seek_near_end_of_large_range)
 {
-  const uint64_t count = ObExternalLobMacroIterator::MAX_PIECE_COUNT;
   const uint64_t size = ObExternalLobMacroIterator::PIECE_SIZE;
+  const uint64_t offset = 1;
+  const uint64_t end_offset = INT64_MAX;
+  const uint64_t length = end_offset - offset;
+  const uint64_t last_piece_size = end_offset % size;
   ObExternalLobMacroIterator iter;
   MacroBlockId id;
-  ASSERT_EQ(OB_SUCCESS, iter.init(1001, 1, 0, count * size));
-  for (uint64_t i = 0; i < count; ++i) {
-    ASSERT_EQ(OB_SUCCESS, iter.get_next(id));
-  }
+  ASSERT_EQ(OB_SUCCESS, iter.init(1001, 1, offset, length, length - 1));
+  ASSERT_EQ(OB_SUCCESS, iter.get_next(id));
+  EXPECT_TRUE(id.is_valid());
+  EXPECT_EQ(end_offset - last_piece_size, static_cast<uint64_t>(id.fourth_id()));
+  EXPECT_EQ(last_piece_size, static_cast<uint64_t>(id.fifth_id()));
   EXPECT_EQ(OB_ITER_END, iter.get_next(id));
+}
+
+TEST(TestExternalLobPieceIterator, seek_preserves_clipped_piece_boundaries)
+{
+  const uint64_t size = ObExternalLobMacroIterator::PIECE_SIZE;
+  const uint64_t offset = size + 7;
+  const uint64_t length = 2 * size;
+  ObExternalLobMacroIterator iter;
+  MacroBlockId id;
+
+  ASSERT_EQ(OB_SUCCESS, iter.init(1001, 1, offset, length, 1));
+  ASSERT_EQ(OB_SUCCESS, iter.get_next(id));
+  EXPECT_EQ(offset, static_cast<uint64_t>(id.fourth_id()));
+  EXPECT_EQ(size - 7, static_cast<uint64_t>(id.fifth_id()));
+
   iter.reset();
-  // With the same declared length, an unaligned start covers one extra block.
-  EXPECT_EQ(OB_SIZE_OVERFLOW, iter.init(1001, 1, 1, count * size));
-  EXPECT_EQ(OB_SUCCESS, iter.init(1001, 1, 1, count * size - 1));
+  ASSERT_EQ(OB_SUCCESS, iter.init(1001, 1, offset, length, size - 7));
+  ASSERT_EQ(OB_SUCCESS, iter.get_next(id));
+  EXPECT_EQ(2 * size, static_cast<uint64_t>(id.fourth_id()));
+  EXPECT_EQ(size, static_cast<uint64_t>(id.fifth_id()));
+  ASSERT_EQ(OB_SUCCESS, iter.get_next(id));
+  EXPECT_EQ(3 * size, static_cast<uint64_t>(id.fourth_id()));
+  EXPECT_EQ(7, id.fifth_id());
+  EXPECT_EQ(OB_ITER_END, iter.get_next(id));
+
+  iter.reset();
+  ASSERT_EQ(OB_SUCCESS, iter.init(1001, 1, offset, length, length));
+  EXPECT_EQ(OB_ITER_END, iter.get_next(id));
 }
 
 TEST(TestExternalLobPieceIterator, empty_range_has_no_pieces)
 {
   ObExternalLobMacroIterator invalid_iter;
-  EXPECT_EQ(OB_INVALID_ARGUMENT, invalid_iter.init(1001, 7, UINT64_MAX, 0));
-  EXPECT_EQ(OB_INVALID_ARGUMENT, invalid_iter.init(1001, 7, uint64_t(INT64_MAX) + 1, 0));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, invalid_iter.init(1001, 7, UINT64_MAX, 0, 0));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, invalid_iter.init(1001, 7, uint64_t(INT64_MAX) + 1, 0, 0));
   const uint64_t offsets[] = {0, 1, INT64_MAX};
   for (uint64_t offset : offsets) {
     ObExternalLobMacroIterator iter;
     MacroBlockId id;
-    ASSERT_EQ(OB_SUCCESS, iter.init(1001, 7, offset, 0));
+    ASSERT_EQ(OB_SUCCESS, iter.init(1001, 7, offset, 0, 0));
     EXPECT_EQ(OB_ITER_END, iter.get_next(id));
   }
   ObExternalBlobInfo info;
@@ -249,12 +277,12 @@ TEST(TestExternalLobPieceIterator, summary_requires_has_length)
 TEST(TestExternalLobPieceIterator, invalid_identity_and_io_range)
 {
   ObExternalLobMacroIterator iter;
-  EXPECT_EQ(OB_INVALID_ARGUMENT, iter.init(0, 1, 0, 1));
-  EXPECT_EQ(OB_INVALID_ARGUMENT, iter.init(1001, 0, 0, 1));
-  EXPECT_EQ(OB_INVALID_ARGUMENT, iter.init(1001, 1, INT64_MAX, 1));
-  EXPECT_EQ(OB_INVALID_ARGUMENT, iter.init(1001, 1, UINT64_MAX, 1));
-  EXPECT_EQ(OB_SUCCESS, iter.init(1001, 1, INT64_MAX - 1, 1));
-  EXPECT_EQ(OB_INIT_TWICE, iter.init(1001, 1, 0, 1));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, iter.init(0, 1, 0, 1, 0));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, iter.init(1001, 0, 0, 1, 0));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, iter.init(1001, 1, INT64_MAX, 1, 0));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, iter.init(1001, 1, UINT64_MAX, 1, 0));
+  EXPECT_EQ(OB_SUCCESS, iter.init(1001, 1, INT64_MAX - 1, 1, 0));
+  EXPECT_EQ(OB_INIT_TWICE, iter.init(1001, 1, 0, 1, 0));
 }
 
 } // unittest

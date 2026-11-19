@@ -517,7 +517,8 @@ int ObExternalLobMacroIterator::init(
     uint64_t lob_meta_tablet_id,
     uint64_t external_lob_macro_seq_id,
     uint64_t offset,
-    uint64_t length)
+    uint64_t length,
+    uint64_t read_offset)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(is_inited_)) {
@@ -530,18 +531,13 @@ int ObExternalLobMacroIterator::init(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid external lob range or identity", KR(ret), K(lob_meta_tablet_id),
              K(external_lob_macro_seq_id), K(offset), K(length));
-  } else if (length > 0) {
-    const uint64_t num_pieces = (offset + length - 1) / PIECE_SIZE - offset / PIECE_SIZE + 1;
-    if (OB_UNLIKELY(num_pieces > MAX_PIECE_COUNT)) {
-      ret = OB_SIZE_OVERFLOW;
-      LOG_WARN("external lob has too many pieces", KR(ret), K(offset), K(length), K(num_pieces));
-    }
-  }
-  if (OB_SUCC(ret)) {
+  } else {
     lob_meta_tablet_id_ = lob_meta_tablet_id;
     external_lob_macro_seq_id_ = external_lob_macro_seq_id;
-    next_offset_ = offset;
     end_offset_ = offset + length;
+    const uint64_t read_start = offset + OB_MIN(read_offset, length);
+    const uint64_t macro_start_offset = OB_MAX(offset, read_start - read_start % PIECE_SIZE);
+    next_offset_ = (read_start == end_offset_) ? end_offset_ : macro_start_offset;
     is_inited_ = true;
   }
   return ret;
@@ -614,8 +610,11 @@ int ObExternalLobQueryIter::open(const ObLobReadContext &read_ctx,
              K(lob_meta_tablet_id), K(external_lob_macro_seq_id));
   } else if (OB_FAIL(external_info_.deep_copy(allocator_, external_info))) {
     LOG_WARN("failed to copy external lob read info", KR(ret));
-  } else if (OB_FAIL(piece_iter_.init(lob_meta_tablet_id, external_lob_macro_seq_id,
-                                     external_info_.offset_, read_ctx.byte_size_))) {
+  } else if (OB_FAIL(piece_iter_.init(lob_meta_tablet_id,
+                                      external_lob_macro_seq_id,
+                                      external_info_.offset_,
+                                      read_ctx.byte_size_,
+                                      read_ctx.offset_))) {
     LOG_WARN("failed to initialize external lob pieces", KR(ret));
   } else {
     const uint64_t length = read_ctx.byte_size_;
@@ -664,10 +663,7 @@ int ObExternalLobQueryIter::get_next_block(ObString &block_data)
   if (reached_eof_ || read_start_ == read_end_) {
     ret = OB_ITER_END;
   } else {
-    // Skip pre-query macroblocks by ID without IO; read matching blocks in full.
-    do {
-      ret = piece_iter_.get_next(macro_id); // fourth_id: offset; fifth_id: length
-    } while (OB_SUCC(ret) && macro_id.fourth_id() + macro_id.fifth_id() <= read_start_);
+    ret = piece_iter_.get_next(macro_id); // fourth_id: offset; fifth_id: length
     if (OB_SUCC(ret) && macro_id.fourth_id() >= read_end_) {
       ret = OB_ITER_END;
     }

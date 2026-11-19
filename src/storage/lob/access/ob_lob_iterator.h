@@ -193,11 +193,13 @@ class ObExternalLobMacroIterator
 {
 public:
   static constexpr uint64_t PIECE_SIZE = 2UL * 1024 * 1024;
-  static constexpr uint64_t MAX_PIECE_COUNT = 64UL * 1024;
 
   ObExternalLobMacroIterator() { reset(); }
   int init(uint64_t lob_meta_tablet_id,
-      uint64_t external_lob_macro_seq_id, uint64_t offset, uint64_t length);
+           uint64_t external_lob_macro_seq_id,
+           uint64_t offset,
+           uint64_t length,
+           uint64_t read_offset);
   int get_next(blocksstable::MacroBlockId &macro_id);
   void reset();
 
