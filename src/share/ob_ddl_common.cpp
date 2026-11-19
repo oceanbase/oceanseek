@@ -577,72 +577,65 @@ int ObDDLUtil::get_sys_log_handler_role_and_proposal_id(
 
 int ObDDLUtil::get_rs_specific_table_tablets(
     const uint64_t tenant_id,
-    const uint64_t data_table_id, 
-    const uint64_t index_table_id, 
+    const uint64_t data_table_id,
+    const uint64_t index_table_id,
     const uint64_t task_id,
     ObIArray<ObTabletID> &tablet_ids)
 {
-
   int ret = OB_SUCCESS;
-  share::schema::ObSchemaGetterGuard schema_guard;
-  const share::schema::ObTableSchema *table_schema = nullptr;
+  ObSchemaGetterGuard schema_guard;
+  const ObTableSchema *data_schema = nullptr;
+  const ObTableSchema *index_schema = nullptr;
   const ObDatabaseSchema *db_schema = nullptr;
-  ObAlterTableArg alter_table_arg;
+  const ObTenantSchema *tenant_schema = nullptr;
 
-  if (OB_INVALID_ID == tenant_id || OB_INVALID_ID == data_table_id || 
+  DEBUG_SYNC(BEFORE_GET_SPECIFIC_TABLE_TABLETS_LOCAL);
+  if (OB_INVALID_ID == tenant_id || OB_INVALID_ID == data_table_id ||
       OB_INVALID_ID == index_table_id || OB_INVALID_ID == task_id) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", K(ret), K(tenant_id), K(data_table_id), K(index_table_id), K(task_id));
-  } else if (OB_FAIL(share::schema::ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(
+  } else if (OB_ISNULL(GCTX.root_service_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("root service is null", K(ret));
+  } else if (!GCTX.root_service_->is_full_service()) {
+    ret = GCTX.root_service_->in_service() ? OB_SERVER_IS_INIT : OB_RS_NOT_MASTER;
+    LOG_WARN("root service is not ready", K(ret));
+  } else if (!rootserver::ObDDLServiceLauncher::is_ddl_service_started()) {
+    ret = OB_RS_NOT_MASTER;
+    LOG_WARN("ddl service is not started", K(ret));
+  } else if (!GCONF.enable_ddl) {
+    ret = OB_OP_NOT_ALLOW;
+    LOG_WARN("ddl is disabled", K(ret));
+  } else if (OB_FAIL(rootserver::ObDDLService::get_tenant_schema_guard_with_version_in_inner_table(
       tenant_id, schema_guard))) {
-    LOG_WARN("get tenant schema guard failed", K(ret), K(tenant_id));
-  } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id, data_table_id, table_schema))) {
-    LOG_WARN("get table schema failed", K(ret), K(tenant_id), K(data_table_id));
-  } else if (OB_ISNULL(table_schema)) { // skip
-    LOG_INFO("table not exist", K(ret), K(tenant_id), K(data_table_id));
-  } else if (OB_FAIL(alter_table_arg.alter_table_schema_.set_origin_table_name(table_schema->get_table_name_str()))) {
-    LOG_WARN("failed to set orig table name", K(ret));
-  } else if (OB_FAIL(schema_guard.get_database_schema(tenant_id, table_schema->get_database_id(), db_schema))) {
-    LOG_WARN("fail to get database schema", K(ret), K(tenant_id));
-  } else if (OB_ISNULL(db_schema)) { // skip
-    LOG_INFO("database not exist", K(ret), K(tenant_id), K(table_schema->get_database_id()));
-  } else if (OB_FAIL(alter_table_arg.alter_table_schema_.set_origin_database_name(db_schema->get_database_name_str()))) {
-    LOG_WARN("failed to set orig database name", K(ret));
-  } else {
-    alter_table_arg.alter_table_schema_.set_tenant_id(tenant_id);
-    alter_table_arg.ddl_task_type_ = share::GET_SPECIFIC_TABLE_TABLETS;
-    alter_table_arg.table_id_ = data_table_id;
-    alter_table_arg.hidden_table_id_ = index_table_id;
-    alter_table_arg.exec_tenant_id_ = tenant_id;
-    alter_table_arg.tz_info_wrap_.set_tz_info_offset(0);
-    alter_table_arg.nls_formats_[ObNLSFormatEnum::NLS_DATE] = ObTimeConverter::COMPAT_OLD_NLS_DATE_FORMAT;
-    alter_table_arg.nls_formats_[ObNLSFormatEnum::NLS_TIMESTAMP] = ObTimeConverter::COMPAT_OLD_NLS_TIMESTAMP_FORMAT;
-    alter_table_arg.nls_formats_[ObNLSFormatEnum::NLS_TIMESTAMP_TZ] = ObTimeConverter::COMPAT_OLD_NLS_TIMESTAMP_TZ_FORMAT;
-    alter_table_arg.compat_mode_ = lib::Worker::CompatMode::MYSQL;
-    ObTZMapWrap tz_map_wrap;
-    int64_t rpc_timeout = 0;
-    ObSArray<uint64_t> target_tablet_ids;
-
-    if (OB_ISNULL(GCTX.rs_rpc_proxy_)) {
-      ret = OB_INVALID_ARGUMENT;
-      LOG_WARN("invalid argument", KR(ret), KP(GCTX.rs_rpc_proxy_));
-    } else if (OB_FAIL(OTTZ_MGR.get_tenant_tz(tenant_id, tz_map_wrap))) {
-      LOG_WARN("get tenant timezone map failed", K(ret), K(tenant_id));
-    } else if (FALSE_IT(alter_table_arg.set_tz_info_map(tz_map_wrap.get_tz_map()))) {
-    } else if (OB_FAIL(ObDDLUtil::get_ddl_rpc_timeout(tenant_id, index_table_id, rpc_timeout))) {
-      LOG_WARN("get ddl rpc timeout failed", K(ret));
-    } else if (OB_FAIL(GCTX.rs_rpc_proxy_->to(obrpc::ObRpcProxy::myaddr_).timeout(rpc_timeout).
-        execute_ddl_task(alter_table_arg, target_tablet_ids))) {
-      LOG_WARN("fail to get table tablet ids", K(ret));
-    } else {
-      LOG_INFO("success to get specific table tablet ids", K(ret), K(alter_table_arg), K(target_tablet_ids));
-      for (int64_t i = 0; OB_SUCC(ret) && i < target_tablet_ids.count(); ++i) {
-        ObTabletID tmp_tablet_id(target_tablet_ids.at(i));
-        if (OB_FAIL(tablet_ids.push_back(tmp_tablet_id))) {
-          LOG_WARN("fail to push back target tablet id", K(ret));
-        }
-      }
-    }
+    LOG_WARN("get fresh tenant schema guard failed", K(ret), K(tenant_id));
+  } else if (OB_SYS_TENANT_ID != tenant_id
+             && OB_FAIL(schema_guard.get_tenant_info(tenant_id, tenant_schema))) {
+    LOG_WARN("get tenant schema failed", K(ret), K(tenant_id));
+  } else if (OB_SYS_TENANT_ID != tenant_id && OB_ISNULL(tenant_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("tenant schema is null", K(ret), K(tenant_id));
+  } else if (OB_SYS_TENANT_ID != tenant_id && (tenant_schema->is_creating() || tenant_schema->is_dropping())) {
+    ret = OB_OP_NOT_ALLOW;
+    LOG_WARN("tenant is creating or dropping", K(ret), K(tenant_id));
+  } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id, data_table_id, data_schema))) {
+    LOG_WARN("get data table schema failed", K(ret), K(tenant_id), K(data_table_id));
+  } else if (OB_ISNULL(data_schema)) {
+    LOG_INFO("data table not exist", K(tenant_id), K(data_table_id));
+  } else if (OB_FAIL(schema_guard.get_database_schema(tenant_id, data_schema->get_database_id(), db_schema))) {
+    LOG_WARN("get database schema failed", K(ret), K(tenant_id));
+  } else if (OB_ISNULL(db_schema)) {
+    LOG_INFO("database not exist", K(tenant_id), K(data_schema->get_database_id()));
+  } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id, index_table_id, index_schema))) {
+    LOG_WARN("get index table schema failed", K(ret), K(tenant_id), K(index_table_id));
+  } else if (OB_ISNULL(index_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("index table schema is null", K(ret), K(index_table_id));
+  } else if (!index_schema->is_vec_vid_rowkey_type() && !index_schema->is_vec_index_snapshot_data_type()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected index type for tablet lookup", K(ret), KPC(index_schema));
+  } else if (OB_FAIL(ObVectorIndexUtil::get_rowkey_vid_tablets(schema_guard, *data_schema, tenant_id, tablet_ids))) {
+    LOG_WARN("get rowkey vid tablets failed", K(ret), K(tenant_id), K(index_table_id));
   }
   return ret;
 }
