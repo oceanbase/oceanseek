@@ -1865,6 +1865,13 @@ int ObJoinOrder::process_basic_vec_info_for_index_merge_node(const ObDMLStmt *st
                                                                 vector_expr,
                                                                 stmt))) {
       LOG_WARN("failed to set vector index parameters", K(ret));
+    } else if (OPT_CTX.get_is_weak_read()
+               && (index_merge_path->vec_idx_info_->vec_extra_info_.is_hnsw_vec_scan()
+                   || index_merge_path->vec_idx_info_->vec_extra_info_.is_ipivf_scan())) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "weak read using HNSW or SINDI index is");
+      LOG_WARN("weak read using HNSW or SINDI index is not supported", K(ret),
+               K(index_merge_path->vec_idx_info_->vec_extra_info_.vector_index_param_.type_));
     } else if (OB_FAIL(ObVectorIndexUtil::set_adaptive_try_path(
         index_merge_path->vec_idx_info_->vec_extra_info_, stmt->get_vector_index_query_param(), false))) {
       LOG_WARN("set vector index adaptive try path", K(ret));
@@ -2091,6 +2098,13 @@ int ObJoinOrder::process_vec_index_info(const ObDMLStmt *stmt,
                                                                  vector_expr,
                                                                  stmt))) {
       LOG_WARN("failed to set vector index parameters", K(ret));
+    } else if (OPT_CTX.get_is_weak_read()
+               && (access_path.vec_idx_info_->vec_extra_info_.is_hnsw_vec_scan()
+                   || access_path.vec_idx_info_->vec_extra_info_.is_ipivf_scan())) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "weak read using HNSW or SINDI index is");
+      LOG_WARN("weak read using HNSW or SINDI index is not supported", K(ret),
+               K(access_path.vec_idx_info_->vec_extra_info_.vector_index_param_.type_));
     } else {
       access_path.vec_idx_info_->inited_ = true;
       access_path.vec_idx_info_->vec_extra_info_.set_row_count(table_meta_info_.table_row_count_);
