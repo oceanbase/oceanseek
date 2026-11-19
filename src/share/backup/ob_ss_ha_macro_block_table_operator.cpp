@@ -818,9 +818,11 @@ int ObSSHAMacroBlockTaskOperator::get_pending_or_doing_tasks(
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("invalid arguments", K(ret), K(tenant_id), K(parent_task_id), K(task_type));
     } else if (OB_FAIL(sql.assign_fmt(
-        "SELECT * FROM %s WHERE tenant_id = %lu AND parent_task_id = %ld AND task_type = '%s' "
+        "SELECT /*+ INDEX(%s idx_ha_task_status) */ * FROM %s "
+        "WHERE tenant_id = %lu AND parent_task_id = %ld AND task_type = '%s' "
         "AND task_status IN ('PENDING', 'DOING') "
         "ORDER BY tenant_id, parent_task_id, task_type, ls_id, task_id",
+        OB_ALL_TENANT_MACRO_BLOCK_HA_TASK_TNAME,
         OB_ALL_TENANT_MACRO_BLOCK_HA_TASK_TNAME,
         tenant_id,
         parent_task_id,
