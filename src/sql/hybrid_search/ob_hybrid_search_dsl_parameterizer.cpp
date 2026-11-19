@@ -359,7 +359,8 @@ int ObHybridSearchDslParameterizer::create_input_node(ObIAllocator &allocator,
         literal->type_ = T_INT;
         literal->value_ = node.get_int();
       } else if (type == ObJsonNodeType::J_UINT) {
-        literal->type_ = T_UINT64;
+        // JSON uint values within int64 range are signed SQL integer literals.
+        literal->type_ = node.get_uint() <= static_cast<uint64_t>(INT64_MAX) ? T_INT : T_UINT64;
         literal->value_ = static_cast<int64_t>(node.get_uint());
       } else if (type == ObJsonNodeType::J_BOOLEAN) {
         literal->type_ = T_BOOL;

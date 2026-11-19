@@ -70,6 +70,12 @@ public:
                             const ObSQLSessionInfo &session,
                             ObRawExpr *&expr,
                             bool &trans_happened);
+  // Normalize a typed IN/NOT IN before inserting implicit casts, also used by DSL terms.
+  static int check_and_transform_in_or_notin(ObRawExprFactory &expr_factory,
+                                             const ObSQLSessionInfo &session,
+                                             ObRawExpr *&in_expr,
+                                             bool &trans_happened);
+
 private:
   virtual int need_transform(const common::ObIArray<ObParentDMLStmt> &parent_stmts,
                              const int64_t current_level,
@@ -497,10 +503,6 @@ private:
       common::ObIArray<ObRawExpr *> &transed_in_exprs,
       ObRawExpr *&final_or_expr);
 
-  static int check_and_transform_in_or_notin(ObRawExprFactory &expr_factory,
-                                             const ObSQLSessionInfo &session,
-                                             ObRawExpr *&in_expr,
-                                             bool &trans_happened);
   static int replace_in_or_notin_recursively(ObRawExprFactory &expr_factory,
                                              const ObSQLSessionInfo &session,
                                              ObRawExpr *&root_expr,

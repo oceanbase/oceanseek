@@ -24,7 +24,7 @@ public:
   static int parse_json(common::ObIAllocator &allocator, const common::ObString &text,
       common::ObJsonNode *&root, const char *&syntax_error,
       uint64_t &error_offset);
-  // Text is decoded SQL input or a variable snapshot. Results use the request allocator.
+  // Text is normalized UTF8 input. Results use the request allocator.
   static int extract(common::ObIAllocator &allocator, const common::ObString &text,
       const ObHybridDslSource &source, ObHybridDslRequestInfo *&request,
       common::ObIArray<ObPCParam *> &raw_params);

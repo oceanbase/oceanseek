@@ -304,19 +304,29 @@ int ObHybridSearchPlanCache::finish_fast_parse(ObIAllocator &allocator,
         ObObj variable;
         ObSEArray<ObPCParam *, 8> dsl_params;
         int extract_ret = OB_SUCCESS;
-        if (SOURCE_USER_VARIABLE == source.kind_) {
-          if (OB_ISNULL(session)) {
-            extract_ret = OB_NOT_SUPPORTED;
-          } else if (OB_SUCCESS != (extract_ret = session->get_user_variable_value(
-                                     source.user_var_name_, variable))) {
+        ObCollationType source_collation = CS_TYPE_INVALID;
+        ObString utf8_text;
+        if (OB_ISNULL(session)) {
+          extract_ret = OB_NOT_SUPPORTED;
+        } else if (source.kind_ == SOURCE_USER_VARIABLE) {
+          if (OB_SUCCESS != (extract_ret = session->get_user_variable_value(source.user_var_name_, variable))) {
+          } else if (OB_SUCCESS != (extract_ret = variable.get_string(text))) {
           } else {
-            extract_ret = variable.get_string(text);
+            source_collation = variable.get_collation_type();
           }
+        } else {
+          // Charset introducers are rejected by carrier recognition and use the
+          // full resolver. A supported literal follows collation_connection.
+          extract_ret = session->get_collation_connection(source_collation);
         }
         if (OB_SUCCESS == extract_ret) {
           context->get_source().fallback_reason_ = DSL_FALLBACK_DSL_EXTRACTION;
-          extract_ret = ObHybridSearchDslParameterizer::extract(allocator, text, source,
-                                                                request, dsl_params);
+          extract_ret = ObCharset::charset_convert(
+              allocator, text, source_collation, CS_TYPE_UTF8MB4_BIN, utf8_text);
+          if (OB_SUCCESS == extract_ret) {
+            extract_ret = ObHybridSearchDslParameterizer::extract(
+                allocator, utf8_text, source, request, dsl_params);
+          }
         } else {
           context->get_source().fallback_reason_ = DSL_FALLBACK_USER_VARIABLE;
         }
@@ -751,9 +761,15 @@ int ObHybridSearchPlanCache::append_dsl_params(ObPlanCacheCtx &ctx, SqlInfo &sql
     // Extend the growable SqlInfo array before gen_special_param_info() copies
     // it into the fixed-size request metadata used by PCV initialization.
     for (int64_t i = 0; OB_SUCC(ret) && i < dsl_count; ++i) {
-      // JSON input has no SQL charset introducer. The ordinary resolver uses
-      // the connection collation, exactly as for an unadorned SQL literal.
-      OZ(sql_info.param_charset_type_.push_back(CHARSET_INVALID));
+      const ObPCParam *raw = ctx.fp_result_.raw_params_.at(sql_count + i);
+      if (OB_ISNULL(raw) || OB_ISNULL(raw->node_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("missing DSL raw parameter", K(ret), K(i));
+      } else {
+        // JSON strings and serialized arrays contain UTF8 bytes. Persist this
+        // charset for both cold compilation and cache-hit parameter restoration.
+        OZ(sql_info.param_charset_type_.push_back(raw->node_->type_ == T_VARCHAR ? CHARSET_UTF8MB4 : CHARSET_INVALID));
+      }
     }
     if (OB_SUCC(ret)) {
       dsl_raw.init(dsl_count, ctx.fp_result_.raw_params_.get_data() + sql_count, dsl_count);

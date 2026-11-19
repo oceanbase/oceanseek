@@ -867,6 +867,10 @@ TEST_F(SearchTextBindingTest, resolver_fields_and_query_parameters)
   ASSERT_EQ(OB_SUCCESS, oceanbase::ObPreProcessSysVars::init_sys_var());
   ASSERT_EQ(OB_SUCCESS, session.test_init(0, 0, 0, nullptr));
   ASSERT_EQ(OB_SUCCESS, session.load_default_sys_variable(false, true));
+  ObExecContext exec_ctx(alloc_);
+  exec_ctx.set_my_session(&session);
+  session.set_cur_exec_ctx(&exec_ctx);
+  auto unregister_exec_ctx = MakeScopedLambda([&]() { session.set_cur_exec_ctx(nullptr); });
   ObResolverParams params;
   params.allocator_ = &alloc_;
   params.expr_factory_ = &factory;
@@ -978,8 +982,14 @@ TEST_F(SearchTextBindingTest, resolver_fields_and_query_parameters)
     ObString expected_query;
     ASSERT_EQ(OB_SUCCESS, ObCharset::charset_convert(alloc_, ObString("数据库"),
         CS_TYPE_UTF8MB4_BIN, CS_TYPE_GBK_BIN, expected_query));
+    ASSERT_NE(nullptr, fulltext->query_);
     EXPECT_EQ(CS_TYPE_GBK_BIN, fulltext->query_->get_collation_type());
-    EXPECT_EQ(expected_query, static_cast<const ObConstRawExpr *>(fulltext->query_)->get_value().get_string());
+    ParamStore param_store;
+    ObObj result;
+    ASSERT_EQ(OB_SUCCESS, ObSQLUtils::calc_const_expr(
+        &session, *fulltext->query_, result, alloc_, param_store));
+    EXPECT_EQ(CS_TYPE_GBK_BIN, result.get_collation_type());
+    EXPECT_EQ(expected_query, result.get_string());
   }
 }
 
@@ -990,6 +1000,10 @@ TEST_F(SearchTextBindingTest, multi_field_paths_survive_resolve_and_copy)
   ASSERT_EQ(OB_SUCCESS, oceanbase::ObPreProcessSysVars::init_sys_var());
   ASSERT_EQ(OB_SUCCESS, session.test_init(0, 0, 0, nullptr));
   ASSERT_EQ(OB_SUCCESS, session.load_default_sys_variable(false, true));
+  ObExecContext exec_ctx(alloc_);
+  exec_ctx.set_my_session(&session);
+  session.set_cur_exec_ctx(&exec_ctx);
+  auto unregister_exec_ctx = MakeScopedLambda([&]() { session.set_cur_exec_ctx(nullptr); });
   ObResolverParams params;
   params.allocator_ = &alloc_;
   params.expr_factory_ = &factory;
@@ -1699,7 +1713,12 @@ TEST_F(SearchTextBindingTest, production_dsl_to_optimizer_path_preserves_if05)
     EXPECT_EQ(OB_FTS_INDEX_TYPE_PHRASE_MATCH, bound.index_type_);
     EXPECT_TRUE(node->async_delete_info_.is_valid());
     EXPECT_EQ(deletes.get_table_id(), node->async_delete_info_.get_delete_idx_tid());
-    EXPECT_EQ(ObString("alpha beta"), static_cast<ObConstRawExpr *>(node->query_text_)->get_value().get_string());
+    ParamStore param_store;
+    ObObj result;
+    ASSERT_NE(nullptr, node->query_text_);
+    ASSERT_EQ(OB_SUCCESS, ObSQLUtils::calc_const_expr(
+        &session, *node->query_text_, result, alloc_, param_store));
+    EXPECT_EQ(ObString("alpha beta"), result.get_string());
   }
   EXPECT_EQ(ObFullTextQueryNode::OB_FULLTEXT_QUERY_TYPE_MATCH, match->get_query_type());
   EXPECT_EQ(phrase_.get_table_id(), match->inv_idx_tid_);

@@ -812,27 +812,11 @@ int ObDMLStmtPrinter::print_hybrid_search_table(const TableItem *table_item)
       LOG_WARN("hybrid search raw dsl param string is empty", K(ret), KPC(table_item));
     } else {
       ObString dsl_param_str = table_item->dsl_query_->raw_dsl_param_str_.trim_space_only();
-      DATA_PRINTF(", '");
-      if (OB_FAIL(ret)) {
-      } else {
-        for (int64_t i = 0; OB_SUCC(ret) && i < dsl_param_str.length(); ++i) {
-          const char ch = dsl_param_str.ptr()[i];
-          if ('\'' == ch) {
-            DATA_PRINTF("''");
-          } else if ('\\' == ch) {
-            // Keep backslashes after SQL literal parsing.
-            DATA_PRINTF("\\\\");
-          } else {
-            DATA_PRINTF("%c", ch);
-          }
-        }
-        if (OB_SUCC(ret)) {
-          DATA_PRINTF("'");
-        }
+      DATA_PRINTF(", _utf8mb4 X'");
+      for (int64_t i = 0; OB_SUCC(ret) && i < dsl_param_str.length(); ++i) {
+        DATA_PRINTF("%02x", static_cast<unsigned int>(static_cast<unsigned char>(dsl_param_str.ptr()[i])));
       }
-      if (OB_SUCC(ret)) {
-        DATA_PRINTF(")");
-      }
+      DATA_PRINTF("')");
     }
   }
   return ret;

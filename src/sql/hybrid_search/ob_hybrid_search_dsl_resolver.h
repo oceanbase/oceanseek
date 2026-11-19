@@ -301,17 +301,17 @@ struct ObDSLSortItem
 
   ObDSLSortItem()
     : field_expr_(nullptr), output_expr_(nullptr), is_asc_(true), missing_mode_(MissingMode::NONE),
-      missing_literal_(nullptr), is_score_sort_(false), is_unique_shard_doc_(false) {}
+      missing_expr_(nullptr), is_score_sort_(false), is_unique_shard_doc_(false) {}
   ~ObDSLSortItem() {}
 
-  ObRawExpr *field_expr_;         // Effective sort key, including a literal missing replacement. For JSON like COALESCE(NULLIF(expr, JSON null), missing_literal).
+  ObRawExpr *field_expr_;         // Effective sort key, including a literal missing replacement. For JSON like COALESCE(NULLIF(expr, JSON null), missing_expr).
   ObRawExpr *output_expr_;        // Normalized value before missing replacement, used by __sort. For JSON like NULLIF(expr, JSON null).
   bool is_asc_;
   MissingMode missing_mode_;      // NONE/FIRST/LAST/LITERAL for DSL missing handling
-  ObConstRawExpr *missing_literal_; // used when missing_mode_ == LITERAL
+  ObRawExpr *missing_expr_;      // Literal or conversion expression used when missing_mode_ == LITERAL
   bool is_score_sort_;
   bool is_unique_shard_doc_; // Identifies __shard_doc, built from the main-table tablet and hidden increment.
-  TO_STRING_KV(K(field_expr_), K(output_expr_), K(is_asc_), K(missing_mode_), K(missing_literal_), K(is_score_sort_));
+  TO_STRING_KV(K(field_expr_), K(output_expr_), K(is_asc_), K(missing_mode_), K(missing_expr_), K(is_score_sort_));
 };
 
 struct ObDSLCollapseInfo {
@@ -392,7 +392,7 @@ struct ObDSLQueryInfo
   ObSEArray<ObRawExpr *, 4, ModulePageAllocator, true> search_after_values_;
   // JSON columns needed to evaluate sort keys after lookup.
   ObSEArray<ObRawExpr *, 4, ModulePageAllocator, true> sort_lookup_base_columns_;
-  ObString raw_dsl_param_str_;
+  ObString raw_dsl_param_str_; // Original DSL JSON text converted to UTF8.
   bool is_top_k_query_;
   ObDSLResultMode result_mode_;
   bool track_score_;
@@ -557,22 +557,25 @@ public:
            json_type == ObJsonNodeType::J_BOOLEAN ||
            ObIJsonBase::is_json_number_type(json_type);
   }
-  inline static ObJsonNodeType resolve_type_mapping(ObJsonNodeType json_type,
+  inline static ObJsonNodeType resolve_type_mapping(const ObIJsonBase &node,
                                                     ObColumnRefRawExpr *col_expr = nullptr,
                                                     ObEsQueryItem query_type = QUERY_ITEM_UNKNOWN,
                                                     ObObjType array_elem_type = ObMaxType)
   {
+    const ObJsonNodeType json_type = node.json_type();
+    ObJsonNodeType target_type = json_type;
     if (OB_NOT_NULL(col_expr) &&
         col_expr->get_result_type().get_type() == ObTinyIntType &&
         col_expr->get_result_type().get_precision() == DEFAULT_PRECISION_FOR_BOOL) {
-      return ObJsonNodeType::J_BOOLEAN;
+      target_type = ObJsonNodeType::J_BOOLEAN;
     } else if (IS_QUERY_ITEM_ARRAY(query_type) &&
                ObIJsonBase::is_json_number_type(json_type) &&
                (array_elem_type == ObDoubleType || array_elem_type == ObFloatType)) {
-      return ObJsonNodeType::J_DOUBLE;
-    } else {
-      return json_type;
+      target_type = ObJsonNodeType::J_DOUBLE;
+    } else if (json_type == ObJsonNodeType::J_UINT && node.get_uint() <= static_cast<uint64_t>(INT64_MAX)) {
+      target_type = ObJsonNodeType::J_INT;
     }
+    return target_type;
   }
 
   static const int64_t FROM_DEFAULT = 0;
@@ -606,7 +609,7 @@ private :
   int get_wildcard_pattern_from_json_node(ObIJsonBase &node, ObString &pattern_str);
   int append_wildcard_pattern_char(char *buf, const int64_t max_len, int64_t &pos, const char ch);
   int append_wildcard_like_escaped_char(char *buf, const int64_t max_len, int64_t &pos, const char ch);
-  int resolve_query_string_expr(const ObString &str_value, const ObCollationType target_coll, ObRawExpr *&expr);
+  int resolve_query_string_expr(ObIJsonBase &node, const ObCollationType target_coll, ObRawExpr *&expr);
   int formalize_exprs();
   int get_col_idx_info(const ObString &col_name, ObColumnIndexInfo *&idx_info);
   int get_dist_algo_type(ObColumnRefRawExpr *field_expr,
@@ -621,8 +624,6 @@ private :
   int resolve_field_expr_and_path(ObString &field_name, ObColumnRefRawExpr *&col_expr, ObString &path_str);
   int has_user_column_name(const ObString &col_name, bool &exists, ObColumnRefRawExpr **col_expr = nullptr);
   int check_aggs_bucket_name(const ObString &agg_name);
-  static int trunc_json_float_to_int(ObIJsonBase &json_node, bool is_unsigned,
-                                     int64_t &int_val, uint64_t &uint_val);
   int collect_col_idx(const share::schema::ObTableSchema *index_schema);
   int collect_search_index_info(const share::schema::ObTableSchema *index_schema);
   int init_bool_info(ObIJsonBase &req_node, ObConstRawExpr *&msm_expr, ObConstRawExpr *&boost_expr);
@@ -642,6 +643,10 @@ private :
   int resolve_bool_clause(ObIJsonBase &req_node, ObIArray<ObDSLQuery*> &queries, ObDSLQuery *parent_query, ObEsQueryItem outer_query_type);
   int resolve_boost(ObIJsonBase &req_node, ObConstRawExpr *&boost_expr, ObEsQueryItem query_type, ObEsQueryItem outer_query_type);
   int resolve_const(ObIJsonBase &req_node, ObRawExpr *&expr, ObJsonNodeType target_type, ObEsQueryItem query_type = QUERY_ITEM_UNKNOWN, ObObjType array_base_type = ObMaxType);
+  int resolve_integer_value(ObIJsonBase &node, ObObjType target_type, ObRawExpr *&expr,
+      bool discard_fraction = false);
+  int resolve_terms_value(ObIJsonBase &node, ObColumnRefRawExpr *col_expr,
+      ObEsQueryItem query_type, ObObjType array_base_type, ObRawExpr *&expr);
   int resolve_const_to_double(ObIJsonBase &req_node, ObConstRawExpr *&const_expr, ObObjType array_base_type = ObMaxType);
   int resolve_const_to_int(ObIJsonBase &req_node, ObConstRawExpr *&const_expr);
   int resolve_const_to_uint(ObIJsonBase &req_node, ObConstRawExpr *&const_expr);
@@ -700,6 +705,7 @@ private :
   int resolve_sort_options(ObIJsonBase *field_opts, ObDSLSortItem &dsl_sort_item);
   int resolve_sort_field(ObString field_name, bool validate_sort_type, ObDSLSortItem &dsl_sort_item);
   int resolve_sort_missing_literal(ObIJsonBase &missing_node, ObDSLSortItem &dsl_sort_item);
+  int build_sort_missing_integer_expr(ObIJsonBase &node, ObObjType col_type, ObRawExpr *&expr);
   int build_sort_missing_string_literal(ObIJsonBase &missing_node, ObDSLSortItem &dsl_sort_item);
   int build_sort_missing_temporal_literal(ObIJsonBase &missing_node, ObDSLSortItem &dsl_sort_item);
   int build_sort_expr(const ObDSLSortItem &dsl_sort_item, ObRawExpr *&sort_expr);
@@ -710,7 +716,6 @@ private :
   int resolve_slop(ObIJsonBase &req_node, int32_t &slop);
   int resolve_term(ObIJsonBase &req_node, ObDSLQuery *&query, ObDSLQuery *parent_query, ObEsQueryItem outer_query_type);
   int resolve_terms(ObIJsonBase &req_node, ObDSLQuery *&query, ObDSLQuery *parent_query, ObEsQueryItem outer_query_type);
-  int resolve_terms_value(ObIJsonBase &node, ObColumnRefRawExpr *col_expr, ObEsQueryItem query_type, ObObjType array_base_type, ObRawExpr *&expr);
   int resolve_wildcard(ObIJsonBase &req_node, ObDSLQuery *&query, ObDSLQuery *parent_query, ObEsQueryItem outer_query_type);
   int resolve_exists(ObIJsonBase &req_node, ObDSLQuery *&query, ObDSLQuery *parent_query, ObEsQueryItem outer_query_type);
   int resolve_weighted_sum(ObIJsonBase &req_node);

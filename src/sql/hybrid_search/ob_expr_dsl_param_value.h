@@ -26,7 +26,8 @@ public:
     ARRAY_FLOAT_NARROW = 6,
     ARRAY_FLOAT_IN_RANGE = 7,
     INTEGER_TERMS_BASE = 128, // Add the integer column/array element ObObjType.
-    TEXT_COLLATION_BASE = 1024
+    // Guard the choice between a typed integer, a fractional candidate and SQL fallback.
+    INTEGER_CANDIDATE_BASE = 256, // Add the integer column/array element ObObjType.
   };
   explicit ObExprDslParamValue(common::ObIAllocator &alloc);
   virtual ~ObExprDslParamValue() = default;
@@ -36,6 +37,9 @@ public:
   // A NULL result denotes a valid fractional candidate that cannot match an integer field.
   static int convert_integer_terms(common::ObIAllocator &allocator, common::ObIJsonBase &node,
       common::ObObjType target_type, common::ObObj &result);
+  enum IntegerCandidateKind { SQL_FALLBACK = 0, INTEGER_VALUE = 1, FRACTIONAL_VALUE = 2 };
+  static IntegerCandidateKind classify_integer_candidate(const common::ObObj &value,
+      common::ObObjType target_type);
   static int eval_value(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &result);
 private:
   DISALLOW_COPY_AND_ASSIGN(ObExprDslParamValue);

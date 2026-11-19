@@ -4,7 +4,6 @@
  */
 #define USING_LOG_PREFIX SQL_ENG
 #include "sql/hybrid_search/ob_expr_dsl_param_value.h"
-#include "lib/charset/ob_charset.h"
 #include "lib/json_type/ob_json_tree.h"
 #include "sql/resolver/expr/ob_raw_expr.h"
 
@@ -43,6 +42,9 @@ int ObExprDslParamValue::calc_result_type2(ObExprResType &type, ObExprResType &i
     if (!ob_is_string_type(input.get_type()) && input.get_type() != ObUInt64Type) {
       input.set_calc_type(ObDoubleType);
     }
+  } else if (kind >= INTEGER_CANDIDATE_BASE && kind < INTEGER_CANDIDATE_BASE + ObMaxType
+             && ob_is_integer_type(static_cast<ObObjType>(kind - INTEGER_CANDIDATE_BASE))) {
+    type.set_int();
   } else if (kind >= INTEGER_TERMS_BASE && kind < INTEGER_TERMS_BASE + ObMaxType
              && ob_is_integer_type(static_cast<ObObjType>(kind - INTEGER_TERMS_BASE))) {
     const ObObjType target_type = static_cast<ObObjType>(kind - INTEGER_TERMS_BASE);
@@ -51,18 +53,44 @@ int ObExprDslParamValue::calc_result_type2(ObExprResType &type, ObExprResType &i
     if (input.get_type() == ObDecimalIntType) {
       input.set_calc_type(ObNumberType);
     }
-  } else if (kind >= TEXT_COLLATION_BASE
-             && ObCharset::is_valid_collation(
-                 static_cast<ObCollationType>(kind - TEXT_COLLATION_BASE))) {
-    type.set_varchar();
-    type.set_collation_type(static_cast<ObCollationType>(kind - TEXT_COLLATION_BASE));
-    type.set_collation_level(CS_LEVEL_COERCIBLE);
-    type.set_length(OB_MAX_VARCHAR_LENGTH);
   } else {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unsupported DSL conversion mode", K(ret), K(kind));
   }
   return ret;
+}
+
+ObExprDslParamValue::IntegerCandidateKind ObExprDslParamValue::classify_integer_candidate(
+    const ObObj &value, ObObjType target_type)
+{
+  bool fits = false;
+  if (ob_is_integer_type(target_type)) {
+    if (ob_is_uint_tc(value.get_type())) {
+      const uint64_t v = value.get_uint64();
+      fits = ob_is_uint_tc(target_type) ? v <= UINT_MAX_VAL[target_type]
+          : v <= static_cast<uint64_t>(INT_MAX_VAL[target_type]);
+    } else if (ob_is_int_tc(value.get_type())) {
+      const int64_t v = value.get_int();
+      fits = ob_is_uint_tc(target_type) ? v >= 0 && static_cast<uint64_t>(v) <= UINT_MAX_VAL[target_type]
+          : v >= INT_MIN_VAL[target_type] && v <= INT_MAX_VAL[target_type];
+    } else if (value.get_type() == ObDoubleType) {
+      const double v = value.get_double();
+      // Exclusive power-of-two upper bounds avoid rounding INT64/UINT64_MAX up.
+      if (!isnan(v) && !isinf(v) && trunc(v) == v) {
+        if (ob_is_uint_tc(target_type)) {
+          fits = v >= 0 && v < 18446744073709551616.0
+              && static_cast<uint64_t>(v) <= UINT_MAX_VAL[target_type];
+        } else {
+          fits = v >= -9223372036854775808.0 && v < 9223372036854775808.0
+              && static_cast<int64_t>(v) >= INT_MIN_VAL[target_type]
+              && static_cast<int64_t>(v) <= INT_MAX_VAL[target_type];
+        }
+      }
+    }
+  }
+  const bool fractional = value.is_double() && !isnan(value.get_double()) && !isinf(value.get_double())
+      && trunc(value.get_double()) != value.get_double();
+  return fits ? INTEGER_VALUE : fractional ? FRACTIONAL_VALUE : SQL_FALLBACK;
 }
 
 int ObExprDslParamValue::convert_integer_terms(ObIAllocator &allocator, ObIJsonBase &node,
@@ -232,6 +260,18 @@ int ObExprDslParamValue::eval_value(const ObExpr &expr, ObEvalCtx &ctx, ObDatum 
             ? value : static_cast<double>(narrowed));
       }
     }
+  } else if (expr.extra_ >= INTEGER_CANDIDATE_BASE
+             && expr.extra_ < INTEGER_CANDIDATE_BASE + ObMaxType) {
+    ObObj value;
+    const ObObjType input_type = expr.args_[0]->datum_meta_.type_;
+    if (ob_is_int_tc(input_type)) {
+      value.set_int(input->get_int());
+    } else if (ob_is_uint_tc(input_type)) {
+      value.set_uint64(input->get_uint());
+    } else if (input_type == ObDoubleType) {
+      value.set_double(input->get_double());
+    }
+    result.set_int(classify_integer_candidate(value, static_cast<ObObjType>(expr.extra_ - INTEGER_CANDIDATE_BASE)));
   } else if (expr.extra_ >= INTEGER_TERMS_BASE && expr.extra_ < INTEGER_TERMS_BASE + ObMaxType) {
     ObEvalCtx::TempAllocGuard guard(ctx);
     const ObObjType target_type = static_cast<ObObjType>(expr.extra_ - INTEGER_TERMS_BASE);
@@ -260,32 +300,8 @@ int ObExprDslParamValue::eval_value(const ObExpr &expr, ObEvalCtx &ctx, ObDatum 
     }
     OZ(result.from_obj(converted));
   } else {
-    ObEvalCtx::TempAllocGuard guard(ctx);
-    const ObString text = input->get_string();
-    ObString converted;
-    const ObCollationType from = expr.args_[0]->datum_meta_.cs_type_;
-    const ObCollationType to = expr.datum_meta_.cs_type_;
-    if (OB_FAIL(ObCharset::charset_convert(guard.get_allocator(), text, from, to, converted))) {
-      if (ret == OB_ERR_INCORRECT_STRING_VALUE) {
-        ret = OB_ERR_INVALID_CHARACTER_STRING;
-        char context[128];
-        const int len = snprintf(context, sizeof(context),
-            "query text with %s", ObCharset::charset_name(to));
-        LOG_USER_ERROR(OB_ERR_INVALID_CHARACTER_STRING,
-            MIN(MAX(len, 0), static_cast<int>(sizeof(context)) - 1), context,
-            text.length(), text.ptr());
-      }
-    } else {
-      char *buf = expr.get_str_res_mem(ctx, converted.length());
-      if (OB_ISNULL(buf) && converted.length() > 0) {
-        ret = OB_ALLOCATE_MEMORY_FAILED;
-      } else {
-        if (converted.length() > 0) {
-          MEMCPY(buf, converted.ptr(), converted.length());
-        }
-        result.set_string(buf, converted.length());
-      }
-    }
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unsupported DSL conversion mode", K(ret), K(expr.extra_));
   }
   return ret;
 }

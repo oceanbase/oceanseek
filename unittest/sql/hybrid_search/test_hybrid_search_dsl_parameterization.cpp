@@ -17,9 +17,12 @@
 #include "sql/session/ob_sql_session_info.h"
 
 #include "sql/test_sql_utils.h"
+#include "sql/hybrid_search/ob_hybrid_search_dsl_resolver.h"
 #undef private
 #undef protected
 #include "sql/resolver/expr/ob_raw_expr_util.h"
+#include "sql/resolver/expr/ob_raw_expr_copier.h"
+#include "sql/ob_sql_utils.h"
 #include "sql/rewrite/ob_expr_range_converter.h"
 #include "share/search_index/ob_search_index_encoder.h"
 #include "lib/ob_name_def.h"
@@ -34,7 +37,15 @@ public:
   TestHybridDslParameterization()
       : compat_guard_(lib::Worker::CompatMode::MYSQL),
         old_fast_parser_(GCONF._ob_enable_fast_parser) {}
-  void SetUp() override { GCONF._ob_enable_fast_parser = true; }
+  void SetUp() override
+  {
+    GCONF._ob_enable_fast_parser = true;
+    ASSERT_EQ(OB_SUCCESS, ObPreProcessSysVars::init_sys_var());
+    ASSERT_EQ(OB_SUCCESS, session_.test_init(0, 0, 0, nullptr));
+    ASSERT_EQ(OB_SUCCESS, session_.load_default_sys_variable(false, true));
+    ASSERT_EQ(OB_SUCCESS, session_.update_sys_variable(
+        share::SYS_VAR_COLLATION_CONNECTION, static_cast<int64_t>(CS_TYPE_UTF8MB4_BIN)));
+  }
   void TearDown() override { GCONF._ob_enable_fast_parser = old_fast_parser_; }
 
   int extract(const char *text, ObHybridDslRequestInfo *&request)
@@ -58,7 +69,7 @@ public:
     const ObString sql = ObString::make_string(text);
     int ret = OB_SUCCESS;
     ObHybridSearchTokenHandler handler;
-    OZ(ObHybridSearchPlanCache::init_fast_parser(handler, nullptr, is_enabled, context));
+    OZ(ObHybridSearchPlanCache::init_fast_parser(handler, &session_, is_enabled, context));
     if (OB_SUCC(ret)) {
       ret = ObSqlParameterization::fast_parser(allocator_, context, sql, result);
     }
@@ -69,6 +80,7 @@ public:
   ObArenaAllocator allocator_;
   lib::CompatModeGuard compat_guard_;
   bool old_fast_parser_;
+  ObSQLSessionInfo session_;
 };
 
 TEST_F(TestHybridDslParameterization, token_gate_skips_ordinary_tokens)
@@ -152,29 +164,49 @@ TEST_F(TestHybridDslParameterization, mixed_case_carrier_keeps_parameter_offsets
   EXPECT_EQ(ObString("tech"), ObString(value->str_len_, value->str_value_));
 }
 
+TEST_F(TestHybridDslParameterization, missing_session_falls_back_before_charset_conversion)
+{
+  const ObString sql(
+      R"SQL(SELECT id FROM HYBRID_SEARCH(TABLE docs, )SQL"
+      R"SQL('{"query":{"term":{"category":"tech"}}}'))SQL");
+  ObHybridSearchTokenHandler handler;
+  FPContext context;
+  ASSERT_EQ(OB_SUCCESS, ObHybridSearchPlanCache::init_fast_parser(
+      handler, nullptr, true, context));
+  ObFastParserResult result;
+  ASSERT_EQ(OB_SUCCESS, ObSqlParameterization::fast_parser(allocator_, context, sql, result));
+  EXPECT_EQ(nullptr, ObHybridSearchPlanCache::get_request(result));
+  ASSERT_EQ(1, result.raw_params_.count());
+  const ParseNode *carrier = result.raw_params_.at(0)->node_;
+  ASSERT_NE(nullptr, carrier);
+  EXPECT_EQ(T_VARCHAR, carrier->type_);
+  EXPECT_EQ(ObString(R"({"query":{"term":{"category":"tech"}}})"),
+      ObString(carrier->str_len_, carrier->str_value_));
+}
+
 TEST_F(TestHybridDslParameterization, token_hook_respects_parser_modes)
 {
   ObHybridSearchTokenHandler handler;
   FPContext context;
-  ASSERT_EQ(OB_SUCCESS, ObHybridSearchPlanCache::init_fast_parser(handler, nullptr, true, context));
+  ASSERT_EQ(OB_SUCCESS, ObHybridSearchPlanCache::init_fast_parser(handler, &session_, true, context));
   EXPECT_EQ(&handler, context.hybrid_search_token_handler_);
   context.is_format_ = true;
-  ASSERT_EQ(OB_SUCCESS, ObHybridSearchPlanCache::init_fast_parser(handler, nullptr, true, context));
+  ASSERT_EQ(OB_SUCCESS, ObHybridSearchPlanCache::init_fast_parser(handler, &session_, true, context));
   EXPECT_EQ(nullptr, context.hybrid_search_token_handler_);
   context.is_format_ = false;
   context.is_udr_mode_ = true;
-  ASSERT_EQ(OB_SUCCESS, ObHybridSearchPlanCache::init_fast_parser(handler, nullptr, true, context));
+  ASSERT_EQ(OB_SUCCESS, ObHybridSearchPlanCache::init_fast_parser(handler, &session_, true, context));
   EXPECT_EQ(nullptr, context.hybrid_search_token_handler_);
   context.is_udr_mode_ = false;
-  ASSERT_EQ(OB_SUCCESS, ObHybridSearchPlanCache::init_fast_parser(handler, nullptr, false, context));
+  ASSERT_EQ(OB_SUCCESS, ObHybridSearchPlanCache::init_fast_parser(handler, &session_, false, context));
   EXPECT_EQ(nullptr, context.hybrid_search_token_handler_);
   {
     lib::CompatModeGuard guard(lib::Worker::CompatMode::ORACLE);
-    ASSERT_EQ(OB_SUCCESS, ObHybridSearchPlanCache::init_fast_parser(handler, nullptr, true, context));
+    ASSERT_EQ(OB_SUCCESS, ObHybridSearchPlanCache::init_fast_parser(handler, &session_, true, context));
     EXPECT_EQ(nullptr, context.hybrid_search_token_handler_);
   }
   GCONF._ob_enable_fast_parser = false;
-  ASSERT_EQ(OB_SUCCESS, ObHybridSearchPlanCache::init_fast_parser(handler, nullptr, true, context));
+  ASSERT_EQ(OB_SUCCESS, ObHybridSearchPlanCache::init_fast_parser(handler, &session_, true, context));
   EXPECT_EQ(nullptr, context.hybrid_search_token_handler_);
   ObFastParserResult result;
   ASSERT_EQ(OB_SUCCESS, parse("SELECT 'hybrid_search' WHERE id = 42", result));
@@ -217,7 +249,7 @@ TEST_F(TestHybridDslParameterization, token_handler_reset_between_requests)
   FPContext context;
   ObFastParserResult results[5];
   ASSERT_EQ(OB_SUCCESS, ObHybridSearchPlanCache::init_fast_parser(
-      handler, nullptr, true, context));
+      handler, &session_, true, context));
   for (int64_t i = 0; i < 5; ++i) {
     ASSERT_EQ(OB_SUCCESS, ObSqlParameterization::fast_parser(
         allocator_, context, ObString::make_string(inputs[i]), results[i])) << inputs[i];
@@ -437,11 +469,11 @@ TEST_F(TestHybridDslParameterization, signature_ownership_and_key_lifecycle)
 
 TEST_F(TestHybridDslParameterization, user_variable_is_a_request_snapshot)
 {
-  ObSQLSessionInfo session;
-  ASSERT_EQ(OB_SUCCESS, session.get_user_var_val_map().init(2 * 1024 * 1024, 256, nullptr));
+  ObSQLSessionInfo &session = session_;
   FPContext context;
   ObSessionVariable variable;
   variable.value_.set_varchar(R"({"query":{"match":{"content":"first"}}})");
+  variable.value_.set_collation_type(CS_TYPE_UTF8MB4_BIN);
   ASSERT_EQ(OB_SUCCESS, session.replace_user_variable(ObString("dsl"), variable));
   const ObString sql("SELECT id FROM HYBRID_SEARCH(TABLE docs, @dsl)");
   ObHybridSearchTokenHandler handler;
@@ -500,7 +532,7 @@ TEST_F(TestHybridDslParameterization, legacy_parser_preserves_sql_parameters)
     ObHybridSearchTokenHandler handler;
     FPContext context;
     ASSERT_EQ(OB_SUCCESS, ObHybridSearchPlanCache::init_fast_parser(
-        handler, nullptr, true, context));
+        handler, &session_, true, context));
     ASSERT_EQ(nullptr, context.hybrid_search_token_handler_);
     ObFastParserResult observed;
     ObFastParserResult ordinary;
@@ -535,7 +567,7 @@ TEST_F(TestHybridDslParameterization, fast_parser_toggle_resets_hybrid_hook)
   ObFastParserResult disabled;
   ObFastParserResult reenabled;
   ASSERT_EQ(OB_SUCCESS, ObHybridSearchPlanCache::init_fast_parser(
-      handler, nullptr, true, context));
+      handler, &session_, true, context));
   ASSERT_EQ(&handler, context.hybrid_search_token_handler_);
   ASSERT_EQ(OB_SUCCESS, ObSqlParameterization::fast_parser(
       allocator_, context, sql, enabled));
@@ -544,7 +576,7 @@ TEST_F(TestHybridDslParameterization, fast_parser_toggle_resets_hybrid_hook)
 
   GCONF._ob_enable_fast_parser = false;
   ASSERT_EQ(OB_SUCCESS, ObHybridSearchPlanCache::init_fast_parser(
-      handler, nullptr, true, context));
+      handler, &session_, true, context));
   ASSERT_EQ(nullptr, context.hybrid_search_token_handler_);
   ASSERT_EQ(OB_SUCCESS, ObSqlParameterization::fast_parser(
       allocator_, context, sql, disabled));
@@ -558,7 +590,7 @@ TEST_F(TestHybridDslParameterization, fast_parser_toggle_resets_hybrid_hook)
 
   GCONF._ob_enable_fast_parser = true;
   ASSERT_EQ(OB_SUCCESS, ObHybridSearchPlanCache::init_fast_parser(
-      handler, nullptr, true, context));
+      handler, &session_, true, context));
   ASSERT_EQ(&handler, context.hybrid_search_token_handler_);
   ASSERT_EQ(OB_SUCCESS, ObSqlParameterization::fast_parser(
       allocator_, context, sql, reenabled));
@@ -581,6 +613,9 @@ TEST_F(TestHybridDslParameterization, sql_key_embeds_dsl_template)
   ASSERT_EQ(OB_SUCCESS, parse(
       R"SQL(SELECT id FROM HYBRID_SEARCH(TABLE docs, )SQL"
       R"SQL('{"query":{"terms":{"category":["tech","news","art"]}}}') WHERE id >= 100)SQL", c));
+  ASSERT_NE(nullptr, ObHybridSearchPlanCache::get_request(a));
+  ASSERT_NE(nullptr, ObHybridSearchPlanCache::get_request(b));
+  ASSERT_NE(nullptr, ObHybridSearchPlanCache::get_request(c));
   EXPECT_TRUE(a.pc_key_.is_equal(b.pc_key_));
   EXPECT_FALSE(a.pc_key_.is_equal(c.pc_key_));
   ASSERT_EQ(2, ObHybridSearchPlanCache::get_request(a)->get_sql_raw_param_count());
@@ -603,6 +638,60 @@ TEST_F(TestHybridDslParameterization, sql_key_embeds_dsl_template)
   ASSERT_EQ(OB_SUCCESS, ObSqlParameterization::construct_sql(
       key, special, buffer, sizeof(buffer), length));
   EXPECT_EQ(key, ObString(length, buffer));
+}
+
+TEST_F(TestHybridDslParameterization, duplicate_keyword_templates_cannot_reuse_valid_plans)
+{
+  const char *valid[] = {
+    R"({"query":{"term":{"n":1}}})",
+    R"({"query":{"term":{"n":{"value":1}}}})",
+    R"({"query":{"range":{"n":{"gte":1}}}})",
+    R"({"query":{"bool":{"filter":[{"term":{"n":1}}]}}})",
+    R"({"query":{"match":{"body":{"query":"alpha"}}}})",
+    R"({"query":{"term":{"n":1},"search_options":{"multi_value":true}}})"
+  };
+  const char *duplicate[] = {
+    R"({"query":{"term":{"n":2}},"QUERY":{"term":{"n":3}}})",
+    R"({"query":{"term":{"n":{"value":2,"VALUE":3}}}})",
+    R"({"query":{"range":{"n":{"gte":2,"GTE":3}}}})",
+    R"({"query":{"bool":{"filter":[{"term":{"n":2}}],"FILTER":[{"term":{"n":3}}]}}})",
+    R"({"query":{"match":{"body":{"query":"beta","QUERY":"gamma"}}}})",
+    R"({"query":{"term":{"n":2},"search_options":{"multi_value":true,"MULTI_VALUE":false}}})"
+  };
+  ASSERT_EQ(ARRAYSIZEOF(valid), ARRAYSIZEOF(duplicate));
+  for (int64_t i = 0; i < ARRAYSIZEOF(valid); ++i) {
+    SCOPED_TRACE(valid[i]);
+    const std::string prefix = "SELECT id FROM HYBRID_SEARCH(TABLE docs, '";
+    const std::string valid_sql = prefix + valid[i] + "')";
+    const std::string duplicate_sql = prefix + duplicate[i] + "')";
+    ObFastParserResult valid_result;
+    ObFastParserResult duplicate_result;
+    ASSERT_EQ(OB_SUCCESS, parse(valid_sql.c_str(), valid_result));
+    ASSERT_EQ(OB_SUCCESS, parse(duplicate_sql.c_str(), duplicate_result));
+    ASSERT_NE(nullptr, ObHybridSearchPlanCache::get_request(valid_result));
+    ASSERT_NE(nullptr, ObHybridSearchPlanCache::get_request(duplicate_result));
+    // A duplicate request must reach resolver validation instead of a valid cached plan.
+    EXPECT_FALSE(valid_result.pc_key_.is_equal(duplicate_result.pc_key_));
+  }
+}
+
+TEST_F(TestHybridDslParameterization, uppercase_keywords_preserve_parameterized_cache_keys)
+{
+  ObFastParserResult a;
+  ObFastParserResult b;
+  ASSERT_EQ(OB_SUCCESS, parse(
+      R"SQL(SELECT id FROM HYBRID_SEARCH(TABLE docs, '{"QuErY":{"TeRm":{"n":{"VaLuE":1}}},"SiZe":10}'))SQL", a));
+  ASSERT_EQ(OB_SUCCESS, parse(
+      R"SQL(SELECT id FROM HYBRID_SEARCH(TABLE docs, '{"QuErY":{"TeRm":{"n":{"VaLuE":2}}},"SiZe":10}'))SQL", b));
+  const ObHybridDslRequestInfo *request = ObHybridSearchPlanCache::get_request(a);
+  ASSERT_NE(nullptr, request);
+  ASSERT_NE(nullptr, ObHybridSearchPlanCache::get_request(b));
+  EXPECT_EQ(1, request->get_dsl_param_count());
+  EXPECT_TRUE(a.pc_key_.is_equal(b.pc_key_));
+  const ObString dsl_template = request->get_dsl_template();
+  const std::string text(dsl_template.ptr(), dsl_template.length());
+  EXPECT_NE(std::string::npos, text.find("\"VaLuE\":?"));
+  EXPECT_NE(std::string::npos, text.find("\"QuErY\""));
 }
 
 TEST_F(TestHybridDslParameterization, carrier_filter_preserves_other_special_params)
@@ -719,8 +808,8 @@ TEST_F(TestHybridDslParameterization, raw_input_preserves_scalar_types)
   ASSERT_EQ(OB_SUCCESS, extract(
       R"({"query":{"terms":{"doc":["20",20,true,false,9007199254740993,)"
       R"(18446744073709551615]}}})", request));
-  // The JSON parser preserves large positive integers as J_UINT.
-  const ObItemType types[] = {T_VARCHAR, T_INT, T_BOOL, T_BOOL, T_UINT64, T_UINT64};
+  // Values within int64 range use signed SQL integer literals, regardless of the JSON tag.
+  const ObItemType types[] = {T_VARCHAR, T_INT, T_BOOL, T_BOOL, T_INT, T_UINT64};
   const char *expected[] = {"20", "20", "true", "false",
                             "9007199254740993", "18446744073709551615"};
   ASSERT_EQ(6, extracted_.count());
@@ -793,6 +882,7 @@ TEST_F(TestHybridDslParameterization, hybrid_compile_reset_preserves_request)
   ObIJsonBase *json_root = request->get_json_root();
   ObFastParserResult copy;
   ASSERT_EQ(OB_SUCCESS, copy.assign(ctx.fp_result_));
+  ASSERT_NE(nullptr, ObHybridSearchPlanCache::get_request(copy));
   EXPECT_TRUE(ObHybridSearchPlanCache::get_request(copy)->is_carrier_node(carrier));
   request->reset_compile();
   EXPECT_FALSE(request->is_carrier_node(carrier));
@@ -884,7 +974,7 @@ TEST_F(TestHybridDslParameterization, ordinary_sql_does_not_create_hybrid_contex
   FPContext context;
   ObHybridSearchTokenHandler handler;
   ASSERT_EQ(OB_SUCCESS, ObHybridSearchPlanCache::init_fast_parser(
-      handler, nullptr, true, context));
+      handler, &session_, true, context));
   EXPECT_EQ(&handler, context.hybrid_search_token_handler_);
   ObFastParserResult result;
   ASSERT_EQ(OB_SUCCESS, ObSqlParameterization::fast_parser(allocator_, context, sql, result));
@@ -1079,6 +1169,37 @@ TEST_F(TestHybridDslParameterization, fallback_reason_identifies_expected_bypass
   ASSERT_NE(nullptr, batch.hybrid_dsl_request_);
   EXPECT_EQ(DSL_FALLBACK_BATCHED_MULTI_STMT,
       batch.hybrid_dsl_request_->get_source().fallback_reason_);
+}
+
+TEST_F(TestHybridDslParameterization, adjacent_literals_are_merged_before_parameterization)
+{
+  const char *inputs[] = {
+    R"SQL(SELECT id FROM HYBRID_SEARCH(TABLE docs, '{"query":{"term":{"id":' '1}}}'))SQL",
+    R"SQL(SELECT id FROM HYBRID_SEARCH(TABLE docs, '' '{"query":' '{"term":{"id":' '2}}}' ''))SQL"
+  };
+  const char *snapshots[] = {
+    R"({"query":{"term":{"id":1}}})",
+    R"({"query":{"term":{"id":2}}})"
+  };
+  ObFastParserResult results[2];
+  for (int64_t i = 0; i < 2; ++i) {
+    SCOPED_TRACE(inputs[i]);
+    ObFastParserResult &result = results[i];
+    ASSERT_EQ(OB_SUCCESS, parse(inputs[i], result));
+    const ObHybridDslRequestInfo *request = ObHybridSearchPlanCache::get_request(result);
+    ASSERT_NE(nullptr, request);
+    EXPECT_EQ(DSL_FALLBACK_NONE, request->get_source().fallback_reason_);
+    EXPECT_EQ(ObString::make_string(snapshots[i]), request->get_dsl_snapshot());
+    EXPECT_EQ(ObString(R"({"query":{"term":{"id":?}}})"), request->get_dsl_template());
+    ASSERT_EQ(1, request->get_dsl_param_count());
+    int64_t raw_idx = -1;
+    ASSERT_EQ(OB_SUCCESS, request->get_dsl_raw_param_idx(0, result.raw_params_, raw_idx));
+    const ParseNode *value = result.raw_params_.at(raw_idx)->node_;
+    ASSERT_NE(nullptr, value);
+    EXPECT_EQ(T_INT, value->type_);
+    EXPECT_EQ(i + 1, value->value_);
+  }
+  EXPECT_TRUE(results[0].pc_key_.is_equal(results[1].pc_key_));
 }
 
 TEST_F(TestHybridDslParameterization, ordinary_parser_entry_remains_available)
@@ -1427,6 +1548,201 @@ TEST_F(TestHybridDslRange, scalar_string_length_constraint)
   ASSERT_EQ(OB_SUCCESS, extract_range(node));
   ASSERT_NE(nullptr, node);
   EXPECT_TRUE(node->always_true_);
+}
+
+TEST_F(TestHybridDslParameterization, integer_candidate_conversion_kinds)
+{
+  using Convert = ObExprDslParamValue;
+  ObObj value;
+  value.set_int(INT64_MAX);
+  EXPECT_EQ(Convert::INTEGER_VALUE, Convert::classify_integer_candidate(value, ObUInt64Type));
+  value.set_int(-1);
+  EXPECT_EQ(Convert::SQL_FALLBACK, Convert::classify_integer_candidate(value, ObUInt64Type));
+  value.set_uint64(UINT64_MAX);
+  EXPECT_EQ(Convert::INTEGER_VALUE, Convert::classify_integer_candidate(value, ObUInt64Type));
+  EXPECT_EQ(Convert::SQL_FALLBACK, Convert::classify_integer_candidate(value, ObIntType));
+  value.set_int(INT32_MAX);
+  EXPECT_EQ(Convert::INTEGER_VALUE, Convert::classify_integer_candidate(value, ObInt32Type));
+  value.set_int(static_cast<int64_t>(INT32_MAX) + 1);
+  EXPECT_EQ(Convert::SQL_FALLBACK, Convert::classify_integer_candidate(value, ObInt32Type));
+  value.set_int(INT32_MIN);
+  EXPECT_EQ(Convert::INTEGER_VALUE, Convert::classify_integer_candidate(value, ObInt32Type));
+  value.set_int(static_cast<int64_t>(INT32_MIN) - 1);
+  EXPECT_EQ(Convert::SQL_FALLBACK, Convert::classify_integer_candidate(value, ObInt32Type));
+  value.set_double(2.0);
+  EXPECT_EQ(Convert::INTEGER_VALUE, Convert::classify_integer_candidate(value, ObUInt64Type));
+  value.set_double(1.5);
+  EXPECT_EQ(Convert::FRACTIONAL_VALUE, Convert::classify_integer_candidate(value, ObUInt64Type));
+  value.set_double(9223372036854775808.0);
+  EXPECT_EQ(Convert::SQL_FALLBACK, Convert::classify_integer_candidate(value, ObIntType));
+  EXPECT_EQ(Convert::INTEGER_VALUE, Convert::classify_integer_candidate(value, ObUInt64Type));
+  value.set_double(18446744073709551616.0);
+  EXPECT_EQ(Convert::SQL_FALLBACK, Convert::classify_integer_candidate(value, ObUInt64Type));
+  value.set_varchar("01");
+  EXPECT_EQ(Convert::SQL_FALLBACK, Convert::classify_integer_candidate(value, ObIntType));
+}
+
+TEST_F(TestHybridDslRange, fulltext_uses_sql_implicit_cast_for_literals_and_parameters)
+{
+  session_info_.set_cur_exec_ctx(&exec_ctx_);
+  ParamStore input_params((ObWrapperAllocator(&allocator_)));
+  ObResolverParams resolver_params;
+  resolver_params.allocator_ = &allocator_;
+  resolver_params.expr_factory_ = &expr_factory_;
+  resolver_params.session_info_ = &session_info_;
+  resolver_params.param_list_ = &input_params;
+  TableItem table_item(allocator_);
+  ObDSLResolver resolver(resolver_params, nullptr, nullptr, table_item);
+  ObJsonString text(ObString("hello😀"));
+  ObHybridDslRequestInfo request(allocator_);
+  ASSERT_EQ(OB_SUCCESS, request.append_param_node(text));
+  request.set_sql_raw_param_count(0);
+  ParseNode raw_node = {};
+  ObPCParam raw;
+  raw.node_ = &raw_node;
+  ObSEArray<ObPCParam *, 1> raw_params;
+  ASSERT_EQ(OB_SUCCESS, raw_params.push_back(&raw));
+  for (const bool parameterized : {false, true}) {
+    SCOPED_TRACE(parameterized);
+    input_params.reset();
+    if (parameterized) {
+      ObObjParam value;
+      value.set_varchar("hello😀");
+      value.set_collation_type(CS_TYPE_UTF8MB4_BIN);
+      value.set_collation_level(CS_LEVEL_COERCIBLE);
+      value.set_param_meta();
+      ASSERT_EQ(OB_SUCCESS, input_params.push_back(value));
+      request.set_compile_params(raw_params, input_params, 0);
+      resolver.dsl_request_ = &request;
+    }
+    ObRawExpr *expr = nullptr;
+    ASSERT_EQ(OB_SUCCESS, resolver.resolve_query_string_expr(text, CS_TYPE_GBK_BIN, expr));
+    ASSERT_NE(nullptr, expr);
+    ASSERT_EQ(T_FUN_SYS_CAST, expr->get_expr_type());
+    EXPECT_TRUE(CM_IS_IGNORE_CHARSET_CONVERT_ERR(expr->get_cast_mode()));
+    EXPECT_EQ(CS_TYPE_GBK_BIN, expr->get_collation_type());
+    ASSERT_GT(expr->get_param_count(), 0);
+    ObRawExpr *input = expr->get_param_expr(0);
+    ASSERT_NE(nullptr, input);
+    EXPECT_EQ(CS_TYPE_UTF8MB4_BIN, input->get_collation_type());
+    if (parameterized) {
+      ASSERT_EQ(T_QUESTIONMARK, input->get_expr_type());
+      const ObConstRawExpr *param = static_cast<const ObConstRawExpr *>(input);
+      EXPECT_EQ(0, param->get_value().get_unknown());
+      EXPECT_TRUE(request.get_resolved_param_idxs().has_member(0));
+    } else {
+      ObObj result;
+      ASSERT_EQ(OB_SUCCESS, ObSQLUtils::calc_const_expr(&session_info_, *expr, result,
+          allocator_, input_params, &exec_ctx_));
+      EXPECT_EQ(ObString("hello?"), result.get_string());
+    }
+  }
+}
+
+TEST_F(TestHybridDslRange, sort_missing_uses_sql_truncate_and_cast_with_es_boundaries)
+{
+  session_info_.set_cur_exec_ctx(&exec_ctx_);
+  ObResolverParams resolver_params;
+  resolver_params.allocator_ = &allocator_;
+  resolver_params.expr_factory_ = &expr_factory_;
+  resolver_params.session_info_ = &session_info_;
+  TableItem table_item(allocator_);
+  ObDSLResolver resolver(resolver_params, nullptr, nullptr, table_item);
+  ParamStore empty_params;
+  const auto expect_value = [&](ObRawExpr *expr, const int64_t expected) {
+    ObObj result;
+    ASSERT_EQ(OB_SUCCESS, ObSQLUtils::calc_const_expr(&session_info_, *expr, result,
+        allocator_, empty_params, &exec_ctx_));
+    if (expr->get_result_type().get_type() == ObUInt64Type) {
+      EXPECT_EQ(static_cast<uint64_t>(expected) ^ (uint64_t(1) << 63), result.get_uint64());
+    } else {
+      EXPECT_EQ(expected, result.get_int());
+    }
+  };
+  const double values[] = {49.9, -49.9, 0.9, -0.9, 1e19, -1e19};
+  const int64_t expected[] = {49, -49, 0, 0, INT64_MAX, INT64_MIN};
+  for (int64_t i = 0; i < ARRAYSIZEOF(values); ++i) {
+    SCOPED_TRACE(values[i]);
+    ObJsonDouble input(values[i]);
+    ObRawExpr *expr = nullptr;
+    ASSERT_EQ(OB_SUCCESS, resolver.build_sort_missing_integer_expr(input, ObIntType, expr));
+    ASSERT_NE(nullptr, expr);
+    ASSERT_EQ(T_FUN_SYS_CAST, expr->get_expr_type());
+    EXPECT_FALSE(expr->has_flag(IS_INNER_ADDED_EXPR));
+    ASSERT_GT(expr->get_param_count(), 0);
+    ASSERT_NE(nullptr, expr->get_param_expr(0));
+    EXPECT_EQ(T_FUN_SYS_TRUNCATE, expr->get_param_expr(0)->get_expr_type());
+    expect_value(expr, expected[i]);
+    ASSERT_EQ(OB_SUCCESS, resolver.build_sort_missing_integer_expr(input, ObUInt64Type, expr));
+    ASSERT_NE(nullptr, expr);
+    ASSERT_EQ(T_OP_BIT_XOR, expr->get_expr_type());
+    EXPECT_EQ(ObUInt64Type, expr->get_result_type().get_type());
+    ASSERT_EQ(2, expr->get_param_count());
+    ASSERT_NE(nullptr, expr->get_param_expr(0));
+    ObRawExpr *unsigned_cast = expr->get_param_expr(0);
+    ASSERT_EQ(T_FUN_SYS_CAST, unsigned_cast->get_expr_type());
+    EXPECT_EQ(ObUInt64Type, unsigned_cast->get_result_type().get_type());
+    EXPECT_FALSE(unsigned_cast->has_flag(IS_INNER_ADDED_EXPR));
+    ASSERT_GT(unsigned_cast->get_param_count(), 0);
+    ASSERT_NE(nullptr, unsigned_cast->get_param_expr(0));
+    EXPECT_EQ(T_FUN_SYS_CAST, unsigned_cast->get_param_expr(0)->get_expr_type());
+    EXPECT_EQ(ObIntType, unsigned_cast->get_param_expr(0)->get_result_type().get_type());
+    expect_value(expr, expected[i]);
+  }
+  ObJsonUint max_unsigned(UINT64_MAX);
+  ObRawExpr *expr = nullptr;
+  ASSERT_EQ(OB_SUCCESS, resolver.build_sort_missing_integer_expr(max_unsigned, ObIntType, expr));
+  ASSERT_NE(nullptr, expr);
+  EXPECT_EQ(T_FUN_SYS_CAST, expr->get_expr_type());
+  expect_value(expr, -1);
+  ASSERT_EQ(OB_SUCCESS, resolver.build_sort_missing_integer_expr(max_unsigned, ObUInt64Type, expr));
+  ASSERT_NE(nullptr, expr);
+  EXPECT_EQ(T_OP_BIT_XOR, expr->get_expr_type());
+  expect_value(expr, -1);
+
+  // Missing is a general expression and must survive sort-item deep copying.
+  ObDSLQueryInfo source;
+  ObDSLQueryInfo copied;
+  ObDSLSortItem item;
+  item.missing_mode_ = ObDSLSortItem::MissingMode::LITERAL;
+  item.field_expr_ = expr;
+  item.output_expr_ = expr;
+  item.missing_expr_ = expr;
+  ASSERT_EQ(OB_SUCCESS, source.sort_items_.push_back(item));
+  ObRawExprCopier copier(expr_factory_);
+  ASSERT_EQ(OB_SUCCESS, copied.deep_copy_sort_items(source, copier));
+  ASSERT_EQ(1, copied.sort_items_.count());
+  ASSERT_NE(nullptr, copied.sort_items_.at(0).missing_expr_);
+  EXPECT_EQ(T_OP_BIT_XOR, copied.sort_items_.at(0).missing_expr_->get_expr_type());
+  expect_value(copied.sort_items_.at(0).missing_expr_, -1);
+
+  ObJsonInt integer(49);
+  ASSERT_EQ(OB_SUCCESS, resolver.build_sort_missing_integer_expr(integer, ObIntType, expr));
+  ASSERT_NE(nullptr, expr);
+  EXPECT_TRUE(expr->is_const_raw_expr());
+  expect_value(expr, 49);
+  ObJsonUint small_unsigned(49);
+  ASSERT_EQ(OB_SUCCESS, resolver.build_sort_missing_integer_expr(small_unsigned, ObIntType, expr));
+  ASSERT_NE(nullptr, expr);
+  EXPECT_TRUE(expr->is_const_raw_expr());
+  EXPECT_EQ(ObIntType, expr->get_result_type().get_type());
+  expect_value(expr, 49);
+  ObJsonString integer_string(ObString("49"));
+  ASSERT_EQ(OB_SUCCESS, resolver.build_sort_missing_integer_expr(integer_string, ObIntType, expr));
+  ASSERT_NE(nullptr, expr);
+  EXPECT_TRUE(expr->is_const_raw_expr());
+  expect_value(expr, 49);
+  for (const bool value : {false, true}) {
+    ObJsonBoolean input(value);
+    EXPECT_EQ(OB_INVALID_ARGUMENT, resolver.build_sort_missing_integer_expr(input, ObIntType, expr));
+    EXPECT_EQ(nullptr, expr);
+  }
+  for (const char *text : {"49.9", "49e0", "49.9e0", "18446744073709551615"}) {
+    SCOPED_TRACE(text);
+    ObJsonString input(ObString::make_string(text));
+    EXPECT_NE(OB_SUCCESS, resolver.build_sort_missing_integer_expr(input, ObIntType, expr));
+    EXPECT_EQ(nullptr, expr);
+  }
 }
 
 int main(int argc, char **argv)
