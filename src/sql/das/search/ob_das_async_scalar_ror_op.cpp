@@ -799,9 +799,23 @@ void ObDASAsyncScalarRorOp::close_posting_iter()
   posting_iter_allocator_.reset();
 }
 
+void ObDASAsyncScalarRorOp::reuse_posting_iter()
+{
+  nested_key_list_reader_.reset();
+  curr_nested_key_.reset();
+  search_ctx_.reuse_posting_scan(
+      posting_scan_param_, posting_iter_allocator_, posting_entry_, posting_iter_);
+  posting_iter_allocator_.reset();
+}
+
 void ObDASAsyncScalarRorOp::reset_leaf_runtime_state()
 {
   close_posting_iter();
+  reset_leaf_runtime_fields();
+}
+
+void ObDASAsyncScalarRorOp::reset_leaf_runtime_fields()
+{
   posting_scan_param_.reset();
   version_range_.reset();
   term_key_.reset();
@@ -1272,7 +1286,8 @@ int ObDASAsyncScalarRorOp::do_rescan()
     ret = OB_NOT_INIT;
     LOG_WARN("async scalar op is not initialized", K(ret));
   } else {
-    reset_leaf_runtime_state();
+    reuse_posting_iter();
+    reset_leaf_runtime_fields();
     if (OB_FAIL(init_inv_idx_scan_param())) {
       LOG_WARN("failed to init async scalar scan param on rescan", K(ret));
     } else if (OB_FAIL(init_term_key())) {
@@ -1315,7 +1330,7 @@ int ObDASAsyncScalarRorOp::do_rescan_segment(const common::ObNewVersionRange &ra
     LOG_WARN("direct async scalar rejects segment rescan", K(ret),
              K_(index_table_id), K_(group_slot), K(range));
   } else {
-    close_posting_iter();
+    reuse_posting_iter();
     version_range_ = range;
     if (is_empty_range_) {
       // An empty slot does not bind a physical segment.

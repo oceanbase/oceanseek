@@ -231,9 +231,14 @@ public:
   OB_INLINE storage::ObInvIdxParamCache &get_bm25_param_cache() { return bm25_param_cache_; }
   // A null Entry means that the caller must use its original allocation path.
   int acquire_posting_entry(blocksstable::ObInvPostingIterEntry *&entry);
+  // A retained entry must have its previous scan reset before preparation.
   int prepare_posting_scan(const bool use_pool, common::ObIAllocator &scan_allocator,
       blocksstable::ObInvPostingScanParam &param, blocksstable::ObInvPostingIterEntry *&entry);
   void close_posting_scan(blocksstable::ObInvPostingScanParam &param,
+      common::ObIAllocator &scan_allocator, blocksstable::ObInvPostingIterEntry *&entry,
+      blocksstable::ObInvSSTablePostingIter *&iter);
+  // Detach the old scan but retain the pool lease; fallback objects are destroyed.
+  void reuse_posting_scan(blocksstable::ObInvPostingScanParam &param,
       common::ObIAllocator &scan_allocator, blocksstable::ObInvPostingIterEntry *&entry,
       blocksstable::ObInvSSTablePostingIter *&iter);
   blocksstable::ObInvPostingTableCache &get_posting_table_cache() { return posting_table_cache_; }

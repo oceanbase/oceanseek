@@ -392,6 +392,13 @@ void ObDASAsyncTokenOp::close_posting_iter()
   posting_iter_allocator_.reset();
 }
 
+void ObDASAsyncTokenOp::reuse_posting_iter()
+{
+  search_ctx_.reuse_posting_scan(
+      posting_scan_param_, posting_iter_allocator_, posting_entry_, posting_iter_);
+  posting_iter_allocator_.reset();
+}
+
 int ObDASAsyncTokenOp::fetch_curr_id(ObDASRowID &curr_id)
 {
   int ret = OB_SUCCESS;
@@ -1144,7 +1151,7 @@ int ObDASAsyncTokenOp::do_rescan()
     ret = OB_NOT_INIT;
     LOG_WARN("not initialized", K(ret));
   } else {
-    close_posting_iter();
+    reuse_posting_iter();
     version_range_.reset();
     posting_scan_param_.reset();
     param_estimator_.reset();
@@ -1196,7 +1203,7 @@ int ObDASAsyncTokenOp::do_rescan_segment(const common::ObNewVersionRange &range)
     LOG_WARN("direct async token rejects segment rescan", K(ret),
              K_(index_table_id), K_(group_slot), K(range));
   } else {
-    close_posting_iter();
+    reuse_posting_iter();
     version_range_ = range;
     bm25_calc_params_.reset();
     bm25_score_kernels_ = {};

@@ -11,6 +11,7 @@
 #include <time.h>
 #include "lib/utility/ob_sort.h"
 #include "lib/utility/utility.h"
+#include "lib/utility/ob_defer.h"
 #define private public
 #define protected public
 #include "share/rc/ob_tenant_base.h"
@@ -58,6 +59,7 @@
 #include "storage/tmp_file/ob_tmp_file_manager.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable_posting_iter.h"
+#include "storage/access/ob_async_inv_iterator_pool.h"
 #include "storage/blocksstable/async_index/ob_posting_value_block_writer.h"
 #include "storage/tablet/ob_tablet.h"
 #include "sql/engine/ob_exec_context.h"
@@ -4517,12 +4519,91 @@ TEST_F(TestDASAsyncSegmentMerge, posting_scan_helpers_preserve_fallback_lifecycl
   EXPECT_EQ(nullptr, entry);
   EXPECT_EQ(&allocator, param.allocator_);
   EXPECT_EQ(nullptr, param.reusable_iter_);
-  // A live lease cannot be silently overwritten by another preparation.
+  buf = allocator.alloc(sizeof(blocksstable::ObInvSSTablePostingIter));
+  ASSERT_NE(nullptr, buf);
+  iter = new (buf) blocksstable::ObInvSSTablePostingIter();
+  search_ctx_.reuse_posting_scan(param, allocator, entry, iter);
+  EXPECT_EQ(nullptr, iter);
+  EXPECT_EQ(nullptr, entry);
+  EXPECT_EQ(nullptr, param.reusable_iter_);
+  // A pool-disabled scan must not accept a live pooled lease.
   blocksstable::ObInvPostingIterEntry live_entry;
   entry = &live_entry;
   EXPECT_EQ(OB_INVALID_ARGUMENT, search_ctx_.prepare_posting_scan(
       use_pool, allocator, param, entry));
   EXPECT_EQ(&live_entry, entry);
+}
+
+TEST_F(TestDASAsyncSegmentMerge, posting_scan_helpers_reuse_retained_pool_entry)
+{
+  // The fixture's virtual tenant uses the system tenant's fallback configuration.
+  ASSERT_EQ(OB_SUCCESS, omt::ObTenantConfigMgr::get_instance().add_tenant_config(OB_SYS_TENANT_ID));
+  omt::ObTenantConfigGuard valid_config(TENANT_CONF(MTL_ID()));
+  ASSERT_TRUE(valid_config.is_valid());
+  const int64_t old_limit = valid_config->async_inverted_index_iter_cache_max_size;
+  storage::ObAsyncInvIteratorPool pool;
+  ObArenaAllocator allocator;
+  blocksstable::ObInvPostingScanParam param;
+  blocksstable::ObInvPostingIterEntry *entry = nullptr;
+  DEFER(pool.release_inv_entry(entry); search_ctx_.reset();
+      valid_config->async_inverted_index_iter_cache_max_size = old_limit);
+  valid_config->async_inverted_index_iter_cache_max_size = 64L << 20;
+  ASSERT_EQ(OB_SUCCESS, pool.init());
+  ASSERT_TRUE(pool.pin());
+  search_ctx_.inv_iter_pool_ = &pool;
+  search_ctx_.enable_inv_iter_pool_ = true;
+  ASSERT_EQ(OB_SUCCESS, search_ctx_.prepare_posting_scan(true, allocator, param, entry));
+  ASSERT_NE(nullptr, entry);
+  auto *retained = entry;
+  blocksstable::ObInvSSTablePostingIter *iter = &entry->iter_;
+  entry->iter_.allocator_ = &allocator;
+  search_ctx_.reuse_posting_scan(param, allocator, entry, iter);
+  EXPECT_EQ(retained, entry);
+  EXPECT_EQ(nullptr, iter);
+  EXPECT_EQ(nullptr, entry->iter_.allocator_);
+  EXPECT_EQ(nullptr, param.reusable_iter_);
+  allocator.reset();
+  ASSERT_EQ(OB_SUCCESS, search_ctx_.prepare_posting_scan(true, allocator, param, entry));
+  EXPECT_EQ(retained, entry);
+  EXPECT_EQ(&entry->iter_, param.reusable_iter_);
+  EXPECT_EQ(3, pool.refs_);
+  iter = &entry->iter_;
+  search_ctx_.close_posting_scan(param, allocator, entry, iter);
+  EXPECT_EQ(nullptr, entry);
+  EXPECT_EQ(nullptr, iter);
+  EXPECT_EQ(2, pool.refs_);
+  auto check_operator_reuse = [&](auto &op) {
+    DEFER(pool.release_inv_entry(op.posting_entry_); op.posting_iter_ = nullptr);
+    ASSERT_EQ(OB_SUCCESS, search_ctx_.prepare_posting_scan(
+        true, op.posting_iter_allocator_, op.posting_scan_param_, op.posting_entry_));
+    ASSERT_NE(nullptr, op.posting_entry_);
+    auto *op_entry = op.posting_entry_;
+    op.posting_iter_ = &op_entry->iter_;
+    op_entry->iter_.allocator_ = &op.posting_iter_allocator_;
+    ASSERT_NE(nullptr, op.posting_iter_allocator_.alloc(64));
+    op.reuse_posting_iter();
+    EXPECT_EQ(op_entry, op.posting_entry_);
+    EXPECT_EQ(nullptr, op.posting_iter_);
+    EXPECT_EQ(nullptr, op_entry->iter_.allocator_);
+    EXPECT_EQ(0, op.posting_iter_allocator_.total());
+    EXPECT_EQ(3, pool.refs_);
+    ASSERT_EQ(OB_SUCCESS, search_ctx_.prepare_posting_scan(
+        true, op.posting_iter_allocator_, op.posting_scan_param_, op.posting_entry_));
+    EXPECT_EQ(op_entry, op.posting_entry_);
+    op.posting_iter_ = &op_entry->iter_;
+    op.close_posting_iter();
+    EXPECT_EQ(nullptr, op.posting_entry_);
+    EXPECT_EQ(nullptr, op.posting_iter_);
+    EXPECT_EQ(2, pool.refs_);
+  };
+  ObDASAsyncTokenOp token_op(search_ctx_);
+  ObDASAsyncTokenHelper token_helper(search_ctx_);
+  ObDASAsyncScalarRorOp scalar_op(search_ctx_);
+  ASSERT_NO_FATAL_FAILURE(check_operator_reuse(token_op));
+  ASSERT_NO_FATAL_FAILURE(check_operator_reuse(token_helper));
+  ASSERT_NO_FATAL_FAILURE(check_operator_reuse(scalar_op));
+  search_ctx_.reset();
+  EXPECT_EQ(1, pool.refs_);
 }
 
 TEST_F(TestDASAsyncSegmentMerge, async_binding_guard_restores_complete_binding)

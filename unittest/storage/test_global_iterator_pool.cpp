@@ -4,6 +4,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "lib/utility/ob_defer.h"
 #define private public
 #define protected public
 #include "mtlenv/mock_tenant_module_env.h"
@@ -131,6 +132,8 @@ public:
     old_limit_ = valid_config->async_inverted_index_iter_cache_max_size;
     config_saved_ = true;
     set_limit(8 * sizeof(blocksstable::ObInvPostingIterEntry));
+    // Keep byte-budget and LRU assertions deterministic within one shard.
+    pool_.shard_count_ = 1;
     ASSERT_EQ(OB_SUCCESS, pool_.init());
   }
 
@@ -161,24 +164,28 @@ public:
     for (int64_t i = 0; i < 8; ++i) {
       pool_.release_inv_entry(entries_[i]);
     }
-    ASSERT_EQ(8, pool_.inv_idle_count_);
+    check_counts(8);
   }
 
   void expire_window()
   {
-    pool_.inv_shrink_window_start_ = ObTimeUtility::current_monotonic_time()
+    pool_.shards_[0].inv_shrink_window_start_ = ObTimeUtility::current_monotonic_time()
         - 2 * ObAsyncInvIteratorPool::INV_SHRINK_INTERVAL;
   }
 
   void check_counts(const int64_t idle, const int64_t leased = 0)
   {
     const int64_t bytes = sizeof(blocksstable::ObInvPostingIterEntry);
-    EXPECT_EQ(idle, pool_.inv_idle_count_);
-    EXPECT_EQ(idle * bytes, pool_.inv_idle_bytes_);
-    EXPECT_EQ((idle + leased) * bytes, pool_.inv_total_bytes_);
+    EXPECT_EQ(idle * bytes, pool_.shards_[0].inv_idle_bytes_);
+    EXPECT_EQ((idle + leased) * bytes, pool_.shards_[0].inv_total_bytes_);
+    check_idle_list(idle);
+  }
+
+  void check_idle_list(const int64_t idle)
+  {
     int64_t count = 0;
     blocksstable::ObInvIteratorEntryBase *prev = nullptr;
-    blocksstable::ObInvIteratorEntryBase *entry = pool_.inv_idle_head_;
+    blocksstable::ObInvIteratorEntryBase *entry = pool_.shards_[0].inv_idle_head_;
     while (nullptr != entry && count <= idle) {
       EXPECT_EQ(prev, entry->prev_global_entry_);
       EXPECT_TRUE(entry->is_idle_in_global_pool_);
@@ -188,7 +195,7 @@ public:
     }
     EXPECT_EQ(idle, count);
     EXPECT_EQ(nullptr, entry);
-    EXPECT_EQ(prev, pool_.inv_idle_tail_);
+    EXPECT_EQ(prev, pool_.shards_[0].inv_idle_tail_);
   }
 
   ObAsyncInvIteratorPool pool_;
@@ -197,6 +204,48 @@ public:
   int64_t old_limit_ = 0;
 };
 
+TEST(ObInvIteratorPoolTest, posting_small_budget_reuses_entries_with_production_shards)
+{
+  // This pool only needs a tenant context, not the mock storage environment.
+  auto *tenant = ObTenantEnv::get_tenant_local();
+  const uint64_t old_tenant_id = tenant->id_;
+  tenant->id_ = OB_SYS_TENANT_ID;
+  DEFER(tenant->id_ = old_tenant_id);
+  PostingPoolShrinkContext context;
+  ASSERT_NO_FATAL_FAILURE(context.init());
+  context.pool_.shard_count_ = ObAsyncInvIteratorPool::INV_SHARD_COUNT;
+  ASSERT_EQ(16, context.pool_.shard_count_);
+  ASSERT_NO_FATAL_FAILURE(context.fill());
+  for (int64_t i = 0; i < 8; ++i) {
+    auto *expected = context.pool_.shards_[0].inv_idle_head_;
+    ASSERT_NE(nullptr, expected);
+    ASSERT_EQ(OB_SUCCESS, context.pool_.get_inv_entry(
+        blocksstable::ObInvPostingIterEntry::ReuseKey{}, context.entries_[i]));
+    EXPECT_EQ(expected, context.entries_[i]);
+  }
+  context.check_counts(0, 8);
+  for (int64_t i = 0; i < 8; ++i) {
+    context.pool_.release_inv_entry(context.entries_[i]);
+  }
+  context.check_counts(8);
+  ASSERT_EQ(OB_SUCCESS, context.pool_.get_inv_entry(
+      blocksstable::ObInvPostingIterEntry::ReuseKey{}, context.entries_[0]));
+  context.set_limit(4 * sizeof(blocksstable::ObInvPostingIterEntry));
+  context.pool_.shrink_idle_inv_entries();
+  context.check_counts(3, 1);
+  context.pool_.release_inv_entry(context.entries_[0]);
+  context.check_counts(4);
+  context.set_limit(sizeof(blocksstable::ObInvPostingIterEntry) - 1);
+  context.pool_.shrink_idle_inv_entries();
+  context.check_counts(0);
+  ASSERT_EQ(OB_SUCCESS, context.pool_.get_inv_entry(
+      blocksstable::ObInvPostingIterEntry::ReuseKey{}, context.entries_[0]));
+  ASSERT_NE(nullptr, context.entries_[0]);
+  context.pool_.release_inv_entry(context.entries_[0]);
+  context.check_counts(0);
+  EXPECT_EQ(16, context.pool_.active_shard_count(64L << 20));
+}
+
 TEST_F(ObGlobalIteratorPoolTest, posting_shrink_window_and_retain_floor)
 {
   PostingPoolShrinkContext context;
@@ -204,8 +253,8 @@ TEST_F(ObGlobalIteratorPoolTest, posting_shrink_window_and_retain_floor)
   ASSERT_NO_FATAL_FAILURE(context.fill());
   context.set_limit(64L << 20);
   context.pool_.shrink_idle_inv_entries();
-  EXPECT_GT(context.pool_.inv_shrink_window_start_, 0);
-  EXPECT_EQ(8 * sizeof(blocksstable::ObInvPostingIterEntry), context.pool_.inv_idle_bytes_low_water_);
+  EXPECT_GT(context.pool_.shards_[0].inv_shrink_window_start_, 0);
+  EXPECT_EQ(8 * sizeof(blocksstable::ObInvPostingIterEntry), context.pool_.shards_[0].inv_idle_bytes_low_water_);
   context.pool_.shrink_idle_inv_entries();
   context.check_counts(8);
   context.expire_window();
@@ -213,23 +262,23 @@ TEST_F(ObGlobalIteratorPoolTest, posting_shrink_window_and_retain_floor)
   context.check_counts(8);
   context.set_limit(8 * sizeof(blocksstable::ObInvPostingIterEntry));
   // A future start must reset the window, not reclaim entries.
-  context.pool_.inv_shrink_window_start_ = ObTimeUtility::current_monotonic_time()
+  context.pool_.shards_[0].inv_shrink_window_start_ = ObTimeUtility::current_monotonic_time()
       + ObAsyncInvIteratorPool::INV_SHRINK_INTERVAL;
   context.pool_.shrink_idle_inv_entries();
   context.check_counts(8);
-  context.pool_.inv_idle_bytes_low_water_ = 0;
+  context.pool_.shards_[0].inv_idle_bytes_low_water_ = 0;
   context.expire_window();
   context.pool_.shrink_idle_inv_entries();
   context.check_counts(8);
   EXPECT_EQ(8 * sizeof(blocksstable::ObInvPostingIterEntry),
-      context.pool_.inv_idle_bytes_low_water_);
-  context.pool_.inv_idle_bytes_low_water_ = 4 * sizeof(blocksstable::ObInvPostingIterEntry);
-  blocksstable::ObInvIteratorEntryBase *newest = context.pool_.inv_idle_head_;
+      context.pool_.shards_[0].inv_idle_bytes_low_water_);
+  context.pool_.shards_[0].inv_idle_bytes_low_water_ = 4 * sizeof(blocksstable::ObInvPostingIterEntry);
+  blocksstable::ObInvIteratorEntryBase *newest = context.pool_.shards_[0].inv_idle_head_;
   context.expire_window();
   context.pool_.shrink_idle_inv_entries();
   context.check_counts(6);
-  EXPECT_EQ(newest, context.pool_.inv_idle_head_);
-  EXPECT_EQ(6 * sizeof(blocksstable::ObInvPostingIterEntry), context.pool_.inv_idle_bytes_low_water_);
+  EXPECT_EQ(newest, context.pool_.shards_[0].inv_idle_head_);
+  EXPECT_EQ(6 * sizeof(blocksstable::ObInvPostingIterEntry), context.pool_.shards_[0].inv_idle_bytes_low_water_);
   context.expire_window();
   context.pool_.shrink_idle_inv_entries();
   context.check_counts(4);
@@ -245,20 +294,20 @@ TEST_F(ObGlobalIteratorPoolTest, posting_shrink_window_and_retain_floor)
   // Synthetic charges distinguish the 16 MiB floor from the 64 MiB budget.
   context.set_limit(64L << 20);
   ASSERT_NO_FATAL_FAILURE(context.fill());
-  for (blocksstable::ObInvIteratorEntryBase *entry = context.pool_.inv_idle_head_;
+  for (blocksstable::ObInvIteratorEntryBase *entry = context.pool_.shards_[0].inv_idle_head_;
        nullptr != entry; entry = entry->next_global_entry_) {
     entry->accounted_bytes_ = 4L << 20;
   }
-  context.pool_.inv_idle_bytes_ = 32L << 20;
-  context.pool_.inv_total_bytes_ = 32L << 20;
-  context.pool_.inv_idle_bytes_low_water_ = 32L << 20;
+  context.pool_.shards_[0].inv_idle_bytes_ = 32L << 20;
+  context.pool_.shards_[0].inv_total_bytes_ = 32L << 20;
+  context.pool_.shards_[0].inv_idle_bytes_low_water_ = 32L << 20;
   for (int64_t round = 0; round < 2; ++round) {
     context.expire_window();
     context.pool_.shrink_idle_inv_entries();
-    EXPECT_EQ(4, context.pool_.inv_idle_count_);
-    EXPECT_EQ(16L << 20, context.pool_.inv_idle_bytes_);
-    EXPECT_EQ(16L << 20, context.pool_.inv_total_bytes_);
-    EXPECT_EQ(16L << 20, context.pool_.inv_idle_bytes_low_water_);
+    context.check_idle_list(4);
+    EXPECT_EQ(16L << 20, context.pool_.shards_[0].inv_idle_bytes_);
+    EXPECT_EQ(16L << 20, context.pool_.shards_[0].inv_total_bytes_);
+    EXPECT_EQ(16L << 20, context.pool_.shards_[0].inv_idle_bytes_low_water_);
   }
 }
 
@@ -269,13 +318,13 @@ TEST_F(ObGlobalIteratorPoolTest, posting_shrink_borrowing_and_eviction_update_lo
   ASSERT_NO_FATAL_FAILURE(context.init());
   ASSERT_NO_FATAL_FAILURE(context.fill());
   context.pool_.shrink_idle_inv_entries();
-  blocksstable::ObInvIteratorEntryBase *newest = context.pool_.inv_idle_head_;
+  blocksstable::ObInvIteratorEntryBase *newest = context.pool_.shards_[0].inv_idle_head_;
   ASSERT_EQ(OB_SUCCESS, context.pool_.get_inv_entry(blocksstable::ObInvPostingIterEntry::ReuseKey{}, context.entries_[0]));
   EXPECT_EQ(newest, context.entries_[0]);
   EXPECT_FALSE(context.entries_[0]->is_idle_in_global_pool_);
   EXPECT_EQ(nullptr, context.entries_[0]->next_global_entry_);
   EXPECT_EQ(nullptr, context.entries_[0]->prev_global_entry_);
-  EXPECT_EQ(7 * sizeof(blocksstable::ObInvPostingIterEntry), context.pool_.inv_idle_bytes_low_water_);
+  EXPECT_EQ(7 * sizeof(blocksstable::ObInvPostingIterEntry), context.pool_.shards_[0].inv_idle_bytes_low_water_);
   context.check_counts(7, 1);
   ASSERT_NE(nullptr, scan_allocator.alloc(64));
   context.entries_[0]->iter_.allocator_ = &scan_allocator;
@@ -283,15 +332,15 @@ TEST_F(ObGlobalIteratorPoolTest, posting_shrink_borrowing_and_eviction_update_lo
   EXPECT_GT(scan_allocator.total(), 0);
   scan_allocator.reset();
   EXPECT_EQ(nullptr, context.entries_[0]);
-  EXPECT_EQ(newest, context.pool_.inv_idle_head_);
+  EXPECT_EQ(newest, context.pool_.shards_[0].inv_idle_head_);
   EXPECT_EQ(7 * sizeof(blocksstable::ObInvPostingIterEntry),
-      context.pool_.inv_idle_bytes_low_water_);
+      context.pool_.shards_[0].inv_idle_bytes_low_water_);
   ASSERT_EQ(OB_SUCCESS, context.pool_.get_inv_entry(blocksstable::ObInvPostingIterEntry::ReuseKey{}, context.entries_[0]));
   EXPECT_EQ(newest, context.entries_[0]);
   EXPECT_EQ(nullptr, context.entries_[0]->iter_.allocator_);
   EXPECT_EQ(0, scan_allocator.total());
   ASSERT_EQ(OB_SUCCESS, context.pool_.get_inv_entry(blocksstable::ObInvPostingIterEntry::ReuseKey{}, context.entries_[1]));
-  EXPECT_EQ(6 * sizeof(blocksstable::ObInvPostingIterEntry), context.pool_.inv_idle_bytes_low_water_);
+  EXPECT_EQ(6 * sizeof(blocksstable::ObInvPostingIterEntry), context.pool_.shards_[0].inv_idle_bytes_low_water_);
   // A second same-type lease reuses an idle entry and lowers the watermark.
   context.pool_.shrink_idle_inv_entries();
   context.check_counts(6, 2);
@@ -299,8 +348,8 @@ TEST_F(ObGlobalIteratorPoolTest, posting_shrink_borrowing_and_eviction_update_lo
   context.set_limit(6 * sizeof(blocksstable::ObInvPostingIterEntry));
   context.pool_.release_inv_entry(context.entries_[0]);
   context.check_counts(5, 1);
-  EXPECT_EQ(5 * sizeof(blocksstable::ObInvPostingIterEntry), context.pool_.inv_idle_bytes_low_water_);
-  context.pool_.inv_idle_bytes_low_water_ = sizeof(blocksstable::ObInvPostingIterEntry);
+  EXPECT_EQ(5 * sizeof(blocksstable::ObInvPostingIterEntry), context.pool_.shards_[0].inv_idle_bytes_low_water_);
+  context.pool_.shards_[0].inv_idle_bytes_low_water_ = sizeof(blocksstable::ObInvPostingIterEntry);
   context.expire_window();
   context.pool_.shrink_idle_inv_entries();
   context.check_counts(4, 1);
@@ -317,14 +366,20 @@ TEST_F(ObGlobalIteratorPoolTest, posting_shrink_zero_budget_and_reenable)
     ASSERT_EQ(OB_SUCCESS, context.pool_.get_inv_entry(blocksstable::ObInvPostingIterEntry::ReuseKey{}, context.entries_[0]));
     context.pool_.shrink_idle_inv_entries();
     context.set_limit(0);
+    ASSERT_EQ(OB_SUCCESS, context.pool_.get_inv_entry(
+        blocksstable::ObInvPostingIterEntry::ReuseKey{}, context.entries_[1]));
+    EXPECT_EQ(nullptr, context.entries_[1]);
+    EXPECT_EQ(2, context.pool_.refs_);
+    context.check_counts(7, 1);
     context.pool_.shrink_idle_inv_entries();
     context.check_counts(0, 1);
-    EXPECT_EQ(0, context.pool_.inv_idle_bytes_low_water_);
-    EXPECT_EQ(0, context.pool_.inv_shrink_window_start_);
+    EXPECT_EQ(0, context.pool_.shards_[0].inv_idle_bytes_low_water_);
+    EXPECT_EQ(0, context.pool_.shards_[0].inv_shrink_window_start_);
     context.pool_.shrink_idle_inv_entries();
     context.check_counts(0, 1);
     context.pool_.release_inv_entry(context.entries_[0]);
     context.check_counts(0);
+    EXPECT_EQ(1, context.pool_.refs_);
   }
 }
 
@@ -336,15 +391,15 @@ TEST_F(ObGlobalIteratorPoolTest, posting_shrink_byte_charges_and_tail_floor)
   const int64_t bytes = sizeof(blocksstable::ObInvPostingIterEntry);
   // Model unequal charges without adding a production iterator type.
   context.set_limit(10 * bytes);
-  context.pool_.inv_idle_tail_->accounted_bytes_ += 2 * bytes;
-  context.pool_.inv_idle_bytes_ += 2 * bytes;
-  context.pool_.inv_total_bytes_ += 2 * bytes;
+  context.pool_.shards_[0].inv_idle_tail_->accounted_bytes_ += 2 * bytes;
+  context.pool_.shards_[0].inv_idle_bytes_ += 2 * bytes;
+  context.pool_.shards_[0].inv_total_bytes_ += 2 * bytes;
   context.pool_.shrink_idle_inv_entries();
-  EXPECT_EQ(10 * bytes, context.pool_.inv_idle_bytes_low_water_);
+  EXPECT_EQ(10 * bytes, context.pool_.shards_[0].inv_idle_bytes_low_water_);
   context.expire_window();
   context.pool_.shrink_idle_inv_entries();
   context.check_counts(5);
-  EXPECT_EQ(5 * bytes, context.pool_.inv_idle_bytes_low_water_);
+  EXPECT_EQ(5 * bytes, context.pool_.shards_[0].inv_idle_bytes_low_water_);
   // The remaining half-entry of headroom cannot accommodate a whole Entry.
   context.set_limit(9 * bytes);
   context.expire_window();

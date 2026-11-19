@@ -305,12 +305,19 @@ int ObDASSearchCtx::prepare_posting_scan(
     blocksstable::ObInvPostingIterEntry *&entry)
 {
   int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(nullptr != entry)) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("posting entry must be closed before preparing a scan", K(ret), KP(entry));
-  } else if (use_pool && OB_FAIL(acquire_posting_entry(entry))) {
-    LOG_WARN("failed to acquire posting entry", K(ret));
-  } else {
+  if (nullptr != entry) {
+    // A retained lease must have its previous scan state cleared by the caller.
+    if (OB_UNLIKELY(!use_pool)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("unexpected posting entry with pooling disabled", K(ret), KP(entry));
+    }
+  } else if (use_pool) {
+    if (OB_FAIL(acquire_posting_entry(entry))) {
+      LOG_WARN("failed to acquire posting entry", K(ret));
+    }
+  }
+
+  if (OB_SUCC(ret)) {
     param.allocator_ = &scan_allocator;
     param.reusable_iter_ = nullptr != entry ? &entry->iter_ : nullptr;
     param.table_cache_ = &posting_table_cache_;
@@ -334,6 +341,23 @@ void ObDASSearchCtx::close_posting_scan(
   }
   param.reusable_iter_ = nullptr;
   param.allocator_ = &scan_allocator;
+}
+
+void ObDASSearchCtx::reuse_posting_scan(
+    blocksstable::ObInvPostingScanParam &param,
+    common::ObIAllocator &scan_allocator,
+    blocksstable::ObInvPostingIterEntry *&entry,
+    blocksstable::ObInvSSTablePostingIter *&iter)
+{
+  if (nullptr != entry) {
+    iter = nullptr;
+    // Detach scan resources before the caller resets its scan allocator.
+    entry->reuse();
+    param.reusable_iter_ = nullptr;
+    param.allocator_ = &scan_allocator;
+  } else {
+    close_posting_scan(param, scan_allocator, entry, iter);
+  }
 }
 
 ObDASFilterBitmapProvider *ObDASSearchCtx::find_filter_bitmap_provider(

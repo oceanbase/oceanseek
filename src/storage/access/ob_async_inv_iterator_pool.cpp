@@ -6,6 +6,7 @@
 #include "ob_async_inv_iterator_pool.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable_posting_iter.h"
 #include "lib/time/ob_time_utility.h"
+#include "lib/thread_local/ob_tsi_utils.h"
 #include "observer/omt/ob_tenant_config_mgr.h"
 namespace oceanbase
 {
@@ -13,10 +14,7 @@ namespace storage
 {
 ObAsyncInvIteratorPool::ObAsyncInvIteratorPool()
   : is_inited_(false), stopped_(false), is_disabled_(false), is_washing_(false),
-    refs_(1), tenant_id_(MTL_ID()), inv_lock_(common::ObLatchIds::OB_OBJECT_POOL_LOCK),
-    inv_idle_head_(nullptr), inv_idle_tail_(nullptr), inv_idle_count_(0),
-    inv_idle_bytes_(0), inv_total_bytes_(0), inv_idle_bytes_low_water_(0),
-    inv_shrink_window_start_(0)
+    refs_(1), tenant_id_(MTL_ID()), shard_count_(INV_SHARD_COUNT), shards_()
 {}
 ObAsyncInvIteratorPool::~ObAsyncInvIteratorPool()
 {
@@ -44,31 +42,25 @@ int ObAsyncInvIteratorPool::mtl_init(ObAsyncInvIteratorPool *&pool)
 }
 bool ObAsyncInvIteratorPool::pin()
 {
-  common::ObSpinLockGuard guard(inv_lock_);
-  bool accepted = is_inited_ && !stopped_;
-  if (accepted) {
-    ++refs_;
+  // The caller's tenant guard or existing reference protects this initial increment.
+  ATOMIC_INC(&refs_);
+  const bool accepted = is_inited_ && !ATOMIC_LOAD(&stopped_);
+  if (!accepted) {
+    unpin();
   }
   return accepted;
 }
 void ObAsyncInvIteratorPool::unpin()
 {
-  bool destroy = false;
-  {
-    common::ObSpinLockGuard guard(inv_lock_);
-    destroy = 0 == --refs_;
-  }
-  if (destroy) {
+  if (0 == ATOMIC_SAF(&refs_, 1)) {
     ObAsyncInvIteratorPool *pool = this;
     common::ob_delete(pool);
   }
 }
 void ObAsyncInvIteratorPool::stop()
 {
-  {
-    common::ObSpinLockGuard guard(inv_lock_);
-    stopped_ = true;
-  }
+  ATOMIC_STORE(&stopped_, true);
+  // Locking each shard during drain also synchronizes with in-flight publishers.
   drain_idle_inv_entries();
 }
 void ObAsyncInvIteratorPool::mtl_destroy(ObAsyncInvIteratorPool *&pool)
@@ -78,11 +70,11 @@ void ObAsyncInvIteratorPool::mtl_destroy(ObAsyncInvIteratorPool *&pool)
     pool = nullptr;
     released->stop();
     {
-      common::ObSpinLockGuard guard(released->inv_lock_);
-      if (released->refs_ > 1) {
+      const int64_t refs = ATOMIC_LOAD(&released->refs_);
+      if (refs > 1) {
         LOG_WARN_RET(OB_EAGAIN, "inverted iterator pool still has leases, query bindings or operations "
             "during MTL teardown",
-            K(released->refs_), K(released->inv_total_bytes_));
+            K(refs));
       }
     }
     // Late returns keep the management object alive without blocking MTL teardown.
@@ -118,41 +110,50 @@ void ObAsyncInvIteratorPool::destroy_inv_entry(blocksstable::ObInvIteratorEntryB
 
 void ObAsyncInvIteratorPool::drain_idle_inv_entries()
 {
-  blocksstable::ObInvIteratorEntryBase *entry = nullptr;
-  {
-    common::ObSpinLockGuard guard(inv_lock_);
-    entry = inv_idle_head_;
-    inv_idle_head_ = nullptr;
-    inv_idle_tail_ = nullptr;
-    inv_idle_count_ = 0;
-    inv_idle_bytes_low_water_ = 0;
-    inv_shrink_window_start_ = 0;
-    inv_total_bytes_ -= inv_idle_bytes_;
-    inv_idle_bytes_ = 0;
-  }
-  while (nullptr != entry) {
-    blocksstable::ObInvIteratorEntryBase *next = entry->next_global_entry_;
-    destroy_inv_entry(entry);
-    entry = next;
+  for (int64_t id = 0; id < shard_count_; ++id) {
+    InvShard &shard = shards_[id];
+
+    blocksstable::ObInvIteratorEntryBase *entry = nullptr;
+    {
+      common::ObSpinLockGuard guard(shard.inv_lock_);
+      entry = shard.inv_idle_head_;
+      shard.inv_idle_head_ = nullptr;
+      shard.inv_idle_tail_ = nullptr;
+      shard.inv_idle_bytes_low_water_ = 0;
+      shard.inv_shrink_window_start_ = 0;
+      shard.inv_total_bytes_ -= shard.inv_idle_bytes_;
+      shard.inv_idle_bytes_ = 0;
+    }
+    while (nullptr != entry) {
+      blocksstable::ObInvIteratorEntryBase *next = entry->next_global_entry_;
+      destroy_inv_entry(entry);
+      entry = next;
+    }
   }
 }
 
-void ObAsyncInvIteratorPool::evict_idle_tail(blocksstable::ObInvIteratorEntryBase *&evicted)
+void ObAsyncInvIteratorPool::evict_idle_tail(InvShard &shard, blocksstable::ObInvIteratorEntryBase *&evicted)
 {
-  blocksstable::ObInvIteratorEntryBase *victim = inv_idle_tail_;
-  inv_idle_tail_ = victim->prev_global_entry_;
-  if (nullptr != inv_idle_tail_) {
-    inv_idle_tail_->next_global_entry_ = nullptr;
+  blocksstable::ObInvIteratorEntryBase *victim = shard.inv_idle_tail_;
+  shard.inv_idle_tail_ = victim->prev_global_entry_;
+  if (nullptr != shard.inv_idle_tail_) {
+    shard.inv_idle_tail_->next_global_entry_ = nullptr;
   } else {
-    inv_idle_head_ = nullptr;
+    shard.inv_idle_head_ = nullptr;
   }
-  --inv_idle_count_;
-  inv_idle_bytes_ -= victim->accounted_bytes_;
-  inv_total_bytes_ -= victim->accounted_bytes_;
-  inv_idle_bytes_low_water_ = MIN(inv_idle_bytes_low_water_, inv_idle_bytes_);
+  shard.inv_idle_bytes_ -= victim->accounted_bytes_;
+  shard.inv_total_bytes_ -= victim->accounted_bytes_;
+  shard.inv_idle_bytes_low_water_ = MIN(shard.inv_idle_bytes_low_water_, shard.inv_idle_bytes_);
   victim->prev_global_entry_ = nullptr;
   victim->next_global_entry_ = evicted;
   evicted = victim;
+}
+
+int64_t ObAsyncInvIteratorPool::active_shard_count(const int64_t memory_limit) const
+{
+  // Avoid fragmenting a small budget below the size of the supported posting entry.
+  return memory_limit < shard_count_ * static_cast<int64_t>(sizeof(blocksstable::ObInvPostingIterEntry))
+      ? 1 : shard_count_;
 }
 
 void ObAsyncInvIteratorPool::shrink_idle_inv_entries()
@@ -166,28 +167,32 @@ void ObAsyncInvIteratorPool::shrink_idle_inv_entries()
     } else {
       const int64_t retain_bytes = memory_limit >= INV_SHRINK_RETAIN_BYTES
           ? INV_SHRINK_RETAIN_BYTES : memory_limit / 2;
-      {
-        common::ObSpinLockGuard guard(inv_lock_);
+      const int64_t active_count = active_shard_count(memory_limit);
+      for (int64_t id = 0; id < shard_count_; ++id) {
+        InvShard &shard = shards_[id];
+        const int64_t budget = shard_budget(memory_limit, id, active_count);
+        const int64_t retain = shard_budget(retain_bytes, id, active_count);
+        common::ObSpinLockGuard guard(shard.inv_lock_);
         // A reduced budget takes precedence over the periodic retention floor.
-        while (inv_total_bytes_ > memory_limit && nullptr != inv_idle_tail_) {
-          evict_idle_tail(evicted);
+        while (shard.inv_total_bytes_ > budget && nullptr != shard.inv_idle_tail_) {
+          evict_idle_tail(shard, evicted);
         }
         const int64_t now = common::ObTimeUtility::current_monotonic_time();
-        if (0 == inv_shrink_window_start_ || now < inv_shrink_window_start_) {
-          inv_shrink_window_start_ = now;
-          inv_idle_bytes_low_water_ = inv_idle_bytes_;
-        } else if (now - inv_shrink_window_start_ >= INV_SHRINK_INTERVAL) {
-          const int64_t release_bytes = inv_idle_bytes_low_water_ / 2;
+        if (0 == shard.inv_shrink_window_start_ || now < shard.inv_shrink_window_start_) {
+          shard.inv_shrink_window_start_ = now;
+          shard.inv_idle_bytes_low_water_ = shard.inv_idle_bytes_;
+        } else if (now - shard.inv_shrink_window_start_ >= INV_SHRINK_INTERVAL) {
+          const int64_t release_bytes = shard.inv_idle_bytes_low_water_ / 2;
           int64_t released_bytes = 0;
           // Reclaim whole entries without crossing the retained-byte floor.
-          while (released_bytes < release_bytes && nullptr != inv_idle_tail_
-              && inv_idle_tail_->accounted_bytes_ <= inv_idle_bytes_ - retain_bytes) {
-            released_bytes += inv_idle_tail_->accounted_bytes_;
-            evict_idle_tail(evicted);
+          while (released_bytes < release_bytes && nullptr != shard.inv_idle_tail_
+              && shard.inv_idle_tail_->accounted_bytes_ <= shard.inv_idle_bytes_ - retain) {
+            released_bytes += shard.inv_idle_tail_->accounted_bytes_;
+            evict_idle_tail(shard, evicted);
           }
           // A delayed wash closes one window only, without repeated catch-up shrinking.
-          inv_idle_bytes_low_water_ = inv_idle_bytes_;
-          inv_shrink_window_start_ = now;
+          shard.inv_idle_bytes_low_water_ = shard.inv_idle_bytes_;
+          shard.inv_shrink_window_start_ = now;
         }
       }
     }
@@ -215,12 +220,23 @@ int ObAsyncInvIteratorPool::get_inv_entry(
     // Stopping pools fall back to operator-owned allocation.
   } else {
     omt::ObTenantConfigGuard tenant_config(TENANT_CONF(tenant_id_));
-    const bool pool_enabled = tenant_config.is_valid()
-        && static_cast<int64_t>(tenant_config->async_inverted_index_iter_cache_max_size) > 0;
+    const int64_t memory_limit = tenant_config.is_valid()
+        ? static_cast<int64_t>(tenant_config->async_inverted_index_iter_cache_max_size) : 0;
+    if (memory_limit <= 0) {
+      unpin();
+      return ret;
+    }
+    const int64_t itid = common::get_itid();
+    if (OB_UNLIKELY(itid < 0)) {
+      unpin();
+      return ret;
+    }
+    const int64_t shard_id = itid % active_shard_count(memory_limit);
+    InvShard &shard = shards_[shard_id];
     {
-      common::ObSpinLockGuard guard(inv_lock_);
-      if (pool_enabled && !stopped_ && !is_disabled()) {
-        blocksstable::ObInvIteratorEntryBase *candidate = inv_idle_head_;
+      common::ObSpinLockGuard guard(shard.inv_lock_);
+      if (!ATOMIC_LOAD(&stopped_) && !is_disabled()) {
+        blocksstable::ObInvIteratorEntryBase *candidate = shard.inv_idle_head_;
         while (nullptr != candidate
             && (blocksstable::ObInvIteratorTraits<Iter>::TYPE != candidate->type_
                 || !static_cast<Entry *>(candidate)->matches(key))) {
@@ -231,23 +247,23 @@ int ObAsyncInvIteratorPool::get_inv_entry(
           if (nullptr != entry->prev_global_entry_) {
             entry->prev_global_entry_->next_global_entry_ = entry->next_global_entry_;
           } else {
-            inv_idle_head_ = entry->next_global_entry_;
+            shard.inv_idle_head_ = entry->next_global_entry_;
           }
           if (nullptr != entry->next_global_entry_) {
             entry->next_global_entry_->prev_global_entry_ = entry->prev_global_entry_;
           } else {
-            inv_idle_tail_ = entry->prev_global_entry_;
+            shard.inv_idle_tail_ = entry->prev_global_entry_;
           }
           entry->next_global_entry_ = nullptr;
           entry->prev_global_entry_ = nullptr;
-          entry->is_idle_in_global_pool_ = false;
-          --inv_idle_count_;
-          inv_idle_bytes_ -= entry->accounted_bytes_;
-          inv_idle_bytes_low_water_ = MIN(inv_idle_bytes_low_water_, inv_idle_bytes_);
+          ATOMIC_STORE(&entry->is_idle_in_global_pool_, false);
+          shard.inv_idle_bytes_ -= entry->accounted_bytes_;
+          shard.inv_idle_bytes_low_water_ = MIN(shard.inv_idle_bytes_low_water_, shard.inv_idle_bytes_);
         }
       }
     }
-    if (pool_enabled && nullptr == entry) {
+    bool reject = false;
+    if (nullptr == entry) {
       void *buf = common::ob_malloc(sizeof(Entry),
           SET_IGNORE_MEM_VERSION(common::ObMemAttr(tenant_id_, "GlobalInvIter")));
       if (OB_ISNULL(buf)) {
@@ -255,18 +271,14 @@ int ObAsyncInvIteratorPool::get_inv_entry(
         LOG_WARN("failed to allocate global inverted iterator entry", K(ret));
       } else {
         entry = new (buf) Entry();
+        entry->shard_id_ = shard_id;
         {
-          common::ObSpinLockGuard guard(inv_lock_);
-          inv_total_bytes_ += entry->accounted_bytes_;
+          common::ObSpinLockGuard guard(shard.inv_lock_);
+          reject = ATOMIC_LOAD(&stopped_);
+          if (!reject) {
+            shard.inv_total_bytes_ += entry->accounted_bytes_;
+          }
         }
-      }
-    }
-    bool reject = false;
-    if (nullptr != entry) {
-      common::ObSpinLockGuard guard(inv_lock_);
-      reject = stopped_;
-      if (reject) {
-        inv_total_bytes_ -= entry->accounted_bytes_;
       }
     }
     if (reject) {
@@ -289,26 +301,16 @@ void ObAsyncInvIteratorPool::release_inv_entry(blocksstable::ObInvIteratorEntry<
     blocksstable::ObInvIteratorEntry<Iter> *released = entry;
     blocksstable::ObInvIteratorEntryBase *evicted = nullptr;
     int64_t memory_limit = 0;
-    bool stopping = false;
-    {
-      common::ObSpinLockGuard guard(inv_lock_);
-      stopping = stopped_;
-    }
-    if (!stopping) {
+    if (!ATOMIC_LOAD(&stopped_)) {
       omt::ObTenantConfigGuard tenant_config(TENANT_CONF(tenant_id_));
       if (tenant_config.is_valid()) {
         memory_limit = tenant_config->async_inverted_index_iter_cache_max_size;
       }
     }
+    InvShard &shard = shards_[released->shard_id_];
+    const int64_t budget = shard_budget(memory_limit, released->shard_id_, active_shard_count(memory_limit));
     const bool pool_enabled = memory_limit > 0;
-    bool valid = false;
-    {
-      common::ObSpinLockGuard guard(inv_lock_);
-      if (!released->is_idle_in_global_pool_) {
-        released->is_idle_in_global_pool_ = true;
-        valid = true;
-      }
-    }
+    const bool valid = ATOMIC_BCAS(&released->is_idle_in_global_pool_, false, true);
     if (!valid) {
       STORAGE_LOG_RET(ERROR, common::OB_ERR_UNEXPECTED,
           "returning an already returned inverted iterator entry", KP(released));
@@ -318,27 +320,26 @@ void ObAsyncInvIteratorPool::release_inv_entry(blocksstable::ObInvIteratorEntry<
       const int64_t entry_bytes = released->get_cached_mem_size();
       bool retain = false;
       {
-        common::ObSpinLockGuard guard(inv_lock_);
-        retain = pool_enabled && !stopped_ && !is_disabled() && entry_bytes <= memory_limit;
+        common::ObSpinLockGuard guard(shard.inv_lock_);
+        retain = pool_enabled && !ATOMIC_LOAD(&stopped_) && !is_disabled() && entry_bytes <= budget;
         if (retain) {
-          inv_total_bytes_ += entry_bytes - released->accounted_bytes_;
+          shard.inv_total_bytes_ += entry_bytes - released->accounted_bytes_;
           released->accounted_bytes_ = entry_bytes;
-          released->next_global_entry_ = inv_idle_head_;
+          released->next_global_entry_ = shard.inv_idle_head_;
           released->prev_global_entry_ = nullptr;
-          if (nullptr != inv_idle_head_) {
-            inv_idle_head_->prev_global_entry_ = released;
+          if (nullptr != shard.inv_idle_head_) {
+            shard.inv_idle_head_->prev_global_entry_ = released;
           } else {
-            inv_idle_tail_ = released;
+            shard.inv_idle_tail_ = released;
           }
-          inv_idle_head_ = released;
-          ++inv_idle_count_;
-          inv_idle_bytes_ += entry_bytes;
+          shard.inv_idle_head_ = released;
+          shard.inv_idle_bytes_ += entry_bytes;
           // Evict older idle entries first; leased entries are never reclaimed.
-          while (inv_total_bytes_ > memory_limit && nullptr != inv_idle_tail_) {
-            evict_idle_tail(evicted);
+          while (shard.inv_total_bytes_ > budget && nullptr != shard.inv_idle_tail_) {
+            evict_idle_tail(shard, evicted);
           }
         } else {
-          inv_total_bytes_ -= released->accounted_bytes_;
+          shard.inv_total_bytes_ -= released->accounted_bytes_;
         }
       }
       if (!retain) {

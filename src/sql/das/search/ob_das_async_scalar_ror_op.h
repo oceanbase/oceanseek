@@ -111,6 +111,7 @@ public:
   { return is_scoring_ && nullptr != scalar_rtdef_ ? scalar_rtdef_->get_boost_weight() : 0.0; }
 
   void close_posting_iter();
+  void reuse_posting_iter();
   void release_scan_resources() override { close_posting_iter(); }
 
   bool supports_direct_rowid_drain() const override
@@ -155,6 +156,7 @@ private:
   int init_posting_scan_param();
   int open_posting_iter_from_tablet();
   void reset_leaf_runtime_state();
+  void reset_leaf_runtime_fields();
   int fetch_curr(ObDASRowID &curr_id, double &score);
   int fetch_direct_cursor();
   int position_direct_cursor(

@@ -104,6 +104,7 @@ private:
   int init_bm25_param_estimator();
   int open_posting_iter_from_tablet();
   void close_posting_iter();
+  void reuse_posting_iter();
 
   ObDASSearchCtx &search_ctx_;
   // Term key / query token: lives for the whole helper lifetime.

@@ -261,6 +261,13 @@ void ObDASAsyncTokenHelper::close_posting_iter()
   posting_iter_allocator_.reset();
 }
 
+void ObDASAsyncTokenHelper::reuse_posting_iter()
+{
+  search_ctx_.reuse_posting_scan(
+      posting_scan_param_, posting_iter_allocator_, posting_entry_, posting_iter_);
+  posting_iter_allocator_.reset();
+}
+
 int ObDASAsyncTokenHelper::open()
 {
   int ret = OB_SUCCESS;
@@ -310,7 +317,7 @@ int ObDASAsyncTokenHelper::rescan()
     ret = OB_NOT_INIT;
     LOG_WARN("not initialized", K(ret));
   } else {
-    close_posting_iter();
+    reuse_posting_iter();
     version_range_.reset();
     posting_scan_param_.reset();
     param_estimator_.reset();
@@ -359,7 +366,7 @@ int ObDASAsyncTokenHelper::rescan_segment(const common::ObNewVersionRange &range
     LOG_WARN("direct async token helper rejects segment rescan", K(ret),
              K_(index_table_id), K_(group_slot), K(range));
   } else {
-    close_posting_iter();
+    reuse_posting_iter();
     version_range_ = range;
     if (OB_FAIL(init_posting_scan_param())) {
       LOG_WARN("failed to init posting scan param on segment switch", K(ret));

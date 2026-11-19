@@ -66,6 +66,7 @@ public:
   virtual ~ObDASAsyncTokenOp() {}
 
   void close_posting_iter();
+  void reuse_posting_iter();
   void release_scan_resources() override { close_posting_iter(); }
 
   bool can_probe_sorted_ids() const

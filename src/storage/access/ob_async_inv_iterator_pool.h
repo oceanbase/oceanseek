@@ -30,12 +30,13 @@ public:
   const ObInvIteratorType type_;
   ObInvIteratorEntryBase *next_global_entry_; // Null while leased.
   ObInvIteratorEntryBase *prev_global_entry_;
+  int64_t shard_id_; // Immutable while leased; returns may run on another thread.
   int64_t accounted_bytes_; // Pool charge while leased or idle.
   bool is_idle_in_global_pool_; // Return claimed; linked only after scan cleanup completes.
 protected:
   ObInvIteratorEntryBase(const ObInvIteratorType type, const int64_t bytes, DestroyFunc destroy_func)
     : destroy_func_(destroy_func), type_(type), next_global_entry_(nullptr), prev_global_entry_(nullptr),
-      accounted_bytes_(bytes), is_idle_in_global_pool_(false)
+      shard_id_(-1), accounted_bytes_(bytes), is_idle_in_global_pool_(false)
   {}
   // Pool destruction must dispatch to the concrete Entry type.
   ~ObInvIteratorEntryBase() = default;
@@ -113,11 +114,12 @@ public:
   template <typename Iter>
   void release_inv_entry(blocksstable::ObInvIteratorEntry<Iter> *&entry);
 private:
+  struct InvShard;
   bool is_disabled() const { return ATOMIC_LOAD(&is_disabled_); }
   void drain_idle_inv_entries();
   void shrink_idle_inv_entries();
-  // Caller holds inv_lock_ and has verified that the idle list is nonempty.
-  void evict_idle_tail(blocksstable::ObInvIteratorEntryBase *&evicted);
+  // Caller holds the shard lock and has verified that its idle list is nonempty.
+  void evict_idle_tail(InvShard &shard, blocksstable::ObInvIteratorEntryBase *&evicted);
   static void destroy_inv_entry(blocksstable::ObInvIteratorEntryBase *entry);
   bool is_inited_;
   bool stopped_;
@@ -129,14 +131,30 @@ private:
   static const int64_t INV_SHRINK_RETAIN_BYTES = 16L << 20;
   static const int64_t WASH_HIGH_THRESHOLD = 96;
   static const int64_t WASH_LOW_THRESHOLD = 90;
-  common::ObSpinLock inv_lock_;
-  blocksstable::ObInvIteratorEntryBase *inv_idle_head_; // Most recently returned first.
-  blocksstable::ObInvIteratorEntryBase *inv_idle_tail_; // Least recently returned.
-  int64_t inv_idle_count_;
-  int64_t inv_idle_bytes_;
-  int64_t inv_total_bytes_; // Idle retained memory plus leased Entry charges.
-  int64_t inv_idle_bytes_low_water_; // Window minimum in bytes; protected by inv_lock_.
-  int64_t inv_shrink_window_start_; // Monotonic time; zero means no window yet.
+  static const int64_t INV_SHARD_COUNT = 16;
+  struct InvShard
+  {
+    InvShard()
+      : inv_lock_(common::ObLatchIds::OB_OBJECT_POOL_LOCK), inv_idle_head_(nullptr),
+        inv_idle_tail_(nullptr), inv_idle_bytes_(0), inv_total_bytes_(0),
+        inv_idle_bytes_low_water_(0), inv_shrink_window_start_(0)
+    {}
+    common::ObSpinLock inv_lock_;
+    blocksstable::ObInvIteratorEntryBase *inv_idle_head_; // Most recently returned first.
+    blocksstable::ObInvIteratorEntryBase *inv_idle_tail_; // Least recently returned.
+    int64_t inv_idle_bytes_;
+    int64_t inv_total_bytes_; // Idle retained memory plus leased Entry charges.
+    int64_t inv_idle_bytes_low_water_; // Window minimum in bytes; protected by the shard lock.
+    int64_t inv_shrink_window_start_; // Monotonic time; zero means no window yet.
+    // Separate hot fields without imposing over-alignment on the MTL allocator.
+    char padding_[CACHE_ALIGN_SIZE];
+  };
+  // Fixed for the pool lifetime; budgets sum exactly to the tenant setting.
+  int64_t shard_count_;
+  InvShard shards_[INV_SHARD_COUNT];
+  int64_t active_shard_count(const int64_t memory_limit) const;
+  int64_t shard_budget(const int64_t bytes, const int64_t id, const int64_t active_count) const
+  { return id < active_count ? bytes / active_count + (id < bytes % active_count ? 1 : 0) : 0; }
   DISALLOW_COPY_AND_ASSIGN(ObAsyncInvIteratorPool);
 };
 }
