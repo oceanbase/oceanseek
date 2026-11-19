@@ -9,6 +9,7 @@
 
 #include "lib/container/ob_fixed_array_iterator.h"
 #include "lib/container/ob_vector.h"
+#include "sql/engine/basic/ob_arrow_basic.h"
 #include "sql/engine/table/ob_external_data_page_cache.h"
 #include "sql/engine/table/ob_external_file_access.h"
 
@@ -18,6 +19,37 @@ namespace oceanbase
 {
 namespace sql
 {
+
+// Preserve OB errors before Arrow converts a nonzero callback result to ParquetException.
+int ObParquetPageMgr::WithOffsetIndexCallbacks::operator()(
+    const int64_t page_offset,
+    std::shared_ptr<arrow::Buffer> &page_buffer,
+    bool &has_mem_cached,
+    bool &has_decompressed) const
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(page_mgr_->read_page_with_offset_index_(page_offset,
+                                                      page_buffer,
+                                                      has_mem_cached,
+                                                      has_decompressed))) {
+    throw ObErrorCodeException(ret);
+  }
+  return ret;
+}
+
+int ObParquetPageMgr::WithoutOffsetIndexCallbacks::operator()(
+    const int64_t offset,
+    const int64_t length,
+    const int64_t column_end_offset,
+    std::shared_ptr<arrow::Buffer> &buffer) const
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(
+          page_mgr_->read_without_offset_index_range_(offset, length, column_end_offset, buffer))) {
+    throw ObErrorCodeException(ret);
+  }
+  return ret;
+}
 
 parquet::PageReadMode ObParquetPageMgr::PageReadModeCallback::operator()() const
 {

@@ -2799,8 +2799,8 @@ int ObOrcTableRowIterator::get_data_column_batch(
       if (subtype->getColumnId() == col_id) {
         batch = cur_batch->fields[i];
         found = true;
-      } else if (subtype->getColumnId() < col_id && col_id < subtype->getMaximumColumnId()) {
-        // 目标列在当前子类型的范围内，需要进入下一层搜索
+      } else if (subtype->getColumnId() < col_id && col_id <= subtype->getMaximumColumnId()) {
+        // The maximum column ID belongs to this subtree, including a single-child STRUCT.
         cur_batch = dynamic_cast<const orc::StructVectorBatch *>(cur_batch->fields[i]);
         cur_type = subtype;
         CK (OB_NOT_NULL(cur_batch));

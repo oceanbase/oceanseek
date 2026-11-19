@@ -714,6 +714,8 @@ private:
   int pre_buffer(std::shared_ptr<parquet::RowGroupReader> rg_reader);
   int prepare_page_mgr_with_offset_index();
   int prefetch_columns_without_offset_index(std::shared_ptr<parquet::RowGroupReader> rg_reader);
+  int prepare_collection_page_ranges(const int64_t column_id,
+                                     std::shared_ptr<parquet::RowGroupReader> rg_reader);
   int compute_column_id_by_index_type(int index, int &file_col_id, const bool is_collection_column);
   int pre_buffer(ObFilePreBuffer &file_prebuffer,
                  ObFilePreBuffer::ColumnRangeSlicesList &column_range_slice_list);

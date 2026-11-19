@@ -138,13 +138,7 @@ private:
     int operator()(const int64_t page_offset,
                    std::shared_ptr<arrow::Buffer> &page_buffer,
                    bool &has_mem_cached,
-                   bool &has_decompressed) const
-    {
-      return page_mgr_->read_page_with_offset_index_(page_offset,
-                                                     page_buffer,
-                                                     has_mem_cached,
-                                                     has_decompressed);
-    }
+                   bool &has_decompressed) const;
 
     int operator()(const int64_t page_offset) const
     {
@@ -179,10 +173,7 @@ private:
     int operator()(const int64_t offset,
                    const int64_t length,
                    const int64_t column_end_offset,
-                   std::shared_ptr<arrow::Buffer> &buffer) const
-    {
-      return page_mgr_->read_without_offset_index_range_(offset, length, column_end_offset, buffer);
-    }
+                   std::shared_ptr<arrow::Buffer> &buffer) const;
 
     int operator()(const int64_t page_offset,
                    std::shared_ptr<arrow::Buffer> &page_buffer,

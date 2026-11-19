@@ -4781,6 +4781,63 @@ int ObParquetTableRowIterator::alloc_page_range_arrays()
   return ret;
 }
 
+int ObParquetTableRowIterator::prepare_collection_page_ranges(
+    const int64_t column_id,
+    std::shared_ptr<parquet::RowGroupReader> rg_reader)
+{
+  int ret = OB_SUCCESS;
+  // Collection readers skip logical records together through SkipRecords(). Keep every leaf
+  // page selected: pruning their independently paginated streams would desynchronize readers.
+  for (int64_t i = 0; OB_SUCC(ret) && i < coll_record_readers_.at(column_id).count(); ++i) {
+    const int leaf_column_idx = coll_column_indexs_.at(column_id).at(i);
+    const std::shared_ptr<parquet::OffsetIndex> offset_index
+        = rg_page_index_reader_->GetOffsetIndex(leaf_column_idx);
+    if (OB_ISNULL(offset_index)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("collection leaf offset index is missing", K(ret), K(column_id), K(leaf_column_idx));
+    } else {
+      for (const parquet::PageLocation &page : offset_index->page_locations()) {
+        if (OB_SUCC(ret)) {
+          if (OB_UNLIKELY(page.offset < 0 || page.compressed_page_size <= 0
+                          || page.offset > INT64_MAX - page.compressed_page_size)) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_WARN("invalid collection data page range",
+                     K(ret),
+                     K(column_id),
+                     K(leaf_column_idx),
+                     K(page.offset),
+                     K(page.compressed_page_size));
+          } else if (OB_FAIL(page_selected_read_ranges_.at(column_id)->push_back(
+                         {page.offset, page.compressed_page_size}))) {
+            LOG_WARN("failed to push collection data page range", K(ret));
+          } else {
+            ++reader_metrics_.selected_page_count_;
+          }
+        }
+      }
+      const std::unique_ptr<parquet::ColumnChunkMetaData> metadata
+          = rg_reader->metadata()->ColumnChunk(leaf_column_idx);
+      if (OB_SUCC(ret) && metadata->has_dictionary_page()) {
+        const int64_t dictionary_page_offset = metadata->dictionary_page_offset();
+        const int64_t data_page_offset = metadata->data_page_offset();
+        if (OB_UNLIKELY(dictionary_page_offset < 0 || data_page_offset <= dictionary_page_offset)) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_WARN("invalid collection dictionary page range",
+                   K(ret),
+                   K(column_id),
+                   K(leaf_column_idx),
+                   K(dictionary_page_offset),
+                   K(data_page_offset));
+        } else {
+          OZ(page_selected_read_ranges_.at(column_id)->push_back(
+              {dictionary_page_offset, data_page_offset - dictionary_page_offset}));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObParquetTableRowIterator::prepare_page_ranges(
     std::shared_ptr<parquet::RowGroupReader> rg_reader,
     const int64_t num_rows)
@@ -4801,7 +4858,9 @@ int ObParquetTableRowIterator::prepare_page_ranges(
         }
         for (int64_t i = 0; OB_SUCC(ret) && i < page_skip_ranges_.count(); ++i) {
           int column_idx = column_indexs_.at(i);
-          if (column_idx >= 0) {
+          if (column_idx >= 0 && coll_record_readers_.at(i).count() > 0) {
+            OZ(prepare_collection_page_ranges(i, rg_reader));
+          } else if (column_idx >= 0) {
             const ObArray<ObParquetPageLocation> *column_page_locations = all_column_page_locations_.at(i);
             for (int64_t j = 0; OB_SUCC(ret) && j < column_page_locations->size(); ++j) {
               const ObParquetPageLocation &current_page_location = column_page_locations->at(j);
@@ -4833,7 +4892,7 @@ int ObParquetTableRowIterator::prepare_page_ranges(
         // add dictionary page
         // 字典 page 不会存在 page-index 里面，我们需要手动添加到 page_selected_read_ranges_
         for (int64_t i = 0; OB_SUCC(ret) && i < column_indexs_.count(); i++) {
-          if (column_indexs_.at(i) >= 0) {
+          if (column_indexs_.at(i) >= 0 && coll_record_readers_.at(i).count() == 0) {
             std::unique_ptr<parquet::ColumnChunkMetaData> column_metadata
                 = rg_reader->metadata()->ColumnChunk(column_indexs_.at(i));
             if (column_metadata->has_dictionary_page()) {
@@ -5257,8 +5316,19 @@ int ObParquetTableRowIterator::prepare_page_index(const int64_t cur_row_group,
         const int64_t column_idx = column_indexs_.at(i);
         if (column_idx >= 0) {
           has_physical_column = true;
-          all_columns_have_offset_index
-              = nullptr != rg_page_index_reader_->GetOffsetIndex(column_idx);
+          const int64_t leaf_count = coll_record_readers_.at(i).count();
+          if (leaf_count == 0 || scan_param_->sample_info_.is_block_sample()) {
+            // Block sampling selects pages separately; retain its first-leaf index check.
+            all_columns_have_offset_index
+                = nullptr != rg_page_index_reader_->GetOffsetIndex(column_idx);
+          } else {
+            // coll_column_indexs_ has spare capacity; only the reader count denotes valid leaves.
+            for (int64_t j = 0; all_columns_have_offset_index && j < leaf_count; ++j) {
+              const int64_t leaf_column_idx = coll_column_indexs_.at(i).at(j);
+              all_columns_have_offset_index
+                  = nullptr != rg_page_index_reader_->GetOffsetIndex(leaf_column_idx);
+            }
+          }
         }
       }
       if (!has_physical_column || !all_columns_have_offset_index) {
