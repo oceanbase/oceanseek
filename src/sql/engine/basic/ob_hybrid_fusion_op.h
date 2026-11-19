@@ -32,17 +32,19 @@ namespace sql
 {
 struct ObFusionDocInfo
 {
-  ObFusionDocInfo() : row_store_idx_(-1), fusion_score_(0.0) {}
+  ObFusionDocInfo() : row_store_idx_(-1), fusion_score_(0.0), is_query_hit_(false) {}
   ~ObFusionDocInfo() { reset(); }
 
   int64_t row_store_idx_;
   double fusion_score_;
+  bool is_query_hit_;
   void reset() {
     row_store_idx_ = -1;
     fusion_score_ = 0.0;
+    is_query_hit_ = false;
   }
   
-  TO_STRING_KV(K_(row_store_idx), K_(fusion_score));
+  TO_STRING_KV(K_(row_store_idx), K_(fusion_score), K_(is_query_hit));
 };
 
 struct ObPathStats
@@ -172,6 +174,7 @@ private:
                                 bool &has_query_path,
                                 int64_t &child_output_cnt);
   int prepare_batch_doc_indices(const int64_t batch_size);
+  bool need_buffer_query_hit(const bool is_query_hit, const bool has_knn_score) const;
   int classify_child_batch_rows(const ObBatchRows *child_brs,
                                 ObExpr *query_score_expr,
                                 const bool has_query_path,

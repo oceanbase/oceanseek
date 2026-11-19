@@ -213,14 +213,9 @@ int ObHybridFusionOp::inner_rescan()
   full_recall_phase_ = PHASE_STREAMING;
   row_store_reader_.reset();
   row_store_.reuse();
-  if (row_store_.is_inited()) {
-    row_store_reader_.init(&row_store_);
-  }
   fusion_docs_.reset();
   path_stats_.reset();
   sorted_doc_indices_.reset();
-  stored_rows_buffer_.reset();
-  comparers_.reset();
   weights_.reset();
   path_top_k_limit_.reset();
   passthrough_doc_indices_.reset();
@@ -230,6 +225,10 @@ int ObHybridFusionOp::inner_rescan()
   }
   if (OB_FAIL(ObOperator::inner_rescan())) {
     LOG_WARN("failed to rescan", K(ret));
+  } else if (OB_FAIL(row_store_reader_.init(&row_store_))) {
+    LOG_WARN("failed to init row store reader", K(ret));
+  } else if (OB_FAIL(init_constant_params())) {
+    LOG_WARN("failed to refresh fusion parameters", K(ret));
   }
   return ret;
 }
@@ -454,6 +453,9 @@ int ObHybridFusionOp::fetch_next_child_batch(const int64_t batch_cnt,
       ret = OB_SUCCESS;
       is_iter_end = true;
     }
+  } else if (OB_ISNULL(child_brs)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("child batch is null", K(ret));
   } else if (child_brs->end_) {
     is_iter_end = true;
   }
@@ -513,6 +515,24 @@ int ObHybridFusionOp::prepare_batch_doc_indices(const int64_t batch_size)
   return ret;
 }
 
+bool ObHybridFusionOp::need_buffer_query_hit(const bool is_query_hit, const bool has_knn_score) const
+{
+  bool need_buffer = false;
+  if (!is_query_hit) {
+    // KNN-only rows use the existing buffering path.
+  } else if (!has_knn_score) {
+    // Query-only rows already have their final score.
+  } else if (!is_weight_sum()) {
+    // Keep the existing behavior for other fusion methods.
+  } else if (fusion_iter_exec_mode_ == ObFusionIterExecMode::ROWKEY_SCORE_FULL_RECALL) {
+    // Both-hit rows wait for global KNN selection before applying min_score.
+    need_buffer = true;
+  } else {
+    // Other execution modes keep the existing query passthrough behavior.
+  }
+  return need_buffer;
+}
+
 int ObHybridFusionOp::classify_child_batch_rows(const ObBatchRows *child_brs,
                                                 ObExpr *query_score_expr,
                                                 const bool has_query_path,
@@ -548,13 +568,20 @@ int ObHybridFusionOp::classify_child_batch_rows(const ObBatchRows *child_brs,
     }
     bool is_query_hit = false;
     bool has_knn_score = false;
+    double query_score = 0.0;
     if (has_query_path) {
       if (MY_SPEC.use_rich_format_) {
         ObIVector *query_vec = query_score_expr->get_vector(eval_ctx_);
         is_query_hit = (query_vec != nullptr && !query_vec->is_null(i));
+        if (is_query_hit) {
+          query_score = query_vec->get_double(i);
+        }
       } else {
         ObDatum *query_datums = query_score_expr->locate_batch_datums(eval_ctx_);
         is_query_hit = (query_datums != nullptr && !query_datums[i].is_null());
+        if (is_query_hit) {
+          query_score = query_datums[i].get_double();
+        }
       }
     }
 
@@ -579,10 +606,12 @@ int ObHybridFusionOp::classify_child_batch_rows(const ObBatchRows *child_brs,
       }
     }
 
+    const bool can_output_query_hit_directly =
+        is_query_hit && !need_buffer_query_hit(is_query_hit, has_knn_score);
     if (OB_SUCC(ret)) {
       if (!is_query_hit && !has_knn_score) {
         brs_.set_skip(i);
-      } else if (is_query_hit) {
+      } else if (can_output_query_hit_directly) {
         double fusion_score = 0.0;
         if (MY_SPEC.use_rich_format_) {
           ObIVector *vec = fusion_score_expr->get_vector(eval_ctx_);
@@ -614,16 +643,18 @@ int ObHybridFusionOp::classify_child_batch_rows(const ObBatchRows *child_brs,
         brs_.set_skip(i);
         ObCompactRow *stored_row = nullptr;
         if (OB_FAIL(row_store_.add_row(child_->get_spec().output_, i, eval_ctx_, stored_row))) {
-          LOG_WARN("failed to store knn-only row", K(ret));
+          LOG_WARN("failed to store knn candidate", K(ret));
         } else {
           int64_t row_store_idx = row_store_.get_row_cnt() - 1;
           int64_t doc_idx = fusion_docs_.count();
           batch_doc_indices_.at(i) = doc_idx;
           ObFusionDocInfo doc_info;
-          doc_info.fusion_score_ = 0.0;
+          doc_info.is_query_hit_ = is_query_hit;
+          // Global KNN rescoring adds only the selected vector contributions.
+          doc_info.fusion_score_ = is_query_hit ? query_score * weights_.at(search_index_) : 0.0;
           doc_info.row_store_idx_ = row_store_idx;
           if (OB_FAIL(fusion_docs_.push_back(doc_info))) {
-            LOG_WARN("failed to push fusion doc for knn-only", K(ret));
+            LOG_WARN("failed to push fusion doc for knn candidate", K(ret));
           }
         }
       }
@@ -702,7 +733,10 @@ int ObHybridFusionOp::prepare_output_knn_materialization()
 {
   int ret = OB_SUCCESS;
   if (!is_data_ready_) {
-    if (OB_FAIL(rescore())) {
+    // Capture global membership before rescoring: RRF consumes the path heaps.
+    if (OB_FAIL(get_top_k_doc_indices())) {
+      LOG_WARN("failed to collect global knn candidates", K(ret));
+    } else if (OB_FAIL(rescore())) {
       LOG_WARN("failed to rescore in knn-only path", K(ret));
     } else if (OB_FAIL(compute_knn_only_topk())) {
       LOG_WARN("failed to compute knn only topk", K(ret));
@@ -742,24 +776,14 @@ int ObHybridFusionOp::compute_knn_only_topk()
   int ret = OB_SUCCESS;
   int64_t selected_doc_cnt = 0;
   int64_t skipped_doc_cnt = 0;
-  const int64_t bucket_cnt = OB_MAX(path_count_ * OB_MAX(top_k_limit_, 1L), 1L);
-  if (OB_FAIL(top_k_doc_indices_.create(bucket_cnt))) {
-    LOG_WARN("failed to create top k doc indices", K(ret));
-  } else {
-    for (int64_t i = 0; OB_SUCC(ret) && i < path_count_; ++i) {
-      if (i == search_index_) {
-        continue;
-      }
-      ObTopKHeap *heap = path_heaps_.at(i);
-      const int64_t heap_size = heap->count();
-      for (int64_t j = 0; OB_SUCC(ret) && j < heap_size; ++j) {
-        const ObPathScoreEntry &entry = heap->at(j);
-        if (OB_FAIL(top_k_doc_indices_.set_refactored(entry.doc_idx_))) {
-          if (OB_HASH_EXIST == ret) {
-            ret = OB_SUCCESS;
-          } else {
-            LOG_WARN("failed to set doc index", K(ret), K(entry.doc_idx_));
-          }
+  // Buffered query matches remain eligible even if every global KNN path rejects them.
+  for (int64_t doc_idx = 0; OB_SUCC(ret) && doc_idx < fusion_docs_.count(); ++doc_idx) {
+    if (fusion_docs_.at(doc_idx).is_query_hit_) {
+      if (OB_FAIL(top_k_doc_indices_.set_refactored(doc_idx))) {
+        if (OB_HASH_EXIST == ret) {
+          ret = OB_SUCCESS;
+        } else {
+          LOG_WARN("failed to retain query hit", K(ret), K(doc_idx));
         }
       }
     }
@@ -792,9 +816,12 @@ int ObHybridFusionOp::get_top_k_doc_indices()
 {
   int ret = OB_SUCCESS;
   const int64_t bucket_cnt = OB_MAX(path_count_ * OB_MAX(top_k_limit_, 1L), 1L);
-  if (OB_FAIL(top_k_doc_indices_.create(bucket_cnt))) {
+  if (top_k_doc_indices_.created()) {
+    top_k_doc_indices_.reuse();
+  } else if (OB_FAIL(top_k_doc_indices_.create(bucket_cnt))) {
     LOG_WARN("failed to create top k doc indices", K(ret));
-  } else {
+  }
+  if (OB_SUCC(ret)) {
     for (int64_t i = 0; OB_SUCC(ret) && i < path_count_; ++i) {
       ObTopKHeap *heap = path_heaps_.at(i);
       const int64_t heap_size = heap->count();

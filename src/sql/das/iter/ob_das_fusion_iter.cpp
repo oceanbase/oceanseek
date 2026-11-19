@@ -1692,7 +1692,7 @@ int ObDASFusionIter::init_fusion_score_heap()
 int ObDASFusionIter::sort_topk_results()
 {
   int ret = OB_SUCCESS;
-  
+  const bool filter_min_score = need_filter_min_score();
   if (OB_ISNULL(fusion_score_heap_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("fusion_score_heap is null", K(ret));
@@ -1707,7 +1707,7 @@ int ObDASFusionIter::sort_topk_results()
       } else if (entry.doc_idx_ < 0 || entry.doc_idx_ >= fusion_docs_.count()) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("invalid doc_idx", K(ret), K(entry.doc_idx_), K(fusion_docs_.count()));
-      } else if (!has_rerank() && entry.score_ < min_score_) {
+      } else if (filter_min_score && entry.score_ < min_score_) {
         // do nothing
       } else if (OB_FAIL(sorted_doc_indices_.push_back(entry.doc_idx_))) {
         LOG_WARN("failed to push doc index", K(ret), K(entry.doc_idx_));
@@ -2377,16 +2377,34 @@ int ObDASFusionIter::set_rowkey_is_uint64_flag()
   return ret;
 }
 
+bool ObDASFusionIter::need_filter_min_score() const
+{
+  bool need_filter = false;
+  if (has_hybrid_fusion_op()) {
+    // The upper fusion operator applies min_score.
+  } else if (has_rerank()) {
+    // Apply min_score after rerank.
+  } else if (fusion_iter_exec_mode_ == ObFusionIterExecMode::SCORE_TOP_K_QUERY_HITS) {
+    // Unsorted Top-K candidates do not have final fusion scores.
+    need_filter = need_sorted();
+  } else if (fusion_iter_exec_mode_ == ObFusionIterExecMode::ROWKEY_SCORE_FULL_RECALL) {
+    need_filter = true;
+  } else {
+    // Rowkey-only modes do not produce fusion scores.
+  }
+  return need_filter;
+}
+
 int ObDASFusionIter::build_all_path_topk_doc_indices()
 {
   int ret = OB_SUCCESS;
-  bool need_filter_min_score = !(fusion_iter_exec_mode_ == ObFusionIterExecMode::SCORE_TOP_K_QUERY_HITS && !need_sorted());
+  const bool filter_min_score = need_filter_min_score();
   if (need_sorted() && fusion_iter_exec_mode_ == ObFusionIterExecMode::SCORE_TOP_K_QUERY_HITS) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("is_distributed_ is false", K(ret));
   } else {
     for (int64_t i = 0; OB_SUCC(ret) && i < fusion_docs_.count(); ++i) {
-      if (need_filter_min_score && fusion_docs_.at(i).fusion_score_ < min_score_) {
+      if (filter_min_score && fusion_docs_.at(i).fusion_score_ < min_score_) {
         continue;
       }
       if (OB_FAIL(sorted_doc_indices_.push_back(i))) {

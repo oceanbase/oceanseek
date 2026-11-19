@@ -409,6 +409,7 @@ private:
   bool has_hybrid_fusion_op() const { return has_hybrid_fusion_op_; }
   bool is_single_partition() const { return is_single_partition_; }
   bool has_rerank() const { return rerank_window_size_ > 0; }
+  bool need_filter_min_score() const;
   
 private:
   lib::MemoryContext fusion_memctx_;

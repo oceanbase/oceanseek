@@ -862,6 +862,66 @@ protected:
     return ret;
   }
 
+  void verify_min_score_filtering(const ObFusionIterExecMode exec_mode,
+                                  const bool has_upper_fusion,
+                                  const double min_score,
+                                  const uint64_t expected_rowkey_mask,
+                                  const ObFusionMethod fusion_method = ObFusionMethod::WEIGHT_SUM,
+                                  const bool has_rerank = false)
+  {
+    ObSEArray<MockDASChildIter::MockRow, 8> search_rows;
+    ObSEArray<MockDASChildIter::MockRow, 8> vec_rows;
+    ObSEArray<double, 2> weights;
+    const double raw_scores[] = {0.0, 1.0, 0.75, 0.5};
+    ASSERT_EQ(OB_SUCCESS, search_rows.push_back({1, raw_scores[1]}));
+    ASSERT_EQ(OB_SUCCESS, search_rows.push_back({3, raw_scores[3]}));
+    ASSERT_EQ(OB_SUCCESS, vec_rows.push_back({2, raw_scores[2]}));
+    ASSERT_EQ(OB_SUCCESS, weights.push_back(1.0));
+    ASSERT_EQ(OB_SUCCESS, weights.push_back(1.0));
+
+    fusion_param_.fusion_iter_exec_mode_ = exec_mode;
+    fusion_param_.has_hybrid_fusion_op_ = has_upper_fusion;
+    fusion_param_.is_single_partition_ = !has_upper_fusion || has_rerank;
+    fusion_param_.min_score_ = min_score;
+    // Keep the candidate window larger than the input to isolate min_score filtering.
+    ASSERT_EQ(OB_SUCCESS, setup_fusion_iter(search_rows, vec_rows, 10, &weights));
+    fusion_iter_.fusion_method_ = fusion_method;
+    if (has_rerank) {
+      fusion_iter_.rerank_window_size_ = 3;
+    }
+    ASSERT_EQ(OB_SUCCESS, fusion_iter_.do_table_scan());
+
+    uint64_t actual_rowkey_mask = 0;
+    const ExprFixedArray &score_exprs = fusion_ctdef_.get_score_exprs();
+    ASSERT_EQ(3, score_exprs.count());
+    while (true) {
+      const int ret = fusion_iter_.inner_get_next_row();
+      if (OB_ITER_END == ret) {
+        break;
+      }
+      ASSERT_EQ(OB_SUCCESS, ret);
+      const ObDatum &rowkey = fusion_ctdef_.rowid_exprs_.at(0)->locate_expr_datum(eval_ctx_);
+      ASSERT_FALSE(rowkey.is_null());
+      const uint64_t id = rowkey.get_uint();
+      ASSERT_GE(id, 1U);
+      ASSERT_LE(id, 3U);
+      ASSERT_EQ(0U, actual_rowkey_mask & (1ULL << id));
+      actual_rowkey_mask |= 1ULL << id;
+
+      const int64_t hit_path = (2 == id) ? 1 : 0;
+      const ObDatum &raw_score = score_exprs.at(hit_path)->locate_expr_datum(eval_ctx_);
+      ASSERT_FALSE(raw_score.is_null());
+      EXPECT_DOUBLE_EQ(raw_scores[id], raw_score.get_double());
+      EXPECT_TRUE(score_exprs.at(1 - hit_path)->locate_expr_datum(eval_ctx_).is_null());
+      const ObDatum &fusion_score = fusion_ctdef_.get_fusion_score_expr()->locate_expr_datum(eval_ctx_);
+      ASSERT_FALSE(fusion_score.is_null());
+      const double expected_score = (ObFusionMethod::RRF == fusion_method)
+          ? 1.0 / (60.0 + ((3 == id) ? 2 : 1)) : raw_scores[id];
+      EXPECT_DOUBLE_EQ(expected_score, fusion_score.get_double());
+    }
+    EXPECT_EQ(expected_rowkey_mask, actual_rowkey_mask);
+  }
+
   /**
    * Verify fusion results
    */
@@ -946,6 +1006,61 @@ TEST_F(ObDASFusionIterTest, test_basic_fusion)
   expected_scores.push_back(0.3);
 
   verify_results(expected_rowkeys, expected_scores);
+}
+
+// The global fusion operator must receive every candidate, even below local min_score.
+TEST_F(ObDASFusionIterTest, test_min_score_full_recall_global_candidates)
+{
+  verify_min_score_filtering(ObFusionIterExecMode::ROWKEY_SCORE_FULL_RECALL, true,
+                            1.25, (1ULL << 1) | (1ULL << 2) | (1ULL << 3));
+}
+
+TEST_F(ObDASFusionIterTest, test_min_score_topk_global_candidates)
+{
+  verify_min_score_filtering(ObFusionIterExecMode::SCORE_TOP_K_QUERY_HITS, true,
+                            1.25, (1ULL << 1) | (1ULL << 2) | (1ULL << 3));
+}
+
+TEST_F(ObDASFusionIterTest, test_min_score_full_recall_local_results)
+{
+  verify_min_score_filtering(ObFusionIterExecMode::ROWKEY_SCORE_FULL_RECALL, false, 1.25, 0);
+}
+
+TEST_F(ObDASFusionIterTest, test_min_score_topk_local_results)
+{
+  verify_min_score_filtering(ObFusionIterExecMode::SCORE_TOP_K_QUERY_HITS, false, 1.25, 0);
+}
+
+// Equal-to-threshold scores survive, while lower scores are removed.
+TEST_F(ObDASFusionIterTest, test_min_score_full_recall_inclusive_boundary)
+{
+  verify_min_score_filtering(ObFusionIterExecMode::ROWKEY_SCORE_FULL_RECALL, false,
+                            0.75, (1ULL << 1) | (1ULL << 2));
+}
+
+TEST_F(ObDASFusionIterTest, test_min_score_topk_inclusive_boundary)
+{
+  verify_min_score_filtering(ObFusionIterExecMode::SCORE_TOP_K_QUERY_HITS, false,
+                            0.75, (1ULL << 1) | (1ULL << 2));
+}
+
+TEST_F(ObDASFusionIterTest, test_min_score_rrf_global_candidates)
+{
+  verify_min_score_filtering(ObFusionIterExecMode::SCORE_TOP_K_QUERY_HITS, true,
+                            0.025, (1ULL << 1) | (1ULL << 2) | (1ULL << 3), ObFusionMethod::RRF);
+}
+
+TEST_F(ObDASFusionIterTest, test_min_score_rrf_local_results)
+{
+  verify_min_score_filtering(ObFusionIterExecMode::SCORE_TOP_K_QUERY_HITS, false,
+                            0.025, 0, ObFusionMethod::RRF);
+}
+
+TEST_F(ObDASFusionIterTest, test_min_score_rerank_candidates)
+{
+  verify_min_score_filtering(ObFusionIterExecMode::SCORE_TOP_K_QUERY_HITS, true,
+                            1.25, (1ULL << 1) | (1ULL << 2) | (1ULL << 3),
+                            ObFusionMethod::WEIGHT_SUM, true);
 }
 
 // Test fusion with only search path
