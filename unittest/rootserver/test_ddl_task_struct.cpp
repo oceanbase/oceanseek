@@ -39,6 +39,7 @@
 
 #include "share/schema/ob_multi_version_schema_service.h"
 #include "share/schema/ob_schema_service_sql_impl.h"
+#include "share/schema/mock_schema_service.h"
 
 #define LOG_FILE_PATH "./test_ddl_task_struct.log"
 
@@ -1109,7 +1110,7 @@ public:
   int next() override
   {
     int ret = next_ret_;
-    if (is_count_query_ && OB_SUCCESS == ret) {
+    if ((is_count_query_ || !build_task_message_.empty()) && OB_SUCCESS == ret) {
       ret = row_returned_ ? OB_ITER_END : OB_SUCCESS;
       row_returned_ = true;
     }
@@ -1118,12 +1119,31 @@ public:
   int get_int(const char *column, int64_t &value) const override
   {
     int ret = OB_SUCCESS;
-    if (0 == strcmp(column, "have")) {
+    if (!build_task_message_.empty()) {
+      const struct { const char *name; int64_t value; } fields[] = {
+          {"create_time", 1}, {"tenant_id", OB_INVALID_TENANT_ID}, {"task_id", 7002},
+          {"parent_task_id", 7001}, {"object_id", 500001}, {"target_object_id", 500002},
+          {"schema_version", 4001}, {"ddl_type", share::DDL_CREATE_ASYNC_SEARCH_INDEX},
+          {"status", ObDDLTaskStatus::FAIL}, {"task_version", 1},
+          {"ret_code", OB_CANCELED}, {"execution_id", 0}, {"consensus_schema_version", OB_INVALID_VERSION}};
+      ret = OB_ERR_UNEXPECTED;
+      for (const auto &field : fields) {
+        if (0 == strcmp(column, field.name)) {
+          value = field.value;
+          ret = OB_SUCCESS;
+          break;
+        }
+      }
+    } else if (0 == strcmp(column, "have")) {
       value = task_count_;
     } else if (0 == strcmp(column, "status")) {
       value = status_;
-    } else if (0 == strcmp(column, "execution_id")) {
+    } else if (0 == strcmp(column, "execution_id") || 0 == strcmp(column, "affected_rows")) {
       value = 0;
+    } else if (0 == strcmp(column, "ddl_type")) {
+      value = share::DDL_DROP_FTS_INDEX;
+    } else if (0 == strcmp(column, "consensus_schema_version")) {
+      value = OB_INVALID_VERSION;
     } else if (0 == strcmp(column, "ret_code")) {
       value = ObDDLTaskStatus::FAIL == status_ ? OB_CANCELED : OB_SUCCESS;
     } else {
@@ -1143,9 +1163,26 @@ public:
     }
     return ret;
   }
+  int get_varchar(const char *column, ObString &value) const override
+  {
+    int ret = OB_SUCCESS;
+    if (0 == strcmp(column, "trace_id")) {
+      value = "Y1-0000000000000001-0-0";
+    } else if (0 == strcmp(column, "message_unhex")) {
+      value = build_task_message_;
+    } else if (0 == strcmp(column, "ddl_stmt_str_unhex")) {
+      value.reset();
+    } else if (0 == strcmp(column, "dba_message") || 0 == strcmp(column, "user_message")) {
+      value = "Successful ddl";
+    } else {
+      ret = OB_ERR_UNEXPECTED;
+    }
+    return ret;
+  }
   int64_t status_;
   int next_ret_;
   uint64_t snapshot_;
+  ObString build_task_message_;
   bool is_count_query_ = false;
   int64_t task_count_ = 0;
   bool row_returned_ = false;
@@ -1169,10 +1206,270 @@ public:
     result_.next_ret_ = next_ret;
     result_.snapshot_ = snapshot;
   }
+  void set_build_task_record(const ObString &message)
+  {
+    result_.next_ret_ = OB_SUCCESS;
+    result_.snapshot_ = 100;
+    result_.build_task_message_ = message;
+  }
 private:
   sqlclient::ObMySQLStatement statement_;
   CleanupTaskResult result_;
 };
+
+class FailureDropSqlProxy : public ObMySQLProxy
+{
+public:
+  FailureDropSqlProxy() { EXPECT_EQ(OB_SUCCESS, init(&pool_)); }
+  int read(ReadResult &res, const uint64_t tenant_id, const char *sql) override
+  {
+    EXPECT_EQ(1001, tenant_id);
+    int ret = OB_SUCCESS;
+    CleanupTaskResultHandler *handler = nullptr;
+    if (OB_FAIL(res.create_handler(handler))) {
+    } else if (nullptr != strstr(sql, "message_unhex")
+               && nullptr != strstr(sql, "WHERE task_id=7002")) {
+      ++build_record_reads_;
+      if (OB_FAIL(build_record_read_ret_)) {
+      } else {
+        handler->set_build_task_record(build_task_message_);
+      }
+    } else if (nullptr != strstr(sql, "FROM __all_ddl_task_status WHERE task_id=7003")) {
+      ++record_checks_;
+      handler->set_count(drop_record_exists_ ? 1 : 0, OB_SUCCESS);
+    } else if (nullptr != strstr(sql, "from __all_ddl_error_message")
+               && nullptr != strstr(sql, "task_id = 7003")) {
+      handler->set_row(ObDDLTaskStatus::SUCCESS, drop_result_available_ ? OB_SUCCESS : OB_ITER_END, 0);
+    } else {
+      ADD_FAILURE() << "unexpected SQL: " << sql;
+      ret = OB_ERR_UNEXPECTED;
+    }
+    return ret;
+  }
+
+  bool drop_record_exists_ = true;
+  bool drop_result_available_ = true;
+  int64_t record_checks_ = 0;
+  ObString build_task_message_;
+  int build_record_read_ret_ = OB_SUCCESS;
+  int64_t build_record_reads_ = 0;
+private:
+  sqlclient::ObMySQLConnectionPool pool_;
+};
+
+class TestOfflineRebuildDropWait : public testing::Test
+{
+protected:
+  void SetUp() override
+  {
+    auto &version = ObClusterVersion::get_instance();
+    old_cluster_version_ = version.get_cluster_version();
+    old_data_version_ = version.data_version_;
+    version.update_cluster_version(DATA_VERSION_4_6_3_1);
+    version.update_data_version(DATA_VERSION_4_6_3_1);
+    old_proxy_ = GCTX.sql_proxy_;
+    GCTX.sql_proxy_ = &proxy_;
+    task_.is_inited_ = true;
+    task_.tenant_id_ = 1001;
+    task_.dst_tenant_id_ = 1001;
+    task_.task_id_ = 7002;
+    task_.parent_task_id_ = 7001;
+    task_.task_status_ = ObDDLTaskStatus::FAIL;
+    task_.drop_index_task_id_ = 7003;
+    task_.create_index_arg_.is_offline_rebuild_ = true;
+  }
+
+  void TearDown() override
+  {
+    GCTX.sql_proxy_ = old_proxy_;
+    auto &version = ObClusterVersion::get_instance();
+    version.update_data_version(old_data_version_);
+    version.update_cluster_version(old_cluster_version_);
+  }
+
+  uint64_t old_cluster_version_ = 0;
+  uint64_t old_data_version_ = 0;
+  ObMySQLProxy *old_proxy_ = nullptr;
+  FailureDropSqlProxy proxy_;
+  ObFtsIndexBuildTask task_;
+};
+
+TEST_F(TestOfflineRebuildDropWait, waits_until_successful_drop_removes_task_record)
+{
+  const share::ObDDLType task_types[] = {share::DDL_CREATE_FTS_INDEX, share::DDL_CREATE_SEARCH_INDEX,
+      share::DDL_CREATE_MULTIVALUE_INDEX, share::DDL_CREATE_VEC_SPIV_INDEX,
+      share::DDL_CREATE_ASYNC_FTS_INDEX, share::DDL_CREATE_ASYNC_SEARCH_INDEX};
+  for (const auto task_type : task_types) {
+    SCOPED_TRACE(task_type);
+    task_.task_type_ = task_type;
+    const int64_t checks_before = proxy_.record_checks_;
+    proxy_.drop_record_exists_ = true;
+    bool is_finish = true;
+    ASSERT_SUCC(task_.wait_drop_index_finish(is_finish));
+    ASSERT_FALSE(is_finish);
+    ASSERT_EQ(checks_before + 1, proxy_.record_checks_);
+
+    proxy_.drop_record_exists_ = false;
+    ASSERT_SUCC(task_.wait_drop_index_finish(is_finish));
+    ASSERT_TRUE(is_finish);
+    ASSERT_EQ(checks_before + 2, proxy_.record_checks_);
+  }
+}
+
+TEST_F(TestOfflineRebuildDropWait, skips_record_check_outside_offline_rebuild_drop)
+{
+  task_.task_type_ = share::DDL_CREATE_FTS_INDEX;
+  bool is_finish = false;
+  task_.create_index_arg_.is_offline_rebuild_ = false;
+  ASSERT_SUCC(task_.wait_drop_index_finish(is_finish));
+  ASSERT_TRUE(is_finish);
+
+  task_.create_index_arg_.is_offline_rebuild_ = true;
+  task_.parent_task_id_ = 0;
+  ASSERT_SUCC(task_.wait_drop_index_finish(is_finish));
+  ASSERT_TRUE(is_finish);
+  ASSERT_SUCC(task_.handle_drop_fts_index_response(OB_SUCCESS, -1));
+  ASSERT_EQ(-1, task_.drop_index_task_id_);
+
+  task_.parent_task_id_ = 7001;
+  task_.create_index_arg_.is_offline_rebuild_ = false;
+  ASSERT_SUCC(task_.handle_drop_fts_index_response(OB_SUCCESS, -1));
+  ASSERT_EQ(-1, task_.drop_index_task_id_);
+  ASSERT_EQ(0, proxy_.build_record_reads_);
+
+  task_.create_index_arg_.is_offline_rebuild_ = true;
+  ASSERT_SUCC(task_.wait_drop_index_finish(is_finish));
+  ASSERT_TRUE(is_finish);
+  ASSERT_EQ(0, proxy_.record_checks_);
+}
+
+class TestOfflineRebuildDropRecovery : public TestOfflineRebuildDropWait
+{
+protected:
+  void SetUp() override
+  {
+    TestOfflineRebuildDropWait::SetUp();
+    old_root_service_ = GCTX.root_service_;
+    old_ddl_started_ = ObDDLServiceLauncher::is_ddl_service_started();
+    GCTX.root_service_ = &root_service_;
+    ObDDLServiceLauncher::is_ddl_service_started_ = true;
+
+    task_.task_type_ = share::DDL_CREATE_ASYNC_SEARCH_INDEX;
+    task_.object_id_ = 500001;
+    task_.index_table_id_ = 500002;
+    task_.drop_index_task_id_ = -1;
+    ObFtsIndexBuildTask persisted_task;
+    persisted_task.create_index_arg_.tenant_id_ = 1001;
+    persisted_task.create_index_arg_.exec_tenant_id_ = 1001;
+    persisted_task.create_index_arg_.index_type_ = share::schema::INDEX_TYPE_ASYNC_SEARCH_DEF_INDEX_LOCAL;
+    persisted_task.create_index_arg_.is_offline_rebuild_ = true;
+    persisted_task.set_drop_index_task_id(7003);
+    persisted_task.set_drop_index_task_submitted(true);
+    message_.resize(persisted_task.get_serialize_param_size());
+    int64_t pos = 0;
+    ASSERT_SUCC(persisted_task.serialize_params_to_message(message_.data(), message_.size(), pos));
+    proxy_.build_task_message_.assign_ptr(message_.data(), pos);
+  }
+
+  void inject_lost_drop_rpc_response()
+  {
+    // The DROP record committed, but the running build task only sees a timeout.
+    ASSERT_EQ(OB_TIMEOUT, task_.handle_drop_fts_index_response(OB_TIMEOUT, 0));
+    ASSERT_FALSE(task_.drop_index_task_submitted_);
+    ASSERT_EQ(-1, task_.drop_index_task_id_);
+  }
+
+  void TearDown() override
+  {
+    GCTX.root_service_ = old_root_service_;
+    ObDDLServiceLauncher::is_ddl_service_started_ = old_ddl_started_;
+    TestOfflineRebuildDropWait::TearDown();
+  }
+
+  ObRootService root_service_;
+  ObRootService *old_root_service_ = nullptr;
+  bool old_ddl_started_ = false;
+  std::string message_;
+};
+
+TEST_F(TestOfflineRebuildDropRecovery, recovers_committed_drop_after_lost_rpc_response)
+{
+  ASSERT_NO_FATAL_FAILURE(inject_lost_drop_rpc_response());
+  // After the DROP removes the schemas, the repeated RPC cannot find an index.
+  proxy_.build_record_read_ret_ = OB_TIMEOUT;
+  ASSERT_EQ(OB_TIMEOUT, task_.handle_drop_fts_index_response(OB_SUCCESS, -1));
+  ASSERT_FALSE(task_.drop_index_task_submitted_);
+  ASSERT_EQ(-1, task_.drop_index_task_id_);
+  proxy_.build_record_read_ret_ = OB_SUCCESS;
+  ASSERT_SUCC(task_.handle_drop_fts_index_response(OB_SUCCESS, -1));
+  ASSERT_EQ(2, proxy_.build_record_reads_);
+  ASSERT_TRUE(task_.drop_index_task_submitted_);
+  ASSERT_EQ(7003, task_.drop_index_task_id_);
+
+  bool is_finish = true;
+  ASSERT_SUCC(task_.wait_drop_index_finish(is_finish));
+  ASSERT_FALSE(is_finish);
+  proxy_.drop_record_exists_ = false;
+  ASSERT_SUCC(task_.wait_drop_index_finish(is_finish));
+  ASSERT_TRUE(is_finish);
+}
+
+TEST_F(TestOfflineRebuildDropRecovery, reuses_committed_drop_before_resending_with_index_schema_present)
+{
+  using namespace share::schema;
+  MockSchemaService schema_service;
+  ASSERT_SUCC(schema_service.init());
+  ObTenantSchema tenant_schema;
+  tenant_schema.set_tenant_id(task_.tenant_id_);
+  tenant_schema.set_schema_version(4001);
+  ASSERT_SUCC(tenant_schema.set_tenant_name("rebuild_drop_tenant"));
+  ASSERT_SUCC(schema_service.add_tenant_schema(tenant_schema, 4001));
+  ObSysVariableSchema sys_vars;
+  sys_vars.set_tenant_id(task_.tenant_id_);
+  sys_vars.set_schema_version(4001);
+  sys_vars.set_name_case_mode(OB_ORIGIN_AND_INSENSITIVE);
+  ASSERT_SUCC(schema_service.add_sys_variable_schema(sys_vars, 4001));
+
+  ObTableSchema index_schema;
+  index_schema.set_tenant_id(task_.tenant_id_);
+  index_schema.set_database_id(500000);
+  index_schema.set_table_id(task_.index_table_id_);
+  index_schema.set_schema_version(4001);
+  index_schema.set_table_type(USER_INDEX);
+  index_schema.set_index_type(INDEX_TYPE_ASYNC_SEARCH_DEF_INDEX_LOCAL);
+  index_schema.set_data_table_id(task_.object_id_);
+  index_schema.set_name_case_mode(OB_ORIGIN_AND_INSENSITIVE);
+  ASSERT_SUCC(index_schema.set_table_name("__idx_500001_search_idx"));
+  ASSERT_SUCC(schema_service.add_table_schema(index_schema, 4001));
+  ObSchemaGetterGuard schema_guard;
+  ASSERT_SUCC(schema_service.get_schema_guard(schema_guard));
+  bool index_exists = false;
+  ASSERT_SUCC(schema_guard.check_table_exist(task_.tenant_id_, task_.index_table_id_, index_exists));
+  ASSERT_TRUE(index_exists);
+
+  auto *old_schema_service = GCTX.schema_service_;
+  auto *old_rs_rpc_proxy = GCTX.rs_rpc_proxy_;
+  GCTX.schema_service_ = &schema_service;
+  GCTX.rs_rpc_proxy_ = nullptr;
+  DEFER(GCTX.schema_service_ = old_schema_service);
+  DEFER(GCTX.rs_rpc_proxy_ = old_rs_rpc_proxy);
+
+  ASSERT_NO_FATAL_FAILURE(inject_lost_drop_rpc_response());
+  proxy_.build_record_read_ret_ = OB_TIMEOUT;
+  ASSERT_EQ(OB_TIMEOUT, task_.submit_drop_fts_index_task());
+  ASSERT_FALSE(task_.drop_index_task_submitted_);
+  proxy_.build_record_read_ret_ = OB_SUCCESS;
+  ASSERT_SUCC(task_.submit_drop_fts_index_task());
+  ASSERT_EQ(2, proxy_.build_record_reads_);
+  ASSERT_TRUE(task_.drop_index_task_submitted_);
+  ASSERT_EQ(7003, task_.drop_index_task_id_);
+
+  proxy_.drop_result_available_ = false;
+  bool is_finish = true;
+  ASSERT_SUCC(task_.wait_drop_index_finish(is_finish));
+  ASSERT_FALSE(is_finish);
+  ASSERT_EQ(0, proxy_.record_checks_);
+}
 
 class DeletedTaskSqlProxy : public ObMySQLProxy
 {

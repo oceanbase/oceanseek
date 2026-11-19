@@ -7,9 +7,13 @@
 #define USING_LOG_PREFIX RS
 #define private public
 #define protected public
+#include "observer/ob_server_struct.h"
+#include "rootserver/ddl_task/ob_async_index_ddl_util.h"
+#include "rootserver/ddl_task/ob_drop_async_vector_index_task.h"
 #include "rootserver/ob_ddl_service.h"
 #include "rootserver/ob_ddl_operator.h"
 #include "rootserver/ob_index_builder.h"
+#include "rootserver/ob_root_service.h"
 #include "share/ob_index_builder_util.h"
 #include "share/ob_cluster_version.h"
 #include "share/schema/ob_schema_service_sql_impl.h"
@@ -218,6 +222,11 @@ int ObDDLService::publish_schema(uint64_t tenant_id)
   return OB_SUCCESS;
 }
 
+int ObDDLService::publish_schema(uint64_t tenant_id, const ObAddrIArray &)
+{
+  return publish_schema(tenant_id);
+}
+
 int ObDDLService::generate_tablet_id(ObTableSchema &schema, ObIDGenerator *)
 {
   schema.set_tablet_id(700000 + schema.get_table_id());
@@ -404,6 +413,53 @@ public:
     EXPECT_EQ(has_async_index, !ctx_.committed_schema_.get_async_index_params().empty());
   }
 
+  int clear_drop_options()
+  {
+    int ret = OB_SUCCESS;
+    auto *old_schema_service = GCTX.schema_service_;
+    auto *old_proxy = GCTX.sql_proxy_;
+    GCTX.schema_service_ = &schema_service_;
+    GCTX.sql_proxy_ = &proxy_;
+    DEFER(GCTX.schema_service_ = old_schema_service; GCTX.sql_proxy_ = old_proxy);
+    HEAP_VAR(ObRootService, root_service) {
+      ret = ObAsyncIndexDDLUtil::clear_async_index_table_options(
+          &root_service, TENANT_ID, HIDDEN_ID, 1, ObString());
+    }
+    return ret;
+  }
+
+  int check_can_clear_drop_options(bool &can_clear)
+  {
+    int ret = OB_SUCCESS;
+    auto *old_schema_service = GCTX.schema_service_;
+    GCTX.schema_service_ = &schema_service_;
+    DEFER(GCTX.schema_service_ = old_schema_service);
+    ObSchemaGetterGuard schema_guard;
+    if (OB_FAIL(ObDDLService::get_tenant_schema_guard_with_version_in_inner_table(
+        TENANT_ID, schema_guard))) {
+    } else {
+      ret = ObAsyncIndexDDLUtil::check_can_clear_async_index_options(
+          TENANT_ID, HIDDEN_ID, schema_guard, can_clear);
+    }
+    return ret;
+  }
+
+  int clear_async_vector_drop_options()
+  {
+    int ret = OB_SUCCESS;
+    auto *old_schema_service = GCTX.schema_service_;
+    auto *old_proxy = GCTX.sql_proxy_;
+    GCTX.schema_service_ = &schema_service_;
+    GCTX.sql_proxy_ = &proxy_;
+    DEFER(GCTX.schema_service_ = old_schema_service; GCTX.sql_proxy_ = old_proxy);
+    bool has_user_async_index = false;
+    HEAP_VAR(ObRootService, root_service) {
+      ret = ObAsyncVectorIndexTaskUtil::clear_async_index_table_options(
+          TENANT_ID, HIDDEN_ID, ObString(), &root_service, has_user_async_index);
+    }
+    return ret;
+  }
+
   RebuildContext ctx_;
   ObSchemaServiceSQLImpl sql_schema_service_;
   ObMultiVersionSchemaService schema_service_;
@@ -514,6 +570,73 @@ TEST_F(TestHiddenTableIndexRebuild, membership_failure_rolls_back_caller_transac
   EXPECT_EQ(1, ctx_.rollbacks_);
   EXPECT_EQ(0, ctx_.publications_);
   EXPECT_EQ(OB_INVALID_ID, ctx_.committed_schema_.get_table_id());
+}
+
+TEST_F(TestHiddenTableIndexRebuild, async_drop_preserves_hidden_offline_table_options)
+{
+  ctx_.hidden_.add_table_flag(HAS_ASYNC_INDEX_FLAG);
+  ASSERT_EQ(OB_SUCCESS, ctx_.hidden_.set_async_index_params(ObString::make_string("refresh_interval=30s")));
+  bool can_clear = true;
+  ASSERT_EQ(OB_SUCCESS, check_can_clear_drop_options(can_clear));
+  EXPECT_FALSE(can_clear);
+  EXPECT_EQ(0, ctx_.updates_);
+  EXPECT_EQ(0, ctx_.membership_writes_);
+  EXPECT_EQ(0, ctx_.commits_);
+  EXPECT_TRUE(ctx_.hidden_.has_async_index());
+  EXPECT_EQ(ObString::make_string("refresh_interval=30s"), ctx_.hidden_.get_async_index_params());
+}
+
+TEST_F(TestHiddenTableIndexRebuild, shared_drop_cleanup_rejects_hidden_offline_table)
+{
+  ctx_.hidden_.add_table_flag(HAS_ASYNC_INDEX_FLAG);
+  EXPECT_EQ(OB_OP_NOT_ALLOW, clear_drop_options());
+  EXPECT_EQ(0, ctx_.membership_writes_);
+  EXPECT_EQ(0, ctx_.commits_);
+  EXPECT_EQ(1, ctx_.rollbacks_);
+}
+
+TEST_F(TestHiddenTableIndexRebuild, shared_drop_cleanup_rejects_offline_original_table)
+{
+  ctx_.hidden_.set_table_state_flag(TABLE_STATE_OFFLINE_DDL);
+  ctx_.hidden_.add_table_flag(HAS_ASYNC_INDEX_FLAG);
+  EXPECT_EQ(OB_OP_NOT_ALLOW, clear_drop_options());
+  EXPECT_EQ(0, ctx_.membership_writes_);
+  EXPECT_EQ(0, ctx_.commits_);
+  EXPECT_EQ(1, ctx_.rollbacks_);
+}
+
+TEST_F(TestHiddenTableIndexRebuild, async_vector_drop_skips_hidden_offline_table_options)
+{
+  ctx_.hidden_.add_table_flag(HAS_ASYNC_INDEX_FLAG);
+  const ObString params = ObString::make_string("refresh_interval=30s");
+  ASSERT_EQ(OB_SUCCESS, ctx_.hidden_.set_async_index_params(params));
+  ASSERT_EQ(OB_OP_NOT_ALLOW, ObTableSqlService::check_ddl_allowed(ctx_.hidden_));
+
+  ASSERT_EQ(OB_SUCCESS, clear_async_vector_drop_options());
+  EXPECT_TRUE(ctx_.hidden_.has_async_index());
+  EXPECT_EQ(params, ctx_.hidden_.get_async_index_params());
+  EXPECT_EQ(0, ctx_.updates_);
+  EXPECT_EQ(0, ctx_.membership_writes_);
+  EXPECT_EQ(0, ctx_.commits_);
+  EXPECT_EQ(0, ctx_.rollbacks_);
+  EXPECT_EQ(0, ctx_.publications_);
+}
+
+TEST_F(TestHiddenTableIndexRebuild, async_vector_drop_clears_normal_table_options)
+{
+  ctx_.hidden_.set_table_state_flag(TABLE_STATE_NORMAL);
+  ctx_.hidden_.add_table_flag(HAS_ASYNC_INDEX_FLAG);
+  ASSERT_EQ(OB_SUCCESS, ctx_.hidden_.set_async_index_params(ObString::make_string("refresh_interval=30s")));
+
+  ASSERT_EQ(OB_SUCCESS, clear_async_vector_drop_options());
+  EXPECT_FALSE(ctx_.committed_schema_.has_async_index());
+  EXPECT_TRUE(ctx_.committed_schema_.get_async_index_params().empty());
+  EXPECT_FALSE(ctx_.committed_membership_.has_async_index());
+  EXPECT_EQ(1, ctx_.updates_);
+  EXPECT_EQ(1, ctx_.membership_writes_);
+  EXPECT_EQ(1, ctx_.commits_);
+  EXPECT_EQ(0, ctx_.rollbacks_);
+  EXPECT_EQ(1, ctx_.publications_);
 }
 } // namespace unittest
 } // namespace oceanbase

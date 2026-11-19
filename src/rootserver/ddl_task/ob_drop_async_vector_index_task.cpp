@@ -683,6 +683,9 @@ int ObAsyncVectorIndexTaskUtil::clear_async_index_table_options(
   } else if (OB_ISNULL(data_table_schema)) {
     ret = OB_TABLE_NOT_EXIST;
     LOG_INFO("data table schema does not exist", K(ret), K(data_table_id));
+  } else if (TABLE_STATE_HIDDEN_OFFLINE_DDL == data_table_schema->get_table_state_flag()) {
+    // The offline DDL parent owns the hidden table and removes it on rollback.
+    LOG_INFO("skip async vector index metadata cleanup for offline DDL hidden table", K(data_table_id));
   } else if (OB_FAIL(schema_guard.get_index_schemas_with_data_table_id(
                  tenant_id, data_table_id, index_schemas))) {
     LOG_WARN("fail to get index schemas", K(ret), K(tenant_id), K(data_table_id));

@@ -80,7 +80,7 @@ int ObAsyncIndexDDLUtil::check_can_clear_async_index_options(
     ret = OB_TABLE_NOT_EXIST;
     LOG_WARN("data table schema does not exist", K(ret), K(tenant_id), K(data_table_id));
   } else {
-    can_clear = true;
+    can_clear = TABLE_STATE_HIDDEN_OFFLINE_DDL != data_table_schema->get_table_state_flag();
     const ObIArray<ObAuxTableMetaInfo> &index_infos = data_table_schema->get_simple_index_infos();
     for (int64_t i = 0; can_clear && i < index_infos.count(); ++i) {
       const ObAuxTableMetaInfo &index_info = index_infos.at(i);
@@ -119,7 +119,7 @@ int ObAsyncIndexDDLUtil::clear_async_index_table_options(
     LOG_WARN("fail to get tenant schema guard with version in inner table", K(ret), K(tenant_id));
   } else if (OB_FAIL(schema_guard.get_schema_version(tenant_id, refreshed_schema_version))) {
     LOG_WARN("fail to get tenant schema version", K(ret), K(tenant_id));
-  }  else if (OB_FAIL(schema_guard.get_table_schema(tenant_id, data_table_id, data_table_schema))) {
+  } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id, data_table_id, data_table_schema))) {
     LOG_WARN("fail to get data table schema", K(ret), K(tenant_id), K(data_table_id));
   } else if (OB_ISNULL(data_table_schema)) {
     ret = OB_TABLE_NOT_EXIST;

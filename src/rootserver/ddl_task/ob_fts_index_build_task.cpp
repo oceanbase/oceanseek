@@ -2925,6 +2925,7 @@ int ObFtsIndexBuildTask::clean_on_failed()
 int ObFtsIndexBuildTask::submit_drop_fts_index_task()
 {
   int ret = OB_SUCCESS;
+  int64_t persisted_drop_task_id = -1;
   ObSchemaGetterGuard schema_guard;
   const ObDatabaseSchema *database_schema = nullptr;
   const ObTableSchema *data_table_schema = nullptr;
@@ -2935,7 +2936,15 @@ int ObFtsIndexBuildTask::submit_drop_fts_index_task()
   bool has_aux_table = (domain_index_aux_table_id_ != OB_INVALID_ID);
   uint64_t index_table_id = has_aux_table ? domain_index_aux_table_id_ : index_table_id_;
 
-  if (OB_ISNULL(GCTX.schema_service_)) {
+  if (parent_task_id_ > 0 && create_index_arg_.is_offline_rebuild_
+      && OB_FAIL(get_persisted_drop_index_task_id(persisted_drop_task_id))) {
+    LOG_WARN("fail to check for an existing offline rebuild drop", KR(ret), K(task_id_));
+  } else if (persisted_drop_task_id > 0) {
+    // Reuse a committed DROP even if its schemas are still visible to a retry.
+    drop_index_task_submitted_ = true;
+    drop_index_task_id_ = persisted_drop_task_id;
+    LOG_INFO("recovered offline rebuild drop task before submission", K(task_id_), K(drop_index_task_id_));
+  } else if (OB_ISNULL(GCTX.schema_service_)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", KR(ret), KP(GCTX.schema_service_));
   } else if (OB_FAIL(GCTX.schema_service_->get_tenant_schema_guard(tenant_id_, schema_guard))) {
@@ -3002,13 +3011,53 @@ int ObFtsIndexBuildTask::submit_drop_fts_index_task()
     } else if (OB_ISNULL(GCTX.rs_rpc_proxy_)) {
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("invalid argument", KR(ret), KP(GCTX.rs_rpc_proxy_));
-    } else if (OB_FAIL(GCTX.rs_rpc_proxy_->timeout(ddl_rpc_timeout).drop_index_on_failed(drop_index_arg, drop_index_res))) {
-      LOG_WARN("drop index failed", KR(ret), K(ddl_rpc_timeout));
     } else {
-      drop_index_task_submitted_ = true;
-      drop_index_task_id_ = drop_index_res.task_id_;
-      LOG_INFO("success submit drop fts index task", K(ret), K(drop_index_task_id_));
+      const int rpc_ret = GCTX.rs_rpc_proxy_->timeout(ddl_rpc_timeout).drop_index_on_failed(
+          drop_index_arg, drop_index_res);
+      if (OB_FAIL(handle_drop_fts_index_response(rpc_ret, drop_index_res.task_id_))) {
+        LOG_WARN("drop index submission failed", KR(ret), KR(rpc_ret), K(ddl_rpc_timeout));
+      }
     }
+  }
+  return ret;
+}
+
+int ObFtsIndexBuildTask::get_persisted_drop_index_task_id(int64_t &drop_task_id) const
+{
+  int ret = OB_SUCCESS;
+  drop_task_id = -1;
+  if (OB_ISNULL(GCTX.sql_proxy_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("sql proxy is null", KR(ret), K(task_id_));
+  } else {
+    ObArenaAllocator allocator("FtsDropLoad");
+    SMART_VAR(ObFtsIndexBuildTask, persisted_task) {
+      if (OB_FAIL(ObDDLUtil::load_ddl_task(tenant_id_, task_id_, allocator, persisted_task))) {
+        LOG_WARN("fail to load persisted fts drop task id", KR(ret), K(task_id_));
+      } else if (persisted_task.drop_index_task_submitted_
+                 && persisted_task.drop_index_task_id_ > 0
+                 && persisted_task.drop_index_task_id_ != drop_index_task_id_) {
+        // A DROP already observed to fail must not be picked up again.
+        drop_task_id = persisted_task.drop_index_task_id_;
+      }
+    }
+  }
+  return ret;
+}
+
+int ObFtsIndexBuildTask::handle_drop_fts_index_response(const int rpc_ret, const int64_t rpc_task_id)
+{
+  int ret = rpc_ret;
+  int64_t drop_task_id = rpc_task_id;
+  // The first DROP may commit and remove the schemas while the retry is in flight.
+  if (OB_SUCC(ret) && -1 == rpc_task_id && parent_task_id_ > 0 && create_index_arg_.is_offline_rebuild_
+      && OB_FAIL(get_persisted_drop_index_task_id(drop_task_id))) {
+    LOG_WARN("fail to reconcile missing index schemas with persisted drop", KR(ret), K(task_id_));
+  }
+  if (OB_SUCC(ret)) {
+    drop_index_task_submitted_ = true;
+    drop_index_task_id_ = drop_task_id;
+    LOG_INFO("success submit drop fts index task", K(drop_index_task_id_), K(rpc_task_id));
   }
   return ret;
 }
@@ -3043,6 +3092,16 @@ int ObFtsIndexBuildTask::wait_drop_index_finish(bool &is_finish)
     }
     LOG_WARN("fail to wait drop index task",
              K(ret), K(drop_index_task_id_), K(need_resubmit));
+  } else if (is_finish && drop_index_task_id_ > 0 && parent_task_id_ > 0
+             && create_index_arg_.is_offline_rebuild_) {
+    // DROP can report success before it finishes using the hidden table schema.
+    bool drop_task_exists = true;
+    if (OB_FAIL(ObDDLTaskRecordOperator::check_task_id_exist(
+        *GCTX.sql_proxy_, dst_tenant_id_, drop_index_task_id_, drop_task_exists))) {
+      LOG_WARN("fail to check offline rebuild drop task record", K(ret), K(drop_index_task_id_));
+    } else {
+      is_finish = !drop_task_exists;
+    }
   }
   return ret;
 }

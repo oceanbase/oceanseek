@@ -203,6 +203,8 @@ private:
   int wait_aux_table_complement();
   int clean_on_failed();
   int submit_drop_fts_index_task();
+  int get_persisted_drop_index_task_id(int64_t &drop_task_id) const;
+  int handle_drop_fts_index_response(const int rpc_ret, const int64_t rpc_task_id);
   int append_rowkey_doc_table_id_for_cleanup(obrpc::ObDropIndexArg &drop_index_arg) const;
   int wait_drop_index_finish(bool &is_finish);
   int succ();
