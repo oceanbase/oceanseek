@@ -45,7 +45,7 @@ devdeps-protobuf-c-1.5.1-100000052025032810.el7.x86_64.rpm
 devdeps-roaringbitmap-croaring-3.0.0-42024042816.el7.x86_64.rpm
 lakebase-devdeps-apache-arrow-20.0.0-92026102214.el7.x86_64.rpm
 devdeps-hyperscan-5.4.2-242024090219.el7.x86_64.rpm
-devdeps-vsag-1.2.0-722026100914.el7.x86_64.rpm
+devdeps-vsag-1.2.0-742026111317.el7.x86_64.rpm
 devdeps-apache-orc-2.1.1-192026062311.el7.x86_64.rpm
 devdeps-grpc-1.50.0-102026062311.el7.x86_64.rpm
 devdeps-protobuf-3.19.5-32026062217.el7.x86_64.rpm

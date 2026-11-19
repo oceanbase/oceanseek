@@ -41,7 +41,7 @@ devdeps-s3-cpp-sdk-1.11.156-222024100811.al8.aarch64.rpm
 devdeps-protobuf-c-1.5.1-100000052025032810.al8.aarch64.rpm
 devdeps-roaringbitmap-croaring-3.0.0-92024092815.al8.aarch64.rpm
 lakebase-devdeps-apache-arrow-20.0.0-92026102214.al8.aarch64.rpm
-devdeps-vsag-1.2.0-722026100914.al8.aarch64.rpm
+devdeps-vsag-1.2.0-742026111317.al8.aarch64.rpm
 devdeps-apache-orc-2.1.1-192026062311.al8.aarch64.rpm
 devdeps-grpc-1.50.0-102026062311.al8.aarch64.rpm
 devdeps-protobuf-3.19.5-32026062217.al8.aarch64.rpm
