@@ -9,10 +9,8 @@
 #include "lib/allocator/page_arena.h"
 #include "lib/string/ob_string.h"
 #include "sql/engine/cmd/ob_catalog_sync_helper.h"
-#include "sql/engine/ob_exec_context.h"
 #include "sql/ob_sql_utils.h"
 #include "sql/resolver/ddl/ob_create_table_stmt.h"
-#include "sql/session/ob_sql_session_info.h"
 #include "share/catalog/ob_catalog_meta_writer.h"
 #include "share/catalog/ob_unified_catalog_config.h"
 #include "share/catalog/ob_unified_catalog.h"
@@ -30,27 +28,17 @@ namespace sql
 {
 
 ObCreateTableAsSelectCatalogSyncOperation::ObCreateTableAsSelectCatalogSyncOperation(
-    ObExecContext &ctx,
+    const ObString &access_token,
     ObCreateTableStmt &stmt,
     const bool is_unified_catalog)
-  : ctx_(ctx),
-    stmt_(stmt),
-    is_unified_catalog_(is_unified_catalog),
-    tenant_id_(stmt.get_create_table_arg().schema_.get_tenant_id()),
-    allocator_("CatalogSync", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id_),
-    access_token_(),
-    remote_catalog_name_(),
-    endpoint_(),
-    realm_(),
-    unified_catalog_database_name_(),
-    unified_catalog_table_name_(),
-    raw_config_(),
-    hms_database_name_(),
-    hms_table_name_(),
-    sync_placeholder_created_(false),
-    sync_catalog_id_(OB_INVALID_ID),
-    unified_catalog_database_id_(OB_INVALID_ID),
-    unified_catalog_table_id_(OB_INVALID_ID)
+    : stmt_(stmt), is_unified_catalog_(is_unified_catalog),
+      tenant_id_(stmt.get_create_table_arg().schema_.get_tenant_id()),
+      allocator_("CatalogSync", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id_),
+      target_(tenant_id_, access_token),
+      unified_catalog_database_name_(), unified_catalog_table_name_(), raw_config_(),
+      hms_database_name_(), hms_table_name_(), sync_placeholder_created_(false),
+      sync_catalog_id_(OB_INVALID_ID), unified_catalog_database_id_(OB_INVALID_ID),
+      unified_catalog_table_id_(OB_INVALID_ID)
 {
 }
 
@@ -73,41 +61,32 @@ int ObCreateTableAsSelectCatalogSyncOperation::prepare(ObCatalogSyncPrepareResul
 int ObCreateTableAsSelectCatalogSyncOperation::prepare_unified_catalog()
 {
   int ret = OB_SUCCESS;
-  ObSQLSessionInfo *session = ctx_.get_my_session();
   ObString raw_catalog_name;
   ObUnifiedCatalogConfig raw_target_config;
-  if (OB_NOT_NULL(session)) {
-    if (OB_FAIL(ObUnifiedCatalog::get_session_token(*session, allocator_, access_token_))) {
-      LOG_WARN("failed to get Unified Catalog execution token", KR(ret), K(tenant_id_));
-    } else if (stmt_.get_create_table_arg().schema_.is_user_table()) {
-      if (OB_FAIL(ObUnifiedCatalog::validate_sync_target(tenant_id_,
-                                                         access_token_,
-                                                         allocator_,
-                                                         remote_catalog_name_,
-                                                         endpoint_,
-                                                         realm_))) {
-        LOG_WARN("failed to validate Unified Catalog sync target", KR(ret), K(tenant_id_));
-      } else if (OB_FAIL(ObUnifiedCatalog::snapshot_raw_target(tenant_id_,
-                                                               allocator_,
-                                                               raw_catalog_name,
-                                                               raw_config_))) {
-        LOG_WARN("failed to preserve Unified Catalog create table as select target",
-                 KR(ret),
-                 K(tenant_id_));
-      } else if (OB_FAIL(raw_target_config.parse(raw_config_, allocator_))) {
-        LOG_WARN("failed to parse Unified Catalog create table as select target",
-                 KR(ret),
-                 K(tenant_id_));
-      } else if (raw_catalog_name != remote_catalog_name_
-                 || raw_target_config.endpoint_ != endpoint_
-                 || raw_target_config.realm_ != realm_) {
-        ret = OB_STATE_NOT_MATCH;
-        LOG_WARN("Unified Catalog create table as select target changed during prepare",
-                 KR(ret),
-                 K(tenant_id_),
-                 K(remote_catalog_name_),
-                 K(raw_catalog_name));
-      }
+  if (stmt_.get_create_table_arg().schema_.is_user_table()) {
+    if (OB_FAIL(prepare_unified_catalog_target(target_, allocator_))) {
+      LOG_WARN("failed to prepare Unified Catalog create table as select target",
+               KR(ret), K(tenant_id_));
+    } else if (OB_FAIL(ObUnifiedCatalog::snapshot_raw_target(tenant_id_,
+                                                             allocator_,
+                                                             raw_catalog_name,
+                                                             raw_config_))) {
+      LOG_WARN("failed to preserve Unified Catalog create table as select target",
+               KR(ret),
+               K(tenant_id_));
+    } else if (OB_FAIL(raw_target_config.parse(raw_config_, allocator_))) {
+      LOG_WARN("failed to parse Unified Catalog create table as select target",
+               KR(ret),
+               K(tenant_id_));
+    } else if (raw_catalog_name != target_.catalog_name()
+               || raw_target_config.endpoint_ != target_.endpoint()
+               || raw_target_config.realm_ != target_.realm()) {
+      ret = OB_STATE_NOT_MATCH;
+      LOG_WARN("Unified Catalog create table as select target changed during prepare",
+               KR(ret),
+               K(tenant_id_),
+               "expected_catalog_name", target_.catalog_name(),
+               K(raw_catalog_name));
     }
   }
   return ret;
@@ -195,11 +174,7 @@ int ObCreateTableAsSelectCatalogSyncOperation::complete_unified_catalog(
   } else {
     unified_catalog_database_id_ = table_schema->get_database_id();
     unified_catalog_table_id_ = table_schema->get_table_id();
-    if (OB_FAIL(ObUnifiedCatalog::sync_table_to_target(tenant_id_,
-                                                       access_token_,
-                                                       remote_catalog_name_,
-                                                       endpoint_,
-                                                       realm_,
+    if (OB_FAIL(ObUnifiedCatalog::sync_table_to_target(target_,
                                                        unified_catalog_database_name_,
                                                        *table_schema))) {
       if (OB_ERR_ALREADY_EXISTS == ret && create_table_arg.if_not_exist_) {
@@ -321,11 +296,11 @@ int ObCreateTableAsSelectCatalogSyncOperation::compensate_unified_catalog()
              K(tenant_id_),
              K(unified_catalog_database_name_),
              K(unified_catalog_table_name_));
-  } else if (OB_FAIL(ObUnifiedCatalog::drop_table(tenant_id_,
-                                                  access_token_,
+  } else if (OB_FAIL(ObUnifiedCatalog::drop_table(target_.tenant_id(),
+                                                  target_.access_token(),
                                                   unified_catalog_database_name_,
                                                   unified_catalog_table_name_,
-                                                  remote_catalog_name_,
+                                                  target_.catalog_name(),
                                                   raw_config_))) {
     LOG_WARN("failed to drop Unified Catalog table after local create table as select cleanup",
              KR(ret),
@@ -377,22 +352,21 @@ int ObCreateTableAsSelectCatalogSyncOperation::compensate_hms()
 }
 
 int ObCatalogSync::get_create_table_as_select_operator(
-    ObExecContext &ctx,
+    const ObCatalogSyncBackend backend,
+    const ObString &access_token,
     ObCreateTableStmt &stmt,
     ObCatalogSyncOperationHandle &handle)
 {
   int ret = OB_SUCCESS;
   const ObTableSchema &table_schema = stmt.get_create_table_arg().schema_;
   const uint64_t tenant_id = table_schema.get_tenant_id();
-  const bool is_unified_catalog = ObUnifiedCatalog::is_configured(tenant_id);
-  const bool is_sync_enabled = is_unified_catalog
-                               || ObCatalogSyncHelper::is_sync_enabled(tenant_id);
   handle.reset();
-  if (is_sync_enabled) {
+  if (ObCatalogSyncBackend::NONE != backend) {
+    const bool is_unified_catalog = ObCatalogSyncBackend::UNIFIED_CATALOG == backend;
     ObCreateTableAsSelectCatalogSyncOperation *operation =
         OB_NEWx(ObCreateTableAsSelectCatalogSyncOperation,
                 (&allocator_),
-                ctx,
+                access_token,
                 stmt,
                 is_unified_catalog);
     if (OB_ISNULL(operation)) {

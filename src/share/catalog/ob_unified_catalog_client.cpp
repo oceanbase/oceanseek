@@ -736,13 +736,14 @@ int ObUnifiedCatalogReader::load_and_validate_table_source_if_exists(const ObStr
                                                                      const ObString &table_name,
                                                                      const uint64_t table_id,
                                                                      bool &exists,
-                                                                     int64_t *schema_version)
+                                                                     int64_t &schema_version)
 {
   int ret = OB_SUCCESS;
   ObSqlString path;
   ObArenaAllocator response_allocator("UCResp");
   ObString response_body;
   exists = false;
+  schema_version = 0;
   if (OB_INVALID_ID == database_id || OB_INVALID_ID == table_id || database_name.empty()
       || table_name.empty()) {
     ret = OB_INVALID_ARGUMENT;
@@ -955,9 +956,11 @@ int ObUnifiedCatalogWriter::complete_reserved_table(const ObString &database_nam
     LOG_WARN("failed to encode Unified Catalog completed table", K(ret));
   } else if (table_schema.is_partitioned_table()) {
     ObUnifiedCatalogPartitionSync partition_sync(client_);
-    if (OB_FAIL(
-            partition_sync
-                .sync(database_name, database_id, table_schema, true, operation_id, &sync_id))) {
+    if (OB_FAIL(partition_sync.complete_reserved_partitions(database_name,
+                                                            database_id,
+                                                            table_schema,
+                                                            operation_id,
+                                                            sync_id))) {
       LOG_WARN("failed to commit Unified Catalog created table partitions", K(ret));
     }
   }
@@ -1023,11 +1026,48 @@ int ObUnifiedCatalogWriter::cancel_reserved_table(const ObString &database_name,
   return ret;
 }
 
-int ObUnifiedCatalogWriter::update_active_table(const ObString &database_name,
-                                                const uint64_t database_id,
-                                                const schema::ObTableSchema &table_schema)
+int ObUnifiedCatalogWriter::sync_active_table(const ObString &database_name,
+                                              const schema::ObTableSchema &table_schema)
 {
   int ret = OB_SUCCESS;
+  if (OB_FAIL(write_active_table(database_name,
+                                 table_schema,
+                                 TableWriteMode::SYNC,
+                                 table_schema.get_table_id()))) {
+    LOG_WARN("failed to synchronize active Unified Catalog table",
+             K(ret), K(database_name), K(table_schema.get_table_name_str()));
+  }
+  return ret;
+}
+
+int ObUnifiedCatalogWriter::update_active_table(const ObString &database_name,
+                                                const schema::ObTableSchema &table_schema,
+                                                const uint64_t expected_source_table_id)
+{
+  int ret = OB_SUCCESS;
+  if (OB_INVALID_ID == expected_source_table_id) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid Unified Catalog active table update source",
+             K(ret), K(database_name), K(expected_source_table_id));
+  } else if (OB_FAIL(write_active_table(database_name,
+                                        table_schema,
+                                        TableWriteMode::ALTER,
+                                        expected_source_table_id))) {
+    LOG_WARN("failed to update active Unified Catalog table",
+             K(ret), K(database_name), K(table_schema.get_table_name_str()),
+             K(expected_source_table_id));
+  }
+  return ret;
+}
+
+int ObUnifiedCatalogWriter::write_active_table(const ObString &database_name,
+                                               const schema::ObTableSchema &table_schema,
+                                               const TableWriteMode mode,
+                                               const uint64_t source_table_id)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t database_id = table_schema.get_database_id();
+  const bool is_alter = TableWriteMode::ALTER == mode;
   bool exists = false;
   int64_t remote_schema_version = 0;
   ObSqlString path;
@@ -1040,49 +1080,69 @@ int ObUnifiedCatalogWriter::update_active_table(const ObString &database_name,
   ObString metadata;
   ObString request_body;
   ObString response_body;
-  if (OB_FAIL(reader_.load_and_validate_table_source_if_exists(database_name,
-                                                               database_id,
-                                                               table_schema.get_table_name_str(),
-                                                               table_schema.get_table_id(),
-                                                               exists,
-                                                               &remote_schema_version))) {
-    LOG_WARN("failed to validate existing OceanBase table source", K(ret));
-  } else if (!exists) {
-    ret = OB_ENTRY_NOT_EXIST;
-    LOG_WARN("conflicting Unified Catalog table disappeared", K(ret));
-  } else if (remote_schema_version > table_schema.get_schema_version()) {
-    ret = OB_EAGAIN;
-    LOG_WARN("UC table schema is newer than OceanBase",
-             K(ret),
-             K(remote_schema_version),
-             "local_schema_version",
-             table_schema.get_schema_version());
-  } else if (OB_FAIL(ObUnifiedCatalogSchemaCodec::encode_table_metadata(client_.cluster_id_,
-                                                                        client_.tenant_id_,
-                                                                        database_id,
-                                                                        table_schema,
-                                                                        request_allocator,
-                                                                        metadata))) {
-    LOG_WARN("failed to encode OceanBase table update", K(ret));
-  } else if (OB_FAIL(ObUnifiedCatalogSchemaCodec::encode_update_table_request(metadata,
-                                                                              request_allocator,
-                                                                              request_body))) {
-    LOG_WARN("failed to build OceanBase table update", K(ret));
-  } else if (OB_FAIL(ObUnifiedCatalogResourcePaths::build_ob_table_path(client_.catalog_name_,
-                                                                        database_name,
-                                                                        table_schema.get_table_name_str(),
-                                                                        path))) {
-    LOG_WARN("failed to build OceanBase table path", K(ret));
-  } else if (OB_FAIL(client_.request(HTTP_METHOD_PUT,
-                                     path.string(),
-                                     request_body,
-                                     response_allocator,
-                                     response_body,
-                                     ObUnifiedCatalogClient::ConflictPolicy::RETURN_EAGAIN,
-                                     ObUnifiedCatalogClient::HTTP_STATUS_NO_CONTENT))) {
-    LOG_WARN("failed to update OceanBase table metadata", K(ret));
-  } else if (OB_FAIL(reader_.load_and_validate_table(database_name, database_id, table_schema))) {
-    LOG_WARN("updated OceanBase table does not match source", K(ret));
+  bool already_updated = false;
+  if (is_alter) {
+    if (OB_FAIL(reader_.load_and_validate_table(database_name, database_id, table_schema))) {
+      if (OB_STATE_NOT_MATCH == ret) {
+        ret = OB_SUCCESS;
+      } else {
+        LOG_WARN("failed to check completed OceanBase table update",
+                 K(ret),
+                 K(database_name),
+                 K(table_schema.get_table_name_str()));
+      }
+    } else {
+      already_updated = true;
+    }
+  }
+  if (OB_SUCC(ret) && !already_updated) {
+    if (OB_FAIL(reader_.load_and_validate_table_source_if_exists(database_name,
+                                                                 database_id,
+                                                                 table_schema.get_table_name_str(),
+                                                                 source_table_id,
+                                                                 exists,
+                                                                 remote_schema_version))) {
+      LOG_WARN("failed to validate existing OceanBase table source", K(ret));
+    } else if (!exists) {
+      ret = OB_ENTRY_NOT_EXIST;
+      LOG_WARN("conflicting Unified Catalog table disappeared", K(ret));
+    } else if (remote_schema_version > table_schema.get_schema_version()) {
+      ret = OB_EAGAIN;
+      LOG_WARN("UC table schema is newer than OceanBase",
+               K(ret),
+               K(remote_schema_version),
+               "local_schema_version",
+               table_schema.get_schema_version());
+    } else if (OB_FAIL(ObUnifiedCatalogSchemaCodec::encode_table_metadata(client_.cluster_id_,
+                                                                          client_.tenant_id_,
+                                                                          database_id,
+                                                                          table_schema,
+                                                                          request_allocator,
+                                                                          metadata))) {
+      LOG_WARN("failed to encode OceanBase table update", K(ret));
+    } else if (OB_FAIL(ObUnifiedCatalogSchemaCodec::encode_update_table_request(
+                   metadata,
+                   is_alter ? source_table_id : OB_INVALID_ID,
+                   request_allocator,
+                   request_body))) {
+      LOG_WARN("failed to build OceanBase table update", K(ret));
+    } else if (OB_FAIL(ObUnifiedCatalogResourcePaths::build_ob_table_path(
+                   client_.catalog_name_,
+                   database_name,
+                   table_schema.get_table_name_str(),
+                   path))) {
+      LOG_WARN("failed to build OceanBase table path", K(ret));
+    } else if (OB_FAIL(client_.request(HTTP_METHOD_PUT,
+                                       path.string(),
+                                       request_body,
+                                       response_allocator,
+                                       response_body,
+                                       ObUnifiedCatalogClient::ConflictPolicy::RETURN_EAGAIN,
+                                       ObUnifiedCatalogClient::HTTP_STATUS_NO_CONTENT))) {
+      LOG_WARN("failed to update OceanBase table metadata", K(ret));
+    } else if (OB_FAIL(reader_.load_and_validate_table(database_name, database_id, table_schema))) {
+      LOG_WARN("updated OceanBase table does not match source", K(ret));
+    }
   }
   return ret;
 }
@@ -1166,7 +1226,7 @@ int ObUnifiedCatalogWriter::sync_table(const ObString &database_name,
                                                                table_schema.get_table_name_str(),
                                                                table_schema.get_table_id(),
                                                                exists,
-                                                               &remote_schema_version))) {
+                                                               remote_schema_version))) {
         LOG_WARN("failed to validate existing OceanBase table source", K(ret));
       } else if (!exists) {
         ret = OB_ENTRY_NOT_EXIST;
@@ -1180,14 +1240,112 @@ int ObUnifiedCatalogWriter::sync_table(const ObString &database_name,
                  table_schema.get_schema_version());
       } else {
         ObUnifiedCatalogPartitionSync partition_sync(client_);
-        if (OB_FAIL(partition_sync.sync(database_name, database_id, table_schema, false))) {
+        if (OB_FAIL(partition_sync.sync_existing_partitions(
+                database_name, database_id, table_schema))) {
           LOG_WARN("failed to synchronize existing OceanBase partitions", K(ret));
         }
       }
-    } else if (OB_FAIL(update_active_table(database_name, database_id, table_schema))) {
+    } else if (OB_FAIL(sync_active_table(database_name, table_schema))) {
       LOG_WARN("failed to sync existing OceanBase table",
                K(ret), K(database_name), K(table_schema.get_table_name_str()));
     }
+  }
+  return ret;
+}
+
+int ObUnifiedCatalogWriter::update_table(const ObString &database_name,
+                                         const schema::ObTableSchema &table_schema,
+                                         const uint64_t expected_source_table_id)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t database_id = table_schema.get_database_id();
+  if (database_name.empty() || OB_INVALID_ID == database_id
+      || OB_INVALID_ID == expected_source_table_id) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid Unified Catalog table update argument",
+             K(ret),
+             K(database_name),
+             K(database_id),
+             K(expected_source_table_id));
+  } else if (table_schema.is_partitioned_table()) {
+    ObUnifiedCatalogPartitionSync partition_sync(client_);
+    if (OB_FAIL(partition_sync.update_partitions(database_name,
+                                                 database_id,
+                                                 table_schema,
+                                                 expected_source_table_id))) {
+      LOG_WARN("failed to update Unified Catalog partitioned table",
+               K(ret),
+               K(database_name),
+               K(table_schema.get_table_name_str()),
+               K(expected_source_table_id));
+    }
+  } else if (OB_FAIL(update_active_table(database_name,
+                                         table_schema,
+                                         expected_source_table_id))) {
+    LOG_WARN("failed to update Unified Catalog table",
+             K(ret),
+             K(database_name),
+             K(table_schema.get_table_name_str()),
+             K(expected_source_table_id));
+  }
+  return ret;
+}
+
+int ObUnifiedCatalogWriter::rename_table(const ObString &source_database_name,
+                                         const ObString &source_table_name,
+                                         const ObString &destination_database_name,
+                                         const schema::ObTableSchema &final_table_schema,
+                                         const uint64_t expected_source_table_id)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t destination_database_id = final_table_schema.get_database_id();
+  ObSqlString path;
+  ObArenaAllocator request_allocator("UCRename", OB_MALLOC_NORMAL_BLOCK_SIZE, client_.tenant_id_);
+  ObArenaAllocator response_allocator("UCRename", OB_MALLOC_NORMAL_BLOCK_SIZE, client_.tenant_id_);
+  ObString metadata;
+  ObString request_body;
+  ObString response_body;
+  if (OB_FAIL(ObUnifiedCatalogSchemaCodec::encode_table_metadata(client_.cluster_id_,
+                                                                 client_.tenant_id_,
+                                                                 destination_database_id,
+                                                                 final_table_schema,
+                                                                 request_allocator,
+                                                                 metadata))) {
+    LOG_WARN("failed to encode renamed OceanBase table", K(ret));
+  } else if (OB_FAIL(ObUnifiedCatalogSchemaCodec::encode_rename_table_request(
+                 destination_database_name,
+                 final_table_schema.get_table_name_str(),
+                 expected_source_table_id,
+                 metadata,
+                 request_allocator,
+                 request_body))) {
+    LOG_WARN("failed to build OceanBase table rename", K(ret));
+  } else if (OB_FAIL(
+                 ObUnifiedCatalogResourcePaths::build_ob_table_rename_path(client_.catalog_name_,
+                                                                           source_database_name,
+                                                                           source_table_name,
+                                                                           path))) {
+    LOG_WARN("failed to build OceanBase table rename path", K(ret));
+  } else if (OB_FAIL(client_.request(HTTP_METHOD_POST,
+                                     path.string(),
+                                     request_body,
+                                     response_allocator,
+                                     response_body,
+                                     ObUnifiedCatalogClient::ConflictPolicy::RETURN_EAGAIN,
+                                     ObUnifiedCatalogClient::HTTP_STATUS_NO_CONTENT))) {
+    LOG_WARN("failed to rename Unified Catalog OceanBase table",
+             K(ret),
+             K(source_database_name),
+             K(source_table_name),
+             K(destination_database_name),
+             K(final_table_schema.get_table_name_str()));
+  } else if (OB_FAIL(reader_.load_and_validate_table(destination_database_name,
+                                                     destination_database_id,
+                                                     final_table_schema))) {
+    LOG_WARN("renamed Unified Catalog OceanBase table does not match source",
+             K(ret),
+             K(destination_database_name),
+             K(final_table_schema.get_table_name_str()));
   }
   return ret;
 }

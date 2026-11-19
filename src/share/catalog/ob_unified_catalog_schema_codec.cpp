@@ -19,6 +19,7 @@
 #include "share/catalog/ob_unified_catalog_partition_spec_codec.h"
 #include "share/schema/ob_table_schema.h"
 #include "share/schema/ob_column_schema.h"
+#include "share/schema/ob_schema_service.h"
 
 namespace oceanbase
 {
@@ -271,17 +272,29 @@ int ObUnifiedCatalogSchemaCodec::add_column(ObIAllocator &allocator,
   int ret = OB_SUCCESS;
   ObJsonObject *column_object = NULL;
   ObString native_type;
+  ObString generated_expression;
+  const ObString generated_storage = ObString::make_string(
+      column.is_stored_generated_column() ? GENERATED_STORAGE_STORED : GENERATED_STORAGE_VIRTUAL);
   if (OB_FAIL(validate_column_type(column))) {
-    LOG_WARN("failed to validate Unified Catalog column type", K(ret), K(column.get_column_name_str()));
+    LOG_WARN("failed to validate Unified Catalog column type",
+             K(ret),
+             K(column.get_column_name_str()));
+  } else if (column.is_generated_column()
+             && OB_FAIL(column.get_cur_default_value().get_string(generated_expression))) {
+    LOG_WARN("failed to read Unified Catalog generated column expression",
+             K(ret),
+             K(column.get_column_name_str()));
   } else if (OB_FAIL(serialize_native_type(column, allocator, native_type))) {
     LOG_WARN("failed to serialize Unified Catalog column type", K(ret), K(column.get_column_name_str()));
   } else if (OB_FAIL(alloc_object(allocator, column_object))) {
     LOG_WARN("failed to allocate Unified Catalog column object", K(ret));
-  } else if (OB_FAIL(add_uint_string(
-                 allocator, *column_object, COLUMN_ID, column.get_column_id()))) {
+  } else if (OB_FAIL(
+                 add_uint_string(allocator, *column_object, COLUMN_ID, column.get_column_id()))) {
     LOG_WARN("failed to add column id", K(ret));
-  } else if (OB_FAIL(add_string(
-                 allocator, *column_object, COLUMN_NAME, column.get_column_name_str()))) {
+  } else if (OB_FAIL(add_string(allocator,
+                                *column_object,
+                                COLUMN_NAME,
+                                column.get_column_name_str()))) {
     LOG_WARN("failed to add column name", K(ret));
   } else if (OB_FAIL(add_integer(allocator,
                                  *column_object,
@@ -299,6 +312,16 @@ int ObUnifiedCatalogSchemaCodec::add_column(ObIAllocator &allocator,
                                     COLUMN_ROWKEY_POSITION,
                                     column.get_rowkey_position()))) {
     LOG_WARN("failed to add primary key position", K(ret));
+  } else if (column.is_generated_column()
+             && (OB_FAIL(add_string(allocator,
+                                    *column_object,
+                                    COLUMN_GENERATED_EXPRESSION,
+                                    generated_expression))
+                 || OB_FAIL(add_string(allocator,
+                                       *column_object,
+                                       COLUMN_GENERATED_STORAGE,
+                                       generated_storage)))) {
+    LOG_WARN("failed to add generated column metadata", K(ret), K(column.get_column_name_str()));
   } else if (OB_FAIL(columns.append(column_object))) {
     LOG_WARN("failed to append Unified Catalog column", K(ret));
   }
@@ -372,12 +395,23 @@ int ObUnifiedCatalogSchemaCodec::validate_column(const ObJsonObject &column_obje
 {
   int ret = OB_SUCCESS;
   ObString native_type;
+  ObString generated_expression;
   const ObJsonNode *nullable_node = column_object.get_value(COLUMN_NULLABLE);
   const ObJsonNode *rowkey_position_node = column_object.get_value(COLUMN_ROWKEY_POSITION);
-  const bool expect_primary_key_position =
-      validate_primary_key && column.is_original_rowkey_column();
+  const ObJsonNode *generated_expression_node
+      = column_object.get_value(COLUMN_GENERATED_EXPRESSION);
+  const ObJsonNode *generated_storage_node = column_object.get_value(COLUMN_GENERATED_STORAGE);
+  const bool expect_primary_key_position
+      = validate_primary_key && column.is_original_rowkey_column();
+  const ObString generated_storage = ObString::make_string(
+      column.is_stored_generated_column() ? GENERATED_STORAGE_STORED : GENERATED_STORAGE_VIRTUAL);
   if (OB_FAIL(validate_column_type(column))) {
     LOG_WARN("failed to validate expected Unified Catalog column type", K(ret));
+  } else if (column.is_generated_column()
+             && OB_FAIL(column.get_cur_default_value().get_string(generated_expression))) {
+    LOG_WARN("failed to read expected generated column expression",
+             K(ret),
+             K(column.get_column_name_str()));
   } else if (OB_FAIL(serialize_native_type(column, allocator, native_type))) {
     LOG_WARN("failed to serialize expected Unified Catalog column type", K(ret));
   } else if (OB_FAIL(expect_uint_string(column_object, COLUMN_ID, column.get_column_id()))) {
@@ -390,12 +424,35 @@ int ObUnifiedCatalogSchemaCodec::validate_column(const ObJsonObject &column_obje
     LOG_WARN("OceanBase column type mismatch", K(ret), K(column.get_column_name_str()));
   } else if (OB_FAIL(expect_string(column_object, COLUMN_NATIVE_TYPE, native_type))) {
     LOG_WARN("native column type mismatch", K(ret), K(column.get_column_name_str()));
-  } else if (OB_ISNULL(nullable_node)
-             || ObJsonNodeType::J_BOOLEAN != nullable_node->json_type()
+  } else if (OB_ISNULL(nullable_node) || ObJsonNodeType::J_BOOLEAN != nullable_node->json_type()
              || static_cast<const ObJsonBoolean *>(nullable_node)->value()
                     != column.is_nullable()) {
     ret = OB_STATE_NOT_MATCH;
     LOG_WARN("column nullable mismatch", K(ret), K(column.get_column_name_str()));
+  } else if (column.is_generated_column()
+             && (OB_ISNULL(generated_expression_node)
+                 || ObJsonNodeType::J_STRING != generated_expression_node->json_type()
+                 || OB_ISNULL(generated_storage_node)
+                 || ObJsonNodeType::J_STRING != generated_storage_node->json_type())) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("generated column metadata is missing or invalid",
+             K(ret),
+             K(column.get_column_name_str()));
+  } else if (column.is_generated_column()
+             && (static_cast<const ObJsonString *>(generated_expression_node)->value()
+                     != generated_expression
+                 || static_cast<const ObJsonString *>(generated_storage_node)->value()
+                        != generated_storage)) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("generated column metadata mismatch",
+             K(ret),
+             K(column.get_column_name_str()),
+             K(generated_expression),
+             K(generated_storage));
+  } else if (!column.is_generated_column()
+             && (OB_NOT_NULL(generated_expression_node) || OB_NOT_NULL(generated_storage_node))) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("unexpected generated column metadata", K(ret), K(column.get_column_name_str()));
   } else if (expect_primary_key_position
              && OB_FAIL(expect_integer(column_object,
                                        COLUMN_ROWKEY_POSITION,
@@ -422,6 +479,107 @@ int ObUnifiedCatalogSchemaCodec::validate_create_table_schema(const ObTableSchem
   ObJsonObject *partition_spec = NULL;
   return validate_table_schema_and_build_partition_spec(table_schema, allocator,
                                                         partition_spec, true);
+}
+
+int ObUnifiedCatalogSchemaCodec::validate_column_schema(const ObColumnSchemaV2 &column)
+{
+  int ret = OB_SUCCESS;
+  if (column.is_invisible_column()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("unsupported Unified Catalog column",
+             K(ret),
+             K(column.get_column_name_str()),
+             "invisible",
+             column.is_invisible_column());
+  } else if (column.is_autoincrement() || column.is_identity_column()
+             || column.is_on_update_current_timestamp()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("unsupported Unified Catalog column attribute",
+             K(ret),
+             K(column.get_column_name_str()),
+             "auto_increment",
+             column.is_autoincrement(),
+             "identity",
+             column.is_identity_column(),
+             "on_update",
+             column.is_on_update_current_timestamp());
+  } else if (column.is_generated_column()
+             && (column.is_part_key_column() || column.is_subpart_key_column())) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("generated partition column is not supported by Unified Catalog synchronization",
+             K(ret),
+             K(column.get_column_name_str()));
+  } else if (OB_FAIL(validate_column_type(column))) {
+    LOG_WARN("failed to validate Unified Catalog column", K(ret), K(column.get_column_name_str()));
+  } else if (column.is_generated_column()
+             && (column.is_generated_column_using_udf()
+                 || column.has_column_flag(PAD_WHEN_CALC_GENERATED_COLUMN_FLAG))) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("lossy Unified Catalog generated column is not supported",
+             K(ret),
+             K(column.get_column_name_str()),
+             "udf",
+             column.is_generated_column_using_udf(),
+             "pad",
+             column.has_column_flag(PAD_WHEN_CALC_GENERATED_COLUMN_FLAG));
+  } else if (column.is_generated_column()) {
+    ObString generated_expression;
+    if (column.is_virtual_generated_column() == column.is_stored_generated_column()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("invalid Unified Catalog generated column storage",
+               K(ret),
+               K(column.get_column_name_str()));
+    } else if (OB_FAIL(column.get_cur_default_value().get_string(generated_expression))) {
+      LOG_WARN("failed to read Unified Catalog generated column expression",
+               K(ret),
+               K(column.get_column_name_str()));
+    } else if (generated_expression.empty()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("empty Unified Catalog generated column expression",
+               K(ret),
+               K(column.get_column_name_str()));
+    }
+  } else if (!column.get_cur_default_value().is_null()
+             && !column.get_cur_default_value().is_nop_value()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("unsupported Unified Catalog column default", K(ret), K(column.get_column_name_str()));
+  }
+  return ret;
+}
+
+int ObUnifiedCatalogSchemaCodec::validate_alter_add_column(const AlterColumnSchema &column)
+{
+  int ret = OB_SUCCESS;
+  if (OB_DDL_ADD_COLUMN != column.alter_type_) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid ALTER ADD COLUMN validation request",
+             K(ret),
+             K(column.alter_type_),
+             K(column.get_column_name_str()));
+  } else if (column.is_primary_key_ || column.is_unique_key_) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("ALTER ADD COLUMN key is not supported by Unified Catalog synchronization",
+             K(ret),
+             K(column.is_primary_key_),
+             K(column.is_unique_key_),
+             K(column.get_column_name_str()));
+  } else if (!column.is_hidden()
+             && (OB_INVALID_ID == column.get_column_id() || !column.is_shadow_column())
+             && (column.is_heap_table_primary_key_column() || column.is_rowkey_column())) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("ALTER ADD COLUMN key is not supported by Unified Catalog synchronization",
+             K(ret),
+             K(column.is_primary_key_),
+             K(column.is_unique_key_),
+             K(column.get_column_name_str()));
+  } else if (!column.is_hidden()
+             && (OB_INVALID_ID == column.get_column_id() || !column.is_shadow_column())
+             && OB_FAIL(validate_column_schema(column))) {
+    LOG_WARN("ALTER ADD COLUMN is not supported by Unified Catalog synchronization",
+             K(ret),
+             K(column.get_column_name_str()));
+  }
+  return ret;
 }
 
 int ObUnifiedCatalogSchemaCodec::validate_table_schema_and_build_partition_spec(
@@ -479,38 +637,18 @@ int ObUnifiedCatalogSchemaCodec::validate_table_schema_and_build_partition_spec(
       ++visible_column_count;
       const bool supported_primary_key_column =
           has_primary_key_metadata && column->is_original_rowkey_column();
-      const bool unsupported_primary_key_column =
-          (is_partitioned && column->is_heap_table_primary_key_column())
-          || (column->is_rowkey_column() && !supported_primary_key_column);
+      const bool unsupported_primary_key_column
+          = column->is_heap_table_primary_key_column()
+            || (column->is_rowkey_column() && !supported_primary_key_column);
       if (supported_primary_key_column) {
         ++visible_primary_key_count;
       }
-      if (column->is_invisible_column() || column->is_generated_column()) {
-        ret = OB_NOT_SUPPORTED;
-        LOG_WARN("unsupported Unified Catalog column",
-                 K(ret), K(column->get_column_name_str()),
-                 "invisible", column->is_invisible_column(),
-                 "generated", column->is_generated_column());
-      } else if (unsupported_primary_key_column) {
+      if (unsupported_primary_key_column) {
         ret = OB_NOT_SUPPORTED;
         LOG_WARN("unsupported Unified Catalog primary key column",
                  K(ret), K(column->get_column_name_str()));
-      } else if (column->is_autoincrement()
-                 || column->is_identity_column()
-                 || column->is_on_update_current_timestamp()) {
-        ret = OB_NOT_SUPPORTED;
-        LOG_WARN("unsupported Unified Catalog column attribute", K(ret),
-                 K(column->get_column_name_str()),
-                 "auto_increment", column->is_autoincrement(),
-                 "identity", column->is_identity_column(),
-                 "on_update", column->is_on_update_current_timestamp());
-      } else if (!column->get_cur_default_value().is_null()
-                 && !column->get_cur_default_value().is_nop_value()) {
-        ret = OB_NOT_SUPPORTED;
-        LOG_WARN("unsupported Unified Catalog column default",
-                 K(ret), K(column->get_column_name_str()));
-      } else if (OB_FAIL(validate_column_type(*column))) {
-        LOG_WARN("failed to validate Unified Catalog column",
+      } else if (OB_FAIL(validate_column_schema(*column))) {
+        LOG_WARN("failed to validate Unified Catalog column schema",
                  K(ret), K(column->get_column_name_str()));
       }
     }
@@ -689,6 +827,7 @@ int ObUnifiedCatalogSchemaCodec::encode_complete_table_request(const ObString &o
 }
 
 int ObUnifiedCatalogSchemaCodec::encode_update_table_request(const ObString &metadata,
+                                                             const uint64_t expected_source_table_id,
                                                              ObIAllocator &allocator,
                                                              ObString &request_body)
 {
@@ -700,12 +839,55 @@ int ObUnifiedCatalogSchemaCodec::encode_update_table_request(const ObString &met
     LOG_WARN("empty OceanBase table metadata", K(ret));
   } else if (OB_FAIL(alloc_object(allocator, root))) {
     LOG_WARN("failed to allocate OceanBase table update", K(ret));
-  } else if (OB_FAIL(add_string(allocator, *root, COMPLETE_METADATA, metadata))) {
+  } else if ((OB_INVALID_ID != expected_source_table_id
+              && OB_FAIL(add_uint_string(allocator, *root,
+                                         EXPECTED_SOURCE_TABLE_ID, expected_source_table_id)))
+             || OB_FAIL(add_string(allocator, *root, COMPLETE_METADATA, metadata))) {
     LOG_WARN("failed to build OceanBase table update", K(ret));
   } else {
     ObJsonBuffer buffer(&allocator);
     if (OB_FAIL(root->print(buffer, false))) {
       LOG_WARN("failed to serialize OceanBase table update", K(ret));
+    } else {
+      request_body = buffer.string();
+    }
+  }
+  return ret;
+}
+
+int ObUnifiedCatalogSchemaCodec::encode_rename_table_request(
+    const ObString &destination_database_name,
+    const ObString &destination_table_name,
+    const uint64_t expected_source_table_id,
+    const ObString &metadata,
+    ObIAllocator &allocator,
+    ObString &request_body)
+{
+  int ret = OB_SUCCESS;
+  ObJsonObject *root = NULL;
+  request_body.reset();
+  if (destination_database_name.empty() || destination_table_name.empty()
+      || OB_INVALID_ID == expected_source_table_id || metadata.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid OceanBase table rename request",
+             K(ret),
+             K(destination_database_name),
+             K(destination_table_name),
+             K(expected_source_table_id));
+  } else if (OB_FAIL(alloc_object(allocator, root))) {
+    LOG_WARN("failed to allocate OceanBase table rename", K(ret));
+  } else if (OB_FAIL(add_string(allocator, *root, DESTINATION_NAMESPACE, destination_database_name))
+             || OB_FAIL(add_string(allocator, *root, DESTINATION_TABLE, destination_table_name))
+             || OB_FAIL(add_uint_string(allocator,
+                                        *root,
+                                        EXPECTED_SOURCE_TABLE_ID,
+                                        expected_source_table_id))
+             || OB_FAIL(add_string(allocator, *root, COMPLETE_METADATA, metadata))) {
+    LOG_WARN("failed to build OceanBase table rename", K(ret));
+  } else {
+    ObJsonBuffer buffer(&allocator);
+    if (OB_FAIL(root->print(buffer, false))) {
+      LOG_WARN("failed to serialize OceanBase table rename", K(ret));
     } else {
       request_body = buffer.string();
     }
@@ -1023,6 +1205,8 @@ int ObUnifiedCatalogSchemaCodec::decode_ob_column(const ObJsonObject &column_obj
   const ObJsonNode *type_node = column_object.get_value(COLUMN_OB_TYPE);
   const ObJsonNode *nullable_node = column_object.get_value(COLUMN_NULLABLE);
   const ObJsonNode *rowkey_node = column_object.get_value(COLUMN_ROWKEY_POSITION);
+  const ObJsonNode *generated_expression_node = column_object.get_value(COLUMN_GENERATED_EXPRESSION);
+  const ObJsonNode *generated_storage_node = column_object.get_value(COLUMN_GENERATED_STORAGE);
   if (OB_FAIL(get_uint_string(column_object, COLUMN_ID, column.column_id_))) {
     LOG_WARN("failed to decode Unified Catalog column id", K(ret));
   } else if (OB_FAIL(get_string(column_object, COLUMN_NAME, column.name_))
@@ -1038,9 +1222,29 @@ int ObUnifiedCatalogSchemaCodec::decode_ob_column(const ObJsonObject &column_obj
              || ObJsonNodeType::J_BOOLEAN != nullable_node->json_type()) {
     ret = OB_STATE_NOT_MATCH;
     LOG_WARN("invalid Unified Catalog column type or nullability", K(ret));
+  } else if ((OB_ISNULL(generated_expression_node) != OB_ISNULL(generated_storage_node))
+             || (OB_NOT_NULL(generated_expression_node)
+                 && (ObJsonNodeType::J_STRING != generated_expression_node->json_type()
+                     || ObJsonNodeType::J_STRING != generated_storage_node->json_type()
+                     || static_cast<const ObJsonString *>(generated_expression_node)
+                            ->value()
+                            .empty()
+                     || (static_cast<const ObJsonString *>(generated_storage_node)->value()
+                             != ObString::make_string(GENERATED_STORAGE_VIRTUAL)
+                         && static_cast<const ObJsonString *>(generated_storage_node)->value()
+                                != ObString::make_string(GENERATED_STORAGE_STORED))))) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("invalid Unified Catalog generated column metadata", K(ret));
   } else {
     column.ob_type_ = static_cast<ObObjType>(static_cast<const ObJsonInt *>(type_node)->value());
     column.nullable_ = static_cast<const ObJsonBoolean *>(nullable_node)->value();
+    if (OB_NOT_NULL(generated_expression_node)) {
+      column.generated_ = true;
+      column.generated_expression_
+          = static_cast<const ObJsonString *>(generated_expression_node)->value();
+      column.stored_generated_ = static_cast<const ObJsonString *>(generated_storage_node)->value()
+                                 == ObString::make_string(GENERATED_STORAGE_STORED);
+    }
     if (OB_NOT_NULL(rowkey_node)) {
       if (ObJsonNodeType::J_INT != rowkey_node->json_type()
           || static_cast<const ObJsonInt *>(rowkey_node)->value() <= 0) {
@@ -1207,9 +1411,10 @@ int ObUnifiedCatalogSchemaCodec::validate_table_source(const ObString &response_
                                                        const ObString &table_name,
                                                        const uint64_t table_id,
                                                        ObIAllocator &allocator,
-                                                       int64_t *schema_version)
+                                                       int64_t &schema_version)
 {
   int ret = OB_SUCCESS;
+  schema_version = 0;
   const ObJsonObject *source = NULL;
   const ObJsonNode *columns_node = NULL;
   const ObJsonNode *partition_spec_node = NULL;
@@ -1233,8 +1438,7 @@ int ObUnifiedCatalogSchemaCodec::validate_table_source(const ObString &response_
              K(database_id),
              K(table_name),
              K(table_id));
-  } else if (OB_NOT_NULL(schema_version)
-             && OB_FAIL(parse_source_schema_version(*source, *schema_version))) {
+  } else if (OB_FAIL(parse_source_schema_version(*source, schema_version))) {
     LOG_WARN("invalid Unified Catalog table source schema version", K(ret), K(table_name));
   }
   return ret;

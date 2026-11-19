@@ -8,6 +8,7 @@
 
 #include "sql/engine/cmd/ob_catalog_sync.h"
 #include "lib/allocator/page_arena.h"
+#include "share/catalog/ob_unified_catalog.h"
 
 namespace oceanbase
 {
@@ -17,35 +18,27 @@ namespace sql
 class ObAlterTableCatalogSyncOperation : public ObCatalogSyncOperation
 {
 public:
-  ObAlterTableCatalogSyncOperation(
-      const uint64_t tenant_id,
-      const bool is_unified_catalog,
-      ObExecContext &ctx,
-      const obrpc::ObAlterTableArg &alter_table_arg);
+  ObAlterTableCatalogSyncOperation(const uint64_t tenant_id,
+                                   const bool is_unified_catalog,
+                                   const uint64_t source_table_id,
+                                   const common::ObString &access_token,
+                                   ObSQLSessionInfo *session,
+                                   const obrpc::ObAlterTableArg &alter_table_arg);
   virtual ~ObAlterTableCatalogSyncOperation();
   virtual int prepare(ObCatalogSyncPrepareResult &result) override;
   virtual int complete(const ObCatalogSyncDDLResult &result) override;
 
 private:
-  static bool is_supported_uc_partition_alter(
-      const obrpc::ObAlterTableArg &arg);
-  static int validate_uc_partition_alter_source(
-      const uint64_t tenant_id,
-      const obrpc::ObAlterTableArg &arg);
-  int prepare_unified_catalog();
-  int sync_final_schema(const ObCatalogSyncDDLResult &result,
-                        const bool is_unified_catalog);
+  int sync_final_schema(const ObCatalogSyncDDLResult &result);
 
 private:
   const uint64_t tenant_id_;
   const bool is_unified_catalog_;
-  ObExecContext &ctx_;
   const obrpc::ObAlterTableArg &alter_table_arg_;
+  ObSQLSessionInfo *session_;
+  uint64_t source_table_id_;
   common::ObArenaAllocator allocator_;
-  common::ObString access_token_;
-  common::ObString remote_catalog_name_;
-  common::ObString endpoint_;
-  common::ObString realm_;
+  share::ObUnifiedCatalogSyncTarget target_;
   DISALLOW_COPY_AND_ASSIGN(ObAlterTableCatalogSyncOperation);
 };
 

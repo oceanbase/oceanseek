@@ -88,7 +88,7 @@ private:
       const common::ObString &table_name,
       const uint64_t table_id,
       bool &exists,
-      int64_t *schema_version = NULL);
+      int64_t &schema_version);
   int load_preparing_operation_id(const common::ObString &database_name,
                                   const common::ObString &table_name,
                                   common::ObIAllocator &response_allocator,
@@ -121,15 +121,34 @@ public:
                  const uint64_t database_id,
                  const schema::ObTableSchema &table_schema,
                  const bool recover_preparing = false);
+  int update_table(const common::ObString &database_name,
+                   const schema::ObTableSchema &table_schema,
+                   const uint64_t expected_source_table_id);
+  int rename_table(const common::ObString &source_database_name,
+                   const common::ObString &source_table_name,
+                   const common::ObString &destination_database_name,
+                   const schema::ObTableSchema &final_table_schema,
+                   const uint64_t expected_source_table_id);
   int drop_table(const common::ObString &database_name, const common::ObString &table_name);
 
 private:
   friend class ObUnifiedCatalogClient;
   ObUnifiedCatalogWriter(ObUnifiedCatalogClient &client, ObUnifiedCatalogReader &reader)
       : client_(client), reader_(reader) {}
+  enum class TableWriteMode
+  {
+    SYNC,
+    ALTER
+  };
+  int sync_active_table(const common::ObString &database_name,
+                        const schema::ObTableSchema &table_schema);
   int update_active_table(const common::ObString &database_name,
-                          const uint64_t database_id,
-                          const schema::ObTableSchema &table_schema);
+                          const schema::ObTableSchema &table_schema,
+                          const uint64_t expected_source_table_id);
+  int write_active_table(const common::ObString &database_name,
+                         const schema::ObTableSchema &table_schema,
+                         const TableWriteMode mode,
+                         const uint64_t source_table_id);
 private:
   ObUnifiedCatalogClient &client_;
   ObUnifiedCatalogReader &reader_;

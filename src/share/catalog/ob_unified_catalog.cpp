@@ -25,6 +25,42 @@ using namespace share::schema;
 namespace share
 {
 
+ObUnifiedCatalogSyncTarget::ObUnifiedCatalogSyncTarget(
+    const uint64_t tenant_id,
+    const ObString &access_token)
+  : tenant_id_(tenant_id),
+    access_token_(access_token),
+    catalog_name_(),
+    endpoint_(),
+    realm_()
+{
+}
+
+int ObUnifiedCatalogSyncTarget::capture(ObIAllocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  ObString access_token;
+  ObUnifiedCatalogConfig config;
+  reset_snapshot();
+  if (!is_valid_tenant_id(tenant_id_) || access_token_.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid Unified Catalog sync target identity", K(ret), K(tenant_id_));
+  } else if (OB_FAIL(ob_write_string(allocator, access_token_, access_token))) {
+    LOG_WARN("failed to copy Unified Catalog access token", K(ret), K(tenant_id_));
+  } else if (OB_FAIL(ObUnifiedCatalog::resolve_target(tenant_id_,
+                                                       allocator,
+                                                       catalog_name_,
+                                                       &config))) {
+    reset_snapshot();
+    LOG_WARN("failed to capture Unified Catalog sync target", K(ret), K(tenant_id_));
+  } else {
+    access_token_ = access_token;
+    endpoint_ = config.endpoint_;
+    realm_ = config.realm_;
+  }
+  return ret;
+}
+
 bool ObUnifiedCatalog::is_configured(const uint64_t tenant_id)
 {
   bool enabled = false;
@@ -88,40 +124,33 @@ int ObUnifiedCatalog::catalog_exists(const uint64_t tenant_id,
   return ret;
 }
 
-int ObUnifiedCatalog::validate_sync_target(const uint64_t tenant_id, const ObString &access_token)
+int ObUnifiedCatalog::validate_sync_target(
+    const ObUnifiedCatalogSyncTarget &target)
 {
   int ret = OB_SUCCESS;
-  ObArenaAllocator allocator("UnifiedCatalog", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id);
-  ObString remote_catalog_name;
-  ObString endpoint;
-  ObString realm;
-  if (OB_FAIL(validate_sync_target(
-          tenant_id, access_token, allocator, remote_catalog_name, endpoint, realm))) {
-    LOG_WARN("failed to validate Unified Catalog sync target", KR(ret), K(tenant_id));
-  }
-  return ret;
-}
-
-int ObUnifiedCatalog::validate_sync_target(const uint64_t tenant_id,
-                                           const ObString &access_token,
-                                           ObIAllocator &allocator,
-                                           ObString &remote_catalog_name,
-                                           ObString &endpoint,
-                                           ObString &realm)
-{
-  int ret = OB_SUCCESS;
+  const uint64_t tenant_id = target.tenant_id();
+  ObArenaAllocator allocator("UnifiedCatalog", OB_MALLOC_NORMAL_BLOCK_SIZE,
+                             tenant_id);
   ObUnifiedCatalogConfig config;
-  remote_catalog_name.reset();
-  endpoint.reset();
-  realm.reset();
-  if (OB_FAIL(resolve_target(tenant_id, allocator, remote_catalog_name, &config))) {
+  ObString remote_catalog_name;
+  if (!target.is_captured()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("Unified Catalog sync target is not captured", K(ret), K(tenant_id));
+  } else if (OB_FAIL(resolve_target(tenant_id,
+                                    allocator,
+                                    remote_catalog_name,
+                                    &config))) {
     LOG_WARN("failed to resolve Unified Catalog sync target", K(ret));
+  } else if (OB_FAIL(validate_expected_namespace_target(target.catalog_name(),
+                                                        target.endpoint(),
+                                                        target.realm(),
+                                                        remote_catalog_name,
+                                                        config))) {
+    LOG_WARN("Unified Catalog sync target changed", K(ret), K(tenant_id));
   } else {
-    endpoint = config.endpoint_;
-    realm = config.realm_;
     ObUnifiedCatalogClient client(allocator);
     if (OB_FAIL(client.init(config,
-                            access_token,
+                            target.access_token(),
                             remote_catalog_name,
                             static_cast<uint64_t>(GCONF.cluster_id),
                             tenant_id))
@@ -223,36 +252,9 @@ int ObUnifiedCatalog::validate_expected_namespace_target(
   return ret;
 }
 
-int ObUnifiedCatalog::validate_namespace_target(
-    const uint64_t tenant_id,
-    const ObString &expected_remote_catalog_name,
-    const ObString &expected_endpoint,
-    const ObString &expected_realm)
-{
-  int ret = OB_SUCCESS;
-  ObArenaAllocator allocator("UnifiedCatalog", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id);
-  ObUnifiedCatalogConfig config;
-  ObString remote_catalog_name;
-  if (OB_FAIL(resolve_target(tenant_id, allocator, remote_catalog_name, &config))) {
-    LOG_WARN("failed to resolve Unified Catalog namespace target", K(ret));
-  } else if (OB_FAIL(validate_expected_namespace_target(
-                 expected_remote_catalog_name,
-                 expected_endpoint,
-                 expected_realm,
-                 remote_catalog_name,
-                 config))) {
-    LOG_WARN("Unified Catalog namespace target changed", K(ret));
-  }
-  return ret;
-}
-
-int ObUnifiedCatalog::create_namespace(const uint64_t tenant_id,
-                                       const ObString &access_token,
+int ObUnifiedCatalog::create_namespace(const ObUnifiedCatalogSyncTarget &target,
                                        const ObString &database_name,
-                                       const uint64_t database_id,
-                                       const ObString &expected_remote_catalog_name,
-                                       const ObString &expected_endpoint,
-                                       const ObString &expected_realm)
+                                       const uint64_t database_id)
 {
   int ret = OB_SUCCESS;
   ObArenaAllocator allocator("UnifiedCatalog");
@@ -261,26 +263,25 @@ int ObUnifiedCatalog::create_namespace(const uint64_t tenant_id,
   if (OB_INVALID_ID == database_id || database_name.empty()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid namespace source identity", K(ret), K(database_id), K(database_name));
-  } else if (OB_FAIL(resolve_target(tenant_id,
+  } else if (OB_FAIL(resolve_target(target.tenant_id(),
                                     allocator,
                                     remote_catalog_name,
                                     &config))) {
     LOG_WARN("failed to resolve Unified Catalog target", K(ret));
-  } else if (!expected_remote_catalog_name.empty()
-             && OB_FAIL(validate_expected_namespace_target(
-                 expected_remote_catalog_name,
-                 expected_endpoint,
-                 expected_realm,
+  } else if (OB_FAIL(validate_expected_namespace_target(
+                 target.catalog_name(),
+                 target.endpoint(),
+                 target.realm(),
                  remote_catalog_name,
                  config))) {
     LOG_WARN("Unified Catalog create namespace target changed", K(ret));
   } else {
     ObUnifiedCatalogClient client(allocator);
     if (OB_FAIL(client.init(config,
-                            access_token,
+                            target.access_token(),
                             remote_catalog_name,
                             static_cast<uint64_t>(GCONF.cluster_id),
-                            tenant_id))
+                            target.tenant_id()))
         || OB_FAIL(client.reader().validate_catalog())
         || OB_FAIL(client.writer().create_namespace(database_name, database_id))) {
       LOG_WARN("failed to create Unified Catalog namespace",
@@ -290,13 +291,9 @@ int ObUnifiedCatalog::create_namespace(const uint64_t tenant_id,
   return ret;
 }
 
-int ObUnifiedCatalog::check_namespace_empty(const uint64_t tenant_id,
-                                            const ObString &access_token,
+int ObUnifiedCatalog::check_namespace_empty(const ObUnifiedCatalogSyncTarget &target,
                                             const ObString &database_name,
-                                            const uint64_t database_id,
-                                            const ObString &expected_remote_catalog_name,
-                                            const ObString &expected_endpoint,
-                                            const ObString &expected_realm)
+                                            const uint64_t database_id)
 {
   int ret = OB_SUCCESS;
   ObArenaAllocator allocator("UnifiedCatalog");
@@ -306,26 +303,25 @@ int ObUnifiedCatalog::check_namespace_empty(const uint64_t tenant_id,
   if (database_name.empty() || OB_INVALID_ID == database_id) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid namespace source identity", K(ret), K(database_name), K(database_id));
-  } else if (OB_FAIL(resolve_target(tenant_id,
+  } else if (OB_FAIL(resolve_target(target.tenant_id(),
                                     allocator,
                                     remote_catalog_name,
                                     &config))) {
     LOG_WARN("failed to resolve Unified Catalog target", K(ret));
-  } else if (!expected_remote_catalog_name.empty()
-             && OB_FAIL(validate_expected_namespace_target(
-                 expected_remote_catalog_name,
-                 expected_endpoint,
-                 expected_realm,
+  } else if (OB_FAIL(validate_expected_namespace_target(
+                 target.catalog_name(),
+                 target.endpoint(),
+                 target.realm(),
                  remote_catalog_name,
                  config))) {
     LOG_WARN("Unified Catalog namespace inspection target changed", K(ret));
   } else {
     ObUnifiedCatalogClient client(allocator);
     if (OB_FAIL(client.init(config,
-                            access_token,
+                            target.access_token(),
                             remote_catalog_name,
                             static_cast<uint64_t>(GCONF.cluster_id),
-                            tenant_id))
+                            target.tenant_id()))
         || OB_FAIL(client.reader().validate_catalog())
         || OB_FAIL(client.reader().namespace_has_tables(
             database_name, database_id, has_tables))) {
@@ -340,12 +336,8 @@ int ObUnifiedCatalog::check_namespace_empty(const uint64_t tenant_id,
   return ret;
 }
 
-int ObUnifiedCatalog::drop_namespace(const uint64_t tenant_id,
-                                     const ObString &access_token,
-                                     const ObString &database_name,
-                                     const ObString &expected_remote_catalog_name,
-                                     const ObString &expected_endpoint,
-                                     const ObString &expected_realm)
+int ObUnifiedCatalog::drop_namespace(const ObUnifiedCatalogSyncTarget &target,
+                                     const ObString &database_name)
 {
   int ret = OB_SUCCESS;
   ObArenaAllocator allocator("UnifiedCatalog");
@@ -354,26 +346,25 @@ int ObUnifiedCatalog::drop_namespace(const uint64_t tenant_id,
   if (database_name.empty()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid namespace name", K(ret), K(database_name));
-  } else if (OB_FAIL(resolve_target(tenant_id,
+  } else if (OB_FAIL(resolve_target(target.tenant_id(),
                                     allocator,
                                     remote_catalog_name,
                                     &config))) {
     LOG_WARN("failed to resolve Unified Catalog target", K(ret));
-  } else if (!expected_remote_catalog_name.empty()
-             && OB_FAIL(validate_expected_namespace_target(
-                 expected_remote_catalog_name,
-                 expected_endpoint,
-                 expected_realm,
+  } else if (OB_FAIL(validate_expected_namespace_target(
+                 target.catalog_name(),
+                 target.endpoint(),
+                 target.realm(),
                  remote_catalog_name,
                  config))) {
     LOG_WARN("Unified Catalog drop namespace target changed", K(ret));
   } else {
     ObUnifiedCatalogClient client(allocator);
     if (OB_FAIL(client.init(config,
-                            access_token,
+                            target.access_token(),
                             remote_catalog_name,
                             static_cast<uint64_t>(GCONF.cluster_id),
-                            tenant_id))
+                            target.tenant_id()))
         || OB_FAIL(client.reader().validate_catalog())
         || OB_FAIL(client.writer().drop_namespace(database_name))) {
       LOG_WARN("failed to drop Unified Catalog namespace", K(ret), K(database_name));
@@ -436,42 +427,41 @@ int ObUnifiedCatalog::sync_database(
   return ret;
 }
 
-int ObUnifiedCatalog::reserve_create_table(const uint64_t tenant_id,
-                                            const ObString &access_token,
+int ObUnifiedCatalog::reserve_create_table(const ObUnifiedCatalogSyncTarget &target,
                                             const ObString &database_name,
                                             const uint64_t database_id,
                                             const ObTableSchema &table_schema,
-                                            const ObString &operation_id,
-                                            ObIAllocator &allocator,
-                                            ObString &remote_catalog_name,
-                                            ObString &endpoint,
-                                            ObString &realm)
+                                            const ObString &operation_id)
 {
   int ret = OB_SUCCESS;
+  ObArenaAllocator allocator("UnifiedCatalog", OB_MALLOC_NORMAL_BLOCK_SIZE,
+                             target.tenant_id());
   ObUnifiedCatalogConfig config;
-  remote_catalog_name.reset();
-  endpoint.reset();
-  realm.reset();
+  ObString remote_catalog_name;
   if (database_name.empty() || OB_INVALID_ID == database_id || operation_id.empty()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid Unified Catalog create reservation", K(ret));
   } else if (OB_FAIL(ObUnifiedCatalogSchemaCodec::validate_create_table_schema(table_schema))) {
     LOG_WARN("table schema failed Unified Catalog create preflight", K(ret),
              K(table_schema.get_table_name_str()));
-  } else if (OB_FAIL(resolve_target(tenant_id,
+  } else if (OB_FAIL(resolve_target(target.tenant_id(),
                                     allocator,
                                     remote_catalog_name,
                                     &config))) {
     LOG_WARN("failed to resolve Unified Catalog create target", K(ret));
+  } else if (OB_FAIL(validate_expected_namespace_target(target.catalog_name(),
+                                                        target.endpoint(),
+                                                        target.realm(),
+                                                        remote_catalog_name,
+                                                        config))) {
+    LOG_WARN("Unified Catalog create reservation target changed", K(ret));
   } else {
-    endpoint = config.endpoint_;
-    realm = config.realm_;
     ObUnifiedCatalogClient client(allocator);
     if (OB_FAIL(client.init(config,
-                            access_token,
+                            target.access_token(),
                             remote_catalog_name,
                             static_cast<uint64_t>(GCONF.cluster_id),
-                            tenant_id))
+                            target.tenant_id()))
         || OB_FAIL(client.reader().validate_catalog())
         || OB_FAIL(client.writer().create_namespace(database_name, database_id))
         || OB_FAIL(client.writer().reserve_table(database_name,
@@ -487,39 +477,36 @@ int ObUnifiedCatalog::reserve_create_table(const uint64_t tenant_id,
   return ret;
 }
 
-int ObUnifiedCatalog::complete_create_table(const uint64_t tenant_id,
-                                             const ObString &access_token,
-                                             const ObString &expected_remote_catalog_name,
-                                             const ObString &expected_endpoint,
-                                             const ObString &expected_realm,
+int ObUnifiedCatalog::complete_create_table(const ObUnifiedCatalogSyncTarget &target,
                                              const ObString &database_name,
                                              const ObTableSchema &table_schema,
                                              const ObString &operation_id)
 {
   int ret = OB_SUCCESS;
-  ObArenaAllocator allocator("UnifiedCreate", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id);
+  ObArenaAllocator allocator("UnifiedCreate", OB_MALLOC_NORMAL_BLOCK_SIZE,
+                             target.tenant_id());
   ObUnifiedCatalogConfig config;
   ObString remote_catalog_name;
   if (OB_FAIL(ObUnifiedCatalogSchemaCodec::validate_table_schema(table_schema))) {
     LOG_WARN("completed table schema failed Unified Catalog preflight", K(ret));
-  } else if (OB_FAIL(resolve_target(tenant_id,
+  } else if (OB_FAIL(resolve_target(target.tenant_id(),
                                     allocator,
                                     remote_catalog_name,
                                     &config))) {
     LOG_WARN("failed to resolve Unified Catalog create target", K(ret));
-  } else if (expected_remote_catalog_name != remote_catalog_name) {
-    ret = OB_STATE_NOT_MATCH;
-    LOG_WARN("Unified Catalog create target changed", K(ret), K(expected_remote_catalog_name), K(remote_catalog_name));
-  } else if (expected_endpoint != config.endpoint_ || expected_realm != config.realm_) {
-    ret = OB_STATE_NOT_MATCH;
-    LOG_WARN("Unified Catalog connection changed after create reservation", K(ret));
+  } else if (OB_FAIL(validate_expected_namespace_target(target.catalog_name(),
+                                                        target.endpoint(),
+                                                        target.realm(),
+                                                        remote_catalog_name,
+                                                        config))) {
+    LOG_WARN("Unified Catalog create target changed", K(ret));
   } else {
     ObUnifiedCatalogClient client(allocator);
     if (OB_FAIL(client.init(config,
-                            access_token,
+                            target.access_token(),
                             remote_catalog_name,
                             static_cast<uint64_t>(GCONF.cluster_id),
-                            tenant_id))
+                            target.tenant_id()))
         || OB_FAIL(client.reader().validate_catalog())
         || OB_FAIL(client.writer().complete_reserved_table(database_name,
                                                            table_schema.get_database_id(),
@@ -531,35 +518,32 @@ int ObUnifiedCatalog::complete_create_table(const uint64_t tenant_id,
   return ret;
 }
 
-int ObUnifiedCatalog::cancel_create_table(const uint64_t tenant_id,
-                                          const ObString &access_token,
-                                          const ObString &expected_remote_catalog_name,
-                                          const ObString &expected_endpoint,
-                                          const ObString &expected_realm,
+int ObUnifiedCatalog::cancel_create_table(const ObUnifiedCatalogSyncTarget &target,
                                           const ObString &database_name,
                                           const ObString &table_name,
                                           const ObString &operation_id)
 {
   int ret = OB_SUCCESS;
-  ObArenaAllocator allocator("UnifiedCancel", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id);
+  ObArenaAllocator allocator("UnifiedCancel", OB_MALLOC_NORMAL_BLOCK_SIZE,
+                             target.tenant_id());
   ObUnifiedCatalogConfig config;
-  if (expected_remote_catalog_name.empty()
+  if (!target.is_captured()
       || database_name.empty() || table_name.empty() || operation_id.empty()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid Unified Catalog reservation cancellation identity", K(ret),
              K(database_name), K(table_name));
-  } else if (OB_FAIL(config.load(tenant_id, allocator))) {
+  } else if (OB_FAIL(config.load(target.tenant_id(), allocator))) {
     LOG_WARN("failed to resolve reserved Unified Catalog connection", K(ret));
-  } else if (expected_endpoint != config.endpoint_ || expected_realm != config.realm_) {
+  } else if (target.endpoint() != config.endpoint_ || target.realm() != config.realm_) {
     ret = OB_STATE_NOT_MATCH;
     LOG_WARN("Unified Catalog connection changed before reservation cancellation", K(ret));
   } else {
     ObUnifiedCatalogClient client(allocator);
     if (OB_FAIL(client.init(config,
-                            access_token,
-                            expected_remote_catalog_name,
+                            target.access_token(),
+                            target.catalog_name(),
                             static_cast<uint64_t>(GCONF.cluster_id),
-                            tenant_id))) {
+                            target.tenant_id()))) {
       LOG_WARN("failed to initialize Unified Catalog reservation cancellation client", K(ret));
     } else if (OB_FAIL(client.reader().validate_catalog())) {
       LOG_WARN("failed to validate Unified Catalog reservation cancellation Catalog", K(ret));
@@ -581,14 +565,17 @@ int ObUnifiedCatalog::sync_table(const uint64_t tenant_id,
                                  const bool recover_preparing)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(sync_table_to_target(tenant_id,
-                                   access_token,
-                                   expected_remote_catalog_name,
-                                   ObString(),
-                                   ObString(),
-                                   database_name,
-                                   table_schema,
-                                   recover_preparing))) {
+  ObArenaAllocator allocator("UnifiedCatalog", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id);
+  ObUnifiedCatalogSyncTarget target(tenant_id, access_token);
+  if (OB_FAIL(target.capture(allocator))) {
+    LOG_WARN("failed to capture Unified Catalog table target", K(ret), K(tenant_id));
+  } else if (OB_FAIL(validate_expected_config(expected_remote_catalog_name,
+                                              target.catalog_name()))) {
+    LOG_WARN("unexpected Unified Catalog configuration", K(ret));
+  } else if (OB_FAIL(sync_table_to_target(target,
+                                          database_name,
+                                          table_schema,
+                                          recover_preparing))) {
     LOG_WARN("failed to sync table to Unified Catalog target",
              K(ret), K(tenant_id), K(database_name),
              K(table_schema.get_table_name_str()));
@@ -597,11 +584,7 @@ int ObUnifiedCatalog::sync_table(const uint64_t tenant_id,
 }
 
 int ObUnifiedCatalog::sync_table_to_target(
-    const uint64_t tenant_id,
-    const ObString &access_token,
-    const ObString &expected_remote_catalog_name,
-    const ObString &expected_endpoint,
-    const ObString &expected_realm,
+    const ObUnifiedCatalogSyncTarget &target,
     const ObString &database_name,
     const ObTableSchema &table_schema,
     const bool recover_preparing)
@@ -613,31 +596,24 @@ int ObUnifiedCatalog::sync_table_to_target(
   if (OB_FAIL(ObUnifiedCatalogSchemaCodec::validate_table_schema(table_schema))) {
     LOG_WARN("table schema failed Unified Catalog synchronization preflight", K(ret),
              K(database_name), K(table_schema.get_table_name_str()));
-  } else if (OB_FAIL(resolve_target(tenant_id,
+  } else if (OB_FAIL(resolve_target(target.tenant_id(),
                                     allocator,
                                     remote_catalog_name,
                                     &config))) {
     LOG_WARN("failed to resolve Unified Catalog target", K(ret));
-  } else if ((!expected_endpoint.empty() || !expected_realm.empty())
-             && OB_FAIL(validate_expected_namespace_target(
-                 expected_remote_catalog_name,
-                 expected_endpoint,
-                 expected_realm,
-                 remote_catalog_name,
-                 config))) {
+  } else if (OB_FAIL(validate_expected_namespace_target(target.catalog_name(),
+                                                        target.endpoint(),
+                                                        target.realm(),
+                                                        remote_catalog_name,
+                                                        config))) {
     LOG_WARN("Unified Catalog table target changed", K(ret));
-  } else if (expected_endpoint.empty() && expected_realm.empty()
-             && OB_FAIL(validate_expected_config(
-                 expected_remote_catalog_name,
-                 remote_catalog_name))) {
-    LOG_WARN("unexpected Unified Catalog configuration", K(ret));
   } else {
     ObUnifiedCatalogClient client(allocator);
     if (OB_FAIL(client.init(config,
-                            access_token,
+                            target.access_token(),
                             remote_catalog_name,
                             static_cast<uint64_t>(GCONF.cluster_id),
-                            tenant_id))
+                            target.tenant_id()))
         || OB_FAIL(client.reader().validate_catalog())
         || OB_FAIL(client.writer().create_namespace(database_name,
                                                     table_schema.get_database_id()))
@@ -646,6 +622,163 @@ int ObUnifiedCatalog::sync_table_to_target(
                                               table_schema, recover_preparing))) {
       LOG_WARN("failed to sync OceanBase table to Unified Catalog",
                K(ret), K(database_name), K(table_schema.get_table_name_str()));
+    }
+  }
+  return ret;
+}
+
+int ObUnifiedCatalog::update_table_to_target(const ObUnifiedCatalogSyncTarget &target,
+                                             const ObString &database_name,
+                                             const ObTableSchema &table_schema,
+                                             const uint64_t expected_source_table_id)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t tenant_id = target.tenant_id();
+  ObArenaAllocator allocator("UnifiedCatalog", OB_MALLOC_NORMAL_BLOCK_SIZE,
+                             tenant_id);
+  ObUnifiedCatalogConfig config;
+  ObString remote_catalog_name;
+  if (OB_INVALID_ID == expected_source_table_id) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid Unified Catalog table update source",
+             K(ret),
+             K(tenant_id),
+             K(database_name),
+             K(expected_source_table_id));
+  } else if (OB_FAIL(ObUnifiedCatalogSchemaCodec::validate_table_schema(table_schema))) {
+    LOG_WARN("table schema failed Unified Catalog update preflight",
+             K(ret),
+             K(tenant_id),
+             K(database_name),
+             K(table_schema.get_table_name_str()));
+  } else if (OB_FAIL(resolve_target(tenant_id, allocator, remote_catalog_name, &config))) {
+    LOG_WARN("failed to resolve Unified Catalog update target",
+             K(ret),
+             K(tenant_id),
+             K(database_name));
+  } else if (OB_FAIL(validate_expected_namespace_target(target.catalog_name(),
+                                                        target.endpoint(),
+                                                        target.realm(),
+                                                        remote_catalog_name,
+                                                        config))) {
+    LOG_WARN("Unified Catalog table update target changed",
+             K(ret),
+             K(tenant_id),
+             K(database_name));
+  } else {
+    ObUnifiedCatalogClient client(allocator);
+    if (OB_FAIL(client.init(config,
+                            target.access_token(),
+                            remote_catalog_name,
+                            static_cast<uint64_t>(GCONF.cluster_id),
+                            tenant_id))) {
+      LOG_WARN("failed to initialize Unified Catalog table update client",
+               K(ret),
+               K(tenant_id),
+               K(database_name));
+    } else if (OB_FAIL(client.reader().validate_catalog())) {
+      LOG_WARN("failed to validate Unified Catalog table update Catalog",
+               K(ret),
+               K(tenant_id),
+               K(database_name));
+    } else if (OB_FAIL(client.writer().update_table(database_name,
+                                                    table_schema,
+                                                    expected_source_table_id))) {
+      LOG_WARN("failed to update OceanBase table in Unified Catalog",
+               K(ret),
+               K(tenant_id),
+               K(database_name),
+               K(table_schema.get_table_name_str()),
+               K(expected_source_table_id));
+    }
+  }
+  return ret;
+}
+
+int ObUnifiedCatalog::rename_table_to_target(const ObUnifiedCatalogSyncTarget &target,
+                                             const ObString &source_database_name,
+                                             const ObString &source_table_name,
+                                             const ObString &destination_database_name,
+                                             const ObTableSchema &final_table_schema,
+                                             const uint64_t expected_source_table_id)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t tenant_id = target.tenant_id();
+  ObArenaAllocator allocator("UnifiedCatalog", OB_MALLOC_NORMAL_BLOCK_SIZE,
+                             tenant_id);
+  ObUnifiedCatalogConfig config;
+  ObString remote_catalog_name;
+  if (source_database_name.empty() || source_table_name.empty() || destination_database_name.empty()
+      || OB_INVALID_ID == expected_source_table_id) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid Unified Catalog table rename argument",
+             K(ret),
+             K(tenant_id),
+             K(source_database_name),
+             K(source_table_name),
+             K(destination_database_name),
+             K(expected_source_table_id));
+  } else if (OB_FAIL(ObUnifiedCatalogSchemaCodec::validate_table_schema(final_table_schema))) {
+    LOG_WARN("table schema failed Unified Catalog rename preflight",
+             K(ret),
+             K(tenant_id),
+             K(source_database_name),
+             K(source_table_name),
+             K(destination_database_name),
+             K(final_table_schema.get_table_name_str()));
+  } else if (OB_FAIL(resolve_target(tenant_id, allocator, remote_catalog_name, &config))) {
+    LOG_WARN("failed to resolve Unified Catalog rename target",
+             K(ret),
+             K(tenant_id),
+             K(source_database_name),
+             K(source_table_name));
+  } else if (OB_FAIL(validate_expected_namespace_target(target.catalog_name(),
+                                                        target.endpoint(),
+                                                        target.realm(),
+                                                        remote_catalog_name,
+                                                        config))) {
+    LOG_WARN("Unified Catalog table rename target changed",
+             K(ret),
+             K(tenant_id),
+             K(source_database_name),
+             K(source_table_name));
+  } else {
+    ObUnifiedCatalogClient client(allocator);
+    if (OB_FAIL(client.init(config,
+                            target.access_token(),
+                            remote_catalog_name,
+                            static_cast<uint64_t>(GCONF.cluster_id),
+                            tenant_id))) {
+      LOG_WARN("failed to initialize Unified Catalog table rename client",
+               K(ret),
+               K(tenant_id),
+               K(source_database_name),
+               K(source_table_name));
+    } else if (OB_FAIL(client.reader().validate_catalog())) {
+      LOG_WARN("failed to validate Unified Catalog table rename Catalog",
+               K(ret),
+               K(tenant_id),
+               K(source_database_name),
+               K(source_table_name));
+    } else if (OB_FAIL(client.writer().create_namespace(destination_database_name,
+                                                        final_table_schema.get_database_id()))) {
+      LOG_WARN("failed to validate Unified Catalog rename destination namespace",
+               K(ret),
+               K(tenant_id),
+               K(destination_database_name));
+    } else if (OB_FAIL(client.writer().rename_table(source_database_name,
+                                                    source_table_name,
+                                                    destination_database_name,
+                                                    final_table_schema,
+                                                    expected_source_table_id))) {
+      LOG_WARN("failed to rename OceanBase table in Unified Catalog",
+               K(ret),
+               K(tenant_id),
+               K(source_database_name),
+               K(source_table_name),
+               K(destination_database_name),
+               K(final_table_schema.get_table_name_str()),
+               K(expected_source_table_id));
     }
   }
   return ret;
@@ -675,18 +808,14 @@ int ObUnifiedCatalog::drop_table(const uint64_t tenant_id,
     LOG_WARN("failed to resolve Unified Catalog target", K(ret));
   } else if (OB_FAIL(snapshot_config.parse(expected_raw_config, allocator))) {
     LOG_WARN("failed to parse Unified Catalog drop table target snapshot",
-             K(ret), K(tenant_id), K(database_name), K(table_name),
-             "ddl", "drop_table", "backend", "unified_catalog",
-             "stage", "complete");
+             K(ret), K(tenant_id), K(database_name), K(table_name));
   } else if (OB_FAIL(validate_expected_namespace_target(expected_raw_target,
                                                         snapshot_config.endpoint_,
                                                         snapshot_config.realm_,
                                                         remote_catalog_name,
                                                         config))) {
     LOG_WARN("Unified Catalog drop table target changed",
-             K(ret), K(tenant_id), K(database_name), K(table_name),
-             "ddl", "drop_table", "backend", "unified_catalog",
-             "stage", "complete");
+             K(ret), K(tenant_id), K(database_name), K(table_name));
   } else {
     ObUnifiedCatalogClient client(allocator);
     if (OB_FAIL(client.init(config,

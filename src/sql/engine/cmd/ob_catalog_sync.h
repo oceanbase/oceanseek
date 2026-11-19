@@ -15,6 +15,10 @@ namespace common
 {
 class ObIAllocator;
 }
+namespace share
+{
+class ObUnifiedCatalogSyncTarget;
+}
 namespace obrpc
 {
 struct ObAlterTableArg;
@@ -24,11 +28,11 @@ struct ObCreateTableLikeArg;
 struct ObDropDatabaseArg;
 struct ObDropTableArg;
 struct ObFlashBackTableFromRecyclebinArg;
+struct ObForkTableArg;
 struct ObRenameTableArg;
 }
 namespace sql
 {
-class ObExecContext;
 class ObCreateTableStmt;
 class ObSQLSessionInfo;
 
@@ -84,6 +88,11 @@ public:
   virtual int prepare(ObCatalogSyncPrepareResult &result) = 0;
   virtual int complete(const ObCatalogSyncDDLResult &result) = 0;
   virtual int compensate(const int /*ddl_ret*/) { return OB_SUCCESS; }
+
+protected:
+  static int prepare_unified_catalog_target(
+      share::ObUnifiedCatalogSyncTarget &target,
+      common::ObIAllocator &allocator);
 };
 
 class ObCatalogSyncOperationHandle
@@ -110,53 +119,76 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObCatalogSyncOperationHandle);
 };
 
-class ObCatalogSyncAuthContext
+enum class ObCatalogSyncBackend
+{
+  NONE = 0,
+  HMS,
+  UNIFIED_CATALOG
+};
+
+class ObCatalogSyncPrecheckResult
 {
 public:
-  ObCatalogSyncAuthContext()
-      : access_token_(), is_unified_catalog_(false), is_hms_sync_enabled_(false)
+  ObCatalogSyncPrecheckResult()
+      : backend_(ObCatalogSyncBackend::NONE),
+        source_object_id_(OB_INVALID_ID)
   {
   }
+  bool need_operation() const { return ObCatalogSyncBackend::NONE != backend_; }
+  bool is_unified_catalog() const { return ObCatalogSyncBackend::UNIFIED_CATALOG == backend_; }
+  bool need_access_token() const { return is_unified_catalog(); }
+  uint64_t get_source_object_id() const { return source_object_id_; }
 
 private:
   friend class ObCatalogSync;
-  common::ObString access_token_;
-  bool is_unified_catalog_;
-  bool is_hms_sync_enabled_;
+  ObCatalogSyncBackend backend_;
+  uint64_t source_object_id_;
 };
 
 class ObCatalogSync
 {
 public:
   explicit ObCatalogSync(common::ObIAllocator &allocator) : allocator_(allocator) {}
-  int prepare_create_table_context(ObExecContext &ctx,
-                                   const obrpc::ObCreateTableArg &create_table_arg,
-                                   ObCatalogSyncAuthContext &context);
-  int get_create_database_operator(ObExecContext &ctx,
+  static ObCatalogSyncBackend snapshot_backend(const uint64_t tenant_id);
+  int get_create_database_operator(const ObCatalogSyncBackend backend,
+                                   const common::ObString &access_token,
                                    const obrpc::ObCreateDatabaseArg &create_database_arg,
                                    ObCatalogSyncOperationHandle &handle);
-  int get_create_table_operator(const ObCatalogSyncAuthContext &context,
+  int get_create_table_operator(const ObCatalogSyncBackend backend,
+                                const common::ObString &access_token,
                                 const common::ObString &database_name,
                                 const obrpc::ObCreateTableArg &create_table_arg,
                                 ObCatalogSyncOperationHandle &handle);
-  int get_create_table_as_select_operator(ObExecContext &ctx,
+  int get_create_table_as_select_operator(const ObCatalogSyncBackend backend,
+                                          const common::ObString &access_token,
                                           ObCreateTableStmt &stmt,
                                           ObCatalogSyncOperationHandle &handle);
-  int get_create_table_like_operator(ObExecContext &ctx,
+  int get_create_table_like_operator(const ObCatalogSyncBackend backend,
+                                     const common::ObString &access_token,
                                      const obrpc::ObCreateTableLikeArg &create_table_like_arg,
                                      ObCatalogSyncOperationHandle &handle);
-  int get_alter_table_operator(ObExecContext &ctx,
+  int get_fork_table_operator(const ObCatalogSyncBackend backend,
+                              const common::ObString &access_token,
+                              const obrpc::ObForkTableArg &fork_table_arg,
+                              ObCatalogSyncOperationHandle &handle);
+  int precheck_alter_table(const obrpc::ObAlterTableArg &alter_table_arg,
+                           ObCatalogSyncPrecheckResult &precheck_result);
+  int get_alter_table_operator(const ObCatalogSyncPrecheckResult &precheck_result,
+                               const common::ObString &access_token,
+                               ObSQLSessionInfo *session,
                                const obrpc::ObAlterTableArg &alter_table_arg,
                                ObCatalogSyncOperationHandle &handle);
-  int get_rename_table_operator(const obrpc::ObRenameTableArg &rename_table_arg,
+  int precheck_rename_table(const obrpc::ObRenameTableArg &rename_table_arg,
+                            ObCatalogSyncPrecheckResult &precheck_result);
+  int get_rename_table_operator(const ObCatalogSyncPrecheckResult &precheck_result,
+                                const common::ObString &access_token,
+                                const obrpc::ObRenameTableArg &rename_table_arg,
                                 ObCatalogSyncOperationHandle &handle);
   int get_flashback_table_operator(
       const obrpc::ObFlashBackTableFromRecyclebinArg &flashback_table_arg,
       ObCatalogSyncOperationHandle &handle);
-  int prepare_drop_database_context(ObExecContext &ctx,
-                                    const obrpc::ObDropDatabaseArg &drop_database_arg,
-                                    ObCatalogSyncAuthContext &context);
-  int get_drop_database_operator(const ObCatalogSyncAuthContext &context,
+  int get_drop_database_operator(const ObCatalogSyncBackend backend,
+                                 const common::ObString &access_token,
                                  const obrpc::ObDropDatabaseArg &drop_database_arg,
                                  ObCatalogSyncOperationHandle &handle);
   int get_drop_table_operator(const ObSQLSessionInfo &session,
@@ -164,6 +196,18 @@ public:
                               ObCatalogSyncOperationHandle &handle);
 
 private:
+  static bool is_supported_uc_partition_alter(const obrpc::ObAlterTableArg &arg);
+  static bool is_supported_uc_column_alter(const obrpc::ObAlterTableArg &arg);
+  static bool is_supported_uc_table_rename(const obrpc::ObAlterTableArg &arg);
+  static bool is_supported_uc_alter(const obrpc::ObAlterTableArg &arg);
+  static int validate_uc_alter_source(const uint64_t tenant_id,
+                                      const obrpc::ObAlterTableArg &arg,
+                                      uint64_t &source_table_id);
+  static int precheck_unified_catalog_rename(
+      const uint64_t tenant_id,
+      const obrpc::ObRenameTableArg &rename_table_arg,
+      uint64_t &source_table_id);
+
   common::ObIAllocator &allocator_;
   DISALLOW_COPY_AND_ASSIGN(ObCatalogSync);
 };

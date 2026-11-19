@@ -218,7 +218,8 @@ int ObUnifiedCatalogPartitionSync::commit_part_sync(const ObString &database_nam
                                                     const int64_t base_version,
                                                     const int64_t part_count,
                                                     const int64_t sub_part_count,
-                                                    const ObString &metadata)
+                                                    const ObString &metadata,
+                                                    const uint64_t expected_source_table_id)
 {
   int ret = OB_SUCCESS;
   ObSqlString path;
@@ -230,10 +231,20 @@ int ObUnifiedCatalogPartitionSync::commit_part_sync(const ObString &database_nam
   if (OB_ISNULL(root)) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("failed to allocate Unified Catalog partition commit", K(ret));
-  } else if (OB_FAIL(ObUnifiedCatalogResourcePaths::build_part_sync_commit_path(
-                        client_.catalog_name_, database_name, table_name, sync_id, path))
-             || OB_FAIL(ObUnifiedCatalogPartitionSyncCodec::build_commit_fields(
-                 request_allocator, *root, base_version, part_count, sub_part_count, metadata))) {
+  } else if (OB_FAIL(
+                 ObUnifiedCatalogResourcePaths::build_part_sync_commit_path(client_.catalog_name_,
+                                                                            database_name,
+                                                                            table_name,
+                                                                            sync_id,
+                                                                            path))
+             || OB_FAIL(
+                 ObUnifiedCatalogPartitionSyncCodec::build_commit_fields(request_allocator,
+                                                                         *root,
+                                                                         base_version,
+                                                                         part_count,
+                                                                         sub_part_count,
+                                                                         expected_source_table_id,
+                                                                         metadata))) {
     LOG_WARN("failed to build Unified Catalog partition commit", K(ret));
   } else {
     ObJsonBuffer buffer(&request_allocator);
@@ -312,12 +323,73 @@ int ObUnifiedCatalogPartitionSync::validate_part_values(const ObString &database
   return ret;
 }
 
-int ObUnifiedCatalogPartitionSync::sync(const ObString &database_name,
-                                        const uint64_t database_id,
-                                        const schema::ObTableSchema &table_schema,
-                                        const bool force_commit,
-                                        const ObString &operation_id,
-                                        int64_t *committed_sync_id)
+int ObUnifiedCatalogPartitionSync::complete_reserved_partitions(
+    const ObString &database_name,
+    const uint64_t database_id,
+    const schema::ObTableSchema &table_schema,
+    const ObString &operation_id,
+    int64_t &committed_sync_id)
+{
+  int ret = OB_SUCCESS;
+  PartitionSyncContext context = PartitionSyncContext::complete_reserved(operation_id);
+  committed_sync_id = 0;
+  if (operation_id.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid Unified Catalog partition reservation", K(ret), K(database_name));
+  } else if (OB_FAIL(sync_partitions(database_name, database_id, table_schema, context))) {
+    LOG_WARN("failed to complete reserved Unified Catalog partitions",
+             K(ret),
+             K(database_name),
+             K(table_schema.get_table_name_str()));
+  } else {
+    committed_sync_id = context.committed_sync_id_;
+  }
+  return ret;
+}
+
+int ObUnifiedCatalogPartitionSync::sync_existing_partitions(
+    const ObString &database_name,
+    const uint64_t database_id,
+    const schema::ObTableSchema &table_schema)
+{
+  int ret = OB_SUCCESS;
+  PartitionSyncContext context = PartitionSyncContext::existing(table_schema.get_table_id());
+  if (OB_FAIL(sync_partitions(database_name, database_id, table_schema, context))) {
+    LOG_WARN("failed to synchronize existing Unified Catalog partitions",
+             K(ret),
+             K(database_name),
+             K(table_schema.get_table_name_str()));
+  }
+  return ret;
+}
+
+int ObUnifiedCatalogPartitionSync::update_partitions(const ObString &database_name,
+                                                     const uint64_t database_id,
+                                                     const schema::ObTableSchema &table_schema,
+                                                     const uint64_t expected_source_table_id)
+{
+  int ret = OB_SUCCESS;
+  PartitionSyncContext context = PartitionSyncContext::update(expected_source_table_id);
+  if (OB_INVALID_ID == expected_source_table_id) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid Unified Catalog partition update source",
+             K(ret),
+             K(database_name),
+             K(expected_source_table_id));
+  } else if (OB_FAIL(sync_partitions(database_name, database_id, table_schema, context))) {
+    LOG_WARN("failed to update Unified Catalog partitions",
+             K(ret),
+             K(database_name),
+             K(table_schema.get_table_name_str()),
+             K(expected_source_table_id));
+  }
+  return ret;
+}
+
+int ObUnifiedCatalogPartitionSync::sync_partitions(const ObString &database_name,
+                                                   const uint64_t database_id,
+                                                   const schema::ObTableSchema &table_schema,
+                                                   PartitionSyncContext &context)
 {
   int ret = OB_SUCCESS;
   ObArenaAllocator metadata_allocator("UCPart");
@@ -325,9 +397,11 @@ int ObUnifiedCatalogPartitionSync::sync(const ObString &database_name,
   ObSEArray<const schema::ObPartition *, INLINE_PARTITION_COUNT> parts;
   int64_t sub_part_count = 0;
   bool should_sync = true;
-  if (OB_NOT_NULL(committed_sync_id)) {
-    *committed_sync_id = 0;
-  }
+  // Physical partition value publishing is temporarily disabled; keep table metadata sync enabled.
+  const bool publish_partition_values = false;
+  const bool is_complete_reservation = PartitionSyncMode::COMPLETE_RESERVED == context.mode_;
+  const bool is_update = PartitionSyncMode::UPDATE == context.mode_;
+  context.committed_sync_id_ = 0;
   const schema::ObPartitionLevel part_level = table_schema.get_part_level();
   schema::ObPartition **part_array = table_schema.get_part_array();
   if (schema::PARTITION_LEVEL_ONE != part_level && schema::PARTITION_LEVEL_TWO != part_level) {
@@ -347,10 +421,10 @@ int ObUnifiedCatalogPartitionSync::sync(const ObString &database_name,
   if (OB_SUCC(ret) && OB_FAIL(collect_normal_parts(table_schema, parts, sub_part_count))) {
     LOG_WARN("failed to collect Unified Catalog partitions", K(ret));
   }
-  if (OB_SUCC(ret) && !force_commit) {
+  if (OB_SUCC(ret) && !is_complete_reservation) {
     int check_ret = client_.reader().load_and_validate_table(
         database_name, database_id, table_schema);
-    if (OB_SUCCESS == check_ret) {
+    if (OB_SUCCESS == check_ret && publish_partition_values) {
       check_ret = validate_part_values(
           database_name, table_schema.get_table_name_str(), parts, table_schema);
     }
@@ -369,7 +443,7 @@ int ObUnifiedCatalogPartitionSync::sync(const ObString &database_name,
     } else {
       bool exists = false;
       int64_t remote_schema_version = 0;
-      if (!operation_id.empty()) {
+      if (is_complete_reservation) {
         ObArenaAllocator response_allocator("UCPart", OB_MALLOC_NORMAL_BLOCK_SIZE,
                                             client_.tenant_id_);
         ObString remote_operation_id;
@@ -377,52 +451,62 @@ int ObUnifiedCatalogPartitionSync::sync(const ObString &database_name,
                 database_name, table_schema.get_table_name_str(), response_allocator,
                 exists, remote_operation_id))) {
           LOG_WARN("failed to recheck Unified Catalog create reservation", K(ret));
-        } else if (!exists || remote_operation_id != operation_id) {
+        } else if (!exists || remote_operation_id != context.operation_id_) {
           ret = OB_EAGAIN;
           LOG_WARN("Unified Catalog create reservation changed", K(ret));
         }
-      } else if (OB_FAIL(client_.reader().load_and_validate_table_source_if_exists(
-                     database_name, database_id, table_schema.get_table_name_str(),
-                     table_schema.get_table_id(), exists, &remote_schema_version))) {
-        LOG_WARN("failed to recheck Unified Catalog source after partition sync start", K(ret));
-      } else if (!exists || remote_schema_version > table_schema.get_schema_version()) {
-        ret = OB_EAGAIN;
-        LOG_WARN("Unified Catalog source advanced beyond OceanBase partition schema",
-                 K(ret),
-                 K(exists),
-                 K(remote_schema_version),
-                 "local_schema_version",
-                 table_schema.get_schema_version());
+      } else {
+        if (OB_FAIL(client_.reader().load_and_validate_table_source_if_exists(
+                database_name,
+                database_id,
+                table_schema.get_table_name_str(),
+                context.source_table_id_,
+                exists,
+                remote_schema_version))) {
+          LOG_WARN("failed to recheck Unified Catalog source after partition sync start", K(ret));
+        } else if (!exists || remote_schema_version > table_schema.get_schema_version()) {
+          ret = OB_EAGAIN;
+          LOG_WARN("Unified Catalog source advanced beyond OceanBase partition schema",
+                   K(ret),
+                   K(exists),
+                   K(remote_schema_version),
+                   "local_schema_version",
+                   table_schema.get_schema_version());
+        }
       }
       if (OB_SUCC(ret)) {
-        if (OB_FAIL(write_part_sync_batches(database_name,
-                                            table_schema.get_table_name_str(),
-                                            sync_id,
-                                            base_version,
-                                            parts,
-                                            schema::PARTITION_LEVEL_TWO == part_level))) {
+        if (publish_partition_values
+            && OB_FAIL(write_part_sync_batches(database_name,
+                                               table_schema.get_table_name_str(),
+                                               sync_id,
+                                               base_version,
+                                               parts,
+                                               schema::PARTITION_LEVEL_TWO == part_level))) {
           LOG_WARN("failed to write Unified Catalog partition batches", K(ret));
         } else if (OB_FAIL(commit_part_sync(database_name,
                                             table_schema.get_table_name_str(),
                                             sync_id,
                                             base_version,
-                                            parts.count(),
-                                            sub_part_count,
-                                            metadata))) {
+                                            publish_partition_values ? parts.count() : 0,
+                                            publish_partition_values ? sub_part_count : 0,
+                                            metadata,
+                                            is_update ? context.source_table_id_ : OB_INVALID_ID))) {
           LOG_WARN("failed to commit Unified Catalog partition sync", K(ret));
-        } else if (OB_NOT_NULL(committed_sync_id)) {
-          *committed_sync_id = sync_id;
+        } else {
+          context.committed_sync_id_ = sync_id;
         }
       }
     }
   }
   if (OB_SUCC(ret) && should_sync) {
-    if (OB_FAIL(validate_part_values(
+    if (publish_partition_values
+        && OB_FAIL(validate_part_values(
             database_name, table_schema.get_table_name_str(), parts, table_schema))) {
       LOG_WARN("Unified Catalog partition readback does not match source", K(ret));
-    } else if (operation_id.empty()
-               && OB_FAIL(client_.reader().load_and_validate_table(
-                   database_name, database_id, table_schema))) {
+    } else if (!is_complete_reservation
+               && OB_FAIL(client_.reader().load_and_validate_table(database_name,
+                                                                   database_id,
+                                                                   table_schema))) {
       LOG_WARN("Unified Catalog partition metadata does not match source", K(ret));
     }
   }

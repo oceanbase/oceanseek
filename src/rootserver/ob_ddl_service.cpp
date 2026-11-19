@@ -42235,6 +42235,10 @@ int ObDDLService::fork_table(const obrpc::ObForkTableArg &arg, obrpc::ObDDLRes &
   } else if (!arg.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("[ForkTable] invalid arg", KR(ret), K(arg));
+  } else if (!GCTX.is_shared_storage_mode()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "fork table in shared-nothing mode is");
+    LOG_WARN("[ForkTable] fork table is not supported in shared-nothing mode", KR(ret), K(arg));
   } else {
     LOG_INFO("[ForkTable] fork table request accepted", "tenant_id", arg.tenant_id_, "src_db", arg.src_database_name_,
              "src_table", arg.src_table_name_, "dst_db", arg.dst_database_name_, "dst_table", arg.dst_table_name_,

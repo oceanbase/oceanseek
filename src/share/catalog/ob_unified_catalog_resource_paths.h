@@ -40,6 +40,10 @@ public:
                                  const common::ObString &database_name,
                                  const common::ObString &table_name,
                                  common::ObSqlString &path);
+  static int build_ob_table_rename_path(const common::ObString &catalog_name,
+                                        const common::ObString &database_name,
+                                        const common::ObString &table_name,
+                                        common::ObSqlString &path);
   static int build_ob_reservation_path(const common::ObString &catalog_name,
                                        const common::ObString &database_name,
                                        const common::ObString &table_name,
@@ -101,6 +105,8 @@ private:
         "tables?pageSize=%ld&pageToken=%.*s";
   static constexpr char OB_TABLE_PATH_TEMPLATE[]
       = "/api/catalog/oceanbase/v1/%.*s/namespaces/%.*s/tables/%.*s";
+  static constexpr char OB_TABLE_RENAME_PATH_TEMPLATE[]
+      = "/api/catalog/oceanbase/v1/%.*s/namespaces/%.*s/tables/%.*s/rename";
   static constexpr char OB_RESERVATION_PATH_TEMPLATE[]
       = "/api/catalog/oceanbase/v1/%.*s/namespaces/%.*s/tables/%.*s/reservations";
   static constexpr char OB_COMPLETE_PATH_TEMPLATE[]

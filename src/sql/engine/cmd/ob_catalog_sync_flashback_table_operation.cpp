@@ -186,14 +186,15 @@ int ObCatalogSync::get_flashback_table_operator(
   int ret = OB_SUCCESS;
   const uint64_t tenant_id = flashback_table_arg.tenant_id_;
   const bool is_unified_catalog = ObUnifiedCatalog::is_configured(tenant_id);
+  const bool is_sync_enabled = ObCatalogSyncHelper::is_sync_enabled(tenant_id);
   handle.reset();
-  if (is_unified_catalog) {
+  if (is_sync_enabled && is_unified_catalog) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("FLASHBACK TABLE is not supported while UC Schema sync is enabled",
              K(ret), K(tenant_id));
     LOG_USER_ERROR(OB_NOT_SUPPORTED,
                    "FLASHBACK TABLE with Unified Catalog schema synchronization");
-  } else if (ObCatalogSyncHelper::is_sync_enabled(tenant_id)) {
+  } else if (is_sync_enabled) {
     ObFlashbackTableCatalogSyncOperation *operation =
         OB_NEWx(ObFlashbackTableCatalogSyncOperation,
                 (&allocator_), tenant_id, flashback_table_arg);

@@ -153,13 +153,20 @@ int ObDropTableCatalogSyncOperation::prepare(ObCatalogSyncPrepareResult &result)
   } else if (OB_FAIL(capture_local_table_states())) {
     LOG_WARN("failed to capture drop table local states",
              KR(ret), K(tenant_id_), K(is_unified_catalog_), K(is_hms_sync_enabled_));
-  } else if (is_unified_catalog_) {
+  } else if (is_unified_catalog_ && (has_missing_local_table_ || has_syncable_local_table_)) {
     access_token_.reset();
     raw_target_.reset();
     raw_config_.reset();
     target_snapshot_ret_ = OB_SUCCESS;
-    if (OB_FAIL(ObUnifiedCatalog::get_session_token(
-            session_, allocator_, access_token_))) {
+    if (OB_FAIL(ObUnifiedCatalog::snapshot_raw_target(
+            tenant_id_, allocator_, raw_target_, raw_config_))) {
+      LOG_WARN("failed to capture Unified Catalog drop table target snapshot",
+               KR(ret), K(tenant_id_));
+      target_snapshot_ret_ = ret;
+      ret = OB_SUCCESS;
+    } else if (!raw_target_.empty()
+               && OB_FAIL(ObUnifiedCatalog::get_session_token(
+                   session_, allocator_, access_token_))) {
       access_token_.reset();
       LOG_WARN("failed to get Unified Catalog token for drop table sync",
                KR(ret), K(tenant_id_));
@@ -167,12 +174,6 @@ int ObDropTableCatalogSyncOperation::prepare(ObCatalogSyncPrepareResult &result)
         target_snapshot_ret_ = ret;
         ret = OB_SUCCESS;
       }
-    } else if (OB_FAIL(ObUnifiedCatalog::snapshot_raw_target(
-                   tenant_id_, allocator_, raw_target_, raw_config_))) {
-      LOG_WARN("failed to capture Unified Catalog drop table target snapshot",
-               KR(ret), K(tenant_id_));
-      target_snapshot_ret_ = ret;
-      ret = OB_SUCCESS;
     }
   } else if (is_hms_sync_enabled_ && OB_FAIL(prepare_hms())) {
     LOG_WARN("failed to capture HMS drop table target",
@@ -276,12 +277,13 @@ int ObDropTableCatalogSyncOperation::complete_unified_catalog(const bool orphan_
     LOG_WARN("Unified Catalog drop table local state snapshot count mismatch",
              KR(ret), K(tenant_id_), K(table_items_.count()),
              "local_state_count", local_table_states_->count());
-  } else if (!orphan_cleanup || has_missing_local_table_) {
+  } else if ((has_missing_local_table_ || has_syncable_local_table_)
+             && (!orphan_cleanup || has_missing_local_table_)) {
     if (OB_SUCCESS != target_snapshot_ret_) {
       ret = target_snapshot_ret_;
       LOG_WARN("failed to capture Unified Catalog drop table target snapshot",
                KR(ret), K(tenant_id_));
-    } else {
+    } else if (!raw_target_.empty()) {
       for (int64_t i = 0; OB_SUCC(ret) && i < table_items_.count(); ++i) {
         const obrpc::ObTableItem &table_item = table_items_.at(i);
         const LocalTableState local_table_state = local_table_states_->at(i);
@@ -379,9 +381,10 @@ int ObCatalogSync::get_drop_table_operator(
   int ret = OB_SUCCESS;
   const uint64_t tenant_id = drop_table_arg.tenant_id_;
   const bool is_unified_catalog = ObUnifiedCatalog::is_configured(tenant_id);
-  const bool is_hms_sync_enabled = !is_unified_catalog
-                                   && ObCatalogSyncHelper::is_sync_enabled(tenant_id);
-  const bool need_operation = (is_unified_catalog && USER_TABLE == drop_table_arg.table_type_)
+  const bool is_sync_enabled = ObCatalogSyncHelper::is_sync_enabled(tenant_id);
+  const bool is_hms_sync_enabled = !is_unified_catalog && is_sync_enabled;
+  const bool need_operation = (is_unified_catalog && is_sync_enabled
+                               && USER_TABLE == drop_table_arg.table_type_)
                               || is_hms_sync_enabled;
   handle.reset();
   if (need_operation) {

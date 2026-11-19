@@ -32,7 +32,7 @@ namespace sql
 class ObCatalogSyncHelper
 {
 public:
-  // Guard-free switch: read TENANT_CONF catalog_sync_target and unified_catalog_config.
+  // Guard-free switch: read TENANT_CONF catalog_sync_target.
   static bool is_sync_enabled(const uint64_t tenant_id);
   static bool need_reconcile_partitions(const obrpc::ObAlterTableArg &alter_table_arg);
   static int get_refreshed_schema_guard(const uint64_t tenant_id,

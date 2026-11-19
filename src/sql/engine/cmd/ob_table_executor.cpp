@@ -10,6 +10,7 @@
 #include "sql/engine/cmd/ob_catalog_sync.h"
 #include "sql/engine/cmd/ob_catalog_sync_helper.h"
 #include "share/catalog/ob_unified_catalog.h"
+#include "share/ob_server_struct.h"
 #include "sql/resolver/ddl/ob_create_table_stmt.h"
 #include "sql/resolver/ddl/ob_alter_table_stmt.h"
 #include "sql/resolver/ddl/ob_drop_table_stmt.h"
@@ -378,9 +379,23 @@ int ObCreateTableExecutor::execute_ctas(ObExecContext &ctx,
   ObCatalogSyncOperationHandle catalog_sync_operation;
   ObCatalogSyncPrepareResult catalog_sync_prepare_result;
   const uint64_t catalog_sync_tenant_id = stmt.get_create_table_arg().schema_.get_tenant_id();
-  const bool catalog_sync_unified_catalog = ObUnifiedCatalog::is_configured(catalog_sync_tenant_id);
-  if (OB_FAIL(catalog_sync.get_create_table_as_select_operator(
-          ctx, stmt, catalog_sync_operation))) {
+  const ObCatalogSyncBackend catalog_sync_backend =
+      ObCatalogSync::snapshot_backend(catalog_sync_tenant_id);
+  const bool catalog_sync_unified_catalog =
+      ObCatalogSyncBackend::UNIFIED_CATALOG == catalog_sync_backend;
+  ObSQLSessionInfo *my_session = ctx.get_my_session();
+  ObString catalog_sync_access_token;
+  if (catalog_sync_unified_catalog && OB_ISNULL(my_session)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("session is null before Unified Catalog create table as select sync",
+             KR(ret), K(catalog_sync_tenant_id));
+  } else if (catalog_sync_unified_catalog
+             && OB_FAIL(ObUnifiedCatalog::get_session_token(
+                 *my_session, ctx.get_allocator(), catalog_sync_access_token))) {
+    LOG_WARN("failed to capture Unified Catalog token for create table as select",
+             KR(ret), K(catalog_sync_tenant_id));
+  } else if (OB_FAIL(catalog_sync.get_create_table_as_select_operator(
+          catalog_sync_backend, catalog_sync_access_token, stmt, catalog_sync_operation))) {
     LOG_WARN("failed to get create table as select catalog sync operation", KR(ret),
              K(catalog_sync_tenant_id), K(catalog_sync_unified_catalog));
   } else if (catalog_sync_operation.is_valid()
@@ -394,7 +409,6 @@ int ObCreateTableExecutor::execute_ctas(ObExecContext &ctx,
   ObMySQLProxy *sql_proxy = ctx.get_sql_proxy();
   common::ObCommonSqlProxy *user_sql_proxy;
   common::ObOracleSqlProxy oracle_sql_proxy;
-  ObSQLSessionInfo *my_session = ctx.get_my_session();
   ObPhysicalPlanCtx *plan_ctx = ctx.get_physical_plan_ctx();
   ObArenaAllocator allocator("CreateTableExec");
   HEAP_VAR(obrpc::ObAlterTableArg, alter_table_arg) {
@@ -708,11 +722,18 @@ int ObCreateTableExecutor::execute(ObExecContext &ctx, ObCreateTableStmt &stmt)
   ObSQLSessionInfo *my_session = ctx.get_my_session();
   uint64_t tenant_id = table_schema.get_tenant_id();
   uint64_t data_version = 0;
+  ObString catalog_sync_access_token;
   ObCatalogSync catalog_sync(ctx.get_allocator());
-  ObCatalogSyncAuthContext catalog_sync_context;
-  if (OB_FAIL(catalog_sync.prepare_create_table_context(
-          ctx, create_table_arg, catalog_sync_context))) {
-    LOG_WARN("failed to prepare create table catalog sync context",
+  const ObCatalogSyncBackend catalog_sync_backend =
+      ObCatalogSync::snapshot_backend(tenant_id);
+  const bool catalog_sync_unified_catalog =
+      ObCatalogSyncBackend::UNIFIED_CATALOG == catalog_sync_backend;
+  if (table_schema.is_user_table()
+      && catalog_sync_unified_catalog
+      && OB_NOT_NULL(my_session)
+      && OB_FAIL(ObUnifiedCatalog::get_session_token(
+          *my_session, ctx.get_allocator(), catalog_sync_access_token))) {
+    LOG_WARN("failed to capture Unified Catalog token for create table",
              KR(ret), K(tenant_id));
   } else if (OB_ISNULL(my_session)) {
     ret = OB_ERR_UNEXPECTED;
@@ -809,9 +830,9 @@ int ObCreateTableExecutor::execute(ObExecContext &ctx, ObCreateTableStmt &stmt)
       ObCatalogSyncDDLResult catalog_sync_ddl_result;
       bool local_ddl_attempted = false;
       bool local_ddl_rejected_existing = false;
-      const bool catalog_sync_unified_catalog = ObUnifiedCatalog::is_configured(tenant_id);
       if (OB_SUCC(ret)) {
-        if (OB_FAIL(catalog_sync.get_create_table_operator(catalog_sync_context,
+        if (OB_FAIL(catalog_sync.get_create_table_operator(catalog_sync_backend,
+                                                           catalog_sync_access_token,
                                                            stmt.get_database_name(),
                                                            create_table_arg,
                                                            catalog_sync_operation))) {
@@ -1370,11 +1391,32 @@ int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
   LOG_DEBUG("start of alter table execute", K(alter_table_arg));
   ObString first_stmt;
   ObCatalogSync catalog_sync(ctx.get_allocator());
+  ObCatalogSyncPrecheckResult catalog_sync_precheck_result;
   ObCatalogSyncOperationHandle catalog_sync_operation;
   ObCatalogSyncPrepareResult catalog_sync_prepare_result;
+  ObString catalog_sync_access_token;
+  ObSQLSessionInfo *catalog_sync_session = ctx.get_my_session();
   const bool catalog_sync_unified_catalog = ObUnifiedCatalog::is_configured(tenant_id);
-  if (OB_FAIL(catalog_sync.get_alter_table_operator(
-          ctx, alter_table_arg, catalog_sync_operation))) {
+  if (OB_FAIL(catalog_sync.precheck_alter_table(
+          alter_table_arg, catalog_sync_precheck_result))) {
+    LOG_WARN("failed to precheck alter table catalog sync operation",
+             KR(ret), K(tenant_id), K(catalog_sync_unified_catalog));
+  } else if (catalog_sync_precheck_result.need_access_token()
+             && OB_ISNULL(catalog_sync_session)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("session is null before Unified Catalog alter table sync",
+             KR(ret), K(tenant_id));
+  } else if (catalog_sync_precheck_result.need_access_token()
+             && OB_FAIL(ObUnifiedCatalog::get_session_token(
+                 *catalog_sync_session, ctx.get_allocator(), catalog_sync_access_token))) {
+    LOG_WARN("failed to capture Unified Catalog token for alter table",
+             KR(ret), K(tenant_id));
+  } else if (OB_FAIL(catalog_sync.get_alter_table_operator(
+          catalog_sync_precheck_result,
+          catalog_sync_access_token,
+          catalog_sync_session,
+          alter_table_arg,
+          catalog_sync_operation))) {
     LOG_WARN("failed to get alter table catalog sync operation",
              KR(ret), K(tenant_id), K(catalog_sync_unified_catalog));
   } else if (catalog_sync_operation.is_valid()
@@ -2668,12 +2710,32 @@ int ObRenameTableExecutor::execute(ObExecContext &ctx, ObRenameTableStmt &stmt)
   ObTaskExecutorCtx *task_exec_ctx = NULL;
   obrpc::ObCommonRpcProxy *common_rpc_proxy = NULL;
   ObCatalogSync catalog_sync(ctx.get_allocator());
+  ObCatalogSyncPrecheckResult catalog_sync_precheck_result;
   ObCatalogSyncOperationHandle catalog_sync_operation;
   ObCatalogSyncPrepareResult catalog_sync_prepare_result;
   ObCatalogSyncDDLResult catalog_sync_ddl_result;
+  ObString catalog_sync_access_token;
+  ObSQLSessionInfo *catalog_sync_session = ctx.get_my_session();
   bool local_ddl_attempted = false;
-  if (OB_FAIL(catalog_sync.get_rename_table_operator(
-          rename_table_arg, catalog_sync_operation))) {
+  if (OB_FAIL(catalog_sync.precheck_rename_table(
+          rename_table_arg, catalog_sync_precheck_result))) {
+    LOG_WARN("failed to precheck rename table catalog sync operation",
+             KR(ret), K(tenant_id), K(is_unified_catalog));
+  } else if (catalog_sync_precheck_result.need_access_token()
+             && OB_ISNULL(catalog_sync_session)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("session is null before Unified Catalog rename table sync",
+             KR(ret), K(tenant_id));
+  } else if (catalog_sync_precheck_result.need_access_token()
+             && OB_FAIL(ObUnifiedCatalog::get_session_token(
+                 *catalog_sync_session, ctx.get_allocator(), catalog_sync_access_token))) {
+    LOG_WARN("failed to capture Unified Catalog token for rename table",
+             KR(ret), K(tenant_id));
+  } else if (OB_FAIL(catalog_sync.get_rename_table_operator(
+          catalog_sync_precheck_result,
+          catalog_sync_access_token,
+          rename_table_arg,
+          catalog_sync_operation))) {
     LOG_WARN("failed to get rename table catalog sync operation",
              KR(ret), K(tenant_id), K(is_unified_catalog));
   }
@@ -3032,9 +3094,25 @@ int ObCreateTableLikeExecutor::execute(ObExecContext &ctx, ObCreateTableLikeStmt
   obrpc::ObCreateTableLikeArg &tmp_arg = const_cast<obrpc::ObCreateTableLikeArg&>(create_table_like_arg);
   ObString first_stmt;
   ObSQLSessionInfo *my_session = ctx.get_my_session();
-  const bool is_unified_catalog = ObUnifiedCatalog::is_configured(create_table_like_arg.tenant_id_);
-  if (OB_FAIL(catalog_sync.get_create_table_like_operator(
-          ctx, create_table_like_arg, catalog_sync_operation))) {
+  const ObCatalogSyncBackend catalog_sync_backend =
+      ObCatalogSync::snapshot_backend(create_table_like_arg.tenant_id_);
+  const bool is_unified_catalog = ObCatalogSyncBackend::UNIFIED_CATALOG == catalog_sync_backend;
+  ObString catalog_sync_access_token;
+  if (is_unified_catalog
+      && OB_ISNULL(my_session)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("session is null before Unified Catalog create table like sync",
+             KR(ret), K(create_table_like_arg.tenant_id_));
+  } else if (is_unified_catalog
+             && OB_FAIL(ObUnifiedCatalog::get_session_token(
+                 *my_session, ctx.get_allocator(), catalog_sync_access_token))) {
+    LOG_WARN("failed to capture Unified Catalog token for create table like",
+             KR(ret), K(create_table_like_arg.tenant_id_));
+  } else if (OB_FAIL(catalog_sync.get_create_table_like_operator(
+          catalog_sync_backend,
+          catalog_sync_access_token,
+          create_table_like_arg,
+          catalog_sync_operation))) {
     LOG_WARN("failed to get create table like catalog sync operation",
              KR(ret), K(create_table_like_arg.tenant_id_), K(is_unified_catalog));
   } else if (catalog_sync_operation.is_valid()
@@ -3108,12 +3186,47 @@ int ObForkTableExecutor::execute(ObExecContext &ctx, ObForkTableStmt &stmt)
   int ret = OB_SUCCESS;
   const obrpc::ObForkTableArg &fork_table_arg = stmt.get_fork_table_arg();
   obrpc::ObForkTableArg &tmp_arg = const_cast<obrpc::ObForkTableArg&>(fork_table_arg);
+  const uint64_t tenant_id = fork_table_arg.tenant_id_;
+  ObCatalogSync catalog_sync(ctx.get_allocator());
+  ObCatalogSyncOperationHandle catalog_sync_operation;
+  ObCatalogSyncPrepareResult catalog_sync_prepare_result;
   ObString first_stmt;
   obrpc::ObDDLRes res;
-  ObSQLSessionInfo *my_session = nullptr;
-  if (OB_FAIL(stmt.get_first_stmt(first_stmt))) {
+  ObSQLSessionInfo *my_session = ctx.get_my_session();
+  ObString catalog_sync_access_token;
+  const ObCatalogSyncBackend catalog_sync_backend =
+      ObCatalogSync::snapshot_backend(tenant_id);
+  const bool catalog_sync_unified_catalog =
+      ObCatalogSyncBackend::UNIFIED_CATALOG == catalog_sync_backend;
+  if (!GCTX.is_shared_storage_mode()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "fork table in shared-nothing mode is");
+    LOG_WARN("fork table is not supported in shared-nothing mode",
+             KR(ret), K(tenant_id), K(fork_table_arg));
+  } else if (catalog_sync_unified_catalog
+             && OB_ISNULL(my_session)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("session is null before Unified Catalog fork table sync",
+             KR(ret), K(tenant_id), K(fork_table_arg));
+  } else if (catalog_sync_unified_catalog
+             && OB_FAIL(ObUnifiedCatalog::get_session_token(
+                 *my_session, ctx.get_allocator(), catalog_sync_access_token))) {
+    LOG_WARN("failed to capture Unified Catalog token for fork table",
+             KR(ret), K(tenant_id), K(fork_table_arg));
+  } else if (OB_FAIL(catalog_sync.get_fork_table_operator(
+                 catalog_sync_backend,
+                 catalog_sync_access_token,
+                 fork_table_arg,
+                 catalog_sync_operation))) {
+    LOG_WARN("failed to get Unified Catalog fork table sync operation",
+             KR(ret), K(tenant_id), K(fork_table_arg));
+  } else if (catalog_sync_operation.is_valid()
+             && OB_FAIL(catalog_sync_operation->prepare(catalog_sync_prepare_result))) {
+    LOG_WARN("failed to prepare Unified Catalog fork table sync",
+             KR(ret), K(tenant_id), K(fork_table_arg));
+  } else if (OB_FAIL(stmt.get_first_stmt(first_stmt))) {
     LOG_WARN("get first statement failed", K(ret));
-  } else if (OB_ISNULL(my_session = ctx.get_my_session())) {
+  } else if (OB_ISNULL(my_session)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("session is null", K(ret));
   } else {
@@ -3134,6 +3247,15 @@ int ObForkTableExecutor::execute(ObExecContext &ctx, ObForkTableStmt &stmt)
       LOG_WARN("rpc proxy fork table failed", K(ret), K(res), K(fork_table_arg));
     } else {
       LOG_INFO("fork table executor finished", K(fork_table_arg));
+    }
+  }
+  if (OB_SUCC(ret) && catalog_sync_operation.is_valid()) {
+    ObCatalogSyncDDLResult catalog_sync_ddl_result;
+    catalog_sync_ddl_result.state_ = CATALOG_SYNC_DDL_SUCCEEDED;
+    catalog_sync_ddl_result.ddl_ret_ = ret;
+    if (OB_FAIL(catalog_sync_operation->complete(catalog_sync_ddl_result))) {
+      LOG_WARN("failed to complete Unified Catalog fork table sync",
+               KR(ret), K(tenant_id), K(fork_table_arg));
     }
   }
   return ret;

@@ -8,6 +8,7 @@
 
 #include "sql/engine/cmd/ob_catalog_sync.h"
 #include "lib/allocator/page_arena.h"
+#include "share/catalog/ob_unified_catalog.h"
 
 namespace oceanbase
 {
@@ -25,10 +26,9 @@ namespace sql
 class ObCreateTableAsSelectCatalogSyncOperation : public ObCatalogSyncOperation
 {
 public:
-  ObCreateTableAsSelectCatalogSyncOperation(
-      ObExecContext &ctx,
-      ObCreateTableStmt &stmt,
-      const bool is_unified_catalog);
+  ObCreateTableAsSelectCatalogSyncOperation(const common::ObString &access_token,
+                                            ObCreateTableStmt &stmt,
+                                            const bool is_unified_catalog);
   virtual ~ObCreateTableAsSelectCatalogSyncOperation();
   virtual int prepare(ObCatalogSyncPrepareResult &result) override;
   virtual int complete(const ObCatalogSyncDDLResult &result) override;
@@ -46,15 +46,11 @@ private:
   int compensate_hms();
 
 private:
-  ObExecContext &ctx_;
   ObCreateTableStmt &stmt_;
   const bool is_unified_catalog_;
   const uint64_t tenant_id_;
   common::ObArenaAllocator allocator_;
-  common::ObString access_token_;
-  common::ObString remote_catalog_name_;
-  common::ObString endpoint_;
-  common::ObString realm_;
+  share::ObUnifiedCatalogSyncTarget target_;
   common::ObString unified_catalog_database_name_;
   common::ObString unified_catalog_table_name_;
   common::ObString raw_config_;

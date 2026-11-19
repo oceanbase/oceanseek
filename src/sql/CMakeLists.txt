@@ -429,6 +429,7 @@ ob_set_subtarget(ob_sql engine_cmd
   engine/cmd/ob_catalog_sync_database_operation.cpp
   engine/cmd/ob_catalog_sync_drop_table_operation.cpp
   engine/cmd/ob_catalog_sync_flashback_table_operation.cpp
+  engine/cmd/ob_catalog_sync_fork_table_operation.cpp
   engine/cmd/ob_catalog_sync_rename_table_operation.cpp
   engine/cmd/ob_catalog_sync_helper.cpp
   engine/cmd/ob_trigger_storage_cache_executor.cpp

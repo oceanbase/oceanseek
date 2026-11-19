@@ -26,6 +26,7 @@ constexpr char ObUnifiedCatalogResourcePaths::OB_TABLE_COLLECTION_PATH_TEMPLATE[
 constexpr char ObUnifiedCatalogResourcePaths::OB_TABLE_COLLECTION_PAGE_PATH_TEMPLATE[];
 constexpr char ObUnifiedCatalogResourcePaths::OB_TABLE_COLLECTION_PAGE_WITH_TOKEN_PATH_TEMPLATE[];
 constexpr char ObUnifiedCatalogResourcePaths::OB_TABLE_PATH_TEMPLATE[];
+constexpr char ObUnifiedCatalogResourcePaths::OB_TABLE_RENAME_PATH_TEMPLATE[];
 constexpr char ObUnifiedCatalogResourcePaths::OB_RESERVATION_PATH_TEMPLATE[];
 constexpr char ObUnifiedCatalogResourcePaths::OB_COMPLETE_PATH_TEMPLATE[];
 constexpr char ObUnifiedCatalogResourcePaths::OB_TABLE_CANCEL_PATH_TEMPLATE[];
@@ -251,6 +252,31 @@ int ObUnifiedCatalogResourcePaths::build_ob_table_path(const ObString &catalog_n
                                      static_cast<int>(table.length()),
                                      table.ptr()))) {
     LOG_WARN("failed to build OceanBase table path", K(ret));
+  }
+  return ret;
+}
+
+int ObUnifiedCatalogResourcePaths::build_ob_table_rename_path(const ObString &catalog_name,
+                                                              const ObString &database_name,
+                                                              const ObString &table_name,
+                                                              ObSqlString &path)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString catalog;
+  ObSqlString database;
+  ObSqlString table;
+  if (OB_FAIL(encode_url_component(catalog_name, catalog))
+      || OB_FAIL(encode_url_component(database_name, database))
+      || OB_FAIL(encode_url_component(table_name, table))) {
+    LOG_WARN("failed to encode OceanBase table rename identity", K(ret));
+  } else if (OB_FAIL(path.assign_fmt(OB_TABLE_RENAME_PATH_TEMPLATE,
+                                     static_cast<int>(catalog.length()),
+                                     catalog.ptr(),
+                                     static_cast<int>(database.length()),
+                                     database.ptr(),
+                                     static_cast<int>(table.length()),
+                                     table.ptr()))) {
+    LOG_WARN("failed to build OceanBase table rename path", K(ret));
   }
   return ret;
 }

@@ -8,6 +8,7 @@
 
 #include "sql/engine/cmd/ob_catalog_sync.h"
 #include "lib/allocator/page_arena.h"
+#include "share/catalog/ob_unified_catalog.h"
 
 namespace oceanbase
 {
@@ -26,7 +27,7 @@ class ObCreateTableLikeCatalogSyncOperation : public ObCatalogSyncOperation
 {
 public:
   ObCreateTableLikeCatalogSyncOperation(
-      ObExecContext &ctx,
+      const common::ObString &access_token,
       const obrpc::ObCreateTableLikeArg &create_table_like_arg,
       const bool is_unified_catalog);
   virtual ~ObCreateTableLikeCatalogSyncOperation();
@@ -34,7 +35,6 @@ public:
   virtual int complete(const ObCatalogSyncDDLResult &result) override;
 
 private:
-  int prepare_unified_catalog();
   int get_final_table_schema(
       share::schema::ObSchemaGetterGuard &schema_guard,
       const share::schema::ObTableSchema *&table_schema);
@@ -42,16 +42,11 @@ private:
   int complete_hms();
 
 private:
-  // The context and statement argument outlive this execution-scoped Operation.
-  ObExecContext &ctx_;
   const obrpc::ObCreateTableLikeArg &create_table_like_arg_;
   const uint64_t tenant_id_;
   const bool is_unified_catalog_;
   common::ObArenaAllocator allocator_;
-  common::ObString access_token_;
-  common::ObString remote_catalog_name_;
-  common::ObString endpoint_;
-  common::ObString realm_;
+  share::ObUnifiedCatalogSyncTarget target_;
   DISALLOW_COPY_AND_ASSIGN(ObCreateTableLikeCatalogSyncOperation);
 };
 

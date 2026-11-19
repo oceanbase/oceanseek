@@ -8,13 +8,10 @@
 #include "lib/allocator/ob_malloc.h"
 #include "lib/allocator/page_arena.h"
 #include "sql/engine/cmd/ob_catalog_sync_helper.h"
-#include "sql/engine/ob_exec_context.h"
 #include "sql/ob_sql_utils.h"
-#include "sql/session/ob_sql_session_info.h"
 #include "share/catalog/ob_catalog_meta_getter.h"
 #include "share/catalog/ob_catalog_meta_writer.h"
 #include "share/catalog/ob_unified_catalog.h"
-#include "share/catalog/ob_unified_catalog_config.h"
 #include "share/ob_rpc_struct.h"
 #include "share/schema/ob_schema_getter_guard.h"
 #include "share/schema/ob_multi_version_schema_service.h"
@@ -32,17 +29,12 @@ ObCreateDatabaseCatalogSyncOperation::ObCreateDatabaseCatalogSyncOperation(
     const uint64_t tenant_id,
     const bool is_unified_catalog,
     const ObString &access_token,
-    const ObString &database_name,
-    const ObString &remote_catalog_name,
-    const ObString &endpoint,
-    const ObString &realm)
+    const ObString &database_name)
   : tenant_id_(tenant_id),
     is_unified_catalog_(is_unified_catalog),
-    access_token_(access_token),
     database_name_(database_name),
-    remote_catalog_name_(remote_catalog_name),
-    endpoint_(endpoint),
-    realm_(realm)
+    allocator_("CatalogSync", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id),
+    target_(tenant_id, access_token)
 {
 }
 
@@ -59,11 +51,11 @@ ObDropDatabaseCatalogSyncOperation::ObDropDatabaseCatalogSyncOperation(
   : tenant_id_(tenant_id),
     is_unified_catalog_(is_unified_catalog),
     is_hms_sync_enabled_(is_hms_sync_enabled),
-    access_token_(access_token),
     database_name_(database_name),
     database_id_(OB_INVALID_ID),
     sync_catalog_id_(OB_INVALID_ID),
-    allocator_("CatalogSync", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id)
+    allocator_("CatalogSync", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id),
+    target_(tenant_id, access_token)
 {
 }
 
@@ -77,7 +69,7 @@ int ObCreateDatabaseCatalogSyncOperation::prepare(ObCatalogSyncPrepareResult &re
   result.skip_local_ddl_ = false;
   result.source_object_id_ = OB_INVALID_ID;
   if (is_unified_catalog_) {
-    if (OB_FAIL(prepare_unified_catalog())) {
+    if (OB_FAIL(prepare_unified_catalog_target(target_, allocator_))) {
       LOG_WARN("failed to prepare Unified Catalog create database sync",
                KR(ret), K(tenant_id_), K(database_name_), K(is_unified_catalog_));
     }
@@ -125,17 +117,6 @@ int ObCreateDatabaseCatalogSyncOperation::prepare_hms()
   return ret;
 }
 
-int ObCreateDatabaseCatalogSyncOperation::prepare_unified_catalog()
-{
-  int ret = OB_SUCCESS;
-  if (OB_FAIL(ObUnifiedCatalog::validate_namespace_target(
-          tenant_id_, remote_catalog_name_, endpoint_, realm_))) {
-    LOG_WARN("Unified Catalog create database target changed",
-             KR(ret), K(tenant_id_), K(database_name_));
-  }
-  return ret;
-}
-
 int ObCreateDatabaseCatalogSyncOperation::complete(
     const ObCatalogSyncDDLResult &result)
 {
@@ -162,14 +143,9 @@ int ObCreateDatabaseCatalogSyncOperation::complete_unified_catalog(
                    tenant_id_, schema_guard))) {
       LOG_WARN("failed to get tenant schema guard for Unified Catalog namespace sync",
                KR(ret), K(tenant_id_));
-    } else if (OB_FAIL(ObUnifiedCatalog::create_namespace(
-                   tenant_id_,
-                   access_token_,
-                   database_name_,
-                   result.object_id_,
-                   remote_catalog_name_,
-                   endpoint_,
-                   realm_))) {
+    } else if (OB_FAIL(ObUnifiedCatalog::create_namespace(target_,
+                                                           database_name_,
+                                                           result.object_id_))) {
       LOG_WARN("failed to sync create database to Unified Catalog",
                KR(ret), K(database_name_), K(result.object_id_));
     } else {
@@ -250,7 +226,6 @@ int ObDropDatabaseCatalogSyncOperation::prepare_unified_catalog()
 {
   int ret = OB_SUCCESS;
   ObSchemaGetterGuard schema_guard;
-  ObUnifiedCatalogConfig config;
   if (OB_ISNULL(GCTX.schema_service_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("schema service is null for Unified Catalog drop database check",
@@ -265,24 +240,13 @@ int ObDropDatabaseCatalogSyncOperation::prepare_unified_catalog()
   } else if (OB_INVALID_ID == database_id_) {
     LOG_INFO("skip Unified Catalog namespace inspection without a local source identity",
              K(tenant_id_), K(database_name_));
-  } else if (OB_FAIL(ObUnifiedCatalog::resolve_target(
-                 tenant_id_, allocator_, remote_catalog_name_, &config))) {
-    LOG_WARN("failed to resolve Unified Catalog drop database target",
+  } else if (OB_FAIL(target_.capture(allocator_))) {
+    LOG_WARN("failed to capture Unified Catalog drop database target",
              KR(ret), K(tenant_id_));
-  } else {
-    endpoint_ = config.endpoint_;
-    realm_ = config.realm_;
-    if (OB_FAIL(ObUnifiedCatalog::check_namespace_empty(
-            tenant_id_,
-            access_token_,
-            database_name_,
-            database_id_,
-            remote_catalog_name_,
-            endpoint_,
-            realm_))) {
-      LOG_WARN("failed to check Unified Catalog namespace before drop database",
-               KR(ret), K(tenant_id_), K(database_name_), K(database_id_));
-    }
+  } else if (OB_FAIL(ObUnifiedCatalog::check_namespace_empty(
+                 target_, database_name_, database_id_))) {
+    LOG_WARN("failed to check Unified Catalog namespace before drop database",
+             KR(ret), K(tenant_id_), K(database_name_), K(database_id_));
   }
   return ret;
 }
@@ -368,13 +332,7 @@ int ObDropDatabaseCatalogSyncOperation::complete_unified_catalog()
   } else if (OB_INVALID_ID == database_id_) {
     LOG_INFO("skip Unified Catalog namespace drop without a local source identity",
              K(tenant_id_), K(database_name_));
-  } else if (OB_FAIL(ObUnifiedCatalog::drop_namespace(
-                 tenant_id_,
-                 access_token_,
-                 database_name_,
-                 remote_catalog_name_,
-                 endpoint_,
-                 realm_))) {
+  } else if (OB_FAIL(ObUnifiedCatalog::drop_namespace(target_, database_name_))) {
     LOG_WARN("failed to sync drop database to Unified Catalog",
              KR(ret), K(database_name_), K(database_id_));
   } else {
@@ -384,51 +342,30 @@ int ObDropDatabaseCatalogSyncOperation::complete_unified_catalog()
 }
 
 int ObCatalogSync::get_create_database_operator(
-    ObExecContext &ctx,
+    const ObCatalogSyncBackend backend,
+    const ObString &access_token,
     const obrpc::ObCreateDatabaseArg &create_database_arg,
     ObCatalogSyncOperationHandle &handle)
 {
   int ret = OB_SUCCESS;
   const ObDatabaseSchema &database_schema = create_database_arg.database_schema_;
   const uint64_t tenant_id = database_schema.get_tenant_id();
-  const bool is_unified_catalog = ObUnifiedCatalog::is_configured(tenant_id);
-  ObSQLSessionInfo *session = ctx.get_my_session();
-  ObString access_token;
-  ObString remote_catalog_name;
-  ObString endpoint;
-  ObString realm;
   handle.reset();
-  if (OB_NOT_NULL(session)
-      && ObUnifiedCatalog::is_configured(session->get_effective_tenant_id())
-      && OB_FAIL(ObUnifiedCatalog::get_session_token(
-          *session, allocator_, access_token))) {
-    LOG_WARN("failed to get Unified Catalog execution token",
-             KR(ret), K(tenant_id));
-  } else if (is_unified_catalog
-      && OB_FAIL(ObUnifiedCatalog::validate_sync_target(
-          tenant_id,
-          access_token,
-          allocator_,
-          remote_catalog_name,
-          endpoint,
-          realm))) {
-    LOG_WARN("failed to validate Unified Catalog create database sync target",
-             KR(ret), K(tenant_id));
-  } else {
-    ObCreateDatabaseCatalogSyncOperation *operation =
-        OB_NEWx(ObCreateDatabaseCatalogSyncOperation,
-                (&allocator_),
-                tenant_id,
-                is_unified_catalog,
-                access_token,
-                database_schema.get_database_name_str(),
-                remote_catalog_name,
-                endpoint,
-                realm);
+  if (ObCatalogSyncBackend::NONE != backend) {
+    const bool is_unified_catalog = ObCatalogSyncBackend::UNIFIED_CATALOG == backend;
+    ObCreateDatabaseCatalogSyncOperation *operation
+        = OB_NEWx(ObCreateDatabaseCatalogSyncOperation,
+                  (&allocator_),
+                  tenant_id,
+                  is_unified_catalog,
+                  access_token,
+                  database_schema.get_database_name_str());
     if (OB_ISNULL(operation)) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("failed to allocate create database catalog sync operation",
-               KR(ret), K(tenant_id), K(is_unified_catalog));
+               KR(ret),
+               K(tenant_id),
+               K(is_unified_catalog));
       if (!is_unified_catalog) {
         handle.set_deferred_error(ret);
         ret = OB_SUCCESS;
@@ -440,52 +377,31 @@ int ObCatalogSync::get_create_database_operator(
   return ret;
 }
 
-int ObCatalogSync::prepare_drop_database_context(
-    ObExecContext &ctx,
-    const obrpc::ObDropDatabaseArg &drop_database_arg,
-    ObCatalogSyncAuthContext &context)
+int ObCatalogSync::get_drop_database_operator(const ObCatalogSyncBackend backend,
+                                              const ObString &access_token,
+                                              const obrpc::ObDropDatabaseArg &drop_database_arg,
+                                              ObCatalogSyncOperationHandle &handle)
 {
   int ret = OB_SUCCESS;
   const uint64_t tenant_id = drop_database_arg.tenant_id_;
-  ObSQLSessionInfo *session = ctx.get_my_session();
-  context.access_token_.reset();
-  context.is_unified_catalog_ = ObUnifiedCatalog::is_configured(tenant_id);
-  context.is_hms_sync_enabled_ =
-      !context.is_unified_catalog_ && ObCatalogSyncHelper::is_sync_enabled(tenant_id);
-  if (OB_NOT_NULL(session)
-      && context.is_unified_catalog_
-      && OB_FAIL(ObUnifiedCatalog::get_session_token(
-          *session, allocator_, context.access_token_))) {
-    LOG_WARN("failed to capture Unified Catalog access token for drop database operation",
-             KR(ret), K(tenant_id), K(context.is_unified_catalog_));
-  }
-  return ret;
-}
-
-int ObCatalogSync::get_drop_database_operator(
-    const ObCatalogSyncAuthContext &context,
-    const obrpc::ObDropDatabaseArg &drop_database_arg,
-    ObCatalogSyncOperationHandle &handle)
-{
-  int ret = OB_SUCCESS;
-  const uint64_t tenant_id = drop_database_arg.tenant_id_;
-  const bool need_operation =
-      context.is_unified_catalog_ || context.is_hms_sync_enabled_;
   handle.reset();
-  if (need_operation) {
-    ObDropDatabaseCatalogSyncOperation *operation =
-        OB_NEWx(ObDropDatabaseCatalogSyncOperation,
-                (&allocator_),
-                tenant_id,
-                context.is_unified_catalog_,
-                context.is_hms_sync_enabled_,
-                context.access_token_,
-                drop_database_arg.database_name_);
+  if (ObCatalogSyncBackend::NONE != backend) {
+    const bool is_unified_catalog = ObCatalogSyncBackend::UNIFIED_CATALOG == backend;
+    const bool is_hms_sync_enabled = ObCatalogSyncBackend::HMS == backend;
+    ObDropDatabaseCatalogSyncOperation *operation = OB_NEWx(ObDropDatabaseCatalogSyncOperation,
+                                                            (&allocator_),
+                                                            tenant_id,
+                                                            is_unified_catalog,
+                                                            is_hms_sync_enabled,
+                                                            access_token,
+                                                            drop_database_arg.database_name_);
     if (OB_ISNULL(operation)) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("failed to allocate drop database catalog sync operation",
-               KR(ret), K(tenant_id), K(context.is_unified_catalog_),
-               K(context.is_hms_sync_enabled_));
+               KR(ret),
+               K(tenant_id),
+               K(is_unified_catalog),
+               K(is_hms_sync_enabled));
     } else {
       handle.set(allocator_, operation);
     }

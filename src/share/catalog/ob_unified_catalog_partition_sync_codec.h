@@ -76,6 +76,7 @@ public:
                                  const int64_t base_version,
                                  const int64_t part_count,
                                  const int64_t sub_part_count,
+                                 const uint64_t expected_source_table_id,
                                  const common::ObString &metadata);
   static int decode_values_page(common::ObIAllocator &allocator,
                                 const common::ObString &body,
@@ -98,6 +99,7 @@ private:
   static constexpr const char *JSON_PART_COUNT = "partCount";
   static constexpr const char *JSON_SUB_PART_COUNT = "subPartCount";
   static constexpr const char *JSON_METADATA = "metadata";
+  static constexpr const char *JSON_EXPECTED_SOURCE_TABLE_ID = "expectedSourceTableId";
   static constexpr const char *JSON_PART_VALUES = "partitions";
   static constexpr const char *JSON_NEXT_PAGE_TOKEN = "nextPageToken";
   static constexpr const char *JSON_VALUES = "values";
@@ -106,6 +108,10 @@ private:
                              common::ObJsonObject &object,
                              const char *key,
                              const common::ObString &value);
+  static int add_json_uint_string(common::ObIAllocator &allocator,
+                                  common::ObJsonObject &object,
+                                  const char *key,
+                                  const uint64_t value);
   static int add_json_integer(common::ObIAllocator &allocator,
                               common::ObJsonObject &object,
                               const char *key,

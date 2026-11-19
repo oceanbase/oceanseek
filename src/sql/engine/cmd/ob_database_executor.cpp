@@ -356,7 +356,11 @@ int ObCreateDatabaseExecutor::execute(ObExecContext &ctx, ObCreateDatabaseStmt &
   const obrpc::ObCreateDatabaseArg &create_database_arg = stmt.get_create_database_arg();
   obrpc::ObCreateDatabaseArg &tmp_arg = const_cast<obrpc::ObCreateDatabaseArg&>(create_database_arg);
   const uint64_t tenant_id = create_database_arg.database_schema_.get_tenant_id();
-  const bool is_unified_catalog = ObUnifiedCatalog::is_configured(tenant_id);
+  const ObCatalogSyncBackend catalog_sync_backend =
+      ObCatalogSync::snapshot_backend(tenant_id);
+  const bool is_unified_catalog = ObCatalogSyncBackend::UNIFIED_CATALOG == catalog_sync_backend;
+  ObSQLSessionInfo *session = ctx.get_my_session();
+  ObString catalog_sync_access_token;
   ObString first_stmt;
   obrpc::UInt64 database_id(0);
   ObCatalogSync catalog_sync(ctx.get_allocator());
@@ -365,8 +369,16 @@ int ObCreateDatabaseExecutor::execute(ObExecContext &ctx, ObCreateDatabaseStmt &
   ObCatalogSyncDDLResult catalog_sync_ddl_result;
   bool local_ddl_attempted = false;
   bool local_ddl_rejected_existing = false;
-  if (OB_FAIL(catalog_sync.get_create_database_operator(
-                 ctx, create_database_arg, catalog_sync_operation))) {
+  if (is_unified_catalog && OB_NOT_NULL(session)
+      && OB_FAIL(ObUnifiedCatalog::get_session_token(
+          *session, ctx.get_allocator(), catalog_sync_access_token))) {
+    SQL_ENG_LOG(WARN, "failed to capture Unified Catalog token for create database",
+                K(ret), K(tenant_id));
+  } else if (OB_FAIL(catalog_sync.get_create_database_operator(
+                 catalog_sync_backend,
+                 catalog_sync_access_token,
+                 create_database_arg,
+                 catalog_sync_operation))) {
     SQL_ENG_LOG(WARN, "failed to get create database catalog sync operation",
                 K(ret), K(tenant_id), K(is_unified_catalog));
   } else if (OB_FAIL(stmt.get_first_stmt(first_stmt))) {
@@ -668,19 +680,25 @@ int ObDropDatabaseExecutor::execute(ObExecContext &ctx, ObDropDatabaseStmt &stmt
   obrpc::ObCommonRpcProxy *common_rpc_proxy = NULL;
   const obrpc::ObDropDatabaseArg &drop_database_arg = stmt.get_drop_database_arg();
   obrpc::ObDropDatabaseArg &tmp_arg = const_cast<obrpc::ObDropDatabaseArg&>(drop_database_arg);
+  const uint64_t tenant_id = drop_database_arg.tenant_id_;
+  const ObCatalogSyncBackend catalog_sync_backend =
+      ObCatalogSync::snapshot_backend(tenant_id);
+  const bool is_unified_catalog = ObCatalogSyncBackend::UNIFIED_CATALOG == catalog_sync_backend;
+  ObSQLSessionInfo *session = ctx.get_my_session();
+  ObString catalog_sync_access_token;
   ObString first_stmt;
   uint64_t database_id = OB_INVALID_ID;
   ObCatalogSync catalog_sync(ctx.get_allocator());
-  ObCatalogSyncAuthContext catalog_sync_context;
   ObCatalogSyncOperationHandle catalog_sync_operation;
   ObCatalogSyncPrepareResult catalog_sync_prepare_result;
   ObCatalogSyncDDLResult catalog_sync_ddl_result;
   bool local_ddl_attempted = false;
   bool catalog_sync_complete_called = false;
-  if (OB_FAIL(catalog_sync.prepare_drop_database_context(
-          ctx, drop_database_arg, catalog_sync_context))) {
-    SQL_ENG_LOG(WARN, "failed to prepare drop database catalog sync context",
-                K(ret));
+  if (OB_NOT_NULL(session) && is_unified_catalog
+      && OB_FAIL(ObUnifiedCatalog::get_session_token(
+          *session, ctx.get_allocator(), catalog_sync_access_token))) {
+    SQL_ENG_LOG(WARN, "failed to capture Unified Catalog token for drop database",
+                K(ret), K(tenant_id));
   } else if (OB_FAIL(stmt.get_first_stmt(first_stmt))) {
      SQL_ENG_LOG(WARN, "fail to get first stmt" , K(ret));
   } else {
@@ -701,11 +719,12 @@ int ObDropDatabaseExecutor::execute(ObExecContext &ctx, ObDropDatabaseStmt &stmt
     obrpc::ObDropDatabaseRes drop_database_res;
     const_cast<obrpc::ObDropDatabaseArg&>(drop_database_arg).compat_mode_ = ORACLE_MODE == ctx.get_my_session()->get_compatibility_mode()
         ? lib::Worker::CompatMode::ORACLE : lib::Worker::CompatMode::MYSQL;
-    const uint64_t tenant_id = drop_database_arg.tenant_id_;
     const ObString &database_name = drop_database_arg.database_name_;
-    const bool is_unified_catalog = ObUnifiedCatalog::is_configured(tenant_id);
     if (OB_FAIL(catalog_sync.get_drop_database_operator(
-            catalog_sync_context, drop_database_arg, catalog_sync_operation))) {
+            catalog_sync_backend,
+            catalog_sync_access_token,
+            drop_database_arg,
+            catalog_sync_operation))) {
       SQL_ENG_LOG(WARN, "failed to get drop database catalog sync operation",
                   K(ret), K(tenant_id), K(is_unified_catalog));
     } else if (catalog_sync_operation.is_valid()

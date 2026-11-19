@@ -126,9 +126,7 @@ bool ObCatalogSyncHelper::is_sync_enabled(const uint64_t tenant_id)
   omt::ObTenantConfigGuard tenant_config(TENANT_CONF(tenant_id));
   if (tenant_config.is_valid()) {
     const char *sync_target = tenant_config->catalog_sync_target.str();
-    const char *unified_target = tenant_config->unified_catalog_config.str();
-    enabled = (NULL != sync_target && '\0' != sync_target[0])
-              || (NULL != unified_target && '\0' != unified_target[0]);
+    enabled = (NULL != sync_target && '\0' != sync_target[0]);
   }
   return enabled;
 }

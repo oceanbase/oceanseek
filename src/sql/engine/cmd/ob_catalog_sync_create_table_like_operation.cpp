@@ -10,9 +10,7 @@
 #include "lib/string/ob_string.h"
 #include "lib/utility/ob_tracepoint.h"
 #include "sql/engine/cmd/ob_catalog_sync_helper.h"
-#include "sql/engine/ob_exec_context.h"
 #include "sql/ob_sql_utils.h"
-#include "sql/session/ob_sql_session_info.h"
 #include "share/catalog/ob_unified_catalog.h"
 #include "share/ob_rpc_struct.h"
 #include "share/schema/ob_schema_getter_guard.h"
@@ -30,18 +28,13 @@ namespace sql
 ERRSIM_POINT_DEF(ERRSIM_CATALOG_SYNC_CREATE_LIKE_ALLOC_FAIL);
 
 ObCreateTableLikeCatalogSyncOperation::ObCreateTableLikeCatalogSyncOperation(
-    ObExecContext &ctx,
+    const ObString &access_token,
     const obrpc::ObCreateTableLikeArg &create_table_like_arg,
     const bool is_unified_catalog)
-  : ctx_(ctx),
-    create_table_like_arg_(create_table_like_arg),
-    tenant_id_(create_table_like_arg.tenant_id_),
-    is_unified_catalog_(is_unified_catalog),
-    allocator_("CatalogSync", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id_),
-    access_token_(),
-    remote_catalog_name_(),
-    endpoint_(),
-    realm_()
+    : create_table_like_arg_(create_table_like_arg), tenant_id_(create_table_like_arg.tenant_id_),
+      is_unified_catalog_(is_unified_catalog),
+      allocator_("CatalogSync", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id_),
+      target_(tenant_id_, access_token)
 {
 }
 
@@ -54,34 +47,11 @@ int ObCreateTableLikeCatalogSyncOperation::prepare(ObCatalogSyncPrepareResult &r
   int ret = OB_SUCCESS;
   result.skip_local_ddl_ = false;
   result.source_object_id_ = OB_INVALID_ID;
-  if (is_unified_catalog_ && OB_FAIL(prepare_unified_catalog())) {
+  if (is_unified_catalog_
+      && USER_TABLE == create_table_like_arg_.table_type_
+      && OB_FAIL(prepare_unified_catalog_target(target_, allocator_))) {
     LOG_WARN("failed to prepare Unified Catalog create table like sync",
              KR(ret), K(tenant_id_), K(is_unified_catalog_));
-  }
-  return ret;
-}
-
-int ObCreateTableLikeCatalogSyncOperation::prepare_unified_catalog()
-{
-  int ret = OB_SUCCESS;
-  ObSQLSessionInfo *session = ctx_.get_my_session();
-  if (OB_ISNULL(session)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("session is null before Unified Catalog create table like sync",
-             KR(ret), K(tenant_id_));
-  } else if (OB_FAIL(ObUnifiedCatalog::get_session_token(
-                 *session, allocator_, access_token_))) {
-    LOG_WARN("failed to get Unified Catalog execution token",
-             KR(ret), K(tenant_id_));
-  } else if (USER_TABLE == create_table_like_arg_.table_type_
-             && OB_FAIL(ObUnifiedCatalog::validate_sync_target(tenant_id_,
-                                                               access_token_,
-                                                               allocator_,
-                                                               remote_catalog_name_,
-                                                               endpoint_,
-                                                               realm_))) {
-    LOG_WARN("failed to validate fixed Unified Catalog sync target",
-             KR(ret), K(tenant_id_));
   }
   return ret;
 }
@@ -149,11 +119,7 @@ int ObCreateTableLikeCatalogSyncOperation::complete_unified_catalog()
     LOG_WARN("failed to resolve final table for Unified Catalog create table like sync",
              KR(ret), K(tenant_id_));
   } else if (table_schema->is_user_table()
-             && OB_FAIL(ObUnifiedCatalog::sync_table_to_target(tenant_id_,
-                                                               access_token_,
-                                                               remote_catalog_name_,
-                                                               endpoint_,
-                                                               realm_,
+             && OB_FAIL(ObUnifiedCatalog::sync_table_to_target(target_,
                                                                create_table_like_arg_.new_db_name_,
                                                                *table_schema))) {
     if (OB_ERR_ALREADY_EXISTS == ret && create_table_like_arg_.if_not_exist_) {
@@ -213,39 +179,42 @@ int ObCreateTableLikeCatalogSyncOperation::complete_hms()
 }
 
 int ObCatalogSync::get_create_table_like_operator(
-    ObExecContext &ctx,
+    const ObCatalogSyncBackend backend,
+    const ObString &access_token,
     const obrpc::ObCreateTableLikeArg &create_table_like_arg,
     ObCatalogSyncOperationHandle &handle)
 {
   int ret = OB_SUCCESS;
   const uint64_t tenant_id = create_table_like_arg.tenant_id_;
-  const bool is_unified_catalog = ObUnifiedCatalog::is_configured(tenant_id);
   handle.reset();
-  ObCreateTableLikeCatalogSyncOperation *operation = NULL;
-  if (OB_FAIL(ERRSIM_CATALOG_SYNC_CREATE_LIKE_ALLOC_FAIL)) {
-    LOG_WARN("failed to inject create table like catalog sync allocation error",
-             KR(ret), K(tenant_id),
-             K(is_unified_catalog));
-  } else {
-    operation = OB_NEWx(ObCreateTableLikeCatalogSyncOperation,
-                        (&allocator_),
-                        ctx,
-                        create_table_like_arg,
-                        is_unified_catalog);
-    if (OB_ISNULL(operation)) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
-      LOG_WARN("failed to allocate create table like catalog sync operation",
+  if (ObCatalogSyncBackend::NONE != backend) {
+    const bool is_unified_catalog = ObCatalogSyncBackend::UNIFIED_CATALOG == backend;
+    ObCreateTableLikeCatalogSyncOperation *operation = NULL;
+    if (OB_FAIL(ERRSIM_CATALOG_SYNC_CREATE_LIKE_ALLOC_FAIL)) {
+      LOG_WARN("failed to inject create table like catalog sync allocation error",
                KR(ret), K(tenant_id),
                K(is_unified_catalog));
+    } else {
+      operation = OB_NEWx(ObCreateTableLikeCatalogSyncOperation,
+                          (&allocator_),
+                          access_token,
+                          create_table_like_arg,
+                          is_unified_catalog);
+      if (OB_ISNULL(operation)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to allocate create table like catalog sync operation",
+                 KR(ret), K(tenant_id),
+                 K(is_unified_catalog));
+      }
     }
-  }
-  if (OB_SUCCESS != ret) {
-    if (!is_unified_catalog) {
-      handle.set_deferred_error(ret);
-      ret = OB_SUCCESS;
+    if (OB_SUCCESS != ret) {
+      if (!is_unified_catalog) {
+        handle.set_deferred_error(ret);
+        ret = OB_SUCCESS;
+      }
+    } else {
+      handle.set(allocator_, operation);
     }
-  } else {
-    handle.set(allocator_, operation);
   }
   return ret;
 }

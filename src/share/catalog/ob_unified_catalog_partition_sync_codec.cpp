@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include "lib/allocator/ob_malloc.h"
 #include "lib/json_type/ob_json_parse.h"
+#include "lib/string/ob_sql_string.h"
 #include "lib/json_type/ob_json_tree.h"
 #include "share/schema/ob_table_schema.h"
 
@@ -30,6 +31,24 @@ int ObUnifiedCatalogPartitionSyncCodec::add_json_string(ObIAllocator &allocator,
     LOG_WARN("failed to allocate json string", K(ret), K(key));
   } else if (OB_FAIL(object.object_add(ObString::make_string(key), node))) {
     LOG_WARN("failed to add json string", K(ret), K(key));
+  }
+  return ret;
+}
+
+int ObUnifiedCatalogPartitionSyncCodec::add_json_uint_string(ObIAllocator &allocator,
+                                                             ObJsonObject &object,
+                                                             const char *key,
+                                                             const uint64_t value)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString value_string;
+  ObString copied_value;
+  if (OB_FAIL(value_string.append_fmt("%lu", value))) {
+    LOG_WARN("failed to format uint json string", K(ret), K(key), K(value));
+  } else if (OB_FAIL(ob_write_string(allocator, value_string.string(), copied_value))) {
+    LOG_WARN("failed to copy uint json string", K(ret), K(key), K(value));
+  } else if (OB_FAIL(add_json_string(allocator, object, key, copied_value))) {
+    LOG_WARN("failed to add uint json string", K(ret), K(key), K(value));
   }
   return ret;
 }
@@ -323,12 +342,18 @@ int ObUnifiedCatalogPartitionSyncCodec::build_commit_fields(ObIAllocator &alloca
                                                             const int64_t base_version,
                                                             const int64_t part_count,
                                                             const int64_t sub_part_count,
+                                                            const uint64_t expected_source_table_id,
                                                             const ObString &metadata)
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(add_json_integer(allocator, root, JSON_BASE_VERSION, base_version))
       || OB_FAIL(add_json_integer(allocator, root, JSON_PART_COUNT, part_count))
       || OB_FAIL(add_json_integer(allocator, root, JSON_SUB_PART_COUNT, sub_part_count))
+      || (OB_INVALID_ID != expected_source_table_id
+          && OB_FAIL(add_json_uint_string(allocator,
+                                          root,
+                                          JSON_EXPECTED_SOURCE_TABLE_ID,
+                                          expected_source_table_id)))
       || OB_FAIL(add_json_string(allocator, root, JSON_METADATA, metadata))) {
     LOG_WARN("failed to build Unified Catalog partition commit fields", K(ret));
   }

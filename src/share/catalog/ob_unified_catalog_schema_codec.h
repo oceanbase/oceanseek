@@ -26,11 +26,13 @@ namespace schema
 {
 class ObColumnSchemaV2;
 class ObTableSchema;
+struct AlterColumnSchema;
 }
 
 struct ObUnifiedCatalogObColumnMetadata
 {
-  TO_STRING_KV(K_(name), K_(native_type), K_(column_id), K_(ob_type), K_(nullable), K_(rowkey_position));
+  TO_STRING_KV(K_(name), K_(native_type), K_(column_id), K_(ob_type), K_(nullable),
+               K_(rowkey_position), K_(generated), K_(stored_generated), K_(generated_expression));
 
   common::ObString name_;
   common::ObString native_type_;
@@ -38,6 +40,9 @@ struct ObUnifiedCatalogObColumnMetadata
   common::ObObjType ob_type_ = common::ObMaxType;
   bool nullable_ = true;
   int64_t rowkey_position_ = 0;
+  bool generated_ = false;
+  bool stored_generated_ = false;
+  common::ObString generated_expression_;
 };
 
 struct ObUnifiedCatalogObTableMetadata
@@ -88,6 +93,13 @@ public:
                                            common::ObIAllocator &allocator,
                                            common::ObString &request_body);
   static int encode_update_table_request(const common::ObString &metadata,
+                                         const uint64_t expected_source_table_id,
+                                         common::ObIAllocator &allocator,
+                                         common::ObString &request_body);
+  static int encode_rename_table_request(const common::ObString &destination_database_name,
+                                         const common::ObString &destination_table_name,
+                                         const uint64_t expected_source_table_id,
+                                         const common::ObString &metadata,
                                          common::ObIAllocator &allocator,
                                          common::ObString &request_body);
   static int decode_create_state(const common::ObString &response_body,
@@ -110,7 +122,7 @@ public:
                                    const common::ObString &table_name,
                                    const uint64_t table_id,
                                    common::ObIAllocator &allocator,
-                                   int64_t *schema_version = NULL);
+                                   int64_t &schema_version);
 
   // String fields in metadata refer to the supplied allocator and response body.
   // Only a successful decode with is_ob_table=false permits an Iceberg API retry.
@@ -134,6 +146,8 @@ public:
   static int validate_table_schema(const schema::ObTableSchema &table_schema);
   // CREATE resolver has template definitions before the RPC materializes child partitions.
   static int validate_create_table_schema(const schema::ObTableSchema &table_schema);
+  // Run before local ADD COLUMN so unsupported metadata cannot diverge from Unified Catalog.
+  static int validate_alter_add_column(const schema::AlterColumnSchema &column);
 
 private:
   static int parse_table_response_header(const common::ObString &response_body,
@@ -150,6 +164,7 @@ private:
                                     const common::ObJsonNode *&columns_node,
                                     const common::ObJsonNode *&partition_spec_node);
   static bool can_encode_primary_key(const schema::ObTableSchema &table_schema);
+  static int validate_column_schema(const schema::ObColumnSchemaV2 &column);
   static int validate_table_schema_and_build_partition_spec(
       const schema::ObTableSchema &table_schema,
       common::ObIAllocator &allocator,
@@ -165,6 +180,9 @@ private:
   static constexpr const char *COMPLETE_OPERATION_ID = "operationId";
   static constexpr const char *COMPLETE_METADATA = "metadata";
   static constexpr const char *COMPLETE_SYNC_ID = "syncId";
+  static constexpr const char *EXPECTED_SOURCE_TABLE_ID = "expectedSourceTableId";
+  static constexpr const char *DESTINATION_NAMESPACE = "destinationNamespace";
+  static constexpr const char *DESTINATION_TABLE = "destinationTable";
   static constexpr const char *TABLE_STATE = "state";
   static constexpr const char *TABLE_TYPE = "tableType";
   static constexpr const char *TABLE_TYPE_OCEANBASE = "OCEANBASE";
@@ -185,6 +203,10 @@ private:
   static constexpr const char *COLUMN_NATIVE_TYPE = "native-type";
   static constexpr const char *COLUMN_ROWKEY_POSITION = "rowkey-position";
   static constexpr const char *COLUMN_NULLABLE = "nullable";
+  static constexpr const char *COLUMN_GENERATED_EXPRESSION = "generated-expression";
+  static constexpr const char *COLUMN_GENERATED_STORAGE = "generated-storage";
+  static constexpr const char *GENERATED_STORAGE_VIRTUAL = "VIRTUAL";
+  static constexpr const char *GENERATED_STORAGE_STORED = "STORED";
 
   static int alloc_object(common::ObIAllocator &allocator,
                           common::ObJsonObject *&object);

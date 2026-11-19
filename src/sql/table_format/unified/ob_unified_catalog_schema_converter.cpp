@@ -8,6 +8,7 @@
 
 #include <cstring>
 
+#include "common/object/ob_object.h"
 #include "lib/allocator/ob_allocator.h"
 #include "lib/charset/ob_charset.h"
 #include "share/schema/ob_column_schema.h"
@@ -143,7 +144,24 @@ int ObUnifiedCatalogSchemaConverter::build_ob_column(
       LOG_WARN("UC OB native type cannot be restored without loss", K(ret), K(metadata.name_));
     } else {
       column.set_nullable(metadata.nullable_);
-      if (metadata.rowkey_position_ > 0) {
+      if (metadata.generated_) {
+        ObObj generated_expression;
+        generated_expression.set_varchar(metadata.generated_expression_);
+        generated_expression.set_collation_type(ObCharset::get_system_collation());
+        generated_expression.set_collation_level(CS_LEVEL_COERCIBLE);
+        if (OB_FAIL(column.set_cur_default_value(generated_expression, false))) {
+          LOG_WARN("failed to restore UC generated column expression", K(ret), K(metadata.name_));
+        } else if (OB_FAIL(column.set_orig_default_value(generated_expression))) {
+          LOG_WARN("failed to restore UC original generated column expression",
+                   K(ret),
+                   K(metadata.name_));
+        } else if (metadata.stored_generated_) {
+          column.add_column_flag(STORED_GENERATED_COLUMN_FLAG);
+        } else {
+          column.add_column_flag(VIRTUAL_GENERATED_COLUMN_FLAG);
+        }
+      }
+      if (OB_SUCC(ret) && metadata.rowkey_position_ > 0) {
         column.set_rowkey_position(metadata.rowkey_position_);
       }
     }
