@@ -48,6 +48,11 @@ public:
       const common::ObString &meta_key,
       const bool prefix_delete,
       int64_t &affected_rows);
+  int batch_delete_rows(
+      const uint64_t tenant_id,
+      const share::ObLSID &ls_id,
+      const ObSSMetaBaseType &meta_type,
+      const common::ObIArray<common::ObString> &meta_keys);
   int delete_rows_by_tenant(
       const uint64_t tenant_id,
       const ObSSMetaBaseType &meta_type,

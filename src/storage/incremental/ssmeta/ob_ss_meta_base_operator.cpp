@@ -194,6 +194,57 @@ int ObSSMetaBaseOperator::delete_row(
   return ret;
 }
 
+int ObSSMetaBaseOperator::batch_delete_rows(
+    const uint64_t tenant_id,
+    const share::ObLSID &ls_id,
+    const ObSSMetaBaseType &meta_type,
+    const ObIArray<ObString> &meta_keys)
+{
+  int ret = OB_SUCCESS;
+  uint64_t real_tenant_id = OB_INVALID_ID;
+  ObSqlString sql;
+  int64_t affected_rows = 0;
+
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("operator not init", KR(ret));
+  } else if (OB_UNLIKELY(OB_INVALID_ID == tenant_id
+            || !ls_id.is_valid()
+            || (is_meta_type_in_rowkey() && !meta_type.is_valid())
+            || meta_keys.empty())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("batch delete rows get invalid argument", KR(ret), K(tenant_id), K(ls_id), K(meta_type));
+  } else if (OB_FAIL(get_real_tenant_id_(tenant_id, real_tenant_id))) {
+    LOG_WARN("get real tenant fail", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(sql.assign_fmt("DELETE /*+ QUERY_TIMEOUT(%ld) */ FROM %s "
+      "WHERE tenant_id = %lu AND ls_id = %ld",
+      get_sql_timeout_us_(tenant_id), table_name_, tenant_id, ls_id.id()))) {
+    LOG_WARN("fail to assign sql", KR(ret));
+  } else if (meta_type.is_valid()
+      && OB_FAIL(sql.append_fmt(" AND meta_type = %ld", meta_type.get_type_val()))) {
+    LOG_WARN("fail to append meta_type filter", KR(ret), K(meta_type));
+  } else if (OB_FAIL(sql.append(" AND meta_key IN ("))) {
+    LOG_WARN("fail to append key filter", KR(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < meta_keys.count(); ++i) {
+    const ObString &meta_key = meta_keys.at(i);
+    if (OB_UNLIKELY(meta_key.empty())) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("empty meta key", KR(ret), K(i));
+    } else if (OB_FAIL(sql.append_fmt("%s'%.*s'",
+        0 == i ? "" : ",", meta_key.length(), meta_key.ptr()))) {
+      LOG_WARN("fail to append meta key", KR(ret), K(i));
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(sql.append(")"))) {
+    LOG_WARN("fail to finish key filter", KR(ret));
+  } else if (OB_FAIL(do_sql_write_(real_tenant_id, sql.ptr(), affected_rows))) {
+    LOG_WARN("fail to batch delete rows", KR(ret), K(tenant_id), K(real_tenant_id), K(sql));
+  }
+  return ret;
+}
+
 int ObSSMetaBaseOperator::delete_rows_by_tenant(
     const uint64_t tenant_id,
     const ObSSMetaBaseType &meta_type,

@@ -107,6 +107,39 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ScopedNamedEvent);
 };
 
+class CountingTieredDeleteSQLClient : public ObMySQLProxy
+{
+public:
+  explicit CountingTieredDeleteSQLClient(ObISQLClient &client, const int64_t fail_write_idx = 0)
+    : client_(client), fail_write_idx_(fail_write_idx), write_count_(0) {}
+  using ObMySQLProxy::write;
+  int write(const uint64_t tenant_id, const char *sql,
+            const int32_t group_id, int64_t &affected_rows) override
+  {
+    int ret = OB_SUCCESS;
+    affected_rows = 0;
+    if (OB_ISNULL(sql)) {
+      ret = OB_INVALID_ARGUMENT;
+    } else {
+      ++write_count_;
+      EXPECT_EQ(OBCG_SHARED_META, group_id);
+      EXPECT_EQ(gen_meta_tenant_id(oceanbase::share::ObTenantEnv::get_tenant_local()->id()),
+                tenant_id);
+      if (write_count_ == fail_write_idx_) {
+        ret = OB_TIMEOUT;
+      } else if (OB_FAIL(client_.write(tenant_id, sql, group_id, affected_rows))) {
+      }
+    }
+    return ret;
+  }
+  int64_t get_write_count() const { return write_count_; }
+private:
+  ObISQLClient &client_;
+  int64_t fail_write_idx_;
+  int64_t write_count_;
+  DISALLOW_COPY_AND_ASSIGN(CountingTieredDeleteSQLClient);
+};
+
 namespace oceanbase
 {
 char *shared_storage_info = nullptr;
@@ -1709,7 +1742,13 @@ TEST_F(TestTieredMetadataStoreV2, test_batch_del_meta)
   ASSERT_EQ(OB_SUCCESS, ids.push_back(id1));
   ASSERT_EQ(OB_SUCCESS, ids.push_back(id2));
 
-  ASSERT_EQ(OB_SUCCESS, store.batch_del_meta(ids));
+  CountingTieredDeleteSQLClient client(get_sql_client());
+  ObTieredMetadataStore deleting_store;
+  ASSERT_EQ(OB_SUCCESS, deleting_store.init(tenant_id_, &client));
+  ASSERT_EQ(OB_SUCCESS, deleting_store.batch_del_meta(ids));
+  ASSERT_EQ(1, client.get_write_count());
+  ASSERT_EQ(OB_SUCCESS, deleting_store.batch_del_meta(ids));
+  ASSERT_EQ(2, client.get_write_count());
 
   // verify both deleted
   bool is_exist = false;
@@ -1717,6 +1756,125 @@ TEST_F(TestTieredMetadataStoreV2, test_batch_del_meta)
   ASSERT_FALSE(is_exist);
   ASSERT_EQ(OB_SUCCESS, store.is_meta_exist(id2, is_exist));
   ASSERT_FALSE(is_exist);
+}
+
+// Count real SQL submissions across a batch boundary and retry a partially completed delete.
+TEST_F(TestTieredMetadataStoreV2, test_batch_del_meta_batches_and_retry)
+{
+  share::ObTenantSwitchGuard guard;
+  OK(guard.switch_to(tenant_id_));
+  ObTieredMetadataStore store;
+  ASSERT_EQ(OB_SUCCESS, store.init(tenant_id_, &get_sql_client()));
+  ObArray<MacroBlockId> ids;
+  for (int64_t i = 0; i < 257; ++i) {
+    ASSERT_EQ(OB_SUCCESS, ids.push_back(build_sub_meta_in_table_id(300031, i + 1)));
+  }
+  MacroBlockId kept_id = build_sub_meta_in_table_id(300031, 258);
+  ASSERT_EQ(OB_SUCCESS, store.batch_del_meta(ids));
+  ASSERT_EQ(OB_SUCCESS, store.del_meta(kept_id));
+
+  ObArenaAllocator allocator("BatchDelTest");
+  const int64_t value_size = OB_SS_MAX_META_VALUE_LENGTH + 1;
+  char *value_buf = static_cast<char *>(allocator.alloc(value_size));
+  ASSERT_NE(nullptr, value_buf);
+  MEMSET(value_buf, 's', value_size);
+  ASSERT_EQ(OB_SUCCESS, store.write_meta(
+      ids.at(0), kDefaultMetaType, ObString(value_size, value_buf)));
+  ASSERT_EQ(OB_SUCCESS, store.write_meta(
+      ids.at(127), kDefaultMetaType, ObString::make_string("first_batch_tail")));
+  ASSERT_EQ(OB_SUCCESS, store.write_meta(
+      ids.at(128), 1000001, ObString::make_string("unknown_type")));
+  ASSERT_EQ(OB_SUCCESS, store.write_meta(
+      ids.at(255), kDefaultMetaType, ObString::make_string("second_batch_tail")));
+  ASSERT_EQ(OB_SUCCESS, store.write_meta(
+      ids.at(256), kDefaultMetaType, ObString::make_string("last_batch")));
+  ASSERT_EQ(OB_SUCCESS, store.write_meta(
+      kept_id, kDefaultMetaType, ObString::make_string("keep")));
+  int64_t stored_type = 0;
+  int64_t row_count = 0;
+  ASSERT_EQ(OB_SUCCESS, query_stored_meta_type(store, ids.at(0), stored_type, row_count));
+  ASSERT_EQ(2, row_count);
+
+  // The same key in another LS must survive every batch and retry.
+  share::ObLSID ls_id;
+  ObSSTieredMetaType meta_type;
+  char key_buf[1024];
+  int64_t key_len = 0;
+  ASSERT_EQ(OB_SUCCESS, store.macro_block_id_to_ss_meta_key_(
+      ids.at(0), ls_id, meta_type, key_buf, sizeof(key_buf), key_len));
+  const ObString meta_key(key_len, key_buf);
+  meta_type.type_val_ = kDefaultMetaType;
+  ObSSTieredMetaTableOperator op;
+  ASSERT_EQ(OB_SUCCESS, op.init(get_sql_client(), OB_ALL_SHARED_TIERED_META_TNAME));
+  int64_t affected_rows = 0;
+  ASSERT_EQ(OB_SUCCESS, op.insert_row(tenant_id_, ObLSID(1), meta_type,
+      meta_key, ObString::make_string("other_ls"), affected_rows));
+  ASSERT_EQ(1, affected_rows);
+
+  CountingTieredDeleteSQLClient client(get_sql_client(), 2);
+  ObTieredMetadataStore deleting_store;
+  ASSERT_EQ(OB_SUCCESS, deleting_store.init(tenant_id_, &client));
+  ASSERT_EQ(OB_TIMEOUT, deleting_store.batch_del_meta(ids));
+  ASSERT_EQ(2, client.get_write_count());
+  ASSERT_EQ(OB_SUCCESS, query_stored_meta_type(store, ids.at(0), stored_type, row_count));
+  ASSERT_EQ(0, row_count);
+  bool is_exist = true;
+  ASSERT_EQ(OB_SUCCESS, store.is_meta_exist(ids.at(127), is_exist));
+  ASSERT_FALSE(is_exist);
+  ASSERT_EQ(OB_SUCCESS, store.is_meta_exist(ids.at(128), is_exist));
+  ASSERT_TRUE(is_exist);
+  ASSERT_EQ(OB_SUCCESS, store.is_meta_exist(ids.at(255), is_exist));
+  ASSERT_TRUE(is_exist);
+  ASSERT_EQ(OB_SUCCESS, store.is_meta_exist(ids.at(256), is_exist));
+  ASSERT_TRUE(is_exist);
+
+  ASSERT_EQ(OB_SUCCESS, deleting_store.batch_del_meta(ids));
+  ASSERT_EQ(5, client.get_write_count());
+  for (int64_t i = 0; i < ids.count(); ++i) {
+    ASSERT_EQ(OB_SUCCESS, query_stored_meta_type(store, ids.at(i), stored_type, row_count));
+    ASSERT_EQ(0, row_count);
+  }
+  char kept_buf[16];
+  int64_t read_size = 0;
+  ASSERT_EQ(OB_SUCCESS, store.read_meta(kept_id, kept_buf, sizeof(kept_buf), read_size));
+  ASSERT_EQ(ObString::make_string("keep"), ObString(read_size, kept_buf));
+  ObString other_ls_value;
+  ASSERT_EQ(OB_SUCCESS, op.read_row(tenant_id_, ObLSID(1), meta_type,
+      meta_key, allocator, other_ls_value));
+  ASSERT_EQ(ObString::make_string("other_ls"), other_ls_value);
+  ASSERT_EQ(OB_SUCCESS, op.delete_row(
+      tenant_id_, ObLSID(1), meta_type, meta_key, false, affected_rows));
+  ASSERT_EQ(1, affected_rows);
+  ASSERT_EQ(OB_SUCCESS, store.del_meta(kept_id));
+}
+
+// Meta-tenant and sys-tenant rows share the sys tenant's physical table.
+TEST_F(TestTieredMetadataStoreV2, test_batch_del_meta_logical_tenant_isolation)
+{
+  share::ObTenantSwitchGuard guard;
+  OK(guard.switch_to(tenant_id_));
+  ObTieredMetadataStore meta_store;
+  ObTieredMetadataStore sys_store;
+  ASSERT_EQ(OB_SUCCESS, meta_store.init(gen_meta_tenant_id(tenant_id_), &get_sql_client()));
+  ASSERT_EQ(OB_SUCCESS, sys_store.init(OB_SYS_TENANT_ID, &get_sql_client()));
+  const MacroBlockId id = build_sub_meta_in_table_id(300032, 1);
+  ASSERT_EQ(OB_SUCCESS, meta_store.del_meta(id));
+  ASSERT_EQ(OB_SUCCESS, sys_store.del_meta(id));
+  ASSERT_EQ(OB_SUCCESS, meta_store.write_meta(
+      id, kDefaultMetaType, ObString::make_string("meta_value")));
+  ASSERT_EQ(OB_SUCCESS, sys_store.write_meta(
+      id, kDefaultMetaType, ObString::make_string("sys_value")));
+  ObArray<MacroBlockId> ids;
+  ASSERT_EQ(OB_SUCCESS, ids.push_back(id));
+  ASSERT_EQ(OB_SUCCESS, meta_store.batch_del_meta(ids));
+  bool is_exist = true;
+  ASSERT_EQ(OB_SUCCESS, meta_store.is_meta_exist(id, is_exist));
+  ASSERT_FALSE(is_exist);
+  char value_buf[16];
+  int64_t read_size = 0;
+  ASSERT_EQ(OB_SUCCESS, sys_store.read_meta(id, value_buf, sizeof(value_buf), read_size));
+  ASSERT_EQ(ObString::make_string("sys_value"), ObString(read_size, value_buf));
+  ASSERT_EQ(OB_SUCCESS, sys_store.del_meta(id));
 }
 
 TEST_F(TestTieredMetadataStoreV2, test_batch_del_meta_empty_ids)

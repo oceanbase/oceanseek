@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "ob_tiered_metadata_store.h"
+#include "lib/container/ob_se_array.h"
 #include "share/ob_server_struct.h"
 #include "storage/shared_storage/ob_dir_manager.h"
 #include "storage/blocksstable/ob_ss_obj_util.h"
@@ -371,6 +372,11 @@ int ObTieredMetadataStore::batch_del_meta(const ObIArray<MacroBlockId> &macro_bl
 {
   int ret = OB_SUCCESS;
   ObTimeGuard time_guard("ObTieredMetadataStore::batch_del_meta", 1_s);
+  static constexpr int64_t MAX_BATCH_DELETE_COUNT = 128;
+  ObArenaAllocator allocator(ObMemAttr(tenant_id_, "TMDelKeys"));
+  ObSEArray<ObString, MAX_BATCH_DELETE_COUNT> meta_keys;
+  share::ObLSID ls_id;
+  ObSSTieredMetaType meta_type;
 
   if (OB_FAIL(pre_check_())) {
     LOG_WARN("pre check failed", K(ret));
@@ -381,24 +387,30 @@ int ObTieredMetadataStore::batch_del_meta(const ObIArray<MacroBlockId> &macro_bl
 
   for (int64_t i = 0; OB_SUCC(ret) && i < macro_block_ids.count(); i++) {
     const MacroBlockId &macro_block_id = macro_block_ids.at(i);
-    int64_t affected_rows = 0;
     if (!is_valid_macro_block_id_(macro_block_id)) {
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("invalid macro block id", K(ret), K(macro_block_id));
     } else {
-      share::ObLSID ls_id;
-      ObSSTieredMetaType meta_type;
       SMART_VAR(char[MAX_PATH_SIZE], key_buf) {
         int64_t key_len = 0;
+        ObString meta_key;
         if (OB_FAIL(macro_block_id_to_ss_meta_key_(macro_block_id, ls_id, meta_type, key_buf, MAX_PATH_SIZE, key_len))) {
           LOG_WARN("fail to get v2 key", K(ret), K(i), K(macro_block_id));
-        } else {
-          ObString meta_key(key_len, key_buf);
-          if (OB_FAIL(operator_.delete_row(tenant_id_, ls_id, meta_type, meta_key, false/*prefix_delete*/, affected_rows))) {
-            LOG_WARN("fail to delete row", K(ret), K(i), K(macro_block_id));
-          }
+        } else if (OB_FAIL(ob_write_string(allocator, ObString(key_len, key_buf), meta_key))) {
+          LOG_WARN("fail to copy meta key", K(ret), K(i));
+        } else if (OB_FAIL(meta_keys.push_back(meta_key))) {
+          LOG_WARN("fail to add meta key", K(ret), K(i));
         }
       }
+    }
+    if (OB_SUCC(ret)
+        && (MAX_BATCH_DELETE_COUNT == meta_keys.count() || i + 1 == macro_block_ids.count())) {
+      // All sub-meta keys use ls_id=0 and no meta_type filter; omit part to delete every fragment.
+      if (OB_FAIL(operator_.batch_delete_rows(tenant_id_, ls_id, meta_type, meta_keys))) {
+        LOG_WARN("fail to batch delete meta rows", K(ret), K(i), K(meta_keys.count()));
+      }
+      meta_keys.reuse();
+      allocator.reuse();
     }
   }
 
