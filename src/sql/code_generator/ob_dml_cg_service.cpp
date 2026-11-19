@@ -1371,14 +1371,15 @@ int ObDmlCgService::generate_scan_ctdef(ObLogInsert &op,
       if (OB_ISNULL(item)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("invalid column item", K(i), K(item));
-      } else if (item->is_virtual_generated_column() && !item->is_xml_column() && !ObDomainIdUtils::is_domain_id_index_col_expr(item)) {
-        // do nothing.
+      } else if (OB_FAIL(get_column_ref_base_cid(op, item, base_cid))) {
+        LOG_WARN("get base column id failed", K(ret), K(item));
+      } else if (item->is_virtual_generated_column() && !item->is_xml_column()
+                 && !is_contain(flatten_domain_id_col_ids, base_cid)) {
+        // A domain column can precede its auxiliary table during index creation.
         need_push = false;
       } else if (item->is_doc_id_column() && !has_exist_in_array(domain_types, (int64_t)ObDomainIdUtils::ObDomainIDType::DOC_ID)) {
         // do nothing during building fts index.
         need_push = false;
-      } else if (OB_FAIL(get_column_ref_base_cid(op, item, base_cid))) {
-        LOG_WARN("get base column id failed", K(ret), K(item));
       } else if (OB_FAIL(tsc_col_ids.push_back(base_cid))) {
         LOG_WARN("fail to push back column id", K(ret));
       } else {
