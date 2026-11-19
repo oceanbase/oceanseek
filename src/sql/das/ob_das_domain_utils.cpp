@@ -160,12 +160,9 @@ int ObFTIndexRowCache::segment(const common::ObObjMeta &ft_obj_meta,
           }
         } else if (FALSE_IT(position += token_attr.pos_inc_)) {
         } else {
-          ObString token_string;
-          if (OB_FAIL(ob_write_string(scratch_allocator_, token_attr.to_ob_string(), token_string))) {
-            LOG_WARN("fail to deep copy token", K(ret), K(token_attr));
-          }
-          if (FAILEDx(ft_token_processor_.process_token(
-                         need_pos_list, token_string.ptr(), token_string.length(), position))) {
+          const ObString token_string = token_attr.to_ob_string();
+          if (OB_FAIL(ft_token_processor_.process_token(
+                  need_pos_list, token_string.ptr(), token_string.length(), position))) {
             LOG_WARN("fail to process one word", K(ret), K(token_attr));
           }
         }

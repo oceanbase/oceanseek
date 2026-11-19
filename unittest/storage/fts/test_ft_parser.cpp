@@ -44,14 +44,21 @@
 #undef private
 #include "lib/string/ob_sql_string.h"
 #include "storage/fts/ob_fts_literal.h"
+#include "storage/fts/ob_fts_plugin_helper.h"
+#include "storage/fts/ob_ft_token_processor.h"
 #include "storage/fts/utils/ob_ft_ngram_impl.h"
+#include "sql/das/ob_das_domain_utils.h"
+#include "share/ob_fts_pos_list_codec.h"
 #include "share/rc/ob_tenant_base.h"
+#include "plugin/legacy/sys/ob_plugin_mgr.h"
+#include "share/ob_server_struct.h"
 
 #include <alloca.h>
 #include <algorithm>
 #include <chrono>
 #include <gtest/gtest.h>
 #include <iostream>
+#include <map>
 #include <ostream>
 #include <string>
 #include <thread>
@@ -2526,6 +2533,188 @@ TEST_F(FTParserTest, DISABLED_benchmark)
 
 } // end namespace storage
 } // end namespace oceanbase
+
+class OrdinaryTokenOwnershipTest : public ::testing::Test
+{
+protected:
+  oceanbase::plugin::ObPluginMgr plugins_;
+  oceanbase::plugin::ObPluginMgr *saved_ = nullptr;
+  void SetUp() override
+  {
+    saved_ = GCTX.plugin_mgr_;
+    ASSERT_EQ(OB_SUCCESS, plugins_.init(oceanbase::common::ObString()));
+    ASSERT_EQ(OB_SUCCESS, plugins_.load_builtin_plugins());
+    GCTX.plugin_mgr_ = &plugins_;
+  }
+  void TearDown() override { GCTX.plugin_mgr_ = saved_; }
+};
+
+TEST_F(OrdinaryTokenOwnershipTest, row_cache_groups_repeated_tokens)
+{
+  using namespace oceanbase;
+  using namespace oceanbase::common;
+  using namespace oceanbase::storage;
+  using namespace oceanbase::sql;
+  for (const bool phrase : {false, true}) {
+    const auto index_type = phrase ? share::schema::OB_FTS_INDEX_TYPE_PHRASE_MATCH
+                                   : share::schema::OB_FTS_INDEX_TYPE_MATCH;
+    ObObjMeta meta;
+    meta.set_varchar();
+    meta.set_collation_type(CS_TYPE_UTF8MB4_BIN);
+    ObExpr exprs[5];
+    ObSEArray<ObExpr *, 5> all_exprs;
+    ObSEArray<ObExpr *, 1> other_exprs;
+    for (int64_t i = 0; i < 5; ++i) {
+      exprs[i].type_ = ObFTIndexRowCache::FTS_DOC_WORD_EXPR_TYPE[i];
+      exprs[i].obj_meta_ = meta;
+      ASSERT_EQ(OB_SUCCESS, all_exprs.push_back(&exprs[i]));
+    }
+    ObFTIndexRowCache cache;
+    ASSERT_EQ(OB_SUCCESS, cache.init(false, true, ObString("space.1"),
+        ObString("{\"min_token_size\":3,\"max_token_size\":84}"), all_exprs, other_exprs, index_type));
+    ObDatum doc_id;
+    doc_id.set_string(ObString("0012345678901234"));
+    for (const char *text : {"alpha beta alpha", "gamma gamma delta"}) {
+      ASSERT_EQ(OB_SUCCESS, cache.segment(meta, doc_id, ObString(text)));
+      std::map<std::string, uint64_t> counts;
+      blocksstable::ObDatumRow *row = nullptr;
+      int ret = OB_SUCCESS;
+      while (OB_SUCCESS == (ret = cache.get_next_row(row))) {
+        ASSERT_NE(nullptr, row);
+        const ObString term = row->storage_datums_[1].get_string();
+        const bool inserted = counts.emplace(std::string(term.ptr(), term.length()),
+                                             row->storage_datums_[2].get_uint()).second;
+        ASSERT_TRUE(inserted);
+        EXPECT_EQ(3, row->storage_datums_[3].get_uint());
+        if (phrase) {
+          ObFTSPositionListStore store;
+          ObSEArray<int64_t, 4> positions;
+          const ObString encoded = row->storage_datums_[4].get_string();
+          ASSERT_EQ(OB_SUCCESS, store.deserialize_and_decode(encoded.ptr(), encoded.length(), positions));
+          ASSERT_EQ(row->storage_datums_[2].get_uint(), positions.count());
+          if (term == ObString("alpha")) {
+            EXPECT_EQ(0, positions.at(0));
+            EXPECT_EQ(2, positions.at(1));
+          } else if (term == ObString("gamma")) {
+            EXPECT_EQ(0, positions.at(0));
+            EXPECT_EQ(1, positions.at(1));
+          } else {
+            EXPECT_EQ(term == ObString("beta") ? 1 : 2, positions.at(0));
+          }
+        }
+      }
+      EXPECT_EQ(OB_ITER_END, ret);
+      ASSERT_EQ(2, counts.size());
+      if (std::string(text).find("alpha") == 0) {
+        EXPECT_EQ(2, counts["alpha"]);
+        EXPECT_EQ(1, counts["beta"]);
+      } else {
+        EXPECT_EQ(2, counts["gamma"]);
+        EXPECT_EQ(1, counts["delta"]);
+      }
+    }
+    EXPECT_EQ(OB_ITER_END, cache.segment(meta, doc_id, ObString("a an")));
+    EXPECT_EQ(OB_ITER_END, cache.segment(meta, doc_id, ObString()));
+  }
+}
+
+class TokenOwnershipAllocator : public oceanbase::common::ObIAllocator
+{
+public:
+  void *alloc(const int64_t size) override
+  {
+    if (fail_ || allocations_left_ == 0) { return nullptr; }
+    if (allocations_left_ > 0) { --allocations_left_; }
+    void *ptr = arena_.alloc(size);
+    if (ptr != nullptr && size == 5) { ++token_copies_; }
+    return ptr;
+  }
+  void *alloc(const int64_t size, const oceanbase::common::ObMemAttr &) override { return alloc(size); }
+  void free(void *ptr) override { arena_.free(ptr); }
+  oceanbase::common::ObArenaAllocator arena_;
+  bool fail_ = false;
+  int64_t allocations_left_ = -1;
+  int64_t token_copies_ = 0;
+};
+
+TEST(FTTokenProcessorTest, ordinary_owns_distinct_keys_and_preserves_collation)
+{
+  using namespace oceanbase;
+  using namespace oceanbase::common;
+  using namespace oceanbase::storage;
+  for (const auto collation : {CS_TYPE_UTF8MB4_BIN, CS_TYPE_UTF8MB4_GENERAL_CI}) {
+    TokenOwnershipAllocator allocator;
+    ObFTTokenMap tokens;
+    ASSERT_EQ(OB_SUCCESS, tokens.create(4, ObMemAttr(MTL_ID(), "FTTokenOwner")));
+    ObFTTokenProcessor processor(allocator);
+    ObFTParserProperty property;
+    ObObjMeta meta;
+    meta.set_varchar();
+    meta.set_collation_type(collation);
+    ObProcessTokenFlag flags;
+    flags.set_groupby_token();
+    ASSERT_EQ(OB_SUCCESS, processor.init(property, meta, flags, &tokens));
+    char borrowed[] = "alpha";
+    ASSERT_EQ(OB_SUCCESS, processor.process_token(false, borrowed, 5, 0));
+    MEMCPY(borrowed, "ALPHA", 5);
+    ASSERT_EQ(OB_SUCCESS, processor.process_token(false, borrowed, 5, 1));
+    MEMCPY(borrowed, "xxxxx", 5);
+    const int64_t distinct = collation == CS_TYPE_UTF8MB4_GENERAL_CI ? 1 : 2;
+    EXPECT_EQ(distinct, tokens.size());
+    EXPECT_EQ(distinct, allocator.token_copies_);
+    allocator.fail_ = true;
+    for (int64_t i = 2; i < 4; ++i) {
+      ASSERT_EQ(OB_SUCCESS, processor.process_token(false, "alpha", 5, i));
+    }
+    EXPECT_EQ(OB_ALLOCATE_MEMORY_FAILED, processor.process_token(false, "gamma", 5, 4));
+    EXPECT_EQ(4, processor.get_non_stop_token_count());
+    EXPECT_EQ(distinct, tokens.size());
+    int64_t total = 0;
+    for (auto it = tokens.begin(); it != tokens.end(); ++it) {
+      const auto value = it->first.get_token().get_string();
+      EXPECT_TRUE(value == ObString("alpha") || value == ObString("ALPHA"));
+      total += it->second.count_;
+    }
+    EXPECT_EQ(4, total);
+    processor.reset();
+  }
+}
+
+TEST(FTTokenProcessorTest, ordinary_phrase_propagates_update_failure)
+{
+  using namespace oceanbase;
+  using namespace oceanbase::common;
+  using namespace oceanbase::storage;
+  TokenOwnershipAllocator allocator;
+  ObFTTokenMap tokens;
+  ASSERT_EQ(OB_SUCCESS, tokens.create(4, ObMemAttr(MTL_ID(), "FTTokenOwner")));
+  ObFTTokenProcessor processor(allocator);
+  ObFTParserProperty property;
+  ObObjMeta meta;
+  meta.set_varchar();
+  meta.set_collation_type(CS_TYPE_UTF8MB4_BIN);
+  ObProcessTokenFlag flags;
+  flags.set_groupby_token();
+  ASSERT_EQ(OB_SUCCESS, processor.init(property, meta, flags, &tokens));
+  ASSERT_EQ(OB_SUCCESS, processor.process_token(true, "alpha", 5, 7));
+  EXPECT_EQ(OB_ERR_UNEXPECTED, processor.process_token(true, "alpha", 5, 7));
+  EXPECT_EQ(1, processor.get_non_stop_token_count());
+  // Allocate the first position holder, then fail to copy the new key.
+  allocator.allocations_left_ = 1;
+  EXPECT_EQ(OB_ALLOCATE_MEMORY_FAILED, processor.process_token(true, "bravo", 5, 13));
+  EXPECT_EQ(1, processor.get_non_stop_token_count());
+  ASSERT_EQ(1, tokens.size());
+  EXPECT_EQ(1, tokens.begin()->second.count_);
+  EXPECT_EQ(7, tokens.begin()->second.position_list_->at(0));
+  allocator.allocations_left_ = -1;
+  const int64_t copies_before_hit = allocator.token_copies_;
+  ASSERT_EQ(OB_SUCCESS, processor.process_token(true, "alpha", 5, 8));
+  EXPECT_EQ(copies_before_hit, allocator.token_copies_);
+  EXPECT_EQ(2, tokens.begin()->second.count_);
+  ASSERT_EQ(2, tokens.begin()->second.position_list_->count());
+  EXPECT_EQ(8, tokens.begin()->second.position_list_->at(1));
+  processor.reset();
+}
 
 int main(int argc, char **argv)
 {

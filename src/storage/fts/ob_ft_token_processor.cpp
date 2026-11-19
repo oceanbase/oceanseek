@@ -104,22 +104,39 @@ int ObFTTokenProcessor::groupby_token(const bool need_pos_list, const ObFTToken 
 {
   int ret = OB_SUCCESS;
   if (OB_LIKELY(flag_.groupby_token())) {
+    const int64_t token_len = token.get_token().get_string().length();
+    ObFTTokenPair new_entry;
+    // Keep the lookup result separate: the callback writes its update result to ret.
+    int hash_ret = OB_SUCCESS;
     if (need_pos_list) {
-      UpdateTokenCallBack update_token_func(scratch_allocator_, position);
-      ObFTTokenInfo token_info;
-      if (OB_FAIL(token_info.update_one_position(scratch_allocator_, position))) {
-        LOG_WARN("fail to update one position", K(ret), K(token), K(position));
-      } else if (OB_FAIL(token_map_->set_or_update(token, token_info, update_token_func))) {
-        LOG_WARN("fail to set fulltext token and count", K(ret), K(token), K(position));
+      UpdateTokenCallBack update_token_func(scratch_allocator_, position, ret);
+      hash_ret = token_map_->atomic_refactored(token, update_token_func);
+      if (OB_HASH_NOT_EXIST == hash_ret && OB_FAIL(update_token_func(new_entry))) {
+        LOG_WARN("failed to initialize fulltext token with position", K(ret), K(token_len), K(position));
       }
     } else {
-      UpdateTokenWithoutPosListCallBack update_token_func;
-      ObFTTokenInfo token_info;
-      if (OB_FAIL(token_info.update_without_pos_list())) {
-        LOG_WARN("fail to update without pos list", K(ret), K(token));
-      } else if (OB_FAIL(token_map_->set_or_update(token, token_info, update_token_func))) {
-        LOG_WARN("fail to set fulltext token and count", K(ret), K(token));
+      UpdateTokenWithoutPosListCallBack update_token_func(ret);
+      hash_ret = token_map_->atomic_refactored(token, update_token_func);
+      if (OB_HASH_NOT_EXIST == hash_ret && OB_FAIL(update_token_func(new_entry))) {
+        LOG_WARN("failed to initialize fulltext token", K(ret), K(token_len));
       }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_HASH_NOT_EXIST == hash_ret) {
+      ObString owned_text;
+      if (OB_FAIL(ob_write_string(scratch_allocator_, token.get_token().get_string(), owned_text))) {
+        LOG_WARN("failed to copy new fulltext token", K(ret), K(token_len));
+      } else if (OB_FAIL(new_entry.first.init(owned_text.ptr(), owned_text.length(), token_meta_, hash_func_, cmp_func_))) {
+        LOG_WARN("failed to initialize owned fulltext token", K(ret));
+      } else if (OB_FAIL(token_map_->set_refactored(new_entry.first, new_entry.second))) {
+        LOG_WARN("failed to insert fulltext token", K(ret), K(token_len));
+      }
+      if (OB_FAIL(ret) && nullptr != owned_text.ptr()) {
+        scratch_allocator_.free(owned_text.ptr());
+      }
+    } else if (OB_SUCCESS != hash_ret) {
+      ret = hash_ret;
+      LOG_WARN("failed to find fulltext token", K(hash_ret), K(token_len));
     }
   } else {
     // do nothing now
@@ -129,7 +146,7 @@ int ObFTTokenProcessor::groupby_token(const bool need_pos_list, const ObFTToken 
 
 int ObFTTokenProcessor::UpdateTokenCallBack::operator()(common::hash::HashMapPair<ObFTToken, ObFTTokenInfo> &pair)
 {
-  int ret = OB_SUCCESS;
+  int &ret = ret_;
   if (OB_FAIL(pair.second.update_one_position(allocator_, position_))) {
     LOG_WARN("Fail to update one position", K(ret), K(position_), K(pair.first), K(pair.second));
   }
@@ -138,7 +155,7 @@ int ObFTTokenProcessor::UpdateTokenCallBack::operator()(common::hash::HashMapPai
 
 int ObFTTokenProcessor::UpdateTokenWithoutPosListCallBack::operator()(common::hash::HashMapPair<ObFTToken, ObFTTokenInfo> &pair)
 {
-  int ret = OB_SUCCESS;
+  int &ret = ret_;
   if (OB_FAIL(pair.second.update_without_pos_list())) {
     LOG_WARN("Fail to update without pos list", K(ret), K(pair.first), K(pair.second));
   }

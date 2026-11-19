@@ -449,13 +449,9 @@ int ObFTParseHelper::segment(
           }
         } else if (FALSE_IT(position += token.pos_inc_)) {
         } else {
-          ObString token_string;
-          if (OB_FAIL(ob_write_string(*allocator_, token.to_ob_string(), token_string))) {
-            LOG_WARN("fail to deep copy token", K(ret), K(token));
-          }
-          if (OB_FAIL(ret)) {
-          } else if (OB_FAIL(token_processor.process_token(
-                         need_pos_list, token_string.ptr(), token_string.length(), position))) {
+          const ObString token_string = token.to_ob_string();
+          if (OB_FAIL(token_processor.process_token(
+                  need_pos_list, token_string.ptr(), token_string.length(), position))) {
             LOG_WARN("fail to process token", K(ret), K(token), K(need_pos_list));
           } else if (++token_interval_cnt >= FTS_SEGMENT_CHECK_STATUS_TOKEN_INTERVAL_CNT) {
             if (OB_FAIL(THIS_WORKER.check_status())) {

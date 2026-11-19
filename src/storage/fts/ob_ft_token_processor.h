@@ -44,21 +44,25 @@ private:
   class UpdateTokenCallBack final
   {
   public:
-    UpdateTokenCallBack(ObIAllocator &allocator, const int64_t position)
-    : allocator_(allocator), position_(position) { }
+    UpdateTokenCallBack(ObIAllocator &allocator, const int64_t position, int &ret)
+    : allocator_(allocator), position_(position), ret_(ret) { }
     ~UpdateTokenCallBack() = default;
     int operator()(common::hash::HashMapPair<ObFTToken, ObFTTokenInfo> &pair);
 
   private:
     ObIAllocator &allocator_;
     int64_t position_;
+    int &ret_;
   };
   class UpdateTokenWithoutPosListCallBack final
   {
   public:
-    UpdateTokenWithoutPosListCallBack() = default;
+    explicit UpdateTokenWithoutPosListCallBack(int &ret) : ret_(ret) { }
     ~UpdateTokenWithoutPosListCallBack() = default;
     int operator()(common::hash::HashMapPair<ObFTToken, ObFTTokenInfo> &pair);
+
+  private:
+    int &ret_;
   };
 private:
   int groupby_token(const bool need_pos_list, const ObFTToken &token, const int64_t position);
