@@ -15,7 +15,6 @@
 #include "observer/ob_server_event_history_table_operator.h"
 #include "storage/tx_storage/ob_ls_service.h"
 #include "storage/tablet/ob_tablet_medium_info_reader.h"
-#include "storage/tablet/ob_tablet_obj_load_helper.h"
 #include "storage/direct_load/ob_inc_major_ddl_aggregate_sstable.h"
 #ifdef OB_BUILD_SHARED_STORAGE
 #include "storage/incremental/ob_ss_minor_compaction.h"
@@ -102,16 +101,14 @@ static int get_ss_uploaded_ckpt_scn_for_local_minor(
             K(tablet_id));
       }
     }
-    // Load schema only when considering skipping the checkpoint check to avoid overhead on non-emergency paths.
+    // Only check the cached table type when considering bypassing the uploaded checkpoint.
     if (OB_SUCC(ret) && skip_uploaded_ckpt_check) {
-      ObStorageSchema *storage_schema = nullptr;
-      if (OB_FAIL(tablet.load_storage_schema(tmp_allocator, storage_schema))) {
-        LOG_WARN("failed to load schema for local minor", K(ret), K(tablet_id));
+      ObTableType table_type = MAX_TABLE_TYPE;
+      if (OB_FAIL(tablet.get_table_type(table_type))) {
+        LOG_WARN("failed to get tablet type for local minor", K(ret), K(tablet_id));
       } else {
-        const bool is_lob_control_table = storage_schema->is_aux_outtable_lob_control_table();
-        skip_uploaded_ckpt_check = !is_lob_control_table;
+        skip_uploaded_ckpt_check = !is_aux_outtable_lob_control_table(table_type);
       }
-      ObTabletObjLoadHelper::free(tmp_allocator, storage_schema);
     }
     if (OB_SUCC(ret) && !skip_uploaded_ckpt_check) {
       ObTabletHandle ss_tablet_handle;

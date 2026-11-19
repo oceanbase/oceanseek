@@ -497,6 +497,7 @@ int ObAllVirtualSharedGCDiagnose::advance_cursor_to_next_row_(bool &has_row)
         tablet = &cur_meta_scns_.tablet_;
         item_cnt = cur_meta_scns_.meta_scns_.count();
       } else if (ObSSMarkSweepDiagFileType::LOB_META_KEPT == type) {
+        tablet = &cur_lob_meta_rows_.tablet_;
         item_cnt = cur_lob_meta_rows_.macro_ids_.count();
       } else if (ObSSMarkSweepDiagMgr::is_lob_ctrl_type(type)) {
         item_cnt = cur_lob_ctrl_rows_.rows_.count();
@@ -549,8 +550,10 @@ int ObAllVirtualSharedGCDiagnose::advance_cursor_to_next_row_(bool &has_row)
             tablet = &cur_meta_scns_.tablet_;
           }
         } else if (ObSSMarkSweepDiagFileType::LOB_META_KEPT == type) {
-          if (OB_FAIL(ObSSMarkSweepDiagMgr::decode_lob_meta_kept_record(record, cur_lob_meta_rows_))) {
+          if (OB_FAIL(ObSSMarkSweepDiagMgr::decode_macros_record(record, cur_lob_meta_rows_))) {
             SERVER_LOG(WARN, "fail to decode lob meta kept record", KR(ret), K_(record_idx));
+          } else {
+            tablet = &cur_lob_meta_rows_.tablet_;
           }
         } else if (ObSSMarkSweepDiagMgr::is_lob_ctrl_type(type)) {
           if (OB_FAIL(ObSSMarkSweepDiagMgr::decode_lob_ctrl_record(record, cur_lob_ctrl_rows_))) {

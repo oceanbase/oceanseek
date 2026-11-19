@@ -14,6 +14,7 @@
 #include "storage/ddl/ob_tablet_ddl_kv.h"
 #include "storage/meta_mem/ob_tablet_pointer.h"
 #include "storage/tablet/ob_tablet_multi_source_data.h"
+#include "share/inner_table/ob_inner_table_schema.h"
 
 namespace oceanbase
 {
@@ -383,6 +384,58 @@ public:
     }
     std::cout<< "pull ddl memtables:" << ddl_kv_count_ << std::endl;
   }
+  void init_type_serialize_tablet(
+      ObTablet &tablet,
+      ObStorageSchema &storage_schema,
+      const bool empty_shell)
+  {
+    schema::ObTableSchema table_schema;
+    ASSERT_EQ(OB_SUCCESS, ObInnerTableSchema::all_tenant_profile_schema(table_schema));
+    ASSERT_EQ(OB_SUCCESS,
+        storage_schema.init(allocator_, table_schema, lib::Worker::CompatMode::MYSQL));
+    ObTabletTableStoreFlag table_store_flag;
+    share::ObSplitTabletInfo split_info;
+    ASSERT_EQ(OB_SUCCESS,
+        tablet.tablet_meta_.init(ObLSID(3), ObTabletID(1), ObTabletID(4),
+            SCN::base_scn(), 5, lib::Worker::CompatMode::MYSQL, table_store_flag, 1,
+            SCN::base_scn(), split_info, share::ObForkTabletInfo(),
+            false, false, false, false, 0));
+    tablet.tablet_meta_.is_empty_shell_ = empty_shell;
+    tablet.table_store_addr_.addr_.set_none_addr();
+    tablet.storage_schema_addr_.addr_.set_none_addr();
+    tablet.macro_info_addr_.addr_.set_none_addr();
+    ObTabletTableStore table_store;
+    ASSERT_EQ(OB_SUCCESS, tablet.table_store_cache_.init(table_store, storage_schema, 0));
+    if (!empty_shell) {
+      ObSEArray<schema::ObColDesc, 16> cols;
+      int64_t column_count = 0;
+      ASSERT_EQ(OB_SUCCESS, storage_schema.get_mulit_version_rowkey_column_ids(cols));
+      ASSERT_EQ(OB_SUCCESS, storage_schema.get_store_column_count(column_count, true));
+      ASSERT_EQ(OB_SUCCESS,
+          ObTabletObjLoadHelper::alloc_and_new(allocator_, tablet.rowkey_read_info_));
+      ASSERT_EQ(OB_SUCCESS, tablet.rowkey_read_info_->init(allocator_, column_count,
+          storage_schema.get_rowkey_column_num(), false, cols, false, true));
+      tablet.storage_schema_addr_.ptr_ = &storage_schema;
+    }
+  }
+  void check_serialized_table_type(
+      const ObTablet &tablet,
+      const uint64_t data_version,
+      const schema::ObTableType expected_type)
+  {
+    const int64_t len = tablet.get_self_serialize_size(data_version);
+    char *buf = static_cast<char *>(allocator_.alloc(len));
+    ASSERT_NE(nullptr, buf);
+    int64_t pos = 0;
+    ASSERT_EQ(OB_SUCCESS, tablet.self_serialize(data_version, buf, len, pos));
+    ASSERT_EQ(len, pos);
+    // Decode the cache actually emitted by the tablet's first-level serializer.
+    pos -= tablet.table_store_cache_.get_serialize_size(data_version);
+    ObTableStoreCache decoded;
+    ASSERT_EQ(OB_SUCCESS, decoded.deserialize(buf, len, pos, tablet.is_empty_shell()));
+    ASSERT_EQ(len, pos);
+    EXPECT_EQ(expected_type, decoded.get_table_type());
+  }
   void reproducing_bug();
 private:
   ObArenaAllocator allocator_;
@@ -694,6 +747,267 @@ TEST_F(TestTablet, test_transfer_destination_clears_upload_completion)
 }
 #endif
 
+TEST_F(TestTablet, test_table_store_cache_table_type)
+{
+  ObTableStoreCache cache;
+  ObTabletTableStore table_store;
+  ObStorageSchema storage_schema;
+  ASSERT_EQ(schema::MAX_TABLE_TYPE, cache.get_table_type());
+  const schema::ObTableType types[] = {
+      schema::USER_TABLE, schema::AUX_LOB_META, schema::AUX_OUTTABLE_LOB_CONTROL, schema::USER_INDEX
+  };
+  for (const schema::ObTableType type : types) {
+    storage_schema.table_type_ = type;
+    ASSERT_EQ(OB_SUCCESS, cache.init(table_store, storage_schema, 0));
+    ASSERT_EQ(type, cache.get_table_type());
+    ObTableStoreCache copied;
+    copied.assign(cache);
+    ASSERT_EQ(type, copied.get_table_type());
+    ASSERT_TRUE(copied == cache);
+    copied.table_type_ = schema::MAX_TABLE_TYPE;
+    ASSERT_FALSE(copied == cache);
+    cache.reset();
+    ASSERT_EQ(schema::MAX_TABLE_TYPE, cache.get_table_type());
+  }
+  // Empty shells without an old type may use a mock schema and keep the unknown sentinel.
+  storage_schema.reset();
+  ASSERT_EQ(OB_SUCCESS, cache.init(table_store, storage_schema, 0));
+  ASSERT_EQ(schema::MAX_TABLE_TYPE, cache.get_table_type());
+}
+
+TEST_F(TestTablet, test_table_store_cache_table_type_serialize)
+{
+  const uint64_t old_data_version = DATA_VERSION_4_6_2_1;
+  const uint64_t new_data_version = DATA_VERSION_4_6_3_1;
+  ObTableStoreCache cache;
+  ObTabletTableStore table_store;
+  ObStorageSchema storage_schema;
+  ASSERT_EQ(OB_SUCCESS, cache.init(table_store, storage_schema, 0));
+  const int64_t old_len = cache.get_serialize_size(old_data_version);
+  const int64_t new_len = cache.get_serialize_size(new_data_version);
+  ASSERT_EQ(old_len + serialization::encoded_length_i32(cache.table_type_), new_len);
+  char *buf = static_cast<char *>(allocator_.alloc(new_len));
+  ASSERT_NE(nullptr, buf);
+  for (int32_t type = schema::SYSTEM_TABLE; type < schema::MAX_TABLE_TYPE; ++type) {
+    cache.table_type_ = static_cast<schema::ObTableType>(type);
+    int64_t pos = 0;
+    ASSERT_EQ(OB_SUCCESS, cache.serialize(new_data_version, buf, new_len, pos, false));
+    ASSERT_EQ(new_len, pos);
+    ObTableStoreCache decoded;
+    pos = 0;
+    ASSERT_EQ(OB_SUCCESS, decoded.deserialize(buf, new_len, pos, false));
+    ASSERT_EQ(new_len, pos);
+    ASSERT_TRUE(decoded == cache);
+  }
+  cache.table_type_ = schema::AUX_LOB_META;
+  int64_t pos = 0;
+  ASSERT_EQ(OB_SUCCESS, cache.serialize(old_data_version, buf, new_len, pos, false));
+  ASSERT_EQ(old_len, pos);
+  ObTableStoreCache old_cache;
+  old_cache.table_type_ = schema::USER_TABLE;
+  pos = 0;
+  ASSERT_EQ(OB_SUCCESS, old_cache.deserialize(buf, new_len, pos, false));
+  ASSERT_EQ(old_len, pos);
+  ASSERT_TRUE(old_cache.is_inited());
+  ASSERT_EQ(schema::MAX_TABLE_TYPE, old_cache.get_table_type());
+
+  // A legacy UNKNOWN cache must be resolved before writing a non-empty tablet's new format.
+  ObTableStoreCache copied_cache;
+  copied_cache.assign(old_cache);
+  pos = 0;
+  ASSERT_EQ(OB_ERR_UNEXPECTED, copied_cache.serialize(new_data_version, buf, new_len, pos, false));
+  ASSERT_EQ(0, pos);
+  ASSERT_EQ(OB_SUCCESS, copied_cache.serialize(old_data_version, buf, new_len, pos, false));
+  ASSERT_EQ(old_len, pos);
+  ASSERT_EQ(schema::MAX_TABLE_TYPE, copied_cache.get_table_type());
+
+  pos = 0;
+  ASSERT_EQ(OB_SUCCESS, cache.serialize(new_data_version, buf, new_len, pos, false));
+  const int32_t invalid_types[] = {-1, schema::MAX_TABLE_TYPE, schema::MAX_TABLE_TYPE + 1};
+  for (const int32_t type : invalid_types) {
+    pos = old_len;
+    ASSERT_EQ(OB_SUCCESS, serialization::encode_i32(buf, new_len, pos, type));
+    ObTableStoreCache invalid_cache;
+    pos = 0;
+    ASSERT_EQ(OB_ERR_UNEXPECTED, invalid_cache.deserialize(buf, new_len, pos, false));
+    ASSERT_FALSE(invalid_cache.is_inited());
+  }
+}
+
+TEST_F(TestTablet, test_table_store_cache_codec_requires_type_unless_empty_shell)
+{
+  ObTableStoreCache cache;
+  ObTabletTableStore table_store;
+  ObStorageSchema storage_schema;
+  ASSERT_EQ(OB_SUCCESS, cache.init(table_store, storage_schema, 0));
+  const uint64_t data_version = DATA_VERSION_4_6_3_1;
+  const int64_t len = cache.get_serialize_size(data_version);
+  const int64_t type_offset = cache.get_serialize_size(DATA_VERSION_4_6_2_1);
+  char *buf = static_cast<char *>(allocator_.alloc(len));
+  ASSERT_NE(nullptr, buf);
+  const int32_t invalid_types[] = {-1, schema::MAX_TABLE_TYPE, schema::MAX_TABLE_TYPE + 1};
+  for (const int32_t type : invalid_types) {
+    cache.table_type_ = static_cast<schema::ObTableType>(type);
+    int64_t pos = 0;
+    ASSERT_EQ(OB_ERR_UNEXPECTED, cache.serialize(data_version, buf, len, pos, false));
+    ASSERT_EQ(0, pos);
+  }
+
+  const schema::ObTableType types[] = {
+      schema::USER_TABLE, schema::AUX_LOB_META, schema::MAX_TABLE_TYPE,
+      static_cast<schema::ObTableType>(schema::MAX_TABLE_TYPE + 1)
+  };
+  for (const schema::ObTableType type : types) {
+    cache.table_type_ = type;
+    int64_t pos = 0;
+    ASSERT_EQ(OB_SUCCESS, cache.serialize(data_version, buf, len, pos, true));
+    ASSERT_EQ(len, pos);
+    EXPECT_EQ(type, cache.get_table_type());
+    // Empty shells always write UNKNOWN, even if an old cache contains a known or future type.
+    int32_t wire_type = -1;
+    pos = type_offset;
+    ASSERT_EQ(OB_SUCCESS, serialization::decode_i32(buf, len, pos, &wire_type));
+    ASSERT_EQ(len, pos);
+    EXPECT_EQ(schema::MAX_TABLE_TYPE, wire_type);
+    ObTableStoreCache decoded;
+    pos = 0;
+    ASSERT_EQ(OB_SUCCESS, decoded.deserialize(buf, len, pos, true));
+    ASSERT_EQ(len, pos);
+    EXPECT_EQ(schema::MAX_TABLE_TYPE, decoded.get_table_type());
+
+    // Empty-shell readers also normalize known and future types already present in old bytes.
+    pos = type_offset;
+    ASSERT_EQ(OB_SUCCESS, serialization::encode_i32(buf, len, pos, type));
+    ASSERT_EQ(len, pos);
+    ObTableStoreCache old_empty_shell_cache;
+    pos = 0;
+    ASSERT_EQ(OB_SUCCESS, old_empty_shell_cache.deserialize(buf, len, pos, true));
+    ASSERT_EQ(len, pos);
+    EXPECT_EQ(schema::MAX_TABLE_TYPE, old_empty_shell_cache.get_table_type());
+  }
+}
+
+TEST_F(TestTablet, test_get_table_type_cache_and_schema_fallback)
+{
+  ObTablet tablet;
+  schema::ObTableType table_type = schema::MAX_TABLE_TYPE;
+  tablet.table_store_cache_.table_type_ = schema::AUX_OUTTABLE_LOB_CONTROL;
+  ASSERT_EQ(OB_SUCCESS, tablet.get_table_type(table_type));
+  ASSERT_EQ(schema::AUX_OUTTABLE_LOB_CONTROL, table_type);
+
+  tablet.table_store_cache_.reset();
+  ASSERT_NE(OB_SUCCESS, tablet.get_table_type(table_type));
+  ASSERT_EQ(schema::MAX_TABLE_TYPE, table_type);
+  schema::ObTableSchema table_schema;
+  ObStorageSchema storage_schema;
+  ASSERT_EQ(OB_SUCCESS, ObInnerTableSchema::all_tenant_profile_schema(table_schema));
+  ASSERT_EQ(OB_SUCCESS,
+      storage_schema.init(allocator_, table_schema, lib::Worker::CompatMode::MYSQL));
+  tablet.storage_schema_addr_.ptr_ = &storage_schema;
+  DEFER({ tablet.storage_schema_addr_.ptr_ = nullptr; });
+  const schema::ObTableType types[] = {
+      schema::USER_TABLE, schema::AUX_LOB_META, schema::AUX_OUTTABLE_LOB_CONTROL, schema::USER_INDEX
+  };
+  const schema::ObTableType cached_types[] = {
+      schema::MAX_TABLE_TYPE, static_cast<schema::ObTableType>(schema::MAX_TABLE_TYPE + 1)
+  };
+  for (const schema::ObTableType cached_type : cached_types) {
+    tablet.table_store_cache_.table_type_ = cached_type;
+    for (const schema::ObTableType type : types) {
+      storage_schema.table_type_ = type;
+      ASSERT_EQ(OB_SUCCESS, tablet.get_table_type(table_type));
+      ASSERT_EQ(type, table_type);
+      ASSERT_EQ(cached_type, tablet.table_store_cache_.get_table_type());
+    }
+  }
+}
+
+TEST_F(TestTablet, test_tablet_serialize_resolves_unknown_table_type)
+{
+  ObStorageSchema storage_schema;
+  ObTablet tablet;
+  DEFER({ tablet.storage_schema_addr_.ptr_ = nullptr; });
+  ASSERT_NO_FATAL_FAILURE(init_type_serialize_tablet(tablet, storage_schema, false));
+  const schema::ObTableType types[] = {
+      schema::USER_TABLE, schema::AUX_LOB_META, schema::AUX_OUTTABLE_LOB_CONTROL, schema::USER_INDEX
+  };
+  const schema::ObTableType cached_types[] = {
+      schema::MAX_TABLE_TYPE, static_cast<schema::ObTableType>(schema::MAX_TABLE_TYPE + 1)
+  };
+  for (const schema::ObTableType cached_type : cached_types) {
+    tablet.table_store_cache_.table_type_ = cached_type;
+    ObTableStoreCache original;
+    original.assign(tablet.table_store_cache_);
+    for (const schema::ObTableType type : types) {
+      storage_schema.table_type_ = type;
+      ASSERT_NO_FATAL_FAILURE(check_serialized_table_type(tablet, DATA_VERSION_4_6_3_1, type));
+      EXPECT_TRUE(original == tablet.table_store_cache_);
+    }
+  }
+}
+
+TEST_F(TestTablet, test_tablet_serialize_table_type_schema_requirements)
+{
+  ObStorageSchema storage_schema;
+  ObTablet tablet;
+  DEFER({ tablet.storage_schema_addr_.ptr_ = nullptr; });
+  ASSERT_NO_FATAL_FAILURE(init_type_serialize_tablet(tablet, storage_schema, false));
+  tablet.table_store_cache_.table_type_ = schema::MAX_TABLE_TYPE;
+  tablet.storage_schema_addr_.ptr_ = nullptr;
+  tablet.storage_schema_addr_.addr_.reset();
+  const uint64_t data_version = DATA_VERSION_4_6_3_1;
+  const int64_t len = tablet.get_self_serialize_size(data_version);
+  char *buf = static_cast<char *>(allocator_.alloc(len));
+  ASSERT_NE(nullptr, buf);
+  int64_t pos = 0;
+  EXPECT_NE(OB_SUCCESS, tablet.self_serialize(data_version, buf, len, pos));
+  EXPECT_EQ(0, pos);
+  EXPECT_EQ(schema::MAX_TABLE_TYPE, tablet.table_store_cache_.get_table_type());
+
+  tablet.storage_schema_addr_.addr_.set_none_addr();
+  // Old wire formats and already-known types must not load a missing schema.
+  ASSERT_NO_FATAL_FAILURE(
+      check_serialized_table_type(tablet, DATA_VERSION_4_6_2_1, schema::MAX_TABLE_TYPE));
+  EXPECT_EQ(schema::MAX_TABLE_TYPE, tablet.table_store_cache_.get_table_type());
+  tablet.table_store_cache_.table_type_ = schema::AUX_LOB_META;
+  ASSERT_NO_FATAL_FAILURE(check_serialized_table_type(tablet, data_version, schema::AUX_LOB_META));
+  EXPECT_EQ(schema::AUX_LOB_META, tablet.table_store_cache_.get_table_type());
+
+  tablet.table_store_cache_.table_type_ = schema::MAX_TABLE_TYPE;
+  tablet.storage_schema_addr_.ptr_ = &storage_schema;
+  const int32_t invalid_types[] = {-1, schema::MAX_TABLE_TYPE, schema::MAX_TABLE_TYPE + 1};
+  for (const int32_t type : invalid_types) {
+    storage_schema.table_type_ = static_cast<schema::ObTableType>(type);
+    pos = 0;
+    EXPECT_NE(OB_SUCCESS, tablet.self_serialize(data_version, buf, len, pos));
+    EXPECT_EQ(0, pos);
+    EXPECT_EQ(schema::MAX_TABLE_TYPE, tablet.table_store_cache_.get_table_type());
+  }
+}
+
+TEST_F(TestTablet, test_empty_shell_table_type_ignores_cache_and_schema)
+{
+  ObStorageSchema storage_schema;
+  ObTablet tablet;
+  ASSERT_NO_FATAL_FAILURE(init_type_serialize_tablet(tablet, storage_schema, true));
+  ASSERT_TRUE(tablet.is_empty_shell());
+  ASSERT_EQ(nullptr, tablet.storage_schema_addr_.ptr_);
+  const schema::ObTableType types[] = {
+      schema::MAX_TABLE_TYPE, schema::USER_TABLE, schema::AUX_LOB_META,
+      schema::AUX_OUTTABLE_LOB_CONTROL,
+      static_cast<schema::ObTableType>(schema::MAX_TABLE_TYPE + 1)
+  };
+  for (const schema::ObTableType cached_type : types) {
+    tablet.table_store_cache_.table_type_ = cached_type;
+    schema::ObTableType table_type = schema::USER_TABLE;
+    ASSERT_EQ(OB_SUCCESS, tablet.get_table_type(table_type));
+    EXPECT_EQ(schema::MAX_TABLE_TYPE, table_type);
+    ASSERT_NO_FATAL_FAILURE(
+        check_serialized_table_type(tablet, DATA_VERSION_4_6_3_1, schema::MAX_TABLE_TYPE));
+    EXPECT_EQ(cached_type, tablet.table_store_cache_.get_table_type());
+  }
+}
+
 TEST_F(TestTablet, test_table_store_cache_inc_major_table_count)
 {
   const uint64_t old_data_version = DATA_VERSION_4_6_2_0;
@@ -714,12 +1028,12 @@ TEST_F(TestTablet, test_table_store_cache_inc_major_table_count)
   char *buf = reinterpret_cast<char *>(allocator_.alloc(new_len));
   ASSERT_NE(nullptr, buf);
   int64_t pos = 0;
-  ASSERT_EQ(OB_SUCCESS, cache.serialize(new_data_version, buf, new_len, pos));
+  ASSERT_EQ(OB_SUCCESS, cache.serialize(new_data_version, buf, new_len, pos, false));
   ASSERT_EQ(new_len, pos);
 
   ObTableStoreCache decoded_cache;
   pos = 0;
-  ASSERT_EQ(OB_SUCCESS, decoded_cache.deserialize(buf, new_len, pos));
+  ASSERT_EQ(OB_SUCCESS, decoded_cache.deserialize(buf, new_len, pos, false));
   ASSERT_EQ(new_len, pos);
   EXPECT_TRUE(decoded_cache.is_async_index_refresh_target_);
   EXPECT_TRUE(decoded_cache.is_async_delete_index_);
@@ -727,11 +1041,11 @@ TEST_F(TestTablet, test_table_store_cache_inc_major_table_count)
 
   cache.inc_major_table_cnt_ = 2;
   pos = 0;
-  ASSERT_EQ(OB_SUCCESS, cache.serialize(new_data_version, buf, new_len, pos));
+  ASSERT_EQ(OB_SUCCESS, cache.serialize(new_data_version, buf, new_len, pos, false));
   ASSERT_EQ(new_len, pos);
   ObTableStoreCache count_cache;
   pos = 0;
-  ASSERT_EQ(OB_SUCCESS, count_cache.deserialize(buf, new_len, pos));
+  ASSERT_EQ(OB_SUCCESS, count_cache.deserialize(buf, new_len, pos, false));
   ASSERT_EQ(new_len, pos);
   EXPECT_EQ(2, count_cache.inc_major_table_cnt_);
   cache.inc_major_table_cnt_ = 0;
@@ -741,12 +1055,12 @@ TEST_F(TestTablet, test_table_store_cache_inc_major_table_count)
   char *old_buf = reinterpret_cast<char *>(allocator_.alloc(old_len));
   ASSERT_NE(nullptr, old_buf);
   pos = 0;
-  ASSERT_EQ(OB_SUCCESS, cache.serialize(old_data_version, old_buf, old_len, pos));
+  ASSERT_EQ(OB_SUCCESS, cache.serialize(old_data_version, old_buf, old_len, pos, false));
   ASSERT_EQ(old_len, pos);
 
   ObTableStoreCache old_cache;
   pos = 0;
-  ASSERT_EQ(OB_SUCCESS, old_cache.deserialize(old_buf, old_len, pos));
+  ASSERT_EQ(OB_SUCCESS, old_cache.deserialize(old_buf, old_len, pos, false));
   ASSERT_EQ(old_len, pos);
   EXPECT_TRUE(old_cache.is_async_index_refresh_target_);
   EXPECT_TRUE(old_cache.is_async_delete_index_);

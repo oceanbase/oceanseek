@@ -5,15 +5,14 @@
 
 #define USING_LOG_PREFIX STORAGE
 
+#include "lib/utility/utility.h"
 #include "storage/ss_garbage_collector/user_data_gc_dag_task/ob_ss_lob_meta_gc_scan_task.h"
 #include "storage/ss_garbage_collector/ob_ss_lob_gc_scan_util.h"
 #include "storage/access/ob_lob_column_iterator.h"
 #include "storage/incremental/ob_shared_meta_service.h"
 #include "storage/lob/store/ob_lob_store_common.h"
 #include "storage/meta_mem/ob_tablet_handle.h"
-#include "storage/ob_storage_schema.h"
 #include "storage/tablet/ob_tablet.h"
-#include "storage/tablet/ob_tablet_obj_load_helper.h"
 
 namespace oceanbase
 {
@@ -86,6 +85,7 @@ int ObSSLobMetaGCScanTask::process()
 {
   int ret = OB_SUCCESS;
   ObSSMarkSweepCtx *ctx = nullptr;
+  ObSSLobGCCostGuard lob_cost_guard(ctx, ObSSLobGCCostStat::META_SCAN);
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("lob meta gc scan task is not initialized", KR(ret));
@@ -107,7 +107,7 @@ int ObSSLobMetaGCScanTask::process()
         LOG_WARN("invalid lob meta scan input", KR(ret), K(scan_input));
       } else if (OB_FAIL(check_if_stopped_or_failed())) {
         LOG_WARN("failed to check lob meta scan task state", KR(ret));
-      } else if (OB_FAIL(scan_lob_meta_tablet_(scan_input, sorter))) {
+      } else if (OB_FAIL(scan_lob_meta_tablet_(scan_input, sorter, ctx->diag_mgr_))) {
         LOG_WARN("failed to scan lob meta tablet references", KR(ret), K(scan_input));
       }
     }
@@ -129,13 +129,19 @@ int ObSSLobMetaGCScanTask::process()
 
 int ObSSLobMetaGCScanTask::scan_lob_meta_tablet_(
     const ObSSGCTabletWithMetaScn &scan_input,
-    ObMarkSweepSorter &sorter)
+    ObMarkSweepSorter &sorter,
+    ObSSMarkSweepDiagMgr &diag_mgr)
 {
   int ret = OB_SUCCESS;
+  int diag_ret = OB_SUCCESS;
+  const int64_t DIAG_MACRO_BATCH_SIZE = 10240;
+  const bool record_diag = diag_mgr.is_ready_record();
+  ObArray<MacroBlockId> diag_macro_ids;
+  diag_macro_ids.set_attr(ObMemAttr(MTL_ID(), "LobGcDiagMeta"));
   ObArenaAllocator allocator(ObMemAttr(MTL_ID(), "SSGCLobMeta"));
   ObArenaAllocator row_allocator(ObMemAttr(MTL_ID(), "SSGCLobRow"));
   ObTabletHandle tablet_handle;
-  ObStorageSchema *storage_schema = nullptr;
+  schema::ObTableType table_type = schema::MAX_TABLE_TYPE;
   ObSSMetaService *meta_service = MTL(ObSSMetaService *);
   const ObSSGCTablet &gc_tablet = scan_input.gc_tablet_;
   ObSEArray<schema::ObColDesc, ObLobMetaUtil::LOB_META_MACRO_ID_COLUMN_CNT> columns;
@@ -155,17 +161,16 @@ int ObSSLobMetaGCScanTask::scan_lob_meta_tablet_(
   } else if (OB_ISNULL(tablet_handle.get_obj())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("fixed lob meta tablet is null", KR(ret), K(scan_input));
-  } else if (OB_FAIL(tablet_handle.get_obj()->load_storage_schema(allocator, storage_schema))) {
-    LOG_WARN("failed to load frozen lob meta storage schema", KR(ret), K(scan_input));
-  } else if (OB_ISNULL(storage_schema)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("lob meta storage schema is null", KR(ret), K(scan_input));
-  } else if (OB_FAIL(ObSSLobGCScanUtil::prepare_meta_scan_columns(*storage_schema, columns))) {
+  } else if (OB_FAIL(tablet_handle.get_obj()->get_table_type(table_type))) {
+    LOG_WARN("failed to get lob meta tablet type", KR(ret), K(scan_input));
+  } else if (OB_UNLIKELY(!schema::is_aux_lob_meta_table(table_type))) {
+    ret = OB_SCHEMA_ERROR;
+    LOG_WARN("unexpected table type for lob meta scan", KR(ret), K(table_type), K(scan_input));
+  } else if (OB_FAIL(ObSSLobGCScanUtil::prepare_meta_scan_columns(columns))) {
     LOG_WARN("failed to prepare lob meta scan columns", KR(ret));
   } else if (OB_FAIL(iter.init(*tablet_handle.get_obj(), columns, false))) {
     LOG_WARN("failed to open fixed lob meta row iterator", KR(ret), K(scan_input));
   }
-  ObTabletObjLoadHelper::free(allocator, storage_schema);
   // Normal InTable and Summary rows decode successfully without a macro ID and are skipped.
   // An invalid macro ID in an OutTable data row is reported as a decoding error.
   while (OB_SUCC(ret) && !is_iter_end) {
@@ -186,6 +191,22 @@ int ObSSLobMetaGCScanTask::scan_lob_meta_tablet_(
       LOG_WARN("failed to decode retained lob meta reference", KR(ret), K(scan_input));
     } else if (macro_id.is_valid() && OB_FAIL(sorter.add_item(ObGCMacroBlockItem(macro_id)))) {
       LOG_WARN("failed to retain lob meta macro", KR(ret), K(macro_id), K(scan_input));
+    } else if (macro_id.is_valid() && record_diag && OB_SUCCESS == diag_ret) {
+      // Capture each scan occurrence, independently of the sorter's deduplicated output.
+      if (OB_SUCCESS != (diag_ret = diag_macro_ids.push_back(macro_id))) {
+        LOG_WARN_RET(diag_ret, "failed to retain lob meta diagnostic macro", K(scan_input));
+        diag_mgr.mark_diag_failed(diag_ret);
+      } else if (DIAG_MACRO_BATCH_SIZE == diag_macro_ids.count()) {
+        if (OB_SUCCESS != (diag_ret = diag_mgr.write_lob_meta_kept(gc_tablet, diag_macro_ids))) {
+          LOG_WARN_RET(diag_ret, "failed to record lob meta diagnostic batch", K(scan_input));
+        }
+        diag_macro_ids.reuse();
+      }
+    }
+  }
+  if (OB_SUCC(ret) && record_diag && OB_SUCCESS == diag_ret && !diag_macro_ids.empty()) {
+    if (OB_SUCCESS != (diag_ret = diag_mgr.write_lob_meta_kept(gc_tablet, diag_macro_ids))) {
+      LOG_WARN_RET(diag_ret, "failed to record last lob meta diagnostic batch", K(scan_input));
     }
   }
   return ret;

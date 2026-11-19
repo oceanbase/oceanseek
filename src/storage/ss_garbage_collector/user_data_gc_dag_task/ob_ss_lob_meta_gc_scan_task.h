@@ -25,8 +25,10 @@ public:
       K_(start_tablet_idx), K_(end_tablet_idx));
 
 private:
-  int scan_lob_meta_tablet_(const ObSSGCTabletWithMetaScn &scan_input,
-                            ObMarkSweepSorter &sorter);
+  int scan_lob_meta_tablet_(
+      const ObSSGCTabletWithMetaScn &scan_input,
+      ObMarkSweepSorter &sorter,
+      ObSSMarkSweepDiagMgr &diag_mgr);
 
 private:
   bool is_inited_;

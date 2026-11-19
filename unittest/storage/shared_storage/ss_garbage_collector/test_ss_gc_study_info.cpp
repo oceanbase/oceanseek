@@ -263,25 +263,61 @@ TEST_F(TestSSGCStudyInfo, merge_study_info)
 TEST_F(TestSSGCStudyInfo, classify_lob_rely_table_type)
 {
   obrpc::ObSSMarkSweepGCStudyP processor;
+  ObTablet tablet;
+  ObSSGCTabletType table_type;
+  bool need_collect = false;
+  // No schema is attached: known cached types must not trigger a schema load.
+  tablet.table_store_cache_.table_type_ = schema::AUX_LOB_META;
+  ASSERT_EQ(OB_SUCCESS, processor.need_collect_lob_rely_info_(tablet, need_collect, table_type));
+  ASSERT_TRUE(need_collect);
+  ASSERT_EQ(ObSSGCTabletType::LOB_META, table_type.type_);
+
+  tablet.table_store_cache_.table_type_ = schema::AUX_OUTTABLE_LOB_CONTROL;
+  ASSERT_EQ(OB_SUCCESS, processor.need_collect_lob_rely_info_(tablet, need_collect, table_type));
+  ASSERT_TRUE(need_collect);
+  ASSERT_EQ(ObSSGCTabletType::LOB_CTRL, table_type.type_);
+
+  tablet.table_store_cache_.table_type_ = schema::USER_TABLE;
+  ASSERT_EQ(OB_SUCCESS, processor.need_collect_lob_rely_info_(tablet, need_collect, table_type));
+  ASSERT_FALSE(need_collect);
+  ASSERT_EQ(ObSSGCTabletType::NORMAL, table_type.type_);
+
+  tablet.table_store_cache_.table_type_ = schema::AUX_LOB_PIECE;
+  ASSERT_EQ(OB_SUCCESS, processor.need_collect_lob_rely_info_(tablet, need_collect, table_type));
+  ASSERT_FALSE(need_collect);
+  ASSERT_EQ(ObSSGCTabletType::NORMAL, table_type.type_);
+
+  tablet.table_store_cache_.table_type_ = schema::USER_INDEX;
+  ASSERT_EQ(OB_SUCCESS, processor.need_collect_lob_rely_info_(tablet, need_collect, table_type));
+  ASSERT_FALSE(need_collect);
+  ASSERT_EQ(ObSSGCTabletType::NORMAL, table_type.type_);
+
+  // An unknown type without a readable schema must fail instead of skipping LOB dependencies.
+  table_type = ObSSGCTabletType::LOB_META;
+  need_collect = true;
+  tablet.table_store_cache_.reset();
+  ASSERT_NE(OB_SUCCESS, processor.need_collect_lob_rely_info_(tablet, need_collect, table_type));
+  ASSERT_FALSE(need_collect);
+  ASSERT_EQ(ObSSGCTabletType::UNKNOWN, table_type.type_);
+}
+
+TEST_F(TestSSGCStudyInfo, classify_gc_table_type_from_storage_schema)
+{
   ObStorageSchema storage_schema;
   ObSSGCTabletType table_type;
   storage_schema.table_type_ = share::schema::ObTableType::AUX_LOB_META;
-  ASSERT_TRUE(processor.need_collect_lob_rely_info_(storage_schema));
   ASSERT_EQ(OB_SUCCESS, ObSSGCTabletType::get_ss_gc_tablet_type(storage_schema, table_type));
   ASSERT_EQ(ObSSGCTabletType::LOB_META, table_type.type_);
 
   storage_schema.table_type_ = share::schema::ObTableType::AUX_OUTTABLE_LOB_CONTROL;
-  ASSERT_TRUE(processor.need_collect_lob_rely_info_(storage_schema));
   ASSERT_EQ(OB_SUCCESS, ObSSGCTabletType::get_ss_gc_tablet_type(storage_schema, table_type));
   ASSERT_EQ(ObSSGCTabletType::LOB_CTRL, table_type.type_);
 
   storage_schema.table_type_ = share::schema::ObTableType::USER_TABLE;
-  ASSERT_FALSE(processor.need_collect_lob_rely_info_(storage_schema));
   ASSERT_EQ(OB_SUCCESS, ObSSGCTabletType::get_ss_gc_tablet_type(storage_schema, table_type));
   ASSERT_EQ(ObSSGCTabletType::NORMAL, table_type.type_);
 
   storage_schema.table_type_ = share::schema::ObTableType::AUX_LOB_PIECE;
-  ASSERT_FALSE(processor.need_collect_lob_rely_info_(storage_schema));
   ASSERT_EQ(OB_SUCCESS, ObSSGCTabletType::get_ss_gc_tablet_type(storage_schema, table_type));
   ASSERT_EQ(ObSSGCTabletType::NORMAL, table_type.type_);
 }

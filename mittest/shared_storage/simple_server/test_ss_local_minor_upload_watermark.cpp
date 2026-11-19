@@ -490,6 +490,7 @@ TEST_F(ObSSLocalMinorWatermarkTest, lob_ctrl_emergency_minor_checks_uploaded_che
   param.merge_type_ = MINOR_MERGE;
   ObGetMergeTablesResult result;
   schema.table_type_ = share::schema::AUX_OUTTABLE_LOB_CONTROL;
+  ASSERT_EQ(OB_SUCCESS, tablet.table_store_cache_.init(store, schema, 0 /*max_medium_scn*/));
   ASSERT_TRUE(schema.is_aux_outtable_lob_control_table());
   ASSERT_EQ(OB_SUCCESS, ObPartitionMergePolicy::find_minor_merge_tables(
       param, 0 /*min_snapshot*/, INT64_MAX /*max_snapshot*/, ls, tablet, result));
@@ -500,8 +501,17 @@ TEST_F(ObSSLocalMinorWatermarkTest, lob_ctrl_emergency_minor_checks_uploaded_che
     ASSERT_EQ(tables.at(i)->get_key(), result.handle_.get_table(i)->get_key());
   }
 
+  // Older tablets without a cached type must preserve the same Ctrl checkpoint restriction.
+  tablet.table_store_cache_.table_type_ = share::schema::MAX_TABLE_TYPE;
+  ASSERT_EQ(OB_SUCCESS, ObPartitionMergePolicy::find_minor_merge_tables(
+      param, 0 /*min_snapshot*/, INT64_MAX /*max_snapshot*/, ls, tablet, result));
+  ASSERT_EQ(uploaded_count, result.handle_.get_count());
+  ASSERT_EQ(checkpoint, result.scn_range_.end_scn_);
+  ASSERT_EQ(share::schema::MAX_TABLE_TYPE, tablet.table_store_cache_.get_table_type());
+
   // Control group: identical inputs as a normal table must retain the emergency bypass.
   schema.table_type_ = source_schema->get_table_type();
+  ASSERT_EQ(OB_SUCCESS, tablet.table_store_cache_.init(store, schema, 0 /*max_medium_scn*/));
   ASSERT_FALSE(schema.is_aux_outtable_lob_control_table());
   ASSERT_EQ(OB_SUCCESS, ObPartitionMergePolicy::find_minor_merge_tables(
       param, 0 /*min_snapshot*/, INT64_MAX /*max_snapshot*/, ls, tablet, result));
@@ -532,6 +542,7 @@ TEST_F(ObSSLocalMinorWatermarkTest, lob_ctrl_emergency_minor_checks_uploaded_che
   ASSERT_TRUE(tablet.get_tablet_meta().has_transfer_table());
 
   schema.table_type_ = share::schema::AUX_OUTTABLE_LOB_CONTROL;
+  ASSERT_EQ(OB_SUCCESS, tablet.table_store_cache_.init(store, schema, 0 /*max_medium_scn*/));
   ASSERT_EQ(OB_SUCCESS, ObPartitionMergePolicy::find_minor_merge_tables(
       param, 0 /*min_snapshot*/, INT64_MAX /*max_snapshot*/, ls, tablet, result));
   ASSERT_EQ(uploaded_count, result.handle_.get_count());
@@ -541,6 +552,7 @@ TEST_F(ObSSLocalMinorWatermarkTest, lob_ctrl_emergency_minor_checks_uploaded_che
     ASSERT_EQ(tables.at(i)->get_key(), result.handle_.get_table(i)->get_key());
   }
   schema.table_type_ = source_schema->get_table_type();
+  ASSERT_EQ(OB_SUCCESS, tablet.table_store_cache_.init(store, schema, 0 /*max_medium_scn*/));
   ASSERT_EQ(OB_SUCCESS, ObPartitionMergePolicy::find_minor_merge_tables(
       param, 0 /*min_snapshot*/, INT64_MAX /*max_snapshot*/, ls, tablet, result));
   ASSERT_EQ(local_count, result.handle_.get_count());
@@ -554,6 +566,7 @@ TEST_F(ObSSLocalMinorWatermarkTest, lob_ctrl_emergency_minor_checks_uploaded_che
       transfer_info.ls_id_, RunCtx.tablet_id_, transfer_info.src_reorganization_scn_,
       allocator, missing_source));
   schema.table_type_ = share::schema::AUX_OUTTABLE_LOB_CONTROL;
+  ASSERT_EQ(OB_SUCCESS, tablet.table_store_cache_.init(store, schema, 0 /*max_medium_scn*/));
   ASSERT_EQ(OB_NO_NEED_MERGE, ObPartitionMergePolicy::find_minor_merge_tables(
       param, 0 /*min_snapshot*/, INT64_MAX /*max_snapshot*/, ls, tablet, result));
   ASSERT_EQ(0, result.handle_.get_count());

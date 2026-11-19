@@ -148,6 +148,58 @@ public:
   int64_t merged_kept_size_;
 };
 
+// LOB phases are independent of the system DEL/KEPT merge statistics.
+// Record once at each task's exit, including failures and time spent retrying.
+struct ObSSLobGCCostStat final
+{
+  enum Stage
+  {
+    PREPARE = 0,
+    META_SCAN,
+    META_MERGE,
+    CTRL_SCAN,
+    CTRL_MERGE,
+    DIFF,
+    CTRL_DELETE,
+    STAGE_COUNT
+  };
+
+  ObSSLobGCCostStat() { reset(); }
+  void reset();
+  void record_cost(const Stage stage, const int64_t start_us, const int64_t end_us);
+  // A phase that never ran has a cost of -1, distinct from a zero-duration task.
+  int64_t get_stage_cost_us(const Stage stage) const;
+  // Span of recorded LOB tasks only; later system GC work is excluded.
+  int64_t get_total_cost_us() const;
+  int64_t to_string(char *buf, const int64_t buf_len) const;
+  int64_t to_task_cost_string(char *buf, const int64_t buf_len) const;
+
+  int64_t start_us_[STAGE_COUNT];
+  int64_t end_us_[STAGE_COUNT];
+  // Sum of task durations, including waits/retries; not CPU time or normalized by parallelism.
+  int64_t task_cost_us_[STAGE_COUNT];
+};
+
+// Records on scope exit, including failed tasks and time spent retrying.
+// The local ctx pointer is bound by reference because get_ctx() assigns it after construction.
+class ObSSLobGCCostGuard final
+{
+public:
+  // META_MERGE is recorded only for the supplied LOB Meta pipeline.
+  ObSSLobGCCostGuard(
+      ObSSMarkSweepCtx *&ctx,
+      const ObSSLobGCCostStat::Stage stage,
+      const ObMarkSweepPipeline *pipeline = nullptr);
+  ~ObSSLobGCCostGuard();
+
+private:
+  ObSSMarkSweepCtx *const &ctx_;
+  const ObSSLobGCCostStat::Stage stage_;
+  const ObMarkSweepPipeline *const pipeline_;
+  const int64_t start_us_;
+  DISALLOW_COPY_AND_ASSIGN(ObSSLobGCCostGuard);
+};
+
 // ====================================================================================
 // Per-group merge status of one ObSSMarkSweepDag, used for live progress reporting in
 // fill_info_param.
@@ -316,6 +368,8 @@ public:
   // reported into the FINISH_MARK_SWEEP_GC event at report_result.
   // Not included in TO_STRING_KV to avoid log noise.
   ObSSMarkSweepCostStat cost_stat_;
+  // Reported separately in MARK_SWEEP_LOB_GC_STAT; excluded from TO_STRING_KV.
+  ObSSLobGCCostStat lob_cost_stat_;
   // Diagnostic recorder shared by all SortTasks of this round; created in PrepareTask only
   // when _enable_shared_mark_sweep_gc_diagnose is on, finished/aborted in report_result.
   // The manager owns the enabled gate; use diag_mgr_.is_ready_record() to decide whether to
@@ -862,7 +916,6 @@ public:
   VIRTUAL_TO_STRING_KV("task", "ObSSMarkSweepMergeCompleteTask", KP(this));
 
 private:
-  int process_lob_meta_pipeline_(ObSSMarkSweepCtx &ctx);
   int process_system_gc_pipeline_(ObSSMarkSweepCtx &ctx, int64_t &retry_cnt);
 
   struct CompleteSystemMergeFn {

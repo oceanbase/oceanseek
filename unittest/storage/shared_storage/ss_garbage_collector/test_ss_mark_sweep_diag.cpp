@@ -466,6 +466,78 @@ TEST_F(TestSSMarkSweepDiag, study_record_filters_complete_tablet_key)
   ASSERT_EQ(OB_SUCCESS, diag.advance_cursor_to_next_row_(has_row));
   ASSERT_FALSE(has_row);
 }
+TEST_F(TestSSMarkSweepDiag, lob_meta_raw_records_preserve_duplicates_and_source_filters)
+{
+  const int64_t sequences[] = {9, 3, 9};
+  const ObSSGCTablet tablets[] = {
+      ObSSGCTablet(ObLSID(1), ObTabletID(1001), SCN::min_scn()),
+      ObSSGCTablet(ObLSID(2), ObTabletID(1002), SCN::base_scn())};
+  for (const bool filter : {false, true}) {
+    ObAllVirtualSharedGCDiagnose diag;
+    ObObj cells[5];
+    char buf[2048] = {0};
+    int64_t pos = 0;
+    for (int64_t i = 0; i < ARRAYSIZEOF(tablets); ++i) {
+      const int64_t start_pos = pos;
+      ASSERT_EQ(OB_SUCCESS, tablets[i].serialize(buf, sizeof(buf), pos));
+      ASSERT_EQ(OB_SUCCESS,
+          serialization::encode_i64(buf, sizeof(buf), pos, ARRAYSIZEOF(sequences)));
+      for (const int64_t sequence : sequences) {
+        const MacroBlockId macro_id(MacroBlockId::DEFAULT_FIRST_ID, sequence, 0, 0, 0);
+        ASSERT_EQ(OB_SUCCESS, macro_id.serialize(buf, sizeof(buf), pos));
+      }
+      ASSERT_EQ(OB_SUCCESS, diag.cur_records_.push_back(
+          ObString(static_cast<int32_t>(pos - start_pos), buf + start_pos)));
+    }
+    diag.group_idx_ = static_cast<int64_t>(ObMarkSweepGroupType::DEL);
+    diag.type_idx_ = static_cast<int64_t>(ObSSMarkSweepDiagFileType::LOB_META_KEPT);
+    diag.has_group_filter_ = true;
+    diag.group_filter_ = ObAllVirtualSharedGCDiagnose::DiagGroupType::LOB_USER_GC;
+    diag.has_type_filter_ = true;
+    diag.type_filter_ = ObSSMarkSweepDiagFileType::LOB_META_KEPT;
+    diag.is_buckets_listed_ = true;
+    diag.has_tablet_id_filter_ = filter;
+    diag.tablet_id_filter_ = tablets[1].tablet_id_.id();
+    diag.has_ls_id_filter_ = filter;
+    diag.ls_id_filter_ = tablets[1].ls_id_.id();
+    diag.has_reorg_scn_filter_ = filter;
+    diag.reorg_scn_filter_ = tablets[1].transfer_scn_.get_val_for_inner_table_field();
+    diag.cur_row_.cells_ = cells;
+    diag.cur_row_.count_ = ARRAYSIZEOF(cells);
+    ASSERT_EQ(OB_SUCCESS, diag.output_column_ids_.push_back(ObAllVirtualSharedGCDiagnose::LS_ID));
+    ASSERT_EQ(OB_SUCCESS,
+        diag.output_column_ids_.push_back(ObAllVirtualSharedGCDiagnose::TABLET_ID));
+    ASSERT_EQ(OB_SUCCESS,
+        diag.output_column_ids_.push_back(ObAllVirtualSharedGCDiagnose::REORGANIZATION_SCN));
+    ASSERT_EQ(OB_SUCCESS, diag.output_column_ids_.push_back(ObAllVirtualSharedGCDiagnose::TYPE));
+    ASSERT_EQ(OB_SUCCESS, diag.output_column_ids_.push_back(ObAllVirtualSharedGCDiagnose::VALUE));
+    bool has_row = false;
+    const int64_t first_tablet = filter ? 1 : 0;
+    for (int64_t i = first_tablet; i < ARRAYSIZEOF(tablets); ++i) {
+      for (int64_t j = 0; j < ARRAYSIZEOF(sequences); ++j) {
+        const MacroBlockId expected(MacroBlockId::DEFAULT_FIRST_ID, sequences[j], 0, 0, 0);
+        char macro_buf[256] = {0};
+        const int64_t len = expected.to_string(macro_buf, sizeof(macro_buf));
+        ASSERT_EQ(OB_SUCCESS, diag.advance_cursor_to_next_row_(has_row));
+        ASSERT_TRUE(has_row);
+        ASSERT_EQ(tablets[i].ls_id_.id(), cells[0].get_int());
+        ASSERT_EQ(tablets[i].tablet_id_.id(), cells[1].get_int());
+        ASSERT_EQ(tablets[i].transfer_scn_.get_val_for_inner_table_field(), cells[2].get_int());
+        ASSERT_EQ(0, cells[3].get_string().case_compare("lob_meta_kept"));
+        ASSERT_EQ(ObString(static_cast<int32_t>(len), macro_buf), cells[4].get_string());
+        ASSERT_EQ(tablets[i], diag.cur_lob_meta_rows_.tablet_);
+        ASSERT_EQ(ARRAYSIZEOF(sequences), diag.cur_lob_meta_rows_.macro_ids_.count());
+        ASSERT_EQ(expected, diag.cur_lob_meta_rows_.macro_ids_.at(j));
+      }
+    }
+    ASSERT_EQ(OB_SUCCESS, diag.advance_cursor_to_next_row_(has_row));
+    ASSERT_FALSE(has_row);
+    diag.reset();
+    ASSERT_FALSE(diag.cur_lob_meta_rows_.tablet_.is_valid());
+    ASSERT_TRUE(diag.cur_lob_meta_rows_.macro_ids_.empty());
+  }
+}
+
 } // namespace unittest
 } // namespace oceanbase
 

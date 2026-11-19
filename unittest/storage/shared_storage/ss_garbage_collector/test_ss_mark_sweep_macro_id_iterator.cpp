@@ -12,6 +12,7 @@
 #include "storage/lob/store/ob_lob_outtable_io.h"
 #include "storage/lob/store/ob_lob_store_common.h"
 #include "storage/lob/store/ob_outtable_lob_control_page_iterator.h"
+#include "storage/ss_garbage_collector/ob_ss_lob_gc_scan_util.h"
 #define private public
 #include "storage/ss_data_check/ob_ss_data_check_macro_id_iterator.h"
 #include "storage/ss_garbage_collector/ob_ss_mark_sweep_macro_id_iterator.h"
@@ -421,6 +422,7 @@ TEST_F(TestSSMarkSweepMacroIDIterator, actual_meta_and_ctrl_schema_projection)
     for (const bool simplified : {false, true}) {
       TabletFixture f;
       prepare_tablet(f, type, simplified);
+      ASSERT_EQ(OB_SUCCESS, f.tablet_.table_store_cache_.init(f.store_, f.schema_, 0));
       ObSSMarkSweepMacroIDIterator iter;
       ASSERT_EQ(OB_SUCCESS, iter.init_user_iterator_(f.tablet_));
       ASSERT_NE(nullptr, iter.out_table_data_iter_);
@@ -429,12 +431,44 @@ TEST_F(TestSSMarkSweepMacroIDIterator, actual_meta_and_ctrl_schema_projection)
       ASSERT_EQ((AUX_LOB_META == type) ? 7 : 0, iter.out_table_data_iter_->projector_.at(0));
       if (AUX_LOB_META == type) {
         ASSERT_EQ(8, iter.out_table_data_iter_->projector_.at(1));
+        ObSSDataCheckMacroIDIterator check_iter;
+        ASSERT_EQ(OB_SUCCESS, check_iter.init_lob_meta_iterator_(f.tablet_));
+        ASSERT_NE(nullptr, check_iter.out_table_data_iter_);
+        ASSERT_TRUE(check_iter.out_table_data_iter_->skip_uncommitted_);
+        ASSERT_EQ(2, check_iter.out_table_data_iter_->projector_.count());
+        ASSERT_EQ(7, check_iter.out_table_data_iter_->projector_.at(0));
+        ASSERT_EQ(8, check_iter.out_table_data_iter_->projector_.at(1));
       }
       MacroBlockId id;
       ASSERT_EQ(OB_ITER_END, iter.get_next_user_macro_id_(id));
       ASSERT_EQ(nullptr, iter.out_table_data_iter_);
     }
   }
+}
+
+TEST_F(TestSSMarkSweepMacroIDIterator, column_iterator_still_validates_meta_requests)
+{
+  for (const bool simplified : {false, true}) {
+    TabletFixture f;
+    prepare_tablet(f, AUX_LOB_META, simplified);
+    ObSEArray<ObColDesc, ObLobMetaUtil::LOB_META_MACRO_ID_COLUMN_CNT> columns;
+    ASSERT_EQ(OB_SUCCESS, ObSSLobGCScanUtil::prepare_meta_scan_columns(columns));
+    columns.at(0).col_id_ = OB_APP_MIN_COLUMN_ID + f.schema_.get_column_count();
+    ObLobColumnIterator missing_column_iter;
+    ASSERT_EQ(OB_INVALID_ARGUMENT, missing_column_iter.init(f.tablet_, columns, false));
+    if (!simplified) {
+      ASSERT_EQ(OB_SUCCESS, ObSSLobGCScanUtil::prepare_meta_scan_columns(columns));
+      columns.at(0).col_type_.set_int();
+      ObLobColumnIterator wrong_type_iter;
+      ASSERT_EQ(OB_INVALID_ARGUMENT, wrong_type_iter.init(f.tablet_, columns, false));
+    }
+  }
+  TabletFixture f;
+  prepare_tablet(f, USER_TABLE);
+  ObSEArray<ObColDesc, ObLobMetaUtil::LOB_META_MACRO_ID_COLUMN_CNT> columns;
+  ASSERT_EQ(OB_SUCCESS, ObSSLobGCScanUtil::prepare_meta_scan_columns(columns));
+  ObLobColumnIterator wrong_table_iter;
+  ASSERT_EQ(OB_NOT_SUPPORTED, wrong_table_iter.init(f.tablet_, columns, false));
 }
 
 TEST_F(TestSSMarkSweepMacroIDIterator, gc_retains_uncommitted_references_across_tablet_switch)
@@ -504,10 +538,64 @@ TEST_F(TestSSMarkSweepMacroIDIterator, skips_normal_index_and_empty_shell_tablet
   ASSERT_EQ(nullptr, iter.out_table_data_iter_);
 }
 
+TEST_F(TestSSMarkSweepMacroIDIterator, cached_types_skip_unneeded_schema_loads)
+{
+  for (const ObTableType type : {USER_TABLE, USER_INDEX, AUX_LOB_PIECE}) {
+    ObTablet tablet;
+    tablet.table_store_cache_.table_type_ = type;
+    // These tablets have no schema or table store; classification must use the cache only.
+    ObSSMarkSweepMacroIDIterator gc_iter;
+    ASSERT_EQ(OB_SUCCESS, gc_iter.init_user_iterator_(tablet));
+    ASSERT_EQ(nullptr, gc_iter.out_table_data_iter_);
+    ObSSDataCheckMacroIDIterator check_iter;
+    ASSERT_EQ(OB_SUCCESS, check_iter.init_lob_meta_iterator_(tablet));
+    ASSERT_EQ(nullptr, check_iter.out_table_data_iter_);
+  }
+  ObTablet ctrl_tablet;
+  ctrl_tablet.table_store_cache_.table_type_ = AUX_OUTTABLE_LOB_CONTROL;
+  ObSSDataCheckMacroIDIterator check_iter;
+  ASSERT_EQ(OB_SUCCESS, check_iter.init_lob_meta_iterator_(ctrl_tablet));
+  ASSERT_EQ(nullptr, check_iter.out_table_data_iter_);
+}
+
+TEST_F(TestSSMarkSweepMacroIDIterator, unknown_type_uses_schema_without_updating_cache)
+{
+  for (const ObTableType type : {USER_TABLE, USER_INDEX, AUX_LOB_META, AUX_OUTTABLE_LOB_CONTROL}) {
+    TabletFixture f;
+    prepare_tablet(f, type);
+    ASSERT_EQ(MAX_TABLE_TYPE, f.tablet_.table_store_cache_.get_table_type());
+    ObSSMarkSweepMacroIDIterator gc_iter;
+    ASSERT_EQ(OB_SUCCESS, gc_iter.init_user_iterator_(f.tablet_));
+    ASSERT_EQ(AUX_LOB_META == type || AUX_OUTTABLE_LOB_CONTROL == type,
+        nullptr != gc_iter.out_table_data_iter_);
+    ObSSDataCheckMacroIDIterator check_iter;
+    ASSERT_EQ(OB_SUCCESS, check_iter.init_lob_meta_iterator_(f.tablet_));
+    ASSERT_EQ(AUX_LOB_META == type, nullptr != check_iter.out_table_data_iter_);
+    ASSERT_EQ(MAX_TABLE_TYPE, f.tablet_.table_store_cache_.get_table_type());
+  }
+}
+
+TEST_F(TestSSMarkSweepMacroIDIterator, unknown_type_without_schema_is_an_error)
+{
+  ObTablet tablet;
+  ASSERT_EQ(MAX_TABLE_TYPE, tablet.table_store_cache_.get_table_type());
+  ObSSMarkSweepMacroIDIterator gc_iter;
+  ASSERT_EQ(OB_INVALID_ARGUMENT, gc_iter.init_user_iterator_(tablet));
+  ObSSDataCheckMacroIDIterator check_iter;
+  ASSERT_EQ(OB_INVALID_ARGUMENT, check_iter.init_lob_meta_iterator_(tablet));
+
+  tablet.tablet_meta_.is_empty_shell_ = true;
+  ASSERT_EQ(OB_SUCCESS, gc_iter.init_user_iterator_(tablet));
+  ASSERT_EQ(OB_SUCCESS, check_iter.init_lob_meta_iterator_(tablet));
+  ASSERT_EQ(nullptr, gc_iter.out_table_data_iter_);
+  ASSERT_EQ(nullptr, check_iter.out_table_data_iter_);
+}
+
 TEST_F(TestSSMarkSweepMacroIDIterator, schema_and_table_store_errors_are_not_empty_scans)
 {
   TabletFixture f;
   prepare_tablet(f, AUX_LOB_META);
+  ASSERT_EQ(OB_SUCCESS, f.tablet_.table_store_cache_.init(f.store_, f.schema_, 0));
   f.store_.is_inited_ = false;
   {
     ObSSMarkSweepMacroIDIterator iter;
@@ -517,6 +605,8 @@ TEST_F(TestSSMarkSweepMacroIDIterator, schema_and_table_store_errors_are_not_emp
   f.tablet_.storage_schema_addr_.ptr_ = nullptr;
   ObSSMarkSweepMacroIDIterator iter;
   ASSERT_EQ(OB_INVALID_ARGUMENT, iter.init_user_iterator_(f.tablet_));
+  ObSSDataCheckMacroIDIterator check_iter;
+  ASSERT_EQ(OB_INVALID_ARGUMENT, check_iter.init_lob_meta_iterator_(f.tablet_));
 }
 
 TEST_F(TestSSMarkSweepMacroIDIterator, ctrl_preserves_physical_flags_versions_and_statuses)

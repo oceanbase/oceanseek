@@ -28,7 +28,8 @@ private:
   int scan_lob_ctrl_tablet_(const ObSSGCTabletWithMetaScn &scan_input,
       ObSSLobCtrlGCScanSorter &sorter);
   int add_lob_ctrl_row_(const blocksstable::ObDatumRow &row,
-      const share::SCN &min_outtable_data_scn, ObSSLobCtrlGCScanSorter &sorter);
+      const share::SCN &min_outtable_data_scn, ObSSLobCtrlGCScanSorter &sorter,
+      ObSSOuttableLobCtrlCandidate &item);
   int write_lob_ctrl_scan_file_(ObSSMarkSweepCtx &ctx, ObSSLobCtrlGCScanSorter &sorter);
 
 private:

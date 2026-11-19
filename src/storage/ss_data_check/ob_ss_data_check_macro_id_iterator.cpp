@@ -8,10 +8,8 @@
 #include "storage/ss_data_check/ob_ss_data_check_macro_id_iterator.h"
 #include "storage/incremental/ssmeta/ob_ss_meta_info_util.h"
 #include "storage/lob/store/ob_lob_store_common.h"
-#include "storage/ob_storage_schema.h"
 #include "storage/ss_garbage_collector/ob_ss_lob_gc_scan_util.h"
 #include "storage/tablet/ob_tablet.h"
-#include "storage/tablet/ob_tablet_obj_load_helper.h"
 
 namespace oceanbase
 {
@@ -96,17 +94,14 @@ int ObSSDataCheckMacroIDIterator::prepare_lob_meta_iterator_()
 int ObSSDataCheckMacroIDIterator::init_lob_meta_iterator_(const ObTablet &tablet)
 {
   int ret = OB_SUCCESS;
-  ObStorageSchema *storage_schema = nullptr;
+  schema::ObTableType table_type = schema::MAX_TABLE_TYPE;
   ObSEArray<schema::ObColDesc, ObLobMetaUtil::LOB_META_MACRO_ID_COLUMN_CNT> columns;
   if (tablet.is_empty_shell()) {
     // Empty shells have no row references or loadable StorageSchema.
-  } else if (OB_FAIL(tablet.load_storage_schema(allocator_, storage_schema))) {
-    LOG_WARN("failed to load data check tablet schema", KR(ret), K_(gc_tablet));
-  } else if (OB_ISNULL(storage_schema)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("data check tablet schema is null", KR(ret), K_(gc_tablet));
-  } else if (storage_schema->is_aux_lob_meta_table()) {
-    if (OB_FAIL(ObSSLobGCScanUtil::prepare_meta_scan_columns(*storage_schema, columns))) {
+  } else if (OB_FAIL(tablet.get_table_type(table_type))) {
+    LOG_WARN("failed to get data check tablet type", KR(ret), K_(gc_tablet));
+  } else if (schema::is_aux_lob_meta_table(table_type)) {
+    if (OB_FAIL(ObSSLobGCScanUtil::prepare_meta_scan_columns(columns))) {
       LOG_WARN("failed to prepare data check lob meta columns", KR(ret));
     } else if (OB_ISNULL(out_table_data_iter_ = OB_NEWx(ObLobColumnIterator, &allocator_))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -115,7 +110,6 @@ int ObSSDataCheckMacroIDIterator::init_lob_meta_iterator_(const ObTablet &tablet
       LOG_WARN("failed to initialize data check lob meta iterator", KR(ret), K_(gc_tablet));
     }
   }
-  ObTabletObjLoadHelper::free(allocator_, storage_schema);
   return ret;
 }
 

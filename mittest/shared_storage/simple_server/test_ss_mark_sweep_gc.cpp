@@ -2381,6 +2381,7 @@ static int read_all_buckets_lob_meta_kept(
     const uint64_t tenant_id,
     const int64_t round_id,
     const int64_t bucket_cnt,
+    const ObSSGCTablet &expected_tablet,
     ObIAllocator &allocator,
     ObIArray<MacroBlockId> &macro_ids)
 {
@@ -2402,8 +2403,11 @@ static int read_all_buckets_lob_meta_kept(
           break;
         }
         for (int64_t i = 0; OB_SUCC(ret) && i < records.count(); ++i) {
-          ObSSLobMetaGCDiagRows rows;
-          if (OB_FAIL(ObSSMarkSweepDiagMgr::decode_lob_meta_kept_record(records.at(i), rows))) {
+          ObSSMarkSweepDiagTabletMacros rows;
+          if (OB_FAIL(ObSSMarkSweepDiagMgr::decode_macros_record(records.at(i), rows))) {
+          } else if (!(rows.tablet_ == expected_tablet)
+              || static_cast<uint64_t>(bucket) != expected_tablet.hash() % bucket_cnt) {
+            ret = OB_ERR_UNEXPECTED;
           } else {
             for (int64_t j = 0; OB_SUCC(ret) && j < rows.macro_ids_.count(); ++j) {
               if (OB_FAIL(macro_ids.push_back(rows.macro_ids_.at(j)))) {
@@ -2702,82 +2706,70 @@ TEST_F(TestSSMarkSweepGC, diagnose_manager_round_trip)
   }
 }
 
-TEST_F(TestSSMarkSweepGC, diagnose_lob_meta_kept_file_round_trip)
+TEST_F(TestSSMarkSweepGC, diagnose_lob_meta_scan_rows_round_trip)
 {
   const int64_t round_id = 20002;
   const int64_t bucket_cnt = 4;
   const int64_t macro_count = 1025;
-  const int64_t memory_limit = 8L << 20;
-  const int64_t file_buf_size = 32L << 10;
+  const int64_t batch_size = 1024;
   const ObLSID ls_id(1001);
   const ObTabletID tablet_id(400004);
-  ObGCMacroBlockCompare compare;
-  ObMarkSweepPipeline pipeline;
+  const ObSSGCTablet tablet(ls_id, tablet_id, SCN::min_scn());
   ObArray<MacroBlockId> expected_macro_ids;
+  ObArray<MacroBlockId> batch;
   share::ObTenantSwitchGuard guard;
   ASSERT_EQ(OB_SUCCESS, guard.switch_to(tenant_id_));
-  ASSERT_EQ(OB_SUCCESS, pipeline.init(
-      tenant_id_, memory_limit, file_buf_size, 0 /*expire_timestamp*/, &compare));
-  {
-    ObMarkSweepSorter sorter;
-    ObSEArray<ObSortedFileInfo, 16> files;
-    ASSERT_EQ(OB_SUCCESS, sorter.init(&pipeline));
-    for (int64_t i = 0; i < macro_count; ++i) {
-      MacroBlockId macro_id;
-      ASSERT_EQ(OB_SUCCESS, build_sstable_macro_id_(
-          blocksstable::ObStorageObjectType::SHARED_MINI_DATA_MACRO,
-          ls_id, tablet_id, i, macro_id));
-      ASSERT_EQ(OB_SUCCESS, expected_macro_ids.push_back(macro_id));
-      ASSERT_EQ(OB_SUCCESS, sorter.add_item(ObGCMacroBlockItem(macro_id)));
-    }
-    ASSERT_EQ(OB_SUCCESS, sorter.finish(files));
-    ASSERT_EQ(1, files.count());
-    ASSERT_EQ(OB_SUCCESS, pipeline.add_file(ObMarkSweepGroupType::KEPT, files.at(0)));
-  }
-  ASSERT_EQ(OB_SUCCESS, pipeline.prepare_merge());
-  ASSERT_EQ(OB_SUCCESS, pipeline.complete_group(ObMarkSweepGroupType::KEPT));
-  ObSortedFileInfo kept_file;
-  ASSERT_EQ(OB_SUCCESS, pipeline.get_merged_file(ObMarkSweepGroupType::KEPT, kept_file));
-  ASSERT_EQ(macro_count, kept_file.item_count_);
-
   ObSSMarkSweepDiagMgr mgr;
   ASSERT_EQ(OB_SUCCESS, mgr.init(tenant_id_, round_id, bucket_cnt));
-  ASSERT_EQ(OB_SUCCESS, mgr.write_lob_meta_kept_file(kept_file, file_buf_size));
+  for (int64_t i = 0; i < macro_count; ++i) {
+    MacroBlockId macro_id;
+    // Repeated, non-sorted references must survive both full and tail diagnostic batches.
+    ASSERT_EQ(OB_SUCCESS, build_sstable_macro_id_(
+        blocksstable::ObStorageObjectType::SHARED_MINI_DATA_MACRO,
+        ls_id, tablet_id, 3 - i % 3, macro_id));
+    ASSERT_EQ(OB_SUCCESS, expected_macro_ids.push_back(macro_id));
+    ASSERT_EQ(OB_SUCCESS, batch.push_back(macro_id));
+    if (batch_size == batch.count()) {
+      ASSERT_EQ(OB_SUCCESS, mgr.write_lob_meta_kept(tablet, batch));
+      batch.reuse();
+    }
+  }
+  ASSERT_EQ(1, batch.count());
+  ASSERT_EQ(OB_SUCCESS, mgr.write_lob_meta_kept(tablet, batch));
   ASSERT_EQ(OB_SUCCESS, mgr.complete());
 
   ObArenaAllocator allocator;
   ObArray<MacroBlockId> actual_macro_ids;
   ASSERT_EQ(OB_SUCCESS, read_all_buckets_lob_meta_kept(
-      tenant_id_, round_id, bucket_cnt, allocator, actual_macro_ids));
+      tenant_id_, round_id, bucket_cnt, tablet, allocator, actual_macro_ids));
   ASSERT_EQ(expected_macro_ids.count(), actual_macro_ids.count());
   for (int64_t i = 0; i < expected_macro_ids.count(); ++i) {
-    bool found = false;
-    for (int64_t j = 0; !found && j < actual_macro_ids.count(); ++j) {
-      found = expected_macro_ids.at(i) == actual_macro_ids.at(j);
-    }
-    ASSERT_TRUE(found) << "missing macro index " << i;
+    ASSERT_EQ(expected_macro_ids.at(i), actual_macro_ids.at(i)) << "macro index " << i;
   }
 }
 
 TEST_F(TestSSMarkSweepGC, diagnose_lob_ctrl_rows_and_file_round_trip)
 {
   const int64_t round_id = 20003;
-  const int64_t bucket_cnt = 4;
-  const int64_t direct_row_count = 4;
+  const int64_t bucket_cnt = 1;
+  const int64_t direct_row_count = 10241;
+  const int64_t batch_size = 10240;
   const int64_t file_row_count = 1025;
   const int64_t file_buf_size = 32L << 10;
   const ObLSID ls_id(1001);
   const ObTabletID tablet_id(400005);
   ObArray<ObSSOuttableLobCtrlCandidate> expected_candidates;
   ObArray<ObSSOuttableLobCtrlCandidate> expected_diffs;
+  ObArray<ObSSOuttableLobCtrlCandidate> batch;
   share::ObTenantSwitchGuard guard;
   ASSERT_EQ(OB_SUCCESS, guard.switch_to(tenant_id_));
   for (int64_t i = 0; i < direct_row_count; ++i) {
     ObSSOuttableLobCtrlCandidate row;
+    // Preserve repeated, non-sorted Macro IDs with distinct physical row versions.
     ASSERT_EQ(OB_SUCCESS, build_sstable_macro_id_(
         blocksstable::ObStorageObjectType::SHARED_MINI_DATA_MACRO,
-        ls_id, tablet_id, i, row.macro_id_));
-    row.hash_ = 0 == i ? 0 : (1 == i ? UINT64_MAX : i * 17);
+        ls_id, tablet_id, 3 - i % 3, row.macro_id_));
+    row.hash_ = (0 == i % 3) ? 0 : ((1 == i % 3) ? UINT64_MAX : i * 17);
     row.mark_row_scn_ = 2000 + i;
     ASSERT_EQ(OB_SUCCESS, expected_candidates.push_back(row));
   }
@@ -2799,8 +2791,17 @@ TEST_F(TestSSMarkSweepGC, diagnose_lob_ctrl_rows_and_file_round_trip)
   ASSERT_TRUE(diff_file.is_valid());
   ObSSMarkSweepDiagMgr diag_mgr;
   ASSERT_EQ(OB_SUCCESS, diag_mgr.init(tenant_id_, round_id, bucket_cnt));
+  for (int64_t i = 0; i < expected_candidates.count(); ++i) {
+    ASSERT_EQ(OB_SUCCESS, batch.push_back(expected_candidates.at(i)));
+    if (batch_size == batch.count()) {
+      ASSERT_EQ(OB_SUCCESS, diag_mgr.write_lob_ctrl_rows(
+          ObSSMarkSweepDiagFileType::LOB_CTRL_CANDIDATE, batch));
+      batch.reuse();
+    }
+  }
+  ASSERT_EQ(1, batch.count());
   ASSERT_EQ(OB_SUCCESS, diag_mgr.write_lob_ctrl_rows(
-      ObSSMarkSweepDiagFileType::LOB_CTRL_CANDIDATE, expected_candidates));
+      ObSSMarkSweepDiagFileType::LOB_CTRL_CANDIDATE, batch));
   ASSERT_EQ(OB_SUCCESS, diag_mgr.write_lob_ctrl_file(
       ObSSMarkSweepDiagFileType::LOB_CTRL_DIFF, diff_file, file_buf_size));
   ASSERT_EQ(OB_SUCCESS, diag_mgr.complete());
@@ -2812,7 +2813,14 @@ TEST_F(TestSSMarkSweepGC, diagnose_lob_ctrl_rows_and_file_round_trip)
       ObSSMarkSweepDiagFileType::LOB_CTRL_CANDIDATE, allocator, actual_candidates));
   ASSERT_EQ(OB_SUCCESS, read_all_buckets_lob_ctrl(tenant_id_, round_id, bucket_cnt,
       ObSSMarkSweepDiagFileType::LOB_CTRL_DIFF, allocator, actual_diffs));
-  ASSERT_NO_FATAL_FAILURE(check_lob_ctrl_rows(expected_candidates, actual_candidates));
+  ASSERT_EQ(expected_candidates.count(), actual_candidates.count());
+  for (int64_t i = 0; i < expected_candidates.count(); ++i) {
+    const ObSSOuttableLobCtrlCandidate &expected = expected_candidates.at(i);
+    const ObSSOuttableLobCtrlCandidate &actual = actual_candidates.at(i);
+    EXPECT_EQ(expected.macro_id_, actual.macro_id_);
+    EXPECT_EQ(expected.hash_, actual.hash_);
+    EXPECT_EQ(expected.mark_row_scn_, actual.mark_row_scn_);
+  }
   ASSERT_NO_FATAL_FAILURE(check_lob_ctrl_rows(expected_diffs, actual_diffs));
 }
 

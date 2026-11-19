@@ -72,12 +72,6 @@ ObSSMarkSweepDiagStudyResults::ObSSMarkSweepDiagStudyResults()
   study_results_.set_attr(ObMemAttr(MTL_ID(), "MSGcDiagStudy"));
 }
 
-ObSSLobMetaGCDiagRows::ObSSLobMetaGCDiagRows()
-  : macro_ids_()
-{
-  macro_ids_.set_attr(ObMemAttr(MTL_ID(), "LobGcDiagMeta"));
-}
-
 ObSSLobCtrlGCDiagRows::ObSSLobCtrlGCDiagRows()
   : rows_()
 {
@@ -597,12 +591,12 @@ int ObSSMarkSweepDiagMgr::write_tablet_meta_scns(
 }
 
 int ObSSMarkSweepDiagMgr::write_lob_meta_kept_record_(
-    const int64_t bucket,
+    const ObSSGCTablet &tablet,
     const ObIArray<MacroBlockId> &macro_ids)
 {
   int ret = OB_SUCCESS;
   const int64_t item_count = macro_ids.count();
-  int64_t buf_len = serialization::encoded_length_i64(item_count);
+  int64_t buf_len = tablet.get_serialize_size() + serialization::encoded_length_i64(item_count);
   for (int64_t i = 0; i < item_count; ++i) {
     buf_len += macro_ids.at(i).get_serialize_size();
   }
@@ -615,6 +609,8 @@ int ObSSMarkSweepDiagMgr::write_lob_meta_kept_record_(
   } else if (OB_ISNULL(buf = static_cast<char *>(allocator.alloc(buf_len)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("failed to allocate lob meta gc diag record", KR(ret), K(buf_len));
+  } else if (OB_FAIL(tablet.serialize(buf, buf_len, pos))) {
+    LOG_WARN("failed to serialize lob meta gc diag tablet", KR(ret), K(tablet));
   } else if (OB_FAIL(serialization::encode_i64(buf, buf_len, pos, item_count))) {
     LOG_WARN("failed to encode lob meta gc diag row count", KR(ret), K(item_count));
   } else {
@@ -623,9 +619,9 @@ int ObSSMarkSweepDiagMgr::write_lob_meta_kept_record_(
         LOG_WARN("failed to serialize lob meta gc diag row", KR(ret), K(i), K(macro_ids.at(i)));
       }
     }
-    if (OB_SUCC(ret) && OB_FAIL(write_record_(
-        ObSSMarkSweepDiagFileType::LOB_META_KEPT, bucket, buf, pos))) {
-      LOG_WARN("failed to write lob meta gc diag record", KR(ret), K(bucket), K(item_count));
+    if (FAILEDx(write_record_(
+        ObSSMarkSweepDiagFileType::LOB_META_KEPT, calc_bucket_(tablet), buf, pos))) {
+      LOG_WARN("failed to write lob meta gc diag record", KR(ret), K(tablet), K(item_count));
     }
   }
   return ret;
@@ -659,122 +655,34 @@ int ObSSMarkSweepDiagMgr::write_lob_ctrl_record_(
         LOG_WARN("failed to serialize lob ctrl gc diag row", KR(ret), K(i), K(rows.at(i)));
       }
     }
-    if (OB_SUCC(ret) && OB_FAIL(write_record_(type, bucket, buf, pos))) {
+    if (FAILEDx(write_record_(type, bucket, buf, pos))) {
       LOG_WARN("failed to write lob ctrl gc diag record", KR(ret), K(type), K(bucket), K(row_count));
     }
   }
   return ret;
 }
 
-int ObSSMarkSweepDiagMgr::write_lob_meta_kept(const ObIArray<MacroBlockId> &macro_ids)
+int ObSSMarkSweepDiagMgr::write_lob_meta_kept(
+    const ObSSGCTablet &tablet,
+    const ObIArray<MacroBlockId> &macro_ids)
 {
   int ret = OB_SUCCESS;
-  typedef ObSEArray<MacroBlockId, 16> ObLobMetaDiagBucket;
-  ObArenaAllocator allocator(ObMemAttr(tenant_id_, "LobGcDiagMeta"));
-  ObLobMetaDiagBucket **buckets = nullptr;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("not inited", KR(ret));
-  } else if (macro_ids.empty()) {
-  } else if (OB_ISNULL(buckets = static_cast<ObLobMetaDiagBucket **>(
-      allocator.alloc(sizeof(ObLobMetaDiagBucket *) * bucket_cnt_)))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-    LOG_WARN("failed to allocate lob meta gc diag buckets", KR(ret), K_(bucket_cnt));
-  } else {
-    MEMSET(buckets, 0, sizeof(ObLobMetaDiagBucket *) * bucket_cnt_);
-    for (int64_t i = 0; OB_SUCC(ret) && i < macro_ids.count(); ++i) {
-      const MacroBlockId &macro_id = macro_ids.at(i);
-      if (OB_UNLIKELY(!macro_id.is_valid())) {
-        ret = OB_INVALID_ARGUMENT;
-        LOG_WARN("invalid lob meta gc diag macro id", KR(ret), K(i), K(macro_id));
-      } else {
-        const int64_t bucket = calc_lob_bucket_(macro_id);
-        if (OB_ISNULL(buckets[bucket])) {
-          void *buf = allocator.alloc(sizeof(ObLobMetaDiagBucket));
-          if (OB_ISNULL(buf)) {
-            ret = OB_ALLOCATE_MEMORY_FAILED;
-            LOG_WARN("failed to allocate lob meta gc diag bucket", KR(ret), K(bucket));
-          } else {
-            buckets[bucket] = new (buf) ObLobMetaDiagBucket();
-            buckets[bucket]->set_attr(ObMemAttr(tenant_id_, "LobGcDiagMeta"));
-          }
-        }
-        if (OB_SUCC(ret) && OB_FAIL(buckets[bucket]->push_back(macro_id))) {
-          LOG_WARN("failed to append lob meta gc diag row", KR(ret), K(bucket), K(macro_id));
-        }
-      }
-    }
-    for (int64_t i = 0; OB_SUCC(ret) && i < bucket_cnt_; ++i) {
-      if (OB_NOT_NULL(buckets[i]) && OB_FAIL(write_lob_meta_kept_record_(i, *buckets[i]))) {
-        LOG_WARN("failed to write lob meta gc diag bucket", KR(ret), K(i));
-      }
-    }
-  }
-  if (OB_NOT_NULL(buckets)) {
-    for (int64_t i = 0; i < bucket_cnt_; ++i) {
-      if (OB_NOT_NULL(buckets[i])) {
-        buckets[i]->~ObLobMetaDiagBucket();
-      }
-    }
-  }
-  if (OB_FAIL(ret)) {
-    mark_diag_failed(ret);
-  }
-  return ret;
-}
-
-int ObSSMarkSweepDiagMgr::write_lob_meta_kept_file(
-    const ObSortedFileInfo &file,
-    const int64_t file_buf_size)
-{
-  int ret = OB_SUCCESS;
-  const int64_t macro_batch_size = 1024;
-  int64_t read_count = 0;
-  ObFragmentReaderV2<ObGCMacroBlockItem> reader(OB_MALLOC_NORMAL_BLOCK_SIZE);
-  ObArray<MacroBlockId> macro_ids;
-  macro_ids.set_attr(ObMemAttr(tenant_id_, "LobGcDiagMeta"));
-  if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("not inited", KR(ret));
-  } else if (OB_UNLIKELY(!file.is_valid() || file.item_count_ < 0 || file_buf_size <= 0)) {
+  } else if (OB_UNLIKELY(!tablet.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid lob meta gc diag file", KR(ret), K(file), K(file_buf_size));
-  } else if (OB_FAIL(reader.init_for_pread(file.get_fd(), file.get_dir_id(),
-      0 /*expire_timestamp*/, tenant_id_, file.sample_item_, file_buf_size))) {
-    LOG_WARN("failed to init lob meta gc diag reader", KR(ret), K(file));
-  } else if (OB_FAIL(reader.open())) {
-    LOG_WARN("failed to open lob meta gc diag reader", KR(ret), K(file));
+    LOG_WARN("invalid lob meta gc diag tablet", KR(ret), K(tablet));
   } else {
-    while (OB_SUCC(ret)) {
-      const ObGCMacroBlockItem *item = nullptr;
-      if (OB_ITER_END == (ret = reader.get_next_item(item))) {
-        ret = OB_SUCCESS;
-        if (OB_UNLIKELY(read_count != file.item_count_)) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("lob meta gc diag row count mismatch", KR(ret), K(read_count), K(file.item_count_));
-        } else if (!macro_ids.empty() && OB_FAIL(write_lob_meta_kept(macro_ids))) {
-          LOG_WARN("failed to write last lob meta gc diag batch", KR(ret), K(read_count));
-        }
-        break;
-      } else if (OB_FAIL(ret)) {
-        LOG_WARN("failed to read lob meta gc diag row", KR(ret), K(read_count));
-      } else if (OB_ISNULL(item) || OB_UNLIKELY(!item->is_valid())) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("invalid lob meta gc diag row", KR(ret), K(read_count), KPC(item));
-      } else if (OB_UNLIKELY(read_count >= file.item_count_)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unexpected extra lob meta gc diag row", KR(ret), K(read_count), K(file.item_count_));
-      } else if (OB_FAIL(macro_ids.push_back(item->macro_id_))) {
-        LOG_WARN("failed to retain lob meta gc diag row", KR(ret), K(read_count));
-      } else {
-        ++read_count;
-        if (macro_ids.count() == macro_batch_size) {
-          if (OB_FAIL(write_lob_meta_kept(macro_ids))) {
-            LOG_WARN("failed to write lob meta gc diag batch", KR(ret), K(read_count));
-          } else {
-            macro_ids.reuse();
-          }
-        }
+    for (int64_t i = 0; OB_SUCC(ret) && i < macro_ids.count(); ++i) {
+      if (OB_UNLIKELY(!macro_ids.at(i).is_valid())) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("invalid lob meta gc diag macro id", KR(ret), K(i), K(macro_ids.at(i)));
+      }
+    }
+    if (!macro_ids.empty()) {
+      if (FAILEDx(write_lob_meta_kept_record_(tablet, macro_ids))) {
+        LOG_WARN("failed to write lob meta gc diag rows", KR(ret), K(tablet));
       }
     }
   }
@@ -822,7 +730,7 @@ int ObSSMarkSweepDiagMgr::write_lob_ctrl_rows(
             buckets[bucket]->set_attr(ObMemAttr(tenant_id_, "LobGcDiagCtrl"));
           }
         }
-        if (OB_SUCC(ret) && OB_FAIL(buckets[bucket]->push_back(row))) {
+        if (FAILEDx(buckets[bucket]->push_back(row))) {
           LOG_WARN("failed to append lob ctrl gc diag row", KR(ret), K(bucket), K(row));
         }
       }
@@ -1993,39 +1901,6 @@ int ObSSMarkSweepDiagMgr::decode_study_record(
   return ret;
 }
 
-int ObSSMarkSweepDiagMgr::decode_lob_meta_kept_record(
-    const ObString &record,
-    ObSSLobMetaGCDiagRows &rows)
-{
-  int ret = OB_SUCCESS;
-  int64_t pos = 0;
-  int64_t row_count = 0;
-  rows.reset();
-  if (OB_FAIL(serialization::decode_i64(record.ptr(), record.length(), pos, &row_count))) {
-    LOG_WARN("failed to decode lob meta gc diag row count", KR(ret));
-  } else if (OB_UNLIKELY(row_count <= 0)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("invalid lob meta gc diag row count", KR(ret), K(row_count));
-  } else {
-    MacroBlockId macro_id;
-    for (int64_t i = 0; OB_SUCC(ret) && i < row_count; ++i) {
-      macro_id.reset();
-      if (OB_FAIL(macro_id.deserialize(record.ptr(), record.length(), pos))) {
-        LOG_WARN("failed to deserialize lob meta gc diag row", KR(ret), K(i));
-      } else if (OB_UNLIKELY(!macro_id.is_valid())) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("invalid lob meta gc diag macro id", KR(ret), K(i), K(macro_id));
-      } else if (OB_FAIL(rows.macro_ids_.push_back(macro_id))) {
-        LOG_WARN("failed to append lob meta gc diag macro id", KR(ret), K(i));
-      }
-    }
-    if (OB_SUCC(ret) && OB_UNLIKELY(pos != record.length())) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected lob meta gc diag record length", KR(ret), K(pos), K(record.length()));
-    }
-  }
-  return ret;
-}
 
 int ObSSMarkSweepDiagMgr::decode_lob_ctrl_record(
     const ObString &record,

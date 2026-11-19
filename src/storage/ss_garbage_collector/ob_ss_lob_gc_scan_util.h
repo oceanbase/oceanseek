@@ -29,9 +29,8 @@ public:
   // Return macro_id, hash and the hidden transaction version from the frozen schema.
   static int prepare_ctrl_scan_columns(const ObStorageSchema &storage_schema,
       common::ObIArray<share::schema::ObColDesc> &columns);
-  // Return info and lob_block_id, using the fixed types only for simplified StorageSchema.
-  static int prepare_meta_scan_columns(const ObStorageSchema &storage_schema,
-      common::ObIArray<share::schema::ObColDesc> &columns);
+  // Use the fixed LOB Meta layout for info and lob_block_id; the iterator validates the schema.
+  static int prepare_meta_scan_columns(common::ObIArray<share::schema::ObColDesc> &columns);
 };
 
 } // namespace storage

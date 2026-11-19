@@ -133,14 +133,20 @@ public:
   inline bool is_last_major_row_store() const { return ObMajorStoreType::ROW_STORE == last_major_store_type_; }
   inline bool is_major_exit() const { return 0 != major_table_cnt_; }
   int serialize(
-      const uint64_t data_version, char *buf, const int64_t len, int64_t &pos) const;
+      const uint64_t data_version,
+      char *buf,
+      const int64_t len,
+      int64_t &pos,
+      const bool is_empty_shell) const;
   int deserialize(
       const char *buf,
       const int64_t len,
-      int64_t &pos);
+      int64_t &pos,
+      const bool is_empty_shell);
   int64_t get_serialize_size(const uint64_t data_version) const;
   bool operator==(const ObTableStoreCache &other) const;
   bool is_inited() const { return is_inited_; }
+  share::schema::ObTableType get_table_type() const { return table_type_; }
   inline bool is_global_index_table() const { return is_global_index_table_; }
   inline bool need_progressive_merge() const { return need_progressive_merge_; }
   inline bool is_async_index_refresh_target() const { return is_async_index_refresh_target_; }
@@ -160,7 +166,7 @@ public:
       K_(is_async_index_refresh_target), K_(is_async_delete_index),
       K_(last_major_compressor_type), K_(last_major_latest_row_store_type),
       K_(last_major_store_type), K_(unmerged_inc_major_cnt), K_(min_recycle_scn),
-      K_(max_upper_trans_version), K_(max_sync_medium_scn), K_(is_inited));
+      K_(max_upper_trans_version), K_(max_sync_medium_scn), K_(table_type), K_(is_inited));
 private:
   int32_t version_;
   int32_t length_;
@@ -198,6 +204,7 @@ public:
   int64_t max_upper_trans_version_;  //max upper trans version
   int64_t max_sync_medium_scn_;
   int64_t inc_major_table_cnt_;  // TableStore 中的 IncMajor 数量
+  share::schema::ObTableType table_type_;
   //no need serialize add below
 private:
   bool is_inited_;
@@ -281,6 +288,7 @@ public:
   int get_fork_info(share::ObForkTabletInfo &fork_info) const;
   inline int64_t get_last_compaction_scn() const { return tablet_meta_.extra_medium_info_.last_medium_scn_; }
   inline bool is_row_store() const { return table_store_cache_.is_row_store_; }
+  int get_table_type(share::schema::ObTableType &table_type) const;
   inline bool is_tablet_referenced_by_collect_mv() const { return table_store_cache_.is_tablet_referenced_by_collect_mv_; }
   inline bool is_global_index_table() const { return table_store_cache_.is_global_index_table_; }
   inline bool need_progressive_merge() const { return table_store_cache_.need_progressive_merge_; }

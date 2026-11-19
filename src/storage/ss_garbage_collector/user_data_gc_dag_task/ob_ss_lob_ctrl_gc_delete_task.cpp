@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX STORAGE
 
+#include "lib/utility/utility.h"
 #include "storage/ss_garbage_collector/user_data_gc_dag_task/ob_ss_lob_ctrl_gc_delete_task.h"
 #include "observer/ob_server_struct.h"
 #include "share/ob_share_util.h"
@@ -45,6 +46,7 @@ int ObSSLobCtrlGCDeleteTask::process()
 {
   int ret = OB_SUCCESS;
   ObSSMarkSweepCtx *ctx = nullptr;
+  ObSSLobGCCostGuard lob_cost_guard(ctx, ObSSLobGCCostStat::CTRL_DELETE);
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("lob ctrl gc delete task is not initialized", KR(ret));

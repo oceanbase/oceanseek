@@ -1296,11 +1296,11 @@ TEST_F(TestLSTabletService, test_tablet_table_store_cache)
   int64_t pos = 0;
   ASSERT_NE(nullptr, buf);
   ASSERT_TRUE(table_table_cache.is_inited_);
-  ASSERT_EQ(OB_SUCCESS, table_table_cache.serialize(data_version, buf, serialize_size, pos));
+  ASSERT_EQ(OB_SUCCESS, table_table_cache.serialize(data_version, buf, serialize_size, pos, false));
 
   pos = 0;
   ObTableStoreCache dest_table_store_cache;
-  ASSERT_EQ(OB_SUCCESS, dest_table_store_cache.deserialize(buf, serialize_size, pos));
+  ASSERT_EQ(OB_SUCCESS, dest_table_store_cache.deserialize(buf, serialize_size, pos, false));
   ASSERT_EQ(true, table_table_cache == dest_table_store_cache);
   LOG_INFO("print table store cache", K(table_table_cache), K(dest_table_store_cache));
   ret = ls_tablet_service_->do_remove_tablet(ls_id_, tablet_id);

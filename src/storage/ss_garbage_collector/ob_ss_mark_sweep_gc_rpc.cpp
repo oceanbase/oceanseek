@@ -194,11 +194,28 @@ int ObSSMarkSweepGCStudyP::handle_tablet_not_exist_(
   return ret;
 }
 
-bool ObSSMarkSweepGCStudyP::need_collect_lob_rely_info_(
-    const ObStorageSchema &storage_schema)
+int ObSSMarkSweepGCStudyP::need_collect_lob_rely_info_(
+    const ObTablet &tablet,
+    bool &need_collect,
+    ObSSGCTabletType &gc_table_type)
 {
-  return storage_schema.is_aux_lob_meta_table()
-      || storage_schema.is_aux_outtable_lob_control_table();
+  int ret = OB_SUCCESS;
+  schema::ObTableType table_type = schema::MAX_TABLE_TYPE;
+  need_collect = false;
+  gc_table_type.reset();
+  if (OB_FAIL(tablet.get_table_type(table_type))) {
+    LOG_WARN("failed to get tablet type for study", KR(ret), K(tablet));
+  } else {
+    if (schema::is_aux_lob_meta_table(table_type)) {
+      gc_table_type = ObSSGCTabletType::LOB_META;
+    } else if (schema::is_aux_outtable_lob_control_table(table_type)) {
+      gc_table_type = ObSSGCTabletType::LOB_CTRL;
+    } else {
+      gc_table_type = ObSSGCTabletType::NORMAL;
+    }
+    need_collect = gc_table_type.is_lob_meta() || gc_table_type.is_lob_ctrl();
+  }
+  return ret;
 }
 
 bool ObSSMarkSweepGCStudyP::update_cold_lob_rely_info_(
@@ -251,9 +268,8 @@ int ObSSMarkSweepGCStudyP::handle_tablet_exist_(
     ObSSGCUtil::report_mark_sweep_set_to_min_event(cur_gc_tablet, "TRANSFER_TABLE_NOT_REFRESHED");
   } else { // tablet_handle.get_obj()->get_reorganization_scn() == transfer_scn
     study_info.set_to_min();  // means can not recycle any versions
-    ObArenaAllocator allocator(ObMemAttr(MTL_ID(), "GCStudySchema"));
-    ObStorageSchema *storage_schema = nullptr;
     int64_t tablet_cnt = 0;
+    bool collect_lob_rely_info = false;
     const ObTabletMapKey key(ls_id, tablet_id);
     ObTenantMetaMemMgr *t3m = MTL(ObTenantMetaMemMgr *);
     bool tablet_exist = false;
@@ -268,15 +284,10 @@ int ObSSMarkSweepGCStudyP::handle_tablet_exist_(
     } else if (tablet_handle.get_obj()->is_empty_shell()) {
       // 空壳 Tablet 没有 StorageSchema，保留 MIN 边界并等待本地 Tablet GC 完成。
       LOG_INFO("skip studying empty shell tablet", K(cur_gc_tablet), K(tablet_handle));
-    } else if (OB_FAIL(tablet_handle.get_obj()->load_storage_schema(allocator, storage_schema))) {
-      LOG_WARN("fail to load storage schema", KR(ret), K(cur_gc_tablet));
-    } else if (OB_ISNULL(storage_schema)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("storage schema is null", KR(ret), K(cur_gc_tablet));
-    } else if (OB_FAIL(ObSSGCTabletType::get_ss_gc_tablet_type(*storage_schema, table_type))) {
-      LOG_WARN("failed to get gc tablet type", KR(ret), K(cur_gc_tablet));
+    } else if (OB_FAIL(need_collect_lob_rely_info_(
+        *tablet_handle.get_obj(), collect_lob_rely_info, table_type))) {
+      LOG_WARN("failed to determine tablet type for study", KR(ret), K(cur_gc_tablet));
     } else {
-      const bool collect_lob_rely_info = need_collect_lob_rely_info_(*storage_schema);
       bool has_memtable = false;
       // 为兼容既有 Study RPC，min_dep_meta_scn_ 承载 Minor 与 IncMajor 的共同物理依赖下界。
       ScanAllVersionTabletsOp::GetMinTabletRelyInfo op(study_info.min_dep_meta_scn_,
@@ -310,7 +321,6 @@ int ObSSMarkSweepGCStudyP::handle_tablet_exist_(
             K(cur_gc_tablet), K(study_info));
       }
     }
-    ObTabletObjLoadHelper::free(allocator, storage_schema);
   }
 
   // Note: must check check_allow_tablet_version_gc_(flying/external tablets) after scan_all_version_tablets.

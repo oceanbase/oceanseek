@@ -125,7 +125,7 @@ private:
   bool is_cur_record_decoded_;
   storage::ObSSMarkSweepDiagTabletMacros cur_macros_;     // decoded when current type=macros
   storage::ObSSMarkSweepTabletMetaScns cur_meta_scns_;    // decoded when current type=tablet_meta_scns
-  storage::ObSSLobMetaGCDiagRows cur_lob_meta_rows_;
+  storage::ObSSMarkSweepDiagTabletMacros cur_lob_meta_rows_;
   storage::ObSSLobCtrlGCDiagRows cur_lob_ctrl_rows_;
   storage::ObSSMarkSweepDiagStudyResults cur_study_results_; // Raw per-node watermarks of the current record
   int64_t item_idx_;     // index into the current record's items

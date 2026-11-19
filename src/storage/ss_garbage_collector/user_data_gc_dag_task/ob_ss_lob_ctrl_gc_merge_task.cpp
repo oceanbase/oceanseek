@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX STORAGE
 
+#include "lib/utility/utility.h"
 #include "storage/ss_garbage_collector/user_data_gc_dag_task/ob_ss_lob_ctrl_gc_merge_task.h"
 
 namespace oceanbase
@@ -72,6 +73,7 @@ int ObSSLobCtrlGCMergeTask::process()
 {
   int ret = OB_SUCCESS;
   ObSSMarkSweepCtx *ctx = nullptr;
+  ObSSLobGCCostGuard lob_cost_guard(ctx, ObSSLobGCCostStat::CTRL_MERGE);
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("lob ctrl gc merge task is not initialized", KR(ret));
@@ -161,15 +163,6 @@ int ObSSLobCtrlGCMergePassTask::publish_final_file_(ObSSMarkSweepCtx &ctx)
   } else if (OB_FAIL(ctx.lob_ctrl_merged_file_.assign(ctx.lob_ctrl_merge_inputs_.at(0)))) {
     LOG_WARN("failed to publish final lob ctrl merge file", KR(ret));
   } else {
-    if (ctx.diag_mgr_.is_ready_record()) {
-      int tmp_ret = OB_SUCCESS;
-      if (OB_TMP_FAIL(ctx.diag_mgr_.write_lob_ctrl_file(
-          ObSSMarkSweepDiagFileType::LOB_CTRL_CANDIDATE,
-          ctx.lob_ctrl_merged_file_, ctx.file_buf_size_))) {
-        LOG_WARN_RET(tmp_ret, "failed to record lob ctrl candidates", K(ctx.tenant_id_),
-            K(ctx.round_id_));
-      }
-    }
     ctx.lob_ctrl_scan_files_.reset();
     ctx.lob_ctrl_merge_inputs_.reset();
     ctx.lob_ctrl_merge_outputs_.reset();
@@ -181,6 +174,7 @@ int ObSSLobCtrlGCMergePassTask::process()
 {
   int ret = OB_SUCCESS;
   ObSSMarkSweepCtx *ctx = nullptr;
+  ObSSLobGCCostGuard lob_cost_guard(ctx, ObSSLobGCCostStat::CTRL_MERGE);
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("lob ctrl gc merge pass task is not initialized", KR(ret));

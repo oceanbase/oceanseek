@@ -118,6 +118,7 @@ ObTableStoreCache::ObTableStoreCache()
     max_upper_trans_version_(0),
     max_sync_medium_scn_(0),
     inc_major_table_cnt_(0),
+    table_type_(share::schema::MAX_TABLE_TYPE),
     is_inited_(false)
 {
 }
@@ -150,6 +151,7 @@ void ObTableStoreCache::reset()
   max_upper_trans_version_ = 0;
   max_sync_medium_scn_ = 0;
   inc_major_table_cnt_ = 0;
+  table_type_ = share::schema::MAX_TABLE_TYPE;
   is_inited_ = false;
 }
 
@@ -179,6 +181,7 @@ void ObTableStoreCache::assign(const ObTableStoreCache &other)
   max_upper_trans_version_ = other.max_upper_trans_version_;
   max_sync_medium_scn_ = other.max_sync_medium_scn_;
   inc_major_table_cnt_ = other.inc_major_table_cnt_;
+  table_type_ = other.table_type_;
   version_ = other.version_;
   is_inited_ = other.is_inited_;
   unmerged_inc_major_cnt_ = other.unmerged_inc_major_cnt_;
@@ -199,6 +202,7 @@ int ObTableStoreCache::init(
   is_global_index_table_ = storage_schema.is_global_index_table();
   is_async_index_refresh_target_ = storage_schema.is_async_index_refresh_target();
   is_async_delete_index_ = storage_schema.is_async_delete_index();
+  table_type_ = storage_schema.get_table_type();
   major_table_cnt_ = major_tables.count();
   minor_table_cnt_ = minor_tables.count();
   inc_row_cnt_ = 0;
@@ -324,11 +328,14 @@ int ObTableStoreCache::serialize(
     const uint64_t data_version,
     char *buf,
     const int64_t len,
-    int64_t &pos) const
+    int64_t &pos,
+    const bool is_empty_shell) const
 {
   int ret = OB_SUCCESS;
   int64_t new_pos = pos;
   const int64_t length = get_serialize_size(data_version);
+  const share::schema::ObTableType table_type =
+      is_empty_shell ? share::schema::MAX_TABLE_TYPE : table_type_;
 
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
@@ -341,6 +348,11 @@ int ObTableStoreCache::serialize(
   } else if (data_version < DATA_VERSION_4_5_1_0) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("tablet store cache will serialize after 451", K(ret), K(data_version));
+  } else if (data_version >= DATA_VERSION_4_6_3_1 && !is_empty_shell
+      && OB_UNLIKELY(table_type < share::schema::SYSTEM_TABLE
+          || table_type >= share::schema::MAX_TABLE_TYPE)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid cached table type for serialization", K(ret), K_(table_type));
   } else if (OB_UNLIKELY(length > len - pos)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("buffer's length is not enough", K(ret), K(length), K(len - new_pos));
@@ -378,6 +390,9 @@ int ObTableStoreCache::serialize(
       && new_pos - pos < length
       && OB_FAIL(serialization::encode_i64(buf, len, new_pos, inc_major_table_cnt_))) {
     LOG_WARN("failed to serialize inc major table count", K(ret), K(len), K(new_pos), K_(inc_major_table_cnt));
+  } else if (data_version >= DATA_VERSION_4_6_3_1
+      && OB_FAIL(serialization::encode_i32(buf, len, new_pos, table_type))) {
+    LOG_WARN("failed to serialize cached table type", K(ret), K_(table_type));
   } else if (OB_UNLIKELY(length != new_pos - pos)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("table store cache's length doesn't match standard length", K(ret), K(new_pos), K(pos), K(length), K(length));
@@ -394,7 +409,8 @@ int ObTableStoreCache::serialize(
 int ObTableStoreCache::deserialize(
     const char *buf,
     const int64_t len,
-    int64_t &pos)
+    int64_t &pos,
+    const bool is_empty_shell)
 {
   int ret = OB_SUCCESS;
   int64_t new_pos = pos;
@@ -415,6 +431,8 @@ int ObTableStoreCache::deserialize(
   } else if (TABLET_STORE_CACHE_VERSION == version_) {
     // 旧格式没有精确计数，按可能存在一个处理；新格式在尾部覆盖为真实值。
     inc_major_table_cnt_ = 1;
+    // Older caches do not carry a table type; callers must fall back to StorageSchema.
+    table_type_ = share::schema::MAX_TABLE_TYPE;
     if (OB_UNLIKELY(length_ > len - pos)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("buffer's length is not enough", K(ret), K(length_), K(len - new_pos));
@@ -455,6 +473,20 @@ int ObTableStoreCache::deserialize(
           || inc_major_table_cnt_ > MAX_INC_MAJOR_SSTABLE_CNT)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("invalid inc major table count", K(ret), K_(inc_major_table_cnt));
+      }
+    }
+    if (OB_SUCC(ret) && new_pos - pos < length_) {
+      int32_t table_type = share::schema::MAX_TABLE_TYPE;
+      if (OB_FAIL(serialization::decode_i32(buf, pos + length_, new_pos, &table_type))) {
+        LOG_WARN("failed to deserialize cached table type", K(ret));
+      } else if (is_empty_shell) {
+        table_type_ = share::schema::MAX_TABLE_TYPE;
+      } else if (OB_UNLIKELY(table_type < share::schema::SYSTEM_TABLE
+          || table_type >= share::schema::MAX_TABLE_TYPE)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid cached table type", K(ret), K(table_type));
+      } else {
+        table_type_ = static_cast<share::schema::ObTableType>(table_type);
       }
     }
     if (OB_FAIL(ret)) {
@@ -500,6 +532,9 @@ int64_t ObTableStoreCache::get_serialize_size(const uint64_t data_version) const
   if (data_version >= DATA_VERSION_4_6_2_1) {
     size += serialization::encoded_length_i64(inc_major_table_cnt_);
   }
+  if (data_version >= DATA_VERSION_4_6_3_1) {
+    size += serialization::encoded_length_i32(table_type_);
+  }
   //ATTENTION!
   //Add new value after 451, need using data version to check serialize
   return size;
@@ -529,6 +564,7 @@ bool ObTableStoreCache::operator==(const ObTableStoreCache &other) const
       && is_async_index_refresh_target_ == other.is_async_index_refresh_target_
       && is_async_delete_index_ == other.is_async_delete_index_
       && inc_major_table_cnt_ == other.inc_major_table_cnt_
+      && table_type_ == other.table_type_
       && is_inited_ == other.is_inited_;
   return bret;
 }
@@ -1672,6 +1708,33 @@ int ObTablet::fetch_table_store_with_prewarm(
   return ret;
 }
 
+int ObTablet::get_table_type(share::schema::ObTableType &table_type) const
+{
+  int ret = OB_SUCCESS;
+  table_type = share::schema::MAX_TABLE_TYPE;
+  if (!is_empty_shell()) {
+    table_type = table_store_cache_.get_table_type();
+    if (table_type >= share::schema::MAX_TABLE_TYPE) {
+      // Resolve unknown or newer types without mutating a published Tablet.
+      ObArenaAllocator allocator(ObMemAttr(MTL_ID(), "TabletTblType"));
+      ObStorageSchema *storage_schema = nullptr;
+      if (OB_FAIL(load_storage_schema(allocator, storage_schema))) {
+        LOG_WARN("failed to load schema for unknown cached table type", KR(ret), KPC(this));
+      } else {
+        table_type = storage_schema->get_table_type();
+      }
+      ObTabletObjLoadHelper::free(allocator, storage_schema);
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_UNLIKELY(table_type < share::schema::SYSTEM_TABLE
+        || table_type >= share::schema::MAX_TABLE_TYPE)) {
+      ret = OB_SCHEMA_ERROR;
+      LOG_WARN("invalid tablet table type", KR(ret), K(table_type));
+    }
+  }
+  return ret;
+}
+
 int ObTablet::load_storage_schema(common::ObIAllocator &allocator, ObStorageSchema *&storage_schema) const
 {
   int ret = OB_SUCCESS;
@@ -2423,6 +2486,7 @@ int ObTablet::init_empty_shell(
     LOG_WARN("failed to init table store cache", K(ret), KPC(this));
   } else {
     tablet_meta_.extra_medium_info_.reset();
+    table_store_cache_.table_type_ = old_tablet.table_store_cache_.get_table_type();
     table_store_addr_.addr_.set_none_addr();
     storage_schema_addr_.addr_.set_none_addr();
     macro_info_addr_.addr_.set_none_addr();
@@ -2694,9 +2758,14 @@ int ObTablet::self_serialize(
   int ret = OB_SUCCESS;
   int64_t new_pos = pos;
   const int64_t length = get_self_serialize_size(data_version);
+  ObTableStoreCache table_store_cache;
+  table_store_cache.assign(table_store_cache_);
   if (OB_UNLIKELY(length > len - pos)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("buffer's length is not enough", K(ret), K(length), K(len - new_pos));
+  } else if (data_version >= DATA_VERSION_4_6_3_1
+      && OB_FAIL(get_table_type(table_store_cache.table_type_))) {
+    LOG_WARN("failed to get table type for tablet serialization", KR(ret), KPC(this));
   } else if (OB_FAIL(serialization::encode_i32(buf, len, new_pos, version_))) {
     LOG_WARN("failed to serialize tablet meta's version", K(ret), K(len), K(new_pos), K_(version));
   } else if (new_pos - pos < length && OB_FAIL(serialization::encode_i32(buf, len, new_pos, length))) {
@@ -2714,7 +2783,7 @@ int ObTablet::self_serialize(
     LOG_WARN("failed to serialize macro info addr", K(ret), K(len), K(new_pos), K(macro_info_addr_));
   } else if (data_version >= DATA_VERSION_4_5_1_0
       && new_pos - pos < length
-      && OB_FAIL(table_store_cache_.serialize(data_version, buf, len, new_pos))) {
+      && OB_FAIL(table_store_cache.serialize(data_version, buf, len, new_pos, is_empty_shell()))) {
     LOG_WARN("failed to serialize table store cache", K(ret), K(len), K(new_pos), K(macro_info_addr_));
   } else if (OB_UNLIKELY(length != new_pos - pos)) {
     ret = OB_ERR_UNEXPECTED;
@@ -2944,6 +3013,9 @@ int ObTablet::deserialize_post_work(common::ObArenaAllocator &allocator)
             K(schema->schema_version_));
         tablet_meta_.max_sync_storage_schema_version_ = schema->schema_version_;
       }
+      if (OB_SUCC(ret)) {
+        table_store_cache_.table_type_ = schema->get_table_type();
+      }
       ObTabletObjLoadHelper::free(arena_allocator, schema);
     }
 
@@ -3160,7 +3232,8 @@ int ObTablet::load_deserialize_v3(
     LOG_WARN("fail to load_deserialize_v2", K(ret));
   } else if (new_pos - pos < length_ && OB_FAIL(macro_info_addr_.addr_.deserialize(buf, len, new_pos))) {
     LOG_WARN("fail to deserialize macro info addr", K(ret), K(len), K(new_pos));
-  } else if (new_pos - pos < length_ && OB_FAIL(table_store_cache_.deserialize(buf, len, new_pos))) {
+  } else if (new_pos - pos < length_
+      && OB_FAIL(table_store_cache_.deserialize(buf, len, new_pos, is_empty_shell()))) {
     LOG_WARN("fail to deserialize table store cache", K(ret), K(len), K(new_pos));
   } else if (OB_UNLIKELY(new_pos - pos >= len && 0 != header.inline_meta_count_)) {
     ret = OB_ERR_UNEXPECTED;
@@ -3296,7 +3369,7 @@ int ObTablet::deserialize(
         && OB_FAIL(macro_info_addr_.addr_.deserialize(buf, len, new_pos))) {
       LOG_WARN("fail to deserialize macro info addr", K(ret), K(len), K(new_pos));
     } else if (new_pos - pos < length_
-        && OB_FAIL(table_store_cache_.deserialize(buf, len, new_pos))) {
+        && OB_FAIL(table_store_cache_.deserialize(buf, len, new_pos, is_empty_shell()))) {
       LOG_WARN("fail to deserialize table store cache", K(ret), K(len), K(new_pos));
     }
 

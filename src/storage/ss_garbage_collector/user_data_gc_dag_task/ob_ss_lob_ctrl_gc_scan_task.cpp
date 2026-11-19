@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX STORAGE
 
+#include "lib/utility/utility.h"
 #include "storage/ss_garbage_collector/user_data_gc_dag_task/ob_ss_lob_ctrl_gc_scan_task.h"
 #include "storage/ss_garbage_collector/ob_ss_lob_gc_scan_util.h"
 #include "storage/access/ob_lob_column_iterator.h"
@@ -85,6 +86,7 @@ int ObSSLobCtrlGCScanTask::process()
 {
   int ret = OB_SUCCESS;
   ObSSMarkSweepCtx *ctx = nullptr;
+  ObSSLobGCCostGuard lob_cost_guard(ctx, ObSSLobGCCostStat::CTRL_SCAN);
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("lob ctrl gc scan task is not initialized", KR(ret));
@@ -127,6 +129,11 @@ int ObSSLobCtrlGCScanTask::scan_lob_ctrl_tablet_(
     ObSSLobCtrlGCScanSorter &sorter)
 {
   int ret = OB_SUCCESS;
+  int diag_ret = OB_SUCCESS;
+  const int64_t DIAG_ROW_BATCH_SIZE = 10240;
+  ObArray<ObSSOuttableLobCtrlCandidate> diag_rows;
+  diag_rows.set_attr(ObMemAttr(MTL_ID(), "LobGcDiagCtrl"));
+  ObSSOuttableLobCtrlCandidate item;
   ObSSMarkSweepCtx *ctx = nullptr;
   ObSSMetaService *meta_service = MTL(ObSSMetaService *);
   ObArenaAllocator allocator(ObMemAttr(MTL_ID(), "SSGCCtrlScan"));
@@ -162,9 +169,10 @@ int ObSSLobCtrlGCScanTask::scan_lob_ctrl_tablet_(
     LOG_WARN("failed to prepare lob ctrl scan columns", KR(ret), K(scan_input));
   }
   ObTabletObjLoadHelper::free(allocator, storage_schema);
-  if (OB_SUCC(ret) && OB_FAIL(iter.init(*tablet_handle.get_obj(), columns, false))) {
+  if (FAILEDx(iter.init(*tablet_handle.get_obj(), columns, false))) {
     LOG_WARN("failed to init lob ctrl column iterator", KR(ret), K(scan_input));
   }
+  const bool record_diag = OB_NOT_NULL(ctx) && ctx->diag_mgr_.is_ready_record();
   const blocksstable::ObDatumRow *row = nullptr;
   while (OB_SUCC(ret)) {
     if (OB_FAIL(check_if_stopped_or_failed())) {
@@ -178,8 +186,26 @@ int ObSSLobCtrlGCScanTask::scan_lob_ctrl_tablet_(
     } else if (OB_ISNULL(row)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("lob ctrl column iterator returned null row", KR(ret), K(scan_input));
-    } else if (OB_FAIL(add_lob_ctrl_row_(*row, ctx->min_outtable_data_scn_, sorter))) {
+    } else if (OB_FAIL(add_lob_ctrl_row_(*row, ctx->min_outtable_data_scn_, sorter, item))) {
       LOG_WARN("failed to collect lob ctrl row candidate", KR(ret), K(scan_input));
+    } else if (item.is_valid() && record_diag && OB_SUCCESS == diag_ret) {
+      // Capture candidates in scan order, independently of the sorter's output.
+      if (OB_SUCCESS != (diag_ret = diag_rows.push_back(item))) {
+        LOG_WARN_RET(diag_ret, "failed to retain lob ctrl diagnostic row", K(scan_input));
+        ctx->diag_mgr_.mark_diag_failed(diag_ret);
+      } else if (DIAG_ROW_BATCH_SIZE == diag_rows.count()) {
+        if (OB_SUCCESS != (diag_ret = ctx->diag_mgr_.write_lob_ctrl_rows(
+            ObSSMarkSweepDiagFileType::LOB_CTRL_CANDIDATE, diag_rows))) {
+          LOG_WARN_RET(diag_ret, "failed to record lob ctrl diagnostic batch", K(scan_input));
+        }
+        diag_rows.reuse();
+      }
+    }
+  }
+  if (OB_SUCC(ret) && record_diag && OB_SUCCESS == diag_ret && !diag_rows.empty()) {
+    if (OB_SUCCESS != (diag_ret = ctx->diag_mgr_.write_lob_ctrl_rows(
+        ObSSMarkSweepDiagFileType::LOB_CTRL_CANDIDATE, diag_rows))) {
+      LOG_WARN_RET(diag_ret, "failed to record last lob ctrl diagnostic batch", K(scan_input));
     }
   }
   return ret;
@@ -188,10 +214,11 @@ int ObSSLobCtrlGCScanTask::scan_lob_ctrl_tablet_(
 int ObSSLobCtrlGCScanTask::add_lob_ctrl_row_(
     const blocksstable::ObDatumRow &row,
     const SCN &min_outtable_data_scn,
-    ObSSLobCtrlGCScanSorter &sorter)
+    ObSSLobCtrlGCScanSorter &sorter,
+    ObSSOuttableLobCtrlCandidate &item)
 {
   int ret = OB_SUCCESS;
-  ObSSOuttableLobCtrlCandidate item;
+  item.reset();
   int64_t pos = 0;
   if (OB_UNLIKELY(!row.is_valid() || ObSSLobGCScanUtil::CTRL_SCAN_COLUMN_COUNT != row.count_)) {
     ret = OB_INVALID_ARGUMENT;

@@ -871,16 +871,15 @@ TEST_F(TestTabletStudyInfo, outtable_gc_reuses_studied_type_without_storage_sche
 {
   ObSSOuttableGCTask task;
   ObTablet tablet;
-  ObArenaAllocator allocator;
   const ObSSGCTabletType types[] = {
       ObSSGCTabletType::NORMAL, ObSSGCTabletType::LOB_META, ObSSGCTabletType::LOB_CTRL};
   for (const ObSSGCTabletType expected : types) {
     ObSSGCTabletType type = expected;
-    ASSERT_EQ(OB_SUCCESS, task.get_table_type_(tablet, allocator, type));
+    ASSERT_EQ(OB_SUCCESS, task.get_table_type_(tablet, type));
     ASSERT_EQ(expected, type);
   }
   ObSSGCTabletType type = ObSSGCTabletType::UNKNOWN;
-  ASSERT_EQ(OB_INVALID_ARGUMENT, task.get_table_type_(tablet, allocator, type));
+  ASSERT_EQ(OB_INVALID_ARGUMENT, task.get_table_type_(tablet, type));
   ASSERT_TRUE(type.is_unknown());
 }
 
@@ -904,7 +903,7 @@ TEST_F(TestTabletStudyInfo, outtable_gc_unknown_type_loads_storage_schema)
   for (int64_t i = 0; i < 3; ++i) {
     storage_schema.table_type_ = schema_types[i];
     ObSSGCTabletType type = ObSSGCTabletType::UNKNOWN;
-    ASSERT_EQ(OB_SUCCESS, task.get_table_type_(tablet, allocator, type));
+    ASSERT_EQ(OB_SUCCESS, task.get_table_type_(tablet, type));
     EXPECT_EQ(expected_types[i], type);
   }
 }

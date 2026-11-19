@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX STORAGE
 
+#include "lib/utility/utility.h"
 #include "storage/ss_garbage_collector/user_data_gc_dag_task/ob_ss_outtable_gc_task.h"
 #include "storage/ss_garbage_collector/user_data_gc_dag_task/ob_ss_lob_meta_gc_scan_task.h"
 #include "storage/ss_garbage_collector/user_data_gc_dag_task/ob_ss_lob_ctrl_gc_scan_task.h"
@@ -18,9 +19,7 @@
 #include "share/schema/ob_schema_getter_guard.h"
 #include "storage/incremental/ob_shared_meta_service.h"
 #include "storage/meta_mem/ob_tablet_handle.h"
-#include "storage/ob_storage_schema.h"
 #include "storage/tablet/ob_tablet.h"
-#include "storage/tablet/ob_tablet_obj_load_helper.h"
 
 namespace oceanbase
 {
@@ -52,6 +51,7 @@ int ObSSOuttableGCTask::process()
 {
   int ret = OB_SUCCESS;
   ObSSMarkSweepCtx *ctx = nullptr;
+  ObSSLobGCCostGuard lob_cost_guard(ctx, ObSSLobGCCostStat::PREPARE);
   SCN min_outtable_data_scn = SCN::max_scn();
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
@@ -483,7 +483,7 @@ int ObSSOuttableGCTask::prepare_lob_tablet_scan_input_(
         LOG_WARN("selected tablet handle is null", KR(ret), K(gc_tablet), K(meta_scn));
       } else if (tablet->is_empty_shell()) {
         // 空壳 Tablet 没有存储 Schema 和可扫描的 LOB 行。
-      } else if (OB_FAIL(get_table_type_(*tablet, allocator, table_type))) {
+      } else if (OB_FAIL(get_table_type_(*tablet, table_type))) {
         LOG_WARN("failed to get selected tablet table type", KR(ret), K(gc_tablet), K(meta_scn));
       } else if (table_type.is_lob_meta() || table_type.is_lob_ctrl()) {
         SCN clog_checkpoint_scn;
@@ -513,22 +513,22 @@ int ObSSOuttableGCTask::prepare_lob_tablet_scan_input_(
 }
 
 int ObSSOuttableGCTask::get_table_type_(
-    const ObTablet &tablet, ObArenaAllocator &allocator, ObSSGCTabletType &table_type)
+    const ObTablet &tablet,
+    ObSSGCTabletType &table_type)
 {
   int ret = OB_SUCCESS;
   if (table_type.is_unknown()) {
-    // Absent tablets and older Study responses still need the frozen shared storage schema.
-    ObStorageSchema *storage_schema = nullptr;
-    if (OB_FAIL(tablet.load_storage_schema(allocator, storage_schema))) {
-      LOG_WARN("failed to load selected tablet storage schema",
-          KR(ret), K(tablet.get_tablet_meta()));
-    } else if (OB_ISNULL(storage_schema)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("selected tablet storage schema is null", KR(ret), K(tablet.get_tablet_meta()));
-    } else if (OB_FAIL(ObSSGCTabletType::get_ss_gc_tablet_type(*storage_schema, table_type))) {
-      LOG_WARN("failed to get gc tablet type", KR(ret), K(tablet.get_tablet_meta()));
+    // Absent tablets and older Study responses still need the frozen tablet's type.
+    schema::ObTableType tablet_table_type = schema::MAX_TABLE_TYPE;
+    if (OB_FAIL(tablet.get_table_type(tablet_table_type))) {
+      LOG_WARN("failed to get selected tablet type", KR(ret), K(tablet.get_tablet_meta()));
+    } else if (schema::is_aux_lob_meta_table(tablet_table_type)) {
+      table_type = ObSSGCTabletType::LOB_META;
+    } else if (schema::is_aux_outtable_lob_control_table(tablet_table_type)) {
+      table_type = ObSSGCTabletType::LOB_CTRL;
+    } else {
+      table_type = ObSSGCTabletType::NORMAL;
     }
-    ObTabletObjLoadHelper::free(allocator, storage_schema);
   }
   return ret;
 }

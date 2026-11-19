@@ -739,6 +739,8 @@ TEST_F(TestSSOuttableLobUserGCTask, default_max_does_not_skip_preparation)
       ObSSGCTablet(ObLSID(1), ObTabletID(200002), SCN::base_scn()), SCN::base_scn(),
       ObSSGCTabletType::UNKNOWN)));
   ASSERT_EQ(OB_ERR_UNEXPECTED, task.process());
+  ASSERT_GE(dag.get_ctx()->lob_cost_stat_.get_stage_cost_us(ObSSLobGCCostStat::PREPARE), 0);
+  ASSERT_EQ(-1, dag.get_ctx()->lob_cost_stat_.get_stage_cost_us(ObSSLobGCCostStat::META_SCAN));
   ASSERT_TRUE(dag.get_ctx()->lob_ctrl_scan_inputs_.empty());
   ASSERT_TRUE(dag.get_ctx()->min_outtable_data_scn_.is_max());
   ASSERT_EQ(OB_SUCCESS, dag.get_ctx()->min_outtable_data_scn_.convert_for_tx(100));
@@ -1019,18 +1021,29 @@ TEST_F(TestSSOuttableLobUserGCTask, scan_range_is_checked_before_file_operations
   ASSERT_EQ(OB_ERR_UNEXPECTED, task.generate_next_task(next_task));
   ASSERT_EQ(nullptr, next_task);
   ASSERT_EQ(OB_ERR_UNEXPECTED, task.process());
+  ASSERT_GE(dag.get_ctx()->lob_cost_stat_.get_stage_cost_us(ObSSLobGCCostStat::META_SCAN), 0);
   ASSERT_TRUE(dag.get_ctx()->is_valid());
+
+  ObSSLobCtrlGCScanTask ctrl_task;
+  ASSERT_EQ(OB_SUCCESS, ctrl_task.init(0, 2));
+  ctrl_task.set_dag(dag);
+  ASSERT_EQ(OB_ERR_UNEXPECTED, ctrl_task.process());
+  ASSERT_GE(dag.get_ctx()->lob_cost_stat_.get_stage_cost_us(ObSSLobGCCostStat::CTRL_SCAN), 0);
+  dag.get_ctx()->reset();
+  ASSERT_EQ(-1, dag.get_ctx()->lob_cost_stat_.get_total_cost_us());
 }
 
 TEST_F(TestSSOuttableLobUserGCTask, missing_meta_service_is_not_an_empty_keep_set)
 {
   ObSSLobMetaGCScanTask task;
   ObMarkSweepSorter sorter;
+  ObSSMarkSweepDiagMgr diag_mgr;
   const ObSSGCTabletWithMetaScn scan_input(
       ObSSGCTablet(ObLSID(1), ObTabletID(200001), SCN::base_scn()), SCN::base_scn(),
       ObSSGCTabletType::UNKNOWN);
-  ASSERT_EQ(OB_ERR_UNEXPECTED, task.scan_lob_meta_tablet_(scan_input, sorter));
-  ASSERT_EQ(OB_INVALID_ARGUMENT, task.scan_lob_meta_tablet_(ObSSGCTabletWithMetaScn(), sorter));
+  ASSERT_EQ(OB_ERR_UNEXPECTED, task.scan_lob_meta_tablet_(scan_input, sorter, diag_mgr));
+  ASSERT_EQ(OB_INVALID_ARGUMENT,
+      task.scan_lob_meta_tablet_(ObSSGCTabletWithMetaScn(), sorter, diag_mgr));
 }
 
 TEST_F(TestSSOuttableLobUserGCTask, meta_scan_skips_non_outtable_rows)
@@ -1283,6 +1296,7 @@ TEST_F(TestSSOuttableLobUserGCTask, dag_skips_user_gc_before_min_cluster_version
   ASSERT_EQ(OB_SUCCESS, dag.init_by_param(&param));
   ASSERT_EQ(OB_SUCCESS, dag.create_first_task());
   ASSERT_EQ(5, dag.get_task_list_count());
+  ASSERT_EQ(-1, dag.get_ctx()->lob_cost_stat_.get_total_cost_us());
 }
 
 TEST_F(TestSSOuttableLobUserGCTask, merge_waits_for_all_scans_and_blocks_system_sort)
@@ -1408,13 +1422,10 @@ TEST_F(TestSSOuttableLobUserGCTask, ctrl_scan_columns_follow_frozen_storage_sche
       ASSERT_EQ(physical_columns.at(i).col_order_, columns.at(i).col_order_);
       ASSERT_NE(OB_HIDDEN_SQL_SEQUENCE_COLUMN_ID, columns.at(i).col_id_);
     }
-    ASSERT_EQ(OB_SCHEMA_ERROR,
-        ObSSLobGCScanUtil::prepare_meta_scan_columns(storage_schema, columns));
-    ASSERT_TRUE(columns.empty());
   }
 }
 
-TEST_F(TestSSOuttableLobUserGCTask, meta_scan_columns_follow_frozen_storage_schema)
+TEST_F(TestSSOuttableLobUserGCTask, meta_scan_columns_use_fixed_layout)
 {
   ObArenaAllocator allocator;
   schema::ObTableSchema table_schema;
@@ -1427,12 +1438,16 @@ TEST_F(TestSSOuttableLobUserGCTask, meta_scan_columns_follow_frozen_storage_sche
   ObObjMeta column_type;
   column_type.set_varbinary();
   column_type.set_collation_type(CS_TYPE_BINARY);
+  // Column preparation needs no schema and replaces any previously requested columns.
+  schema::ObColDesc unused_column;
+  unused_column.col_id_ = OB_HIDDEN_SQL_SEQUENCE_COLUMN_ID;
+  ASSERT_EQ(OB_SUCCESS, columns.push_back(unused_column));
   for (const bool simplified : {false, true}) {
     ObStorageSchema storage_schema;
     ASSERT_EQ(OB_SUCCESS,
         storage_schema.init(allocator, table_schema, lib::Worker::CompatMode::MYSQL, simplified));
     ASSERT_EQ(simplified, storage_schema.is_column_info_simplified());
-    ASSERT_EQ(OB_SUCCESS, ObSSLobGCScanUtil::prepare_meta_scan_columns(storage_schema, columns));
+    ASSERT_EQ(OB_SUCCESS, ObSSLobGCScanUtil::prepare_meta_scan_columns(columns));
     ASSERT_EQ(2, columns.count());
     ASSERT_EQ(OB_APP_MIN_COLUMN_ID + ObLobMetaUtil::LOB_INFO_COL_ID, columns.at(0).col_id_);
     ASSERT_EQ(OB_APP_MIN_COLUMN_ID + ObLobMetaUtil::LOB_BLOCK_ID_COL_ID, columns.at(1).col_id_);

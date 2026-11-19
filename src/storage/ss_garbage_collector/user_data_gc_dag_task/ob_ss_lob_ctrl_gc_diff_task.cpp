@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX STORAGE
 
+#include "lib/utility/utility.h"
 #include "storage/ss_garbage_collector/user_data_gc_dag_task/ob_ss_lob_ctrl_gc_diff_task.h"
 
 namespace oceanbase
@@ -41,6 +42,7 @@ int ObSSLobCtrlGCDiffTask::process()
 {
   int ret = OB_SUCCESS;
   ObSSMarkSweepCtx *ctx = nullptr;
+  ObSSLobGCCostGuard lob_cost_guard(ctx, ObSSLobGCCostStat::DIFF);
   ObSortedFileInfo kept_file;
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;

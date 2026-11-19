@@ -229,6 +229,101 @@ int64_t ObSSMarkSweepCostStat::to_merge_string(char *buf, const int64_t buf_len)
   return pos;
 }
 
+// ============================ ObSSLobGCCostStat ============================
+void ObSSLobGCCostStat::reset()
+{
+  for (int64_t i = 0; i < STAGE_COUNT; ++i) {
+    start_us_[i] = INT64_MAX;
+    end_us_[i] = 0;
+    task_cost_us_[i] = 0;
+  }
+}
+
+void ObSSLobGCCostStat::record_cost(
+    const Stage stage,
+    const int64_t start_us,
+    const int64_t end_us)
+{
+  if (OB_LIKELY(stage >= PREPARE && stage < STAGE_COUNT && start_us > 0
+      && start_us < INT64_MAX && end_us >= start_us)) {
+    dec_update(&start_us_[stage], start_us);
+    inc_update(&end_us_[stage], end_us);
+    (void)ATOMIC_AAF(&task_cost_us_[stage], end_us - start_us);
+  }
+}
+
+int64_t ObSSLobGCCostStat::get_stage_cost_us(const Stage stage) const
+{
+  int64_t cost_us = -1;
+  if (stage >= PREPARE && stage < STAGE_COUNT) {
+    const int64_t start_us = ATOMIC_LOAD(&start_us_[stage]);
+    const int64_t end_us = ATOMIC_LOAD(&end_us_[stage]);
+    if (INT64_MAX != start_us && end_us >= start_us) {
+      cost_us = end_us - start_us;
+    }
+  }
+  return cost_us;
+}
+
+int64_t ObSSLobGCCostStat::get_total_cost_us() const
+{
+  int64_t start_us = INT64_MAX;
+  int64_t end_us = 0;
+  for (int64_t i = 0; i < STAGE_COUNT; ++i) {
+    const int64_t stage_start_us = ATOMIC_LOAD(&start_us_[i]);
+    const int64_t stage_end_us = ATOMIC_LOAD(&end_us_[i]);
+    if (INT64_MAX != stage_start_us && stage_end_us >= stage_start_us) {
+      start_us = MIN(start_us, stage_start_us);
+      end_us = MAX(end_us, stage_end_us);
+    }
+  }
+  return (INT64_MAX == start_us) ? -1 : end_us - start_us;
+}
+
+int64_t ObSSLobGCCostStat::to_string(char *buf, const int64_t buf_len) const
+{
+  int64_t pos = 0;
+  (void)databuff_printf(buf, buf_len, pos,
+      "{total_us=%ld,prepare_us=%ld,meta_scan_us=%ld,meta_merge_us=%ld,ctrl_scan_us=%ld,"
+      "ctrl_merge_us=%ld,diff_us=%ld,ctrl_delete_us=%ld}",
+      get_total_cost_us(), get_stage_cost_us(PREPARE), get_stage_cost_us(META_SCAN),
+      get_stage_cost_us(META_MERGE), get_stage_cost_us(CTRL_SCAN), get_stage_cost_us(CTRL_MERGE),
+      get_stage_cost_us(DIFF), get_stage_cost_us(CTRL_DELETE));
+  return pos;
+}
+
+int64_t ObSSLobGCCostStat::to_task_cost_string(char *buf, const int64_t buf_len) const
+{
+  int64_t pos = 0;
+  const char *stage_names[STAGE_COUNT] = {
+      "prepare", "meta_scan", "meta_merge", "ctrl_scan", "ctrl_merge", "diff", "ctrl_delete"};
+  (void)databuff_printf(buf, buf_len, pos, "{task_cost_us={");
+  for (int64_t i = 0; i < STAGE_COUNT; ++i) {
+    const int64_t cost_us = (get_stage_cost_us(static_cast<Stage>(i)) < 0)
+        ? -1 : ATOMIC_LOAD(&task_cost_us_[i]);
+    (void)databuff_printf(buf, buf_len, pos, "%s%s=%ld",
+        (0 == i) ? "" : ",", stage_names[i], cost_us);
+  }
+  (void)databuff_printf(buf, buf_len, pos, "}}");
+  return pos;
+}
+
+ObSSLobGCCostGuard::ObSSLobGCCostGuard(
+    ObSSMarkSweepCtx *&ctx,
+    const ObSSLobGCCostStat::Stage stage,
+    const ObMarkSweepPipeline *pipeline)
+  : ctx_(ctx), stage_(stage), pipeline_(pipeline), start_us_(ObTimeUtility::current_time_us())
+{
+}
+
+ObSSLobGCCostGuard::~ObSSLobGCCostGuard()
+{
+  if (OB_NOT_NULL(ctx_)
+      && (ObSSLobGCCostStat::META_MERGE != stage_ || pipeline_ == &ctx_->lob_meta_pipeline_)) {
+    ctx_->lob_cost_stat_.record_cost(stage_, start_us_, ObTimeUtility::current_time_us());
+  }
+}
+
 // ============================ ObSSMarkSweepProgress ============================
 void ObSSMarkSweepProgress::reset()
 {
@@ -354,6 +449,7 @@ void ObSSMarkSweepCtx::reset()
   round_id_ = 0;
   progress_.reset();
   cost_stat_.reset();
+  lob_cost_stat_.reset();
   diag_mgr_.reset();
 }
 
@@ -787,6 +883,22 @@ int ObSSMarkSweepDag::report_result_()
         "diag_first_fail_ret", ctx_->diag_mgr_.get_first_fail_ret(),
         "dag_ret", dag_ret,
         get_dag_id() /*extra_info(dag_id)*/);
+  }
+  if (OB_NOT_NULL(ctx_) && ctx_->lob_cost_stat_.get_total_cost_us() >= 0) {
+    char lob_stat_buf[MAX_ROOTSERVICE_EVENT_EXTRA_INFO_LENGTH] = {0};
+    char lob_task_stat_buf[MAX_ROOTSERVICE_EVENT_EXTRA_INFO_LENGTH] = {0};
+    (void)ctx_->lob_cost_stat_.to_string(lob_stat_buf, sizeof(lob_stat_buf));
+    (void)ctx_->lob_cost_stat_.to_task_cost_string(lob_task_stat_buf, sizeof(lob_task_stat_buf));
+    SERVER_EVENT_ADD("SHARED_GC", "MARK_SWEEP_LOB_GC_STAT",
+        "tenant_id", tenant_id_,
+        "round_id", ctx_->round_id_,
+        "gc_meta_scn", ctx_->safe_meta_scn_,
+        "dag_ret", dag_ret,
+        "dag_id", get_dag_id(),
+        "tablet_cnt", ctx_->progress_.get_total_tablet_count(),
+        lob_stat_buf /*extra_info*/);
+    LOG_INFO("finish lob gc cost statistics", K_(tenant_id), K(ctx_->round_id_), K(dag_ret),
+        "dag_id", get_dag_id(), K(lob_stat_buf), K(lob_task_stat_buf));
   }
   return ret;
 }
@@ -2277,6 +2389,7 @@ int ObSSMarkSweepMergeStartTask::process()
   FLOG_INFO("start to process ObSSMarkSweepMergeStartTask");
   ObTimePiece time_piece;
   ObSSMarkSweepCtx *ctx = nullptr;
+  ObSSLobGCCostGuard lob_cost_guard(ctx, ObSSLobGCCostStat::META_MERGE, pipeline_);
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("ObSSMarkSweepMergeStartTask not inited", KR(ret));
@@ -2423,6 +2536,7 @@ int ObSSMarkSweepMergePassCtrlTask::process()
   FLOG_INFO("start to process ObSSMarkSweepMergePassCtrlTask", K_(group));
   ObTimePiece time_piece;
   ObSSMarkSweepCtx *ctx = nullptr;
+  ObSSLobGCCostGuard lob_cost_guard(ctx, ObSSLobGCCostStat::META_MERGE, pipeline_);
 
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
@@ -2577,6 +2691,7 @@ int ObSSMarkSweepMergeBatchTask::process()
   int ret = OB_SUCCESS;
   ObTimePiece time_piece;
   ObSSMarkSweepCtx *ctx = nullptr;
+  ObSSLobGCCostGuard lob_cost_guard(ctx, ObSSLobGCCostStat::META_MERGE, pipeline_);
   int64_t retry_cnt = 0;
 
   if (IS_NOT_INIT) {
@@ -2663,27 +2778,6 @@ int ObSSMarkSweepMergeCompleteTask::CompleteSystemMergeFn::operator()()
   return ret;
 }
 
-int ObSSMarkSweepMergeCompleteTask::process_lob_meta_pipeline_(ObSSMarkSweepCtx &ctx)
-{
-  int ret = OB_SUCCESS;
-  if (ctx.diag_mgr_.is_ready_record()) {
-    int tmp_ret = OB_SUCCESS;
-    ObSortedFileInfo kept_file;
-    if (OB_ENTRY_NOT_EXIST == (tmp_ret = pipeline_->get_merged_file(
-        ObMarkSweepGroupType::KEPT, kept_file))) {
-      tmp_ret = OB_SUCCESS;
-    } else if (OB_SUCCESS != tmp_ret) {
-      LOG_WARN_RET(tmp_ret, "failed to get lob meta kept file for diagnose",
-          K(ctx.tenant_id_), K(ctx.round_id_));
-      ctx.diag_mgr_.mark_diag_failed(tmp_ret);
-    } else if (OB_SUCCESS != (tmp_ret = ctx.diag_mgr_.write_lob_meta_kept_file(
-        kept_file, ctx.file_buf_size_))) {
-      LOG_WARN_RET(tmp_ret, "failed to record lob meta kept macros",
-          K(ctx.tenant_id_), K(ctx.round_id_));
-    }
-  }
-  return ret;
-}
 
 int ObSSMarkSweepMergeCompleteTask::process_system_gc_pipeline_(
     ObSSMarkSweepCtx &ctx,
@@ -2703,6 +2797,7 @@ int ObSSMarkSweepMergeCompleteTask::process()
   FLOG_INFO("start to process ObSSMarkSweepMergeCompleteTask");
   ObTimePiece time_piece;
   ObSSMarkSweepCtx *ctx = nullptr;
+  ObSSLobGCCostGuard lob_cost_guard(ctx, ObSSLobGCCostStat::META_MERGE, pipeline_);
   int64_t retry_cnt = 0;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
@@ -2712,9 +2807,7 @@ int ObSSMarkSweepMergeCompleteTask::process()
   } else if (OB_FAIL(check_if_stopped_or_failed())) {
     LOG_WARN("fail to check before completing reference merge", KR(ret));
   } else if (pipeline_ == &ctx->lob_meta_pipeline_) {
-    if (OB_FAIL(process_lob_meta_pipeline_(*ctx))) {
-      LOG_WARN("fail to process lob meta merge completion", KR(ret));
-    }
+    // The final group is already complete; raw LOB Meta diagnostics are recorded during scanning.
   } else if (pipeline_ == &ctx->pipeline_) {
     if (OB_FAIL(process_system_gc_pipeline_(*ctx, retry_cnt))) {
       LOG_WARN("fail to process system gc merge completion", KR(ret), K(retry_cnt));

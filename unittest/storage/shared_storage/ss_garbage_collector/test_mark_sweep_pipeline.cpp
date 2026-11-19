@@ -30,6 +30,7 @@
 #include "lib/mysqlclient/ob_mysql_result_impl.h"
 #include "observer/omt/ob_tenant_config_mgr.h"
 #include "lib/hash/ob_hashset.h"
+#include "lib/time/ob_time_utility.h"
 #include <atomic>
 #include <string>
 #include <thread>
@@ -51,6 +52,204 @@ static MacroBlockId make_id(int64_t seq)
 }
 
 // Cost statistics do not need the tenant or temporary-file fixture.
+TEST(TestSSLobGCCostStat, unexecuted_phases_and_reset)
+{
+  ObSSLobGCCostStat stat;
+  ASSERT_EQ(-1, stat.get_total_cost_us());
+  for (int64_t i = 0; i < ObSSLobGCCostStat::STAGE_COUNT; ++i) {
+    ASSERT_EQ(-1, stat.get_stage_cost_us(static_cast<ObSSLobGCCostStat::Stage>(i)));
+  }
+  stat.record_cost(ObSSLobGCCostStat::PREPARE, 100, 100);
+  ASSERT_EQ(0, stat.get_total_cost_us());
+  ASSERT_EQ(0, stat.get_stage_cost_us(ObSSLobGCCostStat::PREPARE));
+  ASSERT_EQ(-1, stat.get_stage_cost_us(ObSSLobGCCostStat::META_SCAN));
+  char buf[MAX_ROOTSERVICE_EVENT_EXTRA_INFO_LENGTH] = {};
+  stat.to_string(buf, sizeof(buf));
+  ASSERT_NE(nullptr, STRSTR(buf, "prepare_us=0,meta_scan_us=-1"));
+  stat.to_task_cost_string(buf, sizeof(buf));
+  ASSERT_NE(nullptr, STRSTR(buf, "prepare=0,meta_scan=-1"));
+
+  stat.reset();
+  ASSERT_EQ(-1, stat.get_total_cost_us());
+  for (int64_t i = 0; i < ObSSLobGCCostStat::STAGE_COUNT; ++i) {
+    ASSERT_EQ(INT64_MAX, stat.start_us_[i]);
+    ASSERT_EQ(0, stat.end_us_[i]);
+    ASSERT_EQ(0, stat.task_cost_us_[i]);
+  }
+}
+
+TEST(TestSSLobGCCostStat, phase_spans_and_task_duration_sums_are_distinct)
+{
+  ObSSLobGCCostStat stat;
+  stat.record_cost(ObSSLobGCCostStat::PREPARE, 100, 120);
+  stat.record_cost(ObSSLobGCCostStat::META_SCAN, 200, 300);
+  stat.record_cost(ObSSLobGCCostStat::META_SCAN, 250, 400);
+  stat.record_cost(ObSSLobGCCostStat::META_SCAN, 500, 600);
+  stat.record_cost(ObSSLobGCCostStat::CTRL_DELETE, 800, 900);
+  ASSERT_EQ(400, stat.get_stage_cost_us(ObSSLobGCCostStat::META_SCAN));
+  ASSERT_EQ(350, stat.task_cost_us_[ObSSLobGCCostStat::META_SCAN]);
+  ASSERT_EQ(800, stat.get_total_cost_us());
+  char buf[MAX_ROOTSERVICE_EVENT_EXTRA_INFO_LENGTH] = {};
+  stat.to_task_cost_string(buf, sizeof(buf));
+  ASSERT_NE(nullptr, STRSTR(buf, "meta_scan=350,"));
+
+  // Finishing the whole DAG later must not extend the LOB span.
+  ObSSMarkSweepCostStat system_stat;
+  system_stat.set_total_start_us(50);
+  system_stat.set_total_end_us(2000);
+  ASSERT_EQ(800, stat.get_total_cost_us());
+}
+
+TEST(TestSSLobGCCostStat, invalid_samples_do_not_change_statistics)
+{
+  ObSSLobGCCostStat stat;
+  stat.record_cost(ObSSLobGCCostStat::STAGE_COUNT, 100, 200);
+  stat.record_cost(ObSSLobGCCostStat::PREPARE, 0, 200);
+  stat.record_cost(ObSSLobGCCostStat::PREPARE, 200, 100);
+  ASSERT_EQ(-1, stat.get_total_cost_us());
+  ASSERT_EQ(-1, stat.get_stage_cost_us(ObSSLobGCCostStat::STAGE_COUNT));
+  ASSERT_EQ(0, stat.task_cost_us_[ObSSLobGCCostStat::PREPARE]);
+}
+
+TEST(TestSSLobGCCostStat, concurrent_tasks_accumulate_all_phases)
+{
+  ObSSLobGCCostStat stat;
+  constexpr int64_t THREAD_COUNT = 4;
+  constexpr int64_t SAMPLE_COUNT = 1000;
+  std::atomic<bool> start(false);
+  std::vector<std::thread> threads;
+  for (int64_t i = 0; i < THREAD_COUNT; ++i) {
+    threads.emplace_back([&stat, &start, i]() {
+      while (!start.load()) {
+        std::this_thread::yield();
+      }
+      for (int64_t j = 0; j < SAMPLE_COUNT; ++j) {
+        for (int64_t k = 0; k < ObSSLobGCCostStat::STAGE_COUNT; ++k) {
+          stat.record_cost(static_cast<ObSSLobGCCostStat::Stage>(k), 100 + i, 200 + i);
+        }
+      }
+    });
+  }
+  start.store(true);
+  for (std::thread &thread : threads) {
+    thread.join();
+  }
+  for (int64_t i = 0; i < ObSSLobGCCostStat::STAGE_COUNT; ++i) {
+    ASSERT_EQ(100, stat.start_us_[i]);
+    ASSERT_EQ(200 + THREAD_COUNT - 1, stat.end_us_[i]);
+    ASSERT_EQ(100 * THREAD_COUNT * SAMPLE_COUNT, stat.task_cost_us_[i]);
+    ASSERT_EQ(100 + THREAD_COUNT - 1,
+        stat.get_stage_cost_us(static_cast<ObSSLobGCCostStat::Stage>(i)));
+  }
+  ASSERT_EQ(100 + THREAD_COUNT - 1, stat.get_total_cost_us());
+}
+
+TEST(TestSSLobGCCostStat, largest_costs_fit_event_extra_info)
+{
+  ObSSLobGCCostStat stat;
+  for (int64_t i = 0; i < ObSSLobGCCostStat::STAGE_COUNT; ++i) {
+    stat.record_cost(static_cast<ObSSLobGCCostStat::Stage>(i), 1, INT64_MAX);
+  }
+  const char *names[] = {"total_us=", "prepare_us=", "meta_scan_us=", "meta_merge_us=",
+      "ctrl_scan_us=", "ctrl_merge_us=", "diff_us=", "ctrl_delete_us="};
+  char buf[MAX_ROOTSERVICE_EVENT_EXTRA_INFO_LENGTH] = {};
+  const int64_t len = stat.to_string(buf, sizeof(buf));
+  ASSERT_GT(len, 0);
+  ASSERT_LT(len, sizeof(buf));
+  ASSERT_EQ(len, STRLEN(buf));
+  ASSERT_EQ('}', buf[len - 1]);
+  for (const char *name : names) {
+    char field[64] = {};
+    ASSERT_EQ(OB_SUCCESS, databuff_printf(field, sizeof(field), "%s%ld", name, INT64_MAX - 1));
+    ASSERT_NE(nullptr, STRSTR(buf, field));
+  }
+  const int64_t task_len = stat.to_task_cost_string(buf, sizeof(buf));
+  ASSERT_GT(task_len, 0);
+  ASSERT_LT(task_len, sizeof(buf));
+  ASSERT_EQ(task_len, STRLEN(buf));
+  ASSERT_EQ('}', buf[task_len - 1]);
+}
+
+TEST(TestSSLobGCCostGuard, observes_context_assigned_after_construction)
+{
+  ObSSMarkSweepCtx context;
+  ObSSMarkSweepCtx *ctx = nullptr;
+  {
+    ObSSLobGCCostGuard guard(ctx, ObSSLobGCCostStat::META_SCAN);
+    ObSSLobGCCostGuard merge_guard(ctx, ObSSLobGCCostStat::META_MERGE);
+  }
+  ASSERT_EQ(-1, context.lob_cost_stat_.get_total_cost_us());
+
+  const int64_t before = ObTimeUtility::current_time_us();
+  int64_t after_construction = 0;
+  {
+    ObSSLobGCCostGuard guard(ctx, ObSSLobGCCostStat::PREPARE);
+    after_construction = ObTimeUtility::current_time_us();
+    ctx = &context;
+    ASSERT_EQ(-1, context.lob_cost_stat_.get_total_cost_us());
+  }
+  const int64_t after = ObTimeUtility::current_time_us();
+  const ObSSLobGCCostStat &stat = context.lob_cost_stat_;
+  EXPECT_GE(stat.start_us_[ObSSLobGCCostStat::PREPARE], before);
+  EXPECT_LE(stat.start_us_[ObSSLobGCCostStat::PREPARE], after_construction);
+  EXPECT_LE(stat.end_us_[ObSSLobGCCostStat::PREPARE], after);
+  EXPECT_GE(stat.get_stage_cost_us(ObSSLobGCCostStat::PREPARE), 0);
+  EXPECT_EQ(-1, stat.get_stage_cost_us(ObSSLobGCCostStat::META_SCAN));
+
+  // A failed context lookup may also clear a previously assigned pointer.
+  {
+    ObSSLobGCCostGuard guard(ctx, ObSSLobGCCostStat::META_SCAN);
+    ctx = nullptr;
+  }
+  EXPECT_EQ(-1, stat.get_stage_cost_us(ObSSLobGCCostStat::META_SCAN));
+}
+
+TEST(TestSSLobGCCostGuard, early_error_return_records_one_task_duration)
+{
+  ObSSMarkSweepCtx context;
+  const auto fail_after_get_ctx = [&context]() {
+    ObSSMarkSweepCtx *ctx = nullptr;
+    ObSSLobGCCostGuard guard(ctx, ObSSLobGCCostStat::CTRL_DELETE);
+    ctx = &context;
+    return OB_TIMEOUT;
+  };
+  ASSERT_EQ(OB_TIMEOUT, fail_after_get_ctx());
+  const ObSSLobGCCostStat &stat = context.lob_cost_stat_;
+  const int64_t duration = stat.get_stage_cost_us(ObSSLobGCCostStat::CTRL_DELETE);
+  ASSERT_GE(duration, 0);
+  // A single task's sum equals its span, including on an error exit.
+  EXPECT_EQ(duration, stat.task_cost_us_[ObSSLobGCCostStat::CTRL_DELETE]);
+  EXPECT_EQ(duration, stat.get_total_cost_us());
+  EXPECT_EQ(-1, stat.get_stage_cost_us(ObSSLobGCCostStat::PREPARE));
+}
+
+TEST(TestSSLobGCCostGuard, meta_merge_records_only_the_context_lob_pipeline)
+{
+  ObSSMarkSweepCtx context;
+  ObSSMarkSweepCtx *ctx = &context;
+  const ObMarkSweepPipeline *other_pipelines[] = {nullptr, &context.pipeline_};
+  for (const ObMarkSweepPipeline *pipeline : other_pipelines) {
+    {
+      ObSSLobGCCostGuard guard(ctx, ObSSLobGCCostStat::META_MERGE, pipeline);
+    }
+    ASSERT_EQ(-1, context.lob_cost_stat_.get_total_cost_us());
+  }
+  {
+    ObSSLobGCCostGuard guard(ctx, ObSSLobGCCostStat::META_MERGE, &context.lob_meta_pipeline_);
+  }
+  const ObSSLobGCCostStat &stat = context.lob_cost_stat_;
+  ASSERT_GE(stat.get_stage_cost_us(ObSSLobGCCostStat::META_MERGE), 0);
+  const int64_t start_us = stat.start_us_[ObSSLobGCCostStat::META_MERGE];
+  const int64_t end_us = stat.end_us_[ObSSLobGCCostStat::META_MERGE];
+  const int64_t task_cost_us = stat.task_cost_us_[ObSSLobGCCostStat::META_MERGE];
+  {
+    ObSSLobGCCostGuard guard(ctx, ObSSLobGCCostStat::META_MERGE, &context.pipeline_);
+  }
+  EXPECT_EQ(start_us, stat.start_us_[ObSSLobGCCostStat::META_MERGE]);
+  EXPECT_EQ(end_us, stat.end_us_[ObSSLobGCCostStat::META_MERGE]);
+  EXPECT_EQ(task_cost_us, stat.task_cost_us_[ObSSLobGCCostStat::META_MERGE]);
+}
+
 TEST(TestSSMarkSweepCostStat, persist_cost_sums_calls_instead_of_their_span)
 {
   ObSSMarkSweepCostStat stat;
@@ -1505,6 +1704,8 @@ protected:
 
   void check_system_merge_metrics_unchanged_(const ObSSMarkSweepCtx &ctx)
   {
+    EXPECT_GE(ctx.lob_cost_stat_.get_stage_cost_us(ObSSLobGCCostStat::META_MERGE), 0);
+    EXPECT_GE(ctx.lob_cost_stat_.task_cost_us_[ObSSLobGCCostStat::META_MERGE], 0);
     EXPECT_EQ(1, ctx.progress_.get_total_sort_task_count());
     EXPECT_EQ(1, ctx.progress_.get_total_tablet_count());
     EXPECT_EQ(0, ctx.progress_.get_finished_sort_task_count());
@@ -1698,6 +1899,7 @@ TEST_F(TestLobMetaGCSharedMerge, system_pipeline_merge_keeps_full_set_difference
   int64_t processed_task_count = 0;
   ASSERT_EQ(OB_SUCCESS, run_merge_tasks_(dag, false, processed_task_count));
   ASSERT_EQ(8, processed_task_count);
+  ASSERT_EQ(-1, ctx.lob_cost_stat_.get_total_cost_us());
   const int64_t expected[] = {0, 2, 4};
   for (int64_t i = 0; i < ARRAYSIZEOF(expected); ++i) {
     const ObGCMacroBlockItem *item = nullptr;
@@ -1837,6 +2039,7 @@ TEST_F(TestLobCtrlGCScanFile, projected_rows_preserve_physical_versions_and_igno
   ASSERT_EQ(OB_SUCCESS, cutoff.convert_for_tx(6000));
   ObSSLobCtrlGCScanTask task;
   const ObDmlFlag operations[] = {DF_INSERT, DF_UPDATE, DF_DELETE, DF_DELETE, DF_INSERT};
+  ObSSOuttableLobCtrlCandidate candidate;
   for (int64_t i = 0; i < ARRAYSIZEOF(operations); ++i) {
     row.row_flag_.set_flag(operations[i]);
     row.mvcc_row_flag_.reset();
@@ -1844,7 +2047,11 @@ TEST_F(TestLobCtrlGCScanFile, projected_rows_preserve_physical_versions_and_igno
     row.mvcc_row_flag_.set_ghost_row(i == 3);
     row.mvcc_row_flag_.set_shadow_row(i == 4);
     row.storage_datums_[2].set_int(-5000 - i);
-    ASSERT_EQ(OB_SUCCESS, task.add_lob_ctrl_row_(row, cutoff, sorter_));
+    ASSERT_EQ(OB_SUCCESS, task.add_lob_ctrl_row_(row, cutoff, sorter_, candidate));
+    ASSERT_TRUE(candidate.is_valid());
+    EXPECT_EQ(macro_id, candidate.macro_id_);
+    EXPECT_EQ(UINT64_MAX, candidate.hash_);
+    EXPECT_EQ(5000 + i, candidate.mark_row_scn_);
   }
   ASSERT_EQ(OB_SUCCESS, sorter_.do_sort(true /*final_merge*/));
   const ObSSOuttableLobCtrlCandidate *item = nullptr;
@@ -1881,9 +2088,16 @@ TEST_F(TestLobCtrlGCScanFile, projected_rows_apply_strict_cutoff)
   ASSERT_EQ(OB_SUCCESS, cutoff.convert_for_tx(6000));
   ObSSLobCtrlGCScanTask task;
   const int64_t versions[] = {-5999, -6000, -6001, -INT64_MAX, INT64_MAX};
+  ObSSOuttableLobCtrlCandidate candidate;
   for (const int64_t version : versions) {
+    // Seed a valid output to verify every skipped row clears the previous candidate.
+    candidate.macro_id_ = macro_id;
+    candidate.hash_ = 42;
+    candidate.mark_row_scn_ = 5999;
+    ASSERT_TRUE(candidate.is_valid());
     row.storage_datums_[2].set_int(version);
-    ASSERT_EQ(OB_SUCCESS, task.add_lob_ctrl_row_(row, cutoff, sorter_));
+    ASSERT_EQ(OB_SUCCESS, task.add_lob_ctrl_row_(row, cutoff, sorter_, candidate));
+    EXPECT_EQ(-5999 == version, candidate.is_valid());
   }
   ASSERT_EQ(OB_SUCCESS, sorter_.do_sort(true /*final_merge*/));
   const ObSSOuttableLobCtrlCandidate *item = nullptr;
@@ -1913,32 +2127,62 @@ TEST_F(TestLobCtrlGCScanFile, projected_rows_reject_invalid_columns_versions_and
   share::SCN cutoff;
   ASSERT_EQ(OB_SUCCESS, cutoff.convert_for_tx(6000));
   ObSSLobCtrlGCScanTask task;
+  ObSSOuttableLobCtrlCandidate candidate;
   for (int64_t i = 0; i < row.count_; ++i) {
     const ObStorageDatum saved = row.storage_datums_[i];
     row.storage_datums_[i].set_null();
-    ASSERT_EQ(OB_ERR_UNEXPECTED, task.add_lob_ctrl_row_(row, cutoff, sorter_));
+    ASSERT_EQ(OB_ERR_UNEXPECTED, task.add_lob_ctrl_row_(row, cutoff, sorter_, candidate));
     row.storage_datums_[i] = saved;
   }
   const int64_t versions[] = {0, 1, INT64_MIN};
   for (const int64_t version : versions) {
     row.storage_datums_[2].set_int(version);
-    ASSERT_EQ(OB_ERR_UNEXPECTED, task.add_lob_ctrl_row_(row, cutoff, sorter_));
+    ASSERT_EQ(OB_ERR_UNEXPECTED, task.add_lob_ctrl_row_(row, cutoff, sorter_, candidate));
   }
   row.storage_datums_[2].set_int(-5000);
   row.storage_datums_[0].set_string(macro_id_buf, pos - 1);
-  ASSERT_NE(OB_SUCCESS, task.add_lob_ctrl_row_(row, cutoff, sorter_));
+  ASSERT_NE(OB_SUCCESS, task.add_lob_ctrl_row_(row, cutoff, sorter_, candidate));
   row.storage_datums_[0].set_string(macro_id_buf, pos + 1);
-  ASSERT_EQ(OB_ERR_UNEXPECTED, task.add_lob_ctrl_row_(row, cutoff, sorter_));
+  ASSERT_EQ(OB_ERR_UNEXPECTED, task.add_lob_ctrl_row_(row, cutoff, sorter_, candidate));
   macro_id = make_id(8);
   pos = 0;
   ASSERT_EQ(OB_SUCCESS, macro_id.serialize(macro_id_buf, sizeof(macro_id_buf), pos));
   row.storage_datums_[0].set_string(macro_id_buf, pos);
-  ASSERT_EQ(OB_ERR_UNEXPECTED, task.add_lob_ctrl_row_(row, cutoff, sorter_));
+  ASSERT_EQ(OB_ERR_UNEXPECTED, task.add_lob_ctrl_row_(row, cutoff, sorter_, candidate));
   row.count_ = 2;
-  ASSERT_EQ(OB_INVALID_ARGUMENT, task.add_lob_ctrl_row_(row, cutoff, sorter_));
+  ASSERT_EQ(OB_INVALID_ARGUMENT, task.add_lob_ctrl_row_(row, cutoff, sorter_, candidate));
   ASSERT_EQ(OB_SUCCESS, sorter_.do_sort(true /*final_merge*/));
   const ObSSOuttableLobCtrlCandidate *item = nullptr;
   ASSERT_EQ(OB_ITER_END, sorter_.get_next_item(item));
+}
+
+TEST_F(TestLobCtrlGCScanFile, candidate_output_preserves_scan_order_and_duplicates)
+{
+  const int64_t sequences[] = {9, 3, 9};
+  ObArenaAllocator allocator(ObModIds::TEST);
+  ObDatumRow row;
+  ASSERT_EQ(OB_SUCCESS, row.init(allocator, 3));
+  share::SCN cutoff;
+  ASSERT_EQ(OB_SUCCESS, cutoff.convert_for_tx(6000));
+  ObSSLobCtrlGCScanTask task;
+  ObSSOuttableLobCtrlCandidate candidate;
+  char macro_id_buf[128] = {};
+  for (int64_t i = 0; i < ARRAYSIZEOF(sequences); ++i) {
+    MacroBlockId macro_id = make_id(sequences[i]);
+    macro_id.set_storage_object_type(
+        static_cast<uint64_t>(ObStorageObjectType::SHARED_OUTTABLE_LOB_DATA_MACRO));
+    macro_id.set_location(ObMacroBlockIdLocation::OBJECT_STORAGE);
+    int64_t pos = 0;
+    ASSERT_EQ(OB_SUCCESS, macro_id.serialize(macro_id_buf, sizeof(macro_id_buf), pos));
+    row.storage_datums_[0].set_string(macro_id_buf, pos);
+    row.storage_datums_[1].set_uint(42);
+    row.storage_datums_[2].set_int(-5000 - i);
+    ASSERT_EQ(OB_SUCCESS, task.add_lob_ctrl_row_(row, cutoff, sorter_, candidate));
+    ASSERT_TRUE(candidate.is_valid());
+    EXPECT_EQ(macro_id, candidate.macro_id_);
+    EXPECT_EQ(42, candidate.hash_);
+    EXPECT_EQ(5000 + i, candidate.mark_row_scn_);
+  }
 }
 
 TEST_F(TestLobCtrlGCScanFile, sorted_file_preserves_complete_candidate_records)
@@ -2176,6 +2420,8 @@ TEST_F(TestLobCtrlGCMergeFile, empty_files_do_not_publish_merged_record_file)
   ASSERT_EQ(OB_SUCCESS, run_ctrl_merge_tasks_(dag, processed_task_count));
   ASSERT_EQ(1, processed_task_count);
   ObSSMarkSweepCtx &ctx = *dag.get_ctx();
+  ASSERT_GE(ctx.lob_cost_stat_.get_stage_cost_us(ObSSLobGCCostStat::CTRL_MERGE), 0);
+  ASSERT_EQ(-1, ctx.lob_cost_stat_.get_stage_cost_us(ObSSLobGCCostStat::META_MERGE));
   ASSERT_TRUE(ctx.lob_ctrl_scan_files_.empty());
   ASSERT_TRUE(ctx.lob_ctrl_merge_inputs_.empty());
   ASSERT_TRUE(ctx.lob_ctrl_merge_outputs_.empty());
@@ -2203,6 +2449,24 @@ TEST_F(TestLobCtrlGCMergeFile, single_file_reuses_original_handle)
   ASSERT_NO_FATAL_FAILURE(check_records_(ctx.lob_ctrl_merged_file_, 11, 2));
   ctx.lob_ctrl_merged_file_.reset();
   EXPECT_EQ(0, ctx.lob_ctrl_scan_file_mgr_.acquired_file_count_);
+}
+
+TEST_F(TestLobCtrlGCMergeFile, merge_completion_does_not_record_candidates)
+{
+  ObArenaAllocator allocator(ObModIds::TEST);
+  ObSSMarkSweepDag dag;
+  ASSERT_EQ(OB_SUCCESS, init_ctrl_merge_dag_(dag, allocator));
+  ObSSMarkSweepCtx &ctx = *dag.get_ctx();
+  ASSERT_EQ(OB_SUCCESS, write_scan_file_(ctx, 11, 2));
+  // No diagnostic file slots are installed: merge must not record scan candidates again.
+  ctx.diag_mgr_.is_inited_ = true;
+  ctx.diag_mgr_.bucket_cnt_ = 1;
+  ctx.diag_mgr_.set_diag_enabled(true);
+  int64_t processed_task_count = 0;
+  ASSERT_EQ(OB_SUCCESS, run_ctrl_merge_tasks_(dag, processed_task_count));
+  ASSERT_EQ(1, processed_task_count);
+  ASSERT_FALSE(ctx.diag_mgr_.has_diag_failed());
+  ASSERT_NO_FATAL_FAILURE(check_records_(ctx.lob_ctrl_merged_file_, 11, 2));
 }
 
 TEST_F(TestLobCtrlGCMergeFile, shuffled_files_preserve_unique_macros_and_repeated_hashes)
@@ -2243,6 +2507,8 @@ TEST_F(TestLobCtrlGCMergeFile, bounded_fan_in_merges_multiple_passes)
   int64_t processed_task_count = 0;
   ASSERT_EQ(OB_SUCCESS, run_ctrl_merge_tasks_(dag, processed_task_count));
   ASSERT_EQ(6, processed_task_count);
+  ASSERT_GE(ctx.lob_cost_stat_.get_stage_cost_us(ObSSLobGCCostStat::CTRL_MERGE), 0);
+  ASSERT_GE(ctx.lob_cost_stat_.task_cost_us_[ObSSLobGCCostStat::CTRL_MERGE], 0);
   ASSERT_TRUE(ctx.lob_ctrl_scan_files_.empty());
   ASSERT_TRUE(ctx.lob_ctrl_merge_inputs_.empty());
   ASSERT_TRUE(ctx.lob_ctrl_merge_outputs_.empty());
@@ -2350,39 +2616,57 @@ class TestLobMetaGCDiagFile : public TestLobCtrlGCDiffFile
 {
 };
 
-TEST_F(TestLobMetaGCDiagFile, empty_file_is_valid_diagnostic_input)
+TEST_F(TestLobMetaGCDiagFile, empty_scan_batch_is_valid_diagnostic_input)
 {
-  ObArenaAllocator allocator(ObModIds::TEST);
-  ObSSMarkSweepDag dag;
-  ASSERT_EQ(OB_SUCCESS, init_ctrl_merge_dag_(dag, allocator));
-  ObSortedFileInfo kept_file;
-  ASSERT_EQ(OB_SUCCESS, create_raw_kept_file_(*dag.get_ctx(), false, kept_file));
-  ASSERT_TRUE(kept_file.is_valid());
-  ASSERT_EQ(0, kept_file.item_count_);
-
+  const ObSSGCTablet tablet(ObLSID(1), ObTabletID(200001), SCN::base_scn());
+  ObArray<MacroBlockId> macro_ids;
   ObSSMarkSweepDiagMgr diag_mgr;
   diag_mgr.is_inited_ = true;
   diag_mgr.tenant_id_ = OB_SYS_TENANT_ID;
-  ASSERT_EQ(OB_SUCCESS, diag_mgr.write_lob_meta_kept_file(kept_file, BUF_SIZE));
+  ASSERT_EQ(OB_SUCCESS, diag_mgr.write_lob_meta_kept(tablet, macro_ids));
   ASSERT_FALSE(diag_mgr.has_diag_failed());
 }
 
-TEST_F(TestLobMetaGCDiagFile, mismatched_item_count_fails_diagnostic_input)
+TEST_F(TestLobMetaGCDiagFile, invalid_scan_input_marks_diagnostic_failure)
+{
+  const ObSSGCTablet tablet(ObLSID(1), ObTabletID(200001), SCN::base_scn());
+  ObArray<MacroBlockId> macro_ids;
+  ObSSMarkSweepDiagMgr diag_mgr;
+  ASSERT_EQ(OB_NOT_INIT, diag_mgr.write_lob_meta_kept(tablet, macro_ids));
+  diag_mgr.reset();
+  diag_mgr.is_inited_ = true;
+  diag_mgr.tenant_id_ = OB_SYS_TENANT_ID;
+  ASSERT_EQ(OB_INVALID_ARGUMENT, diag_mgr.write_lob_meta_kept(ObSSGCTablet(), macro_ids));
+  ASSERT_TRUE(diag_mgr.has_diag_failed());
+  ASSERT_EQ(OB_INVALID_ARGUMENT, diag_mgr.get_first_fail_ret());
+
+  diag_mgr.reset();
+  diag_mgr.is_inited_ = true;
+  diag_mgr.tenant_id_ = OB_SYS_TENANT_ID;
+  ASSERT_EQ(OB_SUCCESS, macro_ids.push_back(MacroBlockId()));
+  ASSERT_EQ(OB_INVALID_ARGUMENT, diag_mgr.write_lob_meta_kept(tablet, macro_ids));
+  ASSERT_TRUE(diag_mgr.has_diag_failed());
+}
+
+TEST_F(TestLobMetaGCDiagFile, merge_completion_does_not_record_merged_references)
 {
   ObArenaAllocator allocator(ObModIds::TEST);
   ObSSMarkSweepDag dag;
   ASSERT_EQ(OB_SUCCESS, init_ctrl_merge_dag_(dag, allocator));
+  const int64_t sequences[] = {9, 3, 9};
   ObSortedFileInfo kept_file;
-  ASSERT_EQ(OB_SUCCESS, create_raw_kept_file_(*dag.get_ctx(), true, kept_file));
-  ASSERT_TRUE(kept_file.is_valid());
-  ASSERT_EQ(3, kept_file.item_count_);
+  ASSERT_EQ(OB_SUCCESS, prepare_kept_file_(dag, sequences, ARRAYSIZEOF(sequences), kept_file));
+  ASSERT_EQ(2, kept_file.item_count_);
 
-  ObSSMarkSweepDiagMgr diag_mgr;
-  diag_mgr.is_inited_ = true;
-  diag_mgr.tenant_id_ = OB_SYS_TENANT_ID;
-  ASSERT_EQ(OB_ERR_UNEXPECTED, diag_mgr.write_lob_meta_kept_file(kept_file, BUF_SIZE));
-  ASSERT_TRUE(diag_mgr.has_diag_failed());
-  ASSERT_EQ(OB_ERR_UNEXPECTED, diag_mgr.get_first_fail_ret());
+  ObSSMarkSweepCtx &ctx = *dag.get_ctx();
+  // No diagnostic file slots are installed: merge completion must not try to write them.
+  ctx.diag_mgr_.is_inited_ = true;
+  ctx.diag_mgr_.set_diag_enabled(true);
+  ObSSMarkSweepMergeCompleteTask task;
+  task.set_dag(dag);
+  ASSERT_EQ(OB_SUCCESS, task.init(&ctx.lob_meta_pipeline_));
+  ASSERT_EQ(OB_SUCCESS, task.process());
+  ASSERT_FALSE(ctx.diag_mgr_.has_diag_failed());
 }
 
 TEST_F(TestLobCtrlGCDiffFile, partial_kept_macros_preserve_all_candidate_fields)
@@ -2476,6 +2760,8 @@ TEST_F(TestLobCtrlGCDiffFile, missing_ctrl_file_does_not_publish_difference)
   ASSERT_EQ(OB_SUCCESS, task.init());
   task.set_dag(dag);
   ASSERT_EQ(OB_SUCCESS, task.process());
+  ASSERT_GE(dag.get_ctx()->lob_cost_stat_.get_stage_cost_us(ObSSLobGCCostStat::DIFF), 0);
+  ASSERT_EQ(-1, dag.get_ctx()->lob_cost_stat_.get_stage_cost_us(ObSSLobGCCostStat::CTRL_DELETE));
   ASSERT_FALSE(dag.get_ctx()->lob_ctrl_diff_file_.is_valid());
   ASSERT_TRUE(kept_file.is_valid());
   ASSERT_EQ(0, dag.get_ctx()->lob_ctrl_scan_file_mgr_.acquired_file_count_);
@@ -2512,6 +2798,7 @@ TEST_F(TestLobCtrlGCDiffFile, uninitialized_kept_pipeline_does_not_authorize_dif
   ASSERT_EQ(OB_SUCCESS, task.init());
   task.set_dag(dag);
   ASSERT_EQ(OB_NOT_INIT, task.process());
+  ASSERT_GE(dag.get_ctx()->lob_cost_stat_.get_stage_cost_us(ObSSLobGCCostStat::DIFF), 0);
   ASSERT_FALSE(dag.get_ctx()->lob_ctrl_diff_file_.is_valid());
   ASSERT_NO_FATAL_FAILURE(check_records_(dag.get_ctx()->lob_ctrl_merged_file_, 2, 4));
 }
@@ -3275,6 +3562,10 @@ TEST_F(TestLobCtrlGCDeleteFile, delete_error_rolls_back_current_batch_and_retry_
   ASSERT_EQ(OB_SUCCESS, task.init());
   task.set_dag(dag);
   ASSERT_EQ(OB_TIMEOUT, task.process());
+  const ObSSLobGCCostStat &stat = dag.get_ctx()->lob_cost_stat_;
+  const int64_t first_cost_us = stat.get_stage_cost_us(ObSSLobGCCostStat::CTRL_DELETE);
+  ASSERT_GE(first_cost_us, 0);
+  ASSERT_EQ(first_cost_us, stat.task_cost_us_[ObSSLobGCCostStat::CTRL_DELETE]);
   ASSERT_EQ(1, connection_.start_count_);
   ASSERT_EQ(0, connection_.commit_count_);
   ASSERT_EQ(1, connection_.rollback_count_);
@@ -3283,6 +3574,9 @@ TEST_F(TestLobCtrlGCDeleteFile, delete_error_rolls_back_current_batch_and_retry_
   ASSERT_EQ(2, connection_.select_count_);
   connection_.fail_delete_at_ = 0;
   ASSERT_EQ(OB_SUCCESS, task.process());
+  ASSERT_GE(stat.task_cost_us_[ObSSLobGCCostStat::CTRL_DELETE], first_cost_us);
+  ASSERT_GE(stat.get_stage_cost_us(ObSSLobGCCostStat::CTRL_DELETE),
+      stat.task_cost_us_[ObSSLobGCCostStat::CTRL_DELETE]);
   ASSERT_EQ(3, connection_.commit_count_);
   ASSERT_TRUE(connection_.rows_[0].deleted_);
   ASSERT_TRUE(connection_.rows_[6].deleted_);
@@ -3298,6 +3592,7 @@ TEST_F(TestLobCtrlGCDeleteFile, changed_round_before_next_batch_stops_deletes)
   ASSERT_EQ(OB_SUCCESS, task.init());
   task.set_dag(dag);
   ASSERT_EQ(OB_CANCELED, task.process());
+  ASSERT_GE(dag.get_ctx()->lob_cost_stat_.get_stage_cost_us(ObSSLobGCCostStat::CTRL_DELETE), 0);
   ASSERT_EQ(3, connection_.delete_count_);
   ASSERT_EQ(1, connection_.start_count_);
   ASSERT_EQ(1, connection_.commit_count_);

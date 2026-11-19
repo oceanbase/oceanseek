@@ -11,7 +11,6 @@
 #include "storage/incremental/ob_shared_meta_service.h"
 #include "storage/lob/store/ob_lob_store_common.h"
 #include "storage/lob/store/ob_outtable_lob_control_page_iterator.h"
-#include "storage/ob_storage_schema.h"
 #include "storage/tablet/ob_tablet.h"
 
 namespace oceanbase
@@ -125,21 +124,18 @@ int ObSSMarkSweepMacroIDIterator::open_next_user_tablet_()
 int ObSSMarkSweepMacroIDIterator::init_user_iterator_(const ObTablet &tablet)
 {
   int ret = OB_SUCCESS;
-  ObStorageSchema *storage_schema = nullptr;
+  schema::ObTableType table_type = schema::MAX_TABLE_TYPE;
   ObSEArray<schema::ObColDesc, ObLobMetaUtil::LOB_META_MACRO_ID_COLUMN_CNT> columns;
   schema::ObColDesc column;
   if (tablet.is_empty_shell()) {
     // Empty shells have no row references and no loadable StorageSchema.
-  } else if (OB_FAIL(tablet.load_storage_schema(tablet_allocator_, storage_schema))) {
-    LOG_WARN("failed to load tablet storage schema", KR(ret), K_(gc_tablet));
-  } else if (OB_ISNULL(storage_schema)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("tablet storage schema is null", KR(ret), K_(gc_tablet));
-  } else if (storage_schema->is_aux_lob_meta_table()
-      || storage_schema->is_aux_outtable_lob_control_table()) {
-    is_lob_meta_ = storage_schema->is_aux_lob_meta_table();
+  } else if (OB_FAIL(tablet.get_table_type(table_type))) {
+    LOG_WARN("failed to get tablet type for macro scan", KR(ret), K_(gc_tablet));
+  } else if (schema::is_aux_lob_meta_table(table_type)
+      || schema::is_aux_outtable_lob_control_table(table_type)) {
+    is_lob_meta_ = schema::is_aux_lob_meta_table(table_type);
     if (is_lob_meta_) {
-      if (OB_FAIL(ObSSLobGCScanUtil::prepare_meta_scan_columns(*storage_schema, columns))) {
+      if (OB_FAIL(ObSSLobGCScanUtil::prepare_meta_scan_columns(columns))) {
         LOG_WARN("failed to prepare lob meta scan columns", KR(ret));
       }
     } else {
@@ -158,7 +154,6 @@ int ObSSMarkSweepMacroIDIterator::init_user_iterator_(const ObTablet &tablet)
       LOG_WARN("failed to initialize lob column iterator", KR(ret), K_(gc_tablet));
     }
   }
-  ObTabletObjLoadHelper::free(tablet_allocator_, storage_schema);
   return ret;
 }
 

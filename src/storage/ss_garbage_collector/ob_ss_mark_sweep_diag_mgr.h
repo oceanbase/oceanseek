@@ -180,17 +180,6 @@ public:
   common::ObArray<share::SCN> meta_scns_;
 };
 
-struct ObSSLobMetaGCDiagRows final
-{
-public:
-  ObSSLobMetaGCDiagRows();
-  ~ObSSLobMetaGCDiagRows() { reset(); }
-  void reset() { macro_ids_.reset(); }
-  TO_STRING_KV("macro_cnt", macro_ids_.count());
-public:
-  common::ObArray<blocksstable::MacroBlockId> macro_ids_;
-};
-
 struct ObSSLobCtrlGCDiagRows final
 {
 public:
@@ -293,11 +282,11 @@ public:
   int write_tablet_meta_scns(const ObMarkSweepGroupType group,
                              const ObSSGCTablet &tablet,
                              const common::ObIArray<share::SCN> &meta_scns);
+  // Record raw scan references with their source Tablet, preserving order and duplicates.
   int write_lob_meta_kept(
+      const ObSSGCTablet &tablet,
       const common::ObIArray<blocksstable::MacroBlockId> &macro_ids);
-  int write_lob_meta_kept_file(
-      const ObSortedFileInfo &file,
-      const int64_t file_buf_size);
+  // Record raw scan candidates before sorting, preserving duplicates and order within each bucket.
   int write_lob_ctrl_rows(
       const ObSSMarkSweepDiagFileType type,
       const common::ObIArray<ObSSOuttableLobCtrlCandidate> &rows);
@@ -330,8 +319,6 @@ public:
                                   ObSSMarkSweepDiagTabletMacros &out);
   static int decode_meta_scns_record(const common::ObString &rec,
                                      ObSSMarkSweepTabletMetaScns &out);
-  static int decode_lob_meta_kept_record(const common::ObString &rec,
-                                         ObSSLobMetaGCDiagRows &out);
   static int decode_lob_ctrl_record(const common::ObString &rec,
                                     ObSSLobCtrlGCDiagRows &out);
   static bool is_lob_ctrl_type(const ObSSMarkSweepDiagFileType type);
@@ -456,7 +443,7 @@ private:
                     const char *buf,
                     const int64_t len);
   int write_lob_meta_kept_record_(
-      const int64_t bucket,
+      const ObSSGCTablet &tablet,
       const common::ObIArray<blocksstable::MacroBlockId> &macro_ids);
   int write_lob_ctrl_record_(
       const ObSSMarkSweepDiagFileType type,
