@@ -197,11 +197,15 @@ private:
   struct DataBuffer
   {
   public:
+    static const int64_t DEFAULT_CAPACITY =
+      ObLoadFileBuffer::MAX_BUFFER_SIZE - sizeof(ObLoadFileBuffer);
+    static constexpr int64_t MAX_CAPACITY = 64L * 1024 * 1024;
     DataBuffer();
     ~DataBuffer();
     void reuse();
     void reset();
-    int init(int64_t capacity = ObLoadFileBuffer::MAX_BUFFER_SIZE);
+    int init();
+    int reserve(int64_t capacity);
     bool is_valid() const;
     int64_t get_data_length() const;
     int64_t get_remain_length() const;
@@ -217,6 +221,7 @@ private:
     int64_t pos_; // left pos
     bool is_end_file_;
   private:
+    int resize(int64_t capacity);
     DISALLOW_COPY_AND_ASSIGN(DataBuffer);
   };
 
@@ -228,7 +233,7 @@ private:
     ~DataReader();
     int init(const DataAccessParam &data_access_param, LoadExecuteContext &execute_ctx,
              const DataDesc &data_desc, bool read_raw = false);
-    int get_next_buffer(ObLoadFileBuffer &file_buffer, int64_t &line_count,
+    int get_next_buffer(DataBuffer &data_buffer, int64_t &line_count,
                         int64_t limit = INT64_MAX);
     int get_next_raw_buffer(DataBuffer &data_buffer);
     bool has_incomplate_data() const { return data_trimer_.has_incomplate_data(); }
@@ -237,6 +242,9 @@ private:
 
   private:
     int read_buffer(ObLoadFileBuffer &file_buffer);
+    int try_grow_buffer(DataBuffer &data_buffer);
+    int try_read_complete_lines(DataBuffer &data_buffer, int64_t &complete_len,
+                                int64_t &complete_cnt);
 
   private:
     ObArenaAllocator allocator_;

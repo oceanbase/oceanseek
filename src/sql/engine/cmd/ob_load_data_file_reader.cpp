@@ -657,7 +657,7 @@ int ObDecompressFileReader::read(char *buf, int64_t capacity, int64_t &read_size
   } else if (OB_ISNULL(buf) || capacity <= 0) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", KP(buf), K(capacity));
-  } else if (consumed_data_size_ >= compress_data_size_) {
+  } else if (consumed_data_size_ >= compress_data_size_ && !decompressor_->has_remain_data()) {
     if (!source_reader_->eof()) {
       ret = read_compressed_data();
     } else {
@@ -665,7 +665,8 @@ int ObDecompressFileReader::read(char *buf, int64_t capacity, int64_t &read_size
     }
   }
 
-  if (OB_SUCC(ret) && compress_data_size_ > consumed_data_size_) {
+  if (OB_SUCC(ret)
+      && (compress_data_size_ > consumed_data_size_ || decompressor_->has_remain_data())) {
     int64_t consumed_size = 0;
     ret = decompressor_->decompress(compressed_data_ + consumed_data_size_,
                                     compress_data_size_ - consumed_data_size_,

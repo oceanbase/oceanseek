@@ -343,6 +343,16 @@ int ObLoadDataDirectImpl::DataDescIterator::get_next_data_desc(DataDesc &data_de
   return ret;
 }
 
+static int64_t calc_grown_capacity(int64_t current_capacity, int64_t required_capacity,
+                                   int64_t capacity_limit)
+{
+  int64_t new_capacity = current_capacity;
+  while (new_capacity < required_capacity && new_capacity < capacity_limit) {
+    new_capacity = (new_capacity > (capacity_limit / 2)) ? capacity_limit : (new_capacity * 2);
+  }
+  return new_capacity;
+}
+
 /**
  * DataBuffer
  */
@@ -376,25 +386,63 @@ void ObLoadDataDirectImpl::DataBuffer::reset()
   pos_ = 0;
 }
 
-int ObLoadDataDirectImpl::DataBuffer::init(int64_t capacity)
+int ObLoadDataDirectImpl::DataBuffer::init()
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(nullptr != file_buffer_)) {
     ret = OB_INIT_TWICE;
     LOG_WARN("ObLoadDataDirectImpl::DataBuffer init twice", KR(ret), KPC(file_buffer_));
-  } else if (OB_UNLIKELY(capacity <= 0)) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid buffer capacity", KR(ret), K(capacity));
+  } else if (OB_FAIL(resize(DEFAULT_CAPACITY))) {
+    LOG_WARN("failed to init CSV data buffer", KR(ret));
+  }
+  return ret;
+}
+
+int ObLoadDataDirectImpl::DataBuffer::resize(int64_t capacity)
+{
+  int ret = OB_SUCCESS;
+  const int64_t length = get_data_length();
+  if (OB_UNLIKELY(capacity <= 0 || capacity < length || capacity > MAX_CAPACITY)) {
+    ret = OB_SIZE_OVERFLOW;
+    LOG_WARN("CSV buffer capacity exceeds limit", KR(ret), K(capacity), K(length), K(MAX_CAPACITY));
   } else {
-    const int64_t alloc_size =
-      MIN(capacity + sizeof(ObLoadFileBuffer), ObLoadFileBuffer::MAX_BUFFER_SIZE);
+    const int64_t alloc_size = capacity + sizeof(ObLoadFileBuffer);
     ObMemAttr attr(MTL_ID(), "MTL_DataBuffer");
     void *buf = nullptr;
     if (OB_ISNULL(buf = ob_malloc(alloc_size, attr))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("fail to allocate memory", KR(ret), K(alloc_size));
     } else {
-      file_buffer_ = new (buf) ObLoadFileBuffer(alloc_size - sizeof(ObLoadFileBuffer));
+      ObLoadFileBuffer *new_buffer = new (buf) ObLoadFileBuffer(capacity);
+      if (length > 0) {
+        MEMCPY(new_buffer->begin_ptr(), data(), length);
+      }
+      new_buffer->update_pos(length);
+      if (nullptr != file_buffer_) {
+        file_buffer_->~ObLoadFileBuffer();
+        ob_free(file_buffer_);
+      }
+      file_buffer_ = new_buffer;
+      pos_ = 0;
+    }
+  }
+  return ret;
+}
+
+int ObLoadDataDirectImpl::DataBuffer::reserve(int64_t capacity)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(capacity <= 0 || !is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid CSV buffer reservation", KR(ret), K(capacity), KPC(this));
+  } else if (OB_UNLIKELY(capacity > MAX_CAPACITY)) {
+    ret = OB_SIZE_OVERFLOW;
+    LOG_WARN("CSV buffer capacity exceeds limit", KR(ret), K(capacity), K(MAX_CAPACITY));
+  } else if (capacity > file_buffer_->get_buffer_size()) {
+    const int64_t new_capacity =
+      calc_grown_capacity(file_buffer_->get_buffer_size(), capacity, MAX_CAPACITY);
+    if (OB_FAIL(resize(new_capacity))) {
+      LOG_WARN("failed to grow CSV data buffer", KR(ret), K(new_capacity));
     }
   }
   return ret;
@@ -581,7 +629,68 @@ int ObLoadDataDirectImpl::DataReader::read_buffer(ObLoadFileBuffer &file_buffer)
   return ret;
 }
 
-int ObLoadDataDirectImpl::DataReader::get_next_buffer(ObLoadFileBuffer &file_buffer,
+int ObLoadDataDirectImpl::DataReader::try_grow_buffer(DataBuffer &data_buffer)
+{
+  int ret = OB_SUCCESS;
+  char next_byte = 0;
+  int64_t probe_size = 0;
+  bool need_grow = true;
+  // A full stream buffer may already contain the whole final record.
+  if (data_buffer.is_valid() && (0 == data_buffer.pos_) && !file_reader_->seekable()) {
+    if (OB_FAIL(file_reader_->readn(&next_byte, 1, probe_size))) {
+      LOG_WARN("failed to probe CSV input before growing buffer", KR(ret));
+    } else {
+      need_grow = (probe_size > 0);
+    }
+  }
+  if (OB_SUCC(ret) && need_grow) {
+    if (OB_FAIL(data_buffer.reserve(data_buffer.get_data_length() + 1))) {
+      LOG_WARN("failed to grow CSV buffer", KR(ret));
+    } else if (probe_size > 0) {
+      *data_buffer.file_buffer_->current_ptr() = next_byte;
+      data_buffer.update_data_length(probe_size);
+      ATOMIC_AAF(&execute_ctx_->job_stat_->read_bytes_, probe_size);
+    }
+  }
+  return ret;
+}
+
+int ObLoadDataDirectImpl::DataReader::try_read_complete_lines(DataBuffer &data_buffer,
+                                                              int64_t &complete_len,
+                                                              int64_t &complete_cnt)
+{
+  int ret = OB_SUCCESS;
+  if (data_buffer.get_remain_length() > 0) {
+    if (OB_FAIL(read_buffer(*data_buffer.file_buffer_))) {
+      LOG_WARN("failed to read CSV input buffer", KR(ret));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (data_buffer.empty()) {
+      is_iter_end_ = true;
+      ret = OB_ITER_END;
+    } else if (OB_FAIL(ObLoadDataBase::pre_parse_lines(*data_buffer.file_buffer_, csv_parser_,
+                                                       is_end_file(), complete_len,
+                                                       complete_cnt))) {
+      LOG_WARN("failed to parse CSV row boundaries", KR(ret));
+    } else if (0 == complete_len) {
+      if (is_end_file()) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("CSV parser made no progress at end of input", KR(ret),
+                 "remaining_bytes", data_buffer.get_data_length());
+        FORWARD_USER_ERROR_MSG(ret, "CSV parser made no progress at end of input, "
+                               "remaining_bytes = %ld", data_buffer.get_data_length());
+      } else if (0 == data_buffer.get_remain_length()) {
+        if (OB_FAIL(try_grow_buffer(data_buffer))) {
+          LOG_WARN("failed to grow CSV input buffer", KR(ret));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObLoadDataDirectImpl::DataReader::get_next_buffer(DataBuffer &data_buffer,
                                                       int64_t &line_count, int64_t limit)
 {
   int ret = OB_SUCCESS;
@@ -597,39 +706,45 @@ int ObLoadDataDirectImpl::DataReader::get_next_buffer(ObLoadFileBuffer &file_buf
   } else if (is_iter_end_) {
     ret = OB_ITER_END;
   } else {
-    file_buffer.reset();
+    data_buffer.reuse();
     line_count = 0;
-
-    // 1. 从data_trimer中恢复出上次读取留下的数据
-    if (OB_FAIL(data_trimer_.recover_incomplate_data(file_buffer))) {
-      LOG_WARN("fail to recover incomplate data", KR(ret));
+    const int64_t remaining = data_trimer_.get_incomplate_data_len();
+    if (remaining > data_buffer.file_buffer_->get_buffer_size()) {
+      if (OB_FAIL(data_buffer.reserve(remaining))) {
+        LOG_WARN("failed to reserve incomplete row space", KR(ret), K(remaining));
+      }
     }
-    // 2. 读取数据，然后从buffer中找出完整的行，剩下的数据缓存到data_trimer
     if (OB_SUCC(ret)) {
-      int64_t complete_cnt = limit;
-      int64_t complete_len = 0;
-
-      if (OB_FAIL(read_buffer(file_buffer))) {
-        LOG_WARN("failed to read buffer as there is not enough data to parse", KR(ret));
-      } else if (!file_buffer.is_valid()) {
-        is_iter_end_ = true;
-        ret = OB_ITER_END;
-      } else {
-        int64_t complete_cnt = limit;
-        int64_t complete_len = 0;
-        if (OB_FAIL(ObLoadDataBase::pre_parse_lines(file_buffer, csv_parser_, is_end_file(),
-                                                    complete_len, complete_cnt))) {
-          LOG_WARN("fail to fast_lines_parse", KR(ret));
-        } else if (OB_UNLIKELY(0 == complete_len)) {
-          ret = OB_NOT_SUPPORTED;
-          LOG_WARN("direct-load does not support big row", KR(ret), "size",
-                   file_buffer.get_data_len());
-          FORWARD_USER_ERROR_MSG(ret, "direct-load does not support big row, row_size = %ld", file_buffer.get_data_len());
-        } else if (OB_FAIL(data_trimer_.backup_incomplate_data(file_buffer, complete_len))) {
+      if (OB_FAIL(data_trimer_.recover_incomplate_data(*data_buffer.file_buffer_))) {
+        LOG_WARN("fail to recover incomplate data", KR(ret));
+      }
+    }
+    int64_t complete_len = 0;
+    int64_t complete_cnt = 0;
+    while (OB_SUCC(ret) && (0 == complete_len)) {
+      complete_cnt = limit;
+      if (OB_FAIL(try_read_complete_lines(data_buffer, complete_len, complete_cnt))) {
+        if (OB_ITER_END != ret) {
+          LOG_WARN("failed to find complete CSV lines", KR(ret));
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      ObLoadFileBuffer &file_buffer = *data_buffer.file_buffer_;
+      const int64_t tail_size = file_buffer.get_data_len() - complete_len;
+      const int64_t old_capacity = data_trimer_.get_buffer_size();
+      const int64_t input_capacity = file_buffer.get_buffer_size();
+      const int64_t new_capacity = calc_grown_capacity(old_capacity, tail_size, input_capacity);
+      if (new_capacity > old_capacity) {
+        if (OB_FAIL(data_trimer_.reserve_buf(allocator_, new_capacity))) {
+          LOG_WARN("failed to grow CSV tail buffer", KR(ret), K(tail_size), K(new_capacity));
+        }
+      }
+      if (OB_SUCC(ret)) {
+        if (OB_FAIL(data_trimer_.backup_incomplate_data(file_buffer, complete_len))) {
           LOG_WARN("fail to back up data", KR(ret));
         } else {
           line_count = complete_cnt;
-          LOG_DEBUG("LOAD DATA backup", "data", data_trimer_.get_incomplate_data_string());
         }
       }
     }
@@ -647,31 +762,35 @@ int ObLoadDataDirectImpl::DataReader::get_next_raw_buffer(DataBuffer &data_buffe
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected read raw buffer", KR(ret));
   } else if (is_end_file()) {
-    ret = OB_ITER_END;
-  } else if (data_buffer.get_remain_length() > 0) {
-    int64_t read_count = data_buffer.get_remain_length();
-    if (file_reader_->seekable() && read_count > end_offset_ - file_reader_->get_offset()) {
-      read_count = end_offset_ - file_reader_->get_offset();
+    ret = data_buffer.empty() ? OB_ITER_END : OB_SUCCESS;
+  } else {
+    if (0 == data_buffer.get_remain_length()) {
+      if (OB_FAIL(try_grow_buffer(data_buffer))) {
+        LOG_WARN("failed to grow raw CSV buffer", KR(ret));
+      }
     }
-    int64_t read_size = 0;
-    if (OB_FAIL(file_reader_->readn(data_buffer.data() + data_buffer.get_data_length(), read_count,
-                                  read_size))) {
-      LOG_WARN("fail to read file", KR(ret));
-    } else if (read_size > 0) {
-      data_buffer.update_data_length(read_size);
-      ATOMIC_AAF(&execute_ctx_->job_stat_->read_bytes_, read_size);
-    } else {
-      // read_size == 0
-      if (is_end_file()) {
-        ret = OB_ITER_END;
+    if (OB_SUCC(ret) && data_buffer.get_remain_length() > 0) {
+      int64_t read_count = data_buffer.get_remain_length();
+      if (file_reader_->seekable() && read_count > end_offset_ - file_reader_->get_offset()) {
+        read_count = end_offset_ - file_reader_->get_offset();
+      }
+      int64_t read_size = 0;
+      if (OB_FAIL(file_reader_->readn(data_buffer.data() + data_buffer.get_data_length(),
+                                      read_count, read_size))) {
+        LOG_WARN("fail to read file", KR(ret));
+      } else if (read_size > 0) {
+        data_buffer.update_data_length(read_size);
+        ATOMIC_AAF(&execute_ctx_->job_stat_->read_bytes_, read_size);
+      } else if (is_end_file()) {
+        ret = data_buffer.empty() ? OB_ITER_END : OB_SUCCESS;
       } else {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("read buffer got unexpected bytes.", K(read_size), K(read_count), K(ret));
       }
-     }
-   }
-   return ret;
- }
+    }
+  }
+  return ret;
+}
 
 bool ObLoadDataDirectImpl::DataReader::is_end_file() const
 {
@@ -731,6 +850,8 @@ int ObLoadDataDirectImpl::DataParser::parse(const ObString &file_name, int64_t s
   } else if (OB_UNLIKELY(!data_buffer.is_valid() || data_buffer.empty())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid args", KR(ret), K(data_buffer));
+  } else if (OB_FAIL(escape_buffer_.reserve(data_buffer.get_data_length()))) {
+    LOG_WARN("failed to reserve CSV escape buffer", KR(ret), K(data_buffer));
   } else {
     file_name_ = file_name;
     start_line_no_ = start_line_no;
@@ -1475,7 +1596,7 @@ int ObLoadDataDirectImpl::LargeFileLoadExecutor::get_next_task_handle(TaskHandle
   if (OB_UNLIKELY(chunk_id > ObTableLoadSequenceNo::MAX_CHUNK_ID)) {
     ret = OB_SIZE_OVERFLOW;
     LOG_WARN("size is overflow", KR(ret), K(chunk_id));
-  } else if (OB_FAIL(data_reader_.get_next_buffer(*expr_buffer_.file_buffer_, current_line_count))) {
+  } else if (OB_FAIL(data_reader_.get_next_buffer(expr_buffer_, current_line_count))) {
     if (OB_UNLIKELY(OB_ITER_END != ret)) {
       LOG_WARN("fail to get next buffer", KR(ret));
     }
@@ -1526,7 +1647,7 @@ int ObLoadDataDirectImpl::LargeFileLoadExecutor::skip_ignore_rows()
     int64_t line_count = 0;
     int64_t skip_bytes = 0;
     while (OB_SUCC(ret) && skip_line_count < ignore_row_num) {
-      if (OB_FAIL(data_reader_.get_next_buffer(*expr_buffer_.file_buffer_, line_count,
+      if (OB_FAIL(data_reader_.get_next_buffer(expr_buffer_, line_count,
                                                ignore_row_num - skip_line_count))) {
         if (OB_UNLIKELY(OB_ITER_END != ret)) {
           LOG_WARN("fail to get next buffer", KR(ret));
@@ -1628,7 +1749,8 @@ int ObLoadDataDirectImpl::MultiFilesLoadTaskProcessor::process()
       current_line_count = 0;
       if (OB_FAIL(file_load_executor_->process_task_handle(handle_, current_line_count))) {
         LOG_WARN("fail to process task handle", KR(ret));
-      } else if (OB_UNLIKELY(0 == current_line_count)) {
+      } else if (OB_UNLIKELY(0 == current_line_count && data_reader_.is_end_file() &&
+                             !handle_->data_buffer_.empty())) {
         ret = OB_NOT_SUPPORTED;
         LOG_WARN("direct-load does not support big row", KR(ret), "size",
                  handle_->data_buffer_.get_data_length());
@@ -1674,7 +1796,7 @@ int ObLoadDataDirectImpl::MultiFilesLoadTaskProcessor::skip_ignore_rows(int64_t 
               *data_buffer.file_buffer_, data_reader_.get_csv_parser(), data_reader_.is_end_file(),
               complete_len, complete_cnt))) {
           LOG_WARN("fail to fast_lines_parse", KR(ret));
-        } else if (OB_UNLIKELY(0 == complete_len)) {
+        } else if (OB_UNLIKELY(0 == complete_len && data_reader_.is_end_file())) {
           ret = OB_NOT_SUPPORTED;
           LOG_WARN("direct-load does not support big row", KR(ret), "size",
                    data_buffer.get_data_length());

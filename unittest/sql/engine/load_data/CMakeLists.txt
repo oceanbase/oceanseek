@@ -1,1 +1,2 @@
 sql_unittest(ob_load_data_parser_test)
+sql_unittest(test_load_data_direct_buffer)

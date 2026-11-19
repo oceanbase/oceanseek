@@ -392,8 +392,11 @@ public:
   void commit_line_cnt(int64_t line_cnt) { lines_cnt_ += line_cnt; lines_cnt_current_file_ += line_cnt; }
   void reset_current_file_line_cnt() { lines_cnt_current_file_ = 0; }
   int expand_buf(common::ObIAllocator &allocator);
+  int reserve_buf(common::ObIAllocator &allocator, int64_t capacity);
   int64_t get_buffer_size() const { return incomplate_data_buf_len_; }
+  int64_t get_incomplate_data_len() const { return incomplate_data_len_; }
 private:
+  int alloc_buf(common::ObIAllocator &allocator, int64_t capacity);
   ObCSVFormats formats_;
   char *incomplate_data_;
   int64_t incomplate_data_len_;

@@ -2355,16 +2355,14 @@ int ObPartDataFragMgr::update_part_location(ObExecContext &ctx)
 
 int ObLoadFileDataTrimer::expand_buf(ObIAllocator &allocator)
 {
+  const int64_t new_buf_len = ((nullptr == incomplate_data_) ?
+    ObLoadFileBuffer::MAX_BUFFER_SIZE : (incomplate_data_buf_len_ * 2));
+  return alloc_buf(allocator, new_buf_len);
+}
+
+int ObLoadFileDataTrimer::alloc_buf(ObIAllocator &allocator, int64_t new_buf_len)
+{
   int ret = OB_SUCCESS;
-
-  int64_t new_buf_len = 0;
-
-  if (NULL == incomplate_data_) {
-    new_buf_len = ObLoadFileBuffer::MAX_BUFFER_SIZE;
-  } else {
-    new_buf_len = incomplate_data_buf_len_ * 2;
-  }
-
   char *new_buf = NULL;
   if (OB_ISNULL(new_buf = static_cast<char*>(allocator.alloc(new_buf_len)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -2383,6 +2381,17 @@ int ObLoadFileDataTrimer::init(ObIAllocator &allocator, const ObCSVFormats &form
 {
   formats_ = formats;
   return expand_buf(allocator);
+}
+
+int ObLoadFileDataTrimer::reserve_buf(ObIAllocator &allocator, int64_t capacity)
+{
+  int ret = OB_SUCCESS;
+  if (capacity > incomplate_data_buf_len_) {
+    if (OB_FAIL(alloc_buf(allocator, capacity))) {
+      LOG_WARN("failed to allocate CSV tail buffer", KR(ret), K(capacity));
+    }
+  }
+  return ret;
 }
 
 int ObLoadDataSPImpl::ToolBox::release_resources()
