@@ -78,11 +78,13 @@ public:
       const share::SCN &clog_ckpt_scn,
       const share::SCN &ddl_ckpt_scn,
       const share::SCN &mds_start_scn,
+      const share::SCN &reorganization_scn,
       const int64_t current_version)
   {
     notify_ss_change_scn_ = ss_change_scn_;
     tablet_max_checkpoint_scn_ = MAX3(clog_ckpt_scn, ddl_ckpt_scn, mds_start_scn);
     last_match_tablet_meta_version_ = MAX(last_match_tablet_meta_version_, current_version);
+    reorganization_scn_ = reorganization_scn;
   }
   TO_STRING_KV(K_(iter_attr),
                K_(ha_status),
@@ -123,6 +125,7 @@ public:
 
   // =================== ATTENTION !!! ======================
   // The following fields do not need to be persisted
+  // If add new field, please check ObUpdateTabletPointerParam.
   // --------------------------------------------------------
   int64_t auto_part_size_; // 8B
   share::SCN notify_ss_change_scn_; // 8B

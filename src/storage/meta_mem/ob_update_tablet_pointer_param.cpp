@@ -25,10 +25,12 @@ int ObUpdateTabletPointerParam::refresh_tablet_cache()
   }
 
   if (OB_SUCC(ret)) {
-    resident_info_.attr_.refresh_cache(accelerate_info_.clog_checkpoint_scn_,
-                                       accelerate_info_.ddl_checkpoint_scn_,
-                                       accelerate_info_.mds_start_scn_,
-                                       current_version);
+    resident_info_.attr_.refresh_cache(
+        accelerate_info_.clog_checkpoint_scn_,
+        accelerate_info_.ddl_checkpoint_scn_,
+        accelerate_info_.mds_start_scn_,
+        transfer_info().transfer_start_scn_,
+        current_version);
   }
   return ret;
 }

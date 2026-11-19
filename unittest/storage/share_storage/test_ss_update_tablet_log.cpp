@@ -10,10 +10,12 @@
 #define protected public
 
 #include "lib/ob_errno.h"
+#include "lib/allocator/ob_allocator.h"
 #include "lib/allocator/ob_concurrent_fifo_allocator.h"
 #include "lib/container/ob_array.h"
 #include "lib/hash/ob_linear_hash_map.h"
 #include "storage/incremental/share/ob_shared_tablet_extra_info.h"
+#include "storage/meta_mem/ob_update_tablet_pointer_param.h"
 
 namespace oceanbase
 {
@@ -32,6 +34,8 @@ public:
 private:
   void init_update_log_();
   void init_ss_update_log_();
+  void check_replayed_reorganization_scn_(
+      const share::SCN &reorganization_scn);
 
 private:
   static const int32_t BLOCK_SIZE = 2 * 1024 * 1024;
@@ -121,6 +125,73 @@ void TestSSUpdateTabletLog::init_ss_update_log_()
   ss_update_log_.try_cache_size_ = 1000;
   ss_update_log_.tablet_serialize_size_ = 4096;
   ASSERT_EQ(true, ss_update_log_.is_valid());
+}
+
+void TestSSUpdateTabletLog::check_replayed_reorganization_scn_(
+    const share::SCN &reorganization_scn)
+{
+  ObArenaAllocator allocator;
+  ObUpdateTabletLog replayed_log;
+  int64_t serialize_pos = 0;
+  int64_t deserialize_pos = 0;
+  int64_t buf_len = 0;
+  char *buf = nullptr;
+  update_log_.tablet_attr_.reorganization_scn_ = reorganization_scn;
+  update_log_.accelerate_info_.transfer_info_.transfer_start_scn_ = reorganization_scn;
+  buf_len = update_log_.get_serialize_size();
+  buf = static_cast<char *>(allocator.alloc(buf_len));
+  ASSERT_NE(nullptr, buf);
+  ASSERT_EQ(OB_SUCCESS, update_log_.serialize(buf, buf_len, serialize_pos));
+  ASSERT_EQ(buf_len, serialize_pos);
+  ASSERT_EQ(OB_SUCCESS, replayed_log.deserialize(buf, buf_len, deserialize_pos));
+  ASSERT_EQ(serialize_pos, deserialize_pos);
+  ASSERT_FALSE(replayed_log.tablet_attr_.get_reorganization_scn().is_valid());
+  ASSERT_EQ(reorganization_scn, replayed_log.accelerate_info_.transfer_info_.transfer_start_scn_);
+
+  const ObTabletMapKey key(replayed_log.ls_id_, replayed_log.tablet_id_);
+  const ObReplayTabletValue value(replayed_log.disk_addr_, replayed_log.ls_epoch_,
+      replayed_log.tablet_attr_, replayed_log.accelerate_info_);
+  const ObTabletReplayItem item(key, value);
+  ObUpdateTabletPointerParam param(item);
+  ASSERT_EQ(OB_SUCCESS, param.refresh_tablet_cache());
+  EXPECT_EQ(reorganization_scn, param.resident_info_.attr_.get_reorganization_scn());
+}
+
+TEST_F(TestSSUpdateTabletLog, replay_restores_zero_reorganization_scn)
+{
+  check_replayed_reorganization_scn_(SCN::min_scn());
+}
+
+TEST_F(TestSSUpdateTabletLog, replay_restores_nonzero_reorganization_scn)
+{
+  check_replayed_reorganization_scn_(SCN::base_scn());
+}
+
+TEST_F(TestSSUpdateTabletLog, refresh_uses_source_reorganization_scn)
+{
+  ObUpdateTabletPointerParam param;
+  param.resident_info_.addr_ = update_log_.disk_addr_;
+  param.accelerate_info_ = update_log_.accelerate_info_;
+  param.resident_info_.attr_.reorganization_scn_ = SCN::min_scn();
+  param.accelerate_info_.transfer_info_.transfer_start_scn_ = SCN::base_scn();
+  ASSERT_EQ(OB_SUCCESS, param.refresh_tablet_cache());
+  EXPECT_EQ(SCN::base_scn(), param.resident_info_.attr_.get_reorganization_scn());
+
+  param.resident_info_.attr_.reorganization_scn_ = SCN::base_scn();
+  param.accelerate_info_.transfer_info_.transfer_start_scn_ = SCN::invalid_scn();
+  ASSERT_EQ(OB_SUCCESS, param.refresh_tablet_cache());
+  EXPECT_FALSE(param.resident_info_.attr_.get_reorganization_scn().is_valid());
+}
+
+TEST_F(TestSSUpdateTabletLog, refresh_preserves_unknown_reorganization_scn)
+{
+  ObUpdateTabletPointerParam param;
+  param.resident_info_.addr_ = update_log_.disk_addr_;
+  param.accelerate_info_ = update_log_.accelerate_info_;
+  ASSERT_FALSE(param.resident_info_.attr_.get_reorganization_scn().is_valid());
+  ASSERT_FALSE(param.transfer_info().transfer_start_scn_.is_valid());
+  ASSERT_EQ(OB_SUCCESS, param.refresh_tablet_cache());
+  EXPECT_FALSE(param.resident_info_.attr_.get_reorganization_scn().is_valid());
 }
 
 TEST_F(TestSSUpdateTabletLog, update_tablet_log)
