@@ -16,6 +16,7 @@
 #include "share/table/ob_ttl_util.h"
 #include "share/ob_license_utils.h"
 #include "share/compaction_ttl/ob_compaction_ttl_util.h"
+#include "share/catalog/ob_catalog_utils.h"
 
 namespace oceanbase
 {
@@ -902,7 +903,7 @@ int ObCreateViewResolver::check_privilege_needed(ObCreateTableStmt &stmt,
     LOG_WARN("failed to get need priv tables", K(ret));
   }
   if (OB_SUCC(ret)) {
-    int64_t need_privs_size = is_force_view ? 2 : 2 + select_tables.size() + any_tables.size();
+    int64_t need_privs_size = is_force_view ? 2 : 2 + 2 * (select_tables.size() + any_tables.size());
     if (OB_FAIL(stmt.get_view_need_privs().reserve(need_privs_size))) {
       LOG_WARN("fail to reserve view need privs array", K(ret));
     } else if (stmt.get_create_table_arg().if_not_exist_ &&
@@ -915,12 +916,15 @@ int ObCreateViewResolver::check_privilege_needed(ObCreateTableStmt &stmt,
       if (!any_tables.empty()) {
         hash::ObHashMap<int64_t, const TableItem *>::iterator iter = any_tables.begin();
         for (; OB_SUCC(ret) && iter != any_tables.end(); iter++) {
+          ObString catalog_name;
           ObString database_name;
           ObString table_name;
           const TableItem *table_item = iter->second;
           if (OB_ISNULL(table_item)) {
             ret = OB_ERR_UNEXPECTED;
             LOG_WARN("table item is null");
+          } else if (OB_FAIL(ob_write_string(*allocator_, table_item->catalog_name_, catalog_name))) {
+            LOG_WARN("Write catalog name error", K(ret), K(table_item->catalog_name_));
           } else if (OB_FAIL(ob_write_string(*allocator_, table_item->database_name_,
                                              database_name))) {
             LOG_WARN("Write string database name error", K(ret));
@@ -930,8 +934,15 @@ int ObCreateViewResolver::check_privilege_needed(ObCreateTableStmt &stmt,
             ObNeedPriv need_priv_else(database_name, table_name, OB_PRIV_TABLE_LEVEL,
                                       OB_PRIV_SELECT | OB_PRIV_INSERT | OB_PRIV_UPDATE | OB_PRIV_DELETE,
                                       table_item->is_system_table_, table_item->for_update_,
-                                      OB_PRIV_CHECK_ANY);
-            if (OB_FAIL(stmt.add_view_need_priv(need_priv_else))) {
+                                      OB_PRIV_CHECK_ANY, catalog_name);
+            if (!catalog_name.empty() && !share::ObCatalogUtils::is_internal_catalog_name(catalog_name)) {
+              ObNeedPriv catalog_need_priv("", "", OB_PRIV_CATALOG_LEVEL, OB_PRIV_USE_CATALOG,
+                                           false, false, OB_PRIV_CHECK_ALL, catalog_name);
+              if (OB_FAIL(stmt.add_view_need_priv(catalog_need_priv))) {
+                LOG_WARN("Fail to add catalog need priv", K(ret), K(catalog_need_priv));
+              }
+            }
+            if (OB_SUCC(ret) && OB_FAIL(stmt.add_view_need_priv(need_priv_else))) {
               LOG_WARN("Fail to add need_priv", K(ret), K(need_priv_else));
             }
           }
@@ -940,12 +951,15 @@ int ObCreateViewResolver::check_privilege_needed(ObCreateTableStmt &stmt,
       if (OB_SUCC(ret) && !select_tables.empty()) {
         hash::ObHashMap<int64_t, const TableItem *>::iterator iter = select_tables.begin();
         for (; OB_SUCC(ret) && iter != select_tables.end(); iter++) {
+          ObString catalog_name;
           ObString database_name;
           ObString table_name;
           const TableItem *table_item = iter->second;
           if (OB_ISNULL(table_item)) {
             ret = OB_ERR_UNEXPECTED;
             LOG_WARN("table item is null");
+          } else if (OB_FAIL(ob_write_string(*allocator_, table_item->catalog_name_, catalog_name))) {
+            LOG_WARN("Write catalog name error", K(ret), K(table_item->catalog_name_));
           } else if (OB_FAIL(ob_write_string(*allocator_, table_item->database_name_,
                                              database_name))) {
             LOG_WARN("Write string database name error", K(ret));
@@ -954,8 +968,15 @@ int ObCreateViewResolver::check_privilege_needed(ObCreateTableStmt &stmt,
           } else {
             ObNeedPriv need_priv_else(database_name, table_name, OB_PRIV_TABLE_LEVEL,
                                       OB_PRIV_SELECT, table_item->is_system_table_,
-                                      table_item->for_update_);
-            if (OB_FAIL(stmt.add_view_need_priv(need_priv_else))) {
+                                      table_item->for_update_, OB_PRIV_CHECK_ALL, catalog_name);
+            if (!catalog_name.empty() && !share::ObCatalogUtils::is_internal_catalog_name(catalog_name)) {
+              ObNeedPriv catalog_need_priv("", "", OB_PRIV_CATALOG_LEVEL, OB_PRIV_USE_CATALOG,
+                                           false, false, OB_PRIV_CHECK_ALL, catalog_name);
+              if (OB_FAIL(stmt.add_view_need_priv(catalog_need_priv))) {
+                LOG_WARN("Fail to add catalog need priv", K(ret), K(catalog_need_priv));
+              }
+            }
+            if (OB_SUCC(ret) && OB_FAIL(stmt.add_view_need_priv(need_priv_else))) {
               LOG_WARN("Fail to add need_priv", K(ret), K(need_priv_else));
             }
           }

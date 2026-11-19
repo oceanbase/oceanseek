@@ -74,30 +74,60 @@ int ObTableColumns::inner_get_next_row(ObNewRow *&row)
         LOG_WARN("fail to get table schema", K(ret), K(show_table_id));
       } else if (!uc_catalog_ctx_.is_remote_catalog(table_schema->get_catalog_id())
                  && !lib::is_oracle_mode()) {
+        const bool is_catalog_table = is_external_catalog_id(table_schema->get_catalog_id());
+        ObSessionPrivInfo session_priv;
+        const ObDatabaseSchema *db_schema = NULL;
+        ObString catalog_name;
         ObStmtNeedPrivs stmt_need_privs;
         stmt_need_privs.need_privs_.set_allocator(allocator_);
-        ObSessionPrivInfo session_priv;
         const common::ObIArray<uint64_t> &enable_role_id_array = session_->get_enable_role_array();
-        session_->get_session_priv_info(session_priv);
-        const ObDatabaseSchema *db_schema = NULL;
-        if (OB_UNLIKELY(!session_priv.is_valid())) {
+        if (OB_FAIL(session_->get_session_priv_info(session_priv))) {
+          LOG_WARN("get session priv info failed", K(ret));
+        } else if (OB_UNLIKELY(!session_priv.is_valid())) {
           ret = OB_INVALID_ARGUMENT;
           LOG_WARN("Session priv is invalid", "tenant_id", session_priv.tenant_id_,
-                    "user_id", session_priv.user_id_, K(ret));
-        } else if (OB_FAIL(stmt_need_privs.need_privs_.init(3))) {
-          LOG_WARN("init failed", K(ret));
-        } else if (OB_FAIL(sql_schema_guard_.get_database_schema(table_schema->get_tenant_id(), table_schema->get_database_id(), db_schema))) {
+                   "user_id", session_priv.user_id_, K(ret));
+        } else if (OB_FAIL(sql_schema_guard_.get_database_schema(
+                       table_schema->get_tenant_id(), table_schema->get_database_id(), db_schema))) {
           LOG_WARN("get database schema failed", K(ret));
         } else if (OB_ISNULL(db_schema)) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("db schema is null", K(ret));
+        }
+        if (OB_SUCC(ret) && is_catalog_table) {
+          const ObCatalogSchema *catalog_schema = NULL;
+          if (OB_FAIL(schema_guard_->get_catalog_schema_by_id(
+                       table_schema->get_tenant_id(), table_schema->get_catalog_id(), catalog_schema))) {
+            LOG_WARN("get catalog schema failed", K(ret));
+          } else if (OB_ISNULL(catalog_schema)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("catalog schema is null", K(ret));
+          } else if (OB_FAIL(schema_guard_->check_catalog_access(
+                       session_priv, enable_role_id_array, catalog_schema->get_catalog_name_str()))) {
+            LOG_WARN("check catalog access failed", K(ret));
+          } else {
+            catalog_name = catalog_schema->get_catalog_name_str();
+          }
+        }
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(stmt_need_privs.need_privs_.init(is_catalog_table ? 4 : 3))) {
+          LOG_WARN("init failed", K(ret));
         } else {
           ObNeedPriv need_priv;
-          //Priv check: global select || db select || table acc || column acc
+          // Priv check: global select || db select || table acc || column acc (internal only).
           need_priv.priv_level_ = OB_PRIV_USER_LEVEL;
           need_priv.priv_set_ = OB_PRIV_SELECT;
           if (OB_FAIL(stmt_need_privs.need_privs_.push_back(need_priv))) {
             LOG_WARN("push back failed", K(ret));
+          }
+          if (OB_SUCC(ret) && is_catalog_table) {
+            // External catalogs also accept catalog SELECT after USE CATALOG succeeds.
+            need_priv.priv_level_ = OB_PRIV_CATALOG_LEVEL;
+            need_priv.priv_set_ = OB_PRIV_SELECT;
+            need_priv.catalog_ = catalog_name;
+            if (OB_FAIL(stmt_need_privs.need_privs_.push_back(need_priv))) {
+              LOG_WARN("push back failed", K(ret));
+            }
           }
           if (OB_SUCC(ret)) {
             need_priv.priv_level_ = OB_PRIV_DB_LEVEL;
@@ -115,27 +145,30 @@ int ObTableColumns::inner_get_next_row(ObNewRow *&row)
             need_priv.table_ = table_schema->get_table_name_str();
             if (OB_FAIL(stmt_need_privs.need_privs_.push_back(need_priv))) {
               LOG_WARN("push back failed", K(ret));
-            } 
+            }
           }
           if (OB_FAIL(ret)) {
           } else if (OB_FAIL(schema_guard_->check_priv_or(session_priv, enable_role_id_array, stmt_need_privs))) {
             if (OB_ERR_NO_TABLE_PRIVILEGE == ret) {
-              ret = OB_SUCCESS;
-              bool pass = false;
-              if (OB_FAIL(schema_guard_->check_priv_any_column_priv(
-                            session_priv, enable_role_id_array, db_schema->get_database_name_str(),
-                            table_schema->get_table_name_str(), pass))) {
-                LOG_WARN("fail to collect privs in roles", K(ret));
-              } else if (!pass) {
-                ret = OB_ERR_NO_TABLE_PRIVILEGE;
-                LOG_USER_ERROR(OB_ERR_NO_TABLE_PRIVILEGE, (int)strlen("SELECT"), "SELECT",
-                              session_priv.user_name_.length(), session_priv.user_name_.ptr(),
-                              session_priv.host_name_.length(),session_priv.host_name_.ptr(),
-                              table_schema->get_table_name_str().length(),
-                              table_schema->get_table_name_str().ptr());
+              if (!is_catalog_table) {
+                ret = OB_SUCCESS;
+                bool pass = false;
+                if (OB_FAIL(schema_guard_->check_priv_any_column_priv(
+                              session_priv, enable_role_id_array, db_schema->get_database_name_str(),
+                              table_schema->get_table_name_str(), pass))) {
+                  LOG_WARN("fail to collect privs in roles", K(ret));
+                } else if (!pass) {
+                  ret = OB_ERR_NO_TABLE_PRIVILEGE;
+                } else {
+                  is_column_level = true;
+                }
               }
-              if (OB_SUCC(ret)) {
-                is_column_level = true;
+              if (OB_ERR_NO_TABLE_PRIVILEGE == ret) {
+                LOG_USER_ERROR(OB_ERR_NO_TABLE_PRIVILEGE, static_cast<int>(strlen("SELECT")), "SELECT",
+                               session_priv.user_name_.length(), session_priv.user_name_.ptr(),
+                               session_priv.host_name_.length(), session_priv.host_name_.ptr(),
+                               table_schema->get_table_name_str().length(),
+                               table_schema->get_table_name_str().ptr());
               }
             } else {
               LOG_WARN("fail to check priv", K(ret));
@@ -364,8 +397,25 @@ int ObTableColumns::fill_row_cells(const ObTableSchema &table_schema,
     }
   }
   const common::ObIArray<uint64_t> &enable_role_id_array = session_->get_enable_role_array();
+  const bool is_catalog_table = !is_oracle_mode && is_external_catalog_id(table_schema.get_catalog_id())
+      && !uc_catalog_ctx_.is_remote_catalog(table_schema.get_catalog_id());
   if (OB_SUCC(ret) && !is_oracle_mode) {
-    if (OB_FAIL(schema_guard_->collect_all_priv_for_column(session_priv,
+    if (is_catalog_table) {
+      const ObCatalogSchema *catalog_schema = NULL;
+      if (OB_FAIL(schema_guard_->get_catalog_schema_by_id(
+                      tenant_id, table_schema.get_catalog_id(), catalog_schema))) {
+        LOG_WARN("get catalog schema failed", K(ret), K(table_schema));
+      } else if (OB_ISNULL(catalog_schema)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("catalog schema is null", K(ret), K(table_schema));
+      } else if (OB_FAIL(schema_guard_->collect_all_priv_for_catalog_table(
+                      session_priv, enable_role_id_array, catalog_schema->get_catalog_name_str(),
+                      db_schema->get_database_name_str(), table_schema.get_table_name_str(), col_priv_set))) {
+        LOG_WARN("collect catalog table privs failed", K(ret));
+      } else {
+        has_column_priv = OB_PRIV_HAS_ANY(col_priv_set, OB_PRIV_COLUMN_ACC);
+      }
+    } else if (OB_FAIL(schema_guard_->collect_all_priv_for_column(session_priv,
                                                            enable_role_id_array,
                                                            db_schema->get_database_name_str(),
                                                            table_schema.get_table_name_str(),
@@ -685,25 +735,29 @@ int ObTableColumns::fill_row_cells(const ObTableSchema &table_schema,
 
           need_priv.priv_set_ = OB_PRIV_SELECT;
           if (0 != (col_priv_set & OB_PRIV_SELECT) 
-              || OB_SUCCESS == schema_guard_->check_single_table_priv(session_priv, enable_role_id_array, need_priv)) {
+              || (!is_catalog_table
+                  && OB_SUCCESS == schema_guard_->check_single_table_priv(session_priv, enable_role_id_array, need_priv))) {
             ret = databuff_printf(buf, buf_len, pos, "SELECT,");
           }
           need_priv.priv_set_ = OB_PRIV_INSERT;
           if (OB_FAIL(ret)) {
           } else if (0 != (col_priv_set & OB_PRIV_INSERT)
-                    || OB_SUCCESS == schema_guard_->check_single_table_priv(session_priv, enable_role_id_array, need_priv)) {
+                    || (!is_catalog_table
+                        && OB_SUCCESS == schema_guard_->check_single_table_priv(session_priv, enable_role_id_array, need_priv))) {
             ret = databuff_printf(buf, buf_len, pos, "INSERT,");
           }
           need_priv.priv_set_ = OB_PRIV_UPDATE;
           if (OB_FAIL(ret)) {
           } else if (0 != (col_priv_set & OB_PRIV_UPDATE)
-                    || OB_SUCCESS == schema_guard_->check_single_table_priv(session_priv, enable_role_id_array, need_priv)) {
+                    || (!is_catalog_table
+                        && OB_SUCCESS == schema_guard_->check_single_table_priv(session_priv, enable_role_id_array, need_priv))) {
             ret = databuff_printf(buf, buf_len, pos, "UPDATE,");
           }
           need_priv.priv_set_ = OB_PRIV_REFERENCES;
           if (OB_FAIL(ret)) {
           } else if (0 != (col_priv_set & OB_PRIV_REFERENCES)
-                    || OB_SUCCESS == schema_guard_->check_single_table_priv(session_priv, enable_role_id_array, need_priv)) {
+                    || (!is_catalog_table
+                        && OB_SUCCESS == schema_guard_->check_single_table_priv(session_priv, enable_role_id_array, need_priv))) {
             ret = databuff_printf(buf, buf_len, pos, "REFERENCES,");
           }
         }

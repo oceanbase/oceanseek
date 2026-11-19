@@ -689,6 +689,13 @@ public:
       common::ObIArray<const ObCatalogDatabasePriv *> &catalog_database_privs);
   int get_catalog_table_priv_set(const ObCatalogTablePrivSortKey &catalog_table_priv_key,
                                  ObPrivSet &priv_set);
+
+  int collect_all_priv_for_catalog_table(const ObSessionPrivInfo &session_priv,
+                                         const common::ObIArray<uint64_t> &enable_role_id_array,
+                                         const common::ObString &catalog_name,
+                                         const common::ObString &database_name,
+                                         const common::ObString &table_name,
+                                         ObPrivSet &priv_set);
   int get_catalog_table_priv_with_user_id(
       const uint64_t tenant_id,
       const uint64_t user_id,

@@ -135,6 +135,49 @@ int collect_user_catalog_database_priv_in_roles(const ObPrivMgr &priv_mgr,
   return ret;
 }
 
+int collect_catalog_object_level_priv_in_roles(const ObPrivMgr &priv_mgr,
+                                               const ObUserInfo &role_info,
+                                               const ObNeedPriv &need_priv,
+                                               ObNeedPriv &collected_priv)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t tenant_id = role_info.get_tenant_id();
+  const uint64_t user_id = role_info.get_user_id();
+  ObPrivSet priv_set = OB_PRIV_SET_EMPTY;
+  switch (need_priv.priv_level_) {
+    case OB_PRIV_CATALOG_LEVEL: {
+      ObCatalogPrivSortKey key(tenant_id, user_id, need_priv.catalog_);
+      if (OB_FAIL(priv_mgr.get_catalog_priv_set(key, priv_set))) {
+        LOG_WARN("get catalog priv set failed", K(ret), K(key));
+      }
+      break;
+    }
+    case OB_PRIV_DB_LEVEL: {
+      ObCatalogDatabasePrivSortKey key(tenant_id, user_id, need_priv.catalog_, need_priv.db_);
+      if (OB_FAIL(priv_mgr.get_catalog_database_priv_set(key, priv_set))) {
+        LOG_WARN("get catalog database priv set failed", K(ret), K(key));
+      }
+      break;
+    }
+    case OB_PRIV_TABLE_LEVEL: {
+      ObCatalogTablePrivSortKey key(tenant_id, user_id, need_priv.catalog_, need_priv.db_, need_priv.table_);
+      if (OB_FAIL(priv_mgr.get_catalog_table_priv_set(key, priv_set))) {
+        LOG_WARN("get catalog table priv set failed", K(ret), K(key));
+      }
+      break;
+    }
+    default: {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid catalog privilege level", K(ret), K(need_priv));
+      break;
+    }
+  }
+  if (OB_SUCC(ret)) {
+    collected_priv.priv_set_ |= priv_set;
+  }
+  return ret;
+}
+
 int collect_db_level_priv_in_roles(const ObPrivMgr &priv_mgr,
                                    const ObUserInfo &role_info,
                                    const ObNeedPriv &need_priv,
@@ -587,10 +630,24 @@ int ObSchemaGetterGuard::check_table_show(const ObSessionPrivInfo &session_priv,
   if (is_internal_catalog_id(catalog_id)) {
     ret = check_table_show(session_priv, enable_role_id_array, db, table, allow_show);
   } else if (is_external_catalog_id(catalog_id)) {
-    allow_show = true;
+    const ObCatalogSchema *catalog_schema = NULL;
+    allow_show = false;
     if (OB_FAIL(check_catalog_db_access(session_priv, enable_role_id_array, catalog_id, db, db_priv_set))) {
-      allow_show = false;
       LOG_WARN("check catalog table show priv failed", K(ret));
+    } else if (OB_FAIL(get_catalog_schema_by_id(session_priv.tenant_id_, catalog_id, catalog_schema))) {
+      LOG_WARN("get catalog schema failed", K(ret), K(catalog_id));
+    } else if (OB_ISNULL(catalog_schema)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("catalog schema is null", K(ret), K(catalog_id));
+    } else {
+      const ObString catalog_name = catalog_schema->get_catalog_name_str();
+      ObPrivSet total_priv_set = OB_PRIV_SET_EMPTY;
+      if (OB_FAIL(collect_all_priv_for_catalog_table(session_priv, enable_role_id_array,
+                                                    catalog_name, db, table, total_priv_set))) {
+        LOG_WARN("collect catalog table show privs failed", K(ret), K(catalog_name), K(db), K(table));
+      } else {
+        allow_show = OB_PRIV_HAS_ANY(total_priv_set, OB_PRIV_TABLE_ACC);
+      }
     }
   } else {
     ret = OB_ERR_UNEXPECTED;
@@ -1449,10 +1506,13 @@ int ObSchemaGetterGuard::check_catalog_priv(const ObSessionPrivInfo &session_pri
   return ret;
 }
 
-int ObSchemaGetterGuard::check_catalog_table_priv(
+int ObSchemaGetterGuard::collect_all_priv_for_catalog_table(
     const ObSessionPrivInfo &session_priv,
     const common::ObIArray<uint64_t> &enable_role_id_array,
-    const ObNeedPriv &need_priv)
+    const ObString &catalog_name,
+    const ObString &database_name,
+    const ObString &table_name,
+    ObPrivSet &total_priv_set)
 {
   int ret = OB_SUCCESS;
   const uint64_t tenant_id = session_priv.tenant_id_;
@@ -1461,7 +1521,9 @@ int ObSchemaGetterGuard::check_catalog_table_priv(
   ObPrivSet catalog_priv_set = OB_PRIV_SET_EMPTY;
   ObPrivSet database_priv_set = OB_PRIV_SET_EMPTY;
   ObPrivSet table_priv_set = OB_PRIV_SET_EMPTY;
-  ObPrivSet total_priv_set = session_priv.user_priv_set_;
+  total_priv_set = session_priv.user_priv_set_;
+  ObNeedPriv need_priv(database_name, table_name, OB_PRIV_TABLE_LEVEL,
+                       OB_PRIV_SET_EMPTY, false, false, OB_PRIV_CHECK_ALL, catalog_name);
   if (OB_INVALID_ID == tenant_id || OB_INVALID_ID == user_id
       || need_priv.catalog_.empty() || need_priv.db_.empty() || need_priv.table_.empty()) {
     ret = OB_INVALID_ARGUMENT;
@@ -1496,36 +1558,51 @@ int ObSchemaGetterGuard::check_catalog_table_priv(
       if (OB_FAIL(collect_priv_in_roles(priv_mgr, session_priv, enable_role_id_array,
                                        *this, need_priv,
                                        collect_user_catalog_table_priv_in_roles,
-                                       collected_privs, check_succ))) {
+                                       collected_privs, check_succ,
+                                       CheckRolePrivMode::CHECK_PRIV_HAS_NONE))) {
         LOG_WARN("fail to collect catalog table privs in roles", KR(ret), K(need_priv));
       } else {
         total_priv_set |= collected_privs.priv_set_;
       }
     }
+  }
+  return ret;
+}
 
-    if (OB_SUCC(ret) && !OB_TEST_PRIVS(total_priv_set, need_priv.priv_set_)) {
-      ret = OB_ERR_NO_TABLE_PRIVILEGE;
-      const ObPrivSet lack_priv_set = need_priv.priv_set_ & (~total_priv_set);
-      const char *priv_name = priv_mgr.get_first_priv_name(lack_priv_set);
-      if (OB_ISNULL(priv_name)) {
-        ret = OB_INVALID_ARGUMENT;
-        LOG_WARN("invalid privilege type", K(ret), K(lack_priv_set), K(need_priv));
-      } else {
-        LOG_USER_ERROR(OB_ERR_NO_TABLE_PRIVILEGE, static_cast<int>(strlen(priv_name)), priv_name,
-                       session_priv.user_name_.length(), session_priv.user_name_.ptr(),
-                       session_priv.host_name_.length(), session_priv.host_name_.ptr(),
-                       need_priv.table_.length(), need_priv.table_.ptr());
-      }
-    }
-
-    if (OB_SUCC(ret) && need_priv.is_for_update_) {
-      ret = OB_ERR_NO_TABLE_PRIVILEGE;
-      const char *priv_name = "SELECT with locking clause";
+int ObSchemaGetterGuard::check_catalog_table_priv(
+    const ObSessionPrivInfo &session_priv,
+    const common::ObIArray<uint64_t> &enable_role_id_array,
+    const ObNeedPriv &need_priv)
+{
+  int ret = OB_SUCCESS;
+  ObPrivSet total_priv_set = OB_PRIV_SET_EMPTY;
+  const bool check_any = OB_PRIV_CHECK_ANY == need_priv.priv_check_type_;
+  if (OB_FAIL(collect_all_priv_for_catalog_table(session_priv, enable_role_id_array,
+                                                need_priv.catalog_, need_priv.db_,
+                                                need_priv.table_, total_priv_set))) {
+    LOG_WARN("collect catalog table privs failed", KR(ret), K(need_priv));
+  } else if (!(check_any ? OB_PRIV_HAS_ANY(total_priv_set, need_priv.priv_set_)
+                        : OB_TEST_PRIVS(total_priv_set, need_priv.priv_set_))) {
+    ret = OB_ERR_NO_TABLE_PRIVILEGE;
+    const ObPrivSet lack_priv_set = need_priv.priv_set_ & (~total_priv_set);
+    const char *priv_name = check_any ? "ANY" : ObPrivMgr::get_first_priv_name(lack_priv_set);
+    if (OB_ISNULL(priv_name)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid privilege type", K(ret), K(lack_priv_set), K(need_priv));
+    } else {
       LOG_USER_ERROR(OB_ERR_NO_TABLE_PRIVILEGE, static_cast<int>(strlen(priv_name)), priv_name,
                      session_priv.user_name_.length(), session_priv.user_name_.ptr(),
                      session_priv.host_name_.length(), session_priv.host_name_.ptr(),
                      need_priv.table_.length(), need_priv.table_.ptr());
     }
+  }
+  if (OB_SUCC(ret) && need_priv.is_for_update_) {
+    ret = OB_ERR_NO_TABLE_PRIVILEGE;
+    const char *priv_name = "SELECT with locking clause";
+    LOG_USER_ERROR(OB_ERR_NO_TABLE_PRIVILEGE, static_cast<int>(strlen(priv_name)), priv_name,
+                   session_priv.user_name_.length(), session_priv.user_name_.ptr(),
+                   session_priv.host_name_.length(), session_priv.host_name_.ptr(),
+                   need_priv.table_.length(), need_priv.table_.ptr());
   }
   return ret;
 }
@@ -2269,50 +2346,78 @@ int ObSchemaGetterGuard::check_priv_or(const ObSessionPrivInfo &session_priv,
     const ObPrivMgr &priv_mgr = mgr->priv_mgr_;
     for (int64_t i = 0; !pass && OB_SUCC(ret) && i < need_privs.count(); ++i) {
       const ObNeedPriv &need_priv = need_privs.at(i);
-      if (need_priv.priv_level_ > max_priv_level) {
-        max_priv_level = need_priv.priv_level_;
+      const ObPrivLevel error_priv_level = OB_PRIV_CATALOG_LEVEL == need_priv.priv_level_
+          ? OB_PRIV_USER_LEVEL : need_priv.priv_level_;
+      if (error_priv_level > max_priv_level) {
+        max_priv_level = error_priv_level;
       }
-      switch (need_priv.priv_level_) {
-        case OB_PRIV_USER_LEVEL: {
-          pass = OB_PRIV_HAS_ANY(session_priv.user_priv_set_, need_priv.priv_set_);
-          if (!pass) {
-            bool check_succ = false;
-            ObNeedPriv collected_privs("", "", OB_PRIV_USER_LEVEL, OB_PRIV_SET_EMPTY, false);
-            if (OB_FAIL(collect_priv_in_roles(priv_mgr, session_priv, enable_role_id_array, *this, need_priv,
-                                              collect_user_level_priv_in_roles, collected_privs, check_succ))) {
-              LOG_WARN("fail to collect priv in roles", K(ret));
-            } else {
-              ObPrivSet total_set = (session_priv.user_priv_set_ | collected_privs.priv_set_);
-              pass = OB_PRIV_HAS_ANY(total_set, need_priv.priv_set_);
+      if (!need_priv.catalog_.empty()
+          && !ObCatalogUtils::is_internal_catalog_name(need_priv.catalog_)
+          && (OB_PRIV_CATALOG_LEVEL == need_priv.priv_level_
+              || OB_PRIV_DB_LEVEL == need_priv.priv_level_
+              || OB_PRIV_TABLE_LEVEL == need_priv.priv_level_)) {
+        const ObUserInfo *user_info = get_user_info(tenant_id, user_id);
+        ObNeedPriv collected_privs(need_priv.db_, need_priv.table_, need_priv.priv_level_,
+                                   OB_PRIV_SET_EMPTY, false, false, OB_PRIV_CHECK_ANY,
+                                   need_priv.catalog_);
+        if (OB_ISNULL(user_info)) {
+          ret = OB_USER_NOT_EXIST;
+          LOG_WARN("user info is null", K(ret), K(tenant_id), K(user_id));
+        } else if (OB_FAIL(collect_catalog_object_level_priv_in_roles(
+                       priv_mgr, *user_info, need_priv, collected_privs))) {
+          LOG_WARN("collect user catalog object privilege failed", K(ret), K(need_priv));
+        } else {
+          pass = OB_PRIV_HAS_ANY(collected_privs.priv_set_, need_priv.priv_set_);
+          if (!pass && OB_FAIL(collect_priv_in_roles(
+                           priv_mgr, session_priv, enable_role_id_array, *this, need_priv,
+                           collect_catalog_object_level_priv_in_roles, collected_privs, pass,
+                           CheckRolePrivMode::CHECK_PRIV_HAS_ANY))) {
+            LOG_WARN("collect role catalog object privilege failed", K(ret), K(need_priv));
+          }
+        }
+      } else {
+        switch (need_priv.priv_level_) {
+          case OB_PRIV_USER_LEVEL: {
+            pass = OB_PRIV_HAS_ANY(session_priv.user_priv_set_, need_priv.priv_set_);
+            if (!pass) {
+              bool check_succ = false;
+              ObNeedPriv collected_privs("", "", OB_PRIV_USER_LEVEL, OB_PRIV_SET_EMPTY, false);
+              if (OB_FAIL(collect_priv_in_roles(priv_mgr, session_priv, enable_role_id_array, *this, need_priv,
+                                                collect_user_level_priv_in_roles, collected_privs, check_succ))) {
+                LOG_WARN("fail to collect priv in roles", K(ret));
+              } else {
+                ObPrivSet total_set = (session_priv.user_priv_set_ | collected_privs.priv_set_);
+                pass = OB_PRIV_HAS_ANY(total_set, need_priv.priv_set_);
+              }
             }
+            break;
           }
-          break;
-        }
-        case OB_PRIV_DB_LEVEL: {
-          if (OB_FAIL(check_priv_db_or_(session_priv, enable_role_id_array, need_priv, priv_mgr, tenant_id, user_id, pass))) {
-            LOG_WARN("fail to check priv db only", KR(ret), K(tenant_id), K(user_id), K(need_priv.db_));
+          case OB_PRIV_DB_LEVEL: {
+            if (OB_FAIL(check_priv_db_or_(session_priv, enable_role_id_array, need_priv, priv_mgr, tenant_id, user_id, pass))) {
+              LOG_WARN("fail to check priv db only", KR(ret), K(tenant_id), K(user_id), K(need_priv.db_));
+            }
+            break;
           }
-          break;
-        }
-        case OB_PRIV_TABLE_LEVEL: {
-          if (OB_FAIL(check_priv_table_or_(session_priv, enable_role_id_array, need_priv, priv_mgr, tenant_id, user_id, pass))) {
-            LOG_WARN("fail to check priv table only", KR(ret), K(tenant_id), K(user_id), K(need_priv.db_), K(need_priv.table_));
+          case OB_PRIV_TABLE_LEVEL: {
+            if (OB_FAIL(check_priv_table_or_(session_priv, enable_role_id_array, need_priv, priv_mgr, tenant_id, user_id, pass))) {
+              LOG_WARN("fail to check priv table only", KR(ret), K(tenant_id), K(user_id), K(need_priv.db_), K(need_priv.table_));
+            }
+            break;
           }
-          break;
-        }
-        case OB_PRIV_ROUTINE_LEVEL: {
-          ret = OB_INVALID_ARGUMENT;
-          LOG_WARN("should not reach here", KR(ret));
-          break;
-        }
-        case OB_PRIV_DB_ACCESS_LEVEL: {
-          //this should not occur
-          ret = OB_INVALID_ARGUMENT;
-          LOG_WARN("should not reach here", KR(ret));
-          break;
-        }
-        default: {
-          break;
+          case OB_PRIV_ROUTINE_LEVEL: {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_WARN("should not reach here", KR(ret));
+            break;
+          }
+          case OB_PRIV_DB_ACCESS_LEVEL: {
+            //this should not occur
+            ret = OB_INVALID_ARGUMENT;
+            LOG_WARN("should not reach here", KR(ret));
+            break;
+          }
+          default: {
+            break;
+          }
         }
       }
     }

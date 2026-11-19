@@ -810,7 +810,7 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
               allow_show = true;
             } else if (OB_SUCC(ret) && !is_result_scan_show
                        && OB_FAIL(schema_checker_->check_table_show(
-                              session_priv, enable_role_id_array, catalog_id, show_db_name,
+                              session_priv, enable_role_id_array, show_catalog_id, show_db_name,
                               show_table_name, allow_show))) {
               LOG_WARN("Check table show error", K(ret));
             } else if (OB_SUCC(ret) && !is_result_scan_show && !allow_show) {

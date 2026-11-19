@@ -35625,6 +35625,7 @@ def_table_schema(
   TABLE_PRIV AS (
     select A.tenant_id TENANT_ID,
            A.user_id USER_ID,
+           'def' TABLE_CATALOG,
            A.database_name DATABASE_NAME,
            A.table_name TABLE_NAME,
            A.priv_alter PRIV_ALTER,
@@ -35642,16 +35643,39 @@ def_table_schema(
     from oceanbase.__all_table_privilege_history A,
         (select tenant_id, user_id, database_name, table_name, max(schema_version) schema_version from oceanbase.__all_table_privilege_history group by tenant_id, user_id, database_name, database_name collate utf8mb4_bin, table_name, table_name collate utf8mb4_bin) B
     where A.tenant_id = B.tenant_id and A.user_id = B.user_id and A.database_name collate utf8mb4_bin = B.database_name collate utf8mb4_bin and A.schema_version = B.schema_version and A.table_name collate utf8mb4_bin = B.table_name collate utf8mb4_bin and A.is_deleted = 0
+    UNION ALL
+    select A.tenant_id TENANT_ID,
+           A.user_id USER_ID,
+           A.catalog_name TABLE_CATALOG,
+           A.database_name DATABASE_NAME,
+           A.table_name TABLE_NAME,
+           (A.priv_set & (1 << 1)) != 0 PRIV_ALTER,
+           (A.priv_set & (1 << 2)) != 0 PRIV_CREATE,
+           (A.priv_set & (1 << 4)) != 0 PRIV_DELETE,
+           (A.priv_set & (1 << 5)) != 0 PRIV_DROP,
+           (A.priv_set & (1 << 6)) != 0 PRIV_GRANT_OPTION,
+           (A.priv_set & (1 << 7)) != 0 PRIV_INSERT,
+           (A.priv_set & (1 << 8)) != 0 PRIV_UPDATE,
+           (A.priv_set & (1 << 9)) != 0 PRIV_SELECT,
+           (A.priv_set & (1 << 10)) != 0 PRIV_INDEX,
+           (A.priv_set & (1 << 11)) != 0 PRIV_CREATE_VIEW,
+           (A.priv_set & (1 << 12)) != 0 PRIV_SHOW_VIEW,
+           ((((A.priv_set & (1 << 22)) != 0) << 6)
+            | (((A.priv_set & (1 << 44)) != 0) << 9)) PRIV_OTHERS
+    from oceanbase.__all_catalog_table_privilege_history A,
+        (select tenant_id, user_id, catalog_name, database_name, table_name, max(schema_version) schema_version from oceanbase.__all_catalog_table_privilege_history group by tenant_id, user_id, catalog_name, database_name, table_name) B
+    where A.tenant_id = B.tenant_id and A.user_id = B.user_id and A.catalog_name = B.catalog_name and A.database_name = B.database_name and A.table_name = B.table_name and A.schema_version = B.schema_version and A.is_deleted = 0
   )
   SELECT
          CAST(CONCAT('''', V.USER_NAME, '''', '@', '''', V.HOST, '''') AS CHAR(81)) AS GRANTEE ,
-         CAST('def' AS CHAR(512)) AS TABLE_CATALOG ,
+         CAST(V.TABLE_CATALOG AS CHAR(512)) AS TABLE_CATALOG ,
          CAST(V.DATABASE_NAME AS CHAR(128)) collate utf8mb4_name_case AS TABLE_SCHEMA ,
          CAST(V.TABLE_NAME AS CHAR(64)) collate utf8mb4_name_case AS TABLE_NAME,
          CAST(V.PRIVILEGE_TYPE AS CHAR(64)) AS PRIVILEGE_TYPE ,
          CAST(V.IS_GRANTABLE AS CHAR(3)) AS IS_GRANTABLE
   FROM
-    (SELECT TP.DATABASE_NAME AS DATABASE_NAME,
+    (SELECT TP.TABLE_CATALOG AS TABLE_CATALOG,
+            TP.DATABASE_NAME AS DATABASE_NAME,
             TP.TABLE_NAME AS TABLE_NAME,
             U.USER_NAME AS USER_NAME,
             U.HOST AS HOST,
@@ -35992,14 +36016,50 @@ def_table_schema(
     from oceanbase.__all_database_privilege_history A,
         (select tenant_id, user_id, database_name, max(schema_version) schema_version from oceanbase.__all_database_privilege_history group by tenant_id, user_id, database_name, database_name collate utf8mb4_bin) B
     where A.tenant_id = B.tenant_id and A.user_id = B.user_id and A.database_name collate utf8mb4_bin = B.database_name collate utf8mb4_bin and A.schema_version = B.schema_version and A.is_deleted = 0
+  ),
+  SCHEMA_PRIV AS (
+    select 'def' TABLE_CATALOG, DP.*
+    from DB_PRIV DP
+    where DP.DATABASE_NAME != '__recyclebin'
+      and DP.DATABASE_NAME != '__public'
+      and DP.DATABASE_NAME != 'SYS'
+      and DP.DATABASE_NAME != 'LBACSYS'
+      and DP.DATABASE_NAME != 'ORAAUDITOR'
+    UNION ALL
+    select A.catalog_name TABLE_CATALOG,
+           A.tenant_id TENANT_ID,
+           A.user_id USER_ID,
+           A.database_name DATABASE_NAME,
+           (A.priv_set & (1 << 1)) != 0 PRIV_ALTER,
+           (A.priv_set & (1 << 2)) != 0 PRIV_CREATE,
+           (A.priv_set & (1 << 4)) != 0 PRIV_DELETE,
+           (A.priv_set & (1 << 5)) != 0 PRIV_DROP,
+           (A.priv_set & (1 << 6)) != 0 PRIV_GRANT_OPTION,
+           (A.priv_set & (1 << 7)) != 0 PRIV_INSERT,
+           (A.priv_set & (1 << 8)) != 0 PRIV_UPDATE,
+           (A.priv_set & (1 << 9)) != 0 PRIV_SELECT,
+           (A.priv_set & (1 << 10)) != 0 PRIV_INDEX,
+           (A.priv_set & (1 << 11)) != 0 PRIV_CREATE_VIEW,
+           (A.priv_set & (1 << 12)) != 0 PRIV_SHOW_VIEW,
+           ((((A.priv_set & (1 << 23)) != 0) << 0)
+            | (((A.priv_set & (1 << 37)) != 0) << 1)
+            | (((A.priv_set & (1 << 38)) != 0) << 2)
+            | (((A.priv_set & (1 << 22)) != 0) << 6)
+            | (((A.priv_set & (1 << 44)) != 0) << 9)
+            | (((A.priv_set & (1 << 45)) != 0) << 10)
+            | (((A.priv_set & (1 << 49)) != 0) << 13)) PRIV_OTHERS
+    from oceanbase.__all_catalog_database_privilege_history A,
+        (select tenant_id, user_id, catalog_name, database_name, max(schema_version) schema_version from oceanbase.__all_catalog_database_privilege_history group by tenant_id, user_id, catalog_name, database_name) B
+    where A.tenant_id = B.tenant_id and A.user_id = B.user_id and A.catalog_name = B.catalog_name and A.database_name = B.database_name and A.schema_version = B.schema_version and A.is_deleted = 0
   )
   SELECT CAST(CONCAT('''', V.USER_NAME, '''', '@', '''', V.HOST, '''') AS CHAR(81)) AS GRANTEE ,
-         CAST('def' AS CHAR(512)) AS TABLE_CATALOG ,
+         CAST(V.TABLE_CATALOG AS CHAR(512)) AS TABLE_CATALOG ,
          CAST(V.DATABASE_NAME AS CHAR(128)) collate utf8mb4_name_case AS TABLE_SCHEMA ,
          CAST(V.PRIVILEGE_TYPE AS CHAR(64)) AS PRIVILEGE_TYPE ,
          CAST(V.IS_GRANTABLE AS CHAR(3)) AS IS_GRANTABLE
   FROM
-    (SELECT DP.DATABASE_NAME DATABASE_NAME,
+    (SELECT DP.TABLE_CATALOG TABLE_CATALOG,
+            DP.DATABASE_NAME DATABASE_NAME,
             U.USER_NAME AS USER_NAME,
             U.HOST AS HOST,
             CASE
@@ -36043,7 +36103,7 @@ def_table_schema(
                 WHEN DP.PRIV_GRANT_OPTION = 1 THEN 'YES'
                 WHEN DP.PRIV_GRANT_OPTION = 0 THEN 'NO'
             END IS_GRANTABLE
-     FROM DB_PRIV DP,
+     FROM SCHEMA_PRIV DP,
                       oceanbase.__all_user U,
        (SELECT 1 AS C1
         UNION ALL SELECT 2 AS C1
@@ -36075,11 +36135,6 @@ def_table_schema(
      WHERE DP.TENANT_ID = 0
        AND DP.TENANT_ID = U.TENANT_ID
        AND DP.USER_ID = U.USER_ID
-       AND DP.DATABASE_NAME != '__recyclebin'
-       AND DP.DATABASE_NAME != '__public'
-       AND DP.DATABASE_NAME != 'SYS'
-       AND DP.DATABASE_NAME != 'LBACSYS'
-       AND DP.DATABASE_NAME != 'ORAAUDITOR'
        AND (DB.USER_ID IS NOT NULL
             OR 512 & CURRENT_USER_PRIV() = 512
             OR DP.USER_ID = CURR.USER_ID)) V
@@ -43596,8 +43651,8 @@ def_table_schema(
     cast(tp.grantor_host as char(256)) as GRANTOR_HOST,
     cast(u.user_name as char(32)) as GRANTEE,
     cast(u.host as char(255)) as GRANTEE_HOST,
-    cast('def' as char(3)) as TABLE_CATALOG,
-    cast(tp.database_name as char(64)) as TABLE_SCHEMA,
+    cast('def' as char(512)) as TABLE_CATALOG,
+    cast(tp.database_name as char(128)) as TABLE_SCHEMA,
     cast(tp.table_name as char(64)) as TABLE_NAME,
     substr(concat(case when tp.priv_alter > 0 then ',Alter' else '' end,
             case when tp.priv_create > 0 then ',Create' else '' end,
@@ -43614,6 +43669,32 @@ def_table_schema(
     cast(if (tp.priv_grant_option > 0,'YES','NO') as char(3)) AS IS_GRANTABLE
   from (select distinct from_user, from_host, to_user, to_host, is_enabled from role_graph) rg
       join oceanbase.__all_table_privilege tp join oceanbase.__all_user u
+  on tp.user_id = u.user_id and rg.from_user = u.user_name and rg.from_host = u.host
+  where rg.is_enabled and rg.to_user <> '' and tp.tenant_id = 0 and u.tenant_id = 0
+  UNION ALL
+  select distinct
+    cast(NULL as char(97)) as GRANTOR,
+    cast(NULL as char(256)) as GRANTOR_HOST,
+    cast(u.user_name as char(32)) as GRANTEE,
+    cast(u.host as char(255)) as GRANTEE_HOST,
+    cast(tp.catalog_name as char(512)) as TABLE_CATALOG,
+    cast(tp.database_name as char(128)) as TABLE_SCHEMA,
+    cast(tp.table_name as char(64)) as TABLE_NAME,
+    substr(concat(case when (tp.priv_set & (1 << 1)) != 0 then ',Alter' else '' end,
+                  case when (tp.priv_set & (1 << 2)) != 0 then ',Create' else '' end,
+                  case when (tp.priv_set & (1 << 4)) != 0 then ',Delete' else '' end,
+                  case when (tp.priv_set & (1 << 5)) != 0 then ',Drop' else '' end,
+                  case when (tp.priv_set & (1 << 6)) != 0 then ',Grant' else '' end,
+                  case when (tp.priv_set & (1 << 7)) != 0 then ',Insert' else '' end,
+                  case when (tp.priv_set & (1 << 8)) != 0 then ',Update' else '' end,
+                  case when (tp.priv_set & (1 << 9)) != 0 then ',Select' else '' end,
+                  case when (tp.priv_set & (1 << 10)) != 0 then ',Index' else '' end,
+                  case when (tp.priv_set & (1 << 11)) != 0 then ',Create View' else '' end,
+                  case when (tp.priv_set & (1 << 12)) != 0 then ',Show View' else '' end,
+                  case when (tp.priv_set & (1 << 22)) != 0 then ',References' else '' end), 2) as PRIVILEGE_TYPE,
+    cast(if ((tp.priv_set & (1 << 6)) != 0, 'YES', 'NO') as char(3)) AS IS_GRANTABLE
+  from (select distinct from_user, from_host, to_user, to_host, is_enabled from role_graph) rg
+      join oceanbase.__all_catalog_table_privilege tp join oceanbase.__all_user u
   on tp.user_id = u.user_id and rg.from_user = u.user_name and rg.from_host = u.host
   where rg.is_enabled and rg.to_user <> '' and tp.tenant_id = 0 and u.tenant_id = 0
   """.replace("\n", " "),
