@@ -879,7 +879,15 @@ int ObTenantAsyncIndexRefresher::process_retry_tasks_(
               && !is_async_index_retryable_error(node->stat_.result_))) {
         // Drop obsolete work even when its delay has not elapsed or the pool is
         // full. OB_SUCCESS is reserved for tasks deferred before SQL admission.
-        refresh_worker_.record_finished_stat(node->stat_);
+        ObRefreshTaskStat stat = node->stat_;
+        // DOP-deferred nodes need a terminal stat when cancelled.
+        if (stat.result_ == OB_SUCCESS || is_async_index_retryable_error(stat.result_)) {
+          stat.result_ = scheduler->is_stopped() ? OB_IN_STOP_STATE : OB_NOT_MASTER;
+          stat.end_time_ = common::ObTimeUtility::current_time();
+        } else if (stat.end_time_ == 0) {
+          stat.end_time_ = common::ObTimeUtility::current_time();
+        }
+        refresh_worker_.record_finished_stat(stat);
         retry_list.remove(node);
         node->~ObRetryTaskNode();
         ob_free(node);

@@ -410,6 +410,111 @@ TEST_F(TestTenantAsyncIndexRefresher, test_follower_switch_only_affects_own_ls)
   scheduler2.destroy();  // internally unregisters
 }
 
+// Simulate role publication before cancel_retry_tasks() drains the retry list.
+TEST_F(TestTenantAsyncIndexRefresher, test_retry_cleanup_records_terminal_state)
+{
+  struct Scenario {
+    const char *name_;
+    bool stopped_;
+    bool leader_;
+    bool stale_epoch_;
+    int result_;
+    int64_t end_time_;
+    int expected_result_;
+    bool preserve_end_time_;
+  };
+  const Scenario scenarios[] = {
+    {"deferred_follower", false, false, false, OB_SUCCESS, 0, OB_NOT_MASTER, false},
+    {"deferred_stale_epoch", false, true, true, OB_SUCCESS, 0, OB_NOT_MASTER, false},
+    {"deferred_stopped", true, true, false, OB_SUCCESS, 0, OB_IN_STOP_STATE, false},
+    {"stopped_follower", true, false, true, OB_SUCCESS, 0, OB_IN_STOP_STATE, false},
+    {"retryable_error_cancelled", false, false, false, OB_TIMEOUT, 123, OB_NOT_MASTER, false},
+    {"terminal_error", false, true, false, OB_INVALID_ARGUMENT, 123, OB_INVALID_ARGUMENT, true},
+    {"terminal_error_and_stop", true, false, true, OB_INVALID_ARGUMENT, 123, OB_INVALID_ARGUMENT, true},
+    {"terminal_error_missing_end", false, true, false, OB_INVALID_ARGUMENT, 0, OB_INVALID_ARGUMENT, false},
+  };
+  for (const Scenario &scenario : scenarios) {
+    SCOPED_TRACE(scenario.name_);
+    ObAsyncIndexService service;
+    ObTenantAsyncIndexRefresher &refresher = service.refresher_;
+    ASSERT_NO_FATAL_FAILURE(init_worker_only(refresher));
+    ObLSAsyncIndexScheduler scheduler;
+    ASSERT_NO_FATAL_FAILURE(init_scheduler_for_test(
+        scheduler, ObLSID(1001), OB_SERVER_TENANT_ID, &service));
+    ASSERT_EQ(OB_SUCCESS, scheduler.switch_to_leader());
+    ASSERT_NO_FATAL_FAILURE(add_retry_node(scheduler, ObTabletID(200001), INT64_MAX));
+    ObRetryTaskNode *node = scheduler.get_retry_tasks().get_first();
+    node->stat_.leader_epoch_ = scheduler.get_leader_epoch();
+    node->stat_.refresh_task_id_ = 42;
+    node->stat_.start_time_ = 100;
+    node->stat_.result_ = scenario.result_;
+    node->stat_.end_time_ = scenario.end_time_;
+    ASSERT_EQ(OB_SUCCESS, node->sql_.assign("INSERT INTO `db`.`idx` SELECT 1"));
+    ATOMIC_STORE(&scheduler.stopped_, scenario.stopped_);
+    ATOMIC_STORE(&scheduler.is_leader_, scenario.leader_);
+    if (scenario.stale_epoch_) {
+      ATOMIC_AAF(&scheduler.leader_epoch_, 1);
+    }
+
+    int64_t admission_budget = 0;
+    const int64_t before_cleanup = ObTimeUtility::current_time();
+    ASSERT_EQ(OB_SUCCESS, refresher.process_retry_tasks_(&scheduler, admission_budget));
+    const int64_t after_cleanup = ObTimeUtility::current_time();
+    EXPECT_EQ(0, admission_budget);
+    EXPECT_EQ(0, retry_list_size(scheduler));
+    ObSEArray<ObRefreshTaskStat, 1> stats;
+    ASSERT_EQ(OB_SUCCESS, refresher.refresh_worker_.get_recent_finished_stats(stats));
+    ASSERT_EQ(1, stats.count());
+    EXPECT_EQ(42, stats.at(0).refresh_task_id_);
+    EXPECT_EQ(ObTabletID(200001), stats.at(0).tablet_id_);
+    EXPECT_EQ(scenario.expected_result_, stats.at(0).result_);
+    if (scenario.preserve_end_time_) {
+      EXPECT_EQ(scenario.end_time_, stats.at(0).end_time_);
+    } else {
+      EXPECT_GE(stats.at(0).end_time_, before_cleanup);
+      EXPECT_LE(stats.at(0).end_time_, after_cleanup);
+    }
+    ASSERT_EQ(OB_SUCCESS, refresher.process_retry_tasks_(&scheduler, admission_budget));
+    stats.reset();
+    ASSERT_EQ(OB_SUCCESS, refresher.refresh_worker_.get_recent_finished_stats(stats));
+    EXPECT_EQ(1, stats.count());
+  }
+}
+
+TEST_F(TestTenantAsyncIndexRefresher, test_retry_cleanup_keeps_pending_nodes)
+{
+  ObAsyncIndexService service;
+  ObTenantAsyncIndexRefresher &refresher = service.refresher_;
+  ASSERT_NO_FATAL_FAILURE(init_worker_only(refresher));
+  ObLSAsyncIndexScheduler scheduler;
+  ASSERT_NO_FATAL_FAILURE(init_scheduler_for_test(
+      scheduler, ObLSID(1001), OB_SERVER_TENANT_ID, &service));
+  ASSERT_EQ(OB_SUCCESS, scheduler.switch_to_leader());
+  ASSERT_NO_FATAL_FAILURE(add_retry_node(scheduler, ObTabletID(200001), INT64_MAX));
+  ObRetryTaskNode *node = scheduler.get_retry_tasks().get_first();
+  node->stat_.leader_epoch_ = scheduler.get_leader_epoch();
+  ASSERT_EQ(OB_SUCCESS, node->sql_.assign("INSERT INTO `db`.`idx` SELECT 1"));
+
+  for (const int result : {OB_SUCCESS, OB_TIMEOUT}) {
+    node->stat_.result_ = result;
+    node->stat_.end_time_ = OB_SUCCESS == result ? 0 : 123;
+    for (const int64_t deadline : {INT64_MAX, int64_t(0)}) {
+      node->retry_after_ts_ = deadline;
+      const int64_t initial_budget = INT64_MAX == deadline ? 1 : 0;
+      int64_t admission_budget = initial_budget;
+      ASSERT_EQ(OB_SUCCESS, refresher.process_retry_tasks_(&scheduler, admission_budget));
+      EXPECT_EQ(initial_budget, admission_budget);
+      ASSERT_EQ(1, retry_list_size(scheduler));
+      EXPECT_EQ(node, scheduler.get_retry_tasks().get_first());
+      EXPECT_EQ(result, node->stat_.result_);
+      EXPECT_EQ(OB_SUCCESS == result ? 0 : 123, node->stat_.end_time_);
+      ObSEArray<ObRefreshTaskStat, 1> stats;
+      ASSERT_EQ(OB_SUCCESS, refresher.refresh_worker_.get_recent_finished_stats(stats));
+      EXPECT_EQ(0, stats.count());
+    }
+  }
+}
+
 // A node with no registered LS schedulers does nothing.
 TEST_F(TestTenantAsyncIndexRefresher, test_idle_no_ls_schedulers)
 {
