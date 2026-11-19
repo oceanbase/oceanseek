@@ -11276,8 +11276,6 @@ int ObRootService::set_config_after_bootstrap_()
     LOG_WARN("push _update_all_columns_for_trigger failed", KR(ret));
   } else if (OB_FAIL(configs.push_back({"_enable_spf_batch_rescan", "true"}))) {
     LOG_WARN("push _enable_spf_batch_rescan failed", KR(ret));
-  } else if (OB_FAIL(configs.push_back({"_enable_px_adaptive_dop", "true"}))) {
-    LOG_WARN("push _enable_px_adaptive_dop failed", KR(ret));
   } else if (OB_FAIL(configs.push_back({"_enable_das_batch_rescan_flag", "15"}))) {
     LOG_WARN("push _enable_das_batch_rescan_flag failed", KR(ret));
   } else {

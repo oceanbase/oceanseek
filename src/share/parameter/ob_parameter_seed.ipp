@@ -3542,7 +3542,7 @@ DEF_STR_WITH_CHECKER(_use_distinct_with_expansion, OB_TENANT_PARAMETER, "AUTO",\
          ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE),
         "auto, normal, ordered, disabled");
 
-DEF_BOOL(_enable_px_adaptive_dop, OB_CLUSTER_PARAMETER, "False",
+DEF_BOOL(_enable_px_adaptive_dop, OB_CLUSTER_PARAMETER, "True",
          "Enable control parallel query queuing and dynamical parallelism scaling according to real-time system load",
          ObParameterAttr(Section::OBSERVER, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 DEF_INT(px_target_low_watermark, OB_TENANT_PARAMETER, "60", "[0,100]",
