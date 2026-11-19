@@ -2927,7 +2927,7 @@ int ObTransService::recover_tx(const ObTxInfo &tx_info, ObTxDesc *&tx)
     tx_desc_mgr_.revert(*tx);
     tx = NULL;
     TRANS_LOG(WARN, "assgin parts fail", K(ret));
-  } else if (tx->savepoints_.assign(tx_info.savepoints_)) {
+  } else if (OB_FAIL(tx->savepoints_.assign(tx_info.savepoints_))) {
     tx_desc_mgr_.revert(*tx);
     tx = NULL;
     TRANS_LOG(WARN, "assgin savepoints fail", K(ret));

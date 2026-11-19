@@ -253,13 +253,13 @@ int ObErrorInfo::get_error_info_from_table(ObISQLClient &sql_client, ObErrorInfo
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("error info is invalid", K(ret));
   } else if (
-    sql.assign_fmt("SELECT * FROM %s WHERE obj_id = %ld AND tenant_id = %ld \
+    OB_FAIL(sql.assign_fmt("SELECT * FROM %s WHERE obj_id = %ld AND tenant_id = %ld \
                                                         AND obj_seq = %ld AND obj_type = %ld",
              OB_ALL_TENANT_ERROR_TNAME,
              extract_obj_id(),
              extract_tenant_id(),
              get_obj_seq(),
-             get_obj_type())) {
+             get_obj_type()))) {
     LOG_WARN("assign select object sequence failed.", K(ret));
   } else {
     SMART_VAR(ObMySQLProxy::MySQLResult, res) {

@@ -1739,8 +1739,8 @@ int ObLogArchivePieceContext::get_ls_meta_in_piece_(
     if (OB_FAIL(share::ObArchivePathUtil::get_ls_meta_record_prefix(archive_dest_, dest_id_,
             round_context_.round_id_, piece_id, id_, meta_type, prefix))) {
       CLOG_LOG(WARN, "ger ls meta record prefix failed", K(ret), KPC(this));
-    } else if (archive::ObArchiveFileUtils::list_files(prefix.get_obstr(),
-          archive_dest_.get_storage_info(), array)) {
+    } else if (OB_FAIL(archive::ObArchiveFileUtils::list_files(prefix.get_obstr(),
+          archive_dest_.get_storage_info(), array))) {
       if (OB_ENTRY_NOT_EXIST == ret) {
         CLOG_LOG(INFO, "no file exist, need backward", K(ret), K(prefix));
         ret = OB_SUCCESS;

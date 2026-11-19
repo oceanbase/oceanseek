@@ -2963,8 +2963,7 @@ int ObFtsIndexBuildTask::submit_drop_fts_index_task()
     LOG_WARN("fail to push back search text match phrase table id", K(ret), K(search_text_match_phrase_aux_table_id_));
   } else if (drop_index_arg.index_ids_.count() <= 0) {
     LOG_INFO("no table need to be drop, skip", K(ret)); // no table exist, skip drop
-  } else if (schema_guard.get_table_schema(tenant_id_, object_id_, data_table_schema)) {
-    drop_index_task_submitted_ = true;
+  } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id_, object_id_, data_table_schema))) {
     LOG_WARN("fail to get table schema", K(ret), K(object_id_));
   } else if (create_index_arg_.is_offline_or_restore() && OB_ISNULL(data_table_schema)) {
     drop_index_task_submitted_ = true;

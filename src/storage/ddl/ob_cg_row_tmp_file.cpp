@@ -151,7 +151,7 @@ int ObCGRowFile::get_next_batch(blocksstable::ObBatchDatumRows *&bdrs)
   if (OB_UNLIKELY(!is_opened_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("the ObCGRowFile is not opened", K(ret));
-  } else if (!is_start_iterate_ && begin(iter_)) {
+  } else if (!is_start_iterate_ && OB_FAIL(begin(iter_))) {
     LOG_WARN("fail to begin iterating", K(ret));
   } else if (OB_FAIL(iter_.get_next_batch(bdrs_.vectors_, read_row_count))) {
     if (OB_ITER_END != ret) {

@@ -262,13 +262,13 @@ int ObDependencyInfo::delete_schema_object_dependency(common::ObISQLClient &tran
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("delete error info unexpected.", K(ret), K(tenant_id),
                                               K(dep_obj_id), K(dep_obj_type));
-  } else if (sql.assign_fmt("delete FROM %s WHERE dep_obj_id = %ld \
+  } else if (OB_FAIL(sql.assign_fmt("delete FROM %s WHERE dep_obj_id = %ld \
                                                   AND tenant_id = %ld  \
                                                   AND dep_obj_type = %ld",
             OB_ALL_TENANT_DEPENDENCY_TNAME,
             extract_obj_id(tenant_id, dep_obj_id),
             extract_tid,
-            static_cast<uint64_t>(dep_obj_type))) {
+            static_cast<uint64_t>(dep_obj_type)))) {
     LOG_WARN("delete from __all_tenant_dependency table failed.", K(ret), K(tenant_id),
                                                                   K(extract_tid),
                                                                   K(dep_obj_id),

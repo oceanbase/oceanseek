@@ -231,7 +231,7 @@ int ObUDRSqlService::remove_rule(ObUDRInfo &arg)
     LOG_WARN("failed to gen recyclebin rule name", K(ret));
   } else if (OB_FAIL(sql_append_hex_escape_str(arg.rule_name_, rule_name_sql_str))) {
     LOG_WARN("failed to process rule name", K(ret));
-  } else if (sql.assign_fmt("update %s set gmt_modified = now(), rule_name = '%.*s' ,\
+  } else if (OB_FAIL(sql.assign_fmt("update %s set gmt_modified = now(), rule_name = '%.*s' ,\
                             version = %ld, status = %ld \
                             where tenant_id = %lu and rule_name = %.*s",
             OB_ALL_TENANT_REWRITE_RULES_TNAME,
@@ -239,7 +239,7 @@ int ObUDRSqlService::remove_rule(ObUDRInfo &arg)
             rule_version,
             static_cast<int64_t>(ObUDRInfo::DELETE_STATUS),
             ObSchemaUtils::get_extract_tenant_id(arg.tenant_id_, arg.tenant_id_),
-            LEN_AND_PTR(rule_name_sql_str.string()))) {
+            LEN_AND_PTR(rule_name_sql_str.string())))) {
     LOG_WARN("update from __all_tenant_rewrite_rules table failed.", K(ret));
   } else if (OB_FAIL(trans.write(arg.tenant_id_, sql.ptr(), affected_rows))) {
     LOG_WARN("fail to exec sql", K(ret), K(sql));
@@ -258,11 +258,11 @@ int ObUDRSqlService::clean_up_items_marked_for_deletion(const uint64_t tenant_id
   ObSqlString sql;
   int64_t affected_rows = 0;
   if (OB_FAIL(ret)) {
-  } else if (sql.assign_fmt("delete FROM %s WHERE status = %ld \
+  } else if (OB_FAIL(sql.assign_fmt("delete FROM %s WHERE status = %ld \
                              AND DATEDIFF(now(), gmt_modified) >= %ld", 
             OB_ALL_TENANT_REWRITE_RULES_TNAME,
             static_cast<int64_t>(ObUDRInfo::DELETE_STATUS),
-            DELETE_DATE_INTERVAL_THRESHOLD)) {
+            DELETE_DATE_INTERVAL_THRESHOLD))) {
     LOG_WARN("delete from __all_tenant_rewrite_rules table failed.", K(ret));
   } else if (OB_FAIL(trans.write(tenant_id, sql.ptr(), affected_rows))) {
     LOG_WARN("fail to exec sql", K(ret));
