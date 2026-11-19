@@ -1854,7 +1854,8 @@ int ObPCachedExternalFileService::ss_async_read_(
     LOG_WARN("fail to get or create macro block id",
         KR(ret), K(external_file_info), K(external_read_info));
   } else if (OB_FAIL(async_read_object_manager_(
-      url, access_info, external_read_info, macro_id, io_handle))) {
+      url, access_info, external_file_info.get_file_size(), external_read_info,
+      macro_id, io_handle))) {
     LOG_WARN("fail to async read from local cache",
         KR(ret), K(external_file_info), K(external_read_info), K(macro_id));
   }
@@ -1895,7 +1896,8 @@ int ObPCachedExternalFileService::sn_async_read_(
   } else if (is_cache_hit) {
     nedd_add_prefetch_task = false;
     if (OB_FAIL(async_read_object_manager_(
-        url, access_info, external_read_info, macro_handle.get_macro_id(), io_handle))) {
+        url, access_info, external_file_info.get_file_size(), external_read_info,
+        macro_handle.get_macro_id(), io_handle))) {
       LOG_WARN("fail to async read from local cache",
           KR(ret), K(external_file_info), K(external_read_info), K(macro_handle));
     }
@@ -1991,6 +1993,7 @@ int ObPCachedExternalFileService::async_read_from_object_storage_(
 int ObPCachedExternalFileService::async_read_object_manager_(
     const common::ObString &url,
     const common::ObObjectStorageInfo *access_info,
+    const int64_t file_size,
     const ObExternalReadInfo &external_read_info,
     const blocksstable::MacroBlockId &macro_id,
     blocksstable::ObStorageObjectHandle &io_handle) const
@@ -2023,6 +2026,7 @@ int ObPCachedExternalFileService::async_read_object_manager_(
     read_info.path_ = url;
     read_info.access_info_ = access_info;
     read_info.io_metrics_ = external_read_info.io_metrics_;
+    read_info.external_file_size_ = file_size;
     
     if (OB_FAIL(ObObjectManager::async_read_object(read_info, io_handle))) {
       LOG_WARN("fail to async_read_object", KR(ret),
@@ -2036,10 +2040,13 @@ int ObPCachedExternalFileService::ss_add_prefetch_task(
     const common::ObString &url,
     const common::ObObjectStorageInfo *access_info,
     const int64_t offset_idx,
-    const blocksstable::MacroBlockId &macro_id)
+    const blocksstable::MacroBlockId &macro_id,
+    const int64_t file_size)
 {
   int ret = OB_SUCCESS;
   ObSSExternalDataPrefetchTaskInfo task_info;
+  const int64_t macro_size = OB_STORAGE_OBJECT_MGR.get_macro_block_size();
+  const int64_t read_offset = offset_idx * macro_size;
   if (OB_FAIL(check_init_and_stop_())) {
   } else if (OB_UNLIKELY(!GCTX.is_shared_storage_mode())) {
     ret = OB_NOT_SUPPORTED;
@@ -2049,11 +2056,16 @@ int ObPCachedExternalFileService::ss_add_prefetch_task(
       || OB_UNLIKELY(!is_valid_external_macro_id(macro_id))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", KR(ret), K(url), KPC(access_info), K(offset_idx), K(macro_id));
+  } else if (OB_UNLIKELY(read_offset > file_size)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("read offset is greater than file size", KR(ret), K(read_offset), K(file_size));
+  } else if (OB_UNLIKELY(read_offset == file_size)) {
+    LOG_DEBUG("read offset is equal to file size, skip prefetch", KR(ret), K(read_offset), K(file_size));
   } else if (MAX_RUNNING_PREFETCH_TASK_NUM <= running_prefetch_tasks_map_.size()) {
     LOG_INFO("running prefetch tasks is full", KR(ret),
         K(url), K(offset_idx), K(macro_id), K(running_prefetch_tasks_map_.size()));
   } else if (OB_FAIL(task_info.init(
-      url, access_info, offset_idx * OB_STORAGE_OBJECT_MGR.get_macro_block_size(), macro_id))) {
+      url, access_info, read_offset, macro_id, file_size))) {
     LOG_WARN("fail to init prefetch task info", KR(ret),
         K(url), KPC(access_info), K(offset_idx), K(macro_id));
   } else {
@@ -2538,7 +2550,8 @@ int ObExternalRemoteIOCallback::construct_io_callback(
       read_info->io_callback_,
       read_info->buf_,
       read_info->offset_ / OB_STORAGE_OBJECT_MGR.get_macro_block_size(),
-      read_info->path_, read_info->access_info_, read_info->macro_block_id_))) {
+      read_info->path_, read_info->access_info_, read_info->macro_block_id_,
+      read_info->external_file_size_))) {
     LOG_WARN("fail to init load callback", KR(ret), KP(allocator), KPC(read_info), K(io_info));
   }
 
@@ -2621,6 +2634,7 @@ ObExternalRemoteIOCallback::ObExternalRemoteIOCallback()
       url_(nullptr),
       access_info_(nullptr),
       macro_id_(),
+      file_size_(-1),
       content_digest_(MTL_ID()),
       modify_time_(-1)
 {
@@ -2688,7 +2702,8 @@ int ObExternalRemoteIOCallback::init(
     const int64_t offset_idx,
     const common::ObString &url,
     const ObObjectStorageInfo *access_info,
-    const blocksstable::MacroBlockId &macro_id)
+    const blocksstable::MacroBlockId &macro_id,
+    const int64_t file_size)
 {
   int ret = OB_SUCCESS;
   if (IS_INIT) {
@@ -2698,16 +2713,17 @@ int ObExternalRemoteIOCallback::init(
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("not supported shared storage mode", KR(ret),
         KP(allocator), K(offset_idx), K(url), KPC(access_info), K(macro_id));
-  } else if (OB_UNLIKELY(!is_valid_external_macro_id(macro_id))) {
+  } else if (OB_UNLIKELY(!is_valid_external_macro_id(macro_id) || file_size <= 0)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", KR(ret),
-        KP(allocator), K(offset_idx), K(url), KPC(access_info), K(macro_id));
+        KP(allocator), K(offset_idx), K(url), KPC(access_info), K(macro_id), K(file_size));
   } else if (OB_FAIL(base_init_(
       allocator, original_callback, user_data_buf, offset_idx, url, access_info))) {
     LOG_WARN("fail to base init", KR(ret),
         KP(allocator), K(offset_idx), K(url), KPC(access_info), K(macro_id));
   } else {
     macro_id_ = macro_id;
+    file_size_ = file_size;
     is_inited_ = true;
   }
   return ret;
@@ -2797,12 +2813,12 @@ int ObExternalRemoteIOCallback::inner_process(
     } else if (GCTX.is_shared_storage_mode()) {
       if (size == OB_STORAGE_OBJECT_MGR.get_macro_block_size()) {
         if (OB_TMP_FAIL(accesser->ss_add_prefetch_task(data_buffer, size, macro_id_))) {
-          LOG_WARN("fail to add preread task for external table", KR(ret), KPC(this));
+          LOG_WARN("fail to add preread task for external table", KR(tmp_ret), KPC(this));
         }
       } else {
         if (OB_TMP_FAIL(accesser->ss_add_prefetch_task(
-            url_, access_info_, offset_idx_, macro_id_))) {
-          LOG_WARN("fail to add preread task for external table", KR(ret), KPC(this));
+            url_, access_info_, offset_idx_, macro_id_, file_size_))) {
+          LOG_WARN("fail to add preread task for external table", KR(tmp_ret), KPC(this));
         }
       }
     } else { // SN mode

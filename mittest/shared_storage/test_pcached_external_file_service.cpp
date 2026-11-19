@@ -174,6 +174,10 @@ TEST_F(TestSSPCachedExternalFileService, test_prefetch_task_basic)
     ASSERT_NE(nullptr, task);
     ASSERT_EQ(TaskState::TASK_READ_IN_PROGRESS, task->info_.get_state());
     ASSERT_EQ(ObExternalDataPrefetchTaskInfo::READ_THEN_WRITE, task->info_.operation_type_);
+    LOG_INFO("check bounded full-macro prefetch", K(task->info_));
+    ASSERT_EQ(content_size, task->info_.file_size_);
+    ASSERT_EQ(2 * MB, task->info_.get_read_size());
+    ASSERT_EQ(2 * MB, task->info_.get_buf_size());
     while (0 < accesser->timer_task_scheduler_.ss_prefetch_timer_.pipeline_.async_read_list_.get_curr_total()
         && ObTimeUtility::current_time() < READ_TIME_LIMIT_US) {
       ob_usleep(10 * MS_US); // 10ms
@@ -232,6 +236,13 @@ TEST_F(TestSSPCachedExternalFileService, test_prefetch_task_basic)
 
       // finish prefetch task
       ASSERT_EQ(1, accesser->running_prefetch_tasks_map_.size());
+      OK(accesser->timer_task_scheduler_.ss_prefetch_timer_.pipeline_.async_read_list_
+          .head_unsafe(task));
+      ASSERT_NE(nullptr, task);
+      LOG_INFO("check bounded tail prefetch", K(task->info_));
+      ASSERT_EQ(content_size, task->info_.file_size_);
+      ASSERT_EQ(tail_block_size, task->info_.get_read_size());
+      ASSERT_EQ(2 * MB, task->info_.get_buf_size());
       OK(wait_prefetch_task_finish());
       LOG_INFO("finish read task", K(accesser->timer_task_scheduler_),
           K(external_read_info), K(external_file_info));
@@ -255,6 +266,120 @@ TEST_F(TestSSPCachedExternalFileService, test_prefetch_task_basic)
 
     OK(ObBackupIoAdapter::del_file(external_file_name, &info_base_));
   }
+}
+
+// ----------------------------------------------------------------------------
+// 文件尾预读正确裁剪；非法范围报错，恰好EOF跳过，均不留下去重占位。
+// 场景：两个完整宏块加7字节的对象，检查任务复制、负长度及EOF边界。
+// 操作：初始化任务、深拷贝、重置，再分别提交非法范围和恰好EOF的预读。
+// 校验：尾块请求7字节、buffer仍为宏块大小；返回码符合范围约定且不提交无效任务。
+// ----------------------------------------------------------------------------
+TEST_F(TestSSPCachedExternalFileService, test_prefetch_file_length_boundaries)
+{
+  LOG_INFO("========== test_prefetch_file_length_boundaries begin ==========");
+  if (enable_test_) {
+    ObPCachedExternalFileService *accesser = MTL(ObPCachedExternalFileService *);
+    ASSERT_NE(nullptr, accesser);
+    const int64_t macro_size = OB_STORAGE_OBJECT_MGR.get_macro_block_size();
+    const int64_t full_macro_count = 2;
+    const int64_t tail_size = 7;
+    const int64_t content_size = full_macro_count * macro_size + tail_size;
+    const int64_t tail_offset = full_macro_count * macro_size;
+    ObArenaAllocator allocator(ObMemAttr(MTL_ID(), "TestExtRange"));
+    char external_file_name[OB_MAX_URI_LENGTH] = { 0 };
+    char *write_buf = nullptr;
+
+    // 使用真实文件版本构造任务，但不提交它的GET，独立检查长度复制和重置。
+    OK(generate_external_file(allocator, content_size,
+        external_file_name, sizeof(external_file_name), write_buf));
+    char read_buf[1] = { 0 };
+    ObExternalAccessFileInfo file_info;
+    ObExternalReadInfo read_info;
+    OK(init_external_info(allocator, external_file_name, read_buf, sizeof(read_buf),
+        0/*offset*/, file_info, read_info));
+    ObPCachedExtMacroKey macro_key(
+        external_file_name, "", file_info.get_modify_time(), tail_offset);
+    MacroBlockId macro_id;
+    OK(accesser->path_map_.get_or_generate(macro_key, macro_id));
+    ObSSExternalDataPrefetchTaskInfo task_info;
+    ObSSExternalDataPrefetchTaskInfo copied_info;
+    OK(task_info.init(external_file_name, &info_base_, tail_offset, macro_id, content_size));
+    OK(copied_info.assign(task_info));
+    LOG_INFO("check copied prefetch range", K(task_info), K(copied_info));
+    ASSERT_EQ(tail_size, copied_info.get_read_size());
+    ASSERT_EQ(content_size, copied_info.file_size_);
+    ASSERT_EQ(macro_size, copied_info.get_buf_size());
+    ASSERT_NE(task_info.storage_info_, copied_info.storage_info_);
+    copied_info.reset();
+    ASSERT_EQ(-1, copied_info.file_size_);
+    ASSERT_FALSE(copied_info.is_valid());
+
+    // 负文件长度和超出EOF返回参数错误，不产生预读任务。
+    const int64_t running_count = accesser->running_prefetch_tasks_map_.size();
+    const int64_t beyond_eof_offset_idx = full_macro_count + 1;
+    LOG_INFO("check invalid prefetch ranges", K(content_size), K(beyond_eof_offset_idx));
+    ASSERT_EQ(OB_INVALID_ARGUMENT,
+        accesser->ss_add_prefetch_task(external_file_name, &info_base_, 0/*offset_idx*/,
+            macro_id, -1/*file_size*/));
+    ASSERT_EQ(OB_INVALID_ARGUMENT,
+        accesser->ss_add_prefetch_task(external_file_name, &info_base_, beyond_eof_offset_idx,
+            macro_id, content_size));
+
+    // 用整块对齐的长度构造恰好EOF，与上面超过EOF的场景分开验证。
+    LOG_INFO("check EOF prefetch ranges", K(full_macro_count), K(tail_offset));
+    OK(accesser->ss_add_prefetch_task(external_file_name, &info_base_, 0/*offset_idx*/,
+        macro_id, 0/*file_size*/));
+    OK(accesser->ss_add_prefetch_task(external_file_name, &info_base_, full_macro_count,
+        macro_id, tail_offset/*file_size*/));
+    LOG_INFO("check prefetch range cleanup", K(running_count), K(content_size));
+    ASSERT_EQ(running_count, accesser->running_prefetch_tasks_map_.size());
+    ASSERT_EQ(OB_INVALID_ARGUMENT,
+        copied_info.init(external_file_name, &info_base_, content_size/*read_offset*/,
+            macro_id, content_size));
+    OK(ObBackupIoAdapter::del_file(external_file_name, &info_base_));
+  }
+  LOG_INFO("========== test_prefetch_file_length_boundaries end ==========");
+}
+
+// ----------------------------------------------------------------------------
+// 过期文件长度导致预读短读时，只丢弃缓存填充，已经完成的前台读取仍返回正确数据。
+// 场景：真实对象比交给缓存服务的文件长度少1字节，当前查询只读取有效的首字节。
+// 操作：完成前台读取并推进预读pipeline，等待短读任务回收。
+// 校验：前台数据正确、去重记录清空，异常预读没有把不完整对象写入宏块缓存。
+// ----------------------------------------------------------------------------
+TEST_F(TestSSPCachedExternalFileService, test_prefetch_short_read_does_not_fill_cache)
+{
+  LOG_INFO("========== test_prefetch_short_read_does_not_fill_cache begin ==========");
+  if (enable_test_) {
+    ObPCachedExternalFileService *accesser = MTL(ObPCachedExternalFileService *);
+    ASSERT_NE(nullptr, accesser);
+    const int64_t content_size = 7;
+    ObArenaAllocator allocator(ObMemAttr(MTL_ID(), "TestExtShort"));
+    char external_file_name[OB_MAX_URI_LENGTH] = { 0 };
+    char *write_buf = nullptr;
+    OK(generate_external_file(allocator, content_size,
+        external_file_name, sizeof(external_file_name), write_buf));
+    char read_buf[1] = { 0 };
+    ObExternalAccessFileInfo file_info;
+    ObExternalReadInfo read_info;
+    OK(init_external_info(allocator, external_file_name, read_buf, sizeof(read_buf),
+        0/*offset*/, file_info, read_info));
+
+    // 模拟取得元数据后文件被截短，前台需要的范围仍然有效。
+    file_info.file_size_ = content_size + 1;
+    LOG_INFO("read valid foreground range with stale file length", K(file_info), K(read_info));
+    OK(read_and_check(file_info, read_info, write_buf, sizeof(read_buf)));
+    OK(wait_prefetch_task_finish());
+    ObPCachedExtMacroKey macro_key(
+        external_file_name, "", file_info.get_modify_time(), 0/*offset*/);
+    MacroBlockId macro_id;
+    OK(accesser->path_map_.get(macro_key, macro_id));
+    LOG_INFO("verify short prefetch was discarded", K(macro_id), K(file_info));
+    ASSERT_EQ(0, accesser->running_prefetch_tasks_map_.size());
+    OK(check_macro_cache_hit_status(macro_id, false/*expect_hit_status*/));
+    OK(ObBackupIoAdapter::del_file(external_file_name, &info_base_));
+  }
+  LOG_INFO("========== test_prefetch_short_read_does_not_fill_cache end ==========");
 }
 
 TEST_F(TestSSPCachedExternalFileService, test_read_complete_macro)

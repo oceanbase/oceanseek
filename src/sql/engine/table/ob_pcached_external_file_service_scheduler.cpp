@@ -64,7 +64,7 @@ int ext_async_read_from_object_storage(
         K(url), KPC(info), KP(read_buf), K(read_offset), K(read_size));
   } else if (OB_FAIL(ObExternalIoAdapter::open_with_access_type(
       device_handle, fd, info, url,
-      ObStorageAccessType::OB_STORAGE_ACCESS_READER,
+      ObStorageAccessType::OB_STORAGE_ACCESS_NOHEAD_READER,
       ObStorageIdMod::get_default_external_id_mod()))) {
     LOG_WARN("fail to open fd for read", KR(ret),
         K(url), KPC(info), KP(read_buf), K(read_offset), K(read_size));
@@ -138,6 +138,7 @@ ObExternalDataPrefetchTaskInfo::ObExternalDataPrefetchTaskInfo()
       macro_id_(),
       storage_info_(nullptr),
       read_offset_(-1),
+      file_size_(-1),
       data_(nullptr)
 {
   ObMemAttr attr(MTL_ID(), "ExtPrefetchTask");
@@ -169,6 +170,7 @@ int ObExternalDataPrefetchTaskInfo::assign(const ObExternalDataPrefetchTaskInfo 
       } else {
         MEMCPY(url_, other.url_, sizeof(url_));
         read_offset_ = other.read_offset_;
+        file_size_ = other.file_size_;
       }
     } else if (PrefetchOperationType::DIRECT_WRITE == operation_type_) {
       if (OB_ISNULL(data_ = static_cast<char *>(allocator_.alloc(other.buf_size_)))) {
@@ -192,6 +194,7 @@ void ObExternalDataPrefetchTaskInfo::reset()
   }
   url_[0] = '\0';
   read_offset_ = -1;
+  file_size_ = -1;
   macro_id_.reset();
   operation_type_ = PrefetchOperationType::MAX_TYPE;
   allocator_.reset();
@@ -207,6 +210,7 @@ bool ObExternalDataPrefetchTaskInfo::is_valid() const
     bret &= (url_[0] != '\0'
       && OB_NOT_NULL(storage_info_) && storage_info_->is_valid()
       && read_offset_ >= 0
+      && read_offset_ < file_size_
       && TaskInfoWithRWHandle::is_valid());
   } else if (PrefetchOperationType::DIRECT_WRITE == operation_type_) {
     bret &= (OB_NOT_NULL(data_) && ObStorageIOPipelineTaskInfo::is_valid());
@@ -220,7 +224,14 @@ bool ObExternalDataPrefetchTaskInfo::is_valid() const
   return bret;
 }
 
-// internal func, skips validation check
+// Returns the request size for a valid read task; legacy tasks retain macro-sized reads.
+int64_t ObExternalDataPrefetchTaskInfo::get_read_size() const
+{
+  return ((file_size_ > 0) ? MIN(buf_size_, file_size_ - read_offset_) : buf_size_);
+}
+
+// Refreshes prefetch completion. A bounded NOHEAD read must return the whole clipped range
+// before it is allowed to enter the cache-write stage; unexpected short reads are discarded.
 int ObExternalDataPrefetchTaskInfo::refresh_read_state_()
 {
   int ret = OB_SUCCESS;
@@ -228,8 +239,15 @@ int ObExternalDataPrefetchTaskInfo::refresh_read_state_()
     if (PrefetchOperationType::DIRECT_WRITE == operation_type_) {
       state_ = TASK_READ_DONE;
     } else {
+      const int64_t read_size = get_read_size();
       if (OB_FAIL(TaskInfoWithRWHandle::refresh_read_state_())) {
         LOG_WARN("fail to refresh read state", KR(ret), KPC(this));
+      } else if (OB_UNLIKELY(TASK_READ_DONE == state_ && file_size_ > 0
+          && read_handle_.get_data_size() != read_size)) {
+        ret = OB_OBJECT_STORAGE_IO_ERROR;
+        LOG_WARN("fail to validate external prefetch read size", KR(ret),
+            K(read_offset_), K(read_size), K(file_size_),
+            "actual_size", read_handle_.get_data_size());
       }
     }
   }
@@ -240,7 +258,8 @@ int ObExternalDataPrefetchTaskInfo::init(
     const common::ObString &url,
     const common::ObObjectStorageInfo *info,
     const int64_t read_offset,
-    const blocksstable::MacroBlockId &macro_id)
+    const blocksstable::MacroBlockId &macro_id,
+    const int64_t file_size)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(is_valid())) {
@@ -250,6 +269,10 @@ int ObExternalDataPrefetchTaskInfo::init(
       || OB_UNLIKELY(url.empty() || read_offset < 0 || !macro_id.is_valid() || !info->is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", KR(ret), K(url), KPC(info), K(read_offset), K(macro_id));
+  } else if (OB_UNLIKELY(read_offset >= file_size)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid external prefetch file range", KR(ret),
+        K(read_offset), K(file_size), K(macro_id));
   } else if (OB_FAIL(set_macro_block_id(write_handle_, macro_id))) {
     LOG_WARN("fail to set macro id", KR(ret), K(url), KPC(info), K(read_offset), K(macro_id));
   } else if (OB_FAIL(databuff_printf(url_, sizeof(url_), "%.*s", url.length(), url.ptr()))) {
@@ -259,6 +282,7 @@ int ObExternalDataPrefetchTaskInfo::init(
         K(url), KPC(info), K(read_offset), K(macro_id));
   } else {
     read_offset_ = read_offset;
+    file_size_ = file_size;
     macro_id_ = macro_id;
     operation_type_ = PrefetchOperationType::READ_THEN_WRITE;
 
@@ -509,7 +533,7 @@ int ObExternalDataPrefetchPipeline<TaskInfoType_>::do_async_read_(TaskType &task
       task.info_.storage_info_,
       task.buf_,
       task.info_.read_offset_,
-      task.info_.get_buf_size(),
+      task.info_.get_read_size(),
       task.info_.read_handle_.get_io_handle()))) {
     LOG_WARN("fail to async read from object storage", KR(ret), K(task));
   }

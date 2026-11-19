@@ -583,7 +583,8 @@ public:
       const common::ObString &url,
       const common::ObObjectStorageInfo *access_info,
       const int64_t offset_idx,
-      const blocksstable::MacroBlockId &macro_id);
+      const blocksstable::MacroBlockId &macro_id,
+      const int64_t file_size);
   int ss_add_prefetch_task(
       const char *data,
       const int64_t data_size,
@@ -655,6 +656,7 @@ private:
   int async_read_object_manager_(
       const common::ObString &url,
       const common::ObObjectStorageInfo *access_info,
+      const int64_t file_size,
       const ObExternalReadInfo &external_read_info,
       const blocksstable::MacroBlockId &macro_id,
       blocksstable::ObStorageObjectHandle &io_handle) const;
@@ -716,7 +718,8 @@ public:
       const int64_t offset_idx,
       const common::ObString &url,
       const common::ObObjectStorageInfo *access_info,
-      const blocksstable::MacroBlockId &macro_id);
+      const blocksstable::MacroBlockId &macro_id,
+      const int64_t file_size);
   int init(
       common::ObIAllocator *allocator,
       common::ObIOCallback *original_callback,
@@ -757,7 +760,7 @@ public:
 
   VIRTUAL_TO_STRING_KV(K(is_inited_), KP(allocator_), KPC(ori_callback_),
       KP(user_data_buf_), K(offset_idx_), K(url_), KPC(access_info_),
-      K(macro_id_), K(content_digest_), K(modify_time_));
+      K(macro_id_), K(content_digest_), K(modify_time_), K(file_size_));
 
 private:
   // During initialization, ObExternalRemoteIOCallback clones the provided URL and access info.
@@ -779,6 +782,7 @@ private:
   common::ObString url_;
   common::ObObjectStorageInfo *access_info_;
   blocksstable::MacroBlockId macro_id_; // for SS mode
+  int64_t file_size_; // External file size used to bound SS prefetch read range
   common::ObSmallString<64> content_digest_; // for SN mode
   int64_t modify_time_; // for SN mode
 };

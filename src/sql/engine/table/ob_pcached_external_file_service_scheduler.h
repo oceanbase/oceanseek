@@ -36,12 +36,14 @@ public:
   int assign(const ObExternalDataPrefetchTaskInfo &other);
   virtual void reset() override;
   virtual bool is_valid() const override;
+  int64_t get_read_size() const;
 
   int init(
       const common::ObString &url,
       const common::ObObjectStorageInfo *info,
       const int64_t read_offset,
-      const blocksstable::MacroBlockId &macro_id);
+      const blocksstable::MacroBlockId &macro_id,
+      const int64_t file_size = -1);
   int init(
       const char *data,
       const int64_t data_size,
@@ -49,7 +51,8 @@ public:
   virtual uint64_t hash() const = 0;
 
   INHERIT_TO_STRING_KV("TaskInfoWithRWHandle", storage::TaskInfoWithRWHandle,
-      K(url_), KPC(storage_info_), K(read_offset_), K(macro_id_), K(operation_type_));
+      K(url_), KPC(storage_info_), K(read_offset_), K(file_size_),
+      K(macro_id_), K(operation_type_));
 
 protected:
   virtual int refresh_read_state_() override;
@@ -63,6 +66,7 @@ public:
   char url_[common::OB_MAX_URI_LENGTH];
   common::ObObjectStorageInfo *storage_info_;
   int64_t read_offset_;
+  int64_t file_size_; // Positive for bounded NOHEAD reads; -1 retains legacy reader behavior.
   
   // for DIRECT_WRITE
   // data size must be equal to macro block size

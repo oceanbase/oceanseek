@@ -165,7 +165,8 @@ public:
     : macro_block_id_(), offset_(), size_(), io_timeout_ms_(GCONF._data_storage_io_timeout / 1000L), io_desc_(),
       result_format_(common::ObObjectReadResultFormat::DEFAULT),
       io_callback_(NULL), buf_(NULL), mtl_tenant_id_(OB_INVALID_TENANT_ID), local_cache_read_info_(),
-      server_id_(GCONF.observer_id), path_(), access_info_(nullptr), io_metrics_(nullptr), etag_()
+      server_id_(GCONF.observer_id), path_(), access_info_(nullptr), io_metrics_(nullptr), etag_(),
+      external_file_size_(-1)
   {}
   ~ObStorageObjectReadInfo() = default;
   OB_INLINE bool is_valid() const
@@ -222,7 +223,8 @@ public:
   }
   TO_STRING_KV(K_(macro_block_id), K_(offset), K_(size), K_(io_timeout_ms), K_(io_desc),
                K_(result_format), KP_(io_callback), KP_(buf), K_(mtl_tenant_id), K_(local_cache_read_info),
-               K_(server_id), K(path_), KPC(access_info_), KPC(io_metrics_));
+               K_(server_id), K(path_), KPC(access_info_), KPC(io_metrics_),
+               K(external_file_size_));
 public:
   blocksstable::MacroBlockId macro_block_id_;
   int64_t offset_;
@@ -239,6 +241,8 @@ public:
   const ObObjectStorageInfo *access_info_;
   sql::ObLakeTableIOMetrics *io_metrics_;
   common::ObString etag_;
+  // Optional external-table length from the same file metadata as this read; -1 means unknown.
+  int64_t external_file_size_;
 };
 
 } // namespace blocksstable

@@ -1187,8 +1187,13 @@ int ObBackupIoAdapter::get_file_size(ObIODevice *device_handle, const ObIOFd &fd
     OB_LOG(WARN, "fail to get ctx accroding fd!", K(ret));
   } else {
     if (OB_STORAGE_ACCESS_READER == op_type) {
-      ObStorageReader *reader = static_cast<ObStorageReader*>(ctx);
-      file_length = reader->get_length();
+      if (fd.is_object_storage_async_io_) {
+        ObStorageAsyncReader *reader = static_cast<ObStorageAsyncReader *>(ctx);
+        file_length = reader->get_length();
+      } else {
+        ObStorageReader *reader = static_cast<ObStorageReader *>(ctx);
+        file_length = reader->get_length();
+      }
     } else if (OB_STORAGE_ACCESS_ADAPTIVE_READER == op_type) {
       ObStorageAdaptiveReader *adaptive_reader = static_cast<ObStorageAdaptiveReader*>(ctx);
       file_length = adaptive_reader->get_length();
