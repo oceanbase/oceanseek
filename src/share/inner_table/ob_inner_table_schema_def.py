@@ -19361,6 +19361,11 @@ def_table_schema(**gen_iterate_virtual_table_def(
 # 12637: __all_virtual_local_log_stat
 # 12638: __all_virtual_local_log_pool_stat
 # 12639: __all_virtual_local_log_active_item
+# 12640: __all_virtual_fts_dictionary
+# 12641: __all_virtual_fts_dictionary_word
+# 12642: __all_virtual_fts_dictionary_reference
+# 14983: __idx_12641_all_virtual_fts_dictionary_word_i1
+# 14984: __idx_12642_all_virtual_fts_dictionary_reference_i1
 
 # 余留位置（此行之前占位）
 # 本区域占位建议：采用真实表名进行占位
@@ -49262,6 +49267,9 @@ def_table_schema(
   """.replace("\n", " "),
 )
 
+# 21755: ALL_OB_FTS_DICTIONARY
+# 21756: ALL_OB_FTS_DICTIONARY_WORD
+# 21757: ALL_OB_FTS_DICTIONARY_REFERENCE
 # 余留位置（此行之前占位）
 # 本区域占位建议：采用真实视图名进行占位
 ################################################################################
