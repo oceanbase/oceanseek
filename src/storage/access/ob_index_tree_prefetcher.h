@@ -614,6 +614,16 @@ public:
     return ObStoreRowIterator::IteratorType::IteratorMultiRowLockCheck == iter_type_;
   }
   int refresh_blockscan_checker(const int64_t start_micro_idx, const blocksstable::ObDatumRowkey &rowkey);
+  OB_INLINE void reset_blockscan_border()
+  {
+    // Forward advance can overwrite the row buffer borrowed from another iterator.
+    // MIN prevents new blockscan decisions from using that stale boundary. Previously
+    // established blockscan flags remain valid because the merge boundary only advances.
+    // Preserve static sentinels, including MAX used by single-source pause/resume.
+    if (!border_rowkey_.is_static_rowkey()) {
+      border_rowkey_.set_min_rowkey();
+    }
+  }
   int check_blockscan(bool &can_blockscan);
   int check_row_lock(
       const blocksstable::ObMicroIndexInfo &index_info,

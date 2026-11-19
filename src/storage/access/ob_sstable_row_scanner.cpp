@@ -116,6 +116,9 @@ int ObSSTableRowScanner<PrefetchType>::advance_scan(const blocksstable::ObDatumR
   } else if (OB_FAIL(skip_scanner_->advance_scan(range))) {
     STORAGE_LOG(WARN, "Failed to advance scan", K(ret));
   }
+  if (OB_SUCC(ret)) {
+    prefetcher_.reset_blockscan_border();
+  }
   return ret;
 }
 
