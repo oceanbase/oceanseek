@@ -623,17 +623,17 @@ int ObDASMatchRtDef::generate_op_impl(
           K(query_tokens_.count()), K(token_counts_.count()));
     }
 
-    // With OR semantics (minimum_should_match <= 1), duplicate query tokens match
-    // the same documents and token scoring is linear in boost, so duplicates can
-    // be folded into one token op with a count-weighted boost. AND and msm > 1
-    // keep per-occurrence token ops to preserve clause-count semantics.
+    // With AND, or with OR and minimum_should_match <= 1, duplicate query tokens
+    // match the same documents and token scoring is linear in boost, so duplicates
+    // can be folded into one token op with a count-weighted boost. OR with msm > 1
+    // keeps per-occurrence token ops to preserve clause-count semantics.
     int64_t match_operator = ObMatchOperator::MATCH_OPERATOR_OR;
     int64_t minimum_should_match = 0;
     bool fold_duplicate_tokens = false;
     if (OB_SUCC(ret)) {
       match_operator = match_operator_datum->get_int();
       if (ObMatchOperator::MATCH_OPERATOR_AND == match_operator) {
-        // the conjunction path keeps per-occurrence token ops
+        fold_duplicate_tokens = true;
       } else if (OB_FAIL(ObDASMSMRuntimeUtil::calc_match_msm(
                      allocator_, total_token_cnt_, get_ctdef()->is_msm_unresolved_expr_,
                      minimum_should_match_datum, minimum_should_match))) {

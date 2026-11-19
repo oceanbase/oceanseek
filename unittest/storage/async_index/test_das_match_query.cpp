@@ -5,6 +5,7 @@
 #define USING_LOG_PREFIX SQL_DAS
 
 #include <gtest/gtest.h>
+#include <string>
 #include <type_traits>
 #define private public
 #define protected public
@@ -21,6 +22,7 @@
 #include "sql/engine/expr/ob_expr.h"
 #include "sql/das/search/ob_das_bmm_op.h"
 #include "sql/das/search/ob_das_conjunction_op.h"
+#include "sql/das/search/ob_das_async_token_op.h"
 #include "sql/das/search/ob_das_disjunction_op.h"
 #include "sql/das/search/ob_das_dummy_op.h"
 #include "sql/das/search/ob_das_async_index_query_ctx.h"
@@ -1865,6 +1867,69 @@ TEST_F(ObDASMatchQueryTest, test_generate_async_bmm_prepares_cold_token_costs)
     EXPECT_NE(-1, expected_cost);
     EXPECT_TRUE(match_rtdef_.token_costs_.at(i).is_valid());
     EXPECT_EQ(expected_cost, match_rtdef_.token_costs_.at(i).cost());
+  }
+}
+
+TEST_F(ObDASMatchQueryTest, test_generate_async_match_folds_duplicate_tokens)
+{
+  static const uint64_t INDEX_TABLE_ID = 9001;
+  ir_scan_ctdef_.is_async_index_ = true;
+  inv_idx_scan_ctdef_.is_async_index_ = true;
+  inv_idx_scan_ctdef_.ref_table_id_ = INDEX_TABLE_ID;
+  inv_idx_scan_ctdef_.table_param_.set_is_partition_table(false);
+  match_ctdef_.set_is_scoring(true);
+  set_boost(0.5);
+
+  const struct {
+    int64_t match_operator;
+    int64_t msm;
+    int64_t beta_count;
+    int64_t expected_children;
+  } cases[] = {
+    {ObMatchOperator::MATCH_OPERATOR_AND, 1, 2048, 2},
+    {ObMatchOperator::MATCH_OPERATOR_OR, 1, 3, 2},
+    {ObMatchOperator::MATCH_OPERATOR_OR, 2, 3, 4},
+  };
+  for (const auto &test_case : cases) {
+    SCOPED_TRACE(test_case.match_operator);
+    SCOPED_TRACE(test_case.msm);
+    std::string query = "alpha";
+    for (int64_t i = 0; i < test_case.beta_count; ++i) {
+      query += " beta";
+    }
+    set_query_text(query.c_str());
+    set_match_operator(test_case.match_operator);
+    set_minimum_should_match(test_case.msm);
+    match_rtdef_.reset_cached_runtime_state();
+    SearchCtxSetup ctx_setup(allocator_);
+    ObDASAsyncIndexQueryCtx catalog;
+    build_single_segment_catalog(catalog, ctx_setup.search_ctx_, INDEX_TABLE_ID);
+
+    ObIDASSearchOp *op = nullptr;
+    ASSERT_EQ(OB_SUCCESS,
+        match_rtdef_.generate_op(ObDASSearchCost(0), ctx_setup.search_ctx_, op));
+    ASSERT_NE(nullptr, op);
+    EXPECT_EQ(ObMatchOperator::MATCH_OPERATOR_AND == test_case.match_operator
+        ? DAS_SEARCH_OP_CONJUNCTION : DAS_SEARCH_OP_DISJUNCTION, op->get_op_type());
+    ASSERT_EQ(test_case.expected_children, op->children_cnt_);
+    int64_t alpha_count = 0;
+    int64_t beta_count = 0;
+    double beta_boost = 0.0;
+    for (int64_t i = 0; i < op->children_cnt_; ++i) {
+      ASSERT_EQ(DAS_SEARCH_OP_ASYNC_TOKEN, op->children_[i]->get_op_type());
+      const auto *token_op = static_cast<const ObDASAsyncTokenOp *>(op->children_[i]);
+      if (token_op->query_token_ == ObString::make_string("alpha")) {
+        ++alpha_count;
+        EXPECT_DOUBLE_EQ(0.5, token_op->token_boost_);
+      } else {
+        ASSERT_EQ(ObString::make_string("beta"), token_op->query_token_);
+        ++beta_count;
+        beta_boost += token_op->token_boost_;
+      }
+    }
+    EXPECT_EQ(1, alpha_count);
+    EXPECT_EQ(test_case.expected_children - 1, beta_count);
+    EXPECT_DOUBLE_EQ(0.5 * test_case.beta_count, beta_boost);
   }
 }
 

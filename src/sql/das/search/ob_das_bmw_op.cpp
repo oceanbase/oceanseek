@@ -239,7 +239,14 @@ int ObDASBMWOp::inner_get_next_row_plain(ObDASRowID &next_id, double &score)
   int ret = OB_SUCCESS;
   int64_t dim_cnt = 0;
   bool found_row = false;
+  static constexpr int64_t CHECK_STATUS_INTERVAL = 1024;
+  int64_t check_status_cnt = 0;
   while (OB_SUCC(ret) && !found_row) {
+    if (0 == ++check_status_cnt % CHECK_STATUS_INTERVAL
+        && OB_FAIL(THIS_WORKER.check_status())) {
+      LOG_WARN("failed to check worker status during bmw search", K(ret));
+      continue;
+    }
     if (OB_FAIL(row_merger_->rebuild_with_next())) {
       if (OB_UNLIKELY(OB_ITER_END != ret)) {
         LOG_WARN("failed to rebuild with next", K(ret));
