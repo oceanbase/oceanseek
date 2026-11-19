@@ -363,8 +363,10 @@ public:
       scn_(),
       overlay_active_(false),
       overlay_snapshotted_(false),
-      overlay_covers_meta_(false) {};
+      overlay_covers_meta_(false),
+      bq_hgraph_result_count_(0) {};
   ~ObVectorQueryAdaptorResultContext();
+  int64_t get_bq_hgraph_result_count() const { return bq_hgraph_result_count_; }
   int init_bitmaps();
   int init_prefilter(const int64_t &min, const int64_t &max);
   int init_prefilter(void *adaptor, double selectivity, const ObIArray<const ObNewRange *> &range,
@@ -466,6 +468,10 @@ private:
   bool overlay_active_;
   bool overlay_snapshotted_;
   bool overlay_covers_meta_;
+  // 每轮候选按 [非 BQ 候选][BQ 候选] 排列；
+  // 该值表示过滤前非 BQ 部分的长度，也是 BQ 部分的起始位置，不是过滤后的命中数。
+  // 未分组的结果也使用零值，不能仅凭零值判断运行时索引类型。
+  int64_t bq_hgraph_result_count_;
 };
 
 // Base class for vector query conditions (shared by HNSW and IVF)

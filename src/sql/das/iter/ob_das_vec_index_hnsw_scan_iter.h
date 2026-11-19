@@ -282,13 +282,13 @@ private:
   int merge_and_sort_brute_force_results_bq(const ObVecIdxQueryResult& dist_result,
                                             int64_t* brute_vids,
                                             int64_t brute_cnt,
-                                            ObSimpleMaxHeap& snap_heap,
-                                            ObSimpleMaxHeap& incr_heap,
+                                            ObSimpleMaxHeap& bq_heap,
+                                            ObSimpleMaxHeap& hgraph_heap,
                                             bool& need_complete_data,
                                             bool check_need_complete_data);
   int build_brute_force_result_iterator_bq(ObPluginVectorIndexAdaptor* adaptor,
-                                          const ObSimpleMaxHeap& snap_heap,
-                                          const ObSimpleMaxHeap& incr_heap,
+                                          const ObSimpleMaxHeap& bq_heap,
+                                          const ObSimpleMaxHeap& hgraph_heap,
                                           ObVecIdxQueryResult &dist_result,
                                           ObVectorQueryVidIterator*& result_iter);
   int sort_adaptor_vid_iter_by_distance();

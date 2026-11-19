@@ -458,89 +458,22 @@ int ObVectorVerifyRowIterator::add_row(
   return ret;
 }
 
-int ObPluginVectorIndexHelper::driect_merge_delta_and_snap_vids(
-                                                                       const uint64_t tenant_id,
-                                                                       const ObVsagQueryResultArray &results, 
-                                                                       int64_t &actual_cnt,
-                                                                       int64_t *&vids_result,
-                                                                       float *&float_result,
-                                                                       ObVecExtraInfoPtr &extra_info_result)
-{
-  INIT_SUCC(ret);
-  actual_cnt = 0;
-  int64_t res_num = 0;
-  if (results.count() <= 0) {
-    LOG_INFO("emptry result array", K(actual_cnt), K(results.count()));
-  } else if (results.count() == 1) {
-    const ObVsagQueryResult &first = *results.at(0);
-    while (res_num < first.total_ && OB_SUCC(ret)) {
-      if (!extra_info_result.is_null()) {
-        if (OB_FAIL(extra_info_result.set_with_copy(res_num, first.extra_info_ptr_[res_num], first.extra_info_ptr_.extra_info_actual_size_))) {
-          LOG_WARN("set extra info failed", K(ret), K(first.extra_info_ptr_), K(res_num));
-        }
-      }
-      vids_result[res_num] = first.vids_[res_num];
-      float_result[res_num] = first.distances_[res_num];
-      res_num++;
-    }
-    actual_cnt = res_num;
-  } else {
-    const int64_t hashset_size = 32;
-    ObVectorMergeVidSet vid_hash_set;
-    const common::ObMemAttr bucket_attr(tenant_id, "VecMergeBkt");
-    const common::ObMemAttr node_attr(tenant_id, "VecMergeNode");
-    if (OB_FAIL(vid_hash_set.create(hashset_size, bucket_attr, node_attr))) {
-      LOG_WARN("fail to create vid hashset id set failed", KR(ret), K(hashset_size));
-    } else {
-      for (int64_t i = 0; OB_SUCC(ret) && i < results.count(); ++i) {
-        const ObVsagQueryResult &result = *results.at(i);
-        for (int64_t j = 0; OB_SUCC(ret) && j < result.total_; ++j) {
-          const int64_t vid = result.vids_[j];
-          if (OB_FAIL(vid_hash_set.set_refactored(vid, 0/* flag=0, not overwrite*/))) {
-            if (OB_HASH_EXIST == ret) {
-              ret = OB_SUCCESS;
-              LOG_TRACE("vid exist", K(vid), K(i), K(j));
-            } else {
-              LOG_WARN("fail to set vid to hashset", K(vid));
-            }
-          } else {
-            if (!extra_info_result.is_null()) {
-              if (OB_FAIL(extra_info_result.set_with_copy(res_num, result.extra_info_ptr_[j], result.extra_info_ptr_.extra_info_actual_size_))) {
-                LOG_WARN("set extra info failed", K(ret), K(vid), K(i), K(j), K(res_num));
-              }
-            }
-            if (OB_SUCC(ret)) {
-              float_result[res_num] = result.distances_[j];
-              vids_result[res_num++] = vid;
-            }
-          }
-        }
-      }
-    }
-
-    if (OB_SUCC(ret)) {
-      actual_cnt = res_num;
-    }
-  }
-  
-  return ret;
-}
-
-int ObPluginVectorIndexHelper::sort_merge_delta_and_snap_vids(
+static int sort_merge_delta_and_snap_vids_impl(
                                                          const uint64_t tenant_id,
                                                          ObVsagQueryResultArray& results,
                                                          const int64_t total, 
                                                          int64_t &actual_cnt,
                                                          int64_t *&vids_result,
                                                          float *&float_result,
-                                                         ObVecExtraInfoPtr &extra_info_result)
+                                                         ObVecExtraInfoPtr &extra_info_result,
+                                                         ObVectorMergeVidSet *shared_vids)
 {
   INIT_SUCC(ret);
   actual_cnt = 0;
   int64_t res_num = 0;
-  if (results.count() <= 0) {
+  if (results.count() <= 0 || (nullptr != shared_vids && total <= 0)) {
     LOG_INFO("emptry result array", K(total), K(results.count()));
-  } else if (results.count() == 1) {
+  } else if (results.count() == 1 && nullptr == shared_vids) {
     const ObVsagQueryResult &first = *results.at(0);
     while (res_num < total && res_num < first.total_ && OB_SUCC(ret)) {
       if (!extra_info_result.is_null()) {
@@ -558,7 +491,8 @@ int ObPluginVectorIndexHelper::sort_merge_delta_and_snap_vids(
     ObVectorMergeVidSet vid_hash_set;
     const common::ObMemAttr bucket_attr(tenant_id, "VecMergeBkt");
     const common::ObMemAttr node_attr(tenant_id, "VecMergeNode");
-    if (OB_FAIL(vid_hash_set.create(hashset_size, bucket_attr, node_attr))) {
+    auto &seen = nullptr == shared_vids ? vid_hash_set : *shared_vids;
+    if (nullptr == shared_vids && OB_FAIL(vid_hash_set.create(hashset_size, bucket_attr, node_attr))) {
       LOG_WARN("fail to create vid hashset id set failed", KR(ret), K(hashset_size));
     } else {
       int64_t min_dist_idx = -1;
@@ -578,7 +512,7 @@ int ObPluginVectorIndexHelper::sort_merge_delta_and_snap_vids(
         if (OB_SUCC(ret) && min_dist_idx >= 0) {
           ObVsagQueryResult &result = *results.at(min_dist_idx);
           const int64_t vid = result.vids_[result.idx_];
-          if (OB_FAIL(vid_hash_set.set_refactored(vid, 0/* flag=0, not overwrite*/))) {
+          if (OB_FAIL(seen.set_refactored(vid, 0/* flag=0, not overwrite*/))) {
             if (OB_HASH_EXIST == ret) {
               ret = OB_SUCCESS;
               LOG_TRACE("vid exist", K(vid), K(min_dist_idx), K(min_dist), K(result.idx_));
@@ -607,6 +541,67 @@ int ObPluginVectorIndexHelper::sort_merge_delta_and_snap_vids(
     }
   }
 
+  return ret;
+}
+
+int ObPluginVectorIndexHelper::sort_merge_delta_and_snap_vids(
+    const uint64_t tenant_id, ObVsagQueryResultArray &results, const int64_t total,
+    int64_t &actual_cnt, int64_t *&vids, float *&distances, ObVecExtraInfoPtr &extra_info)
+{
+  return sort_merge_delta_and_snap_vids_impl(
+      tenant_id, results, total, actual_cnt, vids, distances, extra_info, nullptr);
+}
+
+int ObPluginVectorIndexHelper::sort_merge_hnsw_bq_groups(
+    const uint64_t tenant_id, ObVsagQueryResultArray &results, const int64_t total, int64_t &actual_cnt,
+    int64_t *&vids, float *&distances, ObVecExtraInfoPtr &extra_info,
+    int64_t &bq_hgraph_result_count)
+{
+  int ret = OB_SUCCESS;
+  ObVsagQueryResultArray hgraph, bq;
+  ObVectorMergeVidSet seen;
+  ObVectorMergeVidSet *dedup_set = results.count() > 1 ? &seen : nullptr;
+  const common::ObMemAttr bucket_attr(tenant_id, "VecMergeBkt");
+  const common::ObMemAttr node_attr(tenant_id, "VecMergeNode");
+  bq_hgraph_result_count = actual_cnt = 0;
+  for (int64_t i = 0; OB_SUCC(ret) && i < results.count(); ++i) {
+    ObVsagQueryResult *result = results.at(i);
+    result->idx_ = 0;
+    if (result->index_type_ == VIAT_HNSW_BQ) {
+      ret = bq.push_back(result);
+    } else {
+      ret = hgraph.push_back(result);
+    }
+  }
+  if (OB_FAIL(ret)) {
+    LOG_WARN("invalid BQ result group", K(ret));
+  } else if (nullptr != dedup_set && OB_FAIL(seen.create(32, bucket_attr, node_attr))) {
+    LOG_WARN("create group vid set failed", K(ret));
+  } else if (hgraph.count() > 0) { // sort hgraph results
+    if (OB_FAIL(sort_merge_delta_and_snap_vids_impl(
+            tenant_id, hgraph, total, bq_hgraph_result_count, vids, distances,
+            extra_info, dedup_set))) {
+      LOG_WARN("merge HGRAPH results failed", K(ret));
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (bq.count() > 0) { // sort bq results
+    int64_t *bq_vids = nullptr == vids ? nullptr : vids + bq_hgraph_result_count;
+    float *bq_distances = nullptr == distances ? nullptr : distances + bq_hgraph_result_count;
+    ObVecExtraInfoPtr bq_extra = extra_info;
+    if (!bq_extra.is_null()) {
+      bq_extra.buf_ += bq_hgraph_result_count;
+      bq_extra.count_ -= bq_hgraph_result_count;
+    }
+    if (OB_FAIL(sort_merge_delta_and_snap_vids_impl(
+        tenant_id, bq, total - bq_hgraph_result_count, actual_cnt, bq_vids, bq_distances, bq_extra, dedup_set))) {
+      LOG_WARN("merge BQ results failed", K(ret));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    actual_cnt += bq_hgraph_result_count;
+  }
   return ret;
 }
 

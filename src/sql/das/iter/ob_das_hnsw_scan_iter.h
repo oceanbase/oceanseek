@@ -311,7 +311,8 @@ public:
       profile_(nullptr),
       profile_try_path_(ObVecIdxAdaTryPath::VEC_PATH_UNCHOSEN),
       profile_current_path_(ObVecIdxAdaTryPath::VEC_PATH_UNCHOSEN),
-      profile_switch_reason_(ObVecIdxPathSwitchReason::VEC_PATH_NO_SWITCH) {
+      profile_switch_reason_(ObVecIdxPathSwitchReason::VEC_PATH_NO_SWITCH),
+      non_bq_vid_iter_(nullptr) {
         extra_in_rowkey_idxs_.set_attr(ObMemAttr(MTL_ID(), "ExtraIdx"));
       }
   
@@ -405,11 +406,17 @@ private:
   int filter_func_lookup_iter(bool is_vectorized, bool& filter_res);
   int filter_by_index_back(int64_t vid, ObNewRow *row, bool is_vectorized, bool& filter_res);
   int do_table_post_filter(bool is_vectorized);
+  int post_query_bq_vid_with_filter(ObVectorQueryAdaptorResultContext *ada_ctx,
+                                  ObPluginVectorIndexAdaptor *adaptor,
+                                  int64_t hnsw_max_iter_scan_nums,
+                                  int64_t &iter_scan_total_num,
+                                  bool is_vectorized);
+  int concat_bq_post_filter_results();
   int post_query_vid_with_filter(ObVectorQueryAdaptorResultContext *ada_ctx,
                                 ObPluginVectorIndexAdaptor* adaptor, 
                                 int64_t hnsw_max_iter_scan_nums,
                                 int64_t& iter_scan_total_num, 
-                                bool is_vectorized);
+                                bool is_vectorized, bool is_bq_hgraph_group = false);
   int process_adaptor_state_post_filter(ObVectorQueryAdaptorResultContext *ada_ctx, ObPluginVectorIndexAdaptor* adaptor, bool is_vectorized);
   int process_adaptor_state_post_filter_once(ObVectorQueryAdaptorResultContext *ada_ctx, ObPluginVectorIndexAdaptor* adaptor);
   int get_single_row_from_data_filter_iter(bool is_vectorized);
@@ -657,6 +664,12 @@ private:
   ObVecIdxAdaTryPath profile_try_path_;
   ObVecIdxAdaTryPath profile_current_path_;
   ObVecIdxPathSwitchReason profile_switch_reason_;
+  // 对于按 BQ 类型处理的查询，每轮候选按 [非 BQ 段结果][BQ 段结果] 排列。
+  // 分组过滤时，non_bq_vid_iter_ 保存非 BQ 段（HGRAPH/HNSW/SQ）过滤通过的结果，
+  // adaptor_vid_iter_ 保存 BQ 段过滤通过的结果，两者分别跨轮累计。
+  // 分开保存可避免非 BQ 结果占满候选名额，使 BQ 段仍能继续补搜。
+  // 搜索结束后，两组结果合并到 adaptor_vid_iter_，交给上层处理。
+  ObVectorQueryVidIterator* non_bq_vid_iter_;
 
 private:
 
@@ -680,14 +693,14 @@ private:
   int merge_and_sort_brute_force_results_bq(const ObVecIdxQueryResult& dist_result,
                                             int64_t* brute_vids,
                                             int brute_cnt,
-                                            ObSimpleMaxHeap& snap_heap,
-                                            ObSimpleMaxHeap& incr_heap,
+                                            ObSimpleMaxHeap& bq_heap,
+                                            ObSimpleMaxHeap& hgraph_heap,
                                             bool& need_complete_data,
                                             bool check_need_complete_data);
 
   int build_brute_force_result_iterator_bq(ObPluginVectorIndexAdaptor* adaptor,
-                                           const ObSimpleMaxHeap& snap_heap,
-                                           const ObSimpleMaxHeap& incr_heap,
+                                           const ObSimpleMaxHeap& bq_heap,
+                                           const ObSimpleMaxHeap& hgraph_heap,
                                            ObVecIdxQueryResult &dist_result,
                                            ObVectorQueryVidIterator*& result_iter);
 

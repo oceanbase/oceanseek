@@ -5556,6 +5556,7 @@ int ObPluginVectorIndexAdaptor::vsag_query_vids(ObVectorQueryAdaptorResultContex
                                             segment_querier->is_active_ ? algorithm_profile : nullptr);
       if (OB_FAIL(handler.knn_search(*res, total_segment_cnt))) {
         LOG_WARN("knn search snap fail", K(ret));
+      } else if (OB_FALSE_IT(res->index_type_ = segment_querier->handle_->get_index_type())) {
       } else if (res->total_ > 0 && OB_FAIL(result_list.push_back(res))) {
         LOG_WARN("push back snap data fail", K(ret), KPC(res));
       }
@@ -5565,6 +5566,7 @@ int ObPluginVectorIndexAdaptor::vsag_query_vids(ObVectorQueryAdaptorResultContex
   if (OB_FAIL(ret)) {
   } else {
     int64_t actual_res_cnt = 0;
+    int64_t bq_hgraph_result_count = 0;
     uint64_t tmp_result_cnt = 0;
     uint64_t max_res_cnt = 0;
     for (int64_t i = 0; i < result_list.count(); ++i) tmp_result_cnt += result_list.at(i)->total_;
@@ -5604,9 +5606,9 @@ int ObPluginVectorIndexAdaptor::vsag_query_vids(ObVectorQueryAdaptorResultContex
 
     if (OB_FAIL(ret)) {
     } else if (index_type == VIAT_HNSW_BQ) {
-      if (OB_FAIL(ObPluginVectorIndexHelper::driect_merge_delta_and_snap_vids(
-              tenant_id_, result_list, actual_res_cnt, merge_vids, merge_distance, merge_extra_info_ptr))) {
-        LOG_WARN("failed to merge delta and snap vids.", K(ret));
+      if (OB_FAIL(ObPluginVectorIndexHelper::sort_merge_hnsw_bq_groups(
+          tenant_id_, result_list, max_res_cnt, actual_res_cnt, merge_vids, merge_distance, merge_extra_info_ptr, bq_hgraph_result_count))) {
+        LOG_WARN("failed to merge BQ post-filter groups", K(ret));
       }
     } else if (OB_FAIL(ObPluginVectorIndexHelper::sort_merge_delta_and_snap_vids(
         tenant_id_, result_list, max_res_cnt, actual_res_cnt, merge_vids, merge_distance, merge_extra_info_ptr))) {
@@ -5616,9 +5618,12 @@ int ObPluginVectorIndexAdaptor::vsag_query_vids(ObVectorQueryAdaptorResultContex
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(vids_iter->init(actual_res_cnt, merge_vids, merge_distance, merge_extra_info_ptr, ctx->allocator_))) {
       LOG_WARN("iter init failed.", K(ret), K(actual_res_cnt), K(merge_vids), K(merge_extra_info_ptr), K(ctx->allocator_));
-    } else if (actual_res_cnt == 0) {
-      LOG_INFO("query vector result 0", K(actual_res_cnt), K(tmp_result_cnt), K(result_list.count()),
-          KP(query_vector), K(dim), K(query_cond->ef_search_), K(query_cond->query_limit_), K(ctx->segments_.count()), KPC(this));
+    } else {
+      ctx->bq_hgraph_result_count_ = bq_hgraph_result_count;
+      if (actual_res_cnt == 0) {
+        LOG_INFO("query vector result 0", K(actual_res_cnt), K(tmp_result_cnt), K(result_list.count()),
+            KP(query_vector), K(dim), K(query_cond->ef_search_), K(query_cond->query_limit_), K(ctx->segments_.count()), KPC(this));
+      }
     }
   }
   // TODO(ningxin.ning): remove here after sindi support setting allocator in knn_search
@@ -5717,6 +5722,7 @@ int ObPluginVectorIndexAdaptor::query_next_result(ObVectorQueryAdaptorResultCont
         LOG_WARN("alloc fail", K(ret), "size", sizeof(ObVsagQueryResult));
       } else if (OB_FAIL(handler.knn_search(*res))) {
         LOG_WARN("knn search snap fail", K(ret));
+      } else if (OB_FALSE_IT(res->index_type_ = segment_querier->handle_->get_index_type())) {
       } else if (res->total_ > 0 && OB_FAIL(result_list.push_back(res))) {
         LOG_WARN("push back snap data fail", K(ret), KPC(res));
       }
@@ -5725,6 +5731,7 @@ int ObPluginVectorIndexAdaptor::query_next_result(ObVectorQueryAdaptorResultCont
     if (OB_FAIL(ret)) {
     } else {
       int64_t actual_res_cnt = 0;
+      int64_t bq_hgraph_result_count = 0;
       uint64_t max_res_cnt = 0;
       for (int64_t i = 0; i < result_list.count(); ++i) max_res_cnt += result_list.at(i)->total_;
       LOG_TRACE("query result info", K(max_res_cnt));
@@ -5750,6 +5757,11 @@ int ObPluginVectorIndexAdaptor::query_next_result(ObVectorQueryAdaptorResultCont
       }
       
       if (OB_FAIL(ret)) {
+      } else if (get_query_runtime_index_type() == VIAT_HNSW_BQ) {
+        if (OB_FAIL(ObPluginVectorIndexHelper::sort_merge_hnsw_bq_groups(
+            tenant_id_, result_list, max_res_cnt, actual_res_cnt, merge_vids, merge_distance, merge_extra_info_ptr, bq_hgraph_result_count))) {
+          LOG_WARN("failed to merge BQ post-filter groups", K(ret));
+        }
       } else if (OB_FAIL(ObPluginVectorIndexHelper::sort_merge_delta_and_snap_vids(tenant_id_, result_list,
                                                                               query_cond->query_limit_, 
                                                                               actual_res_cnt, 
@@ -5760,9 +5772,12 @@ int ObPluginVectorIndexAdaptor::query_next_result(ObVectorQueryAdaptorResultCont
       if (OB_FAIL(ret)) {
       } else if (OB_FAIL(vids_iter->init(actual_res_cnt, merge_vids, merge_distance, merge_extra_info_ptr, ctx->allocator_))) {
         LOG_WARN("iter init failed.", K(ret), K(actual_res_cnt), K(merge_vids), K(ctx->allocator_));
-      } else if (actual_res_cnt == 0) {
-        LOG_INFO("query vector result 0", K(actual_res_cnt), K(max_res_cnt), K(result_list.count()),
-            KP(query_vector), K(dim), K(query_cond->ef_search_), K(query_cond->query_limit_), KPC(this));
+      } else {
+        ctx->bq_hgraph_result_count_ = bq_hgraph_result_count;
+        if (actual_res_cnt == 0) {
+          LOG_INFO("query vector result 0", K(actual_res_cnt), K(max_res_cnt), K(result_list.count()),
+              KP(query_vector), K(dim), K(query_cond->ef_search_), K(query_cond->query_limit_), KPC(this));
+        }
       }
     }
 

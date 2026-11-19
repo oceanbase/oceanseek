@@ -72,6 +72,10 @@ void ObDASHNSWScanIter::reset_runtime_index_type()
 
 void ObDASHNSWScanIter::reset_adaptor_result()
 {
+  if (OB_NOT_NULL(non_bq_vid_iter_)) {
+    non_bq_vid_iter_->~ObVectorQueryVidIterator();
+    non_bq_vid_iter_ = nullptr;
+  }
   if (OB_NOT_NULL(adaptor_vid_iter_)) {
     adaptor_vid_iter_->reset();
     adaptor_vid_iter_->~ObVectorQueryVidIterator();
@@ -1037,16 +1041,7 @@ int ObDASHNSWScanIter::reset_filter_path()
     query_cond_.reset();
     go_brute_force_ = false;
     can_retry_ = false;
-    if (OB_NOT_NULL(tmp_adaptor_vid_iter_)) {
-      tmp_adaptor_vid_iter_->reset();
-      tmp_adaptor_vid_iter_->~ObVectorQueryVidIterator();
-      tmp_adaptor_vid_iter_ = nullptr;
-    }
-    if (OB_NOT_NULL(adaptor_vid_iter_)) {
-      adaptor_vid_iter_->reset();
-      adaptor_vid_iter_->~ObVectorQueryVidIterator();
-      adaptor_vid_iter_ = nullptr;
-    }
+    reset_adaptor_result();
     if (OB_NOT_NULL(plan_ctx->get_phy_plan())) {
       ObPlanStat *plan_stat = const_cast<ObPlanStat*>(&(plan_ctx->get_phy_plan()->stat_));
       if (OB_FAIL(updata_vec_exec_ctx(plan_stat))) {
@@ -1838,8 +1833,8 @@ int ObDASHNSWScanIter::query_brute_force_distances(ObPluginVectorIndexAdaptor* a
 int ObDASHNSWScanIter::merge_and_sort_brute_force_results_bq(const ObVecIdxQueryResult& dist_result,
                                                              int64_t* brute_vids,
                                                              int brute_cnt,
-                                                             ObSimpleMaxHeap& snap_heap,
-                                                             ObSimpleMaxHeap& incr_heap,
+                                                             ObSimpleMaxHeap& bq_heap,
+                                                             ObSimpleMaxHeap& hgraph_heap,
                                                              bool& need_complete_data,
                                                              bool check_need_complete_data)
 {
@@ -1862,17 +1857,13 @@ int ObDASHNSWScanIter::merge_and_sort_brute_force_results_bq(const ObVecIdxQuery
           need_complete_data = check_need_complete_data ? true : false;
         } else if (distance <= query_cond_.last_distance_) {
           // skip: within last_distance range
-        } else if (segment_cnt > 1) {
-          if (distance <= distance_threshold_ && ! dist_result.segments_.at(k)->is_base()) {
-            incr_heap.push(brute_vids[i], distance, dist_result.segments_.at(k).get());
+        } else if (distance <= distance_threshold_) {
+          const ObVectorIndexAlgorithmType type = dist_result.segments_.at(k)->get_index_type();
+          if (type == VIAT_HNSW_BQ) {
+            bq_heap.push(brute_vids[i], distance, dist_result.segments_.at(k).get());
+          } else {
+            hgraph_heap.push(brute_vids[i], distance, dist_result.segments_.at(k).get());
           }
-          if (distance <= distance_threshold_ && dist_result.segments_.at(k)->is_base()) {
-            snap_heap.push(brute_vids[i], distance, dist_result.segments_.at(k).get());
-          }
-        } else if (! dist_result.segments_.at(k)->is_base() && distance <= distance_threshold_) {
-          incr_heap.push(brute_vids[i], distance, dist_result.segments_.at(k).get());
-        } else if (dist_result.segments_.at(k)->is_base() && distance <= distance_threshold_) {
-          snap_heap.push(brute_vids[i], distance, dist_result.segments_.at(k).get());
         }
       }
     }
@@ -1882,8 +1873,8 @@ int ObDASHNSWScanIter::merge_and_sort_brute_force_results_bq(const ObVecIdxQuery
 }
 
 int ObDASHNSWScanIter::build_brute_force_result_iterator_bq(ObPluginVectorIndexAdaptor* adaptor,
-                                                            const ObSimpleMaxHeap& snap_heap,
-                                                            const ObSimpleMaxHeap& incr_heap,
+                                                            const ObSimpleMaxHeap& bq_heap,
+                                                            const ObSimpleMaxHeap& hgraph_heap,
                                                             ObVecIdxQueryResult &dist_result,
                                                             ObVectorQueryVidIterator*& result_iter)
 {
@@ -1893,18 +1884,17 @@ int ObDASHNSWScanIter::build_brute_force_result_iterator_bq(ObPluginVectorIndexA
     ret = OB_BAD_NULL_ERROR;
     LOG_WARN("adaptor is null", K(ret));
   } else {
-    uint64_t snap_size = snap_heap.get_size();
-    uint64_t incr_size = incr_heap.get_size();
-    uint64_t total_size = snap_size + incr_size;
+    uint64_t bq_size = bq_heap.get_size();
+    uint64_t hgraph_size = hgraph_heap.get_size();
+    uint64_t total_size = bq_size + hgraph_size;
 
     if (total_size == 0) {
       ret = OB_ITER_END;
     } else {
       int64_t *vids = nullptr;
       float *distances = nullptr;
-      ObVectorIndexSegment** segment_ptrs = nullptr;
       int64_t extra_info_actual_size = 0;
-      ObVecExtraInfoPtr extra_info_ptr;
+      ObVecExtraInfoPtr extra_info_ptr, hgraph_extra, bq_extra;
 
       if (OB_FAIL(adaptor->get_extra_info_actual_size(extra_info_actual_size))) {
         LOG_WARN("failed to get extra info actual size", K(ret));
@@ -1914,9 +1904,20 @@ int ObDASHNSWScanIter::build_brute_force_result_iterator_bq(ObPluginVectorIndexA
       } else if (OB_ISNULL(distances = static_cast<float *>(vec_op_alloc_.alloc(sizeof(float) * total_size)))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
         LOG_WARN("failed to allocate distances", K(ret));
-      } else if (OB_ISNULL(segment_ptrs = static_cast<ObVectorIndexSegment**>(vec_op_alloc_.alloc(sizeof(ObVectorIndexSegment*) * total_size)))) {
-        ret = OB_ALLOCATE_MEMORY_FAILED;
-        LOG_WARN("failed to allocate distances", K(ret));
+      }
+
+      if (OB_SUCC(ret) && extra_column_count_ > 0) {
+        if (OB_FAIL(extra_info_ptr.init(&vec_op_alloc_, extra_info_actual_size, total_size))) {
+          LOG_WARN("failed to allocate result extra pointers", K(ret));
+        } else if (hgraph_size > 0 &&
+                   (OB_FAIL(hgraph_extra.init(&vec_op_alloc_, extra_info_actual_size, hgraph_size)) ||
+                    OB_FAIL(get_extra_info_by_vids(adaptor, hgraph_heap, dist_result, hgraph_extra)))) {
+          LOG_WARN("failed to fetch HGRAPH extra info", K(ret));
+        } else if (bq_size > 0 &&
+                   (OB_FAIL(bq_extra.init(&vec_op_alloc_, extra_info_actual_size, bq_size)) ||
+                    OB_FAIL(get_extra_info_by_vids(adaptor, bq_heap, dist_result, bq_extra)))) {
+          LOG_WARN("failed to fetch BQ extra info", K(ret));
+        }
       }
 
       if (OB_SUCC(ret)) {
@@ -1925,20 +1926,22 @@ int ObDASHNSWScanIter::build_brute_force_result_iterator_bq(ObPluginVectorIndexA
         if (OB_FAIL(added_vids.create(total_size, "BQResultDedup"))) {
           LOG_WARN("failed to create added vids hash map", K(ret));
         } else {
-          for (int64_t i = 0; i < incr_size && OB_SUCC(ret); ++i) {
-            int64_t vid = incr_heap.at(i);
+          for (int64_t i = 0; i < hgraph_size && OB_SUCC(ret); ++i) {
+            int64_t vid = hgraph_heap.at(i);
             vids[idx] = vid;
-            distances[idx] = static_cast<float>(incr_heap.value_at(i));
-            segment_ptrs[idx] = incr_heap.segment_at(i);
+            distances[idx] = static_cast<float>(hgraph_heap.value_at(i));
+            if (extra_column_count_ > 0 && OB_FAIL(extra_info_ptr.set_no_copy(idx, hgraph_extra[i]))) {
+              LOG_WARN("failed to append extra info", K(ret), K(idx));
+            }
             idx++;
 
-            if (OB_FAIL(added_vids.set_refactored(vid, true))) {
+            if (OB_SUCC(ret) && OB_FAIL(added_vids.set_refactored(vid, true))) {
               LOG_WARN("failed to mark vid as added", K(ret), K(vid));
             }
           }
 
-          for (int64_t i = 0; i < snap_size && OB_SUCC(ret); ++i) {
-            int64_t vid = snap_heap.at(i);
+          for (int64_t i = 0; i < bq_size && OB_SUCC(ret); ++i) {
+            int64_t vid = bq_heap.at(i);
             bool exists = false;
             if (OB_FAIL(added_vids.get_refactored(vid, exists))) {
               if (OB_HASH_NOT_EXIST == ret) {
@@ -1951,34 +1954,14 @@ int ObDASHNSWScanIter::build_brute_force_result_iterator_bq(ObPluginVectorIndexA
 
             if (OB_SUCC(ret) && !exists) {
               vids[idx] = vid;
-              distances[idx] = static_cast<float>(snap_heap.value_at(i));
-              segment_ptrs[idx] = snap_heap.segment_at(i);
+              distances[idx] = static_cast<float>(bq_heap.value_at(i));
+              if (extra_column_count_ > 0 && OB_FAIL(extra_info_ptr.set_no_copy(idx, bq_extra[i]))) {
+                LOG_WARN("failed to append extra info", K(ret), K(idx));
+              }
               idx++;
             }
           }
           total_size = idx;
-        }
-
-        if (OB_SUCC(ret) && extra_column_count_ > 0 &&
-            OB_FAIL(extra_info_ptr.init(&vec_op_alloc_, extra_info_actual_size, total_size))) {
-          LOG_WARN("failed to init extra_info_ptr", K(ret));
-        }
-
-        if (OB_SUCC(ret) && extra_column_count_ > 0) {
-          ObArenaAllocator &allocator = mem_context_->get_arena_allocator();
-          ObSimpleMaxHeap merged_heap(&allocator, total_size);
-
-          if (OB_FAIL(merged_heap.init())) {
-            LOG_WARN("failed to init merged heap for extra info", K(ret));
-          } else {
-            for (int64_t i = 0; i < total_size; ++i) {
-              merged_heap.push(vids[i], distances[i], segment_ptrs[i]);
-            }
-
-            if (OB_FAIL(get_extra_info_by_vids(adaptor, merged_heap, dist_result, extra_info_ptr))) {
-              LOG_WARN("failed to get extra info by vids", K(ret));
-            }
-          }
         }
 
         if (OB_SUCC(ret)) {
@@ -2013,25 +1996,25 @@ int ObDASHNSWScanIter::process_adaptor_state_pre_filter_brute_force_bq(
     LOG_WARN("failed to init brute force params", K(ret));
   } else {
     uint64_t capacity = ctx.limit > brute_cnt ? brute_cnt : ctx.limit;
-    if (capacity == 0) {
+    if (capacity == 0 || limit_param_.limit_ + limit_param_.offset_ <= 0) {
       ret = OB_ITER_END;
     } else {
       ObArenaAllocator &allocator = mem_context_->get_arena_allocator();
       ObVecIdxQueryResult dist_result; // initialized by the constructor
-      ObSimpleMaxHeap snap_heap(&allocator, capacity);
-      ObSimpleMaxHeap incr_heap(&allocator, capacity);
+      ObSimpleMaxHeap bq_heap(&allocator, capacity);
+      ObSimpleMaxHeap hgraph_heap(&allocator, min(capacity, static_cast<uint64_t>(limit_param_.limit_ + limit_param_.offset_)));
 
-      if (OB_FAIL(snap_heap.init())) {
+      if (OB_FAIL(bq_heap.init())) {
         LOG_WARN("failed to init snap heap", K(ret));
-      } else if (OB_FAIL(incr_heap.init())) {
+      } else if (OB_FAIL(hgraph_heap.init())) {
         LOG_WARN("failed to init incr heap", K(ret));
       } else if (OB_FAIL(query_brute_force_distances(adaptor, ctx.search_vec, brute_vids, brute_cnt, dist_result))) {
         LOG_WARN("failed to query brute force distances", K(ret));
       } else if (OB_FAIL(merge_and_sort_brute_force_results_bq(dist_result, brute_vids, brute_cnt,
-                                                          snap_heap, incr_heap, need_complete_data, check_need_complete_data))) {
+                                                          bq_heap, hgraph_heap, need_complete_data, check_need_complete_data))) {
         LOG_WARN("failed to merge and sort bq results", K(ret));
       } else if (OB_SUCC(ret) && !need_complete_data) {
-        if (OB_FAIL(build_brute_force_result_iterator_bq(adaptor, snap_heap, incr_heap, dist_result, adaptor_vid_iter_))) {
+        if (OB_FAIL(build_brute_force_result_iterator_bq(adaptor, bq_heap, hgraph_heap, dist_result, adaptor_vid_iter_))) {
           LOG_WARN("failed to build bq result iterator", K(ret));
         }
       }
@@ -3139,11 +3122,27 @@ int ObDASHNSWScanIter::process_adaptor_state_post_filter(
     } else if (OB_ISNULL(tmp_adaptor_vid_iter_)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("shouldn't be null.", K(ret), K(tmp_adaptor_vid_iter_));
-    } else if (OB_FAIL(post_query_vid_with_filter(ada_ctx, adaptor, hnsw_max_iter_scan_nums, iter_scan_total_num, is_vectorized))) {
-      LOG_WARN("failed to query vid with filter.", K(ret), K(extra_column_count_), K(adaptive_ctx_.iter_times_));
-    } else if (query_cond_.query_limit_ == 0) {
-      end_search = true;
+    } else {
+      // Keep H-only input on the original path; once split, preserve both result pools.
+      if (ada_ctx->get_bq_hgraph_result_count() > 0
+          && (ada_ctx->get_bq_hgraph_result_count() < tmp_adaptor_vid_iter_->get_total()
+              || OB_NOT_NULL(non_bq_vid_iter_))) {
+        if (OB_FAIL(post_query_bq_vid_with_filter(ada_ctx, adaptor, hnsw_max_iter_scan_nums,
+            iter_scan_total_num, is_vectorized))) {
+          LOG_WARN("failed to filter hgraph and bq results", K(ret), K(adaptive_ctx_.iter_times_));
+        }
+      } else if (OB_FAIL(post_query_vid_with_filter(ada_ctx, adaptor, hnsw_max_iter_scan_nums,
+          iter_scan_total_num, is_vectorized))) {
+        LOG_WARN("failed to query vid with filter", K(ret), K(extra_column_count_), K(adaptive_ctx_.iter_times_));
+      }
+      if (OB_SUCC(ret) && query_cond_.query_limit_ == 0) {
+        end_search = true;
+      }
     }
+  }
+  if (OB_SUCC(ret) && OB_NOT_NULL(non_bq_vid_iter_) &&
+      OB_FAIL(concat_bq_post_filter_results())) {
+    LOG_WARN("finish post-filter groups failed", K(ret));
   }
   LOG_TRACE("print hnsw search times", K(adaptive_ctx_));
   return ret;
@@ -3480,12 +3479,138 @@ int ObDASHNSWScanIter::filter_by_index_back(int64_t vid,
   return ret;
 }
 
+int ObDASHNSWScanIter::post_query_bq_vid_with_filter(
+    ObVectorQueryAdaptorResultContext *ada_ctx,
+    ObPluginVectorIndexAdaptor *adaptor,
+    int64_t hnsw_max_iter_scan_nums,
+    int64_t &iter_scan_total_num,
+    bool is_vectorized)
+{
+  int ret = OB_SUCCESS;
+  ObVectorQueryVidIterator *round_candidate_iter = tmp_adaptor_vid_iter_;
+  if (OB_ISNULL(ada_ctx) || OB_ISNULL(adaptor) || OB_ISNULL(round_candidate_iter)
+      || ada_ctx->get_bq_hgraph_result_count() < 0 || ada_ctx->get_bq_hgraph_result_count() > round_candidate_iter->get_total()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid grouped post-filter input", K(ret), KP(ada_ctx), KP(adaptor), KP(round_candidate_iter));
+  } else {
+    ObArenaAllocator allocator("HNSWPostView", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
+    const int64_t bq_hgraph_result_count = ada_ctx->get_bq_hgraph_result_count();
+    const int64_t bq_count = round_candidate_iter->get_total() - bq_hgraph_result_count;
+    ObVecExtraInfoPtr extra_info = round_candidate_iter->get_extra_info();
+    if (!extra_info.is_null()) {
+      extra_info.count_ = bq_hgraph_result_count;
+    }
+    // Filter the H prefix with its own cursor; keep the full round for the BQ suffix.
+    tmp_adaptor_vid_iter_ = nullptr;
+    if (OB_ISNULL(non_bq_vid_iter_)) {
+      int64_t extra_info_actual_size = 0;
+      if (OB_FAIL(adaptor->get_extra_info_actual_size(extra_info_actual_size))) {
+        LOG_WARN("failed to get extra info actual size", K(ret));
+      } else if (OB_ISNULL(non_bq_vid_iter_ = OB_NEWx(ObVectorQueryVidIterator, &vec_op_alloc_,
+          extra_column_count_, extra_info_actual_size, query_cond_.rel_count_, query_cond_.rel_map_ptr_))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to allocate non-bq result iterator", K(ret));
+      } else if (OB_FAIL(non_bq_vid_iter_->init(limit_param_.limit_ + limit_param_.offset_, &vec_op_alloc_))) {
+        LOG_WARN("failed to init non-bq result iterator", K(ret));
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_ISNULL(tmp_adaptor_vid_iter_ = OB_NEWx(ObVectorQueryVidIterator, &allocator,
+        round_candidate_iter->get_extra_column_count(), extra_info.extra_info_actual_size_,
+        query_cond_.rel_count_, query_cond_.rel_map_ptr_))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate hgraph post-filter iterator", K(ret));
+    } else if (OB_FAIL(tmp_adaptor_vid_iter_->init(bq_hgraph_result_count, round_candidate_iter->get_vids(),
+        round_candidate_iter->get_distance(), extra_info, &allocator))) {
+      LOG_WARN("failed to init hgraph post-filter iterator", K(ret), K(bq_hgraph_result_count));
+    } else {
+      std::swap(adaptor_vid_iter_, non_bq_vid_iter_);
+      // process hgraph results
+      if (OB_FAIL(post_query_vid_with_filter(ada_ctx, adaptor, hnsw_max_iter_scan_nums,
+          iter_scan_total_num, is_vectorized, bq_count > 0 /* is_bq_hgraph_group */))) {
+        LOG_WARN("failed to filter hgraph results", K(ret));
+      }
+      // Restore the BQ output
+      std::swap(adaptor_vid_iter_, non_bq_vid_iter_);
+    }
+    if (OB_NOT_NULL(tmp_adaptor_vid_iter_)) {
+      tmp_adaptor_vid_iter_->~ObVectorQueryVidIterator();
+      tmp_adaptor_vid_iter_ = nullptr;
+    }
+    // process bq results
+    if (OB_SUCC(ret) && bq_count > 0) {
+      extra_info = round_candidate_iter->get_extra_info();
+      if (!extra_info.is_null()) {
+        extra_info.buf_ += bq_hgraph_result_count;
+        extra_info.count_ = bq_count;
+      }
+      if (OB_ISNULL(tmp_adaptor_vid_iter_ = OB_NEWx(ObVectorQueryVidIterator, &allocator,
+          round_candidate_iter->get_extra_column_count(), extra_info.extra_info_actual_size_,
+          query_cond_.rel_count_, query_cond_.rel_map_ptr_))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to allocate bq post-filter iterator", K(ret));
+      } else if (OB_FAIL(tmp_adaptor_vid_iter_->init(bq_count,
+          OB_ISNULL(round_candidate_iter->get_vids()) ? nullptr : round_candidate_iter->get_vids() + bq_hgraph_result_count,
+          OB_ISNULL(round_candidate_iter->get_distance()) ? nullptr : round_candidate_iter->get_distance() + bq_hgraph_result_count,
+          extra_info, &allocator))) {
+        LOG_WARN("failed to init bq post-filter iterator", K(ret), K(bq_count));
+      } else if (OB_FAIL(post_query_vid_with_filter(ada_ctx, adaptor, hnsw_max_iter_scan_nums,
+          iter_scan_total_num, is_vectorized, false /* is_bq_hgraph_group */))) {
+        LOG_WARN("failed to filter bq results", K(ret));
+      }
+      if (OB_NOT_NULL(tmp_adaptor_vid_iter_)) {
+        tmp_adaptor_vid_iter_->~ObVectorQueryVidIterator();
+        tmp_adaptor_vid_iter_ = nullptr;
+      }
+    }
+    round_candidate_iter->~ObVectorQueryVidIterator();
+  }
+  return ret;
+}
+
+int ObDASHNSWScanIter::concat_bq_post_filter_results()
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(non_bq_vid_iter_) || OB_ISNULL(adaptor_vid_iter_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    const int64_t capacity = non_bq_vid_iter_->get_total() + adaptor_vid_iter_->get_total();
+    ObVectorQueryVidIterator *result = OB_NEWx(ObVectorQueryVidIterator, &vec_op_alloc_,
+        extra_column_count_, adaptor_vid_iter_->get_extra_info().extra_info_actual_size_,
+        query_cond_.rel_count_, query_cond_.rel_map_ptr_);
+    if (OB_ISNULL(result)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_FAIL(result->init(max(int64_t(1), capacity), &vec_op_alloc_))) {
+      LOG_WARN("init final BQ post-filter results failed", K(ret));
+    } else {
+      // Candidate arrays and extra payload already belong to vec_op_alloc_, not the views.
+      for (ObVectorQueryVidIterator *source : {non_bq_vid_iter_, adaptor_vid_iter_}) {
+        ObVecExtraInfoPtr extra = source->get_extra_info();
+        extra.count_ = source->get_total();
+        if (OB_SUCC(ret) && OB_FAIL(result->add_results(source->get_total(), source->get_vids(),
+            source->get_distance(), extra))) {
+          LOG_WARN("append final BQ post-filter results failed", K(ret));
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      adaptor_vid_iter_->~ObVectorQueryVidIterator();
+      adaptor_vid_iter_ = result;
+      non_bq_vid_iter_->~ObVectorQueryVidIterator();
+      non_bq_vid_iter_ = nullptr;
+    } else if (OB_NOT_NULL(result)) {
+      result->~ObVectorQueryVidIterator();
+    }
+  }
+  return ret;
+}
+
 int ObDASHNSWScanIter::post_query_vid_with_filter(
     ObVectorQueryAdaptorResultContext *ada_ctx,
     ObPluginVectorIndexAdaptor* adaptor,
     int64_t hnsw_max_iter_scan_nums,
     int64_t& iter_scan_total_num,
-    bool is_vectorized) 
+    bool is_vectorized, bool is_bq_hgraph_group)
 {
   int ret = OB_SUCCESS;
   common::ScopedTimer iter_filter_timer(
@@ -3500,7 +3625,7 @@ int ObDASHNSWScanIter::post_query_vid_with_filter(
       uint64_t final_res_cnt = limit_param_.limit_ + limit_param_.offset_;
       int64_t extra_info_actual_size = 0;
 
-      if (is_hnsw_bq() || is_ipivf()) {
+      if (!is_bq_hgraph_group && (is_hnsw_bq() || is_ipivf())) {
         final_res_cnt = get_reorder_count(query_cond_.ef_search_, final_res_cnt, search_param_);
       }
 
@@ -3527,7 +3652,9 @@ int ObDASHNSWScanIter::post_query_vid_with_filter(
       int64_t total_before_add = adaptor_vid_iter_->get_total();
       int64_t extra_column_cnt = tmp_adaptor_vid_iter_->get_extra_column_count();
       iter_scan_total_num += unfiltered_vid_cnt;
-      if (simple_cmp_info_.inited_) {
+      if (is_bq_hgraph_group && adaptor_vid_iter_->get_enough()) {
+        // A full H pool must not filter more rows or change the BQ search state.
+      } else if (simple_cmp_info_.inited_) {
         int64_t processed_candidate_count = 0;
         int64_t matched_candidate_count = 0;
         for (int64_t i = 0; OB_SUCC(ret) && i < unfiltered_vid_cnt && !adaptor_vid_iter_->get_enough(); ++i) {
@@ -3587,8 +3714,12 @@ int ObDASHNSWScanIter::post_query_vid_with_filter(
       } else if (OB_FAIL(do_table_post_filter(is_vectorized))) {
         LOG_WARN("do table post filter failed", K(ret));
       }
-      INC_METRIC_VAL(common::ObMetricId::VEC_ITER_FILTER_LOOP_CNT, 1);
+      if (!is_bq_hgraph_group) {
+        INC_METRIC_VAL(common::ObMetricId::VEC_ITER_FILTER_LOOP_CNT, 1);
+      }
       if (OB_FAIL(ret)) {
+      } else if (is_bq_hgraph_group) {
+        // A nonempty BQ suffix will drive expansion, adaptive retry and iteration termination.
       } else if (tmp_adaptor_vid_iter_->get_total() == 0
       || (iter_scan_total_num > hnsw_max_iter_scan_nums && hnsw_max_iter_scan_nums > 0)) {
         // 这里统计的是本轮后过滤前的候选数。按 segment 缩减预算后，

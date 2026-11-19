@@ -192,7 +192,7 @@ struct ObVsagQueryResult
 {
   ObVsagQueryResult():
     total_(0), vids_(nullptr), distances_(nullptr), extra_info_buf_ptr_(nullptr),
-    extra_info_ptr_(), mem_ctx_(nullptr), idx_(0) {}
+    extra_info_ptr_(), mem_ctx_(nullptr), idx_(0), index_type_(VIAT_MAX) {}
 
   TO_STRING_KV(K_(total), KP_(vids), KP_(distances), KP_(extra_info_buf_ptr),
       K_(extra_info_ptr), KP_(mem_ctx), K_(idx))
@@ -206,6 +206,7 @@ struct ObVsagQueryResult
   ObVsagMemContext *mem_ctx_;
   // for result merge
   int64_t idx_;
+  ObVectorIndexAlgorithmType index_type_;
 };
 
 typedef ObSEArray<ObVsagQueryResult*, 4> ObVsagQueryResultArray;
@@ -213,13 +214,6 @@ typedef ObSEArray<ObVsagQueryResult*, 4> ObVsagQueryResultArray;
 class ObPluginVectorIndexHelper final
 {
 public:
-  static int driect_merge_delta_and_snap_vids(
-                                              const uint64_t tenant_id,
-                                              const ObVsagQueryResultArray &results,
-                                              int64_t &actual_cnt,
-                                              int64_t *&vids_result,
-                                              float *&float_result,
-                                              ObVecExtraInfoPtr &extra_info_result);
   static int sort_merge_delta_and_snap_vids(
                                             const uint64_t tenant_id,
                                             ObVsagQueryResultArray &results,
@@ -228,6 +222,12 @@ public:
                                             int64_t *&vids_result,
                                             float *&float_result,
                                             ObVecExtraInfoPtr &extra_info_result);
+  // 对于BQ索引的查询，结果集排序后按照 [非 BQ 段结果][BQ 段结果] 排列
+  // bq_hgraph_result_count 表示过滤前非 BQ 部分的长度，也是 BQ 部分的起始位置。
+  static int sort_merge_hnsw_bq_groups(
+      const uint64_t tenant_id, ObVsagQueryResultArray &results, const int64_t total, int64_t &actual_cnt,
+      int64_t *&vids, float *&distances, ObVecExtraInfoPtr &extra_info,
+      int64_t &bq_hgraph_result_count);
   static int get_vector_memory_limit_size(const uint64_t tenant_id,
                                           int64_t& memory_limit);
   static int get_active_segment_max_size(const uint64_t tenant_id, int64_t &size);

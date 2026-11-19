@@ -7,8 +7,12 @@
 #include <gtest/gtest.h>
 #include <thread>
 #include "lib/oblog/ob_log.h"
+#include "share/rc/ob_tenant_base.h"
 #define private public
 #include "share/vector_index/ob_vector_index_util.h"
+#include "share/vector_index/ob_plugin_vector_index_util.h"
+#include "sql/das/iter/ob_das_hnsw_scan_iter.h"
+#include "sql/das/iter/ob_das_vec_index_hnsw_scan_iter.h"
 #undef private
 #include "sql/engine/expr/ob_expr_vector.h"
 #include "share/vector_index/ob_vector_index_async_task_util.h"
@@ -874,12 +878,133 @@ TEST(TestVectorIndexUtil, l1_ob_distance_converts_to_vsag_distance)
   EXPECT_DOUBLE_EQ(ob_distance, vsag_distance);
 }
 
+TEST(TestVectorIndexUtil, bq_groups_do_not_compare_quantized_and_fp32_distances)
+{
+  common::ObArenaAllocator allocator("BQGroupUT");
+  // H distances are deliberately larger than BQ distances. VID 7 occurs in both groups.
+  int64_t h_vids[] = {7, 8}, b_vids[] = {7, 3, 4}, b2_vids[] = {5, 4};
+  float h_dist[] = {100, 200}, b_dist[] = {1, 3, 5}, b2_dist[] = {2, 4};
+  int64_t h_extra[] = {70, 80}, b_extra[] = {700, 30, 40}, b2_extra[] = {50, 400};
+  ObVsagQueryResult h, b, b2;
+  h.index_type_ = VIAT_HGRAPH; h.total_ = 2; h.vids_ = h_vids; h.distances_ = h_dist;
+  b.index_type_ = VIAT_HNSW_BQ; b.total_ = 3; b.vids_ = b_vids; b.distances_ = b_dist;
+  b2.index_type_ = VIAT_HNSW_BQ; b2.total_ = 2; b2.vids_ = b2_vids; b2.distances_ = b2_dist;
+  ASSERT_EQ(OB_SUCCESS, h.extra_info_ptr_.init(&allocator, reinterpret_cast<char *>(h_extra), 8, 2));
+  ASSERT_EQ(OB_SUCCESS, b.extra_info_ptr_.init(&allocator, reinterpret_cast<char *>(b_extra), 8, 3));
+  ASSERT_EQ(OB_SUCCESS, b2.extra_info_ptr_.init(&allocator, reinterpret_cast<char *>(b2_extra), 8, 2));
+  ObVsagQueryResultArray sources;
+  ASSERT_EQ(OB_SUCCESS, sources.push_back(&b));
+  ASSERT_EQ(OB_SUCCESS, sources.push_back(&h));
+  ASSERT_EQ(OB_SUCCESS, sources.push_back(&b2));
+  int64_t vid_buf[7], payload[7], *vids = vid_buf;
+  float distance_buf[7], *distances = distance_buf;
+  ObVecExtraInfoPtr extra;
+  ASSERT_EQ(OB_SUCCESS, extra.init(&allocator, reinterpret_cast<char *>(payload), 8, 7));
+  int64_t count = 0, h_count = -1;
+  ASSERT_EQ(OB_SUCCESS, ObPluginVectorIndexHelper::sort_merge_hnsw_bq_groups(
+      MTL_ID(), sources, 7, count, vids, distances, extra, h_count));
+  ASSERT_EQ(2, h_count);
+  ASSERT_EQ(5, count);
+  const int64_t expected_vids[] = {7, 8, 5, 3, 4};
+  const int64_t expected_extra[] = {70, 80, 50, 30, 400};
+  for (int64_t i = 0; i < count; ++i) {
+    EXPECT_EQ(expected_vids[i], vids[i]);
+    EXPECT_EQ(expected_extra[i], payload[i]);
+  }
+  // Non-BQ callers of the generic merger retain global sorting.
+  h.idx_ = b.idx_ = b2.idx_ = 0;
+  ASSERT_EQ(OB_SUCCESS, ObPluginVectorIndexHelper::sort_merge_delta_and_snap_vids(
+      MTL_ID(), sources, 7, count, vids, distances, extra));
+  EXPECT_EQ(7, vids[0]);
+  EXPECT_FLOAT_EQ(1, distances[0]);
+  EXPECT_EQ(8, vids[count - 1]);
+}
+
+TEST(TestVectorIndexUtil, bq_groups_empty_and_single_source_types)
+{
+  // A single segment returns unique VIDs; duplicates are covered across sources above.
+  int64_t input[] = {1, 2, 3}, output[3], *vids = output;
+  float input_dist[] = {1, 2, 3}, output_dist[3], *distances = output_dist;
+  ObVsagQueryResult result;
+  result.total_ = 3; result.vids_ = input; result.distances_ = input_dist;
+  ObVecExtraInfoPtr extra;
+  ObVsagQueryResultArray sources;
+  int64_t count = -1, h_count = -1;
+  ASSERT_EQ(OB_SUCCESS, ObPluginVectorIndexHelper::sort_merge_hnsw_bq_groups(
+      MTL_ID(), sources, 0, count, vids, distances, extra, h_count));
+  EXPECT_EQ(0, count);
+  EXPECT_EQ(0, h_count);
+  ASSERT_EQ(OB_SUCCESS, sources.push_back(&result));
+  for (ObVectorIndexAlgorithmType type : {VIAT_HNSW, VIAT_HGRAPH, VIAT_HNSW_SQ, VIAT_HNSW_BQ}) {
+    result.index_type_ = type;
+    ASSERT_EQ(OB_SUCCESS, ObPluginVectorIndexHelper::sort_merge_hnsw_bq_groups(
+        MTL_ID(), sources, 3, count, vids, distances, extra, h_count));
+    ASSERT_EQ(3, count);
+    EXPECT_EQ(type == VIAT_HNSW_BQ ? 0 : 3, h_count);
+    for (int64_t i = 0; i < count; ++i) {
+      EXPECT_EQ(input[i], vids[i]);
+      EXPECT_FLOAT_EQ(input_dist[i], distances[i]);
+    }
+  }
+}
+
+// Feed synthetic CalDistanceById outputs through the production merge functions.
+// Real empty VSAG indexes supply physical types, independently of base/incr placement.
+TEST(TestVectorIndexUtil, bq_brute_force_routes_by_physical_type_across_batches)
+{
+  common::ObArenaAllocator allocator("BQBruteUT");
+  ObVecIdxQueryResult result;
+  const ObVectorIndexAlgorithmType types[] = {VIAT_HGRAPH, VIAT_HNSW_BQ, VIAT_HNSW, VIAT_HNSW_BQ};
+  for (int i = 0; i < 4; ++i) {
+    ObVectorIndexSegment *segment = OB_NEWx(ObVectorIndexSegment, &allocator, &allocator);
+    ASSERT_NE(nullptr, segment);
+    ObVectorIndexSegmentHandle handle;
+    ASSERT_EQ(OB_SUCCESS, handle.set_segment(segment));
+    ASSERT_EQ(OB_SUCCESS, obvectorutil::create_index(segment->index_, types[i], "float32", "l2", 32, 8, 64, 64));
+    segment->is_base_ = i == 0 || i == 3; // HGRAPH base and BQ incr deliberately contradict old routing.
+    ASSERT_EQ(types[i], segment->get_index_type());
+    ASSERT_EQ(OB_SUCCESS, result.segments_.push_back(handle));
+  }
+  int64_t vids[] = {10, 11, 12, 13, 14, 15, 16, 17};
+  float distances[4][8] = {{100, -1, -1, -1, 50, -1, -1, -1},
+                           {-1, 9, -1, -1, -1, 4, -1, -1},
+                           {-1, -1, 200, -1, -1, -1, 80, -1},
+                           {-1, -1, -1, 8, -1, -1, -1, 5}};
+  sql::ObDASHNSWScanIter ordinary;
+  sql::ObDASVecIndexHNSWScanIter driver;
+  for (bool use_driver : {false, true}) {
+    sql::ObSimpleMaxHeap hgraph(&allocator, 2), bq(&allocator, 3);
+    ASSERT_EQ(OB_SUCCESS, hgraph.init());
+    ASSERT_EQ(OB_SUCCESS, bq.init());
+    bool need_complete = false;
+    for (int start : {0, 4}) {
+      result.distances_.reuse();
+      for (int i = 0; i < 4; ++i) ASSERT_EQ(OB_SUCCESS, result.distances_.push_back(distances[i] + start));
+      const int ret = use_driver
+          ? driver.merge_and_sort_brute_force_results_bq(result, vids + start, 4, bq, hgraph, need_complete, true)
+          : ordinary.merge_and_sort_brute_force_results_bq(result, vids + start, 4, bq, hgraph, need_complete, true);
+      ASSERT_EQ(OB_SUCCESS, ret);
+      ASSERT_FALSE(need_complete);
+    }
+    hgraph.max_heap_sort();
+    bq.max_heap_sort();
+    ASSERT_EQ(2, hgraph.get_size());
+    ASSERT_EQ(3, bq.get_size());
+    EXPECT_EQ(14, hgraph.at(0)); EXPECT_EQ(16, hgraph.at(1));
+    EXPECT_EQ(15, bq.at(0)); EXPECT_EQ(17, bq.at(1)); EXPECT_EQ(13, bq.at(2));
+  }
+}
+
 } // namespace share
 } // namespace oceanbase
 
 int main(int argc, char **argv)
 {
+  oceanbase::share::ObTenantBase tenant(oceanbase::common::OB_SERVER_TENANT_ID);
+  oceanbase::share::ObTenantEnv::set_tenant(&tenant);
   oceanbase::common::ObLogger::get_logger().set_log_level("INFO");
   ::testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
+  const int ret = RUN_ALL_TESTS();
+  oceanbase::share::ObTenantEnv::set_tenant(nullptr);
+  return ret;
 }
