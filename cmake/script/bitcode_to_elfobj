@@ -56,9 +56,9 @@ def shell_run_command(command_str, need_print_all=True, need_print_output=True, 
     运行shell命令
     '''
     if need_print_all:
-        print_log("[运行命令]: %s" % command_str)
+        print_log("[Command]: %s" % command_str)
         if not need_print_output:
-            print_log("[运行输出]: 日志过多已经忽略输出")
+            print_log("[Output]: Suppressed verbose command output")
     result = dict()
     result["return_code"] = 1
     result["return_message"] = []
@@ -83,7 +83,7 @@ def shell_run_command(command_str, need_print_all=True, need_print_output=True, 
 
         if need_print_output and len(data.strip()) > 1:
             if not is_first:
-                print_log("[运行输出]: %s" % data.replace("\n", ""))
+                print_log("[Output]: %s" % data.replace("\n", ""))
                 is_first = True
             else:
                 data_str = "            %s" % data.replace("\n", "")
@@ -99,7 +99,7 @@ def print_help():
     '''
     打印帮助信息
     '''
-    print("使用说明:")
+    print("Usage:")
     print("./bitcode_to_elfobj --ld=/usr/bin/ld --input=/xxx/absolute_path/demo.a --output=/xxx/absolute_path/demo.a")
 
 def parse_arg():
@@ -113,7 +113,7 @@ def parse_arg():
         opts, args = getopt.getopt(sys.argv[1:], "h", ["help", "input=", "output=","ld="])
 
         if args:
-            print_log("不符合预期输入，请重试\n")
+            print_log("Unexpected arguments; please try again\n")
             print_help()
             exit(ERROR_CODE.COMMON_ERROR)
 
@@ -123,29 +123,29 @@ def parse_arg():
                 exit(ERROR_CODE.COMMON_SUCCESS)
             elif cmd in ("--input",):
                if not arg.startswith("/") or not os.path.exists(arg):
-                    print("[ERROR] 输入路径[%s]不是绝对路径或者不存在" % arg)
+                    print("[ERROR] Input path [%s] is not absolute or does not exist" % arg)
                     exit(ERROR_CODE.COMMON_ERROR)
                GLOBAL_CONF.origin_static_abs_path = arg
             elif cmd in ("--output",):
                 if not arg.startswith("/"):
-                    print("[ERROR] 输入路径[%s]不是绝对路径" % arg)
+                    print("[ERROR] Output path [%s] is not absolute" % arg)
                     exit(ERROR_CODE.COMMON_ERROR)
                 GLOBAL_CONF.target_static_abs_path = arg
             elif cmd in ("--ld",):
                 if not arg.startswith("/") or not os.path.exists(arg):
-                    print("[ERROR] 输入路径[%s]不是绝对路径或者不存在" % arg)
+                    print("[ERROR] Linker path [%s] is not absolute or does not exist" % arg)
                     exit(ERROR_CODE.COMMON_ERROR)
                 GLOBAL_CONF.ld_bin_abs_path = arg
             
     except getopt.GetoptError as ex:
-        print_log("[ERROR] getopt.GetoptError 解析参数失败，请合法输入, %s" % ex)
+        print_log("[ERROR] getopt.GetoptError: Failed to parse arguments; please provide valid arguments: %s" % ex)
         exit(ERROR_CODE.COMMON_ERROR)
     except ValueError as ex:
-        print_log("[ERROR] ValueError 解析参数失败，请合法输入, %s" % ex)
+        print_log("[ERROR] ValueError: Failed to parse arguments; please provide valid arguments: %s" % ex)
         exit(ERROR_CODE.COMMON_ERROR)
 
     if not GLOBAL_CONF.origin_static_abs_path or not GLOBAL_CONF.target_static_abs_path or not GLOBAL_CONF.ld_bin_abs_path:
-        print("[ERROR]输入参数不完整")
+        print("[ERROR] Missing required arguments")
         print_help()
         exit(ERROR_CODE.COMMON_ERROR)
 
@@ -176,16 +176,16 @@ def main():
     #   ar -qc hello.a 0/a.o 1/b.o 2/b.o
 
     static_lib_name = os.path.basename(GLOBAL_CONF.origin_static_abs_path)
-    print_log("开始使用链接器(%s)将bitcode obj(%s)转换为elf obj(%s)" % (GLOBAL_CONF.ld_bin_abs_path, GLOBAL_CONF.origin_static_abs_path, GLOBAL_CONF.target_static_abs_path))
+    print_log("Using linker (%s) to convert bitcode objects (%s) to ELF objects (%s)" % (GLOBAL_CONF.ld_bin_abs_path, GLOBAL_CONF.origin_static_abs_path, GLOBAL_CONF.target_static_abs_path))
     time.sleep(0.1)
     
     # 提取 目标文件
-    print_log("开始分析静态库%s..." % static_lib_name)
+    print_log("Analyzing static library %s..." % static_lib_name)
 
     result = shell_run_command("ar -t %s" % (GLOBAL_CONF.origin_static_abs_path))
     if result['return_code'] != ERROR_CODE.COMMON_SUCCESS:
         print(result['return_message'])
-        print_log("[ERROR]获取目标文件列表失败，运行命令为: %s" % result['cmd'])
+        print_log("[ERROR] Failed to list object files; command: %s" % result['cmd'])
         exit(ERROR_CODE.COMMON_ERROR)
 
     # 用于统计同名目标文件出现的次数
@@ -208,21 +208,21 @@ def main():
     # 创建工作目录
     result = shell_run_command("rm -rf %s && mkdir -p %s" % (GLOBAL_CONF.workspace, GLOBAL_CONF.workspace), need_print_all=False)
     if result['return_code'] != ERROR_CODE.COMMON_SUCCESS:
-        print_log("[ERROR]创建文件夹失败")
+        print_log("[ERROR] Failed to create workspace directory")
         exit(ERROR_CODE.COMMON_ERROR)
 
     # 开始解压文件
-    print_log("开始提取静态库%s..." % static_lib_name)
+    print_log("Extracting static library %s..." % static_lib_name)
     ar_after_object_list = []
     for one_object in all_object_list:
         result = shell_run_command("cd %s && rm -rf %s && mkdir -p %s && cd %s && ar -xN %s %s %s" % (GLOBAL_CONF.workspace, one_object['id'], one_object['id'], one_object['id'], one_object['count'], GLOBAL_CONF.origin_static_abs_path, one_object['object']))
         if result['return_code'] != ERROR_CODE.COMMON_SUCCESS:
             print(result['return_message'])
-            print_log("[ERROR]解压静态库失败, 运行命令为: %s" % result['cmd'])
+            print_log("[ERROR] Failed to extract static library; command: %s" % result['cmd'])
             exit(ERROR_CODE.COMMON_ERROR)
         ar_after_object_list.append(os.path.join(GLOBAL_CONF.workspace, str(one_object['id']), one_object['object']))
 
-    print_log("开始转换%s的目标文件..." % static_lib_name)
+    print_log("Converting object files from %s..." % static_lib_name)
     thread_list = list()
     # 开始bitcode转elfobj过程
     for one_object in ar_after_object_list:
@@ -238,7 +238,7 @@ def main():
         t.join()
 
     # 最后链接过程
-    print_log("开始链接静态库%s..." % static_lib_name)
+    print_log("Linking static library %s..." % static_lib_name)
     cmd_ar_finial = "rm -rf %s && ar qc %s " % (GLOBAL_CONF.target_static_abs_path, GLOBAL_CONF.target_static_abs_path)
     for one_object in ar_after_object_list:
         cmd_ar_finial += "%s " % one_object
@@ -246,10 +246,10 @@ def main():
     result = shell_run_command(cmd_ar_finial)
     if result['return_code'] != ERROR_CODE.COMMON_SUCCESS:
         print(result['return_message'])
-        print_log("[ERROR] 生成elf格式obj失败，运行命令为: %s" % result['cmd'])
+        print_log("[ERROR] Failed to generate ELF objects; command: %s" % result['cmd'])
         exit(ERROR_CODE.COMMON_ERROR)
 
-    print_log("生成静态库！路径位于位于:%s" % GLOBAL_CONF.target_static_abs_path)
+    print_log("Static library generated at: %s" % GLOBAL_CONF.target_static_abs_path)
     return ERROR_CODE.COMMON_SUCCESS
 
 if __name__ == '__main__':
