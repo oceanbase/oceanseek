@@ -19,9 +19,11 @@
 #undef private
 
 #include "lib/allocator/page_arena.h"
+#include "lib/checksum/ob_crc64.h"
 #include "lib/container/ob_array.h"
 #include "lib/mysqlclient/ob_mysql_transaction.h"
 #include "lib/mysqlclient/ob_single_connection_proxy.h"
+#include "lib/restore/ob_object_storage_base.h"
 #include "lib/time/ob_time_utility.h"
 #include "lib/utility/ob_defer.h"
 #include "observer/ob_inner_sql_connection.h"
@@ -35,6 +37,9 @@
 #include "sql/engine/ob_exec_context.h"
 #include "sql/ob_sql_context.h"
 #include "sql/ob_sql_utils.h"
+#include "storage/blocksstable/ob_object_manager.h"
+#include "storage/lob/common/ob_lob_context.h"
+#include "storage/lob/store/ob_lob_outtable_io.h"
 #include "storage/lob/store/ob_lob_store_common.h"
 #include "storage/lob/store/ob_outtable_lob_control_ctx.h"
 #include "storage/lob/store/ob_outtable_lob_control_manager.h"
@@ -343,6 +348,70 @@ void TestOuttableLobControlE2E::age_keys_(
     ASSERT_EQ(OB_SUCCESS, inner_proxy().write(tenant_id_, sql.ptr(), affected_rows));
     ASSERT_EQ(1, affected_rows);
   }
+}
+
+TEST_F(TestOuttableLobControlE2E, chunk_reader_rejects_crc_mismatch)
+{
+  using namespace blocksstable;
+  ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(OB_SYS_TENANT_ID));
+  schema::ObSchemaGetterGuard schema_guard;
+  const schema::ObTableSchema *control_schema = nullptr;
+  ASSERT_EQ(OB_SUCCESS, GCTX.schema_service_->get_tenant_schema_guard(MTL_ID(), schema_guard));
+  ASSERT_EQ(OB_SUCCESS, schema_guard.get_table_schema(MTL_ID(), ObString("oceanbase"),
+      ObString(OB_ALL_OUTTABLE_LOB_CONTROL_TNAME), false, control_schema));
+  ASSERT_NE(nullptr, control_schema);
+  ObTabletIDArray tablet_ids;
+  ASSERT_EQ(OB_SUCCESS, control_schema->get_tablet_ids(tablet_ids));
+  ASSERT_EQ(1, tablet_ids.count());
+
+  const ObString good_payload("outtable-a");
+  const ObString bad_payload("outtable-b");
+  ASSERT_EQ(good_payload.length(), bad_payload.length());
+  const uint64_t expected_crc = ob_crc64(good_payload.ptr(), good_payload.length());
+  ASSERT_NE(expected_crc, ob_crc64(bad_payload.ptr(), bad_payload.length()));
+
+  MacroBlockId good_id;
+  good_id.set_version_v1();
+  good_id.set_id_mode(static_cast<uint64_t>(ObMacroBlockIdMode::ID_MODE_SHARE));
+  good_id.set_storage_object_type(
+      static_cast<uint64_t>(ObStorageObjectType::SHARED_OUTTABLE_LOB_DATA_MACRO));
+  good_id.set_location(ObMacroBlockIdLocation::OBJECT_STORAGE);
+  good_id.set_second_id(ObTimeUtility::current_time_us());
+  good_id.set_third_id(tablet_ids.at(0).id());
+  good_id.set_fourth_id(1);
+  good_id.set_fifth_id(static_cast<int64_t>(expected_crc));
+  // Give the bad payload a separate object key with the good payload's CRC.
+  MacroBlockId bad_id = good_id;
+  bad_id.set_fourth_id(2);
+
+  const int64_t timeout_us = 60L * 1000L * 1000L;
+  ObObjectStorageTenantGuard storage_guard(MTL_ID(), timeout_us);
+  DEFER({
+    const int good_ret = ObObjectManager::delete_object(good_id, 0 /*ls_epoch*/);
+    const int bad_ret = ObObjectManager::delete_object(bad_id, 0 /*ls_epoch*/);
+    EXPECT_TRUE(OB_SUCCESS == good_ret || OB_OBJECT_NOT_EXIST == good_ret) << good_ret;
+    EXPECT_TRUE(OB_SUCCESS == bad_ret || OB_OBJECT_NOT_EXIST == bad_ret) << bad_ret;
+  });
+  ASSERT_EQ(OB_SUCCESS, ObLobOutTableIO::write(good_id, good_payload));
+  ASSERT_EQ(OB_SUCCESS, ObLobOutTableIO::write(bad_id, bad_payload));
+
+  ObArenaAllocator allocator("LobCrcTest");
+  ObLobReadContext read_ctx;
+  read_ctx.timeout_ = ObTimeUtility::current_time_us() + timeout_us;
+  ObLobOutTableChunkReader reader;
+  ASSERT_EQ(OB_SUCCESS, reader.open(&read_ctx));
+  ObLobMetaInfo meta;
+  ObString data;
+  meta.byte_len_ = good_payload.length();
+  ASSERT_EQ(OB_SUCCESS,
+      ObLobOutTableIO::serialize_macro_id(allocator, good_id, meta.lob_block_id_));
+  ASSERT_EQ(OB_SUCCESS, reader.read(meta, data));
+  ASSERT_EQ(good_payload, data);
+
+  ASSERT_EQ(OB_SUCCESS,
+      ObLobOutTableIO::serialize_macro_id(allocator, bad_id, meta.lob_block_id_));
+  EXPECT_EQ(OB_CHECKSUM_ERROR, reader.read(meta, data));
 }
 
 TEST_F(TestOuttableLobControlE2E, remote_owner_complete_rolls_back_with_t1)

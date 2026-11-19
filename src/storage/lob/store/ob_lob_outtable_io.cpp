@@ -8,6 +8,7 @@
 #include "storage/lob/store/ob_lob_outtable_io.h"
 
 #include "lib/allocator/ob_malloc.h"
+#include "lib/checksum/ob_crc64.h"
 #include "lib/worker.h"
 #include "lib/time/ob_time_utility.h"
 #include "storage/blocksstable/ob_object_manager.h"
@@ -606,6 +607,14 @@ int ObLobOutTableChunkReader::read(const ObLobMetaInfo &meta, ObString &data)
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected outtable lob object size", KR(ret), K(macro_id),
                "expected_size", meta.byte_len_, "actual_size", object_handle.get_data_size());
+    } else {
+      const uint64_t expected_crc = static_cast<uint64_t>(macro_id.fifth_id());
+      const uint64_t actual_crc = ob_crc64(data.ptr(), data.length());
+      if (OB_UNLIKELY(actual_crc != expected_crc)) {
+        ret = OB_CHECKSUM_ERROR;
+        LOG_WARN("outtable lob object crc mismatch", KR(ret), K(macro_id),
+                 K(expected_crc), K(actual_crc));
+      }
     }
   }
   return ret;
