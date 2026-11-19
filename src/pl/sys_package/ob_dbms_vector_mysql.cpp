@@ -2798,6 +2798,8 @@ static int trigger_async_task_impl(ObPLExecCtx &ctx,
           LOG_WARN("fail to get candidate schema", KR(ret), "table_id", simple_index_infos.at(i).table_id_);
         } else if (OB_ISNULL(candidate)) {
           // skip deleted / recycled tables
+        } else if (candidate->is_in_deleting()) {
+          // DROP renames auxiliary tables before removing them from the index list.
         } else if (!candidate->is_vec_index_id_type()) {
           // not vbitmap, skip
         } else {
