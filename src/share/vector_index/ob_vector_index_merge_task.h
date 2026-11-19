@@ -105,7 +105,8 @@ private:
       ObVectorIndexSegmentMeta &new_seg_meta,
       const ObVectorIndexMeta &old_meta);
   int refresh_adaptor();
-  int check_and_wait_write();
+  int check_and_wait_write(SCN &max_commit_scn);
+  int prepare_merge_scn(const SCN &max_commit_scn);
 
 private:
   int64_t min_vid_ {INT64_MAX};

@@ -1086,9 +1086,11 @@ TEST_F(TestVectorIndexMultiSegment, merge_wait_updates_snapshot_before_preparing
     roaring::api::roaring64_bitmap_add(adaptor_->vbitmap_data_->bitmap_->delete_bitmap_, 1);
     adaptor_->vbitmap_data_->scn_ = deletion_commit;
   }
-  ASSERT_EQ(OB_SUCCESS, task.check_and_wait_write());
-  EXPECT_GT(ctx.task_status_.target_scn_, initial);
-  EXPECT_GE(ctx.task_status_.target_scn_, deletion_commit);
+  SCN max_commit_scn;
+  ASSERT_EQ(OB_SUCCESS, task.check_and_wait_write(max_commit_scn));
+  EXPECT_GT(max_commit_scn, initial);
+  EXPECT_GE(max_commit_scn, deletion_commit);
+  EXPECT_EQ(initial, ctx.task_status_.target_scn_);
   ASSERT_EQ(OB_SUCCESS, adaptor_->refresh_segment_delete_counts());
   ASSERT_EQ(OB_SUCCESS, adaptor_->prepare_merge_policy_input(
       task.merge_source_meta_, task.merge_policy_input_, task.merge_config_));

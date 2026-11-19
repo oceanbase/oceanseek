@@ -263,4 +263,9 @@ ob_farm_observer(test_vector_index_freeze vector_index/test_vector_index_freeze.
 set_tests_properties(test_vector_index_freeze PROPERTIES TIMEOUT 600)
 ob_unittest_observer(test_ltable_cache_cleanup_retry vector_index/test_ltable_cache_cleanup_retry.cpp)
 ob_unittest_observer(test_spfresh_centroid_cas vector_index/test_spfresh_centroid_cas.cpp)
+if(OB_ERRSIM)
+  ob_farm_observer(test_vector_index_scn_guard
+    vector_index/test_vector_index_scn_guard.cpp ${VECTOR_INDEX_TEST_SHARE})
+  set_tests_properties(test_vector_index_scn_guard PROPERTIES TIMEOUT 600)
+endif()
 ####### vector index case #########

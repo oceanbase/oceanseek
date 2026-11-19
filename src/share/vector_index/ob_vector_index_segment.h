@@ -763,6 +763,8 @@ public:
       last_delta_refresh_scn_(),
       last_read_scn_(),
       last_dml_scn_(),
+      freeze_task_scn_(),
+      merge_task_scn_(),
       can_skip_(NOT_INITED)
   {
     ATOMIC_INC(&instacnce_cnt_);
@@ -780,6 +782,9 @@ public:
   SCN last_delta_refresh_scn_; // updated when delta buffer rows are deleted during refresh
   SCN last_read_scn_;
   SCN last_dml_scn_; // updated when primary table DML writes to delta buffer
+  // Highest SCN registered by each task type. Both are guarded by mem_data_rwlock_.
+  SCN freeze_task_scn_;
+  SCN merge_task_scn_;
   ObCanSkip3rdAnd4thVecIndex can_skip_;
 
 };

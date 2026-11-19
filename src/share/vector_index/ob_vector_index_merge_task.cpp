@@ -5,6 +5,7 @@
 #define USING_LOG_PREFIX SERVER
 #include "ob_vector_index_merge_task.h"
 #include "lib/roaringbitmap/ob_roaringbitmap.h"
+#include "lib/utility/ob_tracepoint.h"
 #include "share/vector_index/ob_plugin_vector_index_service.h"
 #include "share/vector_index/ob_vector_index_async_task_util.h"
 #include "share/vector_index/ob_vector_index_aux_table_handler.h"
@@ -22,6 +23,11 @@ namespace share
 {
 ERRSIM_POINT_DEF(ERRSIM_VEC_MERGE_BEFORE_EXCHANGE,
     "Inject an error before vector index merge exchange.");
+
+ERRSIM_POINT_DEF(ERRSIM_VEC_MERGE_SCN_EQUAL_FREEZE,
+                 "Use the registered freeze SCN for merge; match selects the incremental tablet.");
+ERRSIM_POINT_DEF(ERRSIM_VEC_MERGE_SCN_BEFORE_FREEZE,
+                 "Use a merge SCN older than the registered freeze SCN; match selects the incremental tablet.");
 
 int ObVecIdxMergeTaskExecutor::do_check_task_result(
     ObVecIndexAsyncTaskCtx *task_ctx,
@@ -888,6 +894,7 @@ int ObVecIdxMergeTask::check_and_merge(ObPluginVectorIndexAdapterGuard &adpt_gua
   ObVectorIndexParam target_param;
   bool need_alter_param_merge = false;
   bool need_merge = false;
+  SCN max_commit_scn;
 
   // prepare adaptor
   if (is_alter_param && OB_FAIL(prepare_alter_param_merge(
@@ -906,7 +913,7 @@ int ObVecIdxMergeTask::check_and_merge(ObPluginVectorIndexAdapterGuard &adpt_gua
   } else if (!ctx_->task_status_.target_scn_.is_valid()
              && OB_FAIL(get_current_scn(ctx_->task_status_.target_scn_))) {
     LOG_WARN("fail to get scn", KR(ret));
-  } else if (OB_FAIL(check_and_wait_write())) {
+  } else if (OB_FAIL(check_and_wait_write(max_commit_scn))) {
     LOG_WARN("fail to check and wait write", KR(ret));
   }
   CHECK_TASK_CANCELLED(ret, ctx_);
@@ -942,6 +949,8 @@ int ObVecIdxMergeTask::check_and_merge(ObPluginVectorIndexAdapterGuard &adpt_gua
   if (OB_FAIL(ret)) {
   } else if (!need_merge) {
     LOG_INFO("merge recheck has no plan, finish task", KPC(ctx_));
+  } else if (OB_FAIL(prepare_merge_scn(max_commit_scn))) {
+    LOG_WARN("failed to prepare merge SCN", K(ret), K(max_commit_scn), KPC(ctx_));
   } else if (OB_FAIL(execute_merge())) {
     LOG_WARN("merge incr fail", K(ret), KPC(ctx_));
   } else {
@@ -1626,7 +1635,41 @@ int ObVecIdxMergeTask::refresh_adaptor()
   return ret;
 }
 
-int ObVecIdxMergeTask::check_and_wait_write()
+int ObVecIdxMergeTask::prepare_merge_scn(const SCN &max_commit_scn)
+{
+  int ret = OB_SUCCESS;
+  const ObVecIdxActiveDataHandle &incr_data = old_adapter_->get_incr_data();
+  if (!incr_data.is_valid() || !max_commit_scn.is_valid()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid merge SCN state", K(ret), K(max_commit_scn), K(incr_data));
+  } else {
+    TCWLockGuard guard(incr_data->mem_data_rwlock_);
+    SCN merge_scn = max_commit_scn;
+    const SCN &freeze_task_scn = incr_data->freeze_task_scn_;
+#ifdef ERRSIM
+    if (freeze_task_scn.is_valid()) {
+      if (OB_SUCCESS != ERRSIM_VEC_MERGE_SCN_EQUAL_FREEZE.test(old_adapter_->get_inc_tablet_id().id())) {
+        merge_scn = freeze_task_scn;
+      } else if (OB_SUCCESS != ERRSIM_VEC_MERGE_SCN_BEFORE_FREEZE.test(old_adapter_->get_inc_tablet_id().id())) {
+        merge_scn = SCN::scn_dec(freeze_task_scn);
+      }
+    }
+#endif
+    if (freeze_task_scn.is_valid() && merge_scn <= freeze_task_scn) {
+      ret = OB_EAGAIN;
+      LOG_INFO("merge SCN overlaps freeze registration, retry later",
+               K(ret), K(merge_scn), K(freeze_task_scn), KPC(ctx_));
+    } else {
+      if (!incr_data->merge_task_scn_.is_valid() || incr_data->merge_task_scn_ < merge_scn) {
+        incr_data->merge_task_scn_ = merge_scn;
+      }
+      ctx_->task_status_.target_scn_ = merge_scn;
+    }
+  }
+  return ret;
+}
+
+int ObVecIdxMergeTask::check_and_wait_write(SCN &snapshot_version)
 {
   int ret = OB_SUCCESS;
   const static int64_t WAIT_US = 100 * 1000; // 100ms
@@ -1637,7 +1680,6 @@ int ObVecIdxMergeTask::check_and_wait_write()
   const ObLSID &ls_id = ls_id_;
   transaction::ObTransService *txs = MTL(transaction::ObTransService *);
   ObLSService *ls_service = MTL(ObLSService *);
-  SCN snapshot_version;
   transaction::ObTransID tx_id;
   ObLSHandle ls_handle;
   int64_t loop_cnt = 0;
@@ -1658,7 +1700,6 @@ int ObVecIdxMergeTask::check_and_wait_write()
     } else if (OB_FAIL(txs->get_max_commit_version(snapshot_version))) {
       LOG_WARN("fail to get max commit version", K(ret));
     } else {
-      ctx_->task_status_.target_scn_ = snapshot_version;
       LOG_INFO("check success", K(snapshot_version), K(data_tablet_id), K(wait_threshold_us), K(tx_id));
     }
     ++check_cnt;

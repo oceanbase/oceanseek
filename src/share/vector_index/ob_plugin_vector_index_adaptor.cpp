@@ -64,6 +64,12 @@ static common::ObOpProfile<common::ObMetric> *get_current_vector_iter_profile()
 }
 
 ERRSIM_POINT_DEF(ERRSIM_VEC_DISABLE_MERGE, "When set, check_need_merge always returns false and vector index merge is disabled.");
+ERRSIM_POINT_DEF(ERRSIM_VEC_FREEZE_SCN_EQUAL_MERGE,
+                 "Use the registered merge SCN for freeze; match selects the incremental tablet.");
+ERRSIM_POINT_DEF(ERRSIM_VEC_FREEZE_SCN_BEFORE_MERGE,
+                 "Use a freeze SCN older than the registered merge SCN; match selects the incremental tablet.");
+ERRSIM_POINT_DEF(ERRSIM_VEC_FREEZE_PERSIST_FAILED,
+                 "Fail before persisting the frozen segment; match selects the incremental tablet.");
 ERRSIM_POINT_DEF(ERRSIM_VEC_HNSW_BQ_RESET_INCR_DATA_BEFORE_QUERY,
                  "When set, reset HNSW_BQ incremental memory before query to test query-side completion.");
 ERRSIM_POINT_DEF(ERRSIM_VEC_HNSW_COMPLETE_DELETED_VIDS,
@@ -8009,20 +8015,40 @@ int ObPluginVectorIndexAdaptor::freeze_active_segment(
     LOG_WARN("failed to create incr active segment", K(ret));
   } else {
     TCWLockGuard lock_guard(incr_data_->mem_data_rwlock_);
-    // 查询时, 读incr_data时会加读锁, 所以在frozen设置, 但是incr未设置时, 一个segment查询两次
-    frozen_data_->segment_handle_ = incr_data_->segment_handle_;
-    // same with vbitmap_data before 3->4 refresh finish
-    frozen_data_->vbitmap_ = vbitmap_data_;
-    frozen_data_->frozen_scn_ = frozen_scn;
-    incr_data_->segment_handle_ = new_segment;
+    const SCN &merge_task_scn = incr_data_->merge_task_scn_;
+#ifdef ERRSIM
+    if (merge_task_scn.is_valid()) {
+      if (OB_SUCCESS != ERRSIM_VEC_FREEZE_SCN_EQUAL_MERGE.test(get_inc_tablet_id().id())) {
+        frozen_scn = merge_task_scn;
+      } else if (OB_SUCCESS != ERRSIM_VEC_FREEZE_SCN_BEFORE_MERGE.test(get_inc_tablet_id().id())) {
+        frozen_scn = SCN::scn_dec(merge_task_scn);
+      }
+    }
+#endif
+    if (merge_task_scn.is_valid() && frozen_scn <= merge_task_scn) {
+      ret = OB_EAGAIN;
+      LOG_INFO("freeze SCN overlaps merge registration, retry later",
+               K(ret), K(ls_id), K_(inc_tablet_id), K(frozen_scn), K(merge_task_scn));
+    } else {
+      SCN &freeze_task_scn = incr_data_->freeze_task_scn_;
+      if (!freeze_task_scn.is_valid() || freeze_task_scn < frozen_scn) {
+        freeze_task_scn = frozen_scn;
+      }
+      // 查询时, 读incr_data时会加读锁, 所以在frozen设置, 但是incr未设置时, 一个segment查询两次
+      frozen_data_->segment_handle_ = incr_data_->segment_handle_;
+      // same with vbitmap_data before 3->4 refresh finish
+      frozen_data_->vbitmap_ = vbitmap_data_;
+      frozen_data_->frozen_scn_ = frozen_scn;
+      incr_data_->segment_handle_ = new_segment;
 
-    frozen_data_->set_has_frozen();
-    int64_t seg_cnt = 0;
-    int64_t seg_min_vid = INT64_MAX;
-    int64_t seg_max_vid = 0;
-    frozen_data_->segment_handle_->get_index_number(seg_cnt);
-    frozen_data_->segment_handle_->get_vid_bound(seg_min_vid, seg_max_vid);
-    LOG_INFO("freeze active segment success", K(seg_cnt), K(seg_min_vid), K(seg_max_vid), K(frozen_data_));
+      frozen_data_->set_has_frozen();
+      int64_t seg_cnt = 0;
+      int64_t seg_min_vid = INT64_MAX;
+      int64_t seg_max_vid = 0;
+      frozen_data_->segment_handle_->get_index_number(seg_cnt);
+      frozen_data_->segment_handle_->get_vid_bound(seg_min_vid, seg_max_vid);
+      LOG_INFO("freeze active segment success", K(seg_cnt), K(seg_min_vid), K(seg_max_vid), K(frozen_data_));
+    }
   }
 
   if (OB_FAIL(ret)) {
@@ -8383,6 +8409,12 @@ int ObPluginVectorIndexAdaptor::persist_incr_segment(
   ctx.ls_id_ = ls_id;
   ctx.data_tablet_id_ = get_snap_tablet_id();
   ObVecIdxSnapTableSegAddOp snap_table_handler(tenant_id_);
+#ifdef ERRSIM
+  if (OB_FAIL(ERRSIM_VEC_FREEZE_PERSIST_FAILED.test(get_inc_tablet_id().id()))) {
+    LOG_WARN("errsim fail to persist frozen segment", K(ret), K(ls_id), K_(inc_tablet_id), K(target_scn));
+    return ret;
+  }
+#endif
   if (OB_FAIL(ObVectorIndexTableHelper::create_inner_session(
       tenant_id_, false, free_session_ctx, session))) {
     LOG_WARN("failed to create vector persist session", K(ret), K(tenant_id_));
