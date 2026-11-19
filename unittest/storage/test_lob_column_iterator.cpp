@@ -15,6 +15,10 @@
 #include "storage/tablet/ob_tablet.h"
 #include "storage/tablet/ob_tablet_create_sstable_param.h"
 #include "lib/utility/ob_defer.h"
+#include "lib/utility/utility.h"
+#include "storage/lob/store/ob_lob_store_common.h"
+#include "storage/lob/store/ob_lob_outtable_io.h"
+#include "storage/ss_garbage_collector/ob_ss_mark_sweep_macro_id_iterator.h"
 #undef private
 #undef protected
 
@@ -72,11 +76,23 @@ public:
     }
   };
 
-  void create_empty_sstable(const ObStorageSchema &schema, ObTableHandleV2 &handle)
+  void create_empty_sstable(const ObStorageSchema &schema, ObTableHandleV2 &handle,
+      const int64_t snapshot = 100, const ObITable::TableType table_type = ObITable::MAJOR_SSTABLE)
   {
     ObTabletCreateSSTableParam param;
     ASSERT_EQ(OB_SUCCESS, param.init_for_empty_major_sstable(ObTabletID(200001), schema,
-        100 /*snapshot*/, -1 /*cg_idx*/, false, false));
+        snapshot, -1 /*cg_idx*/, false, false));
+    param.table_key_.table_type_ = table_type;
+    if (ObITable::is_table_with_scn_range(table_type)) {
+      ASSERT_EQ(OB_SUCCESS, param.table_key_.scn_range_.start_scn_.convert_for_tx(snapshot - 1));
+      ASSERT_EQ(OB_SUCCESS, param.table_key_.scn_range_.end_scn_.convert_for_tx(snapshot));
+      param.filled_tx_scn_ = param.table_key_.scn_range_.end_scn_;
+    }
+    if (ObITable::INC_MAJOR_SSTABLE == table_type) {
+      ASSERT_EQ(OB_SUCCESS, param.uncommit_tx_info_.push_back(compaction::ObUncommitTxDesc(1001, 0)));
+      param.uncommit_tx_info_.set_info_status_record_seq();
+      param.ddl_scn_.set_base();
+    }
     void *buffer = allocator_.alloc(sizeof(ObSSTable));
     ASSERT_NE(nullptr, buffer);
     ObSSTable *table = new (buffer) ObSSTable();
@@ -87,8 +103,261 @@ public:
     owned = true;
   }
 
+  void prepare_stats_tablet(TabletFixture &f, const bool is_meta)
+  {
+    ObTableSchema schema;
+    schema.set_tenant_id(OB_SYS_TENANT_ID);
+    schema.set_database_id(OB_SYS_DATABASE_ID);
+    ASSERT_EQ(OB_SUCCESS, is_meta ? share::ObInnerTableSchema::all_tenant_profile_aux_lob_meta_schema(schema)
+        : share::all_outtable_lob_control_schema(schema));
+    schema.set_table_id(500001);
+    schema.set_schema_version(100);
+    ASSERT_EQ(OB_SUCCESS, f.schema_.init(allocator_, schema, lib::Worker::CompatMode::MYSQL));
+    f.bind();
+  }
+
+  class RowReader : public ObIMicroBlockReader
+  {
+  public:
+    int get_row(const int64_t index, ObDatumRow &row) override
+    {
+      ObCostTimer timer(read_cost_us_);
+      usleep(1000);
+      return index == error_index_ ? OB_IO_ERROR : row.shallow_copy_with_local_storage_datum(*rows_.at(index));
+    }
+    bool has_lob_out_row() const override { return false; }
+    const ObMicroBlockHeader *get_micro_header() const override { return nullptr; }
+    ObSEArray<const ObDatumRow *, 6> rows_;
+    int64_t error_index_ = -1;
+    int64_t read_cost_us_ = 0;
+  };
+
+  void attach_rows(ObLobColumnIterator &iter, ObSSTable &table, RowReader &reader)
+  {
+    // Supply rows at the micro-reader boundary; use the real column and macro-id iterators.
+    ASSERT_EQ(nullptr, iter.macro_iter_);
+    iter.macro_iter_ = OB_NEWx(ObMacroBlockRowBareIterator, &iter.macro_allocator_, iter.macro_allocator_);
+    ASSERT_NE(nullptr, iter.macro_iter_);
+    ObMacroBlockRowBareIterator &macro = *iter.macro_iter_;
+    ASSERT_EQ(OB_SUCCESS, macro.row_.init(iter.macro_allocator_, iter.column_count_));
+    macro.micro_reader_ = &reader;
+    macro.curr_block_row_idx_ = 0;
+    macro.curr_block_row_cnt_ = reader.rows_.count();
+    macro.is_inited_ = true;
+    macro.micro_iter_.is_inited_ = true;
+    macro.micro_iter_.iter_idx_ = 0;
+    macro.micro_iter_.end_idx_ = -1;
+    ASSERT_EQ(OB_SUCCESS, iter.macro_ids_.init(nullptr, 0, ObMacroIdIterator::DATA_BLOCK));
+    iter.sstable_ = &table;
+    iter.sstable_scan_start_us_ = ObTimeUtility::current_time_us();
+    iter.has_macro_ = true;
+  }
+
   ObArenaAllocator allocator_;
 };
+
+TEST_F(TestLobColumnIterator, scan_stats_classify_sstables_without_counting_rows)
+{
+  const ObITable::TableType types[] = {ObITable::MAJOR_SSTABLE, ObITable::INC_MAJOR_SSTABLE,
+      ObITable::MINOR_SSTABLE, ObITable::MINI_SSTABLE, ObITable::DDL_DUMP_SSTABLE};
+  const int categories[] = {0, 0, 1, 2, 3};
+  for (int64_t type_idx = 0; type_idx < ARRAYSIZEOF(types); ++type_idx) {
+    SCOPED_TRACE(testing::Message() << "type=" << types[type_idx]);
+    TabletFixture f;
+    prepare_stats_tablet(f, true);
+    ObSEArray<ObColDesc, 16> physical;
+    ObSEArray<ObColDesc, 1> columns;
+    ASSERT_EQ(OB_SUCCESS, f.schema_.get_multi_version_column_descs(physical));
+    ASSERT_EQ(OB_SUCCESS, columns.push_back(physical.at(0)));
+    ObDatumRow source;
+    ASSERT_EQ(OB_SUCCESS, source.init(allocator_, physical.count()));
+    source.row_flag_.set_flag(DF_INSERT);
+    source.storage_datums_[0].set_string("row", 3);
+    // Physical scanning must not parse info just to collect statistics.
+    source.storage_datums_[7].set_string("invalid json", 12);
+    RowReader reader;
+    ASSERT_EQ(OB_SUCCESS, reader.rows_.push_back(&source));
+    ObSSTable table;
+    table.key_.table_type_ = types[type_idx];
+    ObLobColumnIterator iter;
+    ASSERT_EQ(OB_SUCCESS, iter.init(f.tablet_, columns, false));
+    int64_t *costs[] = {&iter.major_scan_cost_us_, &iter.minor_scan_cost_us_,
+        &iter.mini_scan_cost_us_, &iter.other_scan_cost_us_};
+    for (const auto cost : costs) { ASSERT_EQ(0, *cost); }
+    attach_rows(iter, table, reader);
+    const ObDatumRow *row = nullptr;
+    ASSERT_EQ(OB_SUCCESS, iter.get_next_row(row));
+    ASSERT_EQ(0, *costs[categories[type_idx]]);
+    int64_t caller_cost_us = 0;
+    if (0 == type_idx) {
+      const int64_t start_us = ObTimeUtility::current_time_us();
+      usleep(2000);
+      caller_cost_us = ObTimeUtility::current_time_us() - start_us;
+    }
+    ASSERT_EQ(OB_ITER_END, iter.get_next_row(row));
+    ASSERT_EQ(nullptr, row);
+    ASSERT_EQ(0, iter.outtable_row_count_);
+    ASSERT_EQ(0, iter.non_outtable_row_count_);
+    for (int64_t category = 0; category < ARRAYSIZEOF(costs); ++category) {
+      if (categories[type_idx] == category) {
+        ASSERT_GE(*costs[category], reader.read_cost_us_ + caller_cost_us);
+        ASSERT_GT(*costs[category], 0);
+      } else {
+        ASSERT_EQ(0, *costs[category]);
+      }
+    }
+    const int64_t completed_cost_us = *costs[categories[type_idx]];
+    ASSERT_EQ(0, iter.sstable_scan_start_us_);
+    ASSERT_EQ(OB_ITER_END, iter.get_next_row(row));
+    ASSERT_EQ(completed_cost_us, *costs[categories[type_idx]]);
+  }
+}
+
+TEST_F(TestLobColumnIterator, gc_counts_decoded_meta_rows_and_excludes_failed_references)
+{
+  TabletFixture f;
+  prepare_stats_tablet(f, true);
+  ObDatumRow rows[4];
+  RowReader reader;
+  for (auto &row : rows) {
+    ASSERT_EQ(OB_SUCCESS, row.init(allocator_, 9));
+    row.row_flag_.set_flag(DF_INSERT);
+    row.storage_datums_[8].set_null();
+    ASSERT_EQ(OB_SUCCESS, reader.rows_.push_back(&row));
+  }
+  ObLobMetaExtraInfo info;
+  ObString encoded;
+  info.extra_info_type_ = ObLobMetaExtraInfo::LOB_DATA;
+  info.lob_chunk_type_.set_in_table();
+  ASSERT_EQ(OB_SUCCESS, info.serialize(allocator_, encoded));
+  rows[0].storage_datums_[7].set_string(encoded);
+  info.extra_info_type_ = ObLobMetaExtraInfo::LOB_META_SUMMARY;
+  info.lob_chunk_type_.set_out_table();
+  info.compressed_len_ = 1;
+  ASSERT_EQ(OB_SUCCESS, info.serialize(allocator_, encoded));
+  rows[1].storage_datums_[7].set_string(encoded);
+  info.extra_info_type_ = ObLobMetaExtraInfo::LOB_DATA;
+  info.has_crc_ = true;
+  info.crc_ = 0;
+  ASSERT_EQ(OB_SUCCESS, info.serialize(allocator_, encoded));
+  rows[2].storage_datums_[7].set_string(encoded);
+  rows[3].storage_datums_[7].set_string(encoded);
+  MacroBlockId expected;
+  expected.set_id_mode(static_cast<uint64_t>(ObMacroBlockIdMode::ID_MODE_SHARE));
+  expected.set_storage_object_type(static_cast<uint64_t>(ObStorageObjectType::SHARED_OUTTABLE_LOB_DATA_MACRO));
+  expected.set_location(ObMacroBlockIdLocation::OBJECT_STORAGE);
+  expected.set_second_id(100);
+  expected.set_third_id(1001);
+  expected.set_fourth_id(1);
+  expected.set_fifth_id(0);
+  ASSERT_EQ(OB_SUCCESS, ObLobOutTableIO::serialize_macro_id(allocator_, expected, encoded));
+  rows[2].storage_datums_[8].set_string(encoded);
+  ObSSTable table;
+  table.key_.table_type_ = ObITable::MINOR_SSTABLE;
+  ObSSMarkSweepMacroIDIterator gc_iter;
+  ASSERT_EQ(OB_SUCCESS, gc_iter.init_user_iterator_(f.tablet_));
+  ObLobColumnIterator *columns = gc_iter.out_table_data_iter_;
+  ASSERT_NE(nullptr, columns);
+  attach_rows(*columns, table, reader);
+  MacroBlockId id;
+  ASSERT_EQ(OB_SUCCESS, gc_iter.get_next_user_macro_id_(id));
+  ASSERT_EQ(expected, id);
+  ASSERT_EQ(1, columns->outtable_row_count_);
+  ASSERT_EQ(2, columns->non_outtable_row_count_);
+  // The final row has a known OutTable type but no reference; failed decoding is not counted.
+  ASSERT_EQ(OB_ERR_UNEXPECTED, gc_iter.get_next_user_macro_id_(id));
+  ASSERT_EQ(1, columns->outtable_row_count_);
+  ASSERT_EQ(2, columns->non_outtable_row_count_);
+}
+
+TEST_F(TestLobColumnIterator, scan_stats_read_failure_does_not_settle_time)
+{
+  TabletFixture f;
+  prepare_stats_tablet(f, false);
+  ObSEArray<ObColDesc, 16> physical;
+  ObSEArray<ObColDesc, 1> columns;
+  ASSERT_EQ(OB_SUCCESS, f.schema_.get_multi_version_column_descs(physical));
+  ASSERT_EQ(OB_SUCCESS, columns.push_back(physical.at(0)));
+  ObDatumRow source;
+  ASSERT_EQ(OB_SUCCESS, source.init(allocator_, physical.count()));
+  source.row_flag_.set_flag(DF_INSERT);
+  source.storage_datums_[0].set_string("row", 3);
+  RowReader reader;
+  ASSERT_EQ(OB_SUCCESS, reader.rows_.push_back(&source));
+  ASSERT_EQ(OB_SUCCESS, reader.rows_.push_back(&source));
+  reader.error_index_ = 1;
+  ObSSTable table;
+  table.key_.table_type_ = ObITable::MINOR_SSTABLE;
+  ObLobColumnIterator iter;
+  ASSERT_EQ(OB_SUCCESS, iter.init(f.tablet_, columns, false));
+  attach_rows(iter, table, reader);
+  const ObDatumRow *row = nullptr;
+  ASSERT_EQ(OB_SUCCESS, iter.get_next_row(row));
+  ASSERT_EQ(OB_IO_ERROR, iter.get_next_row(row));
+  ASSERT_EQ(nullptr, row);
+  ASSERT_EQ(0, iter.outtable_row_count_);
+  ASSERT_EQ(0, iter.non_outtable_row_count_);
+  ASSERT_EQ(0, iter.minor_scan_cost_us_);
+  ASSERT_EQ(0, iter.major_scan_cost_us_);
+  ASSERT_EQ(0, iter.mini_scan_cost_us_);
+  ASSERT_EQ(0, iter.other_scan_cost_us_);
+}
+
+TEST_F(TestLobColumnIterator, scan_stats_switch_sstables_and_skip_cached_files)
+{
+  for (const bool cached_major : {false, true}) {
+    SCOPED_TRACE(testing::Message() << "cached_major=" << cached_major);
+    TabletFixture f;
+    prepare_schema(f.schema_, AUX_LOB_META);
+    ObTableHandleV2 major;
+    ObTableHandleV2 minor;
+    create_empty_sstable(f.schema_, major, 100, ObITable::MAJOR_SSTABLE);
+    create_empty_sstable(f.schema_, minor, 200, ObITable::MINOR_SSTABLE);
+    ObSEArray<ObITable *, 1> major_tables;
+    ObSEArray<ObITable *, 1> minor_tables;
+    ASSERT_EQ(OB_SUCCESS, major_tables.push_back(major.get_table()));
+    ASSERT_EQ(OB_SUCCESS, minor_tables.push_back(minor.get_table()));
+    ASSERT_EQ(OB_SUCCESS, f.store_.major_tables_.init(allocator_, major_tables));
+    ASSERT_EQ(OB_SUCCESS, f.store_.minor_tables_.init(allocator_, minor_tables));
+    f.bind();
+    ObSEArray<ObColDesc, 16> columns;
+    ASSERT_EQ(OB_SUCCESS, f.schema_.get_multi_version_column_descs(columns));
+    ObLobSSTableScanCache cache;
+    if (cached_major) { ASSERT_EQ(OB_SUCCESS, cache.add(major.get_table()->get_key())); }
+    ObLobColumnIterator iter;
+    ASSERT_EQ(OB_SUCCESS, iter.init_with_scan_cache(f.tablet_, columns, false, cache));
+    ASSERT_EQ(OB_SUCCESS, iter.open_next_sstable_());
+    ASSERT_EQ(cached_major ? f.store_.minor_tables_[0] : f.store_.major_tables_[0], iter.sstable_);
+    ASSERT_GT(iter.sstable_scan_start_us_, 0);
+    ASSERT_EQ(0, iter.major_scan_cost_us_);
+    ASSERT_EQ(0, iter.minor_scan_cost_us_);
+    const int64_t caller_start_us = ObTimeUtility::current_time_us();
+    usleep(2000);
+    const int64_t caller_cost_us = ObTimeUtility::current_time_us() - caller_start_us;
+    const ObDatumRow *row = nullptr;
+    const int64_t scan_start_us = ObTimeUtility::current_time_us();
+    ASSERT_EQ(OB_ITER_END, iter.get_next_row(row));
+    const int64_t scan_cost_us = ObTimeUtility::current_time_us() - scan_start_us;
+    ASSERT_EQ(nullptr, row);
+    ASSERT_EQ(nullptr, iter.sstable_);
+    ASSERT_EQ(0, iter.sstable_scan_start_us_);
+    if (cached_major) {
+      ASSERT_EQ(0, iter.major_scan_cost_us_);
+      ASSERT_GE(iter.minor_scan_cost_us_, caller_cost_us);
+    } else {
+      ASSERT_GE(iter.major_scan_cost_us_, caller_cost_us);
+      // The next file must not inherit time spent on the previous file.
+      ASSERT_LE(iter.minor_scan_cost_us_, scan_cost_us);
+    }
+    ASSERT_EQ(0, iter.mini_scan_cost_us_);
+    ASSERT_EQ(0, iter.other_scan_cost_us_);
+    const int64_t completed_major_cost = iter.major_scan_cost_us_;
+    const int64_t completed_minor_cost = iter.minor_scan_cost_us_;
+    ASSERT_EQ(OB_ITER_END, iter.get_next_row(row));
+    ASSERT_EQ(completed_major_cost, iter.major_scan_cost_us_);
+    ASSERT_EQ(completed_minor_cost, iter.minor_scan_cost_us_);
+  }
+}
 
 // LOB-COL-U001
 TEST_F(TestLobColumnIterator, schema_projection_and_request_validation)
@@ -392,6 +661,12 @@ TEST_F(TestLobColumnIterator, uninitialized_tablet_leaves_iterator_unreadable)
   const ObDatumRow *row = nullptr;
   ASSERT_EQ(OB_NOT_INIT, iter.get_next_row(row));
   ASSERT_EQ(nullptr, row);
+
+  ObLobSSTableScanCache cache;
+  ObLobColumnIterator cached_iter;
+  ASSERT_EQ(OB_NOT_INIT, cached_iter.init_with_scan_cache(tablet, columns, false, cache));
+  ASSERT_EQ(nullptr, cached_iter.scan_cache_);
+  ASSERT_EQ(OB_NOT_INIT, cached_iter.get_next_row(row));
 }
 
 // LOB-COL-U007: invalid requests leave the iterator unreadable.
@@ -449,12 +724,26 @@ TEST_F(TestLobColumnIterator, public_empty_tablet_and_iterator_lifecycle)
     ObSEArray<ObColDesc, 16> columns;
     ASSERT_EQ(OB_SUCCESS, f.schema_.get_multi_version_column_descs(columns));
     {
+      ObLobSSTableScanCache cache;
       ObLobColumnIterator iter;
       ASSERT_EQ(OB_SUCCESS, iter.init(f.tablet_, columns, false));
       ASSERT_EQ(OB_INIT_TWICE, iter.init(f.tablet_, columns, false));
+      ASSERT_EQ(OB_INIT_TWICE, iter.init_with_scan_cache(f.tablet_, columns, false, cache));
+      ASSERT_EQ(nullptr, iter.scan_cache_);
       const ObDatumRow *row = nullptr;
       ASSERT_EQ(OB_ITER_END, iter.get_next_row(row));
       ASSERT_EQ(nullptr, row);
+      ASSERT_EQ(OB_ITER_END, iter.get_next_row(row));
+    }
+    {
+      ObLobSSTableScanCache cache;
+      ObLobSSTableScanCache other_cache;
+      ObLobColumnIterator iter;
+      ASSERT_EQ(OB_SUCCESS, iter.init_with_scan_cache(f.tablet_, columns, false, cache));
+      ASSERT_EQ(OB_INIT_TWICE, iter.init(f.tablet_, columns, false));
+      ASSERT_EQ(OB_INIT_TWICE, iter.init_with_scan_cache(f.tablet_, columns, false, other_cache));
+      ASSERT_EQ(&cache, iter.scan_cache_);
+      const ObDatumRow *row = nullptr;
       ASSERT_EQ(OB_ITER_END, iter.get_next_row(row));
     }
     {
@@ -669,6 +958,204 @@ TEST_F(TestLobColumnIterator, multiple_empty_sstables)
   ASSERT_EQ(OB_ITER_END, iter.get_next_row(row));
 }
 
+TEST_F(TestLobColumnIterator, scan_cache_only_deduplicates_major_and_inc_major)
+{
+  for (const auto table_type : {ObITable::MAJOR_SSTABLE, ObITable::INC_MAJOR_SSTABLE,
+      ObITable::MINOR_SSTABLE, ObITable::MINI_SSTABLE}) {
+    SCOPED_TRACE(testing::Message() << "table_type=" << static_cast<int>(table_type));
+    const bool should_cache = ObITable::MAJOR_SSTABLE == table_type
+        || ObITable::INC_MAJOR_SSTABLE == table_type;
+    TabletFixture v1;
+    TabletFixture v2;
+    prepare_schema(v1.schema_, AUX_LOB_META);
+    prepare_schema(v2.schema_, AUX_LOB_META);
+    ObTableHandleV2 file;
+    create_empty_sstable(v1.schema_, file, 100, table_type);
+    ASSERT_NE(nullptr, file.get_table());
+    v1.bind();
+    v2.bind();
+    ObSEArray<ObITable *, 1> tables;
+    ASSERT_EQ(OB_SUCCESS, tables.push_back(file.get_table()));
+    for (TabletFixture *version : {&v1, &v2}) {
+      ObSSTableArray &array = ObITable::MAJOR_SSTABLE == table_type ? version->store_.major_tables_
+          : ObITable::INC_MAJOR_SSTABLE == table_type ? version->store_.inc_major_tables_
+          : version->store_.minor_tables_;
+      ASSERT_EQ(OB_SUCCESS, array.init(allocator_, tables));
+    }
+    ObSEArray<ObColDesc, 16> columns;
+    ASSERT_EQ(OB_SUCCESS, v1.schema_.get_multi_version_column_descs(columns));
+    ObLobSSTableScanCache cache;
+    const ObDatumRow *row = nullptr;
+    {
+      ObLobColumnIterator iter;
+      ASSERT_EQ(OB_SUCCESS, iter.init_with_scan_cache(v1.tablet_, columns, false, cache));
+      ASSERT_EQ(OB_ITER_END, iter.get_next_row(row));
+    }
+    ASSERT_EQ(should_cache, cache.contains(file.get_table()->get_key()));
+    ASSERT_EQ(should_cache, cache.scanned_sstables_.created());
+
+    ObLobColumnIterator next_version;
+    ASSERT_EQ(OB_SUCCESS, next_version.init_with_scan_cache(v2.tablet_, columns, false, cache));
+    // The same Minor/Mini file must be reopened in each version; Major/IncMajor is skipped.
+    ASSERT_EQ(should_cache ? OB_ITER_END : OB_SUCCESS, next_version.open_next_sstable_());
+    if (!should_cache) {
+      ASSERT_EQ(v2.store_.minor_tables_[0], next_version.sstable_);
+      ASSERT_EQ(OB_ITER_END, next_version.get_next_row(row));
+      ASSERT_FALSE(cache.scanned_sstables_.created());
+    }
+  }
+}
+
+TEST_F(TestLobColumnIterator, scan_cache_rejects_other_sstable_types)
+{
+  ObLobSSTableScanCache cache;
+  ObITable::TableKey key;
+  key.tablet_id_ = ObTabletID(200001);
+  key.version_range_.snapshot_version_ = 100;
+  for (const auto table_type : {ObITable::MINOR_SSTABLE, ObITable::MINI_SSTABLE,
+      ObITable::META_MAJOR_SSTABLE, ObITable::DDL_DUMP_SSTABLE,
+      ObITable::COLUMN_ORIENTED_SSTABLE, ObITable::INC_INV_INDEX_SSTABLE}) {
+    SCOPED_TRACE(testing::Message() << "table_type=" << static_cast<int>(table_type));
+    key.table_type_ = table_type;
+    ASSERT_EQ(OB_SUCCESS, cache.add(key));
+    ASSERT_FALSE(cache.contains(key));
+    ASSERT_FALSE(cache.scanned_sstables_.created());
+  }
+}
+
+TEST_F(TestLobColumnIterator, scan_cache_does_not_remember_unfinished_or_failed_files)
+{
+  TabletFixture f;
+  prepare_schema(f.schema_, AUX_LOB_META);
+  ObTableHandleV2 file;
+  create_empty_sstable(f.schema_, file);
+  f.bind();
+  ObSEArray<ObITable *, 1> tables;
+  ASSERT_EQ(OB_SUCCESS, tables.push_back(file.get_table()));
+  ASSERT_EQ(OB_SUCCESS, f.store_.major_tables_.init(allocator_, tables));
+  ObSEArray<ObColDesc, 16> columns;
+  ASSERT_EQ(OB_SUCCESS, f.schema_.get_multi_version_column_descs(columns));
+  ObLobSSTableScanCache cache;
+  {
+    ObLobColumnIterator stopped;
+    ASSERT_EQ(OB_SUCCESS, stopped.init_with_scan_cache(f.tablet_, columns, false, cache));
+    ASSERT_EQ(OB_SUCCESS, stopped.open_next_sstable_());
+  }
+  ASSERT_FALSE(cache.contains(file.get_table()->get_key()));
+  {
+    ObLobColumnIterator failed;
+    ASSERT_EQ(OB_SUCCESS, failed.init_with_scan_cache(f.tablet_, columns, false, cache));
+    ASSERT_EQ(OB_SUCCESS, failed.open_next_sstable_());
+    const MacroBlockId absent(MacroBlockId::DEFAULT_FIRST_ID, 999999999, 0, 0, 0);
+    failed.macro_ids_.reset();
+    ASSERT_EQ(OB_SUCCESS, failed.macro_ids_.init(&absent, 1, ObMacroIdIterator::DATA_BLOCK));
+    const ObDatumRow *row = nullptr;
+    const int ret = failed.get_next_row(row);
+    ASSERT_NE(OB_SUCCESS, ret);
+    ASSERT_NE(OB_ITER_END, ret);
+    ASSERT_EQ(nullptr, row);
+  }
+  ASSERT_FALSE(cache.contains(file.get_table()->get_key()));
+  ObLobColumnIterator retry;
+  ASSERT_EQ(OB_SUCCESS, retry.init_with_scan_cache(f.tablet_, columns, false, cache));
+  const ObDatumRow *row = nullptr;
+  ASSERT_EQ(OB_ITER_END, retry.get_next_row(row));
+  ASSERT_TRUE(cache.contains(file.get_table()->get_key()));
+}
+
+TEST_F(TestLobColumnIterator, scan_cache_capacity_limits_retained_keys)
+{
+  ObLobSSTableScanCache cache;
+  ObITable::TableKey key;
+  key.table_type_ = ObITable::MAJOR_SSTABLE;
+  key.tablet_id_ = ObTabletID(200001);
+  ASSERT_FALSE(cache.scanned_sstables_.created());
+  key.version_range_.snapshot_version_ = 1000;
+  ASSERT_EQ(OB_SUCCESS, cache.add(key));
+  // create(128) selects 193 buckets; the entry limit must not determine the initial allocation.
+  const int64_t initial_bucket_count = cache.scanned_sstables_.ht_.get_bucket_count();
+  ASSERT_EQ(193, initial_bucket_count);
+  for (int64_t i = 1; i < ObLobSSTableScanCache::MAX_SSTABLE_COUNT; ++i) {
+    key.version_range_.snapshot_version_ = 1000 + i;
+    ASSERT_EQ(OB_SUCCESS, cache.add(key));
+  }
+  ASSERT_EQ(OB_SUCCESS, cache.add(key));
+  ASSERT_EQ(ObLobSSTableScanCache::MAX_SSTABLE_COUNT, cache.scanned_sstables_.size());
+  ASSERT_EQ(initial_bucket_count, cache.scanned_sstables_.ht_.get_bucket_count());
+  // All retained keys must remain reachable through the fixed bucket chains.
+  for (int64_t i = 0; i < ObLobSSTableScanCache::MAX_SSTABLE_COUNT; ++i) {
+    key.version_range_.snapshot_version_ = 1000 + i;
+    ASSERT_TRUE(cache.contains(key));
+  }
+
+  ObITable::TableKey uncached_key = key;
+  uncached_key.version_range_.snapshot_version_ = 20000;
+  ASSERT_FALSE(cache.contains(uncached_key));
+  ASSERT_EQ(OB_SUCCESS, cache.add(uncached_key));
+  ASSERT_EQ(ObLobSSTableScanCache::MAX_SSTABLE_COUNT, cache.scanned_sstables_.size());
+  ASSERT_FALSE(cache.contains(uncached_key));
+  ObLobSSTableScanCache next_scan;
+  ASSERT_FALSE(next_scan.contains(key));
+  ASSERT_EQ(OB_SUCCESS, next_scan.add(uncached_key));
+  ASSERT_TRUE(next_scan.contains(uncached_key));
+}
+
+#ifndef OB_USE_ASAN
+// Non-ASAN ObMallocAllocator rejects INT64_MAX without remapping it to the server tenant.
+// ASAN ignores the tenant attribute and delegates to malloc.
+TEST_F(TestLobColumnIterator, scan_cache_allocation_failure_preserves_scan_result)
+{
+  TabletFixture f;
+  prepare_schema(f.schema_, AUX_LOB_META);
+  ObTableHandleV2 first;
+  ObTableHandleV2 second;
+  create_empty_sstable(f.schema_, first, 100);
+  create_empty_sstable(f.schema_, second, 200);
+  f.bind();
+  ObSEArray<ObITable *, 2> tables;
+  ASSERT_EQ(OB_SUCCESS, tables.push_back(first.get_table()));
+  ASSERT_EQ(OB_SUCCESS, tables.push_back(second.get_table()));
+  ASSERT_EQ(OB_SUCCESS, f.store_.major_tables_.init(allocator_, tables));
+  ObSEArray<ObColDesc, 16> columns;
+  ASSERT_EQ(OB_SUCCESS, f.schema_.get_multi_version_column_descs(columns));
+  ObSSTable *second_table = f.store_.major_tables_[1];
+
+  for (const bool fail_read : {false, true}) {
+    SCOPED_TRACE(testing::Message() << "fail_read=" << fail_read);
+    hash::SimpleAllocer<hash::HashSetTypes<ObITable::TableKey>::AllocType> node_allocator;
+    node_allocator.set_attr(ObMemAttr(INT64_MAX, "LobCacheFail"));
+    ObLobSSTableScanCache cache;
+    ASSERT_EQ(OB_SUCCESS, cache.scanned_sstables_.create(1, &node_allocator));
+    // Verify node allocation fails before checking the iterator's fallback behavior.
+    ASSERT_EQ(OB_ALLOCATE_MEMORY_FAILED, cache.add(first.get_table()->get_key()));
+    ASSERT_EQ(0, cache.scanned_sstables_.size());
+    const ObDatumRow *row = nullptr;
+    {
+      if (fail_read) { --second_table->meta_->basic_meta_.column_cnt_; }
+      DEFER(if (fail_read) { ++second_table->meta_->basic_meta_.column_cnt_; });
+      ObLobColumnIterator iter;
+      ASSERT_EQ(OB_SUCCESS, iter.init_with_scan_cache(f.tablet_, columns, false, cache));
+      // Failing to cache the first file must neither stop at it nor hide a later read error.
+      ASSERT_EQ(fail_read ? OB_NOT_SUPPORTED : OB_ITER_END, iter.get_next_row(row));
+      ASSERT_EQ(nullptr, row);
+      ASSERT_EQ(nullptr, iter.scan_cache_);
+      ASSERT_EQ(0, cache.scanned_sstables_.size());
+    }
+
+    // Later versions may use the same cache again after allocation recovers.
+    node_allocator.set_attr(ObMemAttr(MTL_ID(), "LobCacheFail"));
+    ObLobColumnIterator next_version;
+    ASSERT_EQ(OB_SUCCESS, next_version.init_with_scan_cache(f.tablet_, columns, false, cache));
+    ASSERT_EQ(OB_ITER_END, next_version.get_next_row(row));
+    ASSERT_EQ(nullptr, row);
+    ASSERT_EQ(&cache, next_version.scan_cache_);
+    ASSERT_EQ(2, cache.scanned_sstables_.size());
+    ASSERT_TRUE(cache.contains(first.get_table()->get_key()));
+    ASSERT_TRUE(cache.contains(second.get_table()->get_key()));
+  }
+}
+#endif
+
 // LOB-COL-U017: fail at a later file, even when earlier files were valid and empty.
 TEST_F(TestLobColumnIterator, later_file_failure_is_reported)
 {
@@ -739,12 +1226,14 @@ TEST_F(TestLobColumnIterator, unsupported_file_types)
 TEST_F(TestLobColumnIterator, object_io_failure_is_not_end_of_scan)
 {
   ObSSTable table;
+  table.key_.table_type_ = ObITable::MINOR_SSTABLE;
   table.meta_cache_.nested_size_ = 4096;
   table.meta_cache_.nested_offset_ = 0;
   const MacroBlockId absent(MacroBlockId::DEFAULT_FIRST_ID, 999999999, 0, 0, 0);
   ASSERT_TRUE(absent.is_valid());
   ObLobColumnIterator iter;
   iter.sstable_ = &table;
+  iter.sstable_scan_start_us_ = ObTimeUtility::current_time_us();
   ASSERT_EQ(OB_SUCCESS, iter.macro_ids_.init(&absent, 1, ObMacroIdIterator::DATA_BLOCK));
   iter.is_inited_ = true;
   const ObDatumRow *row = nullptr;
@@ -752,6 +1241,10 @@ TEST_F(TestLobColumnIterator, object_io_failure_is_not_end_of_scan)
   ASSERT_NE(OB_SUCCESS, ret);
   ASSERT_NE(OB_ITER_END, ret);
   ASSERT_EQ(nullptr, row);
+  ASSERT_EQ(0, iter.minor_scan_cost_us_);
+  ASSERT_EQ(0, iter.major_scan_cost_us_);
+  ASSERT_EQ(0, iter.mini_scan_cost_us_);
+  ASSERT_EQ(0, iter.other_scan_cost_us_);
 }
 
 class FailingColumnAllocator : public ObIAllocator
@@ -788,6 +1281,7 @@ TEST_F(TestLobColumnIterator, row_and_macro_allocation_failures)
   table.meta_cache_.nested_offset_ = 0;
   const MacroBlockId id(MacroBlockId::DEFAULT_FIRST_ID, 12345, 0, 0, 0);
   macro_failure.sstable_ = &table;
+  macro_failure.sstable_scan_start_us_ = ObTimeUtility::current_time_us();
   ASSERT_EQ(OB_SUCCESS, macro_failure.macro_ids_.init(&id, 1, ObMacroIdIterator::DATA_BLOCK));
   macro_failure.is_inited_ = true;
   const ObDatumRow *row = nullptr;
@@ -805,6 +1299,7 @@ TEST_F(TestLobColumnIterator, invalid_macro_range_and_metadata_failure)
     table.meta_cache_.nested_offset_ = variant == 0 ? 0 : -1;
     ObLobColumnIterator iter;
     iter.sstable_ = &table;
+    iter.sstable_scan_start_us_ = ObTimeUtility::current_time_us();
     ASSERT_EQ(OB_SUCCESS, iter.macro_ids_.init(&id, 1, ObMacroIdIterator::DATA_BLOCK));
     iter.is_inited_ = true;
     const ObDatumRow *row = nullptr;
@@ -821,6 +1316,10 @@ TEST_F(TestLobColumnIterator, invalid_macro_range_and_metadata_failure)
   const ObDatumRow *row = nullptr;
   ASSERT_EQ(OB_ERR_UNEXPECTED, iter.get_next_row(row));
   ASSERT_EQ(nullptr, row);
+  ASSERT_EQ(0, iter.mini_scan_cost_us_);
+  ASSERT_EQ(0, iter.major_scan_cost_us_);
+  ASSERT_EQ(0, iter.minor_scan_cost_us_);
+  ASSERT_EQ(0, iter.other_scan_cost_us_);
 }
 
 // LOB-COL-U024: simplified Meta has three business rowkeys, distinct from the two MVCC columns.

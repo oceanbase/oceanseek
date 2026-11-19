@@ -18,6 +18,8 @@
 #include "storage/ss_garbage_collector/ob_ss_mark_sweep_macro_id_iterator.h"
 #include "storage/ob_storage_schema.h"
 #include "storage/tablet/ob_tablet.h"
+#include "storage/tablet/ob_tablet_create_sstable_param.h"
+#include "lib/utility/ob_defer.h"
 #undef private
 #undef protected
 
@@ -97,10 +99,14 @@ public:
     f.bind();
   }
 
-  void init_iterator(ObSSMarkSweepMacroIDIterator &iter)
+  void init_iterator(ObSSMarkSweepMacroIDIterator &iter, const int64_t version_count = 1)
   {
     ObSEArray<SCN, 2> versions;
-    ASSERT_EQ(OB_SUCCESS, versions.push_back(SCN::base_scn()));
+    for (int64_t i = 0; i < version_count; ++i) {
+      SCN version;
+      ASSERT_EQ(OB_SUCCESS, version.convert_for_tx(i + 1));
+      ASSERT_EQ(OB_SUCCESS, versions.push_back(version));
+    }
     ASSERT_EQ(OB_SUCCESS, iter.init(sql_proxy_, MTL_ID(), gc_tablet_, versions));
   }
 
@@ -225,6 +231,7 @@ TEST_F(TestSSMarkSweepMacroIDIterator, data_checker_drains_prepared_blocks_befor
   ObSSDataCheckMacroIDIterator iter;
   ASSERT_EQ(OB_SUCCESS, iter.init_lob_meta_iterator_(f.tablet_));
   ASSERT_NE(nullptr, iter.out_table_data_iter_);
+  ASSERT_EQ(nullptr, iter.out_table_data_iter_->scan_cache_);
   const MacroBlockId first(MacroBlockId::DEFAULT_FIRST_ID, 1, 0, 0, 0);
   const MacroBlockId second(MacroBlockId::DEFAULT_FIRST_ID, 2, 0, 0, 0);
   ASSERT_EQ(OB_SUCCESS, iter.block_infos_.push_back(
@@ -413,7 +420,61 @@ TEST_F(TestSSMarkSweepMacroIDIterator, user_read_error_does_not_become_eof)
   ASSERT_EQ(OB_NOT_SUPPORTED, iter.get_next(id));
   ASSERT_FALSE(id.is_valid());
   ASSERT_TRUE(iter.tablet_data_iter_end_);
+  ASSERT_FALSE(iter.lob_scan_cache_.contains(remote.get_key()));
   ASSERT_EQ(OB_NOT_SUPPORTED, iter.get_next(id));
+}
+
+TEST_F(TestSSMarkSweepMacroIDIterator, sstable_scan_cache_survives_version_switch_and_isolates_groups)
+{
+  for (const ObTableType type : {AUX_LOB_META, AUX_OUTTABLE_LOB_CONTROL}) {
+    TabletFixture f;
+    prepare_tablet(f, type);
+    ObTabletCreateSSTableParam param;
+    ASSERT_EQ(OB_SUCCESS, param.init_for_empty_major_sstable(gc_tablet_.tablet_id_, f.schema_,
+        100 /*snapshot*/, -1 /*cg_idx*/, false, false));
+    void *buffer = allocator_.alloc(sizeof(ObSSTable));
+    ASSERT_NE(nullptr, buffer);
+    ObSSTable *table = new (buffer) ObSSTable();
+    bool owned = false;
+    DEFER(if (!owned) { table->~ObSSTable(); });
+    ASSERT_EQ(OB_SUCCESS, table->init(param, &allocator_));
+    ObTableHandleV2 handle;
+    ASSERT_EQ(OB_SUCCESS, handle.set_sstable(table, &allocator_));
+    owned = true;
+    ObSEArray<ObITable *, 1> tables;
+    ASSERT_EQ(OB_SUCCESS, tables.push_back(table));
+    ASSERT_EQ(OB_SUCCESS, f.store_.major_tables_.init(allocator_, tables));
+
+    ObSSMarkSweepMacroIDIterator del_iter;
+    init_iterator(del_iter, 2);
+    // Supply each loaded Tablet directly, avoiding shared-meta I/O in this unit test.
+    del_iter.version_idx_ = del_iter.meta_scns_.count();
+    ASSERT_EQ(OB_SUCCESS, del_iter.init_user_iterator_(f.tablet_));
+    ASSERT_EQ(&del_iter.lob_scan_cache_, del_iter.out_table_data_iter_->scan_cache_);
+    ASSERT_FALSE(del_iter.lob_scan_cache_.scanned_sstables_.created());
+    MacroBlockId id;
+    ASSERT_EQ(OB_ITER_END, del_iter.get_next_user_macro_id_(id));
+    ASSERT_EQ(nullptr, del_iter.out_table_data_iter_);
+    ASSERT_TRUE(del_iter.lob_scan_cache_.contains(table->get_key()));
+
+    // The next version references the same file. Corrupt its layout to detect any re-open.
+    ObSSTable *stored_table = f.store_.major_tables_[0];
+    --stored_table->meta_->basic_meta_.column_cnt_;
+    DEFER(++stored_table->meta_->basic_meta_.column_cnt_);
+    ASSERT_EQ(OB_SUCCESS, del_iter.init_user_iterator_(f.tablet_));
+    ASSERT_EQ(OB_ITER_END, del_iter.get_next_user_macro_id_(id));
+    ASSERT_FALSE(id.is_valid());
+    ASSERT_EQ(nullptr, del_iter.out_table_data_iter_);
+
+    // KEPT must read the file independently, even if DEL has already scanned it.
+    ObSSMarkSweepMacroIDIterator kept_iter;
+    init_iterator(kept_iter, 2);
+    kept_iter.version_idx_ = kept_iter.meta_scns_.count();
+    ASSERT_EQ(OB_SUCCESS, kept_iter.init_user_iterator_(f.tablet_));
+    ASSERT_EQ(OB_NOT_SUPPORTED, kept_iter.get_next_user_macro_id_(id));
+    ASSERT_FALSE(id.is_valid());
+    ASSERT_FALSE(kept_iter.lob_scan_cache_.contains(table->get_key()));
+  }
 }
 
 TEST_F(TestSSMarkSweepMacroIDIterator, actual_meta_and_ctrl_schema_projection)

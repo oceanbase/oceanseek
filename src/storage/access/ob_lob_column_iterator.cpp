@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "storage/access/ob_lob_column_iterator.h"
+#include "lib/time/ob_time_utility.h"
 #include "storage/blocksstable/ob_object_manager.h"
 #include "storage/blocksstable/ob_storage_object_handle.h"
 #include "storage/blocksstable/ob_storage_object_rw_info.h"
@@ -20,8 +21,40 @@ using namespace share::schema;
 
 namespace storage
 {
+bool ObLobSSTableScanCache::contains(const ObITable::TableKey &key) const
+{
+  return (ObITable::MAJOR_SSTABLE == key.table_type_ || ObITable::INC_MAJOR_SSTABLE == key.table_type_)
+      && scanned_sstables_.created() && nullptr != scanned_sstables_.get(key);
+}
+
+int ObLobSSTableScanCache::add(const ObITable::TableKey &key)
+{
+  int ret = OB_SUCCESS;
+  if (ObITable::MAJOR_SSTABLE == key.table_type_ || ObITable::INC_MAJOR_SSTABLE == key.table_type_) {
+    if (!scanned_sstables_.created()
+        && OB_FAIL(scanned_sstables_.create(INITIAL_BUCKET_COUNT, ObMemAttr(MTL_ID(), "LobScanCache")))) {
+      LOG_WARN("failed to create lob sstable scan cache", K(ret), K(key));
+    } else if (scanned_sstables_.size() < MAX_SSTABLE_COUNT) {
+      if (OB_FAIL(scanned_sstables_.set_refactored(key))) {
+        LOG_WARN("failed to cache completed lob sstable", K(ret), K(key));
+      } else if (MAX_SSTABLE_COUNT == scanned_sstables_.size()) {
+        LOG_INFO("lob sstable scan cache reached capacity; additional sstables will not be cached",
+            K(key), "cached_sstable_count", scanned_sstables_.size());
+      }
+    }
+  }
+  // A full cache only permits repeated reads; it must not stop scanning uncached files.
+  return ret;
+}
+
 ObLobColumnIterator::ObLobColumnIterator()
-  : allocator_(ObMemAttr(MTL_ID(), "LobColIter")),
+  : major_scan_cost_us_(0),
+    minor_scan_cost_us_(0),
+    mini_scan_cost_us_(0),
+    other_scan_cost_us_(0),
+    outtable_row_count_(0),
+    non_outtable_row_count_(0),
+    allocator_(ObMemAttr(MTL_ID(), "LobColIter")),
     macro_allocator_(ObMemAttr(MTL_ID(), "LobColMacro")),
     columns_(),
     projector_(),
@@ -32,7 +65,9 @@ ObLobColumnIterator::ObLobColumnIterator()
     row_(),
     column_count_(0),
     rowkey_count_(0),
+    sstable_scan_start_us_(0),
     sstable_(nullptr),
+    scan_cache_(nullptr),
     has_macro_(false),
     skip_uncommitted_(false),
     is_inited_(false)
@@ -69,6 +104,21 @@ int ObLobColumnIterator::init(
   } else {
     skip_uncommitted_ = skip_uncommitted;
     is_inited_ = true;
+  }
+  return ret;
+}
+
+int ObLobColumnIterator::init_with_scan_cache(
+    const ObTablet &tablet,
+    const ObIArray<ObColDesc> &columns,
+    const bool skip_uncommitted,
+    ObLobSSTableScanCache &scan_cache)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(init(tablet, columns, skip_uncommitted))) {
+    LOG_WARN("failed to initialize lob column iterator with scan cache", K(ret), K(tablet.get_tablet_id()));
+  } else {
+    scan_cache_ = &scan_cache;
   }
   return ret;
 }
@@ -130,6 +180,29 @@ int ObLobColumnIterator::prepare_columns_(
   return ret;
 }
 
+void ObLobColumnIterator::update_scan_cost_()
+{
+  if (nullptr != sstable_ && sstable_scan_start_us_ > 0) {
+    const int64_t cost_us = MAX(ObTimeUtility::current_time_us() - sstable_scan_start_us_, 0L);
+    switch (sstable_->get_key().table_type_) {
+      case ObITable::MAJOR_SSTABLE:
+      case ObITable::INC_MAJOR_SSTABLE:
+        major_scan_cost_us_ += cost_us;
+        break;
+      case ObITable::MINOR_SSTABLE:
+        minor_scan_cost_us_ += cost_us;
+        break;
+      case ObITable::MINI_SSTABLE:
+        mini_scan_cost_us_ += cost_us;
+        break;
+      default:
+        other_scan_cost_us_ += cost_us;
+        break;
+    }
+    sstable_scan_start_us_ = 0;
+  }
+}
+
 int ObLobColumnIterator::open_next_sstable_()
 {
   int ret = OB_SUCCESS;
@@ -137,28 +210,35 @@ int ObLobColumnIterator::open_next_sstable_()
   macro_ids_.reset();
   sstable_meta_.reset();
   sstable_ = nullptr;
-  if (OB_FAIL(tables_.get_next(table))) {
-    if (OB_ITER_END != ret) {
-      LOG_WARN("failed to get next sstable", K(ret));
-    }
-  } else if (OB_ISNULL(table) || !table->is_sstable()) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected table in sstable collection", K(ret), KPC(table));
-  } else if (table->is_remote_logical_minor_sstable()
-      || table->is_column_store_sstable() || table->is_ddl_mem_sstable()) {
-    ret = OB_NOT_SUPPORTED;
-    LOG_WARN("unsupported sstable layout in physical column scan", K(ret), KPC(table));
-  } else if (OB_FAIL(static_cast<ObSSTable *>(table)->get_meta(sstable_meta_))) {
-    LOG_WARN("failed to load sstable meta", K(ret), KPC(table));
-  } else {
-    const ObSSTableMeta &meta = sstable_meta_.get_sstable_meta();
-    if (meta.get_column_count() != column_count_ || meta.get_rowkey_column_count() != rowkey_count_) {
+  while (OB_SUCC(ret) && nullptr == sstable_) {
+    const int64_t start_us = ObTimeUtility::current_time_us();
+    if (OB_FAIL(tables_.get_next(table))) {
+      if (OB_ITER_END != ret) {
+        LOG_WARN("failed to get next sstable", K(ret));
+      }
+    } else if (OB_ISNULL(table) || !table->is_sstable()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected table in sstable collection", K(ret), KPC(table));
+    } else if (nullptr != scan_cache_ && scan_cache_->contains(table->get_key())) {
+      continue;
+    } else if (table->is_remote_logical_minor_sstable()
+        || table->is_column_store_sstable() || table->is_ddl_mem_sstable()) {
       ret = OB_NOT_SUPPORTED;
-      LOG_WARN("sstable columns differ from supported schema", K(ret), K(column_count_), K(rowkey_count_), K(meta));
-    } else if (OB_FAIL(meta.get_macro_info().get_data_block_iter(macro_ids_))) {
-      LOG_WARN("failed to enumerate data macros", K(ret));
+      LOG_WARN("unsupported sstable layout in physical column scan", K(ret), KPC(table));
     } else {
       sstable_ = static_cast<ObSSTable *>(table);
+      sstable_scan_start_us_ = start_us;
+      if (OB_FAIL(sstable_->get_meta(sstable_meta_))) {
+        LOG_WARN("failed to load sstable meta", K(ret), KPC(table));
+      } else {
+        const ObSSTableMeta &meta = sstable_meta_.get_sstable_meta();
+        if (meta.get_column_count() != column_count_ || meta.get_rowkey_column_count() != rowkey_count_) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_WARN("sstable columns differ from supported schema", K(ret), K(column_count_), K(rowkey_count_), K(meta));
+        } else if (OB_FAIL(meta.get_macro_info().get_data_block_iter(macro_ids_))) {
+          LOG_WARN("failed to enumerate data macros", K(ret));
+        }
+      }
     }
   }
   return ret;
@@ -178,6 +258,13 @@ int ObLobColumnIterator::open_next_macro_()
     if (nullptr == sstable_ && OB_FAIL(open_next_sstable_())) {
     } else if (OB_FAIL(macro_ids_.get_next_macro_id(macro_id))) {
       if (OB_ITER_END == ret) {
+        int tmp_ret = OB_SUCCESS;
+        if (nullptr != scan_cache_ && OB_TMP_FAIL(scan_cache_->add(sstable_->get_key()))) {
+          LOG_WARN("failed to cache completed lob sstable; continuing scan without cache",
+              K(tmp_ret), "sstable_key", sstable_->get_key());
+          scan_cache_ = nullptr;
+        }
+        update_scan_cost_();
         sstable_ = nullptr;
         ret = OB_SUCCESS;
       } else {

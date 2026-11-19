@@ -189,18 +189,23 @@ int ObSSLobMetaGCScanTask::scan_lob_meta_tablet_(
       LOG_WARN("lob meta iterator returned null row", KR(ret), K(scan_input));
     } else if (OB_FAIL(ObLobMetaUtil::get_lob_meta_macro_id(*row, row_allocator, macro_id))) {
       LOG_WARN("failed to decode retained lob meta reference", KR(ret), K(scan_input));
-    } else if (macro_id.is_valid() && OB_FAIL(sorter.add_item(ObGCMacroBlockItem(macro_id)))) {
-      LOG_WARN("failed to retain lob meta macro", KR(ret), K(macro_id), K(scan_input));
-    } else if (macro_id.is_valid() && record_diag && OB_SUCCESS == diag_ret) {
-      // Capture each scan occurrence, independently of the sorter's deduplicated output.
-      if (OB_SUCCESS != (diag_ret = diag_macro_ids.push_back(macro_id))) {
-        LOG_WARN_RET(diag_ret, "failed to retain lob meta diagnostic macro", K(scan_input));
-        diag_mgr.mark_diag_failed(diag_ret);
-      } else if (DIAG_MACRO_BATCH_SIZE == diag_macro_ids.count()) {
-        if (OB_SUCCESS != (diag_ret = diag_mgr.write_lob_meta_kept(gc_tablet, diag_macro_ids))) {
-          LOG_WARN_RET(diag_ret, "failed to record lob meta diagnostic batch", K(scan_input));
+    } else if (!macro_id.is_valid()) {
+      ++iter.non_outtable_row_count_;
+    } else {
+      ++iter.outtable_row_count_;
+      if (OB_FAIL(sorter.add_item(ObGCMacroBlockItem(macro_id)))) {
+        LOG_WARN("failed to retain lob meta macro", KR(ret), K(macro_id), K(scan_input));
+      } else if (record_diag && OB_SUCCESS == diag_ret) {
+        // Capture each scan occurrence, independently of the sorter's deduplicated output.
+        if (OB_SUCCESS != (diag_ret = diag_macro_ids.push_back(macro_id))) {
+          LOG_WARN_RET(diag_ret, "failed to retain lob meta diagnostic macro", K(scan_input));
+          diag_mgr.mark_diag_failed(diag_ret);
+        } else if (DIAG_MACRO_BATCH_SIZE == diag_macro_ids.count()) {
+          if (OB_SUCCESS != (diag_ret = diag_mgr.write_lob_meta_kept(gc_tablet, diag_macro_ids))) {
+            LOG_WARN_RET(diag_ret, "failed to record lob meta diagnostic batch", K(scan_input));
+          }
+          diag_macro_ids.reuse();
         }
-        diag_macro_ids.reuse();
       }
     }
   }

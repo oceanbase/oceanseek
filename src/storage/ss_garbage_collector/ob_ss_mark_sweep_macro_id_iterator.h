@@ -42,6 +42,7 @@ private:
   common::ObArenaAllocator row_allocator_;
   ObTabletHandle tablet_handle_;
   ObLobColumnIterator *out_table_data_iter_;
+  ObLobSSTableScanCache lob_scan_cache_;
   ObSSGCTablet gc_tablet_;
   common::ObSEArray<share::SCN, 4> meta_scns_;
   int64_t version_idx_;

@@ -28,6 +28,7 @@ ObSSMarkSweepMacroIDIterator::ObSSMarkSweepMacroIDIterator()
     row_allocator_(ObMemAttr(MTL_ID(), "SSGCMacroRow")),
     tablet_handle_(),
     out_table_data_iter_(nullptr),
+    lob_scan_cache_(),
     gc_tablet_(),
     meta_scns_(),
     version_idx_(0),
@@ -150,7 +151,8 @@ int ObSSMarkSweepMacroIDIterator::init_user_iterator_(const ObTablet &tablet)
     } else if (OB_ISNULL(out_table_data_iter_ = OB_NEWx(ObLobColumnIterator, &tablet_allocator_))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("failed to allocate lob column iterator", KR(ret));
-    } else if (OB_FAIL(out_table_data_iter_->init(tablet, columns, false /*skip_uncommitted*/))) {
+    } else if (OB_FAIL(out_table_data_iter_->init_with_scan_cache(
+        tablet, columns, false /*skip_uncommitted*/, lob_scan_cache_))) {
       LOG_WARN("failed to initialize lob column iterator", KR(ret), K_(gc_tablet));
     }
   }
@@ -182,11 +184,14 @@ int ObSSMarkSweepMacroIDIterator::get_next_user_macro_id_(MacroBlockId &macro_id
     } else {
       row_allocator_.reuse();
       if (is_lob_meta_) {
-        ret = ObLobMetaUtil::get_lob_meta_macro_id(*row, row_allocator_, macro_id);
-      } else {
-        ret = ObOuttableLobControlUtil::get_lob_ctrl_macro_id(*row, macro_id);
-      }
-      if (OB_FAIL(ret)) {
+        if (OB_FAIL(ObLobMetaUtil::get_lob_meta_macro_id(*row, row_allocator_, macro_id))) {
+          LOG_WARN("failed to decode physical lob reference", KR(ret), K_(gc_tablet));
+        } else if (macro_id.is_valid()) {
+          ++out_table_data_iter_->outtable_row_count_;
+        } else {
+          ++out_table_data_iter_->non_outtable_row_count_;
+        }
+      } else if (OB_FAIL(ObOuttableLobControlUtil::get_lob_ctrl_macro_id(*row, macro_id))) {
         LOG_WARN("failed to decode physical lob reference", KR(ret), K_(gc_tablet));
       }
     }
