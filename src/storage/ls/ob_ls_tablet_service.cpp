@@ -7503,7 +7503,8 @@ int ObLSTabletService::estimate_row_count(
     const int64_t timeout_us,
     common::ObIArray<ObEstRowCountRecord> &est_records,
     int64_t &logical_row_count,
-    int64_t &physical_row_count)
+    int64_t &physical_row_count,
+    const bool allow_fast_memtable_estimate)
 {
   int ret = OB_SUCCESS;
   ObPartitionEst batch_est;
@@ -7577,7 +7578,7 @@ int ObLSTabletService::estimate_row_count(
       }
     }
     if (OB_SUCC(ret) && tables.count() > 0) {
-      ObTableEstimateBaseInput base_input(param.scan_flag_, param.index_id_, param.tx_id_, tables, tablet_iter.get_tablet_handle(), major_version);
+      ObTableEstimateBaseInput base_input(param.scan_flag_, param.index_id_, param.tx_id_, tables, tablet_iter.get_tablet_handle(), major_version, allow_fast_memtable_estimate);
       if (scan_range.is_get()) {
         if (OB_FAIL(ObTableEstimator::estimate_row_count_for_get(base_input, scan_range.get_rowkeys(), batch_est))) {
           LOG_WARN("failed to estimate row count", K(ret), K(param), K(scan_range));

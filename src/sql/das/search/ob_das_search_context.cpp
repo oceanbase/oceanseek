@@ -728,10 +728,18 @@ int ObDASSearchCtx::refresh_table_row_count()
       }
       if (OB_FAIL(table_scan_range.init(est_param, batch, allocator_))) {
         LOG_WARN("failed to init table scan range for partition row count", K(ret));
-      } else if (OB_FAIL(access_service->estimate_row_count(
-                     est_param, table_scan_range, timeout_us, est_records,
-                     logical_row_cnt, physical_row_cnt))) {
-        LOG_WARN("failed to estimate partition row count", K(ret));
+      } else {
+        omt::ObTenantConfigGuard tenant_config(TENANT_CONF(MTL_ID()));
+        // Range initialization may clip a whole range during tablet splitting.
+        const auto &ranges = table_scan_range.get_ranges();
+        const bool allow_fast_memtable_estimate = tenant_config.is_valid()
+            && tenant_config->_enable_hybrid_search_memtable_stat_estimation
+            && 1 == ranges.count() && ranges.at(0).is_whole_range();
+        if (OB_FAIL(access_service->estimate_row_count(
+                est_param, table_scan_range, timeout_us, est_records,
+                logical_row_cnt, physical_row_cnt, allow_fast_memtable_estimate))) {
+          LOG_WARN("failed to estimate partition row count", K(ret));
+        }
       }
     }
     if (OB_SUCC(ret)) {

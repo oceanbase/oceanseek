@@ -523,7 +523,8 @@ public:
       const int64_t timeout_us,
       common::ObIArray<ObEstRowCountRecord> &est_records,
       int64_t &logical_row_count,
-      int64_t &physical_row_count);
+      int64_t &physical_row_count,
+      const bool allow_fast_memtable_estimate = false);
   int inner_estimate_block_count_and_row_count(
       ObTabletTableIterator &tablet_iter,
       int64_t &macro_block_count,

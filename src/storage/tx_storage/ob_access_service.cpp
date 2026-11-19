@@ -1330,7 +1330,8 @@ int ObAccessService::estimate_row_count(
     const int64_t timeout_us,
     common::ObIArray<ObEstRowCountRecord> &est_records,
     int64_t &logical_row_count,
-    int64_t &physical_row_count) const
+    int64_t &physical_row_count,
+    const bool allow_fast_memtable_estimate) const
 {
   int ret = OB_SUCCESS;
   ObLSHandle ls_handle;
@@ -1348,7 +1349,7 @@ int ObAccessService::estimate_row_count(
     LOG_WARN("ls is unexpected null", K(ret));
   } else if (OB_FAIL(ls->get_tablet_svr()->estimate_row_count(
       param, scan_range, timeout_us, est_records,
-      logical_row_count, physical_row_count))) {
+      logical_row_count, physical_row_count, allow_fast_memtable_estimate))) {
     if (OB_TABLET_NOT_EXIST != ret) {
       LOG_WARN("failed to estimate row count", K(ret), K(param), K(scan_range), K(timeout_us));
     }

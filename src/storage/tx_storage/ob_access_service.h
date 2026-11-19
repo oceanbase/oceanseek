@@ -215,7 +215,8 @@ public:
       const int64_t timeout_us,
       ObIArray<ObEstRowCountRecord> &est_records,
       int64_t &logical_row_count,
-      int64_t &physical_row_count) const;
+      int64_t &physical_row_count,
+      const bool allow_fast_memtable_estimate = false) const;
   int estimate_block_count_and_row_count(
       const share::ObLSID &ls_id,
       const common::ObTabletID &tablet_id,

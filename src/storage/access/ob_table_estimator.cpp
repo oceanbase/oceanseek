@@ -147,7 +147,8 @@ int ObTableEstimator::estimate_multi_scan_row_count(
       if (OB_FAIL(estimate_memtable_scan_row_count(base_input,
           static_cast<const memtable::ObMemtable*>(current_table), range, tmp_cost))) {
         LOG_WARN("failed to estimate memtable row count", K(ret), K(*current_table));
-      } else if (tmp_cost.is_invalid_memtable_result()) {
+      } else if (tmp_cost.is_invalid_memtable_result()
+          && !base_input.allow_fast_memtable_estimate_) {
         ObPartitionEst sub_range_cost;
         const static int64_t sub_range_cnt = 3;
         ObSEArray<ObStoreRange, sub_range_cnt> store_ranges;
@@ -248,6 +249,11 @@ int ObTableEstimator::estimate_memtable_scan_row_count(
   } else if (OB_UNLIKELY(!key_range.is_memtable_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid range to estimate row", K(ret), K(key_range));
+  } else if (base_input.allow_fast_memtable_estimate_) {
+    // shortcut: DML counts include rollbacks and omit replay; use sampling when those errors are unacceptable.
+    const ObMtStat &stat = memtable->get_mt_stat();
+    part_est.physical_row_count_ = memtable->get_physical_row_cnt();
+    part_est.logical_row_count_ = stat.insert_row_count_ - stat.delete_row_count_;
   } else {
     memtable::ObMvccScanRange mvcc_scan_range;
     ObDatumRange real_range;

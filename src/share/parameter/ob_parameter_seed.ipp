@@ -1074,6 +1074,11 @@ DEF_TIME(_ob_trans_rpc_timeout, OB_CLUSTER_PARAMETER, "3s", "[0s, 3600s]",
 DEF_BOOL(enable_early_lock_release, OB_TENANT_PARAMETER, "True",
          "enable early lock release",
          ObParameterAttr(Section::OBSERVER, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
+DEF_BOOL(_enable_hybrid_search_memtable_stat_estimation, OB_TENANT_PARAMETER, "False",
+         "specifies whether to enable statistics-based MemTable row count estimation "
+         "for hybrid search queries. When enabled, uses runtime MemTable statistics "
+         "to estimate row counts instead of the existing sampling-based method.",
+         ObParameterAttr(Section::OBSERVER, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 DEF_BOOL(_enable_hybrid_search_plan_cache, OB_TENANT_PARAMETER, "False",
          "Specifies whether to enable plan caching for HYBRID_SEARCH queries. "
          "When set to True, eligible queries can reuse cached execution plans. "

@@ -13,6 +13,8 @@
 #define private public
 #define protected public
 #include "storage/memtable/ob_memtable.h"
+#include "storage/access/ob_index_sstable_estimator.h"
+#include "storage/access/ob_table_estimator.h"
 #include "lib/utility/ob_defer.h"
 #include "lib/stat/ob_diagnostic_info_container.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
@@ -1330,6 +1332,123 @@ ObLSTxCtxMgr TestMemtableV2::ls_tx_ctx_mgr_;
 ObTxTable TestMemtableV2::tx_table_;
 ObLS TestMemtableV2::ls_;
 bool TestMemtableV2::is_sstable_contains_lock_;
+
+TEST_F(TestMemtableV2, test_fast_estimate_row_count_dml)
+{
+  ObSEArray<ObITable *, 1> tables;
+  ObTabletHandle tablet_handle;
+  ObTableEstimateBaseInput input(query_flag_, tablet_id_.id(), ObTransID(), tables, tablet_handle, 0, true);
+  ObDatumRange range;
+  range.set_whole_range();
+  ObPartitionEst estimate;
+  ObMemtable uninitialized;
+  EXPECT_EQ(OB_NOT_INIT, ObTableEstimator::estimate_memtable_scan_row_count(input, &uninitialized, range, estimate));
+
+  ObMemtable *memtable = create_memtable();
+  DEFER(memtable->destroy());
+  ASSERT_EQ(OB_SUCCESS, ObTableEstimator::estimate_memtable_scan_row_count(input, memtable, range, estimate));
+  EXPECT_EQ(0, estimate.logical_row_count_);
+  EXPECT_EQ(0, estimate.physical_row_count_);
+
+  ObStoreCtx *wtx = start_tx(ObTransID(1));
+  ObDatumRowkey rowkey;
+  ObDatumRow row;
+  for (int64_t key = 1; key <= 3; ++key) {
+    ASSERT_EQ(OB_SUCCESS, mock_row(key, key, rowkey, row));
+    write_tx(wtx, memtable, 1000, row);
+  }
+  ASSERT_EQ(OB_SUCCESS, ObTableEstimator::estimate_memtable_scan_row_count(input, memtable, range, estimate));
+  EXPECT_EQ(3, estimate.logical_row_count_);
+  EXPECT_EQ(3, estimate.physical_row_count_);
+
+  ASSERT_EQ(OB_SUCCESS, mock_row(1, 10, rowkey, row));
+  row.row_flag_.set_flag(ObDmlFlag::DF_UPDATE);
+  write_tx(wtx, memtable, 1000, row);
+  EXPECT_EQ(1, memtable->get_mt_stat().update_row_count_);
+  ASSERT_EQ(OB_SUCCESS, ObTableEstimator::estimate_memtable_scan_row_count(input, memtable, range, estimate));
+  EXPECT_EQ(3, estimate.logical_row_count_);
+  EXPECT_EQ(3, estimate.physical_row_count_);
+
+  for (int64_t key = 1; key <= 5; ++key) {
+    ASSERT_EQ(OB_SUCCESS, mock_row(key, key, rowkey, row));
+    row.row_flag_.set_flag(ObDmlFlag::DF_DELETE);
+    write_tx(wtx, memtable, 1000, row);
+  }
+  commit_txn(wtx, 2000, true);
+  ASSERT_EQ(OB_SUCCESS, ObTableEstimator::estimate_memtable_scan_row_count(input, memtable, range, estimate));
+  EXPECT_EQ(3, memtable->get_mt_stat().insert_row_count_);
+  EXPECT_EQ(5, memtable->get_mt_stat().delete_row_count_);
+  EXPECT_EQ(-2, estimate.logical_row_count_);
+  EXPECT_EQ(5, estimate.physical_row_count_);
+
+  ObDatumRange invalid_range;
+  EXPECT_EQ(OB_INVALID_ARGUMENT,
+      ObTableEstimator::estimate_memtable_scan_row_count(input, memtable, invalid_range, estimate));
+  EXPECT_EQ(0, estimate.logical_row_count_);
+  EXPECT_EQ(0, estimate.physical_row_count_);
+}
+
+TEST_F(TestMemtableV2, test_fast_estimate_row_count_flag_and_fallback)
+{
+  ObMemtable *memtable = create_memtable();
+  DEFER(memtable->destroy());
+  ObStoreCtx *wtx = start_tx(ObTransID(1));
+  ObDatumRowkey rowkey;
+  ObDatumRow row;
+  for (int64_t key = 1; key <= 3; ++key) {
+    ASSERT_EQ(OB_SUCCESS, mock_row(key, key, rowkey, row));
+    write_tx(wtx, memtable, 1000, row);
+  }
+
+  ObSEArray<ObITable *, 1> tables;
+  ObTabletHandle tablet_handle;
+  ObTableEstimateBaseInput input(query_flag_, tablet_id_.id(), ObTransID(), tables, tablet_handle, 0, true);
+  ObTableEstimateBaseInput ordinary_input(query_flag_, tablet_id_.id(), ObTransID(), tables, tablet_handle, 0);
+  ObDatumRange range;
+  range.set_whole_range();
+  ObPartitionEst estimate;
+  // Uncommitted rows distinguish the sampling result from the INSERT counter.
+  ASSERT_EQ(OB_SUCCESS, ObTableEstimator::estimate_memtable_scan_row_count(ordinary_input, memtable, range, estimate));
+  EXPECT_EQ(0, estimate.logical_row_count_);
+  EXPECT_EQ(3, estimate.physical_row_count_);
+
+  ASSERT_EQ(OB_SUCCESS, ObTableEstimator::estimate_memtable_scan_row_count(input, memtable, range, estimate));
+  EXPECT_EQ(3, estimate.logical_row_count_);
+  EXPECT_EQ(3, estimate.physical_row_count_);
+
+  ASSERT_EQ(OB_SUCCESS, ObTableEstimator::estimate_memtable_scan_row_count(ordinary_input, memtable, range, estimate));
+  EXPECT_EQ(0, estimate.logical_row_count_);
+  EXPECT_EQ(3, estimate.physical_row_count_);
+
+  ObTableEstimateBaseInput tx_input(query_flag_, tablet_id_.id(), ObTransID(2), tables, tablet_handle, 0);
+  ASSERT_EQ(OB_SUCCESS, ObTableEstimator::estimate_memtable_scan_row_count(tx_input, memtable, range, estimate));
+  EXPECT_EQ(0, estimate.logical_row_count_);
+  EXPECT_EQ(3, estimate.physical_row_count_);
+
+  ObObj keys[2];
+  keys[0].set_int(1);
+  keys[1].set_int(2);
+  ObStoreRange store_range;
+  ASSERT_EQ(OB_SUCCESS, store_range.get_start_key().assign(&keys[0], 1));
+  ASSERT_EQ(OB_SUCCESS, store_range.get_end_key().assign(&keys[1], 1));
+  store_range.set_left_closed();
+  store_range.set_right_closed();
+  ASSERT_EQ(OB_SUCCESS, range.from_range(store_range, allocator_));
+  ASSERT_FALSE(range.is_whole_range());
+  ASSERT_EQ(OB_SUCCESS, ObTableEstimator::estimate_memtable_scan_row_count(ordinary_input, memtable, range, estimate));
+  EXPECT_EQ(0, estimate.logical_row_count_);
+  EXPECT_EQ(2, estimate.physical_row_count_);
+
+  abort_txn(wtx, true);
+  range.set_whole_range();
+  ASSERT_EQ(OB_SUCCESS, ObTableEstimator::estimate_memtable_scan_row_count(input, memtable, range, estimate));
+  EXPECT_EQ(3, estimate.logical_row_count_);
+  EXPECT_EQ(3, estimate.physical_row_count_);
+
+  ASSERT_EQ(OB_SUCCESS, ObTableEstimator::estimate_memtable_scan_row_count(ordinary_input, memtable, range, estimate));
+  EXPECT_EQ(0, estimate.logical_row_count_);
+  EXPECT_EQ(3, estimate.physical_row_count_);
+}
 
 TEST_F(TestMemtableV2, test_write_read_conflict)
 {
