@@ -6,7 +6,9 @@
 // 场景：验证共享日志成员配置变更、重试幂等性与配置锁持有者隔离。
 
 #include <gtest/gtest.h>
+#include <cstring>
 #include <memory>
+#include <new>
 #define private public
 #include "src/logservice/libpalf/libpalf_proposor_member_info.h"
 #undef private
@@ -28,6 +30,56 @@ ObMember create_member(const char* ip, int32_t port, int64_t timestamp = 0, int6
   }
   addr.set_ip_addr(ip, port);
   return ObMember(addr, timestamp, flag);
+}
+
+TEST(TestLibPalfConfigInfo, test_member_change_args_add_learner)
+{
+  // Reuse nonzero storage so missing initialization cannot pass by chance.
+  alignas(MemberChangeArgs) unsigned char storage[sizeof(MemberChangeArgs)];
+  std::memset(storage, 1, sizeof(storage));
+  MemberChangeArgs *args = new (storage) MemberChangeArgs;
+  const ObMember learner = create_member("127.0.0.1", 1001, 1, 2);
+
+  EXPECT_FALSE(args->has_remove_member_op());
+  EXPECT_EQ(OB_SUCCESS, args->append_learner_list_op(MEMBER_CHANGE_OP_ADD, learner));
+  EXPECT_TRUE(args->need_execute_on_leader());
+  EXPECT_FALSE(args->has_remove_member_op());
+
+  args->~MemberChangeArgs();
+}
+
+TEST(TestLibPalfConfigInfo, test_member_change_args_reset_after_remove)
+{
+  MemberChangeArgs args;
+  const ObMember member = create_member("127.0.0.1", 1001, 1);
+  const ObMember learner = create_member("127.0.0.1", 1002, 1, 2);
+
+  ASSERT_EQ(OB_SUCCESS, args.append_full_member_list_op(MEMBER_CHANGE_OP_REMOVE, member));
+  ASSERT_TRUE(args.has_remove_member_op());
+
+  args.reset();
+  EXPECT_FALSE(args.has_remove_member_op());
+  ASSERT_EQ(OB_SUCCESS, args.append_learner_list_op(MEMBER_CHANGE_OP_ADD, learner));
+  ASSERT_FALSE(args.has_remove_member_op());
+}
+
+TEST(TestLibPalfConfigInfo, test_member_change_args_remove_member_detection)
+{
+  MemberChangeArgs args;
+  const ObMember member = create_member("127.0.0.1", 1001, 1);
+  const ObMember learner = create_member("127.0.0.1", 1002, 1, 2);
+  ObMemberList member_list;
+  ASSERT_EQ(OB_SUCCESS, member_list.add_member(member));
+
+  ASSERT_EQ(OB_SUCCESS, args.append_full_member_list_op(MEMBER_CHANGE_OP_REMOVE, member));
+  ASSERT_TRUE(args.has_remove_member_op());
+  // Adding a learner must preserve a real removal in the same request.
+  ASSERT_EQ(OB_SUCCESS, args.append_learner_list_op(MEMBER_CHANGE_OP_ADD, learner));
+  ASSERT_TRUE(args.has_remove_member_op());
+
+  args.reset();
+  ASSERT_EQ(OB_SUCCESS, args.append_full_member_list_op(MEMBER_CHANGE_OP_REMOVE, member_list));
+  ASSERT_TRUE(args.has_remove_member_op());
 }
 
 TEST(TestLibPalfConfigInfo, test_apply_config_change_basic)

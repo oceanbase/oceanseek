@@ -262,7 +262,8 @@ int MemberConfigChangeOp::set_inc_config_version_op()
 MemberChangeArgs::MemberChangeArgs()
   : config_change_op_array_(),
     need_exec_on_leader_(false),
-    has_lock_config_op_(false)
+    has_lock_config_op_(false),
+    has_remove_member_op_(false)
 {}
 
 void MemberChangeArgs::reset()
@@ -270,6 +271,7 @@ void MemberChangeArgs::reset()
   config_change_op_array_.reset();
   need_exec_on_leader_ = false;
   has_lock_config_op_ = false;
+  has_remove_member_op_ = false;
 }
 
 int MemberChangeArgs::append_full_member_list_op(MemberChangeOpType op_type, const common::ObMember &member)
