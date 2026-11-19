@@ -269,12 +269,14 @@ int ObSearchIndexQueryRangeUtils::json_value_can_extract_range(const ObRawExpr *
     // For json value with pick, can extract range only when
     // returning type and other options (truncate, ascii, empty, error) are all default.
     // 1. Check returning type matches the resolver override for pick:
-    //    varchar + CS_TYPE_UTF8MB4_BIN + length >= OB_MAX_USER_ROW_KEY_LENGTH.
+    //    varchar + PICK-specific collation + length >= OB_MAX_USER_ROW_KEY_LENGTH.
     //    A shorter length (e.g. user-specified RETURNING VARCHAR(100)) could
     //    truncate key values, producing incorrect range boundaries.
     const ObExprResType &res_type = json_expr->get_result_type();
+    const ObCollationType expected_collation = json_expr->get_pick() == T_JSON_STRING
+        ? CS_TYPE_UTF8MB4_0900_BIN : CS_TYPE_UTF8MB4_BIN;
     if (res_type.get_type() != ObVarcharType
-        || res_type.get_collation_type() != CS_TYPE_UTF8MB4_BIN
+        || res_type.get_collation_type() != expected_collation
         || res_type.get_length() < OB_MAX_USER_ROW_KEY_LENGTH) {
       can_extract = false;
     } else if (json_expr->get_param_count() <= JSN_VAL_MISMATCH) {

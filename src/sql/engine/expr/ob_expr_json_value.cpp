@@ -68,10 +68,20 @@ int ObExprJsonValue::calc_result_typeN(ObExprResType& type,
     if (OB_SUCC(ret)) {
       if (OB_FAIL(ObJsonExprHelper::get_cast_type(types_stack[JSN_VAL_RET], dst_type, type_ctx))) {
         LOG_WARN("get cast dest type failed", K(ret));
-      } else if (OB_FAIL(ObJsonExprHelper::set_dest_type(types_stack[JSN_VAL_DOC], type, dst_type, type_ctx))) {
-        LOG_WARN("set dest type failed", K(ret));
       } else {
-        type.set_calc_collation_type(type.get_collation_type());
+        const ObRawExpr *raw_expr = type_ctx.get_raw_expr();
+        const bool is_string_pick = !is_oracle_mode && OB_NOT_NULL(raw_expr)
+            && raw_expr->get_pick() == T_JSON_STRING
+            && dst_type.is_string_type()
+            && dst_type.get_charset_type() == CHARSET_UTF8MB4;
+        if (is_string_pick) {
+          dst_type.set_collation_type(CS_TYPE_UTF8MB4_0900_BIN);
+        }
+        if (OB_FAIL(ObJsonExprHelper::set_dest_type(types_stack[JSN_VAL_DOC], type, dst_type, type_ctx))) {
+          LOG_WARN("set dest type failed", K(ret));
+        } else {
+          type.set_calc_collation_type(type.get_collation_type());
+        }
       }
     }
     // truncate 3
