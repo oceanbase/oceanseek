@@ -138,7 +138,7 @@ C/C++插件可以自动完成代码和语法高亮，但是这个插件无法为
 
 ## 使用
 
-1. 使用 git 下载源码 [https://github.com/oceanbase/oceanbase](https://github.com/oceanbase/oceanbase)
+1. 使用 git 下载源码 [https://github.com/oceanbase/oceanseek](https://github.com/oceanbase/oceanseek)
 2. 生成 `compile_commands.json`
 
    ```bash

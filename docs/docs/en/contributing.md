@@ -8,13 +8,13 @@ If you are interested in contributing code to OceanBase, please read the followi
 
 ## Start off with the right issue
 
-As a new contributor, you can start off by looking through our [good first issues](https://github.com/oceanbase/oceanbase/issues?q=is%3Aopen+is%3Aissue+label%3A%22good+first+issue%22). If none of them feels right for you, you can create a new issue when you find one. If you find an issue for you, please assign this issue to yourself in the issue topic and add the _developing_ label to indicate that this issue is being developed.
+As a new contributor, you can start off by looking through our [good first issues](https://github.com/oceanbase/oceanseek/issues). If none of them feels right for you, you can create a new issue when you find one. If you find an issue for you, please assign this issue to yourself in the issue topic and add the _developing_ label to indicate that this issue is being developed.
 
 ## Contribute code changes
 
 1. Fork the OceanBase repository.
    
-   1. Visit the [OceanBase GitHub repository](https://github.com/oceanbase/oceanbase).
+   1. Visit the [OceanBase GitHub repository](https://github.com/oceanbase/oceanseek).
    2. Click the **Fork** button in the upper-right corner to fork one branch.
 
 2. Configure the local environment.
@@ -33,8 +33,8 @@ git clone git@github.com:$user/oceanbase.git
 
 # Add the upstream branch.
 cd $working_dir/oceanbase
-git remote add upstream git@github.com:oceanbase/oceanbase.git
-# Or choose: git remote add upstream https://github.com/oceanbase/oceanbase
+git remote add upstream git@github.com:oceanbase/oceanseek.git
+# Or choose: git remote add upstream https://github.com/oceanbase/oceanseek
 
 # Set no_push for the upstream branch.
 git remote set-url --push upstream no_push

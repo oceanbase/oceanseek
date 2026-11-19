@@ -32,4 +32,4 @@
 
 本手册不包含用户文档。
 
-可以参考 [oceanbase-doc](https://github.com/oceanbase/oceanbase-doc) 查看用户文档。
+可以参考 [oceanbase-doc](https://github.com/oceanbase/oceanseek-doc) 查看用户文档。
