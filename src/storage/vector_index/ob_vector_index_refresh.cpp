@@ -936,7 +936,11 @@ int ObVectorIndexRefresher::do_rebuild() {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected common_rpc_proxy nullptr", K(ret));
       } else if (OB_FAIL(common_rpc_proxy->to(rs_addr).timeout(ddl_rpc_timeout).rebuild_vec_index(rebuild_index_arg, rebuild_index_res))) {
-        LOG_WARN("failed to post backup ls data res", K(ret), K(ddl_rpc_timeout), K(rebuild_index_arg));
+        // Only RPC-stage conflicts can defer; DDL execution failures keep their retry budget.
+        if (OB_ERR_PARALLEL_DDL_CONFLICT == ret) {
+          refresh_ctx_->rebuild_admission_rejected_ = true;
+        }
+        LOG_WARN("failed to submit rebuild vector index", K(ret), K(ddl_rpc_timeout), K(rebuild_index_arg));
       } else {
         LOG_INFO("succ to send rebuild vector index rpc", K(rs_addr), K(refresh_ctx_));
       }

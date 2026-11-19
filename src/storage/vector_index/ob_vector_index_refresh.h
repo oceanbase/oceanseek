@@ -27,7 +27,8 @@ public:
         domain_tablet_id_(), is_tablet_level_(false),
         need_major_merge_(false),
         use_current_read_with_scn_cutoff_(false),
-        skip_refresh_(false), is_auto_rebuild_(false) {}
+        skip_refresh_(false), is_auto_rebuild_(false),
+        rebuild_admission_rejected_(false) {}
   bool is_valid() const {
     return OB_INVALID_TENANT_ID != tenant_id_ &&
            OB_INVALID_ID != domain_tb_id_ && OB_INVALID_ID != base_tb_id_ &&
@@ -38,13 +39,14 @@ public:
   void reuse() {
     trans_ = nullptr;
     skip_refresh_ = false;
+    rebuild_admission_rejected_ = false;
     allocator_.reuse();
   }
   TO_STRING_KV(K_(tenant_id), K_(base_tb_id), K_(domain_tb_id),
                K_(index_id_tb_id), K_(refresh_method), K_(delta_rate_threshold),
                K_(refresh_threshold), K_(idx_parameters),
                K_(is_tablet_level), K_(use_current_read_with_scn_cutoff),
-               K_(skip_refresh), K_(is_auto_rebuild));
+               K_(skip_refresh), K_(is_auto_rebuild), K_(rebuild_admission_rejected));
 
 public:
   ObArenaAllocator allocator_;
@@ -69,6 +71,7 @@ public:
   bool use_current_read_with_scn_cutoff_;
   bool skip_refresh_;
   bool is_auto_rebuild_;
+  bool rebuild_admission_rejected_;
 };
 
 class ObVectorIndexRefresher {
