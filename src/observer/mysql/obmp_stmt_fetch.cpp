@@ -338,6 +338,7 @@ int ObMPStmtFetch::response_result(pl::ObPLCursorInfo &cursor,
         const ColumnsFieldArray *fields = NULL;
         ObArenaAllocator allocator(ObModIds::OB_SQL_EXECUTOR);
         ObSchemaGetterGuard schema_guard;
+        ObSqlCtx fetch_sql_ctx;
         SMART_VAR(ObExecContext, tmp_exec_ctx, allocator) {
           if (OB_ISNULL(cursor.get_spi_cursor())) {
             ret = OB_ERR_UNEXPECTED;
@@ -355,6 +356,8 @@ int ObMPStmtFetch::response_result(pl::ObPLCursorInfo &cursor,
           }
           if (OB_SUCC(ret)) {
               tmp_exec_ctx.set_my_session(&session);
+              fetch_sql_ctx.schema_guard_ = &schema_guard;
+              tmp_exec_ctx.set_sql_ctx(&fetch_sql_ctx);
               tmp_exec_ctx.set_mem_attr(ObMemAttr(session.get_effective_tenant_id(),
                                                   ObModIds::OB_SQL_EXEC_CONTEXT,
                                                   ObCtxIds::EXECUTE_CTX_ID));
