@@ -67,7 +67,8 @@ public:
     const BlockIDSet &exist_block_set,
     const BlockIDSet &blocks_for_error_check)
     : GCBaseOP(&exist_block_set),
-      blocks_for_error_check_(blocks_for_error_check)
+      blocks_for_error_check_(blocks_for_error_check),
+      referenced_block_hit_count_(0)
   {}
   virtual ~GCTabletMetaVersionOP() 
   { print_debug_block(); }
@@ -76,9 +77,11 @@ public:
       ObIArray<blocksstable::MacroBlockId> &result_block_ids);
   void print_debug_block();
   void add_or_print_debug_block(const blocksstable::MacroBlockId &block_id);
+  int64_t get_referenced_block_hit_count() const { return referenced_block_hit_count_; }
 
 private:
   const BlockIDSet &blocks_for_error_check_;
+  int64_t referenced_block_hit_count_;
   ObArray<blocksstable::MacroBlockId> debug_block_ids_;
 };
 

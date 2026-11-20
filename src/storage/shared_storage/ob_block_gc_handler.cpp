@@ -265,7 +265,8 @@ int MacroBlockCheckOP::operator()(
 void GCTabletMetaVersionOP::print_debug_block() 
 {
   if (debug_block_ids_.count() > 0) {
-    FLOG_INFO("blocks is referenced by lastest tablet meta version", K(debug_block_ids_.count()), K(debug_block_ids_));
+    LOG_DEBUG("blocks is referenced by lastest tablet meta version", K(debug_block_ids_.count()),
+        K(debug_block_ids_));
   }
 }
 
@@ -273,10 +274,10 @@ void GCTabletMetaVersionOP::add_or_print_debug_block(
     const blocksstable::MacroBlockId &block_id)
 {
   int ret = OB_SUCCESS;
-  if (debug_block_ids_.count() > 50) {
-    print_debug_block();
-    debug_block_ids_.reset();
-  } else if (OB_FAIL(debug_block_ids_.push_back(block_id))) {
+  ++referenced_block_hit_count_;
+  const int64_t max_debug_block_count = 50;
+  if (debug_block_ids_.count() < max_debug_block_count
+      && OB_FAIL(debug_block_ids_.push_back(block_id))) {
     LOG_WARN("failed to push_block", K(ret), K(debug_block_ids_.count()), K(block_id));
   }
 }
@@ -430,6 +431,11 @@ int ObBlockGCHandler::gc_blocks_for_tablet_meta_versions_(
                                   is_shared, op, batcher))) {
       LOG_WARN("failed to gc_blocks", KR(ret), KPC(this), K(tablet_versions.count()),
                K(min_retain_tablet_meta_version), K(is_shared));
+    }
+    const int64_t referenced_block_hit_count = op.get_referenced_block_hit_count();
+    if (referenced_block_hit_count > 0) {
+      LOG_INFO("private gc referenced blocks", K(is_shared), K(tablet_versions.count()),
+          K(referenced_block_hit_count), KPC(this));
     }
   }
   exist_block_set.destroy();
