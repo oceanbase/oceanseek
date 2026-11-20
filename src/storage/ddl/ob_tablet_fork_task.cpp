@@ -75,6 +75,8 @@ ERRSIM_POINT_DEF(EN_FORK_TABLE_FORCE_SIMPLIFIED_DST_SCHEMA, "Force simplified ds
 ERRSIM_POINT_DEF(EN_FORK_TABLE_BLOCK_LOCAL_LAND, "Block fork local land to simulate a slow follower");
 ERRSIM_POINT_DEF(EN_FORK_MINOR_REWRITE_TASK_FAIL, "Fail fork minor rewrite task");
 ERRSIM_POINT_DEF(EN_FORK_MINOR_FINISH_TASK_FAIL, "Fail fork minor finish task");
+ERRSIM_POINT_DEF(EN_FORK_MINOR_FINISH_UNCOMMITTED, "Mark fork merge result unresolved before Finish validation");
+ERRSIM_POINT_DEF(EN_FORK_MINOR_PUBLISH_UNCOMMITTED, "Create unresolved fork output before Publish validation");
 #endif
 
 static int check_fork_mds_reloc_done_(const ObLSHandle &dest_ls_handle, const ObTabletID &tablet_id,
@@ -945,12 +947,29 @@ int ObForkTableDataDag::prepare_fork_publish_major_(ObSSTable &major, const int6
   return ret;
 }
 
+bool ObForkTableDataDag::is_fork_minor_snapshot_safe_(
+    const ObITable &table, const share::SCN &fork_snapshot_scn)
+{
+  bool is_safe = false;
+  if (table.is_minor_sstable() && table.get_end_scn() <= fork_snapshot_scn) {
+    const ObSSTable &sstable = static_cast<const ObSSTable &>(table);
+    is_safe = !sstable.contain_uncommitted_row()
+        && sstable.get_upper_trans_version() <= fork_snapshot_scn.get_val_for_tx();
+  }
+  return is_safe;
+}
+
 int ObForkTableDataDag::prepare_fork_publish_minor_(
     ObITable *table, const int64_t table_idx, ObArenaAllocator &allocator, ObForkPublishCtx &ctx)
 {
   int ret = OB_SUCCESS;
   bool can_reuse = false;
-  if (table->is_minor_sstable() && table->get_end_scn() <= ctx.fork_snapshot_scn_
+  // A local shared MINI can outlive the shared compaction that resolved its
+  // transactions. Reusing it would reintroduce dependencies on recycled TX_DATA.
+  // Only reuse SSTables whose rows no longer depend on transaction state lookup.
+  // MINI fill-tx can resolve commits newer than its end SCN. Such rows must still
+  // be filtered at the fork snapshot instead of being published by direct reuse.
+  if (is_fork_minor_snapshot_safe_(*table, ctx.fork_snapshot_scn_)
       && OB_FAIL(check_fork_sstable_shared_(*static_cast<ObSSTable *>(table), can_reuse))) {
     LOG_WARN("[FORKTABLE] failed to check fork source minor shared state", K(ret), "i", table_idx, KPC(table));
   }
@@ -1198,6 +1217,11 @@ int ObForkTableDataDag::normalize_fork_minor_snapshot_row_(
   if (OB_UNLIKELY(schema_rowkey_count <= 0 || !row.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid fork minor snapshot row", K(ret), K(schema_rowkey_count), K(row));
+  } else if (OB_UNLIKELY(row.is_uncommitted_row())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unresolved transaction in fork minor snapshot row", K(ret),
+        "trans_id", row.get_trans_id(), "mvcc_row_flag", row.mvcc_row_flag_,
+        "column_count", row.get_column_count());
   } else {
     if (row.is_shadow_row()) {
       const int64_t sql_sequence_idx =
@@ -1587,6 +1611,16 @@ int ObForkMinorFinishTask::process()
   } else if (OB_FAIL(ctx_->minor_rewrite_.active_.index_builder_->close_with_macro_seq(merge_res, index_seq,
                  OB_DEFAULT_MACRO_BLOCK_SIZE, 0/*nested offset*/, ctx_->minor_rewrite_.active_.pre_warm_param_))) {
     LOG_WARN("[FORKTABLE] failed to close fork minor index builder", K(ret), K(entry_idx_), K(index_seq));
+  }
+#ifdef ERRSIM
+  if (OB_SUCC(ret) && EN_FORK_MINOR_FINISH_UNCOMMITTED) {
+    merge_res.contain_uncommitted_row_ = true;
+  }
+#endif
+  if (OB_FAIL(ret)) {
+  } else if (OB_UNLIKELY(merge_res.contain_uncommitted_row_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("[FORKTABLE] unresolved transaction in fork minor output", K(ret), K(entry_idx_), "tablet_id", ctx_->param_.dest_tablet_id_, K(merge_res));
   } else {
     table_key.tablet_id_ = ctx_->param_.dest_tablet_id_;
     table_key.column_group_idx_ = 0;
@@ -1597,6 +1631,13 @@ int ObForkMinorFinishTask::process()
                    ctx_->minor_rewrite_.active_.sstable_logic_seq_,
                    ctx_->minor_rewrite_.active_.source_->get_rec_scn(), merge_res))) {
       LOG_WARN("[FORKTABLE] failed to init fork minor create param", K(ret), K(entry_idx_), K(table_key));
+    }
+#ifdef ERRSIM
+    if (OB_SUCC(ret) && EN_FORK_MINOR_PUBLISH_UNCOMMITTED) {
+      create_param.contain_uncommitted_row_ = true;
+    }
+#endif
+    if (OB_FAIL(ret)) {
     } else if (OB_FAIL(ObTabletCreateDeleteHelper::create_sstable<ObSSTable>(
                    create_param, ctx_->output_allocator_, ctx_->minor_entries_.at(entry_idx_).output_handle_))) {
       LOG_WARN("[FORKTABLE] failed to create fork rewritten minor", K(ret), K(entry_idx_), K(create_param));
@@ -1631,6 +1672,9 @@ int ObForkTablePublishTask::process()
     } else if (OB_ISNULL(minor)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("[FORKTABLE] fork minor output is null", K(ret), K(i));
+    } else if (OB_UNLIKELY(minor->contain_uncommitted_row())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("[FORKTABLE] cannot publish fork minor with unresolved transactions", K(ret), K(i), KPC(minor));
     } else if (OB_FAIL(ctx_->tables_handle_.add_table(ctx_->minor_entries_.at(i).output_handle_))) {
       LOG_WARN("[FORKTABLE] failed to add fork minor output", K(ret), K(i));
     } else if (minor->get_end_scn() > max_end_scn) {

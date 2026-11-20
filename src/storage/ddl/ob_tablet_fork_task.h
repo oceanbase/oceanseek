@@ -112,6 +112,8 @@ private:
       ObForkPublishCtx &ctx, ObTableHandleV2 &sstable_handle);
   int prepare_fork_publish_major_(blocksstable::ObSSTable &major, const int64_t table_idx,
       common::ObArenaAllocator &allocator, ObForkPublishCtx &ctx, bool &has_major);
+  static bool is_fork_minor_snapshot_safe_(
+      const ObITable &table, const share::SCN &fork_snapshot_scn);
   int prepare_fork_publish_minor_(ObITable *table, const int64_t table_idx,
       common::ObArenaAllocator &allocator, ObForkPublishCtx &ctx);
   int collect_fork_publish_tables_(common::ObArenaAllocator &allocator, ObForkPublishCtx &ctx);

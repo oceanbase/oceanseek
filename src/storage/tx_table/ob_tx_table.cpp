@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "ob_tx_table.h"
+#include "lib/utility/ob_tracepoint.h"
 #include "storage/tx_storage/ob_ls_service.h"
 #include "storage/tx_table/ob_tx_data_cache.h"
 #ifdef OB_BUILD_SHARED_STORAGE
@@ -19,6 +20,10 @@ using namespace palf;
 using namespace transaction;
 
 namespace storage {
+
+#ifdef ERRSIM
+ERRSIM_POINT_DEF(EN_SS_TX_DATA_RECYCLE_FAST, "Shorten shared TX_DATA recycle scheduling intervals");
+#endif
 
 namespace {
 
@@ -1160,8 +1165,14 @@ bool ObTxTable::can_recycle_tx_data(const share::SCN current_recycle_scn, const 
   }
 
   const int64_t current_time = ObClockGenerator::getClock();
-  if (current_recycle_scn.is_min() || current_time - last_recycled_ts < MIN_INTERVAL_OF_TX_DATA_RECYCLE_US ||
-      current_recycle_scn.convert_to_ts() - last_recycled_scn.convert_to_ts() < MIN_INTERVAL_OF_TX_DATA_RECYCLE_US) {
+  int64_t recycle_interval = MIN_INTERVAL_OF_TX_DATA_RECYCLE_US;
+#ifdef ERRSIM
+  if (!is_local_exec_mode && EN_SS_TX_DATA_RECYCLE_FAST) {
+    recycle_interval = 1_s;
+  }
+#endif
+  if (current_recycle_scn.is_min() || current_time - last_recycled_ts < recycle_interval ||
+      current_recycle_scn.convert_to_ts() - last_recycled_scn.convert_to_ts() < recycle_interval) {
     can_recycle = false;
     if (REACH_TIME_INTERVAL(10LL * 1000LL * 1000LL)) {
       FLOG_INFO("current_recycle_scn is close to last recycle scn, skip recycle once",
@@ -1418,7 +1429,12 @@ share::SCN ObTxTable::get_ss_cached_recycle_scn() const
 int ObTxTable::resolve_shared_storage_upload_info_(share::SCN &ss_recycle_scn)
 {
   int ret = OB_SUCCESS;
-  const int64_t SHARED_STORAGE_USE_CACHE_DURATION = 1_hour;
+  int64_t shared_storage_cache_duration = 1_hour;
+#ifdef ERRSIM
+  if (EN_SS_TX_DATA_RECYCLE_FAST) {
+    shared_storage_cache_duration = 1_s;
+  }
+#endif
 
   SCN ss_checkpoint_scn = SCN::invalid_scn();
   SCN tx_data_table_upload_scn = SCN::invalid_scn();
@@ -1426,7 +1442,7 @@ int ObTxTable::resolve_shared_storage_upload_info_(share::SCN &ss_recycle_scn)
   int64_t origin_time = ATOMIC_LOAD(&(ss_upload_scn_cache_.update_ts_));
   int64_t current_time = ObClockGenerator::getClock();
 
-  if (current_time - origin_time > SHARED_STORAGE_USE_CACHE_DURATION
+  if (current_time - origin_time > shared_storage_cache_duration
       && ATOMIC_BCAS(&(ss_upload_scn_cache_.update_ts_), origin_time, current_time)) {
     share::SCN transfer_scn;
     {
