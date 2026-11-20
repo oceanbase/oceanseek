@@ -2888,7 +2888,7 @@ DEF_STR_WITH_CHECKER(_vector_task_disable_list, OB_TENANT_PARAMETER, "",
     "Format: 'TASK_TYPE:TABLET_ID,...', e.g. 'INCREMENTAL_INDEX_FREEZE:200001,INCREMENTAL_INDEX_MERGE:200001,PARTITION_REBUILD:*'. "
     "'*' disables the task type for all tablets. Empty string means nothing disabled.",
     ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
-DEF_BOOL(vector_index_memory_saving_mode, OB_TENANT_PARAMETER, "True",
+DEF_BOOL(vector_index_memory_saving_mode, OB_TENANT_PARAMETER, "False",
         "Specifies whether to enable the vector index memory saving mode. This can reduce the memory used by the partition table vector index rebuild.",
         ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 DEF_BOOL(load_vector_index_on_follower, OB_TENANT_PARAMETER, "True",
