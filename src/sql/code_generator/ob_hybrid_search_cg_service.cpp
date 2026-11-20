@@ -1201,7 +1201,7 @@ int ObHybridSearchCgService::generate_ctdef(ObLogTableScan &op, const ObScalarQu
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("scalar ctdef is null", K(ret));
   } else if (OB_FALSE_IT(new_scalar_ctdef->set_primary_get_ratio(
-      scalar_query_node->is_scoring_ ? 0 : scalar_query_node->primary_get_ratio_))) {
+      scalar_query_node->primary_get_ratio_))) {
   } else if (scalar_query_node->is_merged_probe_) {
     // Merged primary-probe node: a primary-table ROR point-get built from the AND filter of
     // all must/filter clauses. No index scan (the probe IS the primary scan); the primary access

@@ -107,10 +107,10 @@ private:
   int64_t nested_last_idx_ = 0;
   bool is_first_nk_ = true;
   bool has_probe_child_ = false;
-  // True only when nonnegative integer driver scores have an exact sum <= 2^53.
+  // True only when every driver/probe score is a nonnegative integer and their sum is <= 2^53.
   bool is_fixed_score_ = false;
   // Valid bounds are finite and nonnegative; the sentinel also means no cached bound.
-  // Rebuilt after child rescans; accepted sums are independent of driver order.
+  // Rebuilt after child rescans; the sum is exact regardless of child order.
   double fixed_score_bound_ = INVALID_FIXED_SCORE_BOUND;
   // Probe-capable children; the driver is never in this list.
   ObSEArray<ObIDASSearchOp *, 4> probe_ops_;

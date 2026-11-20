@@ -125,8 +125,6 @@ int ObIDASSearchRtDef::prefer_primary_probe(
     if (OB_ISNULL(search_ctdef)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("search_ctdef is null", K(ret));
-    } else if (search_ctdef->is_scoring()) {
-      // do nothing
     } else {
       const int64_t ratio = search_ctdef->get_primary_get_ratio();
       ObDASSearchCost self_cost;

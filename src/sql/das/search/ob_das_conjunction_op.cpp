@@ -88,12 +88,12 @@ int ObDASConjunctionOp::init_fixed_score_bound()
   int ret = OB_SUCCESS;
   const double MAX_EXACT_INTEGER_SCORE = 9007199254740992.0; // 2^53
   double max_score = 0.0;
-  bool known = is_scoring_ && driver_ops_.count() > 1;
+  bool known = is_scoring_ && children_cnt_ > 1;
   is_fixed_score_ = false;
   fixed_score_bound_ = INVALID_FIXED_SCORE_BOUND;
-  // The builder only permits non-scoring probes; only drivers contribute scores.
-  for (int64_t i = 0; OB_SUCC(ret) && known && i < driver_ops_.count(); ++i) {
-    ObIDASSearchOp *op = driver_ops_.at(i);
+  // Both enumerable drivers and required probes contribute to the result score.
+  for (int64_t i = 0; OB_SUCC(ret) && known && i < children_cnt_; ++i) {
+    ObIDASSearchOp *op = children_[i];
     double child_score = 0.0;
     if (OB_ISNULL(op)) {
       ret = OB_ERR_UNEXPECTED;
@@ -102,7 +102,7 @@ int ObDASConjunctionOp::init_fixed_score_bound()
       known = false;
     } else {
       child_score = op->get_constant_score();
-      // Nonnegative integer partial sums up to 2^53 are exact in every driver order.
+      // Nonnegative integer partial sums up to 2^53 are exact in every child order.
       // shortcut: fractional boosts are not optimized; revisit with a linear-time safe bound.
       if (!std::isfinite(child_score) || child_score < 0.0
           || std::floor(child_score) != child_score
@@ -359,17 +359,19 @@ int ObDASConjunctionOp::advance_driver_ops_to(
   int ret = OB_SUCCESS;
   int64_t &last_idx = std::is_same_v<RowType, ObDASNestedKey> ? nested_last_idx_ : last_idx_;
   RowType candidate_target = target;
-  double candidate_score = score;
+  double leading_score = score;
   bool all_advanced = false;
   while (OB_SUCC(ret) && !all_advanced) {
     bool target_changed = false;
+    double candidate_score = 0.0;
     for (int i = 0; OB_SUCC(ret) && i < driver_ops_.count() && !target_changed; ++i) {
       RowType tmp_id;
       double tmp_score = 0.0;
       int cmp = 0;
       ObIDASSearchOp *op = nullptr;
       if (last_idx == i) {
-        // already advanced to the target
+        // Sum drivers in child order even when a later driver supplied the target.
+        candidate_score += leading_score;
       } else if (OB_ISNULL(op = driver_ops_.at(i))) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected null op", KR(ret), K(i));
@@ -385,7 +387,7 @@ int ObDASConjunctionOp::advance_driver_ops_to(
         } else {
           // this child advanced to a greater target, we should start a new round of iteration
           candidate_target = tmp_id;
-          candidate_score = tmp_score;
+          leading_score = tmp_score;
           last_idx = i;
           target_changed = true;
         }
@@ -396,11 +398,11 @@ int ObDASConjunctionOp::advance_driver_ops_to(
     if (OB_SUCC(ret) && !target_changed) {
       // all children advanced to the candidate_target
       all_advanced = true;
+      score = candidate_score;
     }
   }
   if (OB_SUCC(ret)) {
     curr_id = candidate_target;
-    score = candidate_score;
   }
   return ret;
 }
@@ -468,6 +470,7 @@ int ObDASConjunctionOp::do_advance_shallow(
   }
   while (OB_SUCC(ret)) {
     max_score = 0.0;
+    double probe_max_score = 0.0;
     maximum_min_id.set_min();
     minimal_max_id.set_max();
     const MaxScoreTuple *tmp_max_score_tuple = nullptr;
@@ -482,7 +485,8 @@ int ObDASConjunctionOp::do_advance_shallow(
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected null max score tuple", KR(ret), K(i), K(candidate_target));
       } else {
-        max_score += tmp_max_score_tuple->get_max_score();
+        double &subtotal = op->is_probe_mode() ? probe_max_score : max_score;
+        subtotal += tmp_max_score_tuple->get_max_score();
         if (OB_FAIL(compare_rowid(maximum_min_id, tmp_max_score_tuple->get_min_id(), cmp))) {
           LOG_WARN("failed to compare rowids", KR(ret), K(i), K(maximum_min_id), K(tmp_max_score_tuple->get_min_id()));
         } else if (cmp < 0) {
@@ -502,7 +506,8 @@ int ObDASConjunctionOp::do_advance_shallow(
       // all children's ranges should intersect, if not, we should try a new target
       candidate_target = maximum_min_id;
     } else {
-      // all children's ranges intersect, we can return the result
+      // Match row scoring: driver subtotal + probe subtotal.
+      max_score += probe_max_score;
       break;
     }
   }
@@ -518,8 +523,25 @@ int ObDASConjunctionOp::do_calc_max_score(double &threshold)
   int ret = OB_SUCCESS;
   if (has_fixed_score_bound()) {
     threshold = fixed_score_bound_;
-  } else if (OB_FAIL(ObIDASSearchOp::do_calc_max_score(threshold))) {
-    LOG_WARN("failed to calculate conjunction max score", KR(ret));
+  } else {
+    double driver_max_score = 0.0;
+    double probe_max_score = 0.0;
+    for (int64_t i = 0; OB_SUCC(ret) && i < children_cnt_; ++i) {
+      ObIDASSearchOp *op = children_[i];
+      double child_max_score = 0.0;
+      if (OB_ISNULL(op)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected null conjunction child", KR(ret), K(i));
+      } else if (OB_FAIL(op->calc_max_score(child_max_score))) {
+        LOG_WARN("failed to calculate child max score", KR(ret), K(i));
+      } else {
+        double &subtotal = op->is_probe_mode() ? probe_max_score : driver_max_score;
+        subtotal += child_max_score;
+      }
+    }
+    if (OB_SUCC(ret)) {
+      threshold = driver_max_score + probe_max_score;
+    }
   }
   return ret;
 }
@@ -547,9 +569,14 @@ int ObDASConjunctionOp::do_set_min_competitive_score(const double &threshold)
         probe_max_score += child_max_score;
       }
     }
-    if (OB_SUCC(ret)) {
+    // An unbounded probe subtotal leaves no useful cutoff for the driver.
+    if (OB_SUCC(ret) && std::isfinite(probe_max_score)) {
       ObIDASSearchOp *driver_op = driver_ops_.at(0);
-      const double driver_threshold = threshold - probe_max_score;
+      // A rounded-up difference must not discard a competitive driver on equality.
+      double driver_threshold = threshold - probe_max_score;
+      if (driver_threshold + probe_max_score > threshold) {
+        driver_threshold = std::nextafter(driver_threshold, -INFINITY);
+      }
       if (OB_ISNULL(driver_op)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected null driver op", KR(ret));

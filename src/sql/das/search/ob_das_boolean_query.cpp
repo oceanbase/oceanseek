@@ -1113,10 +1113,8 @@ int ObDASBooleanQueryRtDef::req(const ObBooleanSubClause<ObIDASSearchRtDef> &mus
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected nullptr ctdef", KR(ret));
       } else if (clause->op_type_ == DAS_OP_SCALAR_QUERY) {
-        clause->set_allow_probe(
-          i != 0 &&
-          !ctdef->is_scoring() &&
-          DAS_ROWID_TYPE_UINT64 == search_ctx.get_rowid_type());
+        // Probe eligibility is independent of the exact-integer bound used for early termination.
+        clause->set_allow_probe(i != 0 && DAS_ROWID_TYPE_UINT64 == search_ctx.get_rowid_type());
       }
     }
     for (int i = 0; OB_SUCC(ret) && i < required_clauses.count(); i++) {
