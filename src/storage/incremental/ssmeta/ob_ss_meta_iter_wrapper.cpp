@@ -1670,13 +1670,10 @@ int ObSSMetaTabletMacroIDIterator::collect_lob_blocks_(
     share::schema::ObColDesc column;
     column.col_type_.set_varchar();
     column.col_type_.set_collation_type(CS_TYPE_BINARY);
-    ObSEArray<share::schema::ObColDesc, 3> columns;
+    ObSEArray<share::schema::ObColDesc, ObLobMetaUtil::LOB_META_MACRO_ID_COLUMN_CNT> columns;
     const uint64_t column_ids[] = {ObLobMetaUtil::LOB_INFO_COL_ID,
-        ObLobMetaUtil::LOB_BLOCK_ID_COL_ID, ObLobMetaUtil::BYTE_LEN_COL_ID};
+                                  ObLobMetaUtil::LOB_BLOCK_ID_COL_ID};
     for (int64_t i = 0; OB_SUCC(ret) && i < ARRAYSIZEOF(column_ids); ++i) {
-      if (ObLobMetaUtil::BYTE_LEN_COL_ID == column_ids[i]) {
-        column.col_type_.set_uint64();
-      }
       column.col_id_ = OB_APP_MIN_COLUMN_ID + column_ids[i];
       if (OB_FAIL(columns.push_back(column))) {
         LOG_WARN("failed to append lob column", K(ret), K(column));
@@ -1703,7 +1700,6 @@ int ObSSMetaTabletMacroIDIterator::collect_lob_blocks_(
           const blocksstable::ObStorageDatum &datum = row->storage_datums_[1];
           ObLobMetaExtraInfo extra_info;
           blocksstable::MacroBlockId macro_id;
-          const blocksstable::ObStorageDatum &size_datum = row->storage_datums_[2];
           // TODO(xunyuan): Move row-type filtering and object-ID decoding into dedicated Meta/Ctrl iterators,
           // so callers no longer need to request or parse lob_info.
           if (info_datum.is_null() && datum.is_null()) {
@@ -1725,7 +1721,8 @@ int ObSSMetaTabletMacroIDIterator::collect_lob_blocks_(
             ret = OB_ERR_UNEXPECTED;
             LOG_WARN("unexpected outtable lob macro id length", K(ret), K(datum.len_), K(macro_id));
           } else if (OB_FAIL(block_infos.push_back(ObTabletBlockInfo(
-              macro_id, ObTabletMacroType::SHARED_DATA_BLOCK, static_cast<int64_t>(size_datum.get_uint()))))) {
+                         macro_id, ObTabletMacroType::SHARED_DATA_BLOCK,
+                         static_cast<int64_t>(extra_info.compressed_len_))))) {
             LOG_WARN("failed to append lob object", K(ret), K(macro_id));
           }
         }

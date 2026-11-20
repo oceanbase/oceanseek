@@ -1061,7 +1061,7 @@ static void verify_lob_physical_backup_restore(
     const int cleanup_ret = ObObjectManager::delete_object(object_id, 0 /*ls_epoch*/);
     EXPECT_TRUE(OB_SUCCESS == cleanup_ret || OB_OBJECT_NOT_EXIST == cleanup_ret);
   });
-  // Collection uses Meta.byte_len even while the referenced object does not exist.
+  // Collection reads the stored length from Meta before the object exists.
   ObSEArray<ObTabletBlockInfo, 1> blocks;
   ASSERT_EQ(OB_SUCCESS, ObSSMetaTabletMacroIDIterator::collect_lob_blocks_(tablet, blocks));
   ASSERT_EQ(1, blocks.count()); // Only the OUTTABLE data row supplies an object reference.
@@ -1381,7 +1381,10 @@ void ObSSLocalMinorWatermarkTest::create_lob_meta_sstable(
     input.storage_datums_[2].set_string("1", 1); // seq_id
     input.storage_datums_[3].set_int(100 - snapshot + i); // hidden transaction version
     input.storage_datums_[4].set_int(0); // hidden SQL sequence
-    input.storage_datums_[5].set_uint(object_size);
+    // Simulate a shorter stored length for the small OUTTABLE object.
+    const int64_t byte_len = (0 == data_idx && object_size < OB_DEFAULT_MACRO_BLOCK_SIZE)
+        ? object_size + 1 : object_size;
+    input.storage_datums_[5].set_uint(byte_len);
     input.storage_datums_[6].set_uint(10);
     if (data_idx == 3) { input.storage_datums_[7].set_null(); } // Legacy IN_TABLE.
     else { input.storage_datums_[7].set_string(lob_infos[data_idx]); }
