@@ -466,6 +466,9 @@ int ObMajorMergeScheduler::do_one_round_major_merge(const int64_t expected_epoch
       // 
       if (OB_FAIL(merge_info_mgr_->get_zone_merge_mgr().get_snapshot(global_info))) {
         LOG_WARN("fail to get zone global merge info", KR(ret));
+      } else if (ObGlobalMergeInfo::MERGE_MODE_TENANT != global_info.merge_mode_.get_value()) {
+        // Return to do_work() to dispatch the new compaction mode.
+        break;
       } else if (global_info.is_last_merge_complete()) {
         // this round major merge is complete
         break;

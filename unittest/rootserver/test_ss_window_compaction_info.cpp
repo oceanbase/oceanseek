@@ -19,6 +19,7 @@
 #include "share/ob_cluster_version.h"
 #include "share/ob_server_struct.h"
 #include "share/ob_tablet_meta_table_compaction_operator.h"
+#include "share/mock_mysql_proxy.h"
 
 namespace oceanbase
 {
@@ -59,10 +60,12 @@ protected:
       const ObGlobalMergeInfo::MergeMode merge_mode);
 
 protected:
+  MockMySQLProxy sql_proxy_;
   ObMajorMergeInfoManager merge_info_mgr_;
   ObZoneMergeManager zone_merge_mgr_;
   ObServerMode origin_startup_mode_;
   bool origin_enable_major_freeze_;
+  ObAddr origin_self_addr_;
 };
 
 const uint64_t TestSSWindowCompactionInfo::DEFAULT_TENANT_ID;
@@ -134,6 +137,7 @@ void TestSSWindowCompactionInfo::SetUp()
 {
   origin_startup_mode_ = GCTX.startup_mode_;
   origin_enable_major_freeze_ = GCONF.enable_major_freeze;
+  origin_self_addr_ = GCONF.self_addr_;
 #ifndef OB_BUILD_SHARED_STORAGE
   GTEST_SKIP() << "shared storage mode is not enabled in this build";
 #endif
@@ -146,6 +150,7 @@ void TestSSWindowCompactionInfo::TearDown()
 {
   GCTX.startup_mode_ = origin_startup_mode_;
   GCONF.enable_major_freeze = origin_enable_major_freeze_;
+  GCONF.self_addr_ = origin_self_addr_;
 }
 
 TEST_F(TestSSWindowCompactionInfo, check_can_set_ss_window_freeze_info_matrix)
@@ -547,6 +552,114 @@ TEST_F(TestSSWindowCompactionInfo, completed_tenant_merge_does_not_need_merge)
   ASSERT_EQ(OB_SUCCESS, merge_scheduler.check_or_update_major_merge_state(
       EXPECTED_EPOCH, global_merge_info, need_tenant_merge));
   EXPECT_FALSE(need_tenant_merge);
+}
+
+TEST_F(TestSSWindowCompactionInfo, tenant_merge_loop_exits_when_window_target_is_published)
+{
+  class TestScheduler : public ObMajorMergeScheduler
+  {
+  public:
+    explicit TestScheduler(const uint64_t tenant_id)
+      : ObMajorMergeScheduler(tenant_id), idle_count_(0)
+    {
+      stop_ = false;
+    }
+
+    int64_t idle_count_;
+
+  protected:
+    int try_idle(const int64_t, const int) override
+    {
+      // End the loop without sleeping if it incorrectly enters the retry path.
+      ++idle_count_;
+      pause();
+      return OB_SUCCESS;
+    }
+  } scheduler(DEFAULT_TENANT_ID);
+
+  ObZoneMergeManager &zone_mgr = merge_info_mgr_.get_zone_merge_mgr();
+  zone_mgr.tenant_id_ = DEFAULT_TENANT_ID;
+  zone_mgr.is_inited_ = true;
+  zone_mgr.is_loaded_ = true;
+  build_global_merge_info(TARGET_SCN_VAL, TARGET_SCN_VAL, BASE_SCN_VAL,
+      ObZoneMergeInfo::MERGE_STATUS_MERGING, ObGlobalMergeInfo::MERGE_MODE_WINDOW,
+      zone_mgr.global_merge_info_);
+  scheduler.merge_info_mgr_ = &merge_info_mgr_;
+  scheduler.is_inited_ = true;
+  scheduler.sql_proxy_ = &sql_proxy_;
+  // Keep the strategy uninitialized: WINDOW must exit before ordinary zone selection.
+  // The previous Major has already cleared the progress checker's context.
+  scheduler.progress_checker_.is_inited_ = true;
+
+  ASSERT_EQ(OB_SUCCESS, scheduler.do_one_round_major_merge(EXPECTED_EPOCH));
+  EXPECT_GT(scheduler.get_last_run_timestamp(), 0);
+  EXPECT_EQ(0, scheduler.idle_count_);
+}
+
+// MR3616-T002: recheck the mode after a window target is published between iterations.
+TEST_F(TestSSWindowCompactionInfo, tenant_merge_loop_exits_when_mode_changes_between_iterations)
+{
+  class TestScheduler : public ObMajorMergeScheduler
+  {
+  public:
+    TestScheduler(const uint64_t tenant_id, ObGlobalMergeInfo &global_info, const SCN &window_scn)
+      : ObMajorMergeScheduler(tenant_id), idle_count_(0), global_info_(global_info), window_scn_(window_scn)
+    {
+      stop_ = false;
+    }
+
+    int64_t idle_count_;
+
+  protected:
+    int try_idle(const int64_t, const int) override
+    {
+      ++idle_count_;
+      if (1 == idle_count_) {
+        EXPECT_EQ(ObGlobalMergeInfo::MERGE_MODE_TENANT, global_info_.merge_mode_.get_value());
+        // Model Major completion followed by window activation before the next snapshot.
+        global_info_.last_merged_scn_.set_scn(global_info_.global_broadcast_scn(), false);
+        global_info_.frozen_scn_.set_scn(window_scn_, false);
+        global_info_.global_broadcast_scn_.set_scn(window_scn_, false);
+        global_info_.merge_mode_.set_val(ObGlobalMergeInfo::MERGE_MODE_WINDOW, false);
+      } else {
+        ADD_FAILURE() << "the tenant merge loop must exit after switching to window mode";
+        pause();
+      }
+      return OB_SUCCESS;
+    }
+
+  private:
+    ObGlobalMergeInfo &global_info_;
+    const SCN window_scn_;
+  };
+
+  ObZoneMergeManager &zone_mgr = merge_info_mgr_.get_zone_merge_mgr();
+  zone_mgr.tenant_id_ = DEFAULT_TENANT_ID;
+  zone_mgr.is_inited_ = true;
+  zone_mgr.is_loaded_ = true;
+  build_global_merge_info(TARGET_SCN_VAL, TARGET_SCN_VAL, BASE_SCN_VAL,
+      ObZoneMergeInfo::MERGE_STATUS_MERGING, ObGlobalMergeInfo::MERGE_MODE_TENANT,
+      zone_mgr.global_merge_info_);
+  const SCN window_scn = make_scn(TARGET_SCN_VAL + 1);
+  TestScheduler scheduler(DEFAULT_TENANT_ID, zone_mgr.global_merge_info_, window_scn);
+  scheduler.merge_info_mgr_ = &merge_info_mgr_;
+  scheduler.is_inited_ = true;
+  scheduler.sql_proxy_ = &sql_proxy_;
+  ASSERT_EQ(OB_SUCCESS, scheduler.merge_strategy_.init(DEFAULT_TENANT_ID, &zone_mgr));
+  // Leave the progress context empty so the first iteration reaches idle without SQL.
+  scheduler.progress_checker_.is_inited_ = true;
+  ASSERT_TRUE(GCONF.self_addr_.set_ip_addr("127.0.0.1", 2882));
+  // Interval diagnostics must use the live proxy, even when its query fails.
+  EXPECT_CALL(sql_proxy_, read(::testing::_, OB_SYS_TENANT_ID,
+      ::testing::HasSubstr("SELECT start_service_time FROM __all_server ")))
+      .Times(::testing::AtLeast(1))
+      .WillRepeatedly(::testing::Return(OB_ERR_UNEXPECTED));
+
+  ASSERT_EQ(OB_SUCCESS, scheduler.do_one_round_major_merge(EXPECTED_EPOCH));
+  EXPECT_EQ(1, scheduler.idle_count_);
+  EXPECT_FALSE(scheduler.is_paused());
+  EXPECT_EQ(window_scn, zone_mgr.global_merge_info_.global_broadcast_scn());
+  EXPECT_FALSE(zone_mgr.global_merge_info_.is_last_merge_complete());
 }
 
 TEST_F(TestSSWindowCompactionInfo, ss_window_compaction_active_guard_matrix)
