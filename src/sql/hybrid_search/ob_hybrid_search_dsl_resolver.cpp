@@ -2098,6 +2098,28 @@ int ObDSLResolver::resolve_field_expr_and_path(ObString &field_name,
   return ret;
 }
 
+int ObDSLResolver::resolve_fulltext_field_expr_and_path(ObString &field_name,
+                                                       ObColumnRefRawExpr *&col_expr,
+                                                       ObString &path_str)
+{
+  int ret = OB_SUCCESS;
+  // Keep the original JSON member spelling when the complete column name is absent.
+  ObString col_name = field_name;
+  if (OB_FAIL(get_user_column_expr(col_name, col_expr))) {
+    if (OB_HASH_NOT_EXIST != ret) {
+      LOG_WARN("fail to get user column expr", K(ret), K(col_name));
+    } else if (OB_FAIL(resolve_field_expr_and_path(field_name, col_expr, path_str))) {
+      LOG_WARN("fail to resolve fulltext field", K(ret), K(field_name));
+    }
+  } else {
+    field_name = col_name;
+  }
+  if (OB_SUCC(ret) && col_expr->get_result_type().is_json() && path_str.empty()) {
+    path_str = ObString::make_string("$");
+  }
+  return ret;
+}
+
 int ObDSLResolver::get_fulltext_index_schema(const ObString &col_name, const ObTableSchema *&index_schema)
 {
   int ret = OB_SUCCESS;
@@ -4036,7 +4058,7 @@ int ObDSLResolver::resolve_match(ObIJsonBase &req_node, ObDSLQuery *&query, ObDS
     LOG_WARN("match query should be single-key object", K(ret));
   } else if (OB_FAIL(req_node.get_object_value(0, col_name, col_para))) {
     LOG_WARN("fail to get value", K(ret));
-  } else if (OB_FAIL(resolve_field_expr_and_path(col_name, col_expr, path))) {
+  } else if (OB_FAIL(resolve_fulltext_field_expr_and_path(col_name, col_expr, path))) {
     if (OB_HASH_NOT_EXIST == ret) {
       ret = OB_ERR_BAD_FIELD_ERROR;
       LOG_USER_ERROR(OB_ERR_BAD_FIELD_ERROR, col_name.length(), col_name.ptr(),
@@ -4104,14 +4126,9 @@ int ObDSLResolver::resolve_match(ObIJsonBase &req_node, ObDSLQuery *&query, ObDS
     LOG_WARN("match query field value should be string or object", K(ret), K(col_para->json_type()));
   }
 
-  if (OB_SUCC(ret) && col_expr->get_result_type().is_json()) {
-    if (path.empty()) {
-      path = ObString::make_string("$");
-    }
-    if (!enclosing_nested_paths_.empty()) {
-      ret = OB_NOT_SUPPORTED;
-      LOG_USER_ERROR(OB_NOT_SUPPORTED, "Search FULLTEXT inside a nested query");
-    }
+  if (OB_SUCC(ret) && col_expr->get_result_type().is_json() && !enclosing_nested_paths_.empty()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "Search FULLTEXT inside a nested query");
   }
   if (OB_FAIL(ret)) {
   } else if (OB_ISNULL(query_node)) {
@@ -4169,7 +4186,7 @@ int ObDSLResolver::resolve_match_phrase(ObIJsonBase &req_node,
     LOG_WARN("match_phrase query should be single-key object", K(ret));
   } else if (OB_FAIL(req_node.get_object_value(0, col_name, col_para))) {
     LOG_WARN("fail to get value", K(ret));
-  } else if (OB_FAIL(resolve_field_expr_and_path(col_name, col_expr, path))) {
+  } else if (OB_FAIL(resolve_fulltext_field_expr_and_path(col_name, col_expr, path))) {
     if (OB_HASH_NOT_EXIST == ret) {
       ret = OB_ERR_BAD_FIELD_ERROR;
       LOG_USER_ERROR(OB_ERR_BAD_FIELD_ERROR, col_name.length(), col_name.ptr(),
@@ -4225,14 +4242,9 @@ int ObDSLResolver::resolve_match_phrase(ObIJsonBase &req_node,
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "match_phrase query field value, should be string or object");
     LOG_WARN("match_phrase query field value should be string or object", K(ret), K(col_para->json_type()));
   }
-  if (OB_SUCC(ret) && col_expr->get_result_type().is_json()) {
-    if (path.empty()) {
-      path = ObString::make_string("$");
-    }
-    if (!enclosing_nested_paths_.empty()) {
-      ret = OB_NOT_SUPPORTED;
-      LOG_USER_ERROR(OB_NOT_SUPPORTED, "Search FULLTEXT inside a nested query");
-    }
+  if (OB_SUCC(ret) && col_expr->get_result_type().is_json() && !enclosing_nested_paths_.empty()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "Search FULLTEXT inside a nested query");
   }
   if (OB_FAIL(ret)) {
   } else if (OB_ISNULL(query_node)) {
@@ -5208,18 +5220,8 @@ int ObDSLResolver::resolve_field(ObIJsonBase &field_node,
         LOG_WARN("unexpected non-positive boost", K(ret), K(boost));
       }
     }
-    if (OB_SUCC(ret)) {
-      ObString full_col_name = col_name;
-      if (OB_FAIL(get_user_column_expr(full_col_name, col_expr))) {
-        if (OB_HASH_NOT_EXIST == ret) {
-          ret = resolve_field_expr_and_path(col_name, col_expr, col_path);
-        }
-        if (OB_FAIL(ret)) {
-          LOG_WARN("fail to get user column expr", K(ret), K(col_name));
-        }
-      }
-    }
     if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(resolve_fulltext_field_expr_and_path(col_name, col_expr, col_path))) {
       if (OB_HASH_NOT_EXIST == ret) {
         ret = OB_ERR_BAD_FIELD_ERROR;
         LOG_USER_ERROR(OB_ERR_BAD_FIELD_ERROR, col_name.length(), col_name.ptr(),
@@ -5231,9 +5233,6 @@ int ObDSLResolver::resolve_field(ObIJsonBase &field_node,
     } else if (OB_FAIL(ObRawExprUtils::build_const_double_expr(*expr_factory, ObDoubleType, boost, boost_expr))) {
       LOG_WARN("fail to create boost expr", K(ret));
     }
-  }
-  if (OB_SUCC(ret) && col_expr->get_result_type().is_json() && col_path.empty()) {
-    col_path = ObString("$");
   }
   return ret;
 }

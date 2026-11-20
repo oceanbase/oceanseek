@@ -991,6 +991,56 @@ TEST_F(SearchTextBindingTest, resolver_fields_and_query_parameters)
     EXPECT_EQ(CS_TYPE_GBK_BIN, result.get_collation_type());
     EXPECT_EQ(expected_query, result.get_string());
   }
+  // All FULLTEXT entry points must bind the same column in a dotted-name collision.
+  struct FieldCase {
+    const char *name_;
+    uint64_t column_id_;
+    const char *path_;
+  };
+  const FieldCase fields[] = {
+    {"doc.a.b", 61, ""},
+    {"DOC.A.B", 61, ""},
+    {"LITERAL.FIELD", 60, ""},
+    {"DOC.Title", 42, "$.Title"},
+    {"doc", 42, "$"}
+  };
+  for (const auto &field : fields) {
+    for (int entry = 0; entry < 4; ++entry) {
+      SCOPED_TRACE(field.name_);
+      SCOPED_TRACE(entry);
+      std::string request = entry < 2
+          ? std::string("{\"") + field.name_ + "\":\"alpha\"}"
+          : std::string("{\"fields\":[\"") + field.name_ + "\"],\"query\":\"alpha\"}";
+      json = nullptr;
+      ASSERT_EQ(OB_SUCCESS, ObJsonParser::get_tree(&alloc_, ObString(request.c_str()), json));
+      query = nullptr;
+      ObColumnRefRawExpr *resolved_column = nullptr;
+      ObString resolved_path;
+      if (entry == 0 || entry == 1) {
+        ASSERT_EQ(OB_SUCCESS, entry == 0
+            ? resolver.resolve_match(*json, query, nullptr, QUERY_ITEM_QUERY)
+            : resolver.resolve_match_phrase(*json, query, nullptr, QUERY_ITEM_QUERY));
+        const auto *fulltext = static_cast<const ObDSLFullTextQuery *>(query);
+        resolved_column = entry == 0
+            ? static_cast<ObDSLMatchQuery *>(query)->field_
+            : static_cast<ObDSLMatchPhraseQuery *>(query)->field_;
+        resolved_path = fulltext->path_;
+      } else {
+        ASSERT_EQ(OB_SUCCESS, entry == 2
+            ? resolver.resolve_multi_match(*json, query, nullptr, QUERY_ITEM_QUERY)
+            : resolver.resolve_query_string(*json, query, nullptr, QUERY_ITEM_QUERY));
+        const auto &params = entry == 2
+            ? static_cast<ObDSLMultiMatchQuery *>(query)->fields_param_
+            : static_cast<ObDSLQueryStringQuery *>(query)->fields_param_;
+        ASSERT_EQ(1, params.field_count());
+        resolved_column = params.fields_.at(0);
+        resolved_path = params.field_paths_.at(0);
+      }
+      ASSERT_NE(nullptr, resolved_column);
+      EXPECT_EQ(field.column_id_, resolved_column->get_column_id());
+      EXPECT_EQ(ObString(field.path_), resolved_path);
+    }
+  }
 }
 
 TEST_F(SearchTextBindingTest, multi_field_paths_survive_resolve_and_copy)

@@ -622,6 +622,9 @@ private :
   int get_user_column_expr(ObString &col_name, ObColumnRefRawExpr *&col_expr);
   // On success, replace field_name with the normalized SQL column name; preserve JSON member spelling.
   int resolve_field_expr_and_path(ObString &field_name, ObColumnRefRawExpr *&col_expr, ObString &path_str);
+  // FULLTEXT prefers a complete SQL column name before trying a JSON path.
+  // On success, default an empty path to "$" for JSON columns.
+  int resolve_fulltext_field_expr_and_path(ObString &field_name, ObColumnRefRawExpr *&col_expr, ObString &path_str);
   int has_user_column_name(const ObString &col_name, bool &exists, ObColumnRefRawExpr **col_expr = nullptr);
   int check_aggs_bucket_name(const ObString &agg_name);
   int collect_col_idx(const share::schema::ObTableSchema *index_schema);
