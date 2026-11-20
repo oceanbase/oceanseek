@@ -723,7 +723,8 @@ int check_table_udt_id_is_exist(share::schema::ObSchemaGetterGuard &schema_guard
       common::ObMySQLTransaction &trans,
       common::ObArenaAllocator &allocator,
       const obrpc::ObIndexArg::IndexActionType &index_action_type,
-      const uint64_t tenant_data_version);
+      const uint64_t tenant_data_version,
+      bool &is_create_hidden_table);
   int get_add_pk_index_name(const share::schema::ObTableSchema &origin_table_schema,
                             share::schema::ObTableSchema &new_table_schema,
                             const obrpc::ObIndexArg::IndexActionType &index_action_type,
@@ -1662,7 +1663,8 @@ int check_will_be_having_domain_index_operation(
                               ObDDLOperator &ddl_operator,
                               common::ObMySQLTransaction &trans,
                               common::ObArenaAllocator &allocator,
-                              const uint64_t tenant_data_version);
+                              const uint64_t tenant_data_version,
+                              bool &is_create_hidden_table);
   int check_alter_partition_with_tablegroup(const ObTableSchema *orig_table_schema,
                                             ObTableSchema &new_table_schema,
                                             ObSchemaGetterGuard &schema_guard);

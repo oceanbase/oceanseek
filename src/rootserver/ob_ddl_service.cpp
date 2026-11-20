@@ -3367,6 +3367,19 @@ int ObDDLService::add_primary_key(const ObIArray<ObString> &pk_column_names, ObT
   return ret;
 }
 
+static int check_create_hidden_table(bool &is_create_hidden_table)
+{
+  int ret = OB_SUCCESS;
+  if (is_create_hidden_table) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("multiple hidden tables in one alter table statement are not supported", K(ret));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "Creating multiple hidden tables in one ALTER TABLE statement is");
+  } else {
+    is_create_hidden_table = true;
+  }
+  return ret;
+}
+
 int ObDDLService::create_hidden_table_with_pk_changed(
                   const obrpc::ObAlterTableArg &alter_table_arg,
                   const ObSArray<ObString> &index_columns,
@@ -3377,7 +3390,8 @@ int ObDDLService::create_hidden_table_with_pk_changed(
                   ObMySQLTransaction &trans,
                   ObArenaAllocator &allocator,
                   const ObIndexArg::IndexActionType &index_action_type,
-                  const uint64_t tenant_data_version)
+                  const uint64_t tenant_data_version,
+                  bool &is_create_hidden_table)
 {
   int ret = OB_SUCCESS;
   const bool bind_tablets = false;
@@ -3461,6 +3475,8 @@ int ObDDLService::create_hidden_table_with_pk_changed(
                                            schema_guard,
                                            index_name))) {
     LOG_WARN("fail to rename hidden table's pk constraint", K(ret));
+  } else if (OB_FAIL(check_create_hidden_table(is_create_hidden_table))) {
+    LOG_WARN("failed to check hidden table creation", K(ret));
   } else if (OB_FAIL(create_user_hidden_table(origin_table_schema,
                                               new_table_schema,
                                               alter_table_arg.alter_table_schema_,
@@ -5753,7 +5769,8 @@ int ObDDLService::alter_table_primary_key(obrpc::ObAlterTableArg &alter_table_ar
                                           ObDDLOperator &ddl_operator,
                                           ObMySQLTransaction &trans,
                                           common::ObArenaAllocator &allocator,
-                                          const uint64_t tenant_data_version)
+                                          const uint64_t tenant_data_version,
+                                          bool &is_create_hidden_table)
 {
   int ret = OB_SUCCESS;
   int64_t index_count = new_table_schema.get_index_count();
@@ -5786,7 +5803,8 @@ int ObDDLService::alter_table_primary_key(obrpc::ObAlterTableArg &alter_table_ar
                                                                 trans,
                                                                 allocator,
                                                                 type,
-                                                                tenant_data_version))) {
+                                                                tenant_data_version,
+                                                                is_create_hidden_table))) {
             LOG_WARN("failed to add hidden primary key for heap table", K(ret));
           }
           break;
@@ -5831,7 +5849,8 @@ int ObDDLService::alter_table_primary_key(obrpc::ObAlterTableArg &alter_table_ar
                                                             trans,
                                                             allocator,
                                                             type,
-                                                            tenant_data_version))) {
+                                                            tenant_data_version,
+                                                            is_create_hidden_table))) {
               LOG_WARN("failed to add primary key", K(ret));
             }
           }
@@ -17917,6 +17936,7 @@ int ObDDLService::do_offline_ddl_in_trans(obrpc::ObAlterTableArg &alter_table_ar
 {
   int ret = OB_SUCCESS;
   bool bind_tablets = false;
+  bool is_create_hidden_table = false;
   ObSchemaGetterGuard schema_guard;
   AlterTableSchema &alter_table_schema = alter_table_arg.alter_table_schema_;
   uint64_t tenant_id = alter_table_schema.get_tenant_id();
@@ -18012,7 +18032,8 @@ int ObDDLService::do_offline_ddl_in_trans(obrpc::ObAlterTableArg &alter_table_ar
                             ddl_operator,
                             trans,
                             alter_table_arg.allocator_,
-                            tenant_data_version))) {
+                            tenant_data_version,
+                            is_create_hidden_table))) {
           LOG_WARN("failed to alter table primary key", K(ret));
         }
       }
@@ -18057,6 +18078,8 @@ int ObDDLService::do_offline_ddl_in_trans(obrpc::ObAlterTableArg &alter_table_ar
           }
           if (FAILEDx(adjust_cg_for_offline(new_table_schema))) {
             LOG_WARN("fail to adjust cg  after alter column", KR(ret));
+          } else if (FAILEDx(check_create_hidden_table(is_create_hidden_table))) {
+            LOG_WARN("failed to check hidden table creation", K(ret));
           } else if (FAILEDx(create_user_hidden_table(*orig_table_schema,
                                                       new_table_schema,
                                                       alter_table_arg.alter_table_schema_,
@@ -18078,6 +18101,8 @@ int ObDDLService::do_offline_ddl_in_trans(obrpc::ObAlterTableArg &alter_table_ar
         if (OB_FAIL(check_restore_point_allow(tenant_id, *orig_table_schema))) {
           LOG_WARN("check restore point allow failed,", K(ret), K(tenant_id),
           K(orig_table_schema->get_table_id()));
+        } else if (OB_FAIL(check_create_hidden_table(is_create_hidden_table))) {
+          LOG_WARN("failed to check hidden table creation", K(ret));
         } else if (OB_FAIL(alter_table_partition_by(alter_table_arg,
                                                     *orig_table_schema,
                                                     new_table_schema,
@@ -18099,6 +18124,8 @@ int ObDDLService::do_offline_ddl_in_trans(obrpc::ObAlterTableArg &alter_table_ar
         } else if (OB_FAIL(alter_auto_part.alter_table_partition_attr(
             alter_table_arg, *orig_table_schema, new_table_schema))) {
           LOG_WARN("failed to alter table partition by", K(ret));
+        } else if (OB_FAIL(check_create_hidden_table(is_create_hidden_table))) {
+          LOG_WARN("failed to check hidden table creation", K(ret));
         } else if (OB_FAIL(create_user_hidden_table(*orig_table_schema,
                                                     new_table_schema,
                                                     alter_table_arg.alter_table_schema_,
@@ -18141,7 +18168,9 @@ int ObDDLService::do_offline_ddl_in_trans(obrpc::ObAlterTableArg &alter_table_ar
         }
       }
       if (OB_SUCC(ret) && alter_table_arg.is_convert_to_character_) {
-        if (OB_FAIL(convert_to_character(alter_table_arg,
+        if (OB_FAIL(check_create_hidden_table(is_create_hidden_table))) {
+          LOG_WARN("failed to check hidden table creation", K(ret));
+        } else if (OB_FAIL(convert_to_character(alter_table_arg,
                                          *orig_table_schema,
                                          new_table_schema,
                                          schema_guard,
@@ -18160,6 +18189,8 @@ int ObDDLService::do_offline_ddl_in_trans(obrpc::ObAlterTableArg &alter_table_ar
                                        ddl_operator,
                                        trans))) {
           LOG_WARN("failed to alter table column group", K(ret));
+        } else if (OB_FAIL(check_create_hidden_table(is_create_hidden_table))) {
+          LOG_WARN("failed to check hidden table creation", K(ret));
         } else if (OB_FAIL(create_user_hidden_table(*orig_table_schema,
                                                     new_table_schema,
                                                     alter_table_arg.alter_table_schema_,
@@ -18178,6 +18209,7 @@ int ObDDLService::do_offline_ddl_in_trans(obrpc::ObAlterTableArg &alter_table_ar
       if (OB_SUCC(ret) && ObDDLType::DDL_TABLE_REDEFINITION == ddl_type
           && is_dec_table_lob_inrow_threshold(alter_table_arg, alter_table_schema, orig_table_schema)) {
         new_table_schema.set_lob_inrow_threshold(alter_table_schema.get_lob_inrow_threshold());
+        OZ (check_create_hidden_table(is_create_hidden_table));
         OZ (create_user_hidden_table(*orig_table_schema,
                                     new_table_schema,
                                     alter_table_arg.alter_table_schema_,
