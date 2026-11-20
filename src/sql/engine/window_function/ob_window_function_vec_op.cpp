@@ -901,7 +901,9 @@ int ObWindowFunctionVecOp::init()
             LOG_DEBUG("added wf", K(*win_col));
           }
         }
-        if (OB_SUCC(ret) && MY_SPEC.is_participator()) {
+        if (OB_FAIL(ret)) {
+          win_col->destroy();
+        } else if (MY_SPEC.is_participator()) {
           if (wf_info.can_push_down_) {
             if (common::OB_INVALID_COUNT == next_wf_pby_expr_cnt_to_transmit_) {
               // next_wf_pby_expr_cnt_to_transmit_ is for pushdown transmit to datahub
