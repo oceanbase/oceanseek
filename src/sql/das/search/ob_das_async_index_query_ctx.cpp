@@ -253,6 +253,9 @@ static int analyze_async_index_domain_impl(
   if (OB_ISNULL(ctdef)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("null ctdef for async index domain analysis", K(ret));
+  } else if (ctdef->children_cnt_ > 0 && OB_ISNULL(ctdef->children_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("missing children in async index definition", K(ret), K(ctdef->op_type_));
   } else if (DAS_OP_VEC_INDEX_ASYNC_IVF_SCAN == ctdef->op_type_) {
     const auto *scan = static_cast<const ObDASVecIndexAsyncIVFScanCtDef *>(ctdef)->get_index_scan_ctdef();
     if (nullptr == scan) { ret = OB_ERR_UNEXPECTED; }
@@ -273,10 +276,10 @@ static int analyze_async_index_domain_impl(
   } else if (DAS_OP_IR_SCAN == ctdef->op_type_) {
     analyze_ctx.is_pure_range_subtree_ = false;
     const ObDASIRScanCtDef *ir_ctdef = static_cast<const ObDASIRScanCtDef *>(ctdef);
-    const ObDASScalarScanCtDef *inv_ctdef = ir_ctdef->get_inv_idx_scan_scalar_ctdef();
+    const ObDASScalarScanCtDef *inv_ctdef = nullptr;
     if (!ir_ctdef->is_async_index_) {
       analyze_ctx.mixed_sync_ = true;
-    } else if (OB_ISNULL(inv_ctdef)
+    } else if (OB_ISNULL(inv_ctdef = ir_ctdef->get_inv_idx_scan_scalar_ctdef())
                || OB_UNLIKELY(OB_INVALID_ID == inv_ctdef->ref_table_id_)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("invalid async inverted index definition", K(ret), KP(inv_ctdef));
@@ -337,6 +340,7 @@ static int analyze_async_index_domain_impl(
   } else if (is_async_semantic_root_op(ctdef->op_type_)) {
     analyze_ctx.is_pure_range_subtree_ = false;
     ObSEArray<uint64_t, 2> semantic_table_ids;
+    semantic_table_ids.set_attr(ObMemAttr(MTL_ID(), "HsQueryDomain"));
     for (int64_t i = 0; OB_SUCC(ret) && i < ctdef->children_cnt_; ++i) {
       if (OB_ISNULL(ctdef->children_[i])) {
         ret = OB_ERR_UNEXPECTED;
@@ -431,7 +435,9 @@ static int analyze_async_index_domain_impl(
         // Preserve compatibility with lightweight CtDefs used by callers and
         // tests that only populate children_ without clause offsets.
         for (int64_t i = 0; OB_SUCC(ret) && i < ctdef->children_cnt_; ++i) {
-          if (OB_ISNULL(ctdef->children_[i])) {
+          if (boolean_ctdef->has_merged_probe() && i == boolean_ctdef->get_merged_probe_offset()) {
+            // The physical probe adds no semantic access.
+          } else if (OB_ISNULL(ctdef->children_[i])) {
             ret = OB_ERR_UNEXPECTED;
             LOG_WARN("null child in boolean async domain", K(ret), K(i));
           } else if (OB_FAIL(SMART_CALL(analyze_async_index_domain_impl(
@@ -520,6 +526,8 @@ int ObDASAsyncIndexQueryCtx::analyze_async_index_domain(
   analysis.is_pure_range_subtree_ = false;
   analysis.has_group_compatible_sync_filter_ = false;
   analysis.semantic_branch_counts_.reset();
+  table_ids.set_attr(ObMemAttr(MTL_ID(), "HsQueryDomain"));
+  analysis.semantic_branch_counts_.set_attr(ObMemAttr(MTL_ID(), "HsQueryDomain"));
   if (OB_FAIL(analyze_async_index_domain_impl(
           ctdef, table_ids, &analysis.semantic_branch_counts_, analyze_ctx,
           false /* in_nested_scope */, false /* in_async_wrapper */, true))) {
@@ -575,12 +583,17 @@ int ObDASAsyncIndexQueryCtx::analyze_group_filter_domain(
 static int collect_async_wrappers(
     const ObDASBaseCtDef *ctdef,
     ObIArray<uint64_t> &table_ids,
-    int64_t &wrapper_cnt)
+    int64_t &wrapper_cnt,
+    const ObDASScalarScanCtDef *&shared_delete_ctdef,
+    const bool in_nested_scope)
 {
   int ret = OB_SUCCESS;
   if (OB_ISNULL(ctdef)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("null ctdef while collecting async wrappers", K(ret));
+  } else if (ctdef->children_cnt_ > 0 && OB_ISNULL(ctdef->children_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("missing children while collecting async wrappers", K(ret), K(ctdef->op_type_));
   } else if (DAS_OP_VEC_INDEX_ASYNC_IVF_SCAN == ctdef->op_type_) {
     const auto *scan = static_cast<const ObDASVecIndexAsyncIVFScanCtDef *>(ctdef)->get_index_scan_ctdef();
     if (nullptr == scan) { ret = OB_ERR_UNEXPECTED; }
@@ -589,19 +602,19 @@ static int collect_async_wrappers(
     } else { ++wrapper_cnt; }
   } else if (is_async_fts_wrapper(ctdef)) {
     ObSEArray<uint64_t, 2> wrapper_table_ids;
-    ObDASAsyncIndexDomainAnalyzeCtx analyze_ctx;
+    ObDASAsyncIndexDomainAnalyzeCtx analyze_ctx(shared_delete_ctdef);
+    wrapper_table_ids.set_attr(ObMemAttr(MTL_ID(), "HsQueryDomain"));
     if (OB_FAIL(analyze_async_index_domain_impl(
-            ctdef, wrapper_table_ids, nullptr, analyze_ctx,
-            false /* in_nested_scope */, false /* in_async_wrapper */, false))) {
+            ctdef, wrapper_table_ids, nullptr, analyze_ctx, in_nested_scope,
+            false /* in_async_wrapper */, false /* count_semantic_roots */))) {
       LOG_WARN("failed to analyze async wrapper", K(ret));
-    } else if (OB_UNLIKELY(analyze_ctx.mixed_sync_
-                           || analyze_ctx.non_alignable_
-                           || wrapper_table_ids.empty())) {
+    } else if (OB_UNLIKELY(analyze_ctx.non_alignable_ || wrapper_table_ids.empty())) {
       ret = OB_NOT_SUPPORTED;
       LOG_WARN("unsupported async wrapper user query", K(ret),
-               K(analyze_ctx.mixed_sync_), K(analyze_ctx.non_alignable_),
-               K(wrapper_table_ids.count()));
+               K(analyze_ctx.non_alignable_), K(wrapper_table_ids.count()));
     } else {
+      // A Legacy root wrapper can own synchronous predicates alongside async index accesses.
+      shared_delete_ctdef = analyze_ctx.shared_delete_ctdef_;
       ++wrapper_cnt;
       for (int64_t i = 0; OB_SUCC(ret) && i < wrapper_table_ids.count(); ++i) {
         if (OB_FAIL(add_async_index_table_id(wrapper_table_ids.at(i), table_ids))) {
@@ -613,6 +626,13 @@ static int collect_async_wrappers(
   } else if (DAS_OP_IR_SCAN == ctdef->op_type_) {
     // IR is an atomic leaf; its internal physical-scan children do not participate in
     // wrapper collection.
+  } else if (DAS_OP_SCALAR_QUERY == ctdef->op_type_) {
+    const ObDASScalarScanCtDef *scan =
+        static_cast<const ObDASScalarCtDef *>(ctdef)->get_index_scan_ctdef();
+    if (OB_NOT_NULL(scan) && OB_FAIL(collect_async_wrappers(
+            scan, table_ids, wrapper_cnt, shared_delete_ctdef, in_nested_scope))) {
+      LOG_WARN("failed to collect selected scalar index", K(ret));
+    }
   } else if (DAS_OP_SCALAR_SCAN_QUERY == ctdef->op_type_
              && static_cast<const ObDASScalarScanCtDef *>(ctdef)->is_async_index_) {
     const uint64_t index_table_id =
@@ -626,9 +646,15 @@ static int collect_async_wrappers(
                K(ret), K(index_table_id));
     }
   } else {
+    const ObDASBooleanQueryCtDef *boolean = DAS_OP_BOOLEAN_QUERY == ctdef->op_type_
+        ? static_cast<const ObDASBooleanQueryCtDef *>(ctdef) : nullptr;
     for (int64_t i = 0; OB_SUCC(ret) && i < ctdef->children_cnt_; ++i) {
-      if (OB_FAIL(SMART_CALL(collect_async_wrappers(
-              ctdef->children_[i], table_ids, wrapper_cnt)))) {
+      if (OB_NOT_NULL(boolean) && boolean->has_merged_probe()
+          && i == boolean->get_merged_probe_offset()) {
+        // Its source predicates have their own query children.
+      } else if (OB_FAIL(SMART_CALL(collect_async_wrappers(
+                     ctdef->children_[i], table_ids, wrapper_cnt, shared_delete_ctdef,
+                     in_nested_scope || DAS_OP_NESTED_QUERY == ctdef->op_type_)))) {
         LOG_WARN("failed to collect async wrapper from child", K(ret), K(i));
       }
     }
@@ -697,11 +723,13 @@ int ObDASAsyncIndexQueryCtx::collect_async_index_table_ids(
 {
   int ret = OB_SUCCESS;
   int64_t wrapper_cnt = 0;
+  const ObDASScalarScanCtDef *shared_delete_ctdef = nullptr;
   async_table_ids.reset();
   if (OB_ISNULL(ctdef)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("null ctdef for async wrapper collection", K(ret));
-  } else if (OB_FAIL(collect_async_wrappers(ctdef, async_table_ids, wrapper_cnt))) {
+  } else if (OB_FAIL(collect_async_wrappers(
+                 ctdef, async_table_ids, wrapper_cnt, shared_delete_ctdef, false))) {
     LOG_WARN("failed to collect async index wrappers", K(ret));
   } else if (0 == wrapper_cnt) {
     ObDASAsyncIndexDomainAnalyzeCtx analyze_ctx;

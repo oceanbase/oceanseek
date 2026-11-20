@@ -7,6 +7,7 @@
 #include "sql/code_generator/ob_hybrid_search_cg_service.h"
 #include "sql/code_generator/ob_static_engine_cg.h"
 #include "sql/code_generator/ob_tsc_cg_service.h"
+#include "sql/das/search/ob_das_async_index_query_ctx.h"
 #include "sql/das/search/ob_das_match_query.h"
 #include "sql/das/search/ob_das_multi_match_query.h"
 #include "sql/das/search/ob_das_match_phrase_query.h"
@@ -353,6 +354,7 @@ int ObHybridSearchCgService::generate_ctdef(ObLogTableScan &op, const ObVecSearc
       ? vec_search_node->get_brute_filter_strategy()
       : ObVecBruteFilterStrategy::NONE;
 
+  ObHybridSearchNodeBase *filter_node = nullptr;
   // 1. generate filter ctdef
   ObDASBaseCtDef *filter_ctdef = nullptr;
   if (vec_search_node->filter_nodes_.count() > 0) {
@@ -360,7 +362,7 @@ int ObHybridSearchCgService::generate_ctdef(ObLogTableScan &op, const ObVecSearc
       ret = OB_NOT_SUPPORTED;
       LOG_WARN("invalid filter nodes count", K(ret), K(vec_search_node->filter_nodes_.count()));
     } else {
-      ObHybridSearchNodeBase *filter_node = static_cast<ObHybridSearchNodeBase*>(vec_search_node->filter_nodes_.at(0));
+      filter_node = static_cast<ObHybridSearchNodeBase *>(vec_search_node->filter_nodes_.at(0));
       if (OB_FAIL(generate_hybrid_search_node_ctdef(op, filter_node, filter_ctdef))) {
         LOG_WARN("failed to generate filter ctdef", K(ret));
       } else if (OB_ISNULL(filter_ctdef)) {
@@ -636,12 +638,18 @@ int ObHybridSearchCgService::generate_ctdef(ObLogTableScan &op, const ObVecSearc
 
   // 5. generate vec index driver ctdef
   ObDASVecIndexDriverCtDef *vec_index_driver_ctdef = nullptr;
+  ObDASAsyncIndexExecMode filter_exec_mode = ASYNC_INDEX_EXEC_LEGACY;
   ObDASBaseCtDef *driver_filter_ctdef = filter_ctdef;
   if (is_brute_force
       && ObVecBruteFilterStrategy::PUSHDOWN_ONLY == brute_filter_strategy) {
     // The complete scalar predicate is already in the brute-force main-table scan.
     // Keep the logical filter tree for pruning/explain, but omit its physical bitmap child.
     driver_filter_ctdef = nullptr;
+  }
+  if (OB_SUCC(ret)
+      && ObDASAsyncIndexQueryCtx::contains_shared_async_index_query(driver_filter_ctdef)
+      && OB_FAIL(finalize_query_root_(op, filter_node, driver_filter_ctdef, filter_exec_mode))) {
+    LOG_WARN("failed to finalize KNN filter", K(ret));
   }
   int64_t vec_index_driver_child_cnt = 1;
   if (OB_NOT_NULL(driver_filter_ctdef)) {
@@ -680,6 +688,9 @@ int ObHybridSearchCgService::generate_ctdef(ObLogTableScan &op, const ObVecSearc
     vec_index_driver_ctdef->vector_index_param_ = vec_search_node->get_vector_index_param();
     vec_index_driver_ctdef->algorithm_type_ = vec_search_node->get_algorithm_type();
     vec_index_driver_ctdef->vec_type_ = vec_search_node->get_vec_type();
+    vec_index_driver_ctdef->use_async_knn_pre_filter_group_alignment_ =
+        vec_index_driver_ctdef->need_pre_filter_iter()
+        && ASYNC_INDEX_EXEC_GROUP == filter_exec_mode;
     vec_index_driver_ctdef->row_count_ = vec_search_node->get_row_count();
     vec_index_driver_ctdef->dim_ = dim;
     if (vec_search_node->search_option_ != nullptr) {

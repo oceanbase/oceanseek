@@ -559,11 +559,8 @@ int ObHybridSearchCgService::generate_hybrid_search_ctdef(ObLogTableScan &op,
       } else {
         LOG_TRACE("[LT hybrid CG] hybrid search degraded to full scan via Fusion->Scalar");
       }
-    } else if (OB_FAIL(normalize_async_fts_boolean_domain(
-                   search_ctdef, async_exec_mode))) {
-      LOG_WARN("failed to normalize async fts boolean domain", K(ret));
-    } else if (OB_FAIL(normalize_async_knn_filter_domains_(search_ctdef))) {
-      LOG_WARN("failed to normalize async knn filter domain", K(ret));
+    } else if (OB_FAIL(finalize_fusion_query_(op, search_ctdef, *root, async_exec_mode))) {
+      LOG_WARN("failed to finalize ordinary search query", K(ret));
     } else if (search_ctdef->op_type_ == DAS_OP_FUSION_QUERY
         && OB_FAIL(try_alloc_topk_collect_ctdef(static_cast<ObDASFusionCtDef*>(search_ctdef)))) {
       LOG_WARN("failed to try alloc topk collect ctdef", K(ret));
@@ -753,29 +750,6 @@ int ObHybridSearchCgService::generate_hybrid_search_node_ctdef(ObLogTableScan &o
     }
   }
 
-  // Wrap an async index leaf with its shared delete index. Nested subtrees defer
-  // the doc-id exclusion until their outermost boundary restores BASE scope.
-  const ObAsyncIndexDeleteInfo *async_delete_info =
-      OB_NOT_NULL(node) ? node->get_async_delete_info() : nullptr;
-  if (OB_SUCC(ret) && OB_NOT_NULL(async_delete_info)
-      && !is_generating_nested_query_) {
-    ObDASBaseCtDef *wrapped_ctdef = nullptr;
-    if (OB_UNLIKELY(!async_delete_info->is_valid())) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("invalid async delete info", K(ret), KPC(async_delete_info));
-    } else if (OB_FAIL(wrap_async_index_with_delete(
-        op,
-        async_delete_info->get_delete_idx_tid(),
-        async_delete_info->get_delete_doc_id_column(),
-        async_delete_info->get_delete_rowscn_expr(),
-        new_root_ctdef,
-        wrapped_ctdef))) {
-      LOG_WARN("failed to wrap async index ctdef with delete", K(ret));
-    } else {
-      new_root_ctdef = wrapped_ctdef;
-    }
-  }
-
   if (OB_SUCC(ret)) {
     // Populate fusion ctdef's nested_rowid_exprs_ AFTER children ctdefs are generated, so
     // the doc_id/nested_key column rt_expr_ pointers (created by leaf scalar-scan CG) are
@@ -809,27 +783,6 @@ int ObHybridSearchCgService::generate_hybrid_search_node_ctdef(ObLogTableScan &o
     // source and inject it into the bool ctdef so must_not has something to exclude from.
     if (OB_SUCC(ret) && OB_FAIL(synthesize_child_domain_must_not_required(op, new_root_ctdef))) {
       LOG_WARN("failed to synthesize child-domain must_not required source", K(ret));
-    }
-    const bool is_outermost_nested = !is_generating_nested_query_;
-    if (OB_SUCC(ret) && is_outermost_nested) {
-      const ObAsyncIndexDeleteInfo *async_delete_info = nullptr;
-      if (OB_FAIL(collect_async_delete_info(node, async_delete_info))) {
-        LOG_WARN("failed to collect nested async delete info", K(ret));
-      } else if (OB_NOT_NULL(async_delete_info)) {
-        ObDASBaseCtDef *wrapped_ctdef = nullptr;
-        if (OB_FAIL(wrap_async_index_with_delete(
-            op,
-            async_delete_info->get_delete_idx_tid(),
-            async_delete_info->get_delete_doc_id_column(),
-            async_delete_info->get_delete_rowscn_expr(),
-            new_root_ctdef,
-            wrapped_ctdef))) {
-          LOG_WARN("failed to wrap outer nested boundary with async delete", K(ret),
-              KPC(async_delete_info));
-        } else {
-          new_root_ctdef = wrapped_ctdef;
-        }
-      }
     }
   }
 
@@ -870,54 +823,6 @@ int ObHybridSearchCgService::wrap_async_index_with_delete(
   return ret;
 }
 
-int ObHybridSearchCgService::get_async_fts_wrapper_children_(
-    ObDASBaseCtDef *wrapper_ctdef,
-    ObDASBaseCtDef *&query_ctdef,
-    ObDASScalarScanCtDef *&delete_scan_ctdef) const
-{
-  int ret = OB_SUCCESS;
-  query_ctdef = nullptr;
-  delete_scan_ctdef = nullptr;
-  ObBooleanSubClause<ObIDASSearchCtDef> must;
-  ObBooleanSubClause<ObIDASSearchCtDef> must_not;
-  if (OB_ISNULL(wrapper_ctdef)
-      || OB_UNLIKELY(DAS_OP_BOOLEAN_QUERY != wrapper_ctdef->op_type_)) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid async fts wrapper", K(ret), KP(wrapper_ctdef));
-  } else {
-    ObDASBooleanQueryCtDef *boolean_ctdef =
-        static_cast<ObDASBooleanQueryCtDef *>(wrapper_ctdef);
-    ObIDASSearchCtDef *query = nullptr;
-    ObIDASSearchCtDef *deletion = nullptr;
-    if (OB_UNLIKELY(!boolean_ctdef->is_async())) {
-      ret = OB_INVALID_ARGUMENT;
-      LOG_WARN("boolean ctdef is not an async fts wrapper", K(ret));
-    } else if (OB_FAIL(boolean_ctdef->must(must))) {
-      LOG_WARN("failed to get async wrapper must clause", K(ret));
-    } else if (OB_FAIL(boolean_ctdef->must_not(must_not))) {
-      LOG_WARN("failed to get async wrapper must-not clause", K(ret));
-    } else if (OB_UNLIKELY(1 != must.count() || 1 != must_not.count())) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected analyzed async fts wrapper shape", K(ret),
-               K(must.count()), K(must_not.count()));
-    } else if (OB_FAIL(must.get(0, query))) {
-      LOG_WARN("failed to get async wrapper query", K(ret));
-    } else if (OB_FAIL(must_not.get(0, deletion))) {
-      LOG_WARN("failed to get async wrapper deletion", K(ret));
-    } else if (OB_ISNULL(query) || OB_ISNULL(deletion)
-               || OB_UNLIKELY(DAS_OP_SCALAR_SCAN_QUERY != deletion->op_type_)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("invalid async fts wrapper child", K(ret), KP(query), KP(deletion));
-    } else {
-      // The analyzer validates the complete wrapper contract. Planning only needs mutable
-      // pointers for the later atomic rewrite.
-      query_ctdef = query;
-      delete_scan_ctdef = static_cast<ObDASScalarScanCtDef *>(deletion);
-    }
-  }
-  return ret;
-}
-
 int ObHybridSearchCgService::build_async_fts_domain_wrapper(
     ObDASBaseCtDef *query_ctdef,
     ObDASScalarScanCtDef *delete_scan_ctdef,
@@ -941,8 +846,7 @@ int ObHybridSearchCgService::build_async_fts_domain_wrapper(
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("failed to allocate async fts domain children", K(ret));
   } else {
-    // The outer wrapper only performs Group-level deletion exclusion; preserve the original
-    // Boolean must/should/filter/MSM and scoring semantics.
+    // Preserve the complete user query and exclude deleted documents at this boundary.
     boolean_ctdef->children_cnt_ = 2;
     boolean_ctdef->children_[0] = query_ctdef;
     boolean_ctdef->children_[1] = delete_scan_ctdef;
@@ -959,357 +863,245 @@ int ObHybridSearchCgService::build_async_fts_domain_wrapper(
   return ret;
 }
 
-int ObHybridSearchCgService::normalize_async_fts_boolean_domain(
-    ObDASBaseCtDef *&root_ctdef,
-    ObDASAsyncIndexExecMode &exec_mode)
+int ObHybridSearchCgService::finalize_fusion_query_(
+    ObLogTableScan &op,
+    ObDASBaseCtDef *search,
+    const ObHybridSearchNodeBase &root,
+    ObDASAsyncIndexExecMode &mode)
 {
   int ret = OB_SUCCESS;
-  ObDASAsyncIndexExecMode planned_exec_mode = ASYNC_INDEX_EXEC_LEGACY;
-  if (OB_ISNULL(root_ctdef)) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("null hybrid search ctdef", K(ret));
+  mode = ASYNC_INDEX_EXEC_LEGACY;
+  if (OB_ISNULL(search) || DAS_OP_FUSION_QUERY != search->op_type_
+      || INDEX_MERGE_HYBRID_FUSION_SEARCH != root.node_type_) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("expected fusion query", K(ret), KP(search), K(root.node_type_));
   } else {
-    ObDASAsyncIndexDomainAnalysis analysis;
-    if (OB_FAIL(ObDASAsyncIndexQueryCtx::analyze_async_index_domain(
-            root_ctdef, analysis))) {
-      LOG_WARN("failed to analyze async index normalization eligibility", K(ret));
-    } else if (!analysis.has_async_fts_wrapper_) {
-      // An unwrapped runtime tree has no code-generation rewrite target.
-    } else if (ASYNC_INDEX_DOMAIN_MIXED_SYNC == analysis.type_) {
-      // A selected synchronous scalar/full-text path makes the whole query ineligible.
-      // The analyzer has already validated every async wrapper; preserve the original
-      // CtDef tree so runtime uses the existing execution path.
-      LOG_TRACE("keep legacy async index tree for mixed synchronous query", K(analysis));
-    } else if (ASYNC_INDEX_DOMAIN_NON_ALIGNABLE == analysis.type_) {
-      // Structurally valid but non-alignable query shapes stay on the existing path.
-      LOG_TRACE("keep legacy async index tree for non-alignable query", K(analysis));
-    } else if (ASYNC_INDEX_DOMAIN_NONE == analysis.type_) {
+    const ObFusionNode &fusion_node = static_cast<const ObFusionNode &>(root);
+    ObDASFusionCtDef *fusion = static_cast<ObDASFusionCtDef *>(search);
+    const int64_t index = fusion->get_search_idx();
+    if (!fusion->has_search_subquery()) {
+      // KNN filters are finalized by their driver.
+    } else if (index < 0 || index >= fusion->children_cnt_ || OB_ISNULL(fusion->children_)
+               || index != fusion_node.search_index_ || index >= fusion_node.children_.count()) {
       ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("async wrapper has no async index domain", K(ret), K(analysis));
-    } else if (ASYNC_INDEX_EXEC_LEGACY == analysis.get_exec_mode()) {
-      // A single logical async index with one semantic root retains its existing tree.
-      LOG_TRACE("keep single async index tree unchanged", K(analysis));
+      LOG_WARN("invalid fusion search child", K(ret), K(index));
     } else {
-      bool has_domain_rewrite = false;
-      if (OB_FAIL(normalize_async_fts_boolean_domain_impl(
-              root_ctdef, has_domain_rewrite))) {
-        LOG_WARN("failed to normalize eligible async index domain", K(ret), K(analysis));
-      } else if (has_domain_rewrite) {
-        planned_exec_mode = ASYNC_INDEX_EXEC_GROUP;
-      } else {
-        LOG_TRACE("keep legacy async index tree because no rewrite was planned", K(analysis));
-      }
-    }
-  }
-  if (OB_SUCC(ret)) {
-    exec_mode = planned_exec_mode;
-  }
-  return ret;
-}
-
-int ObHybridSearchCgService::normalize_async_knn_filter_domains_(
-    ObDASBaseCtDef *root_ctdef)
-{
-  int ret = OB_SUCCESS;
-  if (OB_ISNULL(root_ctdef)) {
-    // Leave malformed/optional children to the ordinary CtDef validation path. This
-    // pass only discovers independent KNN filter domains and must not reject unrelated trees.
-  } else if (DAS_OP_VEC_INDEX_DRIVER == root_ctdef->op_type_) {
-    // Vector driver child[0] is the vector scan and child[1], when it contains an
-    // async query, is the KNN filter. Keep the vector/extracted-filter domains intact.
-    ObDASVecIndexDriverCtDef *vec_driver_ctdef =
-        static_cast<ObDASVecIndexDriverCtDef *>(root_ctdef);
-    if (vec_driver_ctdef->need_pre_filter_iter()
-        && root_ctdef->children_cnt_ > 1
-        && OB_NOT_NULL(root_ctdef->children_)
-        && OB_NOT_NULL(root_ctdef->children_[1])
-        && ObDASAsyncIndexQueryCtx::contains_shared_async_index_query(
-               root_ctdef->children_[1])) {
-      ObDASBaseCtDef *filter_ctdef = root_ctdef->children_[1];
-      ObDASAsyncIndexExecMode filter_exec_mode = ASYNC_INDEX_EXEC_LEGACY;
-      if (OB_FAIL(normalize_async_fts_boolean_domain(
-              filter_ctdef, filter_exec_mode))) {
-        LOG_WARN("failed to normalize independent async knn filter", K(ret));
-      } else {
-        // Save whether this KNN PRE filter can use GroupMerge. Runtime reads this flag
-        // instead of inheriting the Query mode or analyzing the filter tree again.
-        // When reading a plan generated by an older observer, the flag defaults to false
-        // and the KNN PRE filter uses Legacy mode.
-        vec_driver_ctdef->use_async_knn_pre_filter_group_alignment_ =
-            ASYNC_INDEX_EXEC_GROUP == filter_exec_mode
-            && DAS_OP_BOOLEAN_QUERY == filter_ctdef->op_type_
-            && static_cast<const ObDASBooleanQueryCtDef *>(filter_ctdef)->is_async();
-        root_ctdef->children_[1] = filter_ctdef;
-        LOG_TRACE("processed independent async knn filter domain normalization",
-                  K(filter_exec_mode),
-                  K(vec_driver_ctdef->use_async_knn_pre_filter_group_alignment_),
-                  K(root_ctdef->children_cnt_));
-      }
-    }
-  } else {
-    for (int64_t i = 0; OB_SUCC(ret) && i < root_ctdef->children_cnt_; ++i) {
-      ObDASBaseCtDef *child = OB_NOT_NULL(root_ctdef->children_)
-          ? root_ctdef->children_[i] : nullptr;
-      if (OB_NOT_NULL(child)
-          && OB_FAIL(SMART_CALL(normalize_async_knn_filter_domains_(child)))) {
-        LOG_WARN("failed to normalize child async knn filter", K(ret), K(i),
-                 K(root_ctdef->op_type_));
+      const ObHybridSearchNodeBase *query_node =
+          static_cast<const ObHybridSearchNodeBase *>(fusion_node.children_.at(index));
+      if (OB_FAIL(finalize_query_root_(op, query_node, fusion->children_[index], mode))) {
+        LOG_WARN("failed to finalize fusion query child", K(ret));
       }
     }
   }
   return ret;
 }
 
-int ObHybridSearchCgService::normalize_async_fts_boolean_domain_impl(
-    ObDASBaseCtDef *&root_ctdef,
-    bool &has_domain_rewrite)
+int ObHybridSearchCgService::finalize_query_root_(
+    ObLogTableScan &op,
+    const ObHybridSearchNodeBase *query_node,
+    ObDASBaseCtDef *&query,
+    ObDASAsyncIndexExecMode &mode)
 {
   int ret = OB_SUCCESS;
-  ObSEArray<AsyncFtsDomainRewriteAction, 16> rewrite_actions;
-  ObDASBaseCtDef *normalized_ctdef = nullptr;
-  bool has_unowned_sync_filter = false;
-  has_domain_rewrite = false;
-  if (OB_FAIL(plan_async_fts_boolean_domain_(
-                 root_ctdef, rewrite_actions, has_unowned_sync_filter,
-                 normalized_ctdef))) {
-    LOG_WARN("failed to plan async fts boolean domain rewrite", K(ret));
-  } else if (has_unowned_sync_filter) {
-    // A nested rewrite alone would still select GROUP for the whole runtime.
-    // Discard every planned action before committing, including child wrappers,
-    // when a global synchronous Filter has no positive async ownership proof.
-    LOG_TRACE("discard async group rewrites for unowned synchronous filter");
-  } else {
-    has_domain_rewrite = normalized_ctdef != root_ctdef || !rewrite_actions.empty();
-    // Analysis validates the CtDef domain first. Planning completes every allocation and
-    // array append before these pointer assignments, so failure leaves the input tree intact.
-    for (int64_t i = 0; i < rewrite_actions.count(); ++i) {
-      AsyncFtsDomainRewriteAction &action = rewrite_actions.at(i);
-      *action.target_ = action.replacement_;
-    }
-    root_ctdef = normalized_ctdef;
-  }
-  return ret;
-}
-
-static bool is_async_fts_rewrite_parent(const ObDASOpType op_type)
-{
-  return DAS_OP_FUSION_QUERY == op_type
-      || DAS_OP_TOPK_COLLECT == op_type
-      || DAS_OP_TABLE_LOOKUP == op_type
-      || DAS_OP_IR_AUX_LOOKUP == op_type
-      || DAS_OP_FUNC_LOOKUP == op_type
-      || DAS_OP_INDEX_PROJ_LOOKUP == op_type
-      || DAS_OP_INDEX_MERGE == op_type
-      || DAS_OP_DOC_ID_MERGE == op_type
-      || DAS_OP_DOMAIN_ID_MERGE == op_type
-      || DAS_OP_HYBRID_SEARCH_SORT == op_type;
-}
-
-static int get_boolean_required_child_role(
-    const ObDASBooleanQueryCtDef &boolean_ctdef,
-    const ObDASBaseCtDef *child,
-    bool &is_filter_child,
-    bool &is_required_child)
-{
-  int ret = OB_SUCCESS;
-  enum RequiredClauseIndex
-  {
-    MUST_CLAUSE_IDX = 0,
-    FILTER_CLAUSE_IDX,
-    REQUIRED_CLAUSE_COUNT
-  };
-  ObBooleanSubClause<ObIDASSearchCtDef> required_clauses[REQUIRED_CLAUSE_COUNT];
-  is_filter_child = false;
-  is_required_child = false;
-  if (OB_FAIL(boolean_ctdef.must(required_clauses[MUST_CLAUSE_IDX]))) {
-    LOG_WARN("failed to get boolean must clauses", K(ret));
-  } else if (OB_FAIL(boolean_ctdef.filter(required_clauses[FILTER_CLAUSE_IDX]))) {
-    LOG_WARN("failed to get boolean filter clauses", K(ret));
-  }
-  for (int64_t clause_idx = 0; OB_SUCC(ret) && !is_required_child
-       && clause_idx < ARRAYSIZEOF(required_clauses); ++clause_idx) {
-    for (int64_t i = 0; OB_SUCC(ret) && !is_required_child
-         && i < required_clauses[clause_idx].count(); ++i) {
-      ObIDASSearchCtDef *required_child = nullptr;
-      if (OB_FAIL(required_clauses[clause_idx].get(i, required_child))) {
-        LOG_WARN("failed to get boolean required child", K(ret), K(clause_idx), K(i));
-      } else if (required_child == child) {
-        is_required_child = true;
-        is_filter_child = FILTER_CLAUSE_IDX == clause_idx;
-      }
+  bool has_async = false;
+  mode = ASYNC_INDEX_EXEC_LEGACY;
+  if (OB_ISNULL(query) || OB_ISNULL(query_node)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("missing search query", K(ret), KP(query), KP(query_node));
+  } else if (OB_FAIL(select_async_exec_mode(query, has_async, mode))) {
+    LOG_WARN("failed to select query execution mode", K(ret));
+  } else if (has_async) {
+    const ObAsyncIndexDeleteInfo *deletion = nullptr;
+    ObDASBaseCtDef *wrapper = nullptr;
+    if (OB_FAIL(collect_async_delete_info(op, query_node, deletion))) {
+      LOG_WARN("failed to collect async delete info for search query", K(ret));
+    } else if (OB_ISNULL(deletion)) {
+      ret = OB_STATE_NOT_MATCH;
+      LOG_WARN("async query has no deletion definition", K(ret));
+    } else if (OB_FAIL(wrap_async_index_with_delete(
+                   op, deletion->get_delete_idx_tid(), deletion->get_delete_doc_id_column(),
+                   deletion->get_delete_rowscn_expr(), query, wrapper))) {
+      LOG_WARN("failed to wrap query with shared deletion scan", K(ret));
+    } else {
+      query = wrapper;
     }
   }
   return ret;
 }
 
-int ObHybridSearchCgService::plan_async_fts_boolean_domain_(
-    ObDASBaseCtDef *root_ctdef,
-    ObIArray<AsyncFtsDomainRewriteAction> &rewrite_actions,
-    bool &has_unowned_sync_filter,
-    ObDASBaseCtDef *&normalized_ctdef)
+namespace {
+
+// Each child reports how its parent can use it. Only the complete query chooses a mode.
+enum ObGroupClauseType
+{
+  GROUP_INCOMPATIBLE,
+  GROUP_SYNC_FILTER,
+  GROUP_ASYNC
+};
+
+struct ObGroupModeCheck
+{
+  int check_clause(const ObDASBaseCtDef *query, bool in_nested, ObGroupClauseType &type);
+  int check_boolean(const ObDASBooleanQueryCtDef &query, bool in_nested, ObGroupClauseType &type);
+  int check_leaf(const ObDASBaseCtDef &query, bool in_nested, ObGroupClauseType &type);
+
+  uint64_t first_index_id_ = OB_INVALID_ID;
+  int64_t async_fts_count_ = 0;
+  bool has_multiple_indexes_ = false;
+  bool has_sync_filter_ = false;
+};
+
+int ObGroupModeCheck::check_clause(
+    const ObDASBaseCtDef *query, bool in_nested, ObGroupClauseType &type)
 {
   int ret = OB_SUCCESS;
-  normalized_ctdef = root_ctdef;
-  if (OB_ISNULL(root_ctdef)) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("null hybrid search ctdef", K(ret));
-  } else if (DAS_OP_BOOLEAN_QUERY == root_ctdef->op_type_
-             && static_cast<ObDASBooleanQueryCtDef *>(root_ctdef)->is_async()) {
-    // An analyzed async wrapper is an atomic leaf until its Boolean parent coalesces it.
-  } else if (DAS_OP_BOOLEAN_QUERY != root_ctdef->op_type_) {
-    if (is_async_fts_rewrite_parent(root_ctdef->op_type_)) {
-      // Keep the same structural traversal boundary as domain analysis. IR, scalar-query,
-      // vector, nested, and unsupported nodes remain atomic for this rewrite.
-      for (int64_t i = 0; OB_SUCC(ret) && i < root_ctdef->children_cnt_; ++i) {
-        ObDASBaseCtDef *normalized_child = nullptr;
-        if (OB_ISNULL(root_ctdef->children_[i])) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("null async fts parent child", K(ret), K(i), K(root_ctdef->op_type_));
-        } else if (OB_FAIL(SMART_CALL(plan_async_fts_boolean_domain_(
-                       root_ctdef->children_[i], rewrite_actions,
-                       has_unowned_sync_filter, normalized_child)))) {
-          LOG_WARN("failed to plan async fts parent child", K(ret), K(i),
-                   K(root_ctdef->op_type_));
-        } else if (normalized_child != root_ctdef->children_[i]
-                   && OB_FAIL(rewrite_actions.push_back(
-                          AsyncFtsDomainRewriteAction(
-                              &root_ctdef->children_[i], normalized_child)))) {
-          LOG_WARN("failed to append async fts parent rewrite", K(ret), K(i),
-                   K(root_ctdef->op_type_));
-        }
-      }
-    }
-  } else {
-    const ObDASBooleanQueryCtDef *boolean_ctdef =
-        static_cast<const ObDASBooleanQueryCtDef *>(root_ctdef);
-    const int64_t probe_offset = boolean_ctdef->has_merged_probe()
-        ? boolean_ctdef->get_merged_probe_offset() : -1;
-    const int64_t query_child_cnt = root_ctdef->children_cnt_
-        - (boolean_ctdef->has_merged_probe() ? 1 : 0);
-    if (boolean_ctdef->has_merged_probe()
-        && OB_UNLIKELY(probe_offset < 0 || probe_offset >= root_ctdef->children_cnt_)) {
+  type = GROUP_INCOMPATIBLE;
+  if (OB_ISNULL(query) || (query->children_cnt_ > 0 && OB_ISNULL(query->children_))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid search query", K(ret), KP(query));
+  } else if (DAS_OP_BOOLEAN_QUERY == query->op_type_) {
+    const ObDASBooleanQueryCtDef &boolean = *static_cast<const ObDASBooleanQueryCtDef *>(query);
+    if (boolean.is_async()) {
       ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("invalid merged probe offset", K(ret), K(probe_offset), K(root_ctdef->children_cnt_));
+      LOG_WARN("unexpected visibility wrapper before mode selection", K(ret));
+    } else if (OB_FAIL(check_boolean(boolean, in_nested, type))) {
+      LOG_WARN("failed to check Boolean query", K(ret));
     }
-    int64_t async_child_cnt = 0;
-    ObSEArray<ObDASBaseCtDef *, 8> normalized_children;
-    for (int64_t i = 0; OB_SUCC(ret) && i < root_ctdef->children_cnt_; ++i) {
-      ObDASBaseCtDef *normalized_child = nullptr;
-      if (OB_ISNULL(root_ctdef->children_[i])) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("null hybrid search child ctdef", K(ret), K(i));
-      } else if (i == probe_offset) {
-        // The probe is an alternative execution path, not another Boolean clause.
-        if (OB_FAIL(normalized_children.push_back(root_ctdef->children_[i]))) {
-          LOG_WARN("failed to preserve merged probe child", K(ret), K(i));
-        }
-      } else if (OB_FAIL(SMART_CALL(plan_async_fts_boolean_domain_(
-                     root_ctdef->children_[i], rewrite_actions,
-                     has_unowned_sync_filter, normalized_child)))) {
-        LOG_WARN("failed to plan async fts child domain", K(ret), K(i));
-      } else if (OB_FAIL(normalized_children.push_back(normalized_child))) {
-        LOG_WARN("failed to append planned async fts child", K(ret), K(i));
-      } else if (DAS_OP_BOOLEAN_QUERY == normalized_child->op_type_
-                 && static_cast<ObDASBooleanQueryCtDef *>(
-                     normalized_child)->is_async()) {
-        ++async_child_cnt;
-      }
+  } else if (DAS_OP_NESTED_QUERY == query->op_type_) {
+    if (1 != query->children_cnt_) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid nested query", K(ret), K(query->children_cnt_));
+    } else if (OB_FAIL(SMART_CALL(check_clause(query->children_[0], true, type)))) {
+      LOG_WARN("failed to check nested query", K(ret));
     }
-    bool mixed_children_are_sync_filters = true;
-    bool has_required_async_child = false;
-    for (int64_t i = 0; OB_SUCC(ret) && mixed_children_are_sync_filters
-         && i < normalized_children.count(); ++i) {
-      ObDASBaseCtDef *normalized_child = normalized_children.at(i);
-      const bool is_async_wrapper = DAS_OP_BOOLEAN_QUERY == normalized_child->op_type_
-          && static_cast<ObDASBooleanQueryCtDef *>(normalized_child)->is_async();
-      bool is_filter_child = false;
-      bool is_required_child = false;
-      if (i == probe_offset) {
-      } else if (OB_FAIL(get_boolean_required_child_role(
-              *boolean_ctdef, root_ctdef->children_[i],
-              is_filter_child, is_required_child))) {
-        LOG_WARN("failed to classify mixed boolean child", K(ret), K(i));
-      } else if (is_async_wrapper) {
-        has_required_async_child |= is_required_child;
+  } else if (OB_FAIL(check_leaf(*query, in_nested, type))) {
+    LOG_WARN("failed to check query leaf", K(ret), K(query->op_type_));
+  }
+  return ret;
+}
+
+int ObGroupModeCheck::check_boolean(
+    const ObDASBooleanQueryCtDef &query, bool in_nested, ObGroupClauseType &type)
+{
+  int ret = OB_SUCCESS;
+  enum { MUST, FILTER, SHOULD, MUST_NOT, CLAUSE_COUNT };
+  ObBooleanSubClause<ObIDASSearchCtDef> clauses[CLAUSE_COUNT];
+  bool compatible = query.has_positive_clause();
+  bool has_async = false;
+  bool has_sync = false;
+  bool has_required_async = false;
+  bool all_sync_in_filter = true;
+  if (OB_FAIL(query.must(clauses[MUST])) || OB_FAIL(query.filter(clauses[FILTER]))
+      || OB_FAIL(query.should(clauses[SHOULD])) || OB_FAIL(query.must_not(clauses[MUST_NOT]))) {
+    LOG_WARN("failed to get Boolean clauses", K(ret));
+  } else {
+    // Merge-probe occupies a trailing physical slot outside the four semantic clauses.
+    const int64_t count = clauses[MUST].count() + clauses[FILTER].count()
+        + clauses[SHOULD].count() + clauses[MUST_NOT].count();
+    if (query.children_cnt_ != count + (query.has_merged_probe() ? 1 : 0)
+        || (query.has_merged_probe() && query.get_merged_probe_offset() != count)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid Boolean clause layout", K(ret), K(count), K(query.children_cnt_));
+    }
+  }
+  for (int64_t role = 0; OB_SUCC(ret) && role < CLAUSE_COUNT; ++role) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < clauses[role].count(); ++i) {
+      ObIDASSearchCtDef *child = nullptr;
+      ObGroupClauseType child_type = GROUP_INCOMPATIBLE;
+      if (OB_FAIL(clauses[role].get(i, child))) {
+        LOG_WARN("failed to get query clause", K(ret), K(role), K(i));
+      } else if (OB_FAIL(SMART_CALL(check_clause(child, in_nested, child_type)))) {
+        LOG_WARN("failed to check query clause", K(ret), K(role), K(i));
+      } else if (GROUP_ASYNC == child_type) {
+        has_async = true;
+        has_required_async = has_required_async || MUST == role || FILTER == role;
+      } else if (GROUP_SYNC_FILTER == child_type) {
+        has_sync = true;
+        all_sync_in_filter = all_sync_in_filter && FILTER == role;
       } else {
-        bool is_group_compatible_filter = false;
-        if (is_filter_child
-            && OB_FAIL(ObDASAsyncIndexQueryCtx::is_group_compatible_filter_domain(
-                   normalized_child, is_group_compatible_filter))) {
-          LOG_WARN("failed to analyze mixed Boolean filter child", K(ret), K(i));
-        } else {
-          mixed_children_are_sync_filters = is_filter_child
-              && is_group_compatible_filter;
-        }
+        compatible = false;
       }
     }
-    if (OB_SUCCESS != ret || 0 == async_child_cnt) {
-      // Preserve the original tree when no async full-text domain exists.
-    } else if (async_child_cnt != query_child_cnt
-               && (!mixed_children_are_sync_filters || !has_required_async_child)) {
-      // Eligibility is checked before mutation. Keep this guard non-failing so an
-      // unrecognized mixed shape always falls back to the original execution tree.
-      // A global synchronous Filter needs a required async MUST/FILTER to restrict
-      // its output to the current Group. MUST_NOT and optional SHOULD do not provide
-      // that ownership. Conservatively retain the original tree for SHOULD-only
-      // async domains: its effective minimum_should_match may be a runtime expression.
-      LOG_TRACE("keep mixed async index boolean tree unchanged",
-                K(root_ctdef->op_type_), K(async_child_cnt), K(root_ctdef->children_cnt_),
-                K(has_required_async_child));
-      if (mixed_children_are_sync_filters && !has_required_async_child) {
-        has_unowned_sync_filter = true;
+  }
+  if (OB_SUCC(ret) && compatible) {
+    if (has_async && (!has_sync || (all_sync_in_filter && has_required_async))) {
+      type = GROUP_ASYNC;
+      has_sync_filter_ = has_sync_filter_ || has_sync;
+    } else if (!has_async && has_sync) {
+      type = GROUP_SYNC_FILTER;
+    }
+  }
+  return ret;
+}
+
+int ObGroupModeCheck::check_leaf(
+    const ObDASBaseCtDef &query, bool in_nested, ObGroupClauseType &type)
+{
+  int ret = OB_SUCCESS;
+  const bool is_fts = DAS_OP_MATCH_QUERY == query.op_type_
+      || DAS_OP_MATCH_PHRASE_QUERY == query.op_type_ || DAS_OP_MULTI_MATCH_QUERY == query.op_type_
+      || DAS_OP_QUERY_STRING_QUERY == query.op_type_;
+  const ObDASScalarScanCtDef *scan = nullptr;
+  ObDASAsyncIndexDomainAnalysis access;
+  if (DAS_OP_SCALAR_QUERY == query.op_type_) {
+    const ObDASScalarCtDef &scalar = static_cast<const ObDASScalarCtDef &>(query);
+    scan = scalar.get_index_scan_ctdef();
+    if (OB_ISNULL(scan)) {
+      scan = scalar.get_main_scan_ctdef();
+    }
+  } else if (DAS_OP_SCALAR_SCAN_QUERY == query.op_type_) {
+    scan = static_cast<const ObDASScalarScanCtDef *>(&query);
+  } else if (!is_fts) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected operator in search query", K(ret), K(query.op_type_));
+  }
+  if (OB_SUCC(ret) && OB_FAIL(ObDASAsyncIndexQueryCtx::analyze_async_index_domain(
+          &query, access))) {
+    LOG_WARN("failed to inspect selected index access", K(ret));
+  } else if (OB_SUCC(ret)) {
+    // A mixed full-text leaf still needs deletion for its async indexes in Legacy.
+    const uint64_t index_id = access.semantic_branch_counts_.empty()
+        ? access.index_table_id_ : access.semantic_branch_counts_.at(0).index_table_id_;
+    const bool is_element_universe = OB_NOT_NULL(scan) && scan->is_full_subtree_scan_for_nested_;
+    if (OB_INVALID_ID != index_id) {
+      if (OB_INVALID_ID == first_index_id_) {
+        first_index_id_ = index_id;
       }
-      for (int64_t i = 0; OB_SUCC(ret) && i < normalized_children.count(); ++i) {
-        if (normalized_children.at(i) != root_ctdef->children_[i]
-            && OB_FAIL(rewrite_actions.push_back(
-                   AsyncFtsDomainRewriteAction(
-                       &root_ctdef->children_[i], normalized_children.at(i))))) {
-          LOG_WARN("failed to append mixed async fts rewrite", K(ret), K(i));
-        }
+      has_multiple_indexes_ = has_multiple_indexes_ || first_index_id_ != index_id
+          || access.semantic_branch_counts_.count() > 1;
+      async_fts_count_ += is_fts ? 1 : 0;
+      if (!is_element_universe && !(is_fts && in_nested)
+          && (access.is_single() || ASYNC_INDEX_DOMAIN_MULTI == access.type_)) {
+        type = GROUP_ASYNC;
       }
-    } else {
-      ObDASScalarScanCtDef *shared_delete_ctdef = nullptr;
-      ObSEArray<ObDASBaseCtDef *, 8> query_ctdefs;
-      for (int64_t i = 0; OB_SUCC(ret) && i < root_ctdef->children_cnt_; ++i) {
-        ObDASBaseCtDef *query_ctdef = nullptr;
-        ObDASScalarScanCtDef *delete_scan_ctdef = nullptr;
-        ObDASBaseCtDef *normalized_child = normalized_children.at(i);
-        const bool is_async_wrapper = DAS_OP_BOOLEAN_QUERY == normalized_child->op_type_
-            && static_cast<ObDASBooleanQueryCtDef *>(normalized_child)->is_async();
-        if (is_async_wrapper) {
-          if (OB_FAIL(get_async_fts_wrapper_children_(
-                  normalized_child, query_ctdef, delete_scan_ctdef))) {
-            LOG_WARN("failed to extract async fts child wrapper", K(ret), K(i));
-          } else if (OB_ISNULL(shared_delete_ctdef)) {
-            shared_delete_ctdef = delete_scan_ctdef;
-          }
-        } else {
-          query_ctdef = normalized_child;
-        }
-        if (OB_SUCC(ret) && OB_FAIL(query_ctdefs.push_back(query_ctdef))) {
-          LOG_WARN("failed to append unwrapped async fts query", K(ret), K(i));
-        }
-      }
-      if (OB_SUCC(ret) && OB_ISNULL(shared_delete_ctdef)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("normalized async domain has no shared delete scan", K(ret));
-      } else if (OB_SUCC(ret)) {
-        ObDASBaseCtDef *wrapper_ctdef = nullptr;
-        if (OB_FAIL(build_async_fts_domain_wrapper(
-                root_ctdef, shared_delete_ctdef, wrapper_ctdef))) {
-          LOG_WARN("failed to preallocate normalized async fts wrapper", K(ret));
-        } else {
-          normalized_ctdef = wrapper_ctdef;
-          for (int64_t i = 0; OB_SUCC(ret) && i < query_ctdefs.count(); ++i) {
-            if (query_ctdefs.at(i) != root_ctdef->children_[i]
-                && OB_FAIL(rewrite_actions.push_back(
-                       AsyncFtsDomainRewriteAction(
-                           &root_ctdef->children_[i], query_ctdefs.at(i))))) {
-              LOG_WARN("failed to append async fts unwrap rewrite", K(ret), K(i));
-            }
-          }
-        }
-      }
+    } else if (!is_element_universe && !is_fts && !in_nested) {
+      type = GROUP_SYNC_FILTER;
+    }
+  }
+  return ret;
+}
+
+} // anonymous namespace
+
+int ObHybridSearchCgService::select_async_exec_mode(
+    const ObDASBaseCtDef *query,
+    bool &has_async,
+    ObDASAsyncIndexExecMode &mode)
+{
+  int ret = OB_SUCCESS;
+  ObGroupModeCheck check;
+  ObGroupClauseType root_type = GROUP_INCOMPATIBLE;
+  has_async = false;
+  mode = ASYNC_INDEX_EXEC_LEGACY;
+  if (OB_ISNULL(query)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(check.check_clause(query, false /* in_nested */, root_type))) {
+    LOG_WARN("failed to check complete search query", K(ret));
+  } else {
+    has_async = OB_INVALID_ID != check.first_index_id_;
+    if (GROUP_ASYNC == root_type
+        && (check.has_multiple_indexes_ || check.async_fts_count_ > 1 || check.has_sync_filter_)) {
+      mode = ASYNC_INDEX_EXEC_GROUP;
     }
   }
   return ret;
@@ -1327,12 +1119,21 @@ int ObHybridSearchCgService::generate_async_delete_scan_ctdef(
   ObSEArray<ObRawExpr *, 2> access_exprs;
   ObSEArray<uint64_t, 2> output_cids;
   ObSEArray<ObRawExpr *, 1> rowkey_exprs;
+  const ObTableSchema *schema = nullptr;
   if (OB_UNLIKELY(OB_INVALID_ID == delete_idx_tid)
       || OB_ISNULL(delete_doc_id_column)
       || OB_ISNULL(delete_rowscn_expr)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid async delete scan metadata", KR(ret), K(delete_idx_tid),
         KP(delete_doc_id_column), KP(delete_rowscn_expr));
+  } else if (OB_ISNULL(cg_.opt_ctx_) || OB_ISNULL(cg_.opt_ctx_->get_sql_schema_guard())) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(cg_.opt_ctx_->get_sql_schema_guard()->get_table_schema(
+                 delete_idx_tid, schema))) {
+    LOG_WARN("failed to resolve shared deletion index", K(ret), K(delete_idx_tid));
+  } else if (OB_ISNULL(schema) || !share::schema::is_async_delete_index(schema->get_index_type())) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("unexpected shared deletion index type", K(ret), K(delete_idx_tid));
   } else if (OB_FAIL(access_exprs.push_back(delete_doc_id_column))) {
     LOG_WARN("failed to push back delete doc id column expr", KR(ret));
   } else if (OB_FAIL(access_exprs.push_back(delete_rowscn_expr))) {
@@ -1487,6 +1288,9 @@ int ObHybridSearchCgService::generate_ctdef(ObLogTableScan &op, const ObScalarQu
       } else if (OB_ISNULL(scalar_index_scan_ctdef)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("index scan ctdef is null", K(ret));
+      } else if (scalar_index_scan_ctdef->is_async_index_ != scalar_query_node->is_async_) {
+        ret = OB_STATE_NOT_MATCH;
+        LOG_WARN("scalar scan and selected index disagree on async access", K(ret));
       } else {
         scalar_index_scan_ctdef->is_primary_table_scan_ = false;
         scalar_index_scan_ctdef->is_search_index_ = is_search_index_path;
@@ -1666,9 +1470,8 @@ int ObHybridSearchCgService::generate_ctdef(ObLogTableScan &op, const ObBooleanQ
       // must_not-only bool is allowed when either
       //   (a) we are inside a nested_query subtree (child-scope: universe is
       //       synthesized by synthesize_child_domain_must_not_required), or
-      //   (b) must_not directly wraps a nested_query at parent scope
-      //       (parent-scope negation: the nested_query itself produces the
-      //       parent-doc universe via the nested→parent join).
+      //   (b) a document-level exclusion contains a nested query. On the lookup
+      //       path, a pure exclusion at the query root gets a document universe.
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("there should be at least one positive or must_not clause", KR(ret));
     } else if (op.is_logical_table()) {
@@ -1746,6 +1549,7 @@ int ObHybridSearchCgService::mark_subtree_nested_scope(ObDASBaseCtDef *root_ctde
 }
 
 int ObHybridSearchCgService::collect_async_delete_info(
+    const ObLogTableScan &op,
     const ObHybridSearchNodeBase *node,
     const ObAsyncIndexDeleteInfo *&async_delete_info)
 {
@@ -1754,28 +1558,40 @@ int ObHybridSearchCgService::collect_async_delete_info(
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("node is null", K(ret));
   } else {
-    const ObAsyncIndexDeleteInfo *node_delete_info = node->get_async_delete_info();
-    if (OB_NOT_NULL(node_delete_info) && OB_UNLIKELY(!node_delete_info->is_valid())) {
+    const ObScalarQueryNode *scalar = node->is_hybrid_scalar_node()
+        ? static_cast<const ObScalarQueryNode *>(node) : nullptr;
+    const ObBooleanQueryNode *boolean = INDEX_MERGE_HYBRID_BOOLEAN_QUERY == node->node_type_
+        ? static_cast<const ObBooleanQueryNode *>(node) : nullptr;
+    const bool preserve_first_filter = need_preserve_pk_filter_for_must_not_only_(op, boolean);
+    const ObAsyncIndexDeleteInfo *info = OB_NOT_NULL(scalar)
+        && (scalar->is_merged_probe_ || OB_ISNULL(scalar->ap_))
+        ? nullptr : node->get_async_delete_info();
+    if (OB_NOT_NULL(info) && !info->is_valid()) {
       ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("invalid async delete info in nested query",
-          K(ret), K(node->node_type_), KPC(node_delete_info));
-    } else if (OB_NOT_NULL(node_delete_info)) {
+      LOG_WARN("invalid async delete info", K(ret), K(node->node_type_), KPC(info));
+    } else if (OB_NOT_NULL(info)) {
       if (OB_ISNULL(async_delete_info)) {
-        async_delete_info = node_delete_info;
-      } else if (OB_UNLIKELY(
-          async_delete_info->get_delete_idx_tid() != node_delete_info->get_delete_idx_tid()
-          || OB_ISNULL(async_delete_info->get_delete_doc_id_column())
-          || async_delete_info->get_delete_doc_id_column()->get_column_id()
-             != node_delete_info->get_delete_doc_id_column()->get_column_id())) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("inconsistent shared async delete metadata", K(ret),
-            KPC(async_delete_info), KPC(node_delete_info));
+        async_delete_info = info;
+      } else if (async_delete_info->get_delete_idx_tid() != info->get_delete_idx_tid()
+                 || async_delete_info->get_delete_doc_id_column()->get_column_id()
+                        != info->get_delete_doc_id_column()->get_column_id()
+                 || async_delete_info->get_delete_doc_id_column()->get_result_type().get_type()
+                        != info->get_delete_doc_id_column()->get_result_type().get_type()
+                 || async_delete_info->get_delete_rowscn_expr()->get_expr_type()
+                        != info->get_delete_rowscn_expr()->get_expr_type()) {
+        ret = OB_STATE_NOT_MATCH;
+        LOG_WARN("inconsistent shared async delete metadata", K(ret), KPC(async_delete_info),
+                 KPC(info));
       }
     }
     for (int64_t i = 0; OB_SUCC(ret) && i < node->children_.count(); ++i) {
       const ObHybridSearchNodeBase *child =
           static_cast<const ObHybridSearchNodeBase *>(node->children_.at(i));
-      if (OB_FAIL(SMART_CALL(collect_async_delete_info(child, async_delete_info)))) {
+      // CG keeps the first prefix FILTER when it supplies candidates for MUST_NOT.
+      const bool skip_prefix = op.is_logical_table() && !(preserve_first_filter && 0 == i)
+          && is_logical_table_implicit_pk_filter_node_(child);
+      if (!skip_prefix
+          && OB_FAIL(SMART_CALL(collect_async_delete_info(op, child, async_delete_info)))) {
         LOG_WARN("failed to collect child async delete info", K(ret), K(i));
       }
     }
@@ -2119,7 +1935,18 @@ int ObHybridSearchCgService::synthesize_parent_domain_must_not_required(ObLogTab
     }
   }
 
-  if (OB_ISNULL(bool_root) || bool_root->op_type_ != DAS_OP_BOOLEAN_QUERY
+  // The shared delete wrapper keeps the original query in its first (MUST) child.
+  if (OB_NOT_NULL(bool_root) && DAS_OP_BOOLEAN_QUERY == bool_root->op_type_
+      && static_cast<const ObDASBooleanQueryCtDef *>(bool_root)->is_async()) {
+    if (OB_UNLIKELY(2 != bool_root->children_cnt_) || OB_ISNULL(bool_root->children_)
+        || OB_ISNULL(bool_root->children_[0])) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid query root in async delete wrapper", K(ret));
+    } else {
+      bool_root = bool_root->children_[0];
+    }
+  }
+  if (OB_FAIL(ret) || OB_ISNULL(bool_root) || bool_root->op_type_ != DAS_OP_BOOLEAN_QUERY
       || OB_ISNULL(data_scan) || OB_ISNULL(cg_.phy_plan_)) {
     // nothing to do
   } else {

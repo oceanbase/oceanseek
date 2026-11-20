@@ -6448,6 +6448,152 @@ TEST_F(TestDASAsyncSegmentMerge, sync_scalar_fallback_still_collects_wrapped_asy
   EXPECT_EQ(7001, delete_table_id);
 }
 
+TEST_F(TestDASAsyncSegmentMerge, root_wrapper_collects_mixed_query_semantic_accesses)
+{
+  ObDASScalarScanCtDef a(allocator_), b(allocator_), sync(allocator_);
+  ObDASScalarScanCtDef primary_fallback(allocator_), merged_probe(allocator_), deletion(allocator_);
+  a.is_async_index_ = true;
+  b.is_async_index_ = true;
+  a.ref_table_id_ = TEST_INDEX_TABLE_ID;
+  b.ref_table_id_ = TEST_INDEX_TABLE_ID_2;
+  // Helper provenance must not add a third semantic index to the catalog.
+  primary_fallback.is_async_index_ = true;
+  merged_probe.is_async_index_ = true;
+  primary_fallback.ref_table_id_ = 9999;
+  merged_probe.ref_table_id_ = 9999;
+  primary_fallback.is_primary_table_scan_ = true;
+  sync.ref_table_id_ = 8001;
+  deletion.ref_table_id_ = 7001;
+
+  ObDASScalarCtDef scalar_b(allocator_);
+  ObDASBaseCtDef *scalar_children[] = { &b, &primary_fallback };
+  scalar_b.children_ = scalar_children;
+  scalar_b.children_cnt_ = ARRAYSIZEOF(scalar_children);
+  scalar_b.set_has_index_scan(true);
+  scalar_b.set_has_main_scan(true);
+  ObDASBooleanQueryCtDef inner(allocator_), query(allocator_), wrapper(allocator_);
+  ObDASBaseCtDef *inner_children[] = { &sync, &scalar_b };
+  inner.children_ = inner_children;
+  inner.children_cnt_ = ARRAYSIZEOF(inner_children);
+  inner.set_must(0, 1);
+  inner.set_must_not(1, 1);
+  ObDASBaseCtDef *query_children[] = { &a, &inner, &merged_probe };
+  query.children_ = query_children;
+  query.children_cnt_ = ARRAYSIZEOF(query_children);
+  query.set_must(0, 2);
+  query.set_merged_probe(2);
+  ObDASBaseCtDef *wrapper_children[] = { &query, &deletion };
+  wrapper.children_ = wrapper_children;
+  wrapper.children_cnt_ = ARRAYSIZEOF(wrapper_children);
+  wrapper.set_must(0, 1);
+  wrapper.set_must_not(1, 1);
+  wrapper.set_is_async(true);
+
+  ObSEArray<uint64_t, 2> table_ids;
+  ASSERT_EQ(OB_SUCCESS,
+      ObDASAsyncIndexQueryCtx::collect_async_index_table_ids(&wrapper, table_ids));
+  ASSERT_EQ(2, table_ids.count());
+  EXPECT_EQ(TEST_INDEX_TABLE_ID, table_ids.at(0));
+  EXPECT_EQ(TEST_INDEX_TABLE_ID_2, table_ids.at(1));
+  ObDASAsyncIndexDomainAnalysis analysis;
+  ASSERT_EQ(OB_SUCCESS, ObDASAsyncIndexQueryCtx::analyze_async_index_domain(&wrapper, analysis));
+  EXPECT_EQ(ASYNC_INDEX_DOMAIN_MIXED_SYNC, analysis.type_);
+  uint64_t delete_table_id = OB_INVALID_ID;
+  ASSERT_EQ(OB_SUCCESS,
+      ObDASAsyncIndexQueryCtx::collect_async_delete_table_id(&wrapper, delete_table_id));
+  EXPECT_EQ(7001, delete_table_id);
+}
+
+TEST_F(TestDASAsyncSegmentMerge, catalog_preserves_wrapper_and_nested_scope_validation)
+{
+  ObDASScalarScanCtDef scan(allocator_), deletion(allocator_);
+  scan.is_async_index_ = true;
+  scan.ref_table_id_ = TEST_INDEX_TABLE_ID;
+  deletion.ref_table_id_ = 7001;
+  ObDASBooleanQueryCtDef wrapper(allocator_), outer(allocator_);
+  ObDASBaseCtDef *children[] = { &scan, &deletion };
+  wrapper.children_ = children;
+  wrapper.children_cnt_ = ARRAYSIZEOF(children);
+  wrapper.set_must(0, 1);
+  wrapper.set_must_not(1, 1);
+  wrapper.set_is_async(true);
+  ObDASBaseCtDef *outer_children[] = { &wrapper, &deletion };
+  outer.children_ = outer_children;
+  outer.children_cnt_ = ARRAYSIZEOF(outer_children);
+  outer.set_must(0, 1);
+  outer.set_must_not(1, 1);
+  outer.set_is_async(true);
+  ObSEArray<uint64_t, 2> table_ids;
+  EXPECT_EQ(OB_NOT_SUPPORTED,
+      ObDASAsyncIndexQueryCtx::collect_async_index_table_ids(&outer, table_ids));
+  EXPECT_TRUE(table_ids.empty());
+
+  ObDASNestedQueryCtDef nested(allocator_);
+  ObDASBaseCtDef *nested_children[] = { &wrapper };
+  nested.children_ = nested_children;
+  nested.children_cnt_ = ARRAYSIZEOF(nested_children);
+  EXPECT_EQ(OB_NOT_SUPPORTED,
+      ObDASAsyncIndexQueryCtx::collect_async_index_table_ids(&nested, table_ids));
+
+  nested_children[0] = &scan;
+  children[0] = &nested;
+  ASSERT_EQ(OB_SUCCESS,
+      ObDASAsyncIndexQueryCtx::collect_async_index_table_ids(&wrapper, table_ids));
+  ASSERT_EQ(1, table_ids.count());
+  EXPECT_EQ(TEST_INDEX_TABLE_ID, table_ids.at(0));
+
+  // Fulltext still cannot produce the element RowIDs required inside nested.
+  ObDASIRScanCtDef ir(allocator_);
+  ObDASBaseCtDef *ir_children[] = { &scan };
+  ir.children_ = ir_children;
+  ir.children_cnt_ = ARRAYSIZEOF(ir_children);
+  ir.is_async_index_ = true;
+  ir.use_scalar_scan_def_ = true;
+  nested_children[0] = &ir;
+  EXPECT_EQ(OB_NOT_SUPPORTED,
+      ObDASAsyncIndexQueryCtx::collect_async_index_table_ids(&wrapper, table_ids));
+  EXPECT_TRUE(table_ids.empty());
+}
+
+TEST_F(TestDASAsyncSegmentMerge, catalog_accepts_old_branch_wrappers_with_shared_deletion)
+{
+  ObDASScalarScanCtDef a(allocator_), b(allocator_), delete_a(allocator_), delete_b(allocator_);
+  a.is_async_index_ = true;
+  b.is_async_index_ = true;
+  a.ref_table_id_ = TEST_INDEX_TABLE_ID;
+  b.ref_table_id_ = TEST_INDEX_TABLE_ID_2;
+  delete_a.ref_table_id_ = 7001;
+  delete_b.ref_table_id_ = 7001;
+  ObDASBooleanQueryCtDef wrapper_a(allocator_), wrapper_b(allocator_), query(allocator_);
+  ObDASBaseCtDef *a_children[] = { &a, &delete_a };
+  ObDASBaseCtDef *b_children[] = { &b, &delete_b };
+  wrapper_a.children_ = a_children;
+  wrapper_a.children_cnt_ = ARRAYSIZEOF(a_children);
+  wrapper_a.set_must(0, 1);
+  wrapper_a.set_must_not(1, 1);
+  wrapper_a.set_is_async(true);
+  wrapper_b.children_ = b_children;
+  wrapper_b.children_cnt_ = ARRAYSIZEOF(b_children);
+  wrapper_b.set_must(0, 1);
+  wrapper_b.set_must_not(1, 1);
+  wrapper_b.set_is_async(true);
+  ObDASBaseCtDef *children[] = { &wrapper_a, &wrapper_b };
+  query.children_ = children;
+  query.children_cnt_ = ARRAYSIZEOF(children);
+  query.set_must(0, 2);
+
+  ObSEArray<uint64_t, 2> table_ids;
+  ASSERT_EQ(OB_SUCCESS,
+      ObDASAsyncIndexQueryCtx::collect_async_index_table_ids(&query, table_ids));
+  ASSERT_EQ(2, table_ids.count());
+  EXPECT_EQ(TEST_INDEX_TABLE_ID, table_ids.at(0));
+  EXPECT_EQ(TEST_INDEX_TABLE_ID_2, table_ids.at(1));
+  delete_b.ref_table_id_ = 7002;
+  EXPECT_EQ(OB_STATE_NOT_MATCH,
+      ObDASAsyncIndexQueryCtx::collect_async_index_table_ids(&query, table_ids));
+  EXPECT_TRUE(table_ids.empty());
+}
+
 TEST_F(TestDASAsyncSegmentMerge, async_scalar_equality_predicate_keeps_ror)
 {
   ObDASAsyncIndexQueryCtx catalog;

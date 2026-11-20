@@ -8,6 +8,7 @@
 #include <limits>
 #include <string>
 #include <gtest/gtest.h>
+#include "lib/utility/ob_defer.h"
 #define private public
 #define protected public
 #include "share/rc/ob_tenant_base.h"
@@ -30,8 +31,12 @@
 #include "sql/das/search/ob_das_bmm_op.h"
 #include "sql/das/search/ob_das_bitmap_op.h"
 #include "sql/code_generator/ob_hybrid_search_cg_service.h"
+#include "sql/das/search/ob_das_nested_query_op.h"
+#include "sql/das/search/ob_das_async_index_query_ctx.h"
 #include "sql/code_generator/ob_static_engine_cg.h"
 #include "sql/hybrid_search/ob_hybrid_search_node.h"
+#include "sql/ob_sql_context.h"
+#include "share/schema/ob_table_schema.h"
 #include "sql/session/ob_sql_session_info.h"
 #include "sql/optimizer/ob_log_table_scan.h"
 #include "sql/optimizer/ob_select_log_plan.h"
@@ -5910,17 +5915,69 @@ TEST_F(ObDASBooleanQueryTest, disjunction_op_calc_max_score_no_score)
 class ObDASBooleanQueryCgTest : public ObDASBooleanQueryTest
 {
 public:
-  ObDASBooleanQueryCgTest() : ObDASBooleanQueryTest(), 
-                              phy_plan_(), 
-                              cg_(CLUSTER_VERSION_4_1_0_0),
-                              cg_service_(cg_)
+  ObDASBooleanQueryCgTest()
+    : ObDASBooleanQueryTest(), cg_addr_(), cg_hint_(allocator_), cg_expr_factory_(allocator_),
+      cg_opt_ctx_(nullptr, nullptr, nullptr, nullptr, allocator_, nullptr,
+                  cg_addr_, nullptr, cg_hint_, cg_expr_factory_, nullptr, false),
+      cg_logical_plan_(cg_opt_ctx_, nullptr), table_scan_(cg_logical_plan_),
+      phy_plan_(), cg_(CLUSTER_VERSION_4_1_0_0), cg_service_(cg_)
   {
     cg_.phy_plan_ = &phy_plan_;
   }
-  
   virtual ~ObDASBooleanQueryCgTest() {}
 
 protected:
+  template <size_t N>
+  void attach(ObDASBaseCtDef &parent, ObDASBaseCtDef *(&children)[N])
+  {
+    parent.children_ = children;
+    parent.children_cnt_ = N;
+  }
+
+  void expect_mode(const ObDASBaseCtDef &query, bool expected_async,
+                   ObDASAsyncIndexExecMode expected_mode)
+  {
+    bool has_async = !expected_async;
+    ObDASAsyncIndexExecMode mode = expected_mode == ASYNC_INDEX_EXEC_GROUP
+        ? ASYNC_INDEX_EXEC_LEGACY : ASYNC_INDEX_EXEC_GROUP;
+    ASSERT_EQ(OB_SUCCESS, ObHybridSearchCgService::select_async_exec_mode(
+        &query, has_async, mode));
+    EXPECT_EQ(expected_async, has_async);
+    EXPECT_EQ(expected_mode, mode);
+  }
+
+  void expect_wrapper(const ObDASBaseCtDef *root, const ObDASBaseCtDef *query,
+                      const ObDASBaseCtDef *deletion)
+  {
+    ASSERT_NE(nullptr, root);
+    ASSERT_EQ(DAS_OP_BOOLEAN_QUERY, root->op_type_);
+    EXPECT_TRUE(static_cast<const ObDASBooleanQueryCtDef *>(root)->is_async());
+    ASSERT_EQ(2, root->children_cnt_);
+    EXPECT_EQ(query, root->children_[0]);
+    EXPECT_EQ(deletion, root->children_[1]);
+  }
+
+  int64_t count_async_wrappers(const ObDASBaseCtDef *ctdef) const
+  {
+    int64_t count = 0;
+    if (nullptr != ctdef) {
+      if (DAS_OP_BOOLEAN_QUERY == ctdef->op_type_
+          && static_cast<const ObDASBooleanQueryCtDef *>(ctdef)->is_async()) {
+        ++count;
+      }
+      for (int64_t i = 0; i < ctdef->children_cnt_; ++i) {
+        count += count_async_wrappers(ctdef->children_[i]);
+      }
+    }
+    return count;
+  }
+
+  ObAddr cg_addr_;
+  ObGlobalHint cg_hint_;
+  ObRawExprFactory cg_expr_factory_;
+  ObOptimizerContext cg_opt_ctx_;
+  ObSelectLogPlan cg_logical_plan_;
+  ObLogTableScan table_scan_;
   ObPhysicalPlan phy_plan_;
   ObStaticEngineCG cg_;
   ObHybridSearchCgService cg_service_;
@@ -5932,16 +5989,14 @@ TEST_F(ObDASBooleanQueryCgTest, generate_ctdef_null_phy_plan)
   cg_.phy_plan_ = nullptr;
   ObBooleanQueryNode node(allocator_);
   ObDASBooleanQueryCtDef *ctdef = nullptr;
-  ObLogTableScan *op = nullptr;
-  EXPECT_EQ(OB_ERR_UNEXPECTED, cg_service_.generate_ctdef(*op, &node, ctdef));
+  EXPECT_EQ(OB_ERR_UNEXPECTED, cg_service_.generate_ctdef(table_scan_, &node, ctdef));
 }
 
 // Test: generate_ctdef with null node
 TEST_F(ObDASBooleanQueryCgTest, generate_ctdef_null_node)
 {
   ObDASBooleanQueryCtDef *ctdef = nullptr;
-  ObLogTableScan *op = nullptr;
-  EXPECT_EQ(OB_ERR_UNEXPECTED, cg_service_.generate_ctdef(*op, nullptr, ctdef));
+  EXPECT_EQ(OB_ERR_UNEXPECTED, cg_service_.generate_ctdef(table_scan_, nullptr, ctdef));
 }
 
 // Test: generate_ctdef with invalid min_should_match (< 0)
@@ -5950,32 +6005,22 @@ TEST_F(ObDASBooleanQueryCgTest, generate_ctdef_invalid_min_match_neg)
   ObBooleanQueryNode node(allocator_);
   node.min_should_match_ = -1;
   ObDASBooleanQueryCtDef *ctdef = nullptr;
-  ObLogTableScan *op = nullptr;
-  EXPECT_EQ(OB_INVALID_ARGUMENT, cg_service_.generate_ctdef(*op, &node, ctdef));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, cg_service_.generate_ctdef(table_scan_, &node, ctdef));
 }
 
 // Test: generate_ctdef with no positive clauses
 TEST_F(ObDASBooleanQueryCgTest, generate_ctdef_no_positive_clauses)
 {
   ObBooleanQueryNode node(allocator_);
-  void *buf = allocator_.alloc(sizeof(ObScalarQueryNode));
-  ObScalarQueryNode *s1 = new(buf) ObScalarQueryNode(allocator_);
-  node.must_not_nodes_.push_back(s1);
+  ObScalarQueryNode excluded(allocator_);
+  ASSERT_EQ(OB_SUCCESS, node.must_not_nodes_.push_back(&excluded));
   node.min_should_match_ = 0;
   ObDASBooleanQueryCtDef *ctdef = nullptr;
-  ObLogTableScan *op = nullptr;
-  EXPECT_EQ(OB_INVALID_ARGUMENT, cg_service_.generate_ctdef(*op, &node, ctdef));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, cg_service_.generate_ctdef(table_scan_, &node, ctdef));
 }
 
 TEST_F(ObDASBooleanQueryCgTest, generate_ctdef_registers_merged_probe_child)
 {
-  ObAddr addr;
-  ObGlobalHint global_hint(allocator_);
-  ObRawExprFactory expr_factory(allocator_);
-  ObOptimizerContext opt_ctx(nullptr, nullptr, nullptr, nullptr, allocator_, nullptr,
-                             addr, nullptr, global_hint, expr_factory, nullptr, false);
-  ObSelectLogPlan plan(opt_ctx, nullptr);
-  ObLogTableScan op(plan);
   ObBooleanQueryNode node(allocator_);
   ObScalarQueryNode must_node(allocator_);
   ObScalarQueryNode filter_node(allocator_);
@@ -5987,12 +6032,12 @@ TEST_F(ObDASBooleanQueryCgTest, generate_ctdef_registers_merged_probe_child)
   node.min_should_match_ = 0;
 
   ObDASBooleanQueryCtDef *ctdef = nullptr;
-  ASSERT_EQ(OB_SUCCESS, cg_service_.generate_ctdef(op, &node, ctdef));
+  ASSERT_EQ(OB_SUCCESS, cg_service_.generate_ctdef(table_scan_, &node, ctdef));
   ASSERT_NE(nullptr, ctdef);
   EXPECT_FALSE(ctdef->has_merged_probe());
 
   node.merged_probe_scalar_node_ = &merged_node;
-  ASSERT_EQ(OB_SUCCESS, cg_service_.generate_ctdef(op, &node, ctdef));
+  ASSERT_EQ(OB_SUCCESS, cg_service_.generate_ctdef(table_scan_, &node, ctdef));
   ASSERT_NE(nullptr, ctdef);
   ASSERT_TRUE(ctdef->has_merged_probe());
   EXPECT_EQ(3, ctdef->get_merged_probe_offset());
@@ -6032,520 +6077,468 @@ TEST_F(ObDASBooleanQueryTest, req_opt_op_block_max_pruning_req_only_after_option
   EXPECT_EQ(OB_ITER_END, req_opt_op.next_rowid(next_id, score));
 }
 
-TEST_F(ObDASBooleanQueryCgTest,
-       async_domain_normalization_failure_preserves_tree_and_mode)
+TEST_F(ObDASBooleanQueryCgTest, mode_counts_semantic_fulltext_branches_and_distinct_indexes)
 {
-  ObDASScalarScanCtDef query_ctdef_1(allocator_);
-  ObDASScalarScanCtDef query_ctdef_2(allocator_);
-  ObDASScalarScanCtDef delete_ctdef_1(allocator_);
-  ObDASScalarScanCtDef delete_ctdef_2(allocator_);
-  query_ctdef_1.ref_table_id_ = 1001;
-  query_ctdef_1.is_async_index_ = true;
-  query_ctdef_2.ref_table_id_ = 1002;
-  query_ctdef_2.is_async_index_ = true;
-  delete_ctdef_1.ref_table_id_ = 2001;
-  delete_ctdef_2.ref_table_id_ = 2002;
+  ObDASScalarScanCtDef inv1(allocator_), inv2(allocator_);
+  inv1.ref_table_id_ = 1001;
+  inv2.ref_table_id_ = 1001;
+  ObDASIRScanCtDef ir1(allocator_), ir2(allocator_);
+  ObDASBaseCtDef *ir1_children[] = { &inv1 };
+  ObDASBaseCtDef *ir2_children[] = { &inv2 };
+  attach(ir1, ir1_children);
+  attach(ir2, ir2_children);
+  ir1.is_async_index_ = true;
+  ir2.is_async_index_ = true;
+  ir1.use_scalar_scan_def_ = true;
+  ir2.use_scalar_scan_def_ = true;
 
-  ObDASBooleanQueryCtDef wrapper_ctdef_1(allocator_);
-  ObDASBooleanQueryCtDef wrapper_ctdef_2(allocator_);
-  ObDASBaseCtDef *wrapper_children_1[] = {&query_ctdef_1, &delete_ctdef_1};
-  ObDASBaseCtDef *wrapper_children_2[] = {&query_ctdef_2, &delete_ctdef_2};
-  wrapper_ctdef_1.children_ = wrapper_children_1;
-  wrapper_ctdef_1.children_cnt_ = ARRAYSIZEOF(wrapper_children_1);
-  wrapper_ctdef_1.set_must(0, 1);
-  wrapper_ctdef_1.set_must_not(1, 1);
-  wrapper_ctdef_1.set_is_async(true);
-  wrapper_ctdef_2.children_ = wrapper_children_2;
-  wrapper_ctdef_2.children_cnt_ = ARRAYSIZEOF(wrapper_children_2);
-  wrapper_ctdef_2.set_must(0, 1);
-  wrapper_ctdef_2.set_must_not(1, 1);
-  wrapper_ctdef_2.set_is_async(true);
+  ObDASMatchCtDef match1(allocator_), match2(allocator_);
+  ObDASBaseCtDef *match1_children[] = { &ir1 };
+  ObDASBaseCtDef *match2_children[] = { &ir2 };
+  attach(match1, match1_children);
+  attach(match2, match2_children);
+  match1.ir_ctdef_idx_ = 0;
+  match2.ir_ctdef_idx_ = 0;
+  expect_mode(match1, true, ASYNC_INDEX_EXEC_LEGACY);
 
-  ObDASBooleanQueryCtDef boolean_ctdef(allocator_);
-  ObDASBaseCtDef *boolean_children[] = {&wrapper_ctdef_1, &wrapper_ctdef_2};
-  boolean_ctdef.children_ = boolean_children;
-  boolean_ctdef.children_cnt_ = ARRAYSIZEOF(boolean_children);
-  boolean_ctdef.set_must(0, ARRAYSIZEOF(boolean_children));
-  ObDASBaseCtDef *root_ctdef = &boolean_ctdef;
-  ObDASAsyncIndexExecMode exec_mode = ASYNC_INDEX_EXEC_GROUP;
+  ObDASBooleanQueryCtDef root(allocator_);
+  ObDASBaseCtDef *branches[] = { &match1, &match2 };
+  attach(root, branches);
+  root.set_should(0, 2);
+  root.set_min_should_match(1);
+  expect_mode(root, true, ASYNC_INDEX_EXEC_GROUP);
 
+  ObDASMultiMatchCtDef multi(allocator_);
+  ObDASBaseCtDef *fields[] = { &ir1, &ir2 };
+  attach(multi, fields);
+  ASSERT_EQ(OB_SUCCESS, multi.ir_ctdef_indices_.init(2));
+  ASSERT_EQ(OB_SUCCESS, multi.ir_ctdef_indices_.push_back(0));
+  ASSERT_EQ(OB_SUCCESS, multi.ir_ctdef_indices_.push_back(1));
+  expect_mode(multi, true, ASYNC_INDEX_EXEC_LEGACY);
+  inv2.ref_table_id_ = 1002;
+  expect_mode(multi, true, ASYNC_INDEX_EXEC_GROUP);
+}
+
+TEST_F(ObDASBooleanQueryCgTest, mode_ignores_primary_alternative_and_merged_probe)
+{
+  ObDASScalarScanCtDef first(allocator_), second(allocator_), primary(allocator_);
+  first.is_async_index_ = true;
+  second.is_async_index_ = true;
+  first.ref_table_id_ = 1001;
+  second.ref_table_id_ = 1001;
+  primary.is_primary_table_scan_ = true;
+  ObDASScalarCtDef scalar(allocator_), probe(allocator_);
+  ObDASBaseCtDef *paths[] = { &first, &primary };
+  ObDASBaseCtDef *probe_children[] = { &primary };
+  attach(scalar, paths);
+  scalar.set_has_index_scan(true);
+  scalar.set_has_main_scan(true);
+  attach(probe, probe_children);
+  probe.set_has_main_scan(true);
+
+  ObDASBooleanQueryCtDef root(allocator_);
+  ObDASBaseCtDef *children[] = { &scalar, &second, &probe };
+  attach(root, children);
+  root.set_must(0, 2);
+  root.set_merged_probe(2);
+  expect_mode(root, true, ASYNC_INDEX_EXEC_LEGACY);
+  second.ref_table_id_ = 1002;
+  expect_mode(root, true, ASYNC_INDEX_EXEC_GROUP);
+}
+
+TEST_F(ObDASBooleanQueryCgTest, synchronous_filter_requires_a_local_required_async_child)
+{
+  ObDASScalarScanCtDef async(allocator_), main_scan(allocator_);
+  async.ref_table_id_ = 1001;
+  async.is_async_index_ = true;
+  main_scan.is_primary_table_scan_ = true;
+  ObDASScalarCtDef primary(allocator_);
+  ObDASBaseCtDef *primary_children[] = { &main_scan };
+  attach(primary, primary_children);
+  primary.set_has_main_scan(true);
+  expect_mode(primary, false, ASYNC_INDEX_EXEC_LEGACY);
+
+  const ClauseType roles[] = { MUST, FILTER, SHOULD, MUST_NOT };
+  for (const ClauseType role : roles) {
+    SCOPED_TRACE(role);
+    ObDASBaseCtDef *children[] = { &async, &primary };
+    ObDASBooleanQueryCtDef root(allocator_);
+    attach(root, children);
+    root.set_must(0, 1);
+    switch (role) {
+      case MUST: {
+        root.set_must(0, 2);
+        break;
+      }
+      case FILTER: {
+        root.set_filter(1, 1);
+        break;
+      }
+      case SHOULD: {
+        root.set_should(1, 1);
+        break;
+      }
+      case MUST_NOT: {
+        root.set_must_not(1, 1);
+        break;
+      }
+      default: {
+        FAIL() << "Unexpected Boolean clause type " << role;
+        break;
+      }
+    }
+    expect_mode(root, true, role == FILTER ? ASYNC_INDEX_EXEC_GROUP : ASYNC_INDEX_EXEC_LEGACY);
+  }
+
+  ObDASBooleanQueryCtDef optional(allocator_);
+  ObDASBaseCtDef *children[] = { &async, &primary };
+  attach(optional, children);
+  optional.set_should(0, 1);
+  optional.set_filter(1, 1);
+  expect_mode(optional, true, ASYNC_INDEX_EXEC_LEGACY);
+}
+
+TEST_F(ObDASBooleanQueryCgTest, mixed_inner_query_cannot_borrow_an_outer_async_driver)
+{
+  ObDASScalarScanCtDef a(allocator_), b(allocator_), c(allocator_), d(allocator_);
+  a.ref_table_id_ = 1001;
+  c.ref_table_id_ = 1002;
+  a.is_async_index_ = true;
+  c.is_async_index_ = true;
+  b.is_primary_table_scan_ = true;
+  d.is_primary_table_scan_ = true;
+
+  // Dima 0377: A AND ((B AND NOT C) OR D). B and D are primary-only.
+  const ClauseType roles[] = { MUST, FILTER };
+  for (int64_t i = 0; i < ARRAYSIZEOF(roles); ++i) {
+    ObDASBooleanQueryCtDef exclusion(allocator_), disjunction(allocator_), root(allocator_);
+    ObDASBaseCtDef *excluded[] = { &b, &c };
+    ObDASBaseCtDef *alternatives[] = { &exclusion, &d };
+    ObDASBaseCtDef *required[] = { &a, &disjunction };
+    attach(exclusion, excluded);
+    if (FILTER == roles[i]) {
+      exclusion.set_filter(0, 1);
+    } else {
+      exclusion.set_must(0, 1);
+    }
+    exclusion.set_must_not(1, 1);
+    attach(disjunction, alternatives);
+    disjunction.set_should(0, 2);
+    disjunction.set_min_should_match(1);
+    attach(root, required);
+    root.set_must(0, 1);
+    root.set_filter(1, 1);
+    expect_mode(root, true, ASYNC_INDEX_EXEC_LEGACY);
+    EXPECT_EQ(0, count_async_wrappers(&root));
+  }
+
+  // Even an independently Group-capable sibling remains unwrapped.
+  ObDASBooleanQueryCtDef compatible(allocator_), root(allocator_);
+  ObDASBaseCtDef *async_children[] = { &a, &c };
+  ObDASBaseCtDef *mixed_children[] = { &compatible, &b };
+  attach(compatible, async_children);
+  compatible.set_must(0, 2);
+  attach(root, mixed_children);
+  root.set_must(0, 2);
+  expect_mode(compatible, true, ASYNC_INDEX_EXEC_GROUP);
+  expect_mode(root, true, ASYNC_INDEX_EXEC_LEGACY);
+  EXPECT_EQ(0, count_async_wrappers(&root));
+}
+
+TEST_F(ObDASBooleanQueryCgTest, pure_exclusions_without_a_positive_clause_use_legacy)
+{
+  ObDASScalarScanCtDef a(allocator_), c(allocator_);
+  a.ref_table_id_ = 1001;
+  c.ref_table_id_ = 1002;
+  a.is_async_index_ = true;
+  c.is_async_index_ = true;
+  ObDASNestedQueryCtDef nested(allocator_);
+  ObDASBaseCtDef *inner[] = { &a };
+  attach(nested, inner);
+  ObDASBooleanQueryCtDef root(allocator_);
+  ObDASBaseCtDef *children[] = { &nested, &c };
+  attach(root, children);
+  root.set_must_not(0, 2);
+  expect_mode(root, true, ASYNC_INDEX_EXEC_LEGACY);
+}
+
+TEST_F(ObDASBooleanQueryCgTest, completed_query_owns_one_wrapper_and_cannot_be_finalized_twice)
+{
+  ObDASScalarScanCtDef async(allocator_), sync(allocator_), deletion(allocator_);
+  async.is_async_index_ = true;
+  async.ref_table_id_ = 1001;
+  deletion.ref_table_id_ = 2001;
+  const ClauseType roles[] = { MUST, FILTER };
+  for (const ClauseType role : roles) {
+    ObDASBooleanQueryCtDef query(allocator_);
+    ObDASBaseCtDef *children[] = { &async, &sync };
+    attach(query, children);
+    if (role == MUST) {
+      query.set_must(0, 2);
+    } else {
+      query.set_must(0, 1);
+      query.set_filter(1, 1);
+    }
+    expect_mode(query, true, role == MUST ? ASYNC_INDEX_EXEC_LEGACY : ASYNC_INDEX_EXEC_GROUP);
+    ObDASBaseCtDef *wrapper = nullptr;
+    ASSERT_EQ(OB_SUCCESS, cg_service_.build_async_fts_domain_wrapper(&query, &deletion, wrapper));
+    expect_wrapper(wrapper, &query, &deletion);
+    EXPECT_EQ(1, count_async_wrappers(wrapper));
+    bool has_async = false;
+    ObDASAsyncIndexExecMode mode = ASYNC_INDEX_EXEC_LEGACY;
+    EXPECT_EQ(OB_ERR_UNEXPECTED,
+              ObHybridSearchCgService::select_async_exec_mode(wrapper, has_async, mode));
+    ObDASBaseCtDef *branch = nullptr;
+    ASSERT_EQ(OB_SUCCESS, cg_service_.build_async_fts_domain_wrapper(&async, &deletion, branch));
+    children[0] = branch;
+    // A local visibility wrapper is invalid anywhere in the unwrapped query.
+    EXPECT_EQ(OB_ERR_UNEXPECTED,
+              ObHybridSearchCgService::select_async_exec_mode(&query, has_async, mode));
+  }
+}
+
+TEST_F(ObDASBooleanQueryCgTest, finalize_fusion_uses_the_ordinary_query_slot)
+{
+  TableItem table(allocator_);
+  table.is_logical_table_ = true;
+  table_scan_.set_logical_table(&table);
+  ObBooleanQueryNode query_node(allocator_);
+  ObScalarQueryNode first_node(allocator_), second_node(allocator_);
+  ASSERT_EQ(OB_SUCCESS, query_node.must_nodes_.push_back(&first_node));
+  ASSERT_EQ(OB_SUCCESS, query_node.must_nodes_.push_back(&second_node));
+  ASSERT_EQ(OB_SUCCESS, query_node.children_.push_back(&first_node));
+  ASSERT_EQ(OB_SUCCESS, query_node.children_.push_back(&second_node));
+  ObVecSearchNode knn_node(allocator_);
+  ObDASVecIndexDriverCtDef knn(allocator_);
+  ObFusionNode fusion_node(allocator_);
+  ASSERT_EQ(OB_SUCCESS, fusion_node.children_.push_back(&knn_node));
+  ASSERT_EQ(OB_SUCCESS, fusion_node.children_.push_back(&query_node));
+  fusion_node.has_vector_subquery_ = true;
+  fusion_node.has_search_subquery_ = true;
+  fusion_node.search_index_ = 1;
+  ObDASFusionCtDef fusion(allocator_);
+  ObDASBooleanQueryCtDef boolean(allocator_);
+  ObDASScalarScanCtDef first(allocator_), second(allocator_);
+  first.ref_table_id_ = 1001;
+  second.ref_table_id_ = 1002;
+  ObDASBaseCtDef *required[] = { &first, &second };
+  attach(boolean, required);
+  boolean.set_must(0, 2);
+  ObDASBaseCtDef *branches[] = { &knn, &boolean };
+  attach(fusion, branches);
+  fusion.set_search_index(1);
+  fusion.has_vector_subquery_ = true;
+  fusion.has_search_subquery_ = true;
+
+  ObDASAsyncIndexExecMode mode = ASYNC_INDEX_EXEC_GROUP;
+  ASSERT_EQ(OB_SUCCESS,
+            cg_service_.finalize_fusion_query_(table_scan_, &fusion, fusion_node, mode));
+  EXPECT_EQ(&knn, fusion.children_[0]);
+  EXPECT_EQ(&boolean, fusion.children_[1]);
+  EXPECT_EQ(ASYNC_INDEX_EXEC_LEGACY, mode);
+
+  first.is_async_index_ = true;
+  second.is_async_index_ = true;
+  // Mode selection precedes the missing deletion definition in this fixture.
   EXPECT_EQ(OB_STATE_NOT_MATCH,
-            cg_service_.normalize_async_fts_boolean_domain(root_ctdef, exec_mode));
-  EXPECT_EQ(&boolean_ctdef, root_ctdef);
-  EXPECT_EQ(&wrapper_ctdef_1, boolean_ctdef.children_[0]);
-  EXPECT_EQ(&wrapper_ctdef_2, boolean_ctdef.children_[1]);
-  EXPECT_EQ(&query_ctdef_1, wrapper_ctdef_1.children_[0]);
-  EXPECT_EQ(&delete_ctdef_1, wrapper_ctdef_1.children_[1]);
-  EXPECT_EQ(&query_ctdef_2, wrapper_ctdef_2.children_[0]);
-  EXPECT_EQ(&delete_ctdef_2, wrapper_ctdef_2.children_[1]);
-  EXPECT_EQ(ASYNC_INDEX_EXEC_GROUP, exec_mode);
+            cg_service_.finalize_fusion_query_(table_scan_, &fusion, fusion_node, mode));
+  EXPECT_EQ(ASYNC_INDEX_EXEC_GROUP, mode);
+  EXPECT_EQ(&knn, fusion.children_[0]);
+  EXPECT_EQ(&boolean, fusion.children_[1]);
+
+  ObFusionNode vector_node(allocator_);
+  vector_node.has_vector_subquery_ = true;
+  ObDASFusionCtDef vector_only(allocator_);
+  vector_only.has_vector_subquery_ = true;
+  ASSERT_EQ(OB_SUCCESS,
+            cg_service_.finalize_fusion_query_(table_scan_, &vector_only, vector_node, mode));
+  EXPECT_EQ(ASYNC_INDEX_EXEC_LEGACY, mode);
 }
 
-TEST_F(ObDASBooleanQueryCgTest,
-       same_index_multi_match_normalizes_to_one_group_domain)
+TEST_F(ObDASBooleanQueryCgTest, score_collectors_keep_the_visibility_wrapper_below_topk)
 {
-  ObDASScalarScanCtDef inv_ctdef_1(allocator_);
-  ObDASScalarScanCtDef inv_ctdef_2(allocator_);
-  ObDASIRScanCtDef ir_ctdef_1(allocator_);
-  ObDASIRScanCtDef ir_ctdef_2(allocator_);
-  ObDASMatchCtDef match_ctdef_1(allocator_);
-  ObDASMatchCtDef match_ctdef_2(allocator_);
-  ObDASScalarScanCtDef delete_ctdef_1(allocator_);
-  ObDASScalarScanCtDef delete_ctdef_2(allocator_);
-  ObDASBooleanQueryCtDef wrapper_ctdef_1(allocator_);
-  ObDASBooleanQueryCtDef wrapper_ctdef_2(allocator_);
-  ObDASBooleanQueryCtDef boolean_ctdef(allocator_);
-  ObDASBaseCtDef *ir_children_1[] = {&inv_ctdef_1};
-  ObDASBaseCtDef *ir_children_2[] = {&inv_ctdef_2};
-  ObDASBaseCtDef *match_children_1[] = {&ir_ctdef_1};
-  ObDASBaseCtDef *match_children_2[] = {&ir_ctdef_2};
-  ObDASBaseCtDef *wrapper_children_1[] = {&match_ctdef_1, &delete_ctdef_1};
-  ObDASBaseCtDef *wrapper_children_2[] = {&match_ctdef_2, &delete_ctdef_2};
-  ObDASBaseCtDef *boolean_children[] = {&wrapper_ctdef_1, &wrapper_ctdef_2};
+  ObDASScalarScanCtDef query(allocator_), deletion(allocator_);
+  query.is_async_index_ = true;
+  query.ref_table_id_ = 1001;
+  deletion.ref_table_id_ = 2001;
+  query.set_is_scoring(true);
+  ObDASBaseCtDef *wrapper = nullptr;
+  ASSERT_EQ(OB_SUCCESS, cg_service_.build_async_fts_domain_wrapper(&query, &deletion, wrapper));
 
-  inv_ctdef_1.ref_table_id_ = 1001;
-  inv_ctdef_2.ref_table_id_ = 1001;
-  ir_ctdef_1.children_ = ir_children_1;
-  ir_ctdef_1.children_cnt_ = ARRAYSIZEOF(ir_children_1);
-  ir_ctdef_1.is_async_index_ = true;
-  ir_ctdef_1.use_scalar_scan_def_ = true;
-  ir_ctdef_2.children_ = ir_children_2;
-  ir_ctdef_2.children_cnt_ = ARRAYSIZEOF(ir_children_2);
-  ir_ctdef_2.is_async_index_ = true;
-  ir_ctdef_2.use_scalar_scan_def_ = true;
-  match_ctdef_1.children_ = match_children_1;
-  match_ctdef_1.children_cnt_ = ARRAYSIZEOF(match_children_1);
-  match_ctdef_1.ir_ctdef_idx_ = 0;
-  match_ctdef_2.children_ = match_children_2;
-  match_ctdef_2.children_cnt_ = ARRAYSIZEOF(match_children_2);
-  match_ctdef_2.ir_ctdef_idx_ = 0;
-  delete_ctdef_1.ref_table_id_ = 2001;
-  delete_ctdef_2.ref_table_id_ = 2001;
-  wrapper_ctdef_1.children_ = wrapper_children_1;
-  wrapper_ctdef_1.children_cnt_ = ARRAYSIZEOF(wrapper_children_1);
-  wrapper_ctdef_1.set_must(0, 1);
-  wrapper_ctdef_1.set_must_not(1, 1);
-  wrapper_ctdef_1.set_is_async(true);
-  wrapper_ctdef_2.children_ = wrapper_children_2;
-  wrapper_ctdef_2.children_cnt_ = ARRAYSIZEOF(wrapper_children_2);
-  wrapper_ctdef_2.set_must(0, 1);
-  wrapper_ctdef_2.set_must_not(1, 1);
-  wrapper_ctdef_2.set_is_async(true);
-  boolean_ctdef.children_ = boolean_children;
-  boolean_ctdef.children_cnt_ = ARRAYSIZEOF(boolean_children);
-  boolean_ctdef.set_must(0, ARRAYSIZEOF(boolean_children));
+  ObExpr score, size, offset;
+  score.obj_meta_.set_type(ObDoubleType);
+  score.datum_meta_.type_ = ObDoubleType;
+  ObDASFusionCtDef fusion(allocator_);
+  fusion.has_search_subquery_ = true;
+  fusion.set_search_index(0);
+  fusion.size_expr_ = &size;
+  fusion.offset_expr_ = &offset;
+  fusion.rank_window_size_expr_ = &size;
+  ASSERT_EQ(OB_SUCCESS, fusion.score_exprs_.init(1));
+  ASSERT_EQ(OB_SUCCESS, fusion.score_exprs_.push_back(&score));
+  ObDASBaseCtDef *branches[] = { wrapper };
+  attach(fusion, branches);
+  ASSERT_EQ(OB_SUCCESS, cg_service_.try_alloc_topk_collect_ctdef(&fusion));
+  ObDASBaseCtDef *topk = fusion.children_[0];
+  ASSERT_EQ(DAS_OP_TOPK_COLLECT, topk->op_type_);
+  EXPECT_EQ(wrapper, topk->children_[0]);
+  expect_wrapper(wrapper, &query, &deletion);
 
-  ObDASBaseCtDef *root_ctdef = &boolean_ctdef;
-  ObDASAsyncIndexExecMode exec_mode = ASYNC_INDEX_EXEC_LEGACY;
-  ASSERT_EQ(OB_SUCCESS,
-            cg_service_.normalize_async_fts_boolean_domain(root_ctdef, exec_mode));
-  ASSERT_EQ(ASYNC_INDEX_EXEC_GROUP, exec_mode);
-  ASSERT_NE(&boolean_ctdef, root_ctdef);
-  ASSERT_EQ(DAS_OP_BOOLEAN_QUERY, root_ctdef->op_type_);
-  ObDASBooleanQueryCtDef *group_wrapper =
-      static_cast<ObDASBooleanQueryCtDef *>(root_ctdef);
-  EXPECT_TRUE(group_wrapper->is_async());
-  ASSERT_EQ(2, group_wrapper->children_cnt_);
-  EXPECT_EQ(&boolean_ctdef, group_wrapper->children_[0]);
-  EXPECT_EQ(&delete_ctdef_1, group_wrapper->children_[1]);
-  EXPECT_EQ(&match_ctdef_1, boolean_ctdef.children_[0]);
-  EXPECT_EQ(&match_ctdef_2, boolean_ctdef.children_[1]);
-  EXPECT_EQ(DAS_OP_MATCH_QUERY, boolean_ctdef.children_[0]->op_type_);
-  EXPECT_EQ(DAS_OP_MATCH_QUERY, boolean_ctdef.children_[1]->op_type_);
+  ObFusionNode node(allocator_);
+  ObColumnRefRawExpr sort_key(1001, 1, T_REF_COLUMN);
+  sort_key.set_rt_expr(&score);
+  ObFusionSortItem order;
+  order.order_item_.expr_ = &sort_key;
+  order.order_item_.order_type_ = NULLS_LAST_DESC;
+  order.is_score_sort_ = true;
+  ASSERT_EQ(OB_SUCCESS, node.sort_items_.push_back(order));
+  ASSERT_EQ(OB_SUCCESS, cg_service_.generate_hybrid_sort_ctdef(table_scan_, node, fusion));
+  ASSERT_NE(nullptr, fusion.get_sort_ctdef());
+  EXPECT_EQ(topk, fusion.get_sort_ctdef()->children_[0]);
 }
 
-TEST_F(ObDASBooleanQueryCgTest,
-       async_match_with_sync_filter_normalizes_to_group_domain)
+TEST_F(ObDASBooleanQueryCgTest, collect_deletion_uses_retained_query_nodes)
 {
-  ObDASScalarScanCtDef inv_ctdef(allocator_);
-  ObDASIRScanCtDef ir_ctdef(allocator_);
-  ObDASMatchCtDef match_ctdef(allocator_);
-  ObDASScalarScanCtDef delete_ctdef(allocator_);
-  ObDASScalarScanCtDef sync_filter_ctdef(allocator_);
-  ObDASBooleanQueryCtDef async_wrapper(allocator_);
-  ObDASBooleanQueryCtDef user_boolean(allocator_);
-  ObDASBaseCtDef *ir_children[] = {&inv_ctdef};
-  ObDASBaseCtDef *match_children[] = {&ir_ctdef};
-  ObDASBaseCtDef *wrapper_children[] = {&match_ctdef, &delete_ctdef};
-  ObDASBaseCtDef *user_children[] = {&async_wrapper, &sync_filter_ctdef};
+  TableItem table(allocator_);
+  table.is_logical_table_ = true;
+  table_scan_.set_logical_table(&table);
+  ObColumnRefRawExpr namespace_id(1001, 1, T_REF_COLUMN);
+  namespace_id.set_column_name(ObString::make_string("namespace_id"));
+  ObColumnRefRawExpr delete_doc_id(2001, 1, T_REF_COLUMN);
+  ObPseudoColumnRawExpr rowscn(allocator_);
+  AccessPath index_path(1001, 1001, 1002, nullptr, NULLS_FIRST_ASC, allocator_);
+  ObScalarQueryNode selected(allocator_), implicit_pk(allocator_), probe(allocator_);
+  selected.ap_ = &index_path;
+  selected.has_valid_index_ = true;
+  selected.is_async_ = true;
+  selected.async_delete_info_.delete_idx_tid_ = 2001;
+  selected.async_delete_info_.delete_doc_id_column_ = &delete_doc_id;
+  selected.async_delete_info_.delete_rowscn_expr_ = &rowscn;
+  // The pruned PK and the physical probe must never supply the deletion definition.
+  implicit_pk.ap_ = &index_path;
+  implicit_pk.has_valid_index_ = true;
+  implicit_pk.is_async_ = true;
+  ASSERT_EQ(OB_SUCCESS, implicit_pk.filter_.push_back(&namespace_id));
+  probe.ap_ = &index_path;
+  probe.is_async_ = true;
+  probe.is_merged_probe_ = true;
+  ObBooleanQueryNode query(allocator_);
+  ASSERT_EQ(OB_SUCCESS, query.must_nodes_.push_back(&selected));
+  ASSERT_EQ(OB_SUCCESS, query.filter_nodes_.push_back(&implicit_pk));
+  query.merged_probe_scalar_node_ = &probe;
+  ASSERT_EQ(OB_SUCCESS, query.children_.push_back(&selected));
+  ASSERT_EQ(OB_SUCCESS, query.children_.push_back(&implicit_pk));
+  ASSERT_EQ(OB_SUCCESS, query.children_.push_back(&probe));
 
-  inv_ctdef.ref_table_id_ = 1001;
-  ir_ctdef.children_ = ir_children;
-  ir_ctdef.children_cnt_ = ARRAYSIZEOF(ir_children);
-  ir_ctdef.is_async_index_ = true;
-  ir_ctdef.use_scalar_scan_def_ = true;
-  match_ctdef.children_ = match_children;
-  match_ctdef.children_cnt_ = ARRAYSIZEOF(match_children);
-  match_ctdef.ir_ctdef_idx_ = 0;
-  delete_ctdef.ref_table_id_ = 2001;
-  sync_filter_ctdef.ref_table_id_ = 3001;
-  sync_filter_ctdef.is_async_index_ = false;
-  async_wrapper.children_ = wrapper_children;
-  async_wrapper.children_cnt_ = ARRAYSIZEOF(wrapper_children);
-  async_wrapper.set_must(0, 1);
-  async_wrapper.set_must_not(1, 1);
-  async_wrapper.set_is_async(true);
-  user_boolean.children_ = user_children;
-  user_boolean.children_cnt_ = ARRAYSIZEOF(user_children);
-  user_boolean.set_must(0, 1);
-  user_boolean.set_filter(1, 1);
-
-  ObDASAsyncIndexDomainAnalysis analysis;
-  ASSERT_EQ(OB_SUCCESS,
-            ObDASAsyncIndexQueryCtx::analyze_async_index_domain(
-                &user_boolean, analysis));
-  EXPECT_EQ(ASYNC_INDEX_DOMAIN_SINGLE, analysis.type_);
-  EXPECT_TRUE(analysis.has_group_compatible_sync_filter_);
-  EXPECT_EQ(ASYNC_INDEX_EXEC_GROUP, analysis.get_exec_mode());
-
-  ObDASBaseCtDef *root_ctdef = &user_boolean;
-  ObDASAsyncIndexExecMode exec_mode = ASYNC_INDEX_EXEC_LEGACY;
-  ASSERT_EQ(OB_SUCCESS,
-            cg_service_.normalize_async_fts_boolean_domain(
-                root_ctdef, exec_mode));
-  EXPECT_EQ(ASYNC_INDEX_EXEC_GROUP, exec_mode);
-  ASSERT_NE(&user_boolean, root_ctdef);
-  ASSERT_EQ(DAS_OP_BOOLEAN_QUERY, root_ctdef->op_type_);
-  ObDASBooleanQueryCtDef *group_wrapper =
-      static_cast<ObDASBooleanQueryCtDef *>(root_ctdef);
-  EXPECT_TRUE(group_wrapper->is_async());
-  ASSERT_EQ(2, group_wrapper->children_cnt_);
-  EXPECT_EQ(&user_boolean, group_wrapper->children_[0]);
-  EXPECT_EQ(&delete_ctdef, group_wrapper->children_[1]);
-  EXPECT_EQ(&match_ctdef, user_boolean.children_[0]);
-  EXPECT_EQ(&sync_filter_ctdef, user_boolean.children_[1]);
+  const ObAsyncIndexDeleteInfo *deletion = nullptr;
+  ASSERT_EQ(OB_SUCCESS, cg_service_.collect_async_delete_info(table_scan_, &query, deletion));
+  EXPECT_EQ(&selected.async_delete_info_, deletion);
 }
 
-TEST_F(ObDASBooleanQueryCgTest,
-       nested_sync_filter_normalizes_to_group_domain)
+TEST_F(ObDASBooleanQueryCgTest, parent_universe_preserves_inner_document_exclusion)
 {
-  ObDASScalarScanCtDef inv_ctdef(allocator_);
-  ObDASIRScanCtDef ir_ctdef(allocator_);
-  ObDASMatchCtDef match_ctdef(allocator_);
-  ObDASScalarScanCtDef delete_ctdef(allocator_);
-  ObDASScalarScanCtDef sync_filter_ctdef(allocator_);
-  ObDASBooleanQueryCtDef async_wrapper(allocator_);
-  ObDASBooleanQueryCtDef nested_filter(allocator_);
-  ObDASBooleanQueryCtDef user_boolean(allocator_);
-  ObDASBaseCtDef *ir_children[] = {&inv_ctdef};
-  ObDASBaseCtDef *match_children[] = {&ir_ctdef};
-  ObDASBaseCtDef *wrapper_children[] = {&match_ctdef, &delete_ctdef};
-  ObDASBaseCtDef *nested_children[] = {&sync_filter_ctdef};
-  ObDASBaseCtDef *user_children[] = {&async_wrapper, &nested_filter};
+  ObDASScalarScanCtDef required(allocator_), element(allocator_);
+  ObDASNestedQueryCtDef nested(allocator_);
+  ObDASBaseCtDef *elements[] = { &element };
+  attach(nested, elements);
+  ObDASBooleanQueryCtDef inner(allocator_), root(allocator_);
+  ObDASBaseCtDef *excluded[] = { &nested };
+  attach(inner, excluded);
+  inner.set_must_not(0, 1);
+  ObDASBaseCtDef *children[] = { &required, &inner };
+  attach(root, children);
+  root.set_must(0, 1);
+  root.set_filter(1, 1);
 
-  inv_ctdef.ref_table_id_ = 1001;
-  ir_ctdef.children_ = ir_children;
-  ir_ctdef.children_cnt_ = ARRAYSIZEOF(ir_children);
-  ir_ctdef.is_async_index_ = true;
-  ir_ctdef.use_scalar_scan_def_ = true;
-  match_ctdef.children_ = match_children;
-  match_ctdef.children_cnt_ = ARRAYSIZEOF(match_children);
-  match_ctdef.ir_ctdef_idx_ = 0;
-  delete_ctdef.ref_table_id_ = 2001;
-  sync_filter_ctdef.ref_table_id_ = 3001;
-  sync_filter_ctdef.is_async_index_ = false;
-  async_wrapper.children_ = wrapper_children;
-  async_wrapper.children_cnt_ = ARRAYSIZEOF(wrapper_children);
-  async_wrapper.set_must(0, 1);
-  async_wrapper.set_must_not(1, 1);
-  async_wrapper.set_is_async(true);
-  nested_filter.children_ = nested_children;
-  nested_filter.children_cnt_ = ARRAYSIZEOF(nested_children);
-  nested_filter.set_filter(0, 1);
-  user_boolean.children_ = user_children;
-  user_boolean.children_cnt_ = ARRAYSIZEOF(user_children);
-  user_boolean.set_must(0, 1);
-  user_boolean.set_filter(1, 1);
+  ObDASScalarScanCtDef deletion(allocator_);
+  ObDASBaseCtDef *wrapper = nullptr;
+  ASSERT_EQ(OB_SUCCESS, cg_service_.build_async_fts_domain_wrapper(&root, &deletion, wrapper));
+  ObDASFusionCtDef fusion(allocator_);
+  ObDASBaseCtDef *branches[] = { wrapper };
+  attach(fusion, branches);
+  fusion.has_search_subquery_ = true;
+  fusion.set_search_index(0);
+  ObDASScanCtDef data_scan(allocator_);
+  ObDASTableLookupCtDef lookup(allocator_);
+  ObDASBaseCtDef *lookup_children[] = { &fusion, &data_scan };
+  attach(lookup, lookup_children);
 
-  ObDASAsyncIndexDomainAnalysis analysis;
   ASSERT_EQ(OB_SUCCESS,
-            ObDASAsyncIndexQueryCtx::analyze_async_index_domain(
-                &user_boolean, analysis));
-  EXPECT_EQ(ASYNC_INDEX_EXEC_GROUP, analysis.get_exec_mode());
-
-  ObDASBaseCtDef *root_ctdef = &user_boolean;
-  ObDASAsyncIndexExecMode exec_mode = ASYNC_INDEX_EXEC_LEGACY;
-  ASSERT_EQ(OB_SUCCESS,
-            cg_service_.normalize_async_fts_boolean_domain(
-                root_ctdef, exec_mode));
-  EXPECT_EQ(ASYNC_INDEX_EXEC_GROUP, exec_mode);
-  ASSERT_NE(&user_boolean, root_ctdef);
-  ASSERT_EQ(DAS_OP_BOOLEAN_QUERY, root_ctdef->op_type_);
-  ObDASBooleanQueryCtDef *group_wrapper =
-      static_cast<ObDASBooleanQueryCtDef *>(root_ctdef);
-  EXPECT_TRUE(group_wrapper->is_async());
-  ASSERT_EQ(2, group_wrapper->children_cnt_);
-  EXPECT_EQ(&user_boolean, group_wrapper->children_[0]);
-  EXPECT_EQ(&delete_ctdef, group_wrapper->children_[1]);
-  EXPECT_EQ(&match_ctdef, user_boolean.children_[0]);
-  EXPECT_EQ(&nested_filter, user_boolean.children_[1]);
+            cg_service_.synthesize_parent_domain_must_not_required(table_scan_, &lookup));
+  expect_wrapper(fusion.get_search_ctdef(), &root, &deletion);
+  EXPECT_EQ(&inner, root.children_[1]);
+  EXPECT_FALSE(inner.has_positive_clause());
+  ASSERT_EQ(1, inner.children_cnt_);
+  ObBooleanSubClause<ObIDASSearchCtDef> must_not;
+  ASSERT_EQ(OB_SUCCESS, inner.must_not(must_not));
+  ASSERT_EQ(1, must_not.count());
+  ObIDASSearchCtDef *term = nullptr;
+  ASSERT_EQ(OB_SUCCESS, must_not.get(0, term));
+  EXPECT_EQ(&nested, term);
 }
 
-TEST_F(ObDASBooleanQueryCgTest,
-       mixed_sync_group_normalization_requires_positive_async_clause)
+TEST_F(ObDASBooleanQueryCgTest, nested_only_not_validation_follows_required_branches)
 {
-  const ClauseType roles[] = {MUST, FILTER, SHOULD, MUST_NOT};
-  for (const ClauseType role : roles) {
-    ObDASScalarScanCtDef inv_ctdef(allocator_);
-    ObDASIRScanCtDef ir_ctdef(allocator_);
-    ObDASMatchCtDef match_ctdef(allocator_);
-    ObDASScalarScanCtDef delete_ctdef(allocator_);
-    ObDASScalarScanCtDef sync_filter_ctdef(allocator_);
-    ObDASBooleanQueryCtDef async_wrapper(allocator_);
-    ObDASBooleanQueryCtDef user_boolean(allocator_);
-    ObDASBaseCtDef *ir_children[] = {&inv_ctdef};
-    ObDASBaseCtDef *match_children[] = {&ir_ctdef};
-    ObDASBaseCtDef *wrapper_children[] = {&match_ctdef, &delete_ctdef};
-    ObDASBaseCtDef *user_children[] = {&async_wrapper, &sync_filter_ctdef};
+  ObDASScalarScanCtDef driver(allocator_), excluded(allocator_);
+  ObDASBooleanQueryCtDef only_not(allocator_), branch(allocator_);
+  ObDASBaseCtDef *excluded_terms[] = { &excluded };
+  attach(only_not, excluded_terms);
+  only_not.set_must_not(0, 1);
+  ObDASBaseCtDef *alternatives[] = { &only_not };
+  attach(branch, alternatives);
+  branch.set_should(0, 1);
 
-    inv_ctdef.ref_table_id_ = 1001;
-    ir_ctdef.children_ = ir_children;
-    ir_ctdef.children_cnt_ = ARRAYSIZEOF(ir_children);
-    ir_ctdef.is_async_index_ = true;
-    ir_ctdef.use_scalar_scan_def_ = true;
-    match_ctdef.children_ = match_children;
-    match_ctdef.children_cnt_ = ARRAYSIZEOF(match_children);
-    match_ctdef.ir_ctdef_idx_ = 0;
-    delete_ctdef.ref_table_id_ = 2001;
-    sync_filter_ctdef.ref_table_id_ = 3001;
-    async_wrapper.children_ = wrapper_children;
-    async_wrapper.children_cnt_ = ARRAYSIZEOF(wrapper_children);
-    async_wrapper.set_must(0, 1);
-    async_wrapper.set_must_not(1, 1);
-    async_wrapper.set_is_async(true);
-    user_boolean.children_ = user_children;
-    user_boolean.children_cnt_ = ARRAYSIZEOF(user_children);
-    user_boolean.set_filter(1, 1);
-    if (MUST == role) {
-      user_boolean.set_must(0, 1);
-    } else if (FILTER == role) {
-      user_boolean.set_filter(0, 2);
+  const ClauseType roles[] = { MUST, FILTER, SHOULD, MUST_NOT };
+  for (int64_t i = 0; i < ARRAYSIZEOF(roles); ++i) {
+    const ClauseType role = roles[i];
+    SCOPED_TRACE(role);
+    ObDASBooleanQueryCtDef inner(allocator_);
+    ObDASBaseCtDef *clauses[] = { &driver, &branch };
+    attach(inner, clauses);
+    inner.set_must(0, MUST == role ? 2 : 1);
+    if (FILTER == role) {
+      inner.set_filter(1, 1);
     } else if (SHOULD == role) {
-      user_boolean.set_should(0, 1);
-      user_boolean.set_min_should_match(0);
-    } else {
-      user_boolean.set_must_not(0, 1);
+      inner.set_should(1, 1);
+    } else if (MUST_NOT == role) {
+      inner.set_must_not(1, 1);
     }
-
-    ObDASBaseCtDef *root_ctdef = &user_boolean;
-    ObDASAsyncIndexExecMode exec_mode = ASYNC_INDEX_EXEC_LEGACY;
-    ASSERT_EQ(OB_SUCCESS,
-              cg_service_.normalize_async_fts_boolean_domain(root_ctdef, exec_mode));
-    if (MUST == role || FILTER == role) {
-      EXPECT_EQ(ASYNC_INDEX_EXEC_GROUP, exec_mode);
-      ASSERT_NE(&user_boolean, root_ctdef);
-      EXPECT_EQ(&match_ctdef, user_boolean.children_[0]);
-      EXPECT_EQ(&sync_filter_ctdef, user_boolean.children_[1]);
-    } else {
-      EXPECT_EQ(ASYNC_INDEX_EXEC_LEGACY, exec_mode);
-      EXPECT_EQ(&user_boolean, root_ctdef);
-      EXPECT_EQ(&async_wrapper, user_boolean.children_[0]);
-      EXPECT_EQ(&sync_filter_ctdef, user_boolean.children_[1]);
-      EXPECT_EQ(&match_ctdef, async_wrapper.children_[0]);
-      EXPECT_EQ(&delete_ctdef, async_wrapper.children_[1]);
-    }
+    ObDASNestedQueryCtDef nested(allocator_);
+    ObDASBaseCtDef *children[] = { &inner };
+    attach(nested, children);
+    const int expected = MUST == role || FILTER == role ? OB_INVALID_ARGUMENT : OB_SUCCESS;
+    EXPECT_EQ(expected,
+              cg_service_.synthesize_child_domain_must_not_required(table_scan_, &nested));
   }
 }
 
-TEST_F(ObDASBooleanQueryCgTest,
-       unowned_sync_filter_discards_nested_async_group_rewrites)
+TEST_F(ObDASBooleanQueryCgTest, multi_match_many_indexes_exercises_tenant_scoped_scratch)
 {
-  const ClauseType roles[] = {MUST, SHOULD, MUST_NOT};
-  for (const ClauseType role : roles) {
-    ObDASScalarScanCtDef inv_ctdef(allocator_);
-    ObDASIRScanCtDef ir_ctdef(allocator_);
-    ObDASMatchCtDef match_ctdef(allocator_);
-    ObDASScalarScanCtDef search_ctdef(allocator_);
-    ObDASScalarScanCtDef delete_ctdef_1(allocator_);
-    ObDASScalarScanCtDef delete_ctdef_2(allocator_);
-    ObDASScalarScanCtDef sync_filter_ctdef(allocator_);
-    ObDASBooleanQueryCtDef match_wrapper(allocator_);
-    ObDASBooleanQueryCtDef search_wrapper(allocator_);
-    ObDASBooleanQueryCtDef inner_boolean(allocator_);
-    ObDASBooleanQueryCtDef outer_boolean(allocator_);
-    ObDASBaseCtDef *ir_children[] = {&inv_ctdef};
-    ObDASBaseCtDef *match_children[] = {&ir_ctdef};
-    ObDASBaseCtDef *match_wrapper_children[] = {&match_ctdef, &delete_ctdef_1};
-    ObDASBaseCtDef *search_wrapper_children[] = {&search_ctdef, &delete_ctdef_2};
-    ObDASBaseCtDef *inner_children[] = {&match_wrapper, &search_wrapper};
-    ObDASBaseCtDef *outer_children[] = {&inner_boolean, &sync_filter_ctdef};
-    inv_ctdef.ref_table_id_ = 1001;
-    ir_ctdef.children_ = ir_children;
-    ir_ctdef.children_cnt_ = ARRAYSIZEOF(ir_children);
-    ir_ctdef.is_async_index_ = true;
-    ir_ctdef.use_scalar_scan_def_ = true;
-    match_ctdef.children_ = match_children;
-    match_ctdef.children_cnt_ = ARRAYSIZEOF(match_children);
-    match_ctdef.ir_ctdef_idx_ = 0;
-    search_ctdef.ref_table_id_ = 1002;
-    search_ctdef.is_async_index_ = true;
-    delete_ctdef_1.ref_table_id_ = 2001;
-    delete_ctdef_2.ref_table_id_ = 2001;
-    sync_filter_ctdef.ref_table_id_ = 3001;
-    match_wrapper.children_ = match_wrapper_children;
-    match_wrapper.children_cnt_ = ARRAYSIZEOF(match_wrapper_children);
-    match_wrapper.set_must(0, 1);
-    match_wrapper.set_must_not(1, 1);
-    match_wrapper.set_is_async(true);
-    search_wrapper.children_ = search_wrapper_children;
-    search_wrapper.children_cnt_ = ARRAYSIZEOF(search_wrapper_children);
-    search_wrapper.set_must(0, 1);
-    search_wrapper.set_must_not(1, 1);
-    search_wrapper.set_is_async(true);
-    inner_boolean.children_ = inner_children;
-    inner_boolean.children_cnt_ = ARRAYSIZEOF(inner_children);
-    inner_boolean.set_must(0, 1);
-    inner_boolean.set_filter(1, 1);
-    outer_boolean.children_ = outer_children;
-    outer_boolean.children_cnt_ = ARRAYSIZEOF(outer_children);
-    outer_boolean.set_filter(1, 1);
-    if (MUST == role) {
-      outer_boolean.set_must(0, 1);
-    } else if (SHOULD == role) {
-      outer_boolean.set_should(0, 1);
-      outer_boolean.set_min_should_match(0);
-    } else {
-      outer_boolean.set_must_not(0, 1);
-    }
+  const uint64_t saved_tenant_id = MTL_ID();
+  share::ObTenantEnv::get_tenant_local()->id_ = OB_SYS_TENANT_ID;
+  DEFER(share::ObTenantEnv::get_tenant_local()->id_ = saved_tenant_id);
 
-    ObDASBaseCtDef *root_ctdef = &outer_boolean;
-    ObDASAsyncIndexExecMode exec_mode = ASYNC_INDEX_EXEC_LEGACY;
-    ASSERT_EQ(OB_SUCCESS,
-              cg_service_.normalize_async_fts_boolean_domain(root_ctdef, exec_mode));
-    if (MUST == role) {
-      // The inner two-index subtree can genuinely coalesce when it is required.
-      EXPECT_EQ(ASYNC_INDEX_EXEC_GROUP, exec_mode);
-      ASSERT_NE(&outer_boolean, root_ctdef);
-      EXPECT_EQ(&match_ctdef, inner_boolean.children_[0]);
-      EXPECT_EQ(&search_ctdef, inner_boolean.children_[1]);
-    } else {
-      // Rejecting the outer coalesce must discard already planned inner actions.
-      EXPECT_EQ(ASYNC_INDEX_EXEC_LEGACY, exec_mode);
-      EXPECT_EQ(&outer_boolean, root_ctdef);
-      EXPECT_EQ(&inner_boolean, outer_boolean.children_[0]);
-      EXPECT_EQ(&sync_filter_ctdef, outer_boolean.children_[1]);
-      EXPECT_EQ(&match_wrapper, inner_boolean.children_[0]);
-      EXPECT_EQ(&search_wrapper, inner_boolean.children_[1]);
-      EXPECT_EQ(&match_ctdef, match_wrapper.children_[0]);
-      EXPECT_EQ(&delete_ctdef_1, match_wrapper.children_[1]);
-      EXPECT_EQ(&search_ctdef, search_wrapper.children_[0]);
-      EXPECT_EQ(&delete_ctdef_2, search_wrapper.children_[1]);
-      EXPECT_FALSE(outer_boolean.is_async());
-      EXPECT_FALSE(inner_boolean.is_async());
-      EXPECT_TRUE(match_wrapper.is_async());
-      EXPECT_TRUE(search_wrapper.is_async());
-    }
+  ObDASMultiMatchCtDef multi(allocator_);
+  constexpr int64_t INDEX_COUNT = 8;
+  ObDASBaseCtDef *fields[INDEX_COUNT];
+  ObDASBaseCtDef *inverted_scans[INDEX_COUNT][1];
+  ASSERT_EQ(OB_SUCCESS, multi.ir_ctdef_indices_.init(INDEX_COUNT));
+  for (int64_t i = 0; i < INDEX_COUNT; ++i) {
+    ObDASScalarScanCtDef *inv = OB_NEWx(ObDASScalarScanCtDef, &allocator_, allocator_);
+    ObDASIRScanCtDef *ir = OB_NEWx(ObDASIRScanCtDef, &allocator_, allocator_);
+    ASSERT_NE(nullptr, inv);
+    ASSERT_NE(nullptr, ir);
+    inv->ref_table_id_ = 2000 + i;
+    ir->is_async_index_ = true;
+    ir->use_scalar_scan_def_ = true;
+    inverted_scans[i][0] = inv;
+    attach(*ir, inverted_scans[i]);
+    fields[i] = ir;
+    ASSERT_EQ(OB_SUCCESS, multi.ir_ctdef_indices_.push_back(i));
   }
-}
-
-TEST_F(ObDASBooleanQueryCgTest,
-       same_async_search_index_multi_branch_keeps_legacy_tree)
-{
-  ObDASScalarScanCtDef scalar_ctdef_1(allocator_);
-  ObDASScalarScanCtDef scalar_ctdef_2(allocator_);
-  ObDASScalarScanCtDef delete_ctdef(allocator_);
-  ObDASBooleanQueryCtDef query_ctdef(allocator_);
-  ObDASBooleanQueryCtDef wrapper_ctdef(allocator_);
-  ObDASBaseCtDef *query_children[] = {&scalar_ctdef_1, &scalar_ctdef_2};
-  ObDASBaseCtDef *wrapper_children[] = {&query_ctdef, &delete_ctdef};
-
-  scalar_ctdef_1.ref_table_id_ = 1001;
-  scalar_ctdef_1.is_async_index_ = true;
-  scalar_ctdef_2.ref_table_id_ = 1001;
-  scalar_ctdef_2.is_async_index_ = true;
-  delete_ctdef.ref_table_id_ = 2001;
-  query_ctdef.children_ = query_children;
-  query_ctdef.children_cnt_ = ARRAYSIZEOF(query_children);
-  query_ctdef.set_must(0, ARRAYSIZEOF(query_children));
-  wrapper_ctdef.children_ = wrapper_children;
-  wrapper_ctdef.children_cnt_ = ARRAYSIZEOF(wrapper_children);
-  wrapper_ctdef.set_must(0, 1);
-  wrapper_ctdef.set_must_not(1, 1);
-  wrapper_ctdef.set_is_async(true);
-
-  ObDASBaseCtDef *root_ctdef = &wrapper_ctdef;
-  ObDASAsyncIndexExecMode exec_mode = ASYNC_INDEX_EXEC_LEGACY;
-  ASSERT_EQ(OB_SUCCESS,
-            cg_service_.normalize_async_fts_boolean_domain(root_ctdef, exec_mode));
-  EXPECT_EQ(ASYNC_INDEX_EXEC_LEGACY, exec_mode);
-  EXPECT_EQ(&wrapper_ctdef, root_ctdef);
-  EXPECT_EQ(&query_ctdef, wrapper_ctdef.children_[0]);
-}
-
-TEST_F(ObDASBooleanQueryCgTest,
-       nested_boolean_async_search_domains_normalize_atomically)
-{
-  ObDASScalarScanCtDef target_ctdef_1(allocator_);
-  ObDASScalarScanCtDef target_ctdef_2(allocator_);
-  ObDASScalarScanCtDef aux_ctdef(allocator_);
-  ObDASScalarScanCtDef delete_ctdef_1(allocator_);
-  ObDASScalarScanCtDef delete_ctdef_2(allocator_);
-  ObDASScalarScanCtDef delete_ctdef_3(allocator_);
-  ObDASBooleanQueryCtDef target_wrapper_1(allocator_);
-  ObDASBooleanQueryCtDef target_wrapper_2(allocator_);
-  ObDASBooleanQueryCtDef aux_wrapper(allocator_);
-  ObDASBooleanQueryCtDef inner_boolean(allocator_);
-  ObDASBooleanQueryCtDef outer_boolean(allocator_);
-  ObDASBaseCtDef *target_wrapper_children_1[] = {
-      &target_ctdef_1, &delete_ctdef_1};
-  ObDASBaseCtDef *target_wrapper_children_2[] = {
-      &target_ctdef_2, &delete_ctdef_2};
-  ObDASBaseCtDef *aux_wrapper_children[] = {&aux_ctdef, &delete_ctdef_3};
-  ObDASBaseCtDef *inner_children[] = {&target_wrapper_1, &target_wrapper_2};
-  ObDASBaseCtDef *outer_children[] = {&inner_boolean, &aux_wrapper};
-
-  target_ctdef_1.ref_table_id_ = 1001;
-  target_ctdef_1.is_async_index_ = true;
-  target_ctdef_2.ref_table_id_ = 1001;
-  target_ctdef_2.is_async_index_ = true;
-  aux_ctdef.ref_table_id_ = 1002;
-  aux_ctdef.is_async_index_ = true;
-  delete_ctdef_1.ref_table_id_ = 2001;
-  delete_ctdef_2.ref_table_id_ = 2001;
-  delete_ctdef_3.ref_table_id_ = 2001;
-
-  target_wrapper_1.children_ = target_wrapper_children_1;
-  target_wrapper_1.children_cnt_ = ARRAYSIZEOF(target_wrapper_children_1);
-  target_wrapper_1.set_must(0, 1);
-  target_wrapper_1.set_must_not(1, 1);
-  target_wrapper_1.set_is_async(true);
-  target_wrapper_2.children_ = target_wrapper_children_2;
-  target_wrapper_2.children_cnt_ = ARRAYSIZEOF(target_wrapper_children_2);
-  target_wrapper_2.set_must(0, 1);
-  target_wrapper_2.set_must_not(1, 1);
-  target_wrapper_2.set_is_async(true);
-  aux_wrapper.children_ = aux_wrapper_children;
-  aux_wrapper.children_cnt_ = ARRAYSIZEOF(aux_wrapper_children);
-  aux_wrapper.set_must(0, 1);
-  aux_wrapper.set_must_not(1, 1);
-  aux_wrapper.set_is_async(true);
-
-  inner_boolean.children_ = inner_children;
-  inner_boolean.children_cnt_ = ARRAYSIZEOF(inner_children);
-  inner_boolean.set_should(0, ARRAYSIZEOF(inner_children));
-  inner_boolean.set_min_should_match(1);
-  outer_boolean.children_ = outer_children;
-  outer_boolean.children_cnt_ = ARRAYSIZEOF(outer_children);
-  outer_boolean.set_must(0, 1);
-  outer_boolean.set_filter(1, 1);
-
-  ObDASBaseCtDef *root_ctdef = &outer_boolean;
-  ObDASAsyncIndexExecMode exec_mode = ASYNC_INDEX_EXEC_LEGACY;
-  ASSERT_EQ(OB_SUCCESS,
-            cg_service_.normalize_async_fts_boolean_domain(root_ctdef, exec_mode));
-  ASSERT_EQ(ASYNC_INDEX_EXEC_GROUP, exec_mode);
-  ASSERT_NE(&outer_boolean, root_ctdef);
-  ASSERT_EQ(DAS_OP_BOOLEAN_QUERY, root_ctdef->op_type_);
-  ObDASBooleanQueryCtDef *group_wrapper =
-      static_cast<ObDASBooleanQueryCtDef *>(root_ctdef);
-  EXPECT_TRUE(group_wrapper->is_async());
-  ASSERT_EQ(2, group_wrapper->children_cnt_);
-  EXPECT_EQ(&outer_boolean, group_wrapper->children_[0]);
-  EXPECT_EQ(&delete_ctdef_1, group_wrapper->children_[1]);
-  EXPECT_EQ(&inner_boolean, outer_boolean.children_[0]);
-  EXPECT_EQ(&aux_ctdef, outer_boolean.children_[1]);
-  EXPECT_EQ(&target_ctdef_1, inner_boolean.children_[0]);
-  EXPECT_EQ(&target_ctdef_2, inner_boolean.children_[1]);
+  attach(multi, fields);
+  // More than the inline capacity of the analysis's per-leaf index array.
+  expect_mode(multi, true, ASYNC_INDEX_EXEC_GROUP);
 }
 
 class TenantPrimaryGetRatioDefaultGuard

@@ -362,6 +362,12 @@ private:
                                         ObHybridSearchNodeBase *node,
                                         ObDASBaseCtDef *&root_ctdef);
 
+  // Select a mode from the complete, unwrapped ordinary query or KNN filter.
+  static int select_async_exec_mode(
+      const ObDASBaseCtDef *query,
+      bool &has_async,
+      ObDASAsyncIndexExecMode &mode);
+
   // Wrap an async fulltext/search-index subtree with a boolean query whose
   // must_not is the shared delete-index scan.
   int wrap_async_index_with_delete(ObLogTableScan &op,
@@ -370,40 +376,18 @@ private:
                                    ObRawExpr *delete_rowscn_expr,
                                    ObDASBaseCtDef *index_ctdef,
                                    ObDASBaseCtDef *&boolean_ctdef);
-  // Coalesce compatible async Boolean domains in post-order. Mixed synchronous
-  // Filters require a positive async MUST/FILTER that owns each Group's output.
-  int normalize_async_fts_boolean_domain(
-      ObDASBaseCtDef *&root_ctdef,
-      ObDASAsyncIndexExecMode &exec_mode);
-  // Normalize each KNN filter as an independent async domain. The vector scan and the
-  // ordinary query/boolean domains remain outside this traversal boundary.
-  int normalize_async_knn_filter_domains_(ObDASBaseCtDef *root_ctdef);
-  struct AsyncFtsDomainRewriteAction
-  {
-    AsyncFtsDomainRewriteAction()
-      : target_(nullptr), replacement_(nullptr)
-    {}
-    AsyncFtsDomainRewriteAction(
-        ObDASBaseCtDef **target,
-        ObDASBaseCtDef *replacement)
-      : target_(target), replacement_(replacement)
-    {}
-    TO_STRING_KV(KP_(target), KP_(replacement));
-    ObDASBaseCtDef **target_;
-    ObDASBaseCtDef *replacement_;
-  };
-  int normalize_async_fts_boolean_domain_impl(
-      ObDASBaseCtDef *&root_ctdef,
-      bool &has_domain_rewrite);
-  int plan_async_fts_boolean_domain_(
-      ObDASBaseCtDef *root_ctdef,
-      common::ObIArray<AsyncFtsDomainRewriteAction> &rewrite_actions,
-      bool &has_unowned_sync_filter,
-      ObDASBaseCtDef *&normalized_ctdef);
-  int get_async_fts_wrapper_children_(
-      ObDASBaseCtDef *wrapper_ctdef,
-      ObDASBaseCtDef *&query_ctdef,
-      ObDASScalarScanCtDef *&delete_scan_ctdef) const;
+  // Finalize the ordinary search child before adding TopK, Sort or Lookup.
+  int finalize_fusion_query_(
+      ObLogTableScan &op,
+      ObDASBaseCtDef *search,
+      const ObHybridSearchNodeBase &root,
+      ObDASAsyncIndexExecMode &mode);
+  // Select the mode for the complete query and attach its shared deletion scan if needed.
+  int finalize_query_root_(
+      ObLogTableScan &op,
+      const ObHybridSearchNodeBase *query_node,
+      ObDASBaseCtDef *&query,
+      ObDASAsyncIndexExecMode &mode);
   int build_async_fts_domain_wrapper(ObDASBaseCtDef *query_ctdef,
                                      ObDASScalarScanCtDef *delete_scan_ctdef,
                                      ObDASBaseCtDef *&wrapper_ctdef);
@@ -429,11 +413,8 @@ private:
   // ctdef under `root_ctdef`. Called once per nested-query ctdef so its inner subtree's
   // leaves know to route through ObDASSortOp instead of ObDASBitmapOp at generate_op().
   int mark_subtree_nested_scope(ObDASBaseCtDef *root_ctdef);
-  // Collect the shared async index delete table from a logical subtree and
-  // verify that every async leaf resolves to the same table and column. Nested
-  // query generation applies it after the outermost nested boundary has
-  // collapsed composite rowids back to BASE scope.
   int collect_async_delete_info(
+      const ObLogTableScan &op,
       const ObHybridSearchNodeBase *node,
       const ObAsyncIndexDeleteInfo *&async_delete_info);
 
