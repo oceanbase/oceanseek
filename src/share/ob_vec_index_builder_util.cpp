@@ -45,6 +45,61 @@ const char * ObVecIndexBuilderUtil::IVF_PQ_CENTER_IDS_COL_TYPE_NAME = "ARRAY(VAR
 // spiv
 const char * ObVecIndexBuilderUtil::SPIV_DIM_DOCID_VALUE_TABLE_NAME_SUFFIX = "";
 
+static int get_existing_async_ivf_columns(
+    const ObCreateIndexArg &index_arg,
+    ObTableSchema &data_schema,
+    ObColumnSchemaV2 *&type_column,
+    ObColumnSchemaV2 *&cid_column,
+    ObColumnSchemaV2 *&data_column)
+{
+  int ret = OB_SUCCESS;
+  type_column = nullptr;
+  cid_column = nullptr;
+  data_column = nullptr;
+  const ObColumnSchemaV2 *source_column = nullptr;
+  if (OB_UNLIKELY(1 != index_arg.index_columns_.count())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid async IVF source column count", K(ret), K(index_arg));
+  } else if (OB_ISNULL(source_column = data_schema.get_column_schema(
+                 index_arg.index_columns_.at(0).column_name_))) {
+    ret = OB_SCHEMA_ERROR;
+    LOG_WARN("async IVF source column not found", K(ret), K(index_arg));
+  } else {
+    for (ObTableSchema::const_column_iterator it = data_schema.column_begin();
+         OB_SUCC(ret) && it != data_schema.column_end(); ++it) {
+      ObColumnSchemaV2 *column = *it;
+      ObColumnSchemaV2 **existing_column = nullptr;
+      ObSEArray<uint64_t, 1> source_ids;
+      if (OB_ISNULL(column)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("null async IVF base column", K(ret));
+      } else if (column->is_vec_ivf_type_column()) {
+        existing_column = &type_column;
+      } else if (column->is_vec_ivf_cid_column()) {
+        existing_column = &cid_column;
+      } else if (column->is_vec_ivf_data_column()) {
+        existing_column = &data_column;
+      }
+      if (OB_SUCC(ret) && OB_NOT_NULL(existing_column) && OB_ISNULL(*existing_column)) {
+        if (!column->is_virtual_generated_column()) {
+          ret = OB_SCHEMA_ERROR;
+          LOG_WARN("invalid async IVF generated column", K(ret), KPC(column));
+        } else if (OB_FAIL(column->get_cascaded_column_ids(source_ids))) {
+          LOG_WARN("failed to get async IVF column dependency", K(ret), KPC(column));
+        } else if (1 == source_ids.count() && source_ids.at(0) == source_column->get_column_id()) {
+          *existing_column = column;
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret) && (nullptr != type_column || nullptr != cid_column || nullptr != data_column)
+      && (nullptr == type_column || nullptr == cid_column || nullptr == data_column)) {
+    ret = OB_SCHEMA_ERROR;
+    LOG_WARN("incomplete async IVF generated columns", K(ret), KP(type_column), KP(cid_column), KP(data_column));
+  }
+  return ret;
+}
+
 int ObVecIndexBuilderUtil::adjust_async_ivf_args(
     ObCreateIndexArg &index_arg,
     ObTableSchema &data_schema,
@@ -65,7 +120,7 @@ int ObVecIndexBuilderUtil::adjust_async_ivf_args(
     VEC_IVF_CID_COL,
     VEC_IVF_DATA_COL
   };
-  ObColumnSchemaV2 *generated_columns[VEC_IVF_GENERATED_COLUMN_COUNT] = {nullptr};
+  ObColumnSchemaV2 *index_columns[VEC_IVF_GENERATED_COLUMN_COUNT] = {nullptr};
   if (OB_UNLIKELY(!is_async_ivf_index(index_arg.index_type_)
                   || 1 != index_arg.index_columns_.count())) {
     ret = OB_INVALID_ARGUMENT;
@@ -77,13 +132,17 @@ int ObVecIndexBuilderUtil::adjust_async_ivf_args(
       data_schema.get_column_schema(OB_HIDDEN_PK_INCREMENT_COLUMN_ID))) {
     ret = OB_SCHEMA_ERROR;
     LOG_WARN("async IVF heap hidden pk column not found", K(ret), K(data_schema));
-  } else {
+  } else if (OB_FAIL(get_existing_async_ivf_columns(index_arg, data_schema,
+                 index_columns[VEC_IVF_TYPE_COLUMN], index_columns[VEC_IVF_CID_COLUMN],
+                 index_columns[VEC_IVF_DATA_COLUMN]))) {
+    LOG_WARN("failed to get existing async IVF columns", K(ret));
+  } else if (OB_ISNULL(index_columns[VEC_IVF_TYPE_COLUMN])) {
     for (int64_t role = 0; OB_SUCC(ret) && role < VEC_IVF_GENERATED_COLUMN_COUNT; ++role) {
       const uint64_t column_id = data_schema.get_max_used_column_id() + 1;
       if (OB_FAIL(generate_vec_ivf_column(&index_arg, column_id, column_types[role],
-                                         data_schema, generated_columns[role]))) {
+                                         data_schema, index_columns[role]))) {
         LOG_WARN("failed to generate async IVF column", K(ret), K(role), K(column_id));
-      } else if (OB_FAIL(gen_columns.push_back(generated_columns[role]))) {
+      } else if (OB_FAIL(gen_columns.push_back(index_columns[role]))) {
         LOG_WARN("failed to append async IVF generated column", K(ret), K(role));
       }
     }
@@ -92,8 +151,8 @@ int ObVecIndexBuilderUtil::adjust_async_ivf_args(
     index_arg.index_columns_.reuse();
     index_arg.store_columns_.reuse();
     const ObColumnSchemaV2 *rowkey_columns[] = {
-      generated_columns[VEC_IVF_TYPE_COLUMN],
-      generated_columns[VEC_IVF_CID_COLUMN],
+      index_columns[VEC_IVF_TYPE_COLUMN],
+      index_columns[VEC_IVF_CID_COLUMN],
       rowkey_column
     };
     for (int64_t i = 0; OB_SUCC(ret) && i < ARRAYSIZEOF(rowkey_columns); ++i) {
@@ -111,7 +170,7 @@ int ObVecIndexBuilderUtil::adjust_async_ivf_args(
     ObString data_column_name;
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(ob_write_string(allocator,
-               generated_columns[VEC_IVF_DATA_COLUMN]->get_column_name_str(),
+               index_columns[VEC_IVF_DATA_COLUMN]->get_column_name_str(),
                data_column_name))) {
       LOG_WARN("failed to copy async IVF data column name", K(ret));
     } else if (OB_FAIL(index_arg.store_columns_.push_back(data_column_name))) {
@@ -6503,7 +6562,7 @@ int ObVecIndexBuilderUtil::generate_vec_index_aux_columns(
             LOG_WARN("failed to insert vec column", K(ret), KP(*it));
           }
         }
-        if (OB_SUCC(ret) && new_index_schema.is_async_ivf_index()) {
+        if (OB_SUCC(ret) && new_index_schema.is_async_ivf_index() && !gen_columns.empty()) {
           // Publish the augmented base schema before the rebuilt IVF schema.
           // A column-only update leaves the hidden table version stale.
           if (OB_FAIL(tmp_table_schema.assign(new_table_schema))) {
