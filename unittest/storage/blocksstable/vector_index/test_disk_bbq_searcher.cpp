@@ -12749,7 +12749,8 @@ TEST_F(TestIVFSSTableWriter, async_ivf_plain_post_refills_live_unique_vids)
     ASSERT_EQ(test.expected_count_, result->get_total());
     for (int64_t i = 0; i < count; ++i) {
       EXPECT_EQ(vids[i + 1], result->get_vids()[i]);
-      EXPECT_NEAR(vectors[i + 1][0], result->get_distance()[i], 1e-4F);
+      const float expected_squared_distance = vectors[i + 1][0] * vectors[i + 1][0];
+      EXPECT_NEAR(expected_squared_distance, result->get_distance()[i], 1e-4F);
     }
     if (test.path_ == VEC_INDEX_POST_WITHOUT_FILTER && test.limit_ == 1) {
       EXPECT_TRUE(iter.root_.has_more()); // Neither K nor the score threshold drains later CIDs.

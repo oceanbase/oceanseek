@@ -357,10 +357,8 @@ int ObDASVecIndexAsyncIVFScanIter::publish(const ObIArray<ObDASVectorCandidate> 
               ret = OB_ERR_UNEXPECTED;
               LOG_WARN("negative async IVF squared L2 distance", K(ret), K(entry));
             } else {
-              distance = std::sqrt(std::max(0.0, distance));
+              distance = std::max(0.0, distance);
             }
-          } else if (share::VIDA_IP == query_.expected_dist_type_) {
-            distance -= 1;
           }
           if (OB_SUCC(ret) && ctdef_->query_param_.is_set_similarity_threshold_
               && ctdef_->query_param_.similarity_threshold_ > 0) {
