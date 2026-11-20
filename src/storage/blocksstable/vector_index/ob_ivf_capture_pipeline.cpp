@@ -154,10 +154,8 @@ int ObIVFCaptureOperator::init(
                                               slice_idx))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("failed to allocate IVF slice input", K(ret), K(slice_idx));
-  } else if (OB_FAIL(slice_input_->replay_.init(MTL_ID(),
-                 vector_dim_, replay_memory_limit,
-                 max_sample_count, sample_seed, slice_idx,
-                 !is_async_index_refresh /* capture_vids */))) {
+  } else if (OB_FAIL(slice_input_->replay_.init(
+                 MTL_ID(), vector_dim_, replay_memory_limit, max_sample_count, sample_seed, slice_idx))) {
     LOG_WARN("failed to initialize IVF replay input", K(ret), K(slice_idx));
   } else if (OB_FAIL(tablet_context.ivf_ctx_->register_slice(slice_input_))) {
     LOG_WARN("failed to register IVF replay input", K(ret), K(slice_idx));

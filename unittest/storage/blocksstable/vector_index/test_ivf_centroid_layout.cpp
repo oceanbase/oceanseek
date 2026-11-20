@@ -128,14 +128,16 @@ TEST(TestIvfCentroidLayout, stored_identity_is_independent_of_group_membership)
 TEST(TestIvfCentroidLayout, grouping_preserves_leaf_order_and_soar_replica_identity)
 {
   ObArenaAllocator arena;
-  ObArray<float> leaves;
+  share::ObVectorMatrix leaves;
   const int64_t k = 96, dim = 3;
+  ASSERT_EQ(OB_SUCCESS, leaves.set_dimension(dim));
   for (int64_t j = 0; j < k; ++j) {
     ASSERT_EQ(OB_SUCCESS, leaves.push_back(static_cast<float>(j)));
     ASSERT_EQ(OB_SUCCESS, leaves.push_back(static_cast<float>(j % 7)));
     ASSERT_EQ(OB_SUCCESS, leaves.push_back(static_cast<float>(j % 11)));
   }
-  const std::vector<float> before(leaves.begin(), leaves.end());
+  std::vector<float> before(leaves.count());
+  leaves.copy_to(0, leaves.count(), before.data());
   share::ObHcaTrainParam train;
   share::ObHcaSoarParam soar;
   ObIvfCentroidLayout layout(arena);
@@ -147,7 +149,9 @@ TEST(TestIvfCentroidLayout, grouping_preserves_leaf_order_and_soar_replica_ident
   ASSERT_TRUE(layout.is_ready());
   ASSERT_TRUE(layout.is_hierarchical());
   ASSERT_GT(layout.parent_count(), 1);
-  EXPECT_EQ(0, MEMCMP(before.data(), leaves.get_data(), before.size() * sizeof(float)));
+  for (int64_t j = 0; j < k; ++j) {
+    EXPECT_EQ(0, MEMCMP(before.data() + j * dim, leaves.data_at(j * dim, dim), dim * sizeof(float)));
+  }
   std::vector<int64_t> occurrences(k, 0);
   int64_t rows = 0, replicas = 0;
   for (int64_t p = 0; p < layout.parent_count(); ++p) {
@@ -179,7 +183,8 @@ TEST(TestIvfCentroidLayout, production_threshold_and_degenerate_groups)
   EXPECT_EQ(300000, IVF_CENTROID_HIERARCHY_THRESHOLD);
   EXPECT_EQ(384, IVF_PARENT_CLUSTER_SIZE);
   ObArenaAllocator arena;
-  ObArray<float> leaves;
+  share::ObVectorMatrix leaves;
+  ASSERT_EQ(OB_SUCCESS, leaves.set_dimension(1));
   for (int64_t j = 0; j < 12; ++j) { ASSERT_EQ(OB_SUCCESS, leaves.push_back(1.0F)); }
   ObIvfCentroidLayout layout(arena);
   share::ObHcaTrainParam train;
@@ -193,11 +198,12 @@ TEST(TestIvfCentroidLayout, production_threshold_and_degenerate_groups)
   EXPECT_FALSE(layout.is_ready());
 }
 
-TEST(TestIvfCentroidLayout, borrowed_contiguous_buffer_preserves_layout_and_input)
+TEST(TestIvfCentroidLayout, borrowed_matrix_preserves_layout_and_input)
 {
   const int64_t k = 96, dim = 3;
   std::vector<float> buffer(k * dim);
-  ObArray<float> reference;
+  share::ObVectorMatrix reference;
+  ASSERT_EQ(OB_SUCCESS, reference.set_dimension(dim));
   for (int64_t j = 0; j < k; ++j) {
     const float vector[] = {static_cast<float>(j), static_cast<float>(j % 7), static_cast<float>(j % 11)};
     for (int64_t d = 0; d < dim; ++d) {
@@ -211,10 +217,20 @@ TEST(TestIvfCentroidLayout, borrowed_contiguous_buffer_preserves_layout_and_inpu
   share::ObHcaSoarParam soar;
   ASSERT_EQ(OB_SUCCESS, expected.build(reference, dim, train, soar, nullptr, k, 8));
   {
-    // The wrapper owns no vector memory and may disappear immediately after build.
-    const ObArrayWrap<float> borrowed(buffer.data(), buffer.size());
-    ASSERT_EQ(buffer.data(), borrowed.get_data());
+    // build borrows the caller's matrix only until the call returns.
+    share::ObVectorMatrix borrowed;
+    ASSERT_EQ(OB_SUCCESS, borrowed.set_dimension(dim));
+    ASSERT_EQ(OB_SUCCESS, borrowed.resize(k * dim));
+    borrowed.copy_from(0, buffer.data(), buffer.size());
+    const float *first_row = borrowed.data_at(0, dim);
     ASSERT_EQ(OB_SUCCESS, actual.build(borrowed, dim, train, soar, nullptr, k, 8));
+    EXPECT_EQ(first_row, borrowed.data_at(0, dim));
+    for (int64_t j = 0; j < k; ++j) {
+      EXPECT_EQ(0, MEMCMP(buffer.data() + j * dim, borrowed.data_at(j * dim, dim), dim * sizeof(float)));
+    }
+    const float parent_value = actual.parent_vector(0)[0];
+    borrowed.at(0) = -1000.0F;
+    EXPECT_FLOAT_EQ(parent_value, actual.parent_vector(0)[0]);
   }
   ASSERT_EQ(expected.parent_count(), actual.parent_count());
   ASSERT_EQ(expected.center_row_count(), actual.center_row_count());
@@ -230,11 +246,11 @@ TEST(TestIvfCentroidLayout, borrowed_contiguous_buffer_preserves_layout_and_inpu
       EXPECT_EQ(expected.member(expected.group_begin(p) + offset), actual.member(actual.group_begin(p) + offset));
     }
   }
-  EXPECT_EQ(0, MEMCMP(reference.get_data(), buffer.data(), buffer.size() * sizeof(float)));
-  const float parent_value = actual.parent_vector(0)[0];
-  buffer[0] = -1000.0F;
-  EXPECT_FLOAT_EQ(parent_value, actual.parent_vector(0)[0]);
-  ObArrayWrap<float> missing(nullptr, k * dim);
+  for (int64_t j = 0; j < k; ++j) {
+    EXPECT_EQ(0, MEMCMP(reference.data_at(j * dim, dim), buffer.data() + j * dim, dim * sizeof(float)));
+  }
+  // An empty matrix represents missing input; a null nonempty buffer is not representable.
+  share::ObVectorMatrix missing;
   EXPECT_EQ(OB_INVALID_ARGUMENT, actual.build(missing, dim, train, soar, nullptr, k, 8));
   EXPECT_FALSE(actual.is_ready());
 }

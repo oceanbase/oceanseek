@@ -37,16 +37,15 @@ class HcaVectorCache
 public:
   HcaVectorCache(
       ObIVFVectorReader &reader,
-      const common::ObIArray<ObIVFVectorVID> &vids)
+      const ObIVFVectorIDView &vids)
     : reader_(reader), vids_(vids), dimension_(reader.get_dimension()),
       prefetched_begin_(-1), prefetched_end_(-1),
       allocator_(ObMemAttr(MTL_ID(), "IVFHcaVecCache", ObCtxIds::VECTOR_CTX_ID)),
-      prefetched_(OB_MALLOC_NORMAL_BLOCK_SIZE, ObWrapperAllocator(allocator_)),
-      batch_buffer_(OB_MALLOC_NORMAL_BLOCK_SIZE, ObWrapperAllocator(allocator_)),
-      cache_(), cache_initialized_(false), vector_reads_(0), batch_reads_(0), single_reads_(0), loaded_vectors_(0),
+        prefetched_(share::vector_array_allocator(allocator_)),
+      batch_buffer_(share::vector_array_allocator(allocator_)),
+      cache_(share::vector_array_allocator(allocator_)), cache_initialized_(false), vector_reads_(0), batch_reads_(0), single_reads_(0), loaded_vectors_(0),
       batch_read_us_(0)
   {
-    cache_.set_block_allocator(ObWrapperAllocator(allocator_));
   }
 
   int64_t count() const { return vids_.count(); }
@@ -95,7 +94,7 @@ public:
     return ret;
   }
 
-  int prefetch_indices(const int64_t *indices, const int64_t count)
+  int prefetch_indices(const share::ObVectorArray<int64_t> &indices, const int64_t count)
   {
     int ret = OB_SUCCESS;
     const int64_t max_batch = 4096;
@@ -103,9 +102,9 @@ public:
     batch_vids.set_attr(ObMemAttr(MTL_ID(), "IVFHcaVecCache", ObCtxIds::VECTOR_CTX_ID));
     ObSEArray<int64_t, 64> positions;
     positions.set_attr(ObMemAttr(MTL_ID(), "IVFHcaVecCache", ObCtxIds::VECTOR_CTX_ID));
-    if (count < 0 || (count > 0 && nullptr == indices) || dimension_ <= 0) {
+    if (count < 0 || count > indices.count() || dimension_ <= 0) {
       ret = OB_INVALID_ARGUMENT;
-      LOG_WARN("invalid IVF refine prefetch arguments", K(ret), KP(indices), K(count), K_(dimension));
+      LOG_WARN("invalid IVF refine prefetch arguments", K(ret), "index_count", indices.count(), K(count), K_(dimension));
     } else if (count > 0 && OB_FAIL(init_cache_())) {
       LOG_WARN("failed to initialize IVF refine vector cache", K(ret));
     }
@@ -114,8 +113,8 @@ public:
       positions.reuse();
       int64_t end = begin;
       for (; OB_SUCC(ret) && end < count && positions.count() < max_batch; ++end) {
-        const int64_t pos = indices[end];
-        if (pos < 0 || pos >= vids_.count() || (end > 0 && pos < indices[end - 1])) {
+        const int64_t pos = indices.at(end);
+        if (pos < 0 || pos >= vids_.count() || (end > 0 && pos < indices.at(end - 1))) {
           ret = OB_INVALID_ARGUMENT;
           LOG_WARN("invalid sorted IVF refine prefetch index", K(ret), K(pos), K(end));
         } else if ((pos >= prefetched_begin_ && pos < prefetched_end_)
@@ -148,7 +147,7 @@ public:
             LOG_WARN("failed to allocate IVF vector buffer", K(ret), K(bytes), K(positions.count()),
                 K(dimension_));
           } else {
-            MEMCPY(owned, batch_buffer_.get_data(), bytes);
+            batch_buffer_.copy_to(0, bytes / sizeof(float), owned);
             for (int64_t i = 0; i < positions.count(); ++i) {
               cache_.at(positions.at(i)) = owned + i * dimension_;
             }
@@ -182,8 +181,7 @@ public:
           "vid_count", vids_.count(), K_(dimension));
     } else if (source_pos >= prefetched_begin_
         && source_pos < prefetched_end_) {
-      vector = &prefetched_.at(0)
-          + (source_pos - prefetched_begin_) * dimension_;
+      vector = prefetched_.data_at((source_pos - prefetched_begin_) * dimension_, dimension_);
     } else {
       if (OB_FAIL(init_cache_())) {
         LOG_WARN("failed to initialize IVF HCA vector cache", K(ret),
@@ -191,8 +189,8 @@ public:
       } else if (OB_NOT_NULL(cache_.at(source_pos))) {
         vector = cache_.at(source_pos);
       } else {
-        ObSEArray<float, 16> values;
-        values.set_attr(ObMemAttr(MTL_ID(), "IVFHcaVecCache", ObCtxIds::VECTOR_CTX_ID));
+
+        share::ObVectorMatrix values(ObMemAttr(MTL_ID(), "IVFHcaVecCache", ObCtxIds::VECTOR_CTX_ID));
         float *owned = static_cast<float *>(allocator_.alloc_align(
             dimension_ * sizeof(float), alignof(float)));
         if (OB_ISNULL(owned)) {
@@ -228,7 +226,7 @@ private:
   {
     int ret = OB_SUCCESS;
     if (!cache_initialized_) {
-      if (OB_FAIL(cache_.prepare_allocate(vids_.count()))) {
+      if (OB_FAIL(share::vector_array_resize(cache_, vids_.count()))) {
         LOG_WARN("failed to allocate IVF HCA vector-cache index", K(ret),
             "vid_count", vids_.count());
       } else {
@@ -242,14 +240,14 @@ private:
   }
 
   ObIVFVectorReader &reader_;
-  const common::ObIArray<ObIVFVectorVID> &vids_;
+  ObIVFVectorIDView vids_;
   int64_t dimension_;
   int64_t prefetched_begin_;
   int64_t prefetched_end_;
   mutable ObArenaAllocator allocator_;
-  ObSEArray<float, 16, ObWrapperAllocator> prefetched_;
-  ObSEArray<float, 16, ObWrapperAllocator> batch_buffer_;
-  mutable ObArray<float *, ObWrapperAllocator> cache_;
+  share::ObVectorMatrix prefetched_;
+  share::ObVectorMatrix batch_buffer_;
+  mutable share::ObVectorArray<float *> cache_;
   mutable bool cache_initialized_;
   mutable uint64_t vector_reads_;
   mutable int64_t batch_reads_;
@@ -262,8 +260,9 @@ class HcaCapturedSampleBatch final : public share::ObHcaVectorBatch
 {
 public:
   explicit HcaCapturedSampleBatch(ObIAllocator &allocator)
-    : dimension_(0), vector_reads_(0), values_()
-  { values_.set_block_allocator(ObWrapperAllocator(allocator)); }
+      : dimension_(0), vector_reads_(0), values_(share::vector_array_allocator(allocator))
+  {
+  }
 
   int init(const ObIVFFirstLevelSampleSet &samples, const int64_t vector_count,
       const int64_t dimension, const int64_t sample_limit, const uint64_t seed,
@@ -285,13 +284,18 @@ public:
       LOG_WARN("IVF merge operation failed", K(ret), "operation", "ordinals.prepare_allocate");
     } else if (OB_FAIL(share::hca_sample_ordinals(available, count, seed, &ordinals.at(0)))) {
       LOG_WARN("IVF merge operation failed", K(ret), "operation", "share::hca_sample_ordinals");
+    } else if (OB_FAIL(values_.set_dimension(dimension))) {
     } else if (OB_FAIL(values_.reserve(count * dimension))) {
       LOG_WARN("IVF merge operation failed", K(ret), "operation", "values_.reserve");
     } else {
       dimension_ = dimension;
       ObArray<ObIVFVectorVID, ObWrapperAllocator> vids;
-      ObSEArray<float, 16, ObWrapperAllocator> chunk(OB_MALLOC_NORMAL_BLOCK_SIZE, ObWrapperAllocator(allocator));
       vids.set_block_allocator(ObWrapperAllocator(allocator));
+      share::ObVectorMatrix chunk(share::vector_array_allocator(allocator));
+      if (OB_FAIL(chunk.set_dimension(dimension))) {
+        return ret;
+      }
+
       for (int64_t i = 0; OB_SUCC(ret) && i < count;) {
         const int64_t begin = ordinals.at(i);
         const int64_t end = begin + MIN(int64_t(256), available - begin);
@@ -347,13 +351,13 @@ public:
     else if (++vector_reads_ % 4096 == 0 && OB_FAIL(share::dag_yield())) {
       LOG_WARN("IVF merge operation failed", K(ret), "operation", "share::dag_yield");
     }
-    else { vector_idx = pos; vector = &values_.at(pos * dimension_); }
+    else { vector_idx = pos; vector = values_.data_at(pos * dimension_, dimension_); }
     return ret;
   }
 private:
   int64_t dimension_;
   mutable int64_t vector_reads_;
-  ObArray<float, ObWrapperAllocator> values_;
+  share::ObVectorMatrix values_;
 };
 
 class HcaVectorAccessor final : public share::ObHcaVectorAccessor
@@ -368,7 +372,7 @@ public:
   {
     return cache_.get_vector(vector_idx, vector);
   }
-  virtual int prefetch_vectors(const int64_t *indices, const int64_t count) const override
+  virtual int prefetch_vectors(const share::ObVectorArray<int64_t> &indices, const int64_t count) const override
   {
     return cache_.prefetch_indices(indices, count);
   }
@@ -384,7 +388,7 @@ class HcaStreamingStatsAccessor final : public share::ObHcaVectorAccessor
 public:
   HcaStreamingStatsAccessor(
       ObIVFVectorReader &reader,
-      const common::ObIArray<ObIVFVectorVID> &vids)
+      const ObIVFVectorIDView &vids)
     : cache_(reader, vids), prefetched_begin_(-1), prefetched_end_(-1)
   {}
   virtual int64_t count() const override { return cache_.count(); }
@@ -484,7 +488,7 @@ private:
 class HcaLoadedBatch final : public share::ObHcaVectorBatch
 {
 public:
-  HcaLoadedBatch(const ObIArray<float> &values, const ObIArray<int64_t> &positions,
+  HcaLoadedBatch(const share::ObVectorMatrix &values, const ObIArray<int64_t> &positions,
       int64_t begin, int64_t end, int64_t dimension)
     : values_(values), positions_(positions), begin_(begin), end_(end), dimension_(dimension) {}
   int64_t count() const override { return end_ - begin_; }
@@ -501,13 +505,13 @@ public:
       if (idx < 0 || idx >= values_.count() / dimension_) {
         ret = OB_INVALID_ARGUMENT;
       } else {
-        vector = &values_.at(idx * dimension_);
+        vector = values_.data_at(idx * dimension_, dimension_);
       }
     }
     return ret;
   }
 private:
-  const ObIArray<float> &values_;
+  const share::ObVectorMatrix &values_;
   const ObIArray<int64_t> &positions_;
   int64_t begin_;
   int64_t end_;
@@ -517,14 +521,14 @@ private:
 class HcaBorrowedCenters final : public share::ObHcaCenterStore
 {
 public:
-  HcaBorrowedCenters(const ObIArray<float> &values, int64_t dimension)
+  HcaBorrowedCenters(const share::ObVectorMatrix &values, int64_t dimension)
     : values_(values), dimension_(dimension) {}
   int64_t count() const override { return values_.count() / dimension_; }
   int64_t capacity() const override { return count(); }
   int64_t dimension() const override { return dimension_; }
   int get_center(int64_t cid, const float *&center) const override
   {
-    center = cid >= 0 && cid < count() ? &values_.at(cid * dimension_) : nullptr;
+    center = cid >= 0 && cid < count() ? values_.data_at(cid * dimension_, dimension_) : nullptr;
     return center != nullptr ? OB_SUCCESS : OB_INVALID_ARGUMENT;
   }
   int get_mutable_center(int64_t cid, float *&center) override
@@ -532,7 +536,7 @@ public:
   int set_center(int64_t cid, const float *center) override
   { UNUSEDx(cid, center); return OB_NOT_SUPPORTED; }
 private:
-  const ObIArray<float> &values_;
+  const share::ObVectorMatrix &values_;
   int64_t dimension_;
 };
 
@@ -576,15 +580,15 @@ public:
   HcaCenterBuffer(const int64_t capacity, const int64_t dimension)
     : capacity_(capacity), dimension_(dimension), count_(0),
       allocator_(ObMemAttr(MTL_ID(), "IVFHcaCenter", ObCtxIds::VECTOR_CTX_ID)),
-      values_(), init_ret_(OB_SUCCESS)
+        values_(share::vector_array_allocator(allocator_)), init_ret_(OB_SUCCESS)
   {
-    values_.set_block_allocator(ObWrapperAllocator(allocator_));
+
     if (capacity <= 0 || dimension <= 0) {
       init_ret_ = OB_INVALID_ARGUMENT;
     } else if (capacity > INT64_MAX / dimension) {
       init_ret_ = OB_SIZE_OVERFLOW;
-    } else if (OB_SUCCESS != (init_ret_ =
-        values_.prepare_allocate(capacity * dimension))) {
+    } else if (OB_SUCCESS != (init_ret_ = values_.set_dimension(dimension))) {
+    } else if (OB_SUCCESS != (init_ret_ = values_.resize(capacity * dimension))) {
       LOG_WARN_RET(init_ret_, "failed to allocate IVF HCA center buffer", K_(init_ret),
           K(capacity), K(dimension));
     } else {
@@ -609,7 +613,7 @@ public:
     } else if (cid < 0 || cid >= count_) {
       ret = OB_INVALID_ARGUMENT;
     } else {
-      center = &values_.at(cid * dimension_);
+      center = values_.data_at(cid * dimension_, dimension_);
     }
     return ret;
   }
@@ -624,7 +628,7 @@ public:
     } else if (cid < 0 || cid >= capacity_) {
       ret = OB_INVALID_ARGUMENT;
     } else {
-      center = &values_.at(cid * dimension_);
+      center = values_.data_at(cid * dimension_, dimension_);
     }
     return ret;
   }
@@ -638,7 +642,7 @@ public:
     } else if (cid < 0 || cid >= capacity_ || OB_ISNULL(center)) {
       ret = OB_INVALID_ARGUMENT;
     } else {
-      float *destination = &values_.at(cid * dimension_);
+      float *destination = values_.data_at(cid * dimension_, dimension_);
       if (destination != center) {
         MEMCPY(destination, center, dimension_ * sizeof(float));
       }
@@ -652,12 +656,12 @@ private:
   int64_t dimension_;
   int64_t count_;
   ObArenaAllocator allocator_;
-  ObArray<float, ObWrapperAllocator> values_;
+  share::ObVectorMatrix values_;
   int init_ret_;
 };
 
 int load_centers(
-    const common::ObIArray<float> &values,
+    const share::ObVectorMatrix &values,
     const int64_t center_count,
     const int64_t dimension,
     HcaCenterBuffer &centers)
@@ -670,17 +674,18 @@ int load_centers(
     ret = OB_INVALID_ARGUMENT;
   }
   for (int64_t cid = 0; OB_SUCC(ret) && cid < center_count; ++cid) {
-    ret = centers.set_center(cid, &values.at(cid * dimension));
+    ret = centers.set_center(cid, values.data_at(cid * dimension, dimension));
   }
   return ret;
 }
 
 int append_centers(
     const HcaCenterBuffer &centers,
-    common::ObIArray<float> &values)
+    share::ObVectorMatrix &values)
 {
   int ret = OB_SUCCESS;
   values.reset();
+  ret = values.set_dimension(centers.dimension());
   for (int64_t cid = 0; OB_SUCC(ret) && cid < centers.count(); ++cid) {
     const float *center = nullptr;
     if (OB_FAIL(centers.get_center(cid, center))) {
@@ -698,12 +703,12 @@ class HcaAssignmentBuffer final : public share::ObHcaAssignmentStore
 public:
   explicit HcaAssignmentBuffer(const int64_t count)
     : allocator_(ObMemAttr(MTL_ID(), "IVFHcaAssign", ObCtxIds::VECTOR_CTX_ID)),
-      assignments_(), init_ret_(OB_SUCCESS)
+        assignments_(share::vector_array_allocator(allocator_)), init_ret_(OB_SUCCESS)
   {
-    assignments_.set_block_allocator(ObWrapperAllocator(allocator_));
+
     if (count < 0) {
       init_ret_ = OB_INVALID_ARGUMENT;
-    } else if (OB_SUCCESS != (init_ret_ = assignments_.prepare_allocate(count))) {
+    } else if (OB_SUCCESS != (init_ret_ = share::vector_array_resize(assignments_, count))) {
       LOG_WARN_RET(init_ret_, "failed to allocate IVF HCA assignment buffer", K_(init_ret),
           K(count));
     } else {
@@ -745,12 +750,12 @@ public:
   }
 private:
   ObArenaAllocator allocator_;
-  ObArray<int32_t, ObWrapperAllocator> assignments_;
+  share::ObVectorArray<int32_t> assignments_;
   int init_ret_;
 };
 
 int load_assignments(
-    const common::ObIArray<int64_t> &source,
+    const share::ObVectorArray<int64_t> &source,
     HcaAssignmentBuffer &target)
 {
   int ret = OB_SUCCESS;
@@ -782,13 +787,12 @@ public:
           K(cid_count));
     }
     for (int64_t cid = 0; OB_SUCCESS == init_ret_ && cid < cid_count; ++cid) {
-      MemberRow *row = OB_NEWx(MemberRow, &allocator_);
+      MemberRow *row = OB_NEWx(MemberRow, &allocator_, share::vector_array_allocator(allocator_));
       if (OB_ISNULL(row)) {
         init_ret_ = OB_ALLOCATE_MEMORY_FAILED;
         LOG_WARN_RET(init_ret_, "failed to allocate IVF HCA member row",
             K_(init_ret), K(cid));
       } else {
-        row->set_block_allocator(ObWrapperAllocator(allocator_));
         if (OB_SUCCESS != (init_ret_ = rows_.push_back(row))) {
           LOG_WARN_RET(init_ret_, "failed to append IVF HCA member row",
               K_(init_ret), K(cid));
@@ -892,7 +896,7 @@ public:
     return ret;
   }
 private:
-  using MemberRow = ObArray<int64_t, ObWrapperAllocator>;
+  using MemberRow = share::ObVectorArray<int64_t>;
   ObArenaAllocator allocator_;
   ObArray<MemberRow *, ObWrapperAllocator> rows_;
   int init_ret_;
@@ -959,6 +963,9 @@ public:
       init_ret_ = OB_INVALID_ARGUMENT;
     } else if (count > INT64_MAX / dimension) {
       init_ret_ = OB_SIZE_OVERFLOW;
+    } else if (dimension > share::ObVectorArray<float>::BLOCK_CAPACITY) {
+      // Input vectors are still read through ObVectorMatrix's contiguous rows.
+      init_ret_ = OB_INVALID_ARGUMENT;
     } else if (OB_SUCCESS != (init_ret_ =
         sums_.prepare_allocate(count * dimension))) {
       LOG_WARN_RET(init_ret_, "failed to allocate IVF HCA center-stat sums", K_(init_ret),
@@ -1387,7 +1394,7 @@ class ObIVFRefineSession
 {
 public:
   ObIVFRefineSession(const ObIVFVectorReader &reader,
-      const ObIArray<ObIVFVectorVID> &vids, int64_t center_count,
+      const ObIVFVectorIDView &vids, int64_t center_count,
       const ObIVFNeighborGraphView *graph, ObIAllocator &allocator)
     : reader_(reader), cache_(reader_, vids), vectors_(cache_),
       input_(center_count, reader.get_dimension()),
@@ -1458,9 +1465,9 @@ int ObIVFHcaAlgorithmAdapter::check_cluster_quality(const ObIArray<int64_t> &cou
 }
 
 int ObIVFHcaAlgorithmAdapter::insertion_train_centers(ObIVFVectorReader &reader,
-    const ObIArray<ObIVFVectorVID> &all_vids, const ObIVFFirstLevelSampleSet &first_level_samples,
-    const ObIArray<float> &initial_centers,
-    const int64_t center_count, ObIArray<float> &trained_centers)
+    const ObIVFVectorIDView &all_vids, const ObIVFFirstLevelSampleSet &first_level_samples,
+    const share::ObVectorMatrix &initial_centers,
+    const int64_t center_count, share::ObVectorMatrix &trained_centers)
 {
   int ret = OB_SUCCESS;
   trained_centers.reset();
@@ -1540,8 +1547,8 @@ int ObIVFHcaAlgorithmAdapter::hca_collect_training_rows(const int64_t vector_cou
 
 int ObIVFHcaAlgorithmAdapter::hca_train_loaded_samples(const int64_t vector_count,
     const int64_t cluster_size, const int64_t dimension,
-    const ObIArray<int64_t> &ordinals, const ObIArray<float> &values,
-    int64_t &local_k, ObIArray<float> &local_centers)
+    const common::ObIArray<int64_t> &ordinals, const share::ObVectorMatrix &values,
+    int64_t &local_k, share::ObVectorMatrix &local_centers)
 {
   // Original node ordinals are preserved through external sorting. The HCA
   // kernel performs exactly the same shuffles and minibatches as the old path.
@@ -1549,7 +1556,7 @@ int ObIVFHcaAlgorithmAdapter::hca_train_loaded_samples(const int64_t vector_coun
   {
   public:
     SampleBatch(int64_t count, int64_t dim, const ObIArray<int64_t> &ids,
-        const ObIArray<float> &values) : count_(count), dim_(dim), ids_(ids), values_(values) {}
+        const share::ObVectorMatrix &values) : count_(count), dim_(dim), ids_(ids), values_(values) {}
     int64_t count() const override { return count_; }
     int64_t dimension() const override { return dim_; }
     int get_vector(int64_t pos, int64_t &idx, const float *&value) const override
@@ -1561,13 +1568,13 @@ int ObIVFHcaAlgorithmAdapter::hca_train_loaded_samples(const int64_t vector_coun
       }
       idx = -1; value = nullptr;
       if (lo >= ids_.count() || ids_.at(lo) != pos) { return OB_INVALID_DATA; }
-      idx = pos; value = &values_.at(lo * dim_);
+      idx = pos; value = values_.data_at(lo * dim_, dim_);
       return OB_SUCCESS;
     }
   private:
     int64_t count_, dim_;
     const ObIArray<int64_t> &ids_;
-    const ObIArray<float> &values_;
+    const share::ObVectorMatrix &values_;
   };
   int ret = OB_SUCCESS;
   local_k = 0;
@@ -1605,11 +1612,11 @@ int ObIVFHcaAlgorithmAdapter::hca_train_local_centers(
     const int64_t depth,
     const int64_t node_idx,
     ObIVFVectorReader &reader,
-    const common::ObIArray<ObIVFVectorVID> &node_vids,
+    const ObIVFVectorIDView &node_vids,
     const ObIVFFirstLevelSampleSet *first_level_samples,
     const int64_t cluster_size,
     int64_t &local_k,
-    common::ObIArray<float> &local_centers)
+    share::ObVectorMatrix &local_centers)
 {
   int ret = OB_SUCCESS;
   UNUSED(node_idx);
@@ -1713,7 +1720,7 @@ namespace {
 class HcaCenterArrayView final : public share::ObHcaCenterStore
 {
 public:
-  HcaCenterArrayView(const ObIArray<float> &values, int64_t dimension)
+  HcaCenterArrayView(const share::ObVectorMatrix &values, int64_t dimension)
     : values_(values), dimension_(dimension) {}
   int64_t count() const override { return dimension_ > 0 ? values_.count() / dimension_ : 0; }
   int64_t capacity() const override { return count(); }
@@ -1726,7 +1733,13 @@ public:
       LOG_WARN("invalid IVF center array index", K(ret), K(cid), K(count()));
       return OB_INVALID_ARGUMENT;
     }
-    center = &values_.at(cid * dimension_);
+    const int64_t offset = cid * dimension_;
+    if (values_.contiguous_count(offset) < dimension_) {
+      int ret = OB_INVALID_DATA;
+      LOG_WARN("non-contiguous IVF center array row", K(ret), K(cid), K_(dimension));
+      return ret;
+    }
+    center = values_.data_at(offset, dimension_);
     return OB_SUCCESS;
   }
   int get_mutable_center(int64_t cid, float *&) override
@@ -1742,7 +1755,7 @@ public:
     return ret;
   }
 private:
-  const ObIArray<float> &values_;
+  const share::ObVectorMatrix &values_;
   int64_t dimension_;
 };
 
@@ -1787,7 +1800,7 @@ private:
 }
 
 int ObIVFHcaAlgorithmAdapter::insertion_assign_vectors(ObIVFVectorReader &reader,
-    const ObIArray<ObIVFVectorVID> &vids, const ObIArray<float> &centers,
+    const ObIVFVectorIDView &vids, const share::ObVectorMatrix &centers,
     const ObIArray<int64_t> &offsets, const ObIArray<int64_t> &candidates,
     const int64_t begin, const int64_t end, ObIArray<int64_t> &assignments)
 {
@@ -1847,12 +1860,15 @@ int ObIVFHcaAlgorithmAdapter::insertion_assign_vectors(ObIVFVectorReader &reader
       float best_distance = 0.0F;
       for (int64_t j = first; OB_SUCC(ret) && j < last; ++j) {
         const int64_t cid = candidates.at(j);
+        const float *center = nullptr;
         if (cid < 0 || cid >= k) {
           ret = OB_INVALID_DATA;
           LOG_WARN("invalid cached insertion candidate center", K(ret), K(cid), K(k));
+        } else if (OB_FAIL(center_view.get_center(cid, center))) {
+          LOG_WARN("failed to read insertion candidate center", K(ret), K(cid), K(dimension));
         }
         else {
-          const float distance = share::hca_square_distance(vector, &centers.at(cid * dimension), dimension);
+          const float distance = share::hca_square_distance(vector, center, dimension);
           if (!std::isfinite(distance)) {
             ret = OB_INVALID_DATA;
             LOG_WARN("non-finite insertion candidate distance", K(ret), K(cid), K(distance));
@@ -1896,8 +1912,8 @@ int ObIVFHcaAlgorithmAdapter::insertion_assign_vectors(ObIVFVectorReader &reader
 
 int ObIVFHcaAlgorithmAdapter::hca_assign_vectors(
     ObIVFVectorReader &reader,
-    const common::ObIArray<ObIVFVectorVID> &node_vids,
-    const common::ObIArray<float> &local_centers,
+    const ObIVFVectorIDView &node_vids,
+    const share::ObVectorMatrix &local_centers,
     const int64_t local_k,
     const int64_t vid_begin,
     const int64_t vid_end,
@@ -1967,9 +1983,9 @@ int ObIVFHcaAlgorithmAdapter::hca_assign_vectors(
 }
 
 int ObIVFHcaAlgorithmAdapter::hca_assign_loaded_vectors(
-    const ObIArray<float> &vectors, const ObIArray<int64_t> &positions,
+    const share::ObVectorMatrix &vectors, const common::ObIArray<int64_t> &positions,
     const int64_t begin, const int64_t end, const int64_t dimension,
-    const ObIArray<float> &centers, const int64_t local_k,
+    const share::ObVectorMatrix &centers, const int64_t local_k,
     ObIArray<int64_t> &assignments)
 {
   int ret = OB_SUCCESS;
@@ -2006,7 +2022,7 @@ void ObIVFHcaAlgorithmAdapter::hca_accumulate_center_stats(
 }
 
 int ObIVFHcaAlgorithmAdapter::hca_finalize_center_stats(const float *sum,
-    const int64_t count, const int64_t dimension, ObIArray<float> &center)
+    const int64_t count, const int64_t dimension, share::ObVectorMatrix &center)
 {
   int ret = OB_SUCCESS;
   center.reuse();
@@ -2031,10 +2047,10 @@ int ObIVFHcaAlgorithmAdapter::hca_finalize_center_stats(const float *sum,
 
 int ObIVFHcaAlgorithmAdapter::hca_compute_local_center_stats_range(
     ObIVFVectorReader &reader,
-    const common::ObIArray<ObIVFVectorVID> &member_vids,
-    const common::ObIArray<float> &local_centers,
+    const ObIVFVectorIDView &member_vids,
+    const share::ObVectorMatrix &local_centers,
     const int64_t local_center_idx,
-    common::ObIArray<float> &updated_center)
+    share::ObVectorMatrix &updated_center)
 {
   int ret = OB_SUCCESS;
   UNUSED(local_centers);
@@ -2087,7 +2103,7 @@ int ObIVFHcaAlgorithmAdapter::hca_compute_local_center_stats_range(
 
 int ObIVFHcaAlgorithmAdapter::neighborhood_begin(
     const ObIVFNeighborhoodMode mode,
-    const common::ObIArray<float> &centers,
+    const share::ObVectorMatrix &centers,
     const int64_t center_count,
     const int64_t dimension)
 {
@@ -2161,7 +2177,7 @@ int ObIVFHcaAlgorithmAdapter::neighborhood_build_row_view(
 }
 
 int ObIVFHcaAlgorithmAdapter::neighborhood_add_centers(
-    const common::ObIArray<float> &centers,
+    const share::ObVectorMatrix &centers,
     const int64_t center_count,
     const int64_t dimension,
     const int64_t cid_begin,
@@ -2219,14 +2235,14 @@ int ObIVFHcaAlgorithmAdapter::neighborhood_finish_add()
 
 int ObIVFHcaAlgorithmAdapter::neighborhood_find_neighbors(
     const ObIVFNeighborhoodMode mode,
-    const common::ObIArray<float> &centers,
+    const share::ObVectorMatrix &centers,
     const int64_t center_count,
     const int64_t dimension,
     const int64_t cid_begin,
     const int64_t cid_end,
-    common::ObIArray<int64_t> &neighbor_offsets,
+    ObIArray<int64_t> &neighbor_offsets,
     common::ObIArray<int64_t> &neighbor_cids,
-    common::ObIArray<float> &max_intra_distances)
+    ObIArray<float> &max_intra_distances)
 {
   int ret = OB_SUCCESS;
   neighbor_offsets.reset();
@@ -2340,12 +2356,12 @@ int ObIVFHcaAlgorithmAdapter::neighborhood_finish()
 
 int ObIVFHcaAlgorithmAdapter::refine_train(
     ObIVFVectorReader &reader,
-    const common::ObIArray<ObIVFVectorVID> &all_vids,
-    const common::ObIArray<float> &centers,
-    const common::ObIArray<int64_t> &assignments,
+    const ObIVFVectorIDView &all_vids,
+    const share::ObVectorMatrix &centers,
+    const share::ObVectorArray<int64_t> &assignments,
     const ObIVFNeighborGraphView *neighbor_graph,
     const int64_t center_count,
-    common::ObIArray<float> &working_centers)
+    share::ObVectorMatrix &working_centers)
 {
   int ret = OB_SUCCESS;
   working_centers.reset();
@@ -2404,9 +2420,9 @@ int ObIVFHcaAlgorithmAdapter::refine_train(
 }
 
 int ObIVFHcaAlgorithmAdapter::refine_train_begin(ObIVFVectorReader &reader,
-    const ObIArray<ObIVFVectorVID> &vids, const ObIArray<float> &centers,
-    const ObIArray<int64_t> &assignments, const ObIVFNeighborGraphView *graph,
-    int64_t center_count, ObIArray<float> &working_centers)
+    const ObIVFVectorIDView &vids, const share::ObVectorMatrix &centers,
+    const share::ObVectorArray<int64_t> &assignments, const ObIVFNeighborGraphView *graph,
+    int64_t center_count, share::ObVectorMatrix &working_centers)
 {
   int ret = OB_SUCCESS;
   if (!is_inited_ || refine_session_ != nullptr) {
@@ -2484,7 +2500,7 @@ int ObIVFHcaAlgorithmAdapter::refine_train_distance_task(int64_t task_idx)
 }
 
 int ObIVFHcaAlgorithmAdapter::refine_train_finish_batch(
-    ObIArray<float> &centers, bool &finished)
+    share::ObVectorMatrix &centers, bool &finished)
 {
   int ret = OB_SUCCESS;
   finished = false;
@@ -2528,9 +2544,9 @@ void ObIVFHcaAlgorithmAdapter::release_refine()
 
 int ObIVFHcaAlgorithmAdapter::refine_assign_vectors(
     ObIVFVectorReader &reader,
-    const common::ObIArray<ObIVFVectorVID> &all_vids,
-    const common::ObIArray<float> &working_centers,
-    const common::ObIArray<int64_t> &old_assignments,
+    const ObIVFVectorIDView &all_vids,
+    const share::ObVectorMatrix &working_centers,
+    const share::ObVectorArray<int64_t> &old_assignments,
     const ObIVFNeighborGraphView *neighbor_graph,
     const int64_t center_count,
     const int64_t vid_begin,
@@ -2610,11 +2626,11 @@ int ObIVFHcaAlgorithmAdapter::refine_assign_vectors(
 
 int ObIVFHcaAlgorithmAdapter::refine_update_center(
     ObIVFVectorReader &reader,
-    const common::ObIArray<ObIVFVectorVID> &member_vids,
-    const common::ObIArray<float> &working_centers,
+    const ObIVFVectorIDView &member_vids,
+    const share::ObVectorMatrix &working_centers,
     const int64_t center_count,
     const int64_t cid,
-    common::ObIArray<float> &updated_center)
+    share::ObVectorMatrix &updated_center)
 {
   int ret = OB_SUCCESS;
   updated_center.reset();
@@ -2645,7 +2661,7 @@ int ObIVFHcaAlgorithmAdapter::refine_update_center(
   } else if (!is_inited_ || member_vids.empty() || center_count <= 0
       || cid < 0 || cid >= center_count
       || working_centers.count() != center_count * dimension
-      || OB_FAIL(centers.set_center(local_cid, &working_centers.at(cid * dimension)))) {
+      || OB_FAIL(centers.set_center(local_cid, working_centers.data_at(cid * dimension, dimension)))) {
     if (OB_SUCCESS == ret) {
       ret = OB_INVALID_ARGUMENT;
     }
@@ -2689,8 +2705,8 @@ int ObIVFHcaAlgorithmAdapter::refine_update_center(
 
 int ObIVFHcaAlgorithmAdapter::soar_assign_secondary(
     ObIVFVectorReader &reader,
-    const common::ObIArray<ObIVFVectorVID> &all_vids,
-    const common::ObIArray<float> &final_centers,
+    const ObIVFVectorIDView &all_vids,
+    const share::ObVectorMatrix &final_centers,
     const common::ObIArray<int64_t> &primary_cids,
     const ObIVFNeighborGraphView *neighbor_graph,
     const int64_t center_count,

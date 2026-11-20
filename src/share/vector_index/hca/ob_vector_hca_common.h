@@ -8,6 +8,7 @@
 
 #include "lib/allocator/ob_allocator.h"
 #include "lib/ob_errno.h"
+#include "share/vector_index/ob_vector_build_array.h"
 #include <stdint.h>
 
 namespace oceanbase {
@@ -101,7 +102,7 @@ public:
   // Optional I/O hint for sorted indices (duplicates allowed) in the next
   // algorithm batch. Implementations must keep
   // previously returned vectors valid and must not change vector values/order.
-  virtual int prefetch_vectors(const int64_t *vector_idxs, const int64_t count) const
+  virtual int prefetch_vectors(const share::ObVectorArray<int64_t> &vector_idxs, const int64_t count) const
   {
     UNUSEDx(vector_idxs, count);
     return OB_SUCCESS;

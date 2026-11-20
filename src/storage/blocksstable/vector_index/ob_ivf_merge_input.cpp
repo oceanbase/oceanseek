@@ -49,13 +49,12 @@ bool can_read_ivf_cluster_metadata(const ObIvfSSTable &table)
   return !table.is_empty() && table.get_ivf_meta().format_version_ == IVF_SSTABLE_FORMAT_VERSION;
 }
 
-template <typename T>
-bool is_valid_array_reserve_count(const ObArray<T, ObWrapperAllocator> &array, const int64_t count)
+template <typename Array> bool is_valid_array_reserve_count(const Array &array, const int64_t count)
 {
-  // ObArray::reserve multiplies by sizeof(T), then rounds up to a block.
+  // Include the final block's rounding when validating element counts.
   const int64_t block_size = array.get_block_size();
   return count >= 0 && block_size > 0
-      && count <= (INT64_MAX - (block_size - 1)) / static_cast<int64_t>(sizeof(T));
+      && count <= (INT64_MAX - (block_size - 1)) / static_cast<int64_t>(sizeof(array.at(0)));
 }
 
 struct LocatorVIDOrderLess
@@ -91,22 +90,24 @@ struct ReplayReadRequestLess
 int ObIVFSourceLocators::reserve(const int64_t capacity)
 {
   int ret = OB_SUCCESS;
+  const int64_t storage_bytes = sizeof(Storage);
+  const int64_t old_bytes = values_ == nullptr ? 0 : storage_bytes + get_data_size();
   if (capacity < 0 || capacity > INT64_MAX / static_cast<int64_t>(sizeof(ObAsyncIVFSourceLocator))) {
     ret = OB_SIZE_OVERFLOW;
-  } else if (capacity > capacity_) {
-    auto *data = static_cast<ObAsyncIVFSourceLocator *>(allocator_.alloc(capacity * sizeof(*data_)));
-    if (nullptr == data) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
-    } else {
-      for (int64_t i = 0; i < count_; ++i) { new (data + i) ObAsyncIVFSourceLocator(data_[i]); }
-      if (nullptr != memory_context_) {
-        memory_context_->inc_local_hold_mem(capacity * sizeof(*data_));
-        memory_context_->inc_local_free_mem(get_data_size());
+  } else if (capacity > get_capacity()) {
+    if (values_ == nullptr) {
+      void *buffer = allocator_.alloc(sizeof(Storage));
+      if (buffer == nullptr) { ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        values_ = new (buffer) Storage(share::vector_array_allocator(allocator_));
       }
-      allocator_.free(data_);
-      data_ = data;
-      capacity_ = capacity;
     }
+    if (OB_SUCC(ret)) { ret = values_->reserve(capacity); }
+  }
+  const int64_t new_bytes = values_ == nullptr ? 0 : storage_bytes + get_data_size();
+  if (memory_context_ != nullptr && new_bytes > old_bytes) {
+    // A failed reserve can retain successfully allocated blocks for retry.
+    memory_context_->inc_local_hold_mem(new_bytes - old_bytes);
   }
   return ret;
 }
@@ -114,11 +115,10 @@ int ObIVFSourceLocators::reserve(const int64_t capacity)
 int ObIVFSourceLocators::prepare_allocate(const int64_t count)
 {
   int ret = OB_SUCCESS;
-  if (count < count_) { ret = OB_INVALID_ARGUMENT; }
+  if (count < this->count()) { ret = OB_INVALID_ARGUMENT; }
   else if (OB_FAIL(reserve(count))) {
-  } else {
-    for (int64_t i = count_; i < count; ++i) { new (data_ + i) ObAsyncIVFSourceLocator(); }
-    count_ = count;
+  } else if (values_ != nullptr) {
+    ret = share::vector_array_resize(*values_, count);
   }
   return ret;
 }
@@ -128,15 +128,12 @@ int ObIVFSourceLocators::push_back(const ObAsyncIVFSourceLocator &locator)
   int ret = OB_SUCCESS;
   // Preserve an aliased source element across growth.
   const ObAsyncIVFSourceLocator value = locator;
-  // Bound retained slack after takeover: grow by at most 1/3 instead of
-  // doubling a buffer that now lives for the rest of the merge.
+  // Small captures keep modest slack; larger growth uses bounded blocks.
   if (!value.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (count_ == capacity_ && OB_FAIL(reserve(MAX(256L, capacity_ + capacity_ / 3)))) {
-  } else {
-    new (data_ + count_) ObAsyncIVFSourceLocator(value);
-    ++count_;
-  }
+  } else if (count() == get_capacity()
+      && OB_FAIL(reserve(MAX(256L, get_capacity() + get_capacity() / 3)))) {
+  } else { ret = values_->push_back(value); }
   return ret;
 }
 
@@ -144,14 +141,11 @@ int ObIVFSourceLocators::take_over(ObIVFSourceLocators &source)
 {
   int ret = OB_SUCCESS;
   if (this == &source || &allocator_ != &source.allocator_
-      || memory_context_ != source.memory_context_ || nullptr != data_) {
+      || memory_context_ != source.memory_context_ || nullptr != values_) {
     ret = OB_INVALID_ARGUMENT;
   } else {
-    data_ = source.data_;
-    count_ = source.count_;
-    capacity_ = source.capacity_;
-    source.data_ = nullptr;
-    source.count_ = source.capacity_ = 0;
+    values_ = source.values_;
+    source.values_ = nullptr;
   }
   return ret;
 }
@@ -160,10 +154,14 @@ void ObIVFSourceLocators::reset()
 {
   static_assert(std::is_trivially_destructible<ObAsyncIVFSourceLocator>::value,
       "locator ownership transfer requires trivial destruction");
-  if (nullptr != memory_context_) { memory_context_->inc_local_free_mem(get_data_size()); }
-  allocator_.free(data_);
-  data_ = nullptr;
-  count_ = capacity_ = 0;
+  if (values_ != nullptr) {
+    if (memory_context_ != nullptr) {
+      memory_context_->inc_local_free_mem(sizeof(Storage) + get_data_size());
+    }
+    values_->~Storage();
+    allocator_.free(values_);
+    values_ = nullptr;
+  }
 }
 
 ObIVFMergeInputAdapter::ObIVFMergeInputAdapter(ObIAllocator &allocator,
@@ -171,7 +169,7 @@ ObIVFMergeInputAdapter::ObIVFMergeInputAdapter(ObIAllocator &allocator,
   : allocator_(allocator),
     replay_memory_reservation_(), replay_inputs_(), replay_row_offsets_(),
     prior_posting_allocator_("IVFPriorPost"),
-    prior_(allocator),
+    prior_(allocator, &prior_posting_allocator_),
     reuse_sources_(),
     locator_allocator_(),
     locators_(locator_allocator_, memory_context),
@@ -201,7 +199,6 @@ ObIVFMergeInputAdapter::ObIVFMergeInputAdapter(ObIAllocator &allocator,
     ls_id_(),
     read_info_(nullptr)
 {
-  prior_.postings_.set_block_allocator(ObWrapperAllocator(prior_posting_allocator_));
   replay_inputs_.set_block_allocator(ObWrapperAllocator(allocator_));
   replay_row_offsets_.set_block_allocator(ObWrapperAllocator(allocator_));
   reuse_sources_.set_block_allocator(ObWrapperAllocator(allocator_));
@@ -294,7 +291,7 @@ int ObIVFMergeInputAdapter::init_replay_inputs_(const int64_t slice_count)
       allocator_.free(replay);
     } else if (OB_FAIL(replay->init(MTL_ID(), vector_dim_,
         MAX(ObIVFReplayInput::NO_CACHE_MEMORY_LIMIT, replay_memory_reservation_.get_slice_memory_limit()),
-        0 /* sampling is owned by capture */, 0, i, false, "IVFMergeReplay"))) {
+        0 /* sampling is owned by capture */, 0, i, "IVFMergeReplay"))) {
       LOG_WARN("failed to initialize IVF merge replay slice", K(ret), K(i));
     }
   }
@@ -505,7 +502,8 @@ int ObIVFMergeInputAdapter::reserve_prior_arrays_(int64_t &centroid_count, int64
     // Current IVF rows have one primary and at most one secondary posting per
     // live vector. Reserve once: free() cannot retire growth buffers in Arena.
     posting_limit = live_vectors * 2;
-    if (OB_FAIL(prior_.centroids_.reserve(centroid_count * vector_dim_))) {
+    if (OB_FAIL(prior_.centroids_.set_dimension(vector_dim_))) {
+    } else if (OB_FAIL(prior_.centroids_.reserve(centroid_count * vector_dim_))) {
       LOG_WARN("failed to reserve all IVF prior centers", K(ret), K(centroid_count), K_(vector_dim));
     } else if (OB_FAIL(prior_.old_cids_.reserve(centroid_count))) {
       LOG_WARN("failed to reserve all IVF prior center IDs", K(ret), K(centroid_count));
@@ -531,6 +529,9 @@ int ObIVFMergeInputAdapter::retain_reuse_centroid_(ObIVFBlockReuseSource &source
   // fixed header. Keep every record for coverage, but only certify exact output.
   record.canonical_payload_ = payload_size == ObIvfCentroidPayload::get_size(vector_dim_);
   if (meta.is_hierarchical() && key.cid_ == 0) {
+    if (OB_FAIL(source.parent_centers_.set_dimension(vector_dim_))) {
+      return ret;
+    }
     record.coordinate_idx_ = -source.parent_centers_.count() - 1;
     for (int64_t d = 0; OB_SUCC(ret) && d < vector_dim_; ++d) {
       float value;
@@ -1468,7 +1469,7 @@ bool ObIVFMergeInputAdapter::is_valid() const
 }
 
 int ObIVFMergeInputAdapter::get_all_vids(
-    ObIArray<ObIVFVectorVID> &vids) const
+    share::ObVectorArray<ObIVFVectorVID> &vids) const
 {
   int ret = OB_SUCCESS;
   vids.reset();
@@ -1476,7 +1477,7 @@ int ObIVFMergeInputAdapter::get_all_vids(
     ret = OB_NOT_INIT;
     LOG_WARN("IVF merge input is not initialized", K(ret), KPC(this));
   } else if (OB_FAIL(vids.reserve(locators_.count()))) {
-    LOG_WARN("failed to reserve IVF merge VIDs", K(ret), "count", locators_.count());
+    LOG_WARN("failed to reserve IVF merge VIDs", K(ret), "vector_count", locators_.count());
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < locators_.count(); ++i) {
     ret = vids.push_back(locators_.at(i).vid_);
@@ -1532,10 +1533,10 @@ int ObIVFMergeInputAdapter::find_locator_(
 }
 
 int ObIVFMergeInputAdapter::batch_get_by_vid(
-    const ObIArray<ObIVFVectorVID> &vids,
+    const storage::ObIVFVectorIDView &vids,
     const int64_t vid_begin,
     const int64_t vid_end,
-    ObIArray<float> &vectors) const
+    share::ObVectorMatrix &vectors) const
 {
   int ret = OB_SUCCESS;
   vectors.reuse();
@@ -1545,11 +1546,12 @@ int ObIVFMergeInputAdapter::batch_get_by_vid(
   } else if (vid_end - vid_begin > INT64_MAX / vector_dim_ / static_cast<int64_t>(sizeof(float))) {
     ret = OB_SIZE_OVERFLOW;
     LOG_WARN("IVF replay VID output size overflow", K(ret), K(vid_begin), K(vid_end), K_(vector_dim));
-  } else if (OB_FAIL(vectors.prepare_allocate((vid_end - vid_begin) * vector_dim_))) {
+  } else if (OB_FAIL(vectors.set_dimension(vector_dim_))) {
+  } else if (OB_FAIL(vectors.resize((vid_end - vid_begin) * vector_dim_))) {
     LOG_WARN("failed to allocate replay vector output", K(ret), K(vid_begin), K(vid_end));
   }
-  ObSEArray<ObAsyncIVFSourceLocator, 64> requests;
-  requests.set_attr(ObMemAttr(MTL_ID(), "IVFMergeRead", ObCtxIds::VECTOR_CTX_ID));
+
+  share::ObVectorArray<ObAsyncIVFSourceLocator> requests(ObMemAttr(MTL_ID(), "IVFMergeRead", ObCtxIds::VECTOR_CTX_ID));
   int64_t cursor = 0;
   if (OB_SUCC(ret) && OB_FAIL(requests.reserve(vid_end - vid_begin))) {
     LOG_WARN("failed to reserve IVF replay reads", K(ret));
@@ -1618,20 +1620,21 @@ int ObIVFMergeInputAdapter::get_source_row_idx(const int64_t vector_idx, int64_t
   return ret;
 }
 
-int ObIVFMergeInputAdapter::batch_get_by_source(const ObIArray<int64_t> &vector_idxs,
-    ObIArray<float> &vectors) const
+int ObIVFMergeInputAdapter::batch_get_by_source(const share::ObVectorArray<int64_t> &vector_idxs,
+    share::ObVectorMatrix &vectors) const
 {
   int ret = OB_SUCCESS;
   vectors.reuse();
-  ObSEArray<ObAsyncIVFSourceLocator, 64> requests;
-  requests.set_attr(ObMemAttr(MTL_ID(), "IVFMergeRead", ObCtxIds::VECTOR_CTX_ID));
+
+  share::ObVectorArray<ObAsyncIVFSourceLocator> requests(ObMemAttr(MTL_ID(), "IVFMergeRead", ObCtxIds::VECTOR_CTX_ID));
   if (!is_valid() || vector_idxs.empty()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid IVF source batch", K(ret), "vector_count", vector_idxs.count(), K_(is_inited));
   } else if (vector_idxs.count() > INT64_MAX / vector_dim_ / static_cast<int64_t>(sizeof(float))) {
     ret = OB_SIZE_OVERFLOW;
     LOG_WARN("IVF source output size overflow", K(ret), "vector_count", vector_idxs.count(), K_(vector_dim));
-  } else if (OB_FAIL(vectors.prepare_allocate(vector_idxs.count() * vector_dim_))) {
+  } else if (OB_FAIL(vectors.set_dimension(vector_dim_))) {
+  } else if (OB_FAIL(vectors.resize(vector_idxs.count() * vector_dim_))) {
     LOG_WARN("failed to allocate IVF source-ordered output", K(ret));
   }
   int64_t previous = -1;
@@ -1654,15 +1657,14 @@ int ObIVFMergeInputAdapter::batch_get_by_source(const ObIArray<int64_t> &vector_
 }
 
 int ObIVFMergeInputAdapter::read_replay_vectors_(
-    const ObIArray<ObAsyncIVFSourceLocator> &locators,
-    ObIArray<float> &vectors) const
+    const share::ObVectorArray<ObAsyncIVFSourceLocator> &locators,
+    share::ObVectorMatrix &vectors) const
 {
   if (lazy_raw_) { return read_source_vectors_(locators, vectors); }
   int ret = OB_SUCCESS;
-  ObSEArray<ReplayReadRequest, 64> requests;
-  ObSEArray<ObIVFReplayReadRequest, 64> rows;
-  requests.set_attr(ObMemAttr(MTL_ID(), "IVFMergeRead", ObCtxIds::VECTOR_CTX_ID));
-  rows.set_attr(ObMemAttr(MTL_ID(), "IVFMergeRead", ObCtxIds::VECTOR_CTX_ID));
+
+  share::ObVectorArray<ReplayReadRequest> requests(ObMemAttr(MTL_ID(), "IVFMergeRead", ObCtxIds::VECTOR_CTX_ID));
+  share::ObVectorArray<ObIVFReplayReadRequest> rows(ObMemAttr(MTL_ID(), "IVFMergeRead", ObCtxIds::VECTOR_CTX_ID));
   if (vector_dim_ <= 0 || locators.count() > vectors.count() / vector_dim_) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid IVF replay output capacity", K(ret), K_(vector_dim),
@@ -1685,7 +1687,7 @@ int ObIVFMergeInputAdapter::read_replay_vectors_(
       if (OB_SUCC(ret) && i > 0 && less(requests.at(i), requests.at(i - 1))) { ordered = false; }
     }
   }
-  if (OB_SUCC(ret) && !ordered) { lib::ob_sort(requests.begin(), requests.end(), less); }
+  if (OB_SUCC(ret) && !ordered) { lib::ob_sort(share::vector_array_begin(requests), share::vector_array_end(requests), less); }
   for (int64_t begin = 0; OB_SUCC(ret) && begin < requests.count();) {
     const int64_t slice = requests.at(begin).slice_idx_;
     int64_t end = begin;
@@ -1705,11 +1707,11 @@ int ObIVFMergeInputAdapter::read_replay_vectors_(
 }
 
 int ObIVFMergeInputAdapter::read_source_vectors_(
-    const ObIArray<ObAsyncIVFSourceLocator> &locators, ObIArray<float> &vectors) const
+    const share::ObVectorArray<ObAsyncIVFSourceLocator> &locators, share::ObVectorMatrix &vectors) const
 {
   int ret = OB_SUCCESS;
-  ObSEArray<int64_t, 64> order;
-  order.set_attr(ObMemAttr(MTL_ID(), "IVFLazyRead", ObCtxIds::VECTOR_CTX_ID));
+
+  share::ObVectorArray<int64_t> order(ObMemAttr(MTL_ID(), "IVFLazyRead", ObCtxIds::VECTOR_CTX_ID));
   if (!lazy_raw_ || read_info_ == nullptr || vector_dim_ <= 0
       || locators.count() > vectors.count() / vector_dim_) {
     ret = OB_INVALID_ARGUMENT;
@@ -1729,7 +1731,7 @@ int ObIVFMergeInputAdapter::read_source_vectors_(
     }
   }
   if (OB_SUCC(ret)) {
-    lib::ob_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
+    lib::ob_sort(share::vector_array_begin(order), share::vector_array_end(order), [&](int64_t a, int64_t b) {
       const auto &x = locators.at(a), &y = locators.at(b);
       return x.table_idx_ != y.table_idx_ ? x.table_idx_ < y.table_idx_
           : x.vid_ != y.vid_ ? x.vid_ < y.vid_ : a < b;
@@ -1866,7 +1868,7 @@ int ObIVFMergeInputAdapter::batch_get_samples(
     const int64_t sample_begin,
     const int64_t sample_end,
     ObIArray<ObIVFVectorVID> &sample_vids,
-    ObIArray<float> &sample_vectors) const
+    share::ObVectorMatrix &sample_vectors) const
 {
   int ret = OB_SUCCESS;
   sample_vids.reset();

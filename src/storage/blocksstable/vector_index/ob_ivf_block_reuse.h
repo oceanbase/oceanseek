@@ -6,6 +6,7 @@
 #define OCEANBASE_STORAGE_BLOCKSSTABLE_VECTOR_INDEX_OB_IVF_BLOCK_REUSE_H_
 
 #include "storage/blocksstable/vector_index/ob_ivf_block_reuse_source.h"
+#include "storage/blocksstable/vector_index/ob_ivf_vector_ids.h"
 #include "lib/allocator/page_arena.h"
 #include "storage/blocksstable/vector_index/ob_ivf_sstable_struct.h"
 #include "storage/blocksstable/ob_macro_block_meta.h"
@@ -38,7 +39,7 @@ public:
   // ordered key stream. No assumption is made about consecutive integer VIDs.
   // end is the end of the complete task slice, not a payload batch boundary.
   // If no candidate starts here, read_end bounds the ordinary payload prefix.
-  int try_reuse_raw_keys(const common::ObIArray<uint64_t> &vids,
+  int try_reuse_raw_keys(const storage::ObIVFVectorIDView &vids,
       int64_t begin, int64_t end, int64_t &reused_rows, int64_t &read_end);
   int finish();
   int64_t row_count() const { return rows_; }

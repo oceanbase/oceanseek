@@ -230,16 +230,16 @@ private:
 class Centers final : public share::ObHcaCenterStore
 {
 public:
-  Centers(const ObIArray<float> &values, int64_t dim, ObIArray<float> *writable = nullptr)
+  Centers(const share::ObVectorMatrix &values, int64_t dim, share::ObVectorMatrix *writable = nullptr)
     : values_(values), writable_(writable), dim_(dim) {}
   int64_t count() const override { return dim_ > 0 ? values_.count() / dim_ : 0; }
   int64_t capacity() const override { return count(); }
   int64_t dimension() const override { return dim_; }
   int get_center(int64_t cid, const float *&v) const override
-  { v = cid >= 0 && cid < count() ? &values_.at(cid * dim_) : nullptr;
+  { v = cid >= 0 && cid < count() ? values_.data_at(cid * dim_, dim_) : nullptr;
     return v != nullptr ? OB_SUCCESS : OB_INVALID_ARGUMENT; }
   int get_mutable_center(int64_t cid, float *&v) override
-  { v = writable_ != nullptr && cid >= 0 && cid < count() ? &writable_->at(cid * dim_) : nullptr;
+  { v = writable_ != nullptr && cid >= 0 && cid < count() ? writable_->data_at(cid * dim_, dim_) : nullptr;
     return v != nullptr ? OB_SUCCESS : OB_INVALID_ARGUMENT; }
   int set_center(int64_t cid, const float *v) override
   { float *target = nullptr; int ret = get_mutable_center(cid, target);
@@ -250,16 +250,17 @@ public:
     if (OB_SUCC(ret) && target != v) { MEMCPY(target, v, dim_ * sizeof(float)); }
     return ret; }
 private:
-  const ObIArray<float> &values_;
-  ObIArray<float> *writable_;
+  const share::ObVectorMatrix &values_;
+  share::ObVectorMatrix *writable_;
   int64_t dim_;
 };
 
+template <typename Values>
 class Assignments final : public share::ObHcaAssignmentStore
 {
 public:
-  Assignments(const ObIArray<int64_t> &values, const ObIArray<int64_t> *indices = nullptr,
-      ObIArray<int64_t> *writable = nullptr)
+  Assignments(const Values &values, const share::ObVectorArray<int64_t> *indices = nullptr,
+      Values *writable = nullptr)
     : values_(values), indices_(indices), writable_(writable) {}
   int64_t count() const override { return indices_ == nullptr ? values_.count() : indices_->count(); }
   int get_assignment(int64_t idx, int32_t &cid) const override
@@ -289,22 +290,22 @@ public:
     return OB_SUCCESS;
   }
 private:
-  const ObIArray<int64_t> &values_;
-  const ObIArray<int64_t> *indices_;
-  ObIArray<int64_t> *writable_;
+  const Values &values_;
+  const share::ObVectorArray<int64_t> *indices_;
+  Values *writable_;
 };
 
 class Batch final : public share::ObHcaVectorBatch
 {
 public:
-  Batch(const ObIArray<float> &values, int64_t dim) : values_(values), dim_(dim) {}
+  Batch(const share::ObVectorMatrix &values, int64_t dim) : values_(values), dim_(dim) {}
   int64_t count() const override { return dim_ > 0 ? values_.count() / dim_ : 0; }
   int64_t dimension() const override { return dim_; }
   int get_vector(int64_t pos, int64_t &idx, const float *&v) const override
-  { idx = pos; v = pos >= 0 && pos < count() ? &values_.at(pos * dim_) : nullptr;
+  { idx = pos; v = pos >= 0 && pos < count() ? values_.data_at(pos * dim_, dim_) : nullptr;
     return v == nullptr ? OB_INVALID_ARGUMENT : OB_SUCCESS; }
 private:
-  const ObIArray<float> &values_;
+  const share::ObVectorMatrix &values_;
   int64_t dim_;
 };
 
@@ -329,11 +330,11 @@ class SampleCache final : public share::ObHcaVectorAccessor
   {
     using Sorter = ObExternalSort<ObIVFSortItem, ObIVFClusterSampleCompare>;
     explicit Shard(ObIAllocator &allocator)
-      : store_(allocator), started_(false), complete_(false)
+        : store_(allocator),
+          loaded_positions_(ObMemAttr(MTL_ID(), "IVFRefinePlan", ObCtxIds::VECTOR_CTX_ID)), started_(false),
+          complete_(false)
     {
-      const ObMemAttr attr(MTL_ID(), "IVFRefinePlan", ObCtxIds::VECTOR_CTX_ID);
-      ends_.set_attr(attr);
-      loaded_positions_.set_attr(attr);
+      ends_.set_attr(ObMemAttr(MTL_ID(), "IVFRefinePlan", ObCtxIds::VECTOR_CTX_ID));
     }
     ~Shard() { sorter_.clean_up(); }
     void release_sorter()
@@ -349,52 +350,51 @@ class SampleCache final : public share::ObHcaVectorAccessor
     ObIVFClusterSampleCompare compare_;
     Sorter sorter_;
     ObArray<int64_t> ends_;
-    ObArray<int64_t> loaded_positions_;
+    share::ObVectorArray<int64_t> loaded_positions_;
     bool started_;
     bool complete_;
     TO_STRING_KV(K_(started), K_(complete));
   };
 public:
   SampleCache(ObIAllocator &allocator, int64_t count, int64_t dim, const volatile int *cancel)
-    : allocator_(allocator), count_(count), dim_(dim), cancel_(cancel), ready_(false),
-      memory_limit_(0), shard_count_(0), epochs_(0), batch_size_(0), batches_per_epoch_(0),
-      rows_per_epoch_(0), next_batch_(0), read_rows_(0), resident_source_(nullptr), source_vids_(nullptr)
+      : allocator_(allocator), count_(count), dim_(dim), cancel_(cancel), ready_(false), memory_limit_(0),
+        shard_count_(0), epochs_(0), batch_size_(0), batches_per_epoch_(0), rows_per_epoch_(0), next_batch_(0),
+        read_rows_(0), resident_source_(nullptr), source_vids_(),
+        indices_(ObMemAttr(MTL_ID(), "IVFRefinePlan", ObCtxIds::VECTOR_CTX_ID)),
+        loaded_(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ModulePageAllocator(ObMemAttr(MTL_ID(), "IVFRefinePlan", ObCtxIds::VECTOR_CTX_ID))),
+        ranks_(ObMemAttr(MTL_ID(), "IVFRefinePlan", ObCtxIds::VECTOR_CTX_ID)),
+        batch_indices_(ObMemAttr(MTL_ID(), "IVFRefineBatch", ObCtxIds::VECTOR_CTX_ID)),
+        batch_values_(ObMemAttr(MTL_ID(), "IVFRefineBatch", ObCtxIds::VECTOR_CTX_ID))
   {
-    const ObMemAttr plan_attr(MTL_ID(), "IVFRefinePlan", ObCtxIds::VECTOR_CTX_ID);
-    indices_.set_attr(plan_attr);
-    loaded_.set_attr(plan_attr);
     shards_.set_block_allocator(ObWrapperAllocator(allocator));
-    ranks_.set_attr(ObMemAttr(MTL_ID(), "IVFRefinePlan", ObCtxIds::VECTOR_CTX_ID));
-    const ObMemAttr attr(MTL_ID(), "IVFRefineBatch", ObCtxIds::VECTOR_CTX_ID);
-    batch_indices_.set_attr(attr);
-    batch_values_.set_attr(attr);
-    batch_loaded_.set_attr(attr);
+    batch_loaded_.set_attr(ObMemAttr(MTL_ID(), "IVFRefineBatch", ObCtxIds::VECTOR_CTX_ID));
+    const int rc = batch_values_.set_dimension(dim_);
+    OB_ASSERT(rc == OB_SUCCESS);
   }
   ~SampleCache()
   {
     for (int64_t i = 0; i < shards_.count(); ++i) { shards_.at(i)->~Shard(); }
   }
-  int init(const int64_t *samples, int64_t size, int64_t memory_limit, int64_t shards,
+  int init(const share::ObVectorArray<int64_t> &samples, int64_t size, int64_t memory_limit, int64_t shards,
       int64_t epochs, const share::ObHcaRefineTrainer &trainer)
   {
     int ret = OB_SUCCESS;
-    ObArray<int64_t> shuffled;
-    shuffled.set_attr(ObMemAttr(MTL_ID(), "IVFRefinePlan", ObCtxIds::VECTOR_CTX_ID));
-    if (samples == nullptr || size <= 0 || size > count_ || size > UINT32_MAX || dim_ <= 0
-        || size > INT64_MAX / sizeof(float) / dim_ || memory_limit < 0 || shards <= 0 || epochs <= 0
-        || epochs > INT64_MAX / sizeof(int64_t) / size) {
+
+    share::ObVectorArray<int64_t> shuffled(ObMemAttr(MTL_ID(), "IVFRefinePlan", ObCtxIds::VECTOR_CTX_ID));
+    if (size > samples.count() || size <= 0 || size > count_ || dim_ <= 0 || size > INT64_MAX / sizeof(float) / dim_
+        || memory_limit < 0 || shards <= 0 || epochs <= 0 || epochs > INT64_MAX / sizeof(int64_t) / size) {
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("invalid DDL refinement sample plan", K(ret), K(size), K_(count), K_(dim),
           K(memory_limit), K(shards), K(epochs));
-    } else if (OB_FAIL(indices_.prepare_allocate(size))
+    } else if (OB_FAIL(share::vector_array_resize(indices_, size))
         || OB_FAIL(loaded_.prepare_allocate(size))
-        || OB_FAIL(ranks_.prepare_allocate(size * epochs))
-        || OB_FAIL(shuffled.prepare_allocate(size))) {
+        || OB_FAIL(share::vector_array_resize(ranks_, size * epochs))
+        || OB_FAIL(share::vector_array_resize(shuffled, size))) {
       LOG_WARN("failed to allocate DDL refinement sample plan", K(ret), K(size), K(epochs));
     } else {
-      MEMCPY(&indices_.at(0), samples, size * sizeof(int64_t));
-      MEMSET(&loaded_.at(0), 0, size);
-      lib::ob_sort(indices_.begin(), indices_.end());
+      for (int64_t i = 0; i < size; ++i) { indices_.at(i) = samples.at(i); }
+      std::fill_n(loaded_.get_data(), loaded_.count(), 0);
+      lib::ob_sort(share::vector_array_begin(indices_), share::vector_array_end(indices_));
       memory_limit_ = memory_limit;
       shard_count_ = MIN(shards, size);
       epochs_ = epochs;
@@ -406,7 +406,7 @@ public:
       }
     }
     for (int64_t epoch = 0; OB_SUCC(ret) && epoch < epochs_; ++epoch) {
-      if (OB_FAIL(trainer.get_epoch_sample_indices(epoch, &shuffled.at(0), size, batch_size_))) {
+      if (OB_FAIL(trainer.get_epoch_sample_indices(epoch, shuffled, size, batch_size_))) {
         LOG_WARN("failed to plan DDL refinement epoch", K(ret), K(epoch), K(size));
       }
       for (int64_t rank = 0; OB_SUCC(ret) && rank < size; ++rank) {
@@ -450,7 +450,7 @@ public:
     }
     return ret;
   }
-  int init_resident(const ObIVFVectorStore &source, const ObIArray<ObIVFVectorVID> &vids)
+  int init_resident(const ObIVFVectorStore &source, const ObIVFVectorIDView &vids)
   {
     int ret = OB_SUCCESS;
     if (!source.is_valid() || !source.is_fully_memory_resident()
@@ -462,7 +462,7 @@ public:
     } else {
       // Both objects belong to the build runtime and outlive this session.
       resident_source_ = &source;
-      source_vids_ = &vids;
+      source_vids_ = vids;
     }
     return ret;
   }
@@ -506,7 +506,7 @@ public:
       const int64_t sort_limit = MAX(8L << 20, (128L << 20) / shard_count_);
       if (OB_FAIL(s.ends_.prepare_allocate(epochs_ * batches_per_epoch_))) {
         LOG_WARN("failed to allocate DDL refinement batch ranges", K(ret), K(shard));
-      } else if (OB_FAIL(s.store_.init(MTL_ID(), dim_, limit, 0, 0, -1, false, "IVFRefineStore"))) {
+      } else if (OB_FAIL(s.store_.init(MTL_ID(), dim_, limit, 0, 0, -1, "IVFRefineStore"))) {
         LOG_WARN("failed to initialize DDL refinement sample store", K(ret), K(shard), K(limit));
       } else if (OB_FAIL(s.sorter_.init(sort_limit,
           OB_STORAGE_OBJECT_MGR.get_macro_block_size(), 0, MTL_ID(), &s.compare_))) {
@@ -570,27 +570,27 @@ public:
       ret = OB_STATE_NOT_MATCH;
       LOG_WARN("DDL refinement sample is not prefetched", K(ret), K(idx), K_(ready));
     } else {
-      v = &batch_values_.at(pos * dim_);
+      v = batch_values_.data_at(pos * dim_, dim_);
     }
     return ret;
   }
-  int prefetch_vectors(const int64_t *idxs, int64_t count) const override
+  int prefetch_vectors(const share::ObVectorArray<int64_t> &idxs, int64_t count) const override
   {
     if (uses_resident_source()) { return prefetch_resident(idxs, count); }
     int ret = check_cancel();
     if (OB_FAIL(ret)) {
-    } else if (!ready_ || idxs == nullptr || count != batch_size_ || next_batch_ >= epochs_ * batches_per_epoch_) {
+    } else if (!ready_ || count > idxs.count() || count != batch_size_ || next_batch_ >= epochs_ * batches_per_epoch_) {
       ret = OB_STATE_NOT_MATCH;
       LOG_WARN("invalid DDL refinement batch read", K(ret), K_(ready), K(count), K_(next_batch));
-    } else if (OB_FAIL(batch_indices_.prepare_allocate(count))
-        || (batch_values_.count() != count * dim_ && OB_FAIL(batch_values_.prepare_allocate(count * dim_)))
+    } else if (OB_FAIL(share::vector_array_resize(batch_indices_, count))
+        || (batch_values_.count() != count * dim_ && OB_FAIL(batch_values_.resize(count * dim_)))
         || OB_FAIL(batch_loaded_.prepare_allocate(count))) {
       LOG_WARN("failed to allocate DDL refinement batch vectors", K(ret), K(count), K_(dim));
     } else {
-      MEMCPY(&batch_indices_.at(0), idxs, count * sizeof(int64_t));
+      for (int64_t i = 0; i < count; ++i) { batch_indices_.at(i) = idxs.at(i); }
       MEMSET(&batch_loaded_.at(0), 0, count);
       for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
-        if (idxs[i] < 0 || idxs[i] >= count_ || (i > 0 && idxs[i - 1] > idxs[i])) {
+        if (idxs.at(i) < 0 || idxs.at(i) >= count_ || (i > 0 && idxs.at(i - 1) > idxs.at(i))) {
           ret = OB_INVALID_ARGUMENT;
           LOG_WARN("invalid DDL refinement batch indices", K(ret), K(i), K_(next_batch));
         }
@@ -615,7 +615,7 @@ public:
               ret = OB_INVALID_DATA;
               LOG_WARN("DDL refinement batch membership mismatch", K(ret), K(shard), K(row), K(idx), K_(next_batch));
             } else {
-              MEMCPY(&batch_values_.at(pos * dim_), v, dim_ * sizeof(float));
+              MEMCPY(batch_values_.data_at(pos * dim_, dim_), v, dim_ * sizeof(float));
               batch_loaded_.at(pos) = 1;
               ++copied;
               ++read_rows_;
@@ -631,7 +631,7 @@ public:
     }
     return ret;
   }
-  int load(const ObIArray<int64_t> &positions, const ObIArray<float> &values, int64_t shard)
+  int load(const ObIArray<int64_t> &positions, const share::ObVectorMatrix &values, int64_t shard)
   {
     int ret = check_cancel();
     if (OB_FAIL(ret)) {
@@ -718,37 +718,40 @@ public:
     }
     return ret;
   }
-  const ObIArray<int64_t> &indices() const { return indices_; }
+  const share::ObVectorArray<int64_t> &indices() const { return indices_; }
 private:
-  int prefetch_resident(const int64_t *idxs, const int64_t count) const
+  int prefetch_resident(const share::ObVectorArray<int64_t> &idxs, const int64_t count) const
   {
     int ret = check_cancel();
-    ObArray<ObIVFVectorVID> vids;
-    vids.set_attr(ObMemAttr(MTL_ID(), "IVFRefineBatch", ObCtxIds::VECTOR_CTX_ID));
+    const bool position_ids = resident_source_->uses_position_ids();
+
+    share::ObVectorArray<ObIVFVectorVID> vids(ObMemAttr(MTL_ID(), "IVFRefineBatch", ObCtxIds::VECTOR_CTX_ID));
     if (OB_FAIL(ret)) {
-    } else if (!ready_ || idxs == nullptr || count <= 0 || dim_ <= 0
-        || count > INT64_MAX / dim_ / sizeof(float) || source_vids_ == nullptr) {
+    } else if (!ready_ || count > idxs.count() || count <= 0 || dim_ <= 0
+        || count > INT64_MAX / dim_ / sizeof(float) || source_vids_.empty()) {
       ret = OB_STATE_NOT_MATCH;
       LOG_WARN("invalid resident IVF refinement batch", K(ret), K_(ready), K(count), K_(dim));
-    } else if (OB_FAIL(batch_indices_.prepare_allocate(count)) || OB_FAIL(vids.reserve(count))) {
+    } else if (OB_FAIL(share::vector_array_resize(batch_indices_, count))
+        || (!position_ids && OB_FAIL(vids.reserve(count)))) {
       LOG_WARN("failed to allocate resident IVF refinement batch indices", K(ret), K(count));
     }
     for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
       if (i % 4096 == 0 && OB_FAIL(check_cancel())) {
-      } else if (idxs[i] < 0 || idxs[i] >= count_ || (i > 0 && idxs[i - 1] > idxs[i])) {
+      } else if (idxs.at(i) < 0 || idxs.at(i) >= count_ || (i > 0 && idxs.at(i - 1) > idxs.at(i))) {
         ret = OB_INVALID_ARGUMENT;
-        LOG_WARN("invalid resident IVF refinement index", K(ret), K(i), "index", idxs[i], K_(count));
-      } else if (OB_FAIL(vids.push_back(source_vids_->at(idxs[i])))) {
+        LOG_WARN("invalid resident IVF refinement index", K(ret), K(i), "index", idxs.at(i), K_(count));
+      } else if (!position_ids && OB_FAIL(vids.push_back(source_vids_.at(idxs.at(i))))) {
         LOG_WARN("failed to retain resident IVF refinement VID", K(ret), K(i));
       } else {
         // Keep duplicate indices from wrapped batches in their original positions.
-        batch_indices_.at(i) = idxs[i];
+        batch_indices_.at(i) = idxs.at(i);
       }
     }
     if (OB_SUCC(ret)) {
       // The store copies through task-private readers. This buffer survives all
       // distance/assign/update tasks and is reused only for the next batch.
-      if (OB_FAIL(resident_source_->batch_get_by_vid(vids, 0, count, batch_values_))) {
+      const ObIVFVectorIDView ids = position_ids ? ObIVFVectorIDView::positions(idxs) : ObIVFVectorIDView(vids);
+      if (OB_FAIL(resident_source_->batch_get_by_vid(ids, 0, count, batch_values_))) {
         LOG_WARN("failed to read resident IVF refinement batch", K(ret), K(count));
       } else if (batch_values_.count() != count * dim_) {
         ret = OB_INVALID_DATA;
@@ -772,7 +775,7 @@ private:
     if (OB_SUCC(ret)) { ret = share::dag_yield(); }
     return ret;
   }
-  static int64_t find_index(const ObIArray<int64_t> &values, int64_t idx)
+  static int64_t find_index(const share::ObVectorArray<int64_t> &values, int64_t idx)
   {
     int64_t lo = 0, hi = values.count();
     while (lo < hi) {
@@ -795,13 +798,13 @@ private:
   mutable int64_t next_batch_;
   mutable int64_t read_rows_;
   const ObIVFVectorStore *resident_source_;
-  const ObIArray<ObIVFVectorVID> *source_vids_;
-  ObArray<int64_t> indices_;
+  ObIVFVectorIDView source_vids_;
+  share::ObVectorArray<int64_t> indices_;
   ObArray<uint8_t> loaded_;
-  ObArray<int64_t> ranks_;
+  share::ObVectorArray<int64_t> ranks_;
   ObArray<Shard *, ObWrapperAllocator> shards_;
-  mutable ObArray<int64_t> batch_indices_;
-  mutable ObArray<float> batch_values_;
+  mutable share::ObVectorArray<int64_t> batch_indices_;
+  mutable share::ObVectorMatrix batch_values_;
   mutable ObArray<uint8_t> batch_loaded_;
 };
 } // namespace ddl_hca
@@ -809,17 +812,20 @@ private:
 struct ObIVFDDLRefineSession
 {
   ObIVFDDLRefineSession(ObIAllocator &allocator, int64_t n, int64_t dim,
-      const ObIArray<float> &centers, const ObIArray<int64_t> &assignments,
+      const share::ObVectorMatrix &centers, const share::ObVectorArray<int64_t> &assignments,
       const ObIVFNeighborGraphView *graph, const volatile int *cancel)
     : cache_(allocator, n, dim, cancel), input_(centers, dim), assignments_(assignments),
-      working_(working_values_, dim, &working_values_),
-      graph_(graph == nullptr ? ObIVFNeighborGraphView() : *graph), neighbors_(graph_),
-      trainer_(allocator), rows_(0), batch_prepared_(false), phase_(ObIVFRefinePhase::DISTANCE)
-  { working_values_.set_block_allocator(ObWrapperAllocator(allocator)); }
+        working_values_(share::vector_array_allocator(allocator)), working_(working_values_, dim, &working_values_),
+        graph_(graph == nullptr ? ObIVFNeighborGraphView() : *graph), neighbors_(graph_), trainer_(allocator), rows_(0),
+        batch_prepared_(false), phase_(ObIVFRefinePhase::DISTANCE)
+  {
+    const int rc = working_values_.set_dimension(dim);
+    OB_ASSERT(rc == OB_SUCCESS);
+  }
   ddl_hca::SampleCache cache_;
   ddl_hca::Centers input_;
-  ddl_hca::Assignments assignments_;
-  ObArray<float, ObWrapperAllocator> working_values_;
+  ddl_hca::Assignments<share::ObVectorArray<int64_t>> assignments_;
+  share::ObVectorMatrix working_values_;
   ddl_hca::Centers working_;
   ObIVFNeighborGraphView graph_;
   ddl_hca::Neighborhood neighbors_;
@@ -850,7 +856,7 @@ void ObIVFDDLHcaAdapter::cancel(int ret_code)
   ObIVFHcaAlgorithmAdapter::cancel(ret_code);
 }
 int ObIVFDDLHcaAdapter::neighborhood_add_centers(
-    const ObIArray<float> &centers, const int64_t center_count, const int64_t dimension,
+    const share::ObVectorMatrix &centers, const int64_t center_count, const int64_t dimension,
     const int64_t cid_begin, const int64_t cid_end)
 {
   int ret = ATOMIC_LOAD(&cancel_code_);
@@ -867,7 +873,7 @@ int ObIVFDDLHcaAdapter::neighborhood_add_centers(
 }
 
 int ObIVFDDLHcaAdapter::neighborhood_find_neighbors(
-    const ObIVFNeighborhoodMode mode, const ObIArray<float> &centers,
+    const ObIVFNeighborhoodMode mode, const share::ObVectorMatrix &centers,
     const int64_t center_count, const int64_t dimension,
     const int64_t cid_begin, const int64_t cid_end,
     ObIArray<int64_t> &offsets, ObIArray<int64_t> &cids, ObIArray<float> &distances)
@@ -894,17 +900,17 @@ int ObIVFDDLHcaAdapter::neighborhood_find_neighbors(
 }
 
 int ObIVFDDLHcaAdapter::begin_refine_samples(int64_t n, int64_t dim,
-    const ObIArray<float> &centers, const ObIArray<int64_t> &assignments,
+    const share::ObVectorMatrix &centers, const share::ObVectorArray<int64_t> &assignments,
     const ObIVFNeighborGraphView *graph, int64_t memory_limit, int64_t shards,
-    const ObIVFVectorStore *source, const ObIArray<ObIVFVectorVID> *source_vids)
+    const ObIVFVectorStore *source, ObIVFVectorIDView source_vids)
 {
   int ret = ATOMIC_LOAD(&cancel_code_);
   if (OB_FAIL(ret)) {
   } else if (session_ != nullptr || !is_initialized() || dim <= 0 || centers.empty()
       || centers.count() % dim != 0 || assignments.count() != n
-      || (source == nullptr) != (source_vids == nullptr)
+      || (source == nullptr) != source_vids.empty()
       || (source != nullptr && (!source->is_valid() || source->get_vector_count() != n
-          || source->get_dimension() != dim || source_vids->count() != n))
+          || source->get_dimension() != dim || source_vids.count() != n))
       || (graph != nullptr && (!graph->is_valid() || graph->center_count_ != centers.count() / dim))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid DDL refinement sample state", K(ret), KP_(session), K(n), K(dim), "initialized", is_initialized(),
@@ -917,21 +923,21 @@ int ObIVFDDLHcaAdapter::begin_refine_samples(int64_t n, int64_t dim,
     } else {
       session_ = new (buf) ObIVFDDLRefineSession(allocator_, n, dim, centers, assignments, graph, &cancel_code_);
       auto &s = *session_;
-      const int64_t *samples = nullptr;
+      const share::ObVectorArray<int64_t> *samples = nullptr;
       int64_t count = 0;
-      if (OB_FAIL(s.working_values_.prepare_allocate(centers.count()))) {
+      if (OB_FAIL(s.working_values_.resize(centers.count()))) {
         LOG_WARN("failed to allocate DDL refinement centers", K(ret), "values", centers.count());
       } else if (OB_FAIL(s.trainer_.init(s.cache_, s.input_, s.assignments_,
           graph == nullptr ? nullptr : &s.neighbors_, parameters().refine_param_,
           parameters().center_norm_info_, s.working_))) {
         LOG_WARN("failed to initialize DDL refinement trainer", K(ret), K(n), K(dim));
       } else if (source != nullptr && source->is_fully_memory_resident()) {
-        if (OB_FAIL(s.cache_.init_resident(*source, *source_vids))) {
+        if (OB_FAIL(s.cache_.init_resident(*source, source_vids))) {
           LOG_WARN("failed to bind resident IVF refinement source", K(ret), K(n), K(dim));
         }
       } else if (OB_FAIL(s.trainer_.get_sample_indices(samples, count))) {
         LOG_WARN("failed to get DDL refinement sample indices", K(ret), K(n), K(dim));
-      } else if (OB_FAIL(s.cache_.init(samples, count, memory_limit, shards,
+      } else if (OB_FAIL(s.cache_.init(*samples, count, memory_limit, shards,
           parameters().refine_param_.max_iterations_, s.trainer_))) {
         LOG_WARN("failed to initialize DDL refinement sample cache", K(ret), K(count), K(n), K(dim));
       }
@@ -968,10 +974,10 @@ int ObIVFDDLHcaAdapter::finish_refine_sample_shard(int64_t shard)
   } else if (OB_SUCC(ret)) { ret = session_->cache_.finish_shard(shard); }
   return ret;
 }
-const ObIArray<int64_t> *ObIVFDDLHcaAdapter::refine_sample_indices() const
+const share::ObVectorArray<int64_t> *ObIVFDDLHcaAdapter::refine_sample_indices() const
 { return session_ == nullptr ? nullptr : &session_->cache_.indices(); }
 int ObIVFDDLHcaAdapter::load_refine_samples(const ObIArray<int64_t> &positions,
-    const ObIArray<float> &vectors, int64_t shard)
+    const share::ObVectorMatrix &vectors, int64_t shard)
 {
   int ret = ATOMIC_LOAD(&cancel_code_);
   if (OB_FAIL(ret)) {
@@ -996,8 +1002,8 @@ int ObIVFDDLHcaAdapter::finish_refine_samples()
   return ret;
 }
 int ObIVFDDLHcaAdapter::refine_train_prepare(ObIVFVectorReader &reader,
-    const ObIArray<ObIVFVectorVID> &vids, const ObIArray<float> &centers,
-    const ObIArray<int64_t> &assignments, const ObIVFNeighborGraphView *graph,
+    const ObIVFVectorIDView &vids, const share::ObVectorMatrix &centers,
+    const share::ObVectorArray<int64_t> &assignments, const ObIVFNeighborGraphView *graph,
     int64_t k, int64_t &batch_size)
 {
   UNUSEDx(reader, vids, centers, assignments, graph, k);
@@ -1027,7 +1033,7 @@ int ObIVFDDLHcaAdapter::refine_train_distances(int64_t begin, int64_t end)
   }
   return ret;
 }
-int ObIVFDDLHcaAdapter::refine_train_finish_batch(ObIArray<float> &centers, bool &finished)
+int ObIVFDDLHcaAdapter::refine_train_finish_batch(share::ObVectorMatrix &centers, bool &finished)
 {
   int ret = ATOMIC_LOAD(&cancel_code_);
   finished = false;
@@ -1096,7 +1102,7 @@ int ObIVFDDLHcaAdapter::execute_refine_phase(int64_t begin, int64_t end)
   return ret;
 }
 
-int ObIVFDDLHcaAdapter::finish_refine_phase(ObIArray<float> &centers, bool &finished)
+int ObIVFDDLHcaAdapter::finish_refine_phase(share::ObVectorMatrix &centers, bool &finished)
 {
   int ret = ATOMIC_LOAD(&cancel_code_);
   finished = false;
@@ -1115,7 +1121,8 @@ int ObIVFDDLHcaAdapter::finish_refine_phase(ObIArray<float> &centers, bool &fini
       s.phase_ = ObIVFRefinePhase::DISTANCE;
       if (OB_FAIL(s.trainer_.prepare_batch(s.rows_))) {
         if (ret == OB_ITER_END) {
-          if (OB_SUCC(ret = centers.assign(s.working_values_))) {
+          if (OB_SUCC(ret = centers.set_dimension(s.input_.dimension()))
+              && OB_SUCC(ret = centers.assign(s.working_values_))) {
             finished = true;
             release_samples();
           }
@@ -1127,9 +1134,9 @@ int ObIVFDDLHcaAdapter::finish_refine_phase(ObIArray<float> &centers, bool &fini
   return ret;
 }
 
-int ObIVFDDLHcaAdapter::refine_assign_loaded(const ObIArray<float> &values,
-    const ObIArray<int64_t> &indices, int64_t dim, const ObIArray<float> &centers,
-    const ObIArray<int64_t> &old_assignments, const ObIVFNeighborGraphView *graph,
+int ObIVFDDLHcaAdapter::refine_assign_loaded(const share::ObVectorMatrix &values,
+    const share::ObVectorArray<int64_t> &indices, int64_t dim, const share::ObVectorMatrix &centers,
+    const share::ObVectorArray<int64_t> &old_assignments, const ObIVFNeighborGraphView *graph,
     ObIArray<int64_t> &output)
 {
   int ret = ATOMIC_LOAD(&cancel_code_);
@@ -1146,7 +1153,8 @@ int ObIVFDDLHcaAdapter::refine_assign_loaded(const ObIArray<float> &values,
   } else {
     ddl_hca::Batch batch(values, dim);
     ddl_hca::Centers center_view(centers, dim);
-    ddl_hca::Assignments input(old_assignments, &indices), result(output, nullptr, &output);
+    ddl_hca::Assignments input(old_assignments, &indices);
+    ddl_hca::Assignments result(output, nullptr, &output);
     ddl_hca::Members members(center_view.count());
     ddl_hca::Changed changed(center_view.count());
     ddl_hca::Neighborhood neighbors(graph == nullptr ? ObIVFNeighborGraphView() : *graph);
@@ -1158,8 +1166,8 @@ int ObIVFDDLHcaAdapter::refine_assign_loaded(const ObIArray<float> &values,
   return ret;
 }
 
-int ObIVFDDLHcaAdapter::soar_assign_loaded(const ObIArray<float> &values, int64_t dim,
-    const ObIArray<float> &centers, const ObIArray<int64_t> &primary,
+int ObIVFDDLHcaAdapter::soar_assign_loaded(const share::ObVectorMatrix &values, int64_t dim,
+    const share::ObVectorMatrix &centers, const common::ObIArray<int64_t> &primary,
     const ObIVFNeighborGraphView *graph, ObIArray<int64_t> &secondary)
 {
   int ret = ATOMIC_LOAD(&cancel_code_);
@@ -1174,15 +1182,16 @@ int ObIVFDDLHcaAdapter::soar_assign_loaded(const ObIArray<float> &values, int64_
   } else if (OB_FAIL(secondary.prepare_allocate(primary.count()))) {
     LOG_WARN("failed to allocate DDL SOAR secondary assignments", K(ret), "count", primary.count());
   } else {
-    ObArray<int64_t> primary_output;
-    primary_output.set_attr(ObMemAttr(MTL_ID(), "IVFDDLBatch", ObCtxIds::VECTOR_CTX_ID));
+
+    common::ObArray<int64_t> primary_output(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ModulePageAllocator(ObMemAttr(MTL_ID(), "IVFDDLBatch", ObCtxIds::VECTOR_CTX_ID)));
     if (OB_FAIL(primary_output.prepare_allocate(primary.count()))) {
       LOG_WARN("failed to allocate DDL SOAR primary assignments", K(ret), "count", primary.count());
     } else {
       ddl_hca::Batch batch(values, dim);
       ddl_hca::Centers center_view(centers, dim);
-      ddl_hca::Assignments input(primary), a1(primary_output, nullptr, &primary_output),
-          a2(secondary, nullptr, &secondary);
+      ddl_hca::Assignments input(primary);
+      ddl_hca::Assignments a1(primary_output, nullptr, &primary_output);
+      ddl_hca::Assignments a2(secondary, nullptr, &secondary);
       ddl_hca::Members members(center_view.count());
       ddl_hca::Remap identity(center_view.count());
       ddl_hca::Neighborhood neighbors(graph == nullptr ? ObIVFNeighborGraphView() : *graph);

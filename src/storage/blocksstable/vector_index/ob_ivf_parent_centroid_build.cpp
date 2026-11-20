@@ -22,26 +22,26 @@ namespace
 class ObIVFCentroidMemoryInput final : public ObIVFVectorStore, public ObIVFFirstLevelSampleSet
 {
 public:
-  ObIVFCentroidMemoryInput(const float *values, int64_t count, int64_t dimension)
+  ObIVFCentroidMemoryInput(const share::ObVectorMatrix &values, int64_t count, int64_t dimension)
     : values_(values), count_(count), dimension_(dimension) {}
   bool is_valid() const override
-  { return values_ != nullptr && count_ > 0 && dimension_ > 0 && count_ <= INT64_MAX / dimension_; }
+  { return count_ > 0 && dimension_ > 0 && count_ <= INT64_MAX / dimension_; }
   bool is_fully_memory_resident() const override { return true; }
   int64_t get_vector_count() const override { return count_; }
   int64_t get_sample_count() const override { return count_; }
   int64_t get_dimension() const override { return dimension_; }
-  int get_all_vids(ObIArray<ObIVFVectorVID> &vids) const override
+  int get_all_vids(share::ObVectorArray<ObIVFVectorVID> &vids) const override
   {
     vids.reuse();
-    int ret = vids.prepare_allocate(count_);
+    int ret = share::vector_array_resize(vids, count_);
     if (OB_FAIL(ret)) {
       LOG_WARN("[DISK_BBQ] failed to allocate parent clustering input VIDs", K(ret), K_(count));
     }
     for (int64_t i = 0; OB_SUCC(ret) && i < count_; ++i) { vids.at(i) = i; }
     return ret;
   }
-  int batch_get_by_vid(const ObIArray<ObIVFVectorVID> &vids, int64_t begin, int64_t end,
-      ObIArray<float> &vectors) const override
+  int batch_get_by_vid(const ObIVFVectorIDView &vids, int64_t begin, int64_t end,
+      share::ObVectorMatrix &vectors) const override
   {
     int ret = OB_SUCCESS;
     vectors.reuse();
@@ -49,7 +49,8 @@ public:
         || end - begin > INT64_MAX / dimension_) {
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("[DISK_BBQ] invalid parent clustering vector batch", K(ret), K(begin), K(end), K_(count), K_(dimension));
-    } else if (OB_FAIL(vectors.prepare_allocate((end - begin) * dimension_))) {
+    } else if (OB_FAIL(vectors.set_dimension(dimension_))) {
+    } else if (OB_FAIL(vectors.resize((end - begin) * dimension_))) {
       LOG_WARN("[DISK_BBQ] failed to allocate parent clustering vector batch", K(ret),
           K(begin), K(end), K_(dimension), "value_count", (end - begin) * dimension_);
     } else {
@@ -59,15 +60,14 @@ public:
           LOG_WARN("[DISK_BBQ] parent clustering input VID is out of range", K(ret), K(i), "vid", vids.at(i), K_(count));
         }
         else {
-          MEMCPY(vectors.get_data() + (i - begin) * dimension_,
-              values_ + vids.at(i) * dimension_, dimension_ * sizeof(float));
+          vectors.copy_from((i - begin) * dimension_, values_.data_at(vids.at(i) * dimension_, dimension_), dimension_);
         }
       }
     }
     return ret;
   }
   int batch_get_samples(int64_t begin, int64_t end, ObIArray<ObIVFVectorVID> &vids,
-      ObIArray<float> &vectors) const override
+      share::ObVectorMatrix &vectors) const override
   {
     int ret = OB_SUCCESS;
     vids.reuse();
@@ -77,17 +77,19 @@ public:
       LOG_WARN("[DISK_BBQ] invalid parent clustering sample range", K(ret), K(begin), K(end), K_(count), K_(dimension));
     } else if (OB_FAIL(vids.prepare_allocate(end - begin))) {
       LOG_WARN("[DISK_BBQ] failed to allocate parent sample VIDs", K(ret), K(begin), K(end));
-    } else if (OB_FAIL(vectors.prepare_allocate((end - begin) * dimension_))) {
+    } else if (OB_FAIL(vectors.set_dimension(dimension_))) {
+    } else if (OB_FAIL(vectors.resize((end - begin) * dimension_))) {
       LOG_WARN("[DISK_BBQ] failed to allocate parent sample vectors", K(ret), K(begin), K(end), K_(dimension));
     } else {
       for (int64_t i = begin; i < end; ++i) { vids.at(i - begin) = i; }
-      MEMCPY(vectors.get_data(), values_ + begin * dimension_,
-          (end - begin) * dimension_ * sizeof(float));
+      for (int64_t i = begin; i < end; ++i) {
+        vectors.copy_from((i - begin) * dimension_, values_.data_at(i * dimension_, dimension_), dimension_);
+      }
     }
     return ret;
   }
 private:
-  const float *values_;
+  const share::ObVectorMatrix &values_;
   int64_t count_;
   int64_t dimension_;
 };
@@ -97,8 +99,8 @@ private:
 class ObIVFNoPhysicalOutput final : public ObIVFMergeQuantizer
 {
 public:
-  int quantize_cluster(ObIVFVectorReader &, const ObIArray<float> &, int64_t, int64_t,
-      const ObIArray<ObIVFVectorVID> &, const ObIArray<ObIVFVectorVID> *) override
+  int quantize_cluster(ObIVFVectorReader &, const share::ObVectorMatrix &, int64_t, int64_t, const ObIVFVectorIDView &,
+      const storage::ObIVFVectorIDView *) override
   {
     int ret = OB_STATE_NOT_MATCH;
     LOG_WARN("[DISK_BBQ] unexpected physical output stage during parent centroid clustering", K(ret));
@@ -110,7 +112,7 @@ public:
     LOG_WARN("[DISK_BBQ] unexpected physical output stage during parent centroid clustering", K(ret));
     return ret;
   }
-  int write_raw_vectors(ObIVFVectorReader &, const ObIArray<ObIVFVectorVID> &,
+  int write_raw_vectors(ObIVFVectorReader &, const ObIVFVectorIDView &,
       int64_t, int64_t, int64_t) override
   {
     int ret = OB_STATE_NOT_MATCH;
@@ -128,7 +130,7 @@ public:
 
 struct ObIVFParentCentroidBuilder::State
 {
-  State(const float *values, int64_t count, int64_t dim)
+  State(const share::ObVectorMatrix &values, int64_t count, int64_t dim)
     : source_(values, count, dim), input_(), graph_allocator_(nullptr), algorithm_(),
       output_(), processor_(), flow_(), stage_(ObIVFMergeStage::INVALID),
       step_(ObIVFMergeStep::INVALID), depth_(-1), plan_id_(-1), task_count_(0), prepared_(false), finished_(false) {}
@@ -172,7 +174,7 @@ ObIVFParentCentroidBuilder::~ObIVFParentCentroidBuilder()
   if (state_ != nullptr) { state_->~State(); allocator_.free(state_); }
 }
 
-int ObIVFParentCentroidBuilder::init(const ObIArrayWrap<float> &leaves, int64_t dimension,
+int ObIVFParentCentroidBuilder::init(const share::ObVectorMatrix &leaves, int64_t dimension,
     const ObIVFHcaAlgorithmParam &param, int64_t cluster_size)
 {
   int ret = OB_SUCCESS;
@@ -180,19 +182,17 @@ int ObIVFParentCentroidBuilder::init(const ObIArrayWrap<float> &leaves, int64_t 
   if (state_ != nullptr) {
     ret = OB_INIT_TWICE;
     LOG_WARN("[DISK_BBQ] parent centroid builder is already initialized", K(ret));
-  } else if (dimension <= 0 || leaves.empty() || leaves.get_data() == nullptr
-      || leaves.count() % dimension != 0 || leaves.count() / dimension > INT32_MAX
+  } else if (dimension <= 0 || leaves.empty() || leaves.count() % dimension != 0 || leaves.count() / dimension > INT32_MAX
       || cluster_size <= 0 || !param.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("[DISK_BBQ] invalid parent centroid build input", K(ret), K(dimension), K(cluster_size),
-        "leaf_values", leaves.count(), "has_leaf_data", leaves.get_data() != nullptr,
-        "cluster_params_valid", param.is_valid());
+        "leaf_values", leaves.count(), "cluster_params_valid", param.is_valid());
   } else if ((mem = allocator_.alloc(sizeof(State))) == nullptr) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("[DISK_BBQ] failed to allocate parent centroid builder state", K(ret),
         K(dimension), "leaf_values", leaves.count(), "alloc_size", sizeof(State));
   } else {
-    state_ = new (mem) State(leaves.get_data(), leaves.count() / dimension, dimension);
+    state_ = new (mem) State(leaves, leaves.count() / dimension, dimension);
     // The shared clustering kernels use L2 in the existing FHT coordinates.
     // New parent-center normalization is supplied by the algorithm parameters.
     if (OB_FAIL(state_->input_.init(state_->source_, state_->source_, cluster_size,

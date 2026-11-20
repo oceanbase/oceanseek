@@ -6,6 +6,7 @@
 #ifndef OCEANBASE_STORAGE_BLOCKSSTABLE_VECTOR_INDEX_OB_IVF_HCA_ALGORITHM_ADAPTER_H_
 #define OCEANBASE_STORAGE_BLOCKSSTABLE_VECTOR_INDEX_OB_IVF_HCA_ALGORITHM_ADAPTER_H_
 
+#include "storage/blocksstable/vector_index/ob_ivf_vector_ids.h"
 #include "lib/vector/ob_vsag_adaptor.h"
 #include "lib/allocator/page_arena.h"
 #include "lib/vector/ob_vsag_adaptor.h"
@@ -65,14 +66,14 @@ public:
 
   virtual int check_cluster_quality(const common::ObIArray<int64_t> &counts, bool &degenerate) override;
   virtual int insertion_train_centers(ObIVFVectorReader &reader,
-      const common::ObIArray<ObIVFVectorVID> &all_vids,
+      const ObIVFVectorIDView &all_vids,
       const ObIVFFirstLevelSampleSet &first_level_samples,
-      const common::ObIArray<float> &initial_centers, const int64_t center_count,
-      common::ObIArray<float> &trained_centers) override;
+      const share::ObVectorMatrix &initial_centers, const int64_t center_count,
+      share::ObVectorMatrix &trained_centers) override;
 
   virtual int insertion_assign_vectors(ObIVFVectorReader &reader,
-      const common::ObIArray<ObIVFVectorVID> &vids,
-      const common::ObIArray<float> &centers,
+      const ObIVFVectorIDView &vids,
+      const share::ObVectorMatrix &centers,
       const common::ObIArray<int64_t> &offsets,
       const common::ObIArray<int64_t> &candidates,
       int64_t begin, int64_t end, common::ObIArray<int64_t> &assignments) override;
@@ -83,52 +84,52 @@ public:
   virtual int hca_train_loaded_samples(const int64_t vector_count,
       const int64_t cluster_size, const int64_t dimension,
       const common::ObIArray<int64_t> &ordinals,
-      const common::ObIArray<float> &vectors, int64_t &local_k,
-      common::ObIArray<float> &centers) override;
+      const share::ObVectorMatrix &vectors, int64_t &local_k,
+      share::ObVectorMatrix &centers) override;
 
   virtual int hca_train_local_centers(
       const int64_t depth,
       const int64_t node_idx,
       ObIVFVectorReader &reader,
-      const common::ObIArray<ObIVFVectorVID> &node_vids,
+      const ObIVFVectorIDView &node_vids,
       const ObIVFFirstLevelSampleSet *first_level_samples,
       const int64_t cluster_size,
       int64_t &local_k,
-      common::ObIArray<float> &local_centers) override;
+      share::ObVectorMatrix &local_centers) override;
   virtual int hca_assign_vectors(
       ObIVFVectorReader &reader,
-      const common::ObIArray<ObIVFVectorVID> &node_vids,
-      const common::ObIArray<float> &local_centers,
+      const ObIVFVectorIDView &node_vids,
+      const share::ObVectorMatrix &local_centers,
       const int64_t local_k,
       const int64_t vid_begin,
       const int64_t vid_end,
       common::ObIArray<int64_t> &local_center_idxs) override;
   virtual bool supports_loaded_assign() const override { return true; }
   virtual int hca_assign_loaded_vectors(
-      const common::ObIArray<float> &vectors,
+      const share::ObVectorMatrix &vectors,
       const common::ObIArray<int64_t> &positions,
       const int64_t begin, const int64_t end, const int64_t dimension,
-      const common::ObIArray<float> &centers, const int64_t local_k,
+      const share::ObVectorMatrix &centers, const int64_t local_k,
       common::ObIArray<int64_t> &assignments) override;
   virtual bool supports_source_update() const override { return true; }
   virtual void hca_accumulate_center_stats(float *sum, const float *vector,
       const int64_t dimension) override;
   virtual int hca_finalize_center_stats(const float *sum, const int64_t count,
-      const int64_t dimension, common::ObIArray<float> &center) override;
+      const int64_t dimension, share::ObVectorMatrix &center) override;
   virtual int hca_compute_local_center_stats_range(
       ObIVFVectorReader &reader,
-      const common::ObIArray<ObIVFVectorVID> &member_vids,
-      const common::ObIArray<float> &local_centers,
+      const ObIVFVectorIDView &member_vids,
+      const share::ObVectorMatrix &local_centers,
       const int64_t local_center_idx,
-      common::ObIArray<float> &updated_center) override;
+      share::ObVectorMatrix &updated_center) override;
 
   virtual int neighborhood_begin(
       const ObIVFNeighborhoodMode mode,
-      const common::ObIArray<float> &centers,
+      const share::ObVectorMatrix &centers,
       const int64_t center_count,
       const int64_t dimension) override;
   virtual int neighborhood_add_centers(
-      const common::ObIArray<float> &centers,
+      const share::ObVectorMatrix &centers,
       const int64_t center_count,
       const int64_t dimension,
       const int64_t cid_begin,
@@ -136,7 +137,7 @@ public:
   virtual int neighborhood_finish_add() override;
   virtual int neighborhood_find_neighbors(
       const ObIVFNeighborhoodMode mode,
-      const common::ObIArray<float> &centers,
+      const share::ObVectorMatrix &centers,
       const int64_t center_count,
       const int64_t dimension,
       const int64_t cid_begin,
@@ -148,27 +149,27 @@ public:
 
   virtual int refine_train(
       ObIVFVectorReader &reader,
-      const common::ObIArray<ObIVFVectorVID> &all_vids,
-      const common::ObIArray<float> &centers,
-      const common::ObIArray<int64_t> &assignments,
+      const ObIVFVectorIDView &all_vids,
+      const share::ObVectorMatrix &centers,
+      const share::ObVectorArray<int64_t> &assignments,
       const ObIVFNeighborGraphView *neighbor_graph,
       const int64_t center_count,
-      common::ObIArray<float> &working_centers) override;
+      share::ObVectorMatrix &working_centers) override;
   bool supports_parallel_refine() const override { return true; }
   int refine_train_begin(ObIVFVectorReader &reader,
-      const common::ObIArray<ObIVFVectorVID> &vids,
-      const common::ObIArray<float> &centers,
-      const common::ObIArray<int64_t> &assignments,
+      const ObIVFVectorIDView &vids,
+      const share::ObVectorMatrix &centers,
+      const share::ObVectorArray<int64_t> &assignments,
       const ObIVFNeighborGraphView *graph, int64_t center_count,
-      common::ObIArray<float> &working_centers) override;
+      share::ObVectorMatrix &working_centers) override;
   int64_t refine_train_task_count() const override;
   int refine_train_distance_task(int64_t task_idx) override;
-  int refine_train_finish_batch(common::ObIArray<float> &centers, bool &finished) override;
+  int refine_train_finish_batch(share::ObVectorMatrix &centers, bool &finished) override;
   virtual int refine_assign_vectors(
       ObIVFVectorReader &reader,
-      const common::ObIArray<ObIVFVectorVID> &all_vids,
-      const common::ObIArray<float> &working_centers,
-      const common::ObIArray<int64_t> &old_assignments,
+      const ObIVFVectorIDView &all_vids,
+      const share::ObVectorMatrix &working_centers,
+      const share::ObVectorArray<int64_t> &old_assignments,
       const ObIVFNeighborGraphView *neighbor_graph,
       const int64_t center_count,
       const int64_t vid_begin,
@@ -176,15 +177,15 @@ public:
       common::ObIArray<int64_t> &new_cids) override;
   virtual int refine_update_center(
       ObIVFVectorReader &reader,
-      const common::ObIArray<ObIVFVectorVID> &member_vids,
-      const common::ObIArray<float> &working_centers,
+      const ObIVFVectorIDView &member_vids,
+      const share::ObVectorMatrix &working_centers,
       const int64_t center_count,
       const int64_t cid,
-      common::ObIArray<float> &updated_center) override;
+      share::ObVectorMatrix &updated_center) override;
   virtual int soar_assign_secondary(
       ObIVFVectorReader &reader,
-      const common::ObIArray<ObIVFVectorVID> &all_vids,
-      const common::ObIArray<float> &final_centers,
+      const ObIVFVectorIDView &all_vids,
+      const share::ObVectorMatrix &final_centers,
       const common::ObIArray<int64_t> &primary_cids,
       const ObIVFNeighborGraphView *neighbor_graph,
       const int64_t center_count,

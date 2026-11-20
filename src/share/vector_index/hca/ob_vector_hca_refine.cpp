@@ -146,8 +146,8 @@ public:
         dimension_(v.dimension()), sample_size_(0), batch_size_(0),
         candidate_stride_(0), epoch_(0), offset_(0), learning_rate_shift_(0),
         median_(), median_inited_(false), batch_ready_(false),
-        distances_(allocator), sample_indices_(allocator),
-        shuffled_indices_(allocator), batch_indices_(allocator),
+        distances_(vector_array_allocator(allocator)), sample_indices_(vector_array_allocator(allocator)),
+        shuffled_indices_(vector_array_allocator(allocator)), batch_indices_(vector_array_allocator(allocator)),
         local_assignments_(allocator), cumulative_weights_(allocator),
         updated_centers_(allocator), batch_vectors_(allocator),
         row_max_(allocator), row_done_(allocator), finish_phase_(0), alpha_(0.0F),
@@ -215,16 +215,16 @@ public:
         LOG_WARN("hca refine distance matrix element count overflows int64",
                  K(ret), K(batch_size_), K(candidate_stride_));
       } else {
-        if (OB_FAIL(distances_.allocate(batch_size_ * candidate_stride_))) {
+        if (OB_FAIL(allocate_build_array(distances_, batch_size_ * candidate_stride_))) {
           LOG_WARN("failed to allocate hca refine distances_", K(ret),
                    K(batch_size_), K(candidate_stride_));
-        } else if (OB_FAIL(sample_indices_.allocate(sample_size_))) {
+        } else if (OB_FAIL(allocate_build_array(sample_indices_, sample_size_))) {
           LOG_WARN("failed to allocate hca refine sample indices", K(ret),
                    K(sample_size_));
-        } else if (OB_FAIL(shuffled_indices_.allocate(sample_size_))) {
+        } else if (OB_FAIL(allocate_build_array(shuffled_indices_, sample_size_))) {
           LOG_WARN("failed to allocate shuffled hca refine indices", K(ret),
                    K(sample_size_));
-        } else if (OB_FAIL(batch_indices_.allocate(batch_size_))) {
+        } else if (OB_FAIL(allocate_build_array(batch_indices_, batch_size_))) {
           LOG_WARN("failed to allocate hca refine batch indices", K(ret),
                    K(batch_size_));
         } else if (OB_FAIL(local_assignments_.allocate(batch_size_))) {
@@ -256,7 +256,7 @@ public:
           }
           if (OB_SUCC(ret)) {
             if (vector_idx < sample_size_) {
-              sample_indices_[vector_idx] = vector_idx;
+              sample_indices_.at(vector_idx) = vector_idx;
             } else {
               const int64_t selected = sample_random.get(0, vector_idx);
               if (selected < 0 || selected > vector_idx) {
@@ -264,7 +264,7 @@ public:
                 LOG_WARN("invalid hca refine reservoir sample index", K(ret),
                          K(vector_idx), K(selected), K(sample_size_));
               } else if (selected < sample_size_) {
-                sample_indices_[selected] = vector_idx;
+                sample_indices_.at(selected) = vector_idx;
               }
             }
           }
@@ -286,19 +286,20 @@ public:
     }
     return ret;
   }
-  int get_sample_indices(const int64_t *&indices, int64_t &count) const {
-    indices = sample_indices_.get();
+  int get_sample_indices(const share::ObVectorArray<int64_t> *&indices, int64_t &count) const {
+    indices = &sample_indices_;
     count = sample_size_;
     return indices != nullptr && count > 0 ? OB_SUCCESS : OB_NOT_INIT;
   }
-  int get_epoch_sample_indices(int64_t epoch, int64_t *indices, int64_t count,
+  int get_epoch_sample_indices(int64_t epoch, share::ObVectorArray<int64_t> &indices, int64_t count,
       int64_t &batch_size) const {
     int ret = OB_SUCCESS;
     batch_size = 0;
-    if (epoch < 0 || epoch >= param_.max_iterations_ || indices == nullptr || count != sample_size_) {
+    if (epoch < 0 || epoch >= param_.max_iterations_ || count != sample_size_) {
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("invalid HCA refinement epoch schedule", K(ret), K(epoch), K(count), K(sample_size_));
-    } else if (OB_FAIL(shuffle_samples(sample_indices_.get(), sample_size_,
+    } else if (OB_FAIL(shuffle_build_samples(
+                   sample_indices_, sample_size_,
         param_.random_seed_ + 2 + static_cast<uint64_t>(epoch), indices))) {
       LOG_WARN("failed to copy HCA refinement epoch schedule", K(ret), K(epoch), K(count));
     } else {
@@ -317,28 +318,28 @@ public:
       return OB_ITER_END;
     if (offset_ == 0) {
       int64_t planned_batch_size = 0;
-      ret = get_epoch_sample_indices(epoch_, shuffled_indices_.get(), sample_size_, planned_batch_size);
+      ret = get_epoch_sample_indices(epoch_, shuffled_indices_, sample_size_, planned_batch_size);
       if (OB_FAIL(ret)) {
         LOG_WARN("failed to shuffle HCA refine samples", K(ret), K(epoch_), K(sample_size_));
       }
     }
     if (OB_SUCC(ret)) {
       for (int64_t row = 0; row < batch_size_; ++row) {
-        batch_indices_[row] = shuffled_indices_[(offset_ + row) % sample_size_];
+        batch_indices_.at(row) = shuffled_indices_.at((offset_ + row) % sample_size_);
       }
-      lib::ob_sort(batch_indices_.get(), batch_indices_.get() + batch_size_);
-      ret = all_vectors_.prefetch_vectors(batch_indices_.get(), batch_size_);
+      lib::ob_sort(vector_array_begin(batch_indices_), vector_array_end(batch_indices_));
+      ret = all_vectors_.prefetch_vectors(batch_indices_, batch_size_);
       if (OB_FAIL(ret)) {
         LOG_WARN("failed to prefetch HCA refine batch", K(ret), K(epoch_), K(offset_), K(batch_size_));
       }
     }
     for (int64_t row = 0; OB_SUCC(ret) && row < batch_size_; ++row) {
-      ret = all_vectors_.get_vector(batch_indices_[row], batch_vectors_[row]);
+      ret = all_vectors_.get_vector(batch_indices_.at(row), batch_vectors_[row]);
       if (OB_FAIL(ret)) {
-        LOG_WARN("failed to read HCA refine batch vector", K(ret), K(row), K(batch_indices_[row]));
+        LOG_WARN("failed to read HCA refine batch vector", K(ret), K(row), K(batch_indices_.at(row)));
       } else if (OB_ISNULL(batch_vectors_[row])) {
         ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("null HCA refine batch vector", K(ret), K(row), K(batch_indices_[row]));
+        LOG_WARN("null HCA refine batch vector", K(ret), K(row), K(batch_indices_.at(row)));
       }
     }
     if (OB_SUCC(ret)) {
@@ -356,7 +357,7 @@ public:
       return OB_INVALID_ARGUMENT;
     }
     for (int64_t row = begin; OB_SUCC(ret) && row < end; ++row) {
-      const int64_t vector_idx = batch_indices_[row];
+      const int64_t vector_idx = batch_indices_.at(row);
       const float *vector = batch_vectors_[row];
       float max_distance = 0.0F;
       int32_t owner_cid = -1;
@@ -395,7 +396,7 @@ public:
           } else {
             const float distance =
                 hca_square_distance(vector, center, dimension_);
-            distances_[row * candidate_stride_ + candidate_offset] = distance;
+            distances_.at(row * candidate_stride_ + candidate_offset) = distance;
             max_distance = std::max(max_distance, distance);
           }
         }
@@ -434,10 +435,10 @@ public:
       for (int64_t row = 0; row < batch_size_; ++row) {
         int32_t owner_cid = -1;
         int64_t candidate_count = 0;
-        if (OB_FAIL(input_assignments_.get_assignment(batch_indices_[row],
+        if (OB_FAIL(input_assignments_.get_assignment(batch_indices_.at(row),
                                                       owner_cid))) {
           LOG_WARN("failed to reread sampled hca refine assignment", K(ret),
-                   K(row), K(batch_indices_[row]));
+                   K(row), K(batch_indices_.at(row)));
           break;
         } else if (OB_FAIL(get_refine_candidate_count(neighborhood_,
                                                       center_count_, owner_cid,
@@ -449,7 +450,7 @@ public:
         for (int64_t candidate_offset = 0; candidate_offset < candidate_count;
              ++candidate_offset) {
           median_.update(
-              distances_[row * candidate_stride_ + candidate_offset]);
+              distances_.at(row * candidate_stride_ + candidate_offset));
         }
       }
     }
@@ -463,10 +464,10 @@ public:
     for (int64_t row = 0; OB_SUCC(ret) && row < batch_size_; ++row) {
       int32_t owner_cid = -1;
       int64_t candidate_count = 0;
-      if (OB_FAIL(input_assignments_.get_assignment(batch_indices_[row],
+      if (OB_FAIL(input_assignments_.get_assignment(batch_indices_.at(row),
                                                     owner_cid))) {
         LOG_WARN("failed to read hca refine assignment for penalty", K(ret),
-                 K(row), K(batch_indices_[row]));
+                 K(row), K(batch_indices_.at(row)));
       } else if (OB_FAIL(get_refine_candidate_count(neighborhood_,
                                                     center_count_, owner_cid,
                                                     candidate_count))) {
@@ -485,9 +486,8 @@ public:
             LOG_WARN("failed to get penalized hca refine candidate", K(ret),
                      K(row), K(owner_cid), K(candidate_offset));
           } else {
-            const float adjusted =
-                distances_[row * candidate_stride_ + candidate_offset] +
-                alpha * cumulative_weights_[candidate_cid];
+            const float adjusted = distances_.at(row * candidate_stride_ + candidate_offset)
+                + alpha * cumulative_weights_[candidate_cid];
             if (candidate_offset == 0 || adjusted < best_adjusted) {
               best_adjusted = adjusted;
               best_cid = candidate_cid;
@@ -585,10 +585,10 @@ public:
       for (int64_t row = 0; row < batch_size_; ++row) {
         int32_t owner_cid = -1;
         int64_t candidate_count = 0;
-        if (OB_FAIL(input_assignments_.get_assignment(batch_indices_[row],
+        if (OB_FAIL(input_assignments_.get_assignment(batch_indices_.at(row),
                                                       owner_cid))) {
           LOG_WARN("failed to reread sampled hca refine assignment", K(ret),
-                   K(row), K(batch_indices_[row]));
+                   K(row), K(batch_indices_.at(row)));
           break;
         } else if (OB_FAIL(get_refine_candidate_count(neighborhood_,
                                                       center_count_, owner_cid,
@@ -600,7 +600,7 @@ public:
         for (int64_t candidate_offset = 0; candidate_offset < candidate_count;
              ++candidate_offset) {
           median_.update(
-              distances_[row * candidate_stride_ + candidate_offset]);
+              distances_.at(row * candidate_stride_ + candidate_offset));
         }
       }
     }
@@ -624,10 +624,10 @@ public:
     for (int64_t row = begin; OB_SUCC(ret) && row < end; ++row) {
       int32_t owner_cid = -1;
       int64_t candidate_count = 0;
-      if (OB_FAIL(input_assignments_.get_assignment(batch_indices_[row],
+      if (OB_FAIL(input_assignments_.get_assignment(batch_indices_.at(row),
                                                     owner_cid))) {
         LOG_WARN("failed to read hca refine assignment for penalty", K(ret),
-                 K(row), K(batch_indices_[row]));
+                 K(row), K(batch_indices_.at(row)));
       } else if (OB_FAIL(get_refine_candidate_count(neighborhood_,
                                                     center_count_, owner_cid,
                                                     candidate_count))) {
@@ -646,9 +646,8 @@ public:
             LOG_WARN("failed to get penalized hca refine candidate", K(ret),
                      K(row), K(owner_cid), K(candidate_offset));
           } else {
-            const float adjusted =
-                distances_[row * candidate_stride_ + candidate_offset] +
-                alpha_ * cumulative_weights_[candidate_cid];
+            const float adjusted = distances_.at(row * candidate_stride_ + candidate_offset)
+                + alpha_ * cumulative_weights_[candidate_cid];
             if (candidate_offset == 0 || adjusted < best_adjusted) {
               best_adjusted = adjusted;
               best_cid = candidate_cid;
@@ -790,10 +789,10 @@ private:
   OnlineQuantileEstimator median_;
   bool median_inited_;
   bool batch_ready_;
-  ScopedArray<float> distances_;
-  ScopedArray<int64_t> sample_indices_;
-  ScopedArray<int64_t> shuffled_indices_;
-  ScopedArray<int64_t> batch_indices_;
+  ObVectorArray<float> distances_;
+  ObVectorArray<int64_t> sample_indices_;
+  ObVectorArray<int64_t> shuffled_indices_;
+  ObVectorArray<int64_t> batch_indices_;
   ScopedArray<int32_t> local_assignments_;
   ScopedArray<float> cumulative_weights_;
   ScopedArray<uint8_t> updated_centers_;
@@ -841,12 +840,13 @@ int ObHcaRefineTrainer::init(const ObHcaVectorAccessor &vectors,
   }
   return ret;
 }
-int ObHcaRefineTrainer::get_sample_indices(const int64_t *&indices, int64_t &count) const {
+int ObHcaRefineTrainer::get_sample_indices(const share::ObVectorArray<int64_t> *&indices, int64_t &count) const
+{
   indices = nullptr;
   count = 0;
   return impl_ == nullptr ? OB_NOT_INIT : impl_->get_sample_indices(indices, count);
 }
-int ObHcaRefineTrainer::get_epoch_sample_indices(int64_t epoch, int64_t *indices,
+int ObHcaRefineTrainer::get_epoch_sample_indices(int64_t epoch, share::ObVectorArray<int64_t> &indices,
     int64_t count, int64_t &batch_size) const {
   int ret = OB_SUCCESS;
   batch_size = 0;

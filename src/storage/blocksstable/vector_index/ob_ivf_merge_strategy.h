@@ -6,6 +6,7 @@
 #define OCEANBASE_STORAGE_BLOCKSSTABLE_VECTOR_INDEX_OB_IVF_MERGE_STRATEGY_H_
 
 #include "lib/container/ob_array.h"
+#include "share/vector_index/ob_vector_build_array.h"
 #include "share/vector_index/hca/ob_vector_hca_common.h"
 #include "storage/blocksstable/vector_index/ob_ivf_task_plan.h"
 
@@ -43,16 +44,14 @@ struct ObIVFPriorPosting
 
 struct ObIVFMergePrior
 {
-  explicit ObIVFMergePrior(common::ObIAllocator &allocator)
+  explicit ObIVFMergePrior(common::ObIAllocator &allocator, common::ObIAllocator *posting_allocator = nullptr)
     : dimension_(0), vector_count_(0), covered_vector_count_(0), dominant_segment_(-1),
-      segments_(), centroids_(), old_cids_(), posting_mass_(), postings_(), postings_complete_(false), counts_complete_(false),
-      posting_source_(nullptr), routing_source_(nullptr)
+        segments_(), centroids_(share::vector_array_allocator(allocator)),
+        old_cids_(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ObWrapperAllocator(allocator)), posting_mass_(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ObWrapperAllocator(allocator)),
+        postings_(share::vector_array_allocator(posting_allocator == nullptr ? allocator : *posting_allocator)),
+        postings_complete_(false), counts_complete_(false), posting_source_(nullptr), routing_source_(nullptr)
   {
     segments_.set_block_allocator(common::ObWrapperAllocator(allocator));
-    centroids_.set_block_allocator(common::ObWrapperAllocator(allocator));
-    old_cids_.set_block_allocator(common::ObWrapperAllocator(allocator));
-    posting_mass_.set_block_allocator(common::ObWrapperAllocator(allocator));
-    postings_.set_block_allocator(common::ObWrapperAllocator(allocator));
   }
   int validate() const;
   bool can_concatenate() const
@@ -65,10 +64,10 @@ struct ObIVFMergePrior
   int64_t covered_vector_count_;
   int64_t dominant_segment_;
   common::ObArray<ObIVFSegmentPriorInfo, common::ObWrapperAllocator> segments_;
-  common::ObArray<float, common::ObWrapperAllocator> centroids_;
+  share::ObVectorMatrix centroids_;
   common::ObArray<int64_t, common::ObWrapperAllocator> old_cids_;
   common::ObArray<int64_t, common::ObWrapperAllocator> posting_mass_;
-  common::ObArray<ObIVFPriorPosting, common::ObWrapperAllocator> postings_;
+  share::ObVectorArray<ObIVFPriorPosting> postings_;
   bool postings_complete_;
   // Counts can be certified from metadata without materializing memberships.
   bool counts_complete_;

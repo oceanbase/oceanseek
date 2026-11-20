@@ -92,6 +92,30 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ScopedArray);
 };
 
+// Refinement arrays own bounded Ob2DArray blocks directly.
+template <typename T> int allocate_build_array(ObVectorArray<T> &array, int64_t count, bool zero = false)
+{
+  array.reset();
+  return vector_array_resize(array, count, zero);
+}
+
+inline int shuffle_build_samples(
+    const share::ObVectorArray<int64_t> &samples, int64_t count, uint64_t seed, share::ObVectorArray<int64_t> &shuffled)
+{
+  int ret = OB_SUCCESS;
+  if (count <= 0 || count != samples.count() || count != shuffled.count()) { ret = OB_INVALID_ARGUMENT; }
+  else {
+    for (int64_t i = 0; i < count; ++i) { shuffled.at(i) = samples.at(i); }
+    common::ObRandom random; random.seed(seed);
+    for (int64_t i = count - 1; i > 0; --i) {
+      const int64_t selected = random.get(0, i);
+      if (selected < 0 || selected > i) { ret = OB_ERR_UNEXPECTED; break; }
+      std::swap(shuffled.at(i), shuffled.at(selected));
+    }
+  }
+  return ret;
+}
+
 // Convert a local ObRandom stream to [0, 1) values. Exact Java RNG parity is
 // intentionally not required; only fixed-seed repeatability is required.
 inline float random_unit_float(common::ObRandom &random) {

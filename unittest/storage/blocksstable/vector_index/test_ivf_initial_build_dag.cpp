@@ -40,16 +40,16 @@ public:
   virtual bool is_valid() const override { return true; }
   virtual int64_t get_vector_count() const override { return 1; }
   virtual int64_t get_dimension() const override { return 1; }
-  virtual int get_all_vids(ObIArray<ObIVFVectorVID> &vids) const override
+  virtual int get_all_vids(share::ObVectorArray<ObIVFVectorVID> &vids) const override
   {
     vids.reset();
     return vids.push_back(VID);
   }
   virtual int batch_get_by_vid(
-      const ObIArray<ObIVFVectorVID> &vids,
+      const ObIVFVectorIDView &vids,
       const int64_t vid_begin,
       const int64_t vid_end,
-      ObIArray<float> &vectors) const override
+      share::ObVectorMatrix &vectors) const override
   {
     int ret = OB_SUCCESS;
     vectors.reset();
@@ -70,7 +70,7 @@ public:
       const int64_t sample_begin,
       const int64_t sample_end,
       ObIArray<ObIVFVectorVID> &sample_vids,
-      ObIArray<float> &sample_vectors) const override
+      share::ObVectorMatrix &sample_vectors) const override
   {
     int ret = OB_SUCCESS;
     sample_vids.reset();
@@ -99,11 +99,11 @@ public:
       const int64_t depth,
       const int64_t node_idx,
       ObIVFVectorReader &reader,
-      const ObIArray<ObIVFVectorVID> &node_vids,
+      const ObIVFVectorIDView &node_vids,
       const ObIVFFirstLevelSampleSet *first_level_samples,
       const int64_t cluster_size,
       int64_t &local_k,
-      ObIArray<float> &local_centers) override
+      share::ObVectorMatrix &local_centers) override
   {
     UNUSEDx(node_idx, reader);
     if (0 == depth) {
@@ -118,8 +118,8 @@ public:
 
   virtual int hca_assign_vectors(
       ObIVFVectorReader &reader,
-      const ObIArray<ObIVFVectorVID> &node_vids,
-      const ObIArray<float> &local_centers,
+      const ObIVFVectorIDView &node_vids,
+      const share::ObVectorMatrix &local_centers,
       const int64_t local_k,
       const int64_t vid_begin,
       const int64_t vid_end,
@@ -136,10 +136,10 @@ public:
 
   virtual int hca_compute_local_center_stats_range(
       ObIVFVectorReader &reader,
-      const ObIArray<ObIVFVectorVID> &member_vids,
-      const ObIArray<float> &local_centers,
+      const ObIVFVectorIDView &member_vids,
+      const share::ObVectorMatrix &local_centers,
       const int64_t local_center_idx,
-      ObIArray<float> &updated_center) override
+      share::ObVectorMatrix &updated_center) override
   {
     UNUSEDx(reader, local_centers);
     updated_center.reset();
@@ -148,13 +148,9 @@ public:
         : OB_INVALID_ARGUMENT;
   }
 
-  virtual int quantize_cluster(
-      ObIVFVectorReader &reader,
-      const ObIArray<float> &final_centers,
-      const int64_t center_count,
-      const int64_t cid,
-      const ObIArray<ObIVFVectorVID> &primary_member_vids,
-      const ObIArray<ObIVFVectorVID> *secondary_member_vids) override
+  virtual int quantize_cluster(ObIVFVectorReader &reader, const share::ObVectorMatrix &final_centers,
+      const int64_t center_count, const int64_t cid, const ObIVFVectorIDView &primary_member_vids,
+      const storage::ObIVFVectorIDView *secondary_member_vids) override
   {
     UNUSED(reader);
     if (1 != center_count || 0 != cid || 1 != final_centers.count()
@@ -181,7 +177,7 @@ public:
 
   virtual int write_raw_vectors(
       ObIVFVectorReader &reader,
-      const ObIArray<ObIVFVectorVID> &all_vids,
+      const ObIVFVectorIDView &all_vids,
       const int64_t vid_begin,
       const int64_t vid_end,
       const int64_t task_idx) override
@@ -288,11 +284,11 @@ public:
       const int64_t depth,
       const int64_t node_idx,
       ObIVFVectorReader &reader,
-      const ObIArray<ObIVFVectorVID> &node_vids,
+      const ObIVFVectorIDView &node_vids,
       const ObIVFFirstLevelSampleSet *first_level_samples,
       const int64_t cluster_size,
       int64_t &local_k,
-      ObIArray<float> &local_centers) override
+      share::ObVectorMatrix &local_centers) override
   {
     UNUSEDx(depth, node_idx, reader, node_vids, first_level_samples,
         cluster_size, local_k, local_centers);

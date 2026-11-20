@@ -467,6 +467,7 @@ int ObIVFDDLDagCtx::init_full_build_runtime_()
         K(build_param));
   } else {
     const ObVectorIndexParam &vector_param = schema_ctx_->get_vector_param();
+    const int64_t parallelism = MAX(1L, owner_dag_->get_ddl_thread_count());
     if (vector_param.type_ != VIAT_DISK_BBQ
         || vector_param.cluster_size_
             < ObVectorIndexParam::MIN_DISK_BBQ_CLUSTER_SIZE
@@ -486,7 +487,7 @@ int ObIVFDDLDagCtx::init_full_build_runtime_()
           K(tablet_id_));
     } else if (OB_FAIL(input_adapter_->init(
         *tablet_context, vector_param.cluster_size_,
-        vector_param.dist_algorithm_))) {
+        vector_param.dist_algorithm_, parallelism))) {
       LOG_WARN("failed to initialize IVF DDL input adapter", K(ret),
           K(tablet_id_), K(vector_param));
     } else {
@@ -591,8 +592,7 @@ int ObIVFDDLDagCtx::init_full_build_runtime_()
           *hca_algorithm_, *sstable_writer_, process_type_))) {
         LOG_WARN("failed to initialize IVF DDL INITIAL_BUILD processor",
             K(ret), K(tablet_id_));
-      } else if (OB_FAIL(full_build_processor_->configure_ddl_runtime(*hca_algorithm_,
-          MAX(1L, owner_dag_->get_ddl_thread_count())))) {
+      } else if (OB_FAIL(full_build_processor_->configure_ddl_runtime(*hca_algorithm_, parallelism))) {
         LOG_WARN("failed to configure IVF DDL source execution", K(ret));
       } else if (OB_FAIL(alloc_ddl_runtime_object(
           runtime_allocator_, full_build_planner_))) {

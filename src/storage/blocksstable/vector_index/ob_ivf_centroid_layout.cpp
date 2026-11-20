@@ -20,14 +20,11 @@ using namespace share;
 namespace blocksstable
 {
 ObIvfCentroidLayout::ObIvfCentroidLayout(ObIAllocator &allocator)
-  : allocator_(allocator), parents_(), primary_(), secondary_(), offsets_(), members_(),
-    dim_(0), leaf_count_(0), ready_(false)
+    : allocator_(allocator), parents_(share::vector_array_allocator(allocator)),
+      primary_(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ObWrapperAllocator(allocator)), secondary_(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ObWrapperAllocator(allocator)),
+      offsets_(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ObWrapperAllocator(allocator)), members_(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ObWrapperAllocator(allocator)), dim_(0),
+      leaf_count_(0), ready_(false)
 {
-  parents_.set_block_allocator(ObWrapperAllocator(allocator));
-  primary_.set_block_allocator(ObWrapperAllocator(allocator));
-  secondary_.set_block_allocator(ObWrapperAllocator(allocator));
-  offsets_.set_block_allocator(ObWrapperAllocator(allocator));
-  members_.set_block_allocator(ObWrapperAllocator(allocator));
 }
 
 void ObIvfCentroidLayout::reset()
@@ -45,7 +42,7 @@ int64_t ObIvfCentroidLayout::get_hierarchy_threshold()
   return threshold;
 }
 
-int ObIvfCentroidLayout::begin_grouped(const ObIArray<float> &parents,
+int ObIvfCentroidLayout::begin_grouped(const share::ObVectorMatrix &parents,
     int64_t leaf_count, int64_t dimension)
 {
   int ret = OB_SUCCESS;
@@ -55,6 +52,7 @@ int ObIvfCentroidLayout::begin_grouped(const ObIArray<float> &parents,
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("[DISK_BBQ] invalid grouped centroid layout input", K(ret), K(dimension),
         K(leaf_count), "parent_values", parents.count());
+  } else if (OB_FAIL(parents_.set_dimension(dimension))) {
   } else if (OB_FAIL(parents_.assign(parents))) {
     LOG_WARN("[DISK_BBQ] failed to copy parent centroid values", K(ret), "value_count", parents.count());
   } else if (OB_FAIL(primary_.prepare_allocate(leaf_count))) {
@@ -64,8 +62,8 @@ int ObIvfCentroidLayout::begin_grouped(const ObIArray<float> &parents,
   } else {
     dim_ = dimension;
     leaf_count_ = leaf_count;
-    MEMSET(primary_.get_data(), -1, primary_.count() * sizeof(int32_t));
-    MEMSET(secondary_.get_data(), -1, secondary_.count() * sizeof(int32_t));
+    std::fill_n(primary_.get_data(), primary_.count(), -1);
+    std::fill_n(secondary_.get_data(), secondary_.count(), -1);
     for (int64_t i = 0; OB_SUCC(ret) && i < parents_.count(); ++i) {
       if (!std::isfinite(parents_.at(i))) {
         ret = OB_INVALID_DATA;
@@ -122,15 +120,15 @@ int ObIvfCentroidLayout::build_groups()
 {
   int ret = OB_SUCCESS;
   const int64_t p = parent_count();
-  ObArray<uint32_t, ObWrapperAllocator> cursors;
-  cursors.set_block_allocator(ObWrapperAllocator(allocator_));
+  common::ObArray<uint32_t, common::ObWrapperAllocator> cursors(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ObWrapperAllocator(allocator_));
+
   if (OB_FAIL(offsets_.prepare_allocate(p + 1))) {
     LOG_WARN("[DISK_BBQ] failed to allocate centroid group offsets", K(ret), K(p));
   } else if (OB_FAIL(cursors.prepare_allocate(p))) {
     LOG_WARN("[DISK_BBQ] failed to allocate centroid group cursors", K(ret), K(p));
   } else {
-    MEMSET(offsets_.get_data(), 0, (p + 1) * sizeof(int64_t));
-    MEMSET(cursors.get_data(), 0, p * sizeof(uint32_t));
+    std::fill_n(offsets_.get_data(), offsets_.count(), 0);
+    std::fill_n(cursors.get_data(), cursors.count(), 0);
   }
   for (int64_t j = 0; OB_SUCC(ret) && j < leaf_count_; ++j) {
     const int32_t a = primary_.at(j), b = secondary_.at(j);
@@ -170,20 +168,19 @@ int ObIvfCentroidLayout::build_groups()
   return ret;
 }
 
-int ObIvfCentroidLayout::build(const ObIArrayWrap<float> &leaves, const int64_t dimension,
+int ObIvfCentroidLayout::build(const share::ObVectorMatrix &leaves, const int64_t dimension,
     const ObHcaTrainParam &train_param, const ObHcaSoarParam &soar_param,
     const ObVectorNormalizeInfo *norm_info, const int64_t threshold, const int64_t cluster_size)
 {
   int ret = OB_SUCCESS;
   const int64_t started_at_us = ObTimeUtility::current_time();
   reset();
-  if (dimension <= 0 || leaves.empty() || leaves.get_data() == nullptr || leaves.count() % dimension != 0
+  if (dimension <= 0 || leaves.empty() || leaves.count() % dimension != 0
       || leaves.count() / dimension > INT32_MAX || threshold <= 0 || cluster_size <= 0
       || !train_param.is_valid() || !soar_param.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("[DISK_BBQ] invalid centroid layout build input", K(ret), K(dimension), K(threshold),
-        K(cluster_size), "leaf_values", leaves.count(), "has_leaf_data", leaves.get_data() != nullptr,
-        "train_params_valid", train_param.is_valid(), "soar_params_valid", soar_param.is_valid());
+        K(cluster_size), "leaf_values", leaves.count(), "train_params_valid", train_param.is_valid(), "soar_params_valid", soar_param.is_valid());
   } else {
     const int64_t leaf_count = leaves.count() / dimension;
     if (leaf_count < threshold) {

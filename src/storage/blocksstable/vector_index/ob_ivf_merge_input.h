@@ -6,6 +6,7 @@
 #ifndef OCEANBASE_STORAGE_BLOCKSSTABLE_VECTOR_INDEX_OB_IVF_MERGE_INPUT_H_
 #define OCEANBASE_STORAGE_BLOCKSSTABLE_VECTOR_INDEX_OB_IVF_MERGE_INPUT_H_
 
+#include "storage/blocksstable/vector_index/ob_ivf_vector_ids.h"
 #include "storage/ob_i_table.h"
 #include "lib/container/ob_array.h"
 #include "share/vector_index/ob_vector_index_common_define.h"
@@ -48,27 +49,29 @@ struct ObAsyncIVFSourceLocator
   int64_t row_id_;
 };
 
-// A contiguous, reclaiming buffer whose ownership can pass from a capture
-// slice to the input without copying every locator. All buffers in one capture
-// borrow the input's allocator, which outlives its slices.
+// A segmented, reclaiming buffer whose ownership can pass from a capture slice
+// to the input without copying every locator. The storage object borrows the
+// input's allocator, which outlives its slices and the transferred blocks.
 class ObIVFSourceLocators final
 {
 public:
+  using Storage = share::ObVectorArray<ObAsyncIVFSourceLocator>;
+  using iterator = share::ObSegmentArrayIterator<ObIVFSourceLocators, ObAsyncIVFSourceLocator>;
+  using const_iterator = share::ObSegmentArrayIterator<const ObIVFSourceLocators, const ObAsyncIVFSourceLocator>;
   explicit ObIVFSourceLocators(common::ObIAllocator &allocator, ObCompactionMemoryContext *memory_context = nullptr)
-    : allocator_(allocator), memory_context_(memory_context), data_(nullptr), count_(0), capacity_(0) {}
+    : allocator_(allocator), memory_context_(memory_context), values_(nullptr) {}
   ~ObIVFSourceLocators() { reset(); }
-  int64_t count() const { return count_; }
-  bool empty() const { return count_ == 0; }
+  int64_t count() const { return values_ == nullptr ? 0 : values_->count(); }
+  bool empty() const { return count() == 0; }
   ObCompactionMemoryContext *get_memory_context() const { return memory_context_; }
-  int64_t get_capacity() const { return capacity_; }
-  int64_t get_data_size() const { return capacity_ * sizeof(ObAsyncIVFSourceLocator); }
-  ObAsyncIVFSourceLocator *begin() { return data_; }
-  ObAsyncIVFSourceLocator *end() { return count_ == 0 ? data_ : data_ + count_; }
-  const ObAsyncIVFSourceLocator *begin() const { return data_; }
-  const ObAsyncIVFSourceLocator *end() const { return count_ == 0 ? data_ : data_ + count_; }
-  ObAsyncIVFSourceLocator &at(int64_t idx) { OB_ASSERT(idx >= 0 && idx < count_); return data_[idx]; }
-  const ObAsyncIVFSourceLocator &at(int64_t idx) const
-  { OB_ASSERT(idx >= 0 && idx < count_); return data_[idx]; }
+  int64_t get_capacity() const { return values_ == nullptr ? 0 : values_->get_capacity(); }
+  int64_t get_data_size() const { return values_ == nullptr ? 0 : values_->mem_used(); }
+  iterator begin() { return iterator(this, 0); }
+  iterator end() { return iterator(this, count()); }
+  const_iterator begin() const { return const_iterator(this, 0); }
+  const_iterator end() const { return const_iterator(this, count()); }
+  ObAsyncIVFSourceLocator &at(int64_t idx) { OB_ASSERT(values_ != nullptr); return values_->at(idx); }
+  const ObAsyncIVFSourceLocator &at(int64_t idx) const { OB_ASSERT(values_ != nullptr); return values_->at(idx); }
   int reserve(int64_t capacity);
   int prepare_allocate(int64_t count);
   int push_back(const ObAsyncIVFSourceLocator &locator);
@@ -77,9 +80,7 @@ public:
 private:
   common::ObIAllocator &allocator_;
   ObCompactionMemoryContext *memory_context_;
-  ObAsyncIVFSourceLocator *data_;
-  int64_t count_;
-  int64_t capacity_;
+  Storage *values_;
   DISALLOW_COPY_AND_ASSIGN(ObIVFSourceLocators);
 };
 
@@ -136,15 +137,15 @@ public:
   { return lazy_raw_ ? MAX(0L, replay_row_offsets_.count() - 1) : replay_inputs_.count(); }
   virtual int64_t get_available_replay_memory() const override;
   virtual int get_source_row_idx(const int64_t vector_idx, int64_t &source_idx) const override;
-  virtual int batch_get_by_source(const common::ObIArray<int64_t> &vector_idxs,
-      common::ObIArray<float> &vectors) const override;
+  virtual int batch_get_by_source(const share::ObVectorArray<int64_t> &vector_idxs,
+      share::ObVectorMatrix &vectors) const override;
   virtual int get_all_vids(
-      common::ObIArray<storage::ObIVFVectorVID> &vids) const override;
+      share::ObVectorArray<storage::ObIVFVectorVID> &vids) const override;
   virtual int batch_get_by_vid(
-      const common::ObIArray<storage::ObIVFVectorVID> &vids,
+      const storage::ObIVFVectorIDView &vids,
       const int64_t vid_begin,
       const int64_t vid_end,
-      common::ObIArray<float> &vectors) const override;
+      share::ObVectorMatrix &vectors) const override;
 
   virtual int64_t get_sample_count() const override
   {
@@ -154,7 +155,7 @@ public:
       const int64_t sample_begin,
       const int64_t sample_end,
       common::ObIArray<storage::ObIVFVectorVID> &sample_vids,
-      common::ObIArray<float> &sample_vectors) const override;
+      share::ObVectorMatrix &sample_vectors) const override;
 
   TO_STRING_KV(K_(is_inited), K_(index_table_id), K_(index_tablet_id),
       K_(vector_dim), K_(dist_type),
@@ -166,8 +167,8 @@ private:
   friend class ObIVFMergeDagCtx;
   int prepare_source_(ObAsyncIndexMergeCtx &merge_ctx);
   int prepare_metadata_();
-  int read_source_vectors_(const common::ObIArray<ObAsyncIVFSourceLocator> &locators,
-      common::ObIArray<float> &vectors) const;
+  int read_source_vectors_(const share::ObVectorArray<ObAsyncIVFSourceLocator> &locators,
+      share::ObVectorMatrix &vectors) const;
   int finish_source_();
   int prepare_schema_and_meta_(ObAsyncIndexMergeCtx &merge_ctx);
   int init_source_(ObAsyncIndexMergeCtx &merge_ctx);
@@ -192,8 +193,8 @@ private:
       const ObAsyncIVFSourceLocator *&locator,
       int64_t &cursor) const;
   int read_replay_vectors_(
-      const common::ObIArray<ObAsyncIVFSourceLocator> &locators,
-      common::ObIArray<float> &vectors) const;
+      const share::ObVectorArray<ObAsyncIVFSourceLocator> &locators,
+      share::ObVectorMatrix &vectors) const;
 private:
   // Shared by RAW capture and the adapter's prior/posting scans.
   static constexpr int64_t IVF_CAPTURE_YIELD_INTERVAL = 4096;

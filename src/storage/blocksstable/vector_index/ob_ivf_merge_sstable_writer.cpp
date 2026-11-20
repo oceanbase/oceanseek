@@ -225,7 +225,7 @@ int ObIVFMergeSSTableWriter::write_posting_range(int64_t task_idx)
       : loaded_output_->writer_.write_posting_range(task_idx);
 }
 
-int ObIVFMergeSSTableWriter::write_loaded_centers(const ObIArray<float> &centers,
+int ObIVFMergeSSTableWriter::write_loaded_centers(const share::ObVectorMatrix &centers,
     int64_t dimension, int64_t begin, int64_t end)
 {
   int ret = loaded_output_ == nullptr ? OB_STATE_NOT_MATCH : ATOMIC_LOAD(&loaded_output_->error_);
@@ -250,8 +250,8 @@ int ObIVFMergeSSTableWriter::set_leaf_posting_counts(const ObIArray<uint32_t> &c
   return ret;
 }
 
-int ObIVFMergeSSTableWriter::quantize_loaded_vectors(const ObIArray<float> &centers, int64_t dimension,
-    const ObIArray<ObIVFVectorVID> &vids, const ObIArray<float> &vectors,
+int ObIVFMergeSSTableWriter::quantize_loaded_vectors(const share::ObVectorMatrix &centers, int64_t dimension,
+    const storage::ObIVFVectorIDView &vids, const share::ObVectorMatrix &vectors,
     const ObIArray<int64_t> &primary, const ObIArray<int64_t> *secondary)
 {
   return loaded_output_ == nullptr ? OB_STATE_NOT_MATCH
@@ -260,7 +260,7 @@ int ObIVFMergeSSTableWriter::quantize_loaded_vectors(const ObIArray<float> &cent
 }
 
 int ObIVFMergeSSTableWriter::copy_loaded_postings(const ObIVFEncodedPostingSource &source,
-    int64_t source_cid, int64_t target_cid, const ObIArray<ObIVFVectorVID> &expected_vids)
+    int64_t source_cid, int64_t target_cid, const storage::ObIVFVectorIDView &expected_vids)
 {
   int ret = OB_SUCCESS;
   if (loaded_output_ == nullptr || quantization_finished_) {
@@ -273,7 +273,7 @@ int ObIVFMergeSSTableWriter::copy_loaded_postings(const ObIVFEncodedPostingSourc
   {
   public:
     Consumer(ObIVFDDLSSTableWriter &writer, int64_t cid, int64_t size,
-        const ObIArray<ObIVFVectorVID> &expected, char *codes)
+        const storage::ObIVFVectorIDView &expected, char *codes)
       : writer_(writer), cid_(cid), size_(size), expected_(expected), codes_(codes), count_(0)
     {
       rows_.set_attr(ObMemAttr(MTL_ID(), "IVFReuseCodes", ObCtxIds::VECTOR_CTX_ID));
@@ -316,7 +316,7 @@ int ObIVFMergeSSTableWriter::copy_loaded_postings(const ObIVFEncodedPostingSourc
     }
     ObIVFDDLSSTableWriter &writer_;
     int64_t cid_, size_;
-    const ObIArray<ObIVFVectorVID> &expected_;
+    storage::ObIVFVectorIDView expected_;
     char *codes_;
     int64_t count_;
     ObSEArray<ObIVFBuildRow, 16> rows_;
@@ -382,20 +382,20 @@ ObIVFMergeSSTableWriter::ObIVFMergeSSTableWriter(
     output_row_count_(0),
     reused_posting_count_(0),
     quant_centers_(nullptr),
-    leaf_posting_counts_(),
+    leaf_posting_counts_(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ObWrapperAllocator(allocator)),
     quant_range_count_(0),
     completed_quant_ranges_(0),
     quantized_center_count_(0),
     started_quant_ranges_(0),
     loaded_output_(nullptr),
-    reuse_sources_(), reuse_posting_origins_(), reuse_raw_ranges_(), reuse_posting_ranges_(), reuse_centroid_ranges_(),
+    reuse_sources_(), reuse_posting_origins_(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ObWrapperAllocator(allocator)), reuse_raw_ranges_(), reuse_posting_ranges_(), reuse_centroid_ranges_(),
     is_inited_(false),
     quantization_finished_(false),
     raw_write_finished_(false)
 {
-  leaf_posting_counts_.set_block_allocator(ObWrapperAllocator(allocator));
+
   reuse_sources_.set_block_allocator(ObWrapperAllocator(allocator));
-  reuse_posting_origins_.set_block_allocator(ObWrapperAllocator(allocator));
+
   reuse_raw_ranges_.set_block_allocator(ObWrapperAllocator(allocator));
   reuse_posting_ranges_.set_block_allocator(ObWrapperAllocator(allocator));
   reuse_centroid_ranges_.set_block_allocator(ObWrapperAllocator(allocator));
@@ -522,7 +522,7 @@ int ObIVFMergeSSTableWriter::prepare_posting_reuse_()
   return ret;
 }
 
-int ObIVFMergeSSTableWriter::prepare_centroid_reuse_(const ObIArray<float> &centers, int64_t dimension)
+int ObIVFMergeSSTableWriter::prepare_centroid_reuse_(const share::ObVectorMatrix &centers, int64_t dimension)
 {
   int ret = OB_SUCCESS;
   if (reuse_sources_.empty()) { return ret; }
@@ -795,9 +795,9 @@ public:
     }
     return ret;
   }
-  int quantize_cluster(ObIVFVectorReader &reader, const ObIArray<float> &centers,
-      int64_t k, int64_t cid, const ObIArray<ObIVFVectorVID> &members,
-      const ObIArray<ObIVFVectorVID> *secondary) override
+  int quantize_cluster(ObIVFVectorReader &reader, const share::ObVectorMatrix &centers,
+      int64_t k, int64_t cid, const storage::ObIVFVectorIDView &members,
+      const storage::ObIVFVectorIDView *secondary) override
   {
     int ret = validate(centers, k, cid);
     if (OB_SUCC(ret)) ret = owner_.quantize_cluster_(reader, centers, k, cid,
@@ -805,9 +805,9 @@ public:
     if (OB_SUCC(ret)) ++next_cid_;
     return ret;
   }
-  int quantize_cluster_with_reuse(ObIVFVectorReader &reader, const ObIArray<float> &centers,
-      int64_t k, int64_t cid, const ObIArray<ObIVFVectorVID> &members,
-      const ObIArray<ObIVFVectorVID> *secondary, const ObIVFEncodedPostingSource &source,
+  int quantize_cluster_with_reuse(ObIVFVectorReader &reader, const share::ObVectorMatrix &centers,
+      int64_t k, int64_t cid, const storage::ObIVFVectorIDView &members,
+      const storage::ObIVFVectorIDView *secondary, const ObIVFEncodedPostingSource &source,
       int64_t source_cid, int64_t prefix) override
   {
     int ret = validate(centers, k, cid);
@@ -816,7 +816,7 @@ public:
     if (OB_SUCC(ret)) ++next_cid_;
     return ret;
   }
-  int validate(const ObIArray<float> &centers, int64_t k, int64_t cid) const
+  int validate(const share::ObVectorMatrix &centers, int64_t k, int64_t cid) const
   {
     const int ret = !opened_ || &centers != owner_.quant_centers_ || cid != next_cid_
         || cid >= end_ || k != centers.count() / owner_.vector_dim_
@@ -858,7 +858,7 @@ public:
     LOG_WARN("cannot finish IVF quantization through range writer", K(ret), K(n), K(k), K(p));
     return ret;
   }
-  int write_raw_vectors(ObIVFVectorReader &r, const ObIArray<ObIVFVectorVID> &v,
+  int write_raw_vectors(ObIVFVectorReader &r, const storage::ObIVFVectorIDView &v,
       int64_t b, int64_t e, int64_t t) override
   {
     UNUSEDx(r, v);
@@ -882,7 +882,7 @@ public:
   ObIvfMacroBlockWriter writer_;
 };
 
-int ObIVFMergeSSTableWriter::prepare_quantization(const ObIArray<float> &centers,
+int ObIVFMergeSSTableWriter::prepare_quantization(const share::ObVectorMatrix &centers,
     int64_t center_count, int64_t &task_count)
 {
   int ret = OB_SUCCESS;
@@ -897,7 +897,7 @@ int ObIVFMergeSSTableWriter::prepare_quantization(const ObIArray<float> &centers
   } else if (OB_FAIL(leaf_posting_counts_.prepare_allocate(center_count))) {
     LOG_WARN("failed to allocate leaf posting counts", K(ret), K(center_count));
   } else {
-    MEMSET(leaf_posting_counts_.get_data(), 0, center_count * sizeof(uint32_t));
+    std::fill_n(leaf_posting_counts_.get_data(), leaf_posting_counts_.count(), 0);
     sorter_.reset();
     sorter_inited_ = false;
     quant_centers_ = &centers;
@@ -985,8 +985,8 @@ class ObIVFMergeSSTableWriter::ReusePostingConsumer final : public ObIVFEncodedP
 {
 public:
   ReusePostingConsumer(ObIVFMergeSSTableWriter &writer, const int64_t cid,
-      const ObIArray<ObIVFVectorVID> &members, const int64_t count,
-      QuantizationRange *range, const ObIArray<ObIVFVectorVID> &encoded_vids, const char *codes)
+      const storage::ObIVFVectorIDView &members, const int64_t count,
+      QuantizationRange *range, const storage::ObIVFVectorIDView &encoded_vids, const char *codes)
     : writer_(writer), cid_(cid), members_(members), expected_(count), count_(0),
       range_(range), encoded_vids_(encoded_vids), codes_(codes), encoded_pos_(0) {}
   virtual int append(const ObIVFVectorVID vid, const ObString &payload) override
@@ -1026,32 +1026,32 @@ public:
   }
   ObIVFMergeSSTableWriter &writer_;
   int64_t cid_;
-  const ObIArray<ObIVFVectorVID> &members_;
+  storage::ObIVFVectorIDView members_;
   int64_t expected_;
   int64_t count_;
   QuantizationRange *range_;
-  const ObIArray<ObIVFVectorVID> &encoded_vids_;
+  ObIVFVectorIDView encoded_vids_;
   const char *codes_;
   int64_t encoded_pos_;
 };
 
 int ObIVFMergeSSTableWriter::quantize_cluster(
     ObIVFVectorReader &reader,
-    const ObIArray<float> &final_centers,
+    const share::ObVectorMatrix &final_centers,
     const int64_t center_count,
     const int64_t cid,
-    const ObIArray<ObIVFVectorVID> &primary_member_vids,
-    const ObIArray<ObIVFVectorVID> *secondary_member_vids)
+    const storage::ObIVFVectorIDView &primary_member_vids,
+    const storage::ObIVFVectorIDView *secondary_member_vids)
 {
   return quantize_cluster_(reader, final_centers, center_count, cid,
       primary_member_vids, secondary_member_vids, nullptr, -1, 0);
 }
 
 int ObIVFMergeSSTableWriter::quantize_cluster_with_reuse(
-    ObIVFVectorReader &reader, const ObIArray<float> &final_centers,
+    ObIVFVectorReader &reader, const share::ObVectorMatrix &final_centers,
     const int64_t center_count, const int64_t cid,
-    const ObIArray<ObIVFVectorVID> &member_vids,
-    const ObIArray<ObIVFVectorVID> *secondary_member_vids,
+    const storage::ObIVFVectorIDView &member_vids,
+    const storage::ObIVFVectorIDView *secondary_member_vids,
     const ObIVFEncodedPostingSource &source, const int64_t source_center_idx,
     const int64_t reused_prefix_count)
 {
@@ -1060,10 +1060,10 @@ int ObIVFMergeSSTableWriter::quantize_cluster_with_reuse(
 }
 
 int ObIVFMergeSSTableWriter::quantize_cluster_(
-    ObIVFVectorReader &reader, const ObIArray<float> &final_centers,
+    ObIVFVectorReader &reader, const share::ObVectorMatrix &final_centers,
     const int64_t center_count, const int64_t cid,
-    const ObIArray<ObIVFVectorVID> &primary_member_vids,
-    const ObIArray<ObIVFVectorVID> *secondary_member_vids,
+    const storage::ObIVFVectorIDView &primary_member_vids,
+    const storage::ObIVFVectorIDView *secondary_member_vids,
     const ObIVFEncodedPostingSource *source, const int64_t source_center_idx,
     const int64_t reused_prefix_count, QuantizationRange *range)
 {
@@ -1073,7 +1073,7 @@ int ObIVFMergeSSTableWriter::quantize_cluster_(
   quantization::ObQuantizationParams params = {};
   quantization::ObQuantizationEncoder encoder;
   ObArray<ObIVFVectorVID, ObWrapperAllocator> posting_vids;
-  ObSEArray<float, 16, ObWrapperAllocator> vectors(OB_MALLOC_NORMAL_BLOCK_SIZE, ObWrapperAllocator(task_allocator));
+  share::ObVectorMatrix vectors(share::vector_array_allocator(task_allocator));
   char *one_bit_codes = nullptr;
   const float *center = nullptr;
   uint32_t posting_count = 0;
@@ -1619,7 +1619,7 @@ int ObIVFMergeSSTableWriter::write_sorted_rows_(
 
 int ObIVFMergeSSTableWriter::write_raw_vectors(
     ObIVFVectorReader &reader,
-    const ObIArray<ObIVFVectorVID> &all_vids,
+    const storage::ObIVFVectorIDView &all_vids,
     const int64_t vid_begin,
     const int64_t vid_end,
     const int64_t task_idx)
@@ -1627,7 +1627,7 @@ int ObIVFMergeSSTableWriter::write_raw_vectors(
   int ret = OB_SUCCESS;
   ObArenaAllocator task_allocator(
       ObMemAttr(MTL_ID(), "IVFRawWrite", ObCtxIds::VECTOR_CTX_ID));
-  ObSEArray<float, 16, ObWrapperAllocator> vectors(OB_MALLOC_NORMAL_BLOCK_SIZE, ObWrapperAllocator(task_allocator));
+  share::ObVectorMatrix vectors(share::vector_array_allocator(task_allocator));
   ObArenaAllocator row_allocator(
       ObMemAttr(MTL_ID(), "IVFRawRow", ObCtxIds::VECTOR_CTX_ID));
   ObDatumRow row;

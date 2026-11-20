@@ -5,6 +5,7 @@
 #ifndef OCEANBASE_STORAGE_BLOCKSSTABLE_VECTOR_INDEX_OB_IVF_PARENT_CENTROID_BUILD_H_
 #define OCEANBASE_STORAGE_BLOCKSSTABLE_VECTOR_INDEX_OB_IVF_PARENT_CENTROID_BUILD_H_
 
+#include "storage/blocksstable/vector_index/ob_ivf_vector_ids.h"
 #include "storage/blocksstable/vector_index/ob_ivf_build_interfaces.h"
 
 namespace oceanbase
@@ -21,7 +22,7 @@ class ObIVFParentCentroidBuilder final
 public:
   explicit ObIVFParentCentroidBuilder(common::ObIAllocator &allocator);
   ~ObIVFParentCentroidBuilder();
-  int init(const common::ObIArrayWrap<float> &leaves, int64_t dimension,
+  int init(const share::ObVectorMatrix &leaves, int64_t dimension,
       const ObIVFHcaAlgorithmParam &param, int64_t cluster_size);
   int prepare(int64_t plan_id, int64_t &task_count);
   int get_next_operation(ObIVFMergeStep &step, int64_t &depth) const;

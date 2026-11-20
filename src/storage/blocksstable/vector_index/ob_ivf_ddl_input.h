@@ -6,6 +6,7 @@
 #ifndef OCEANBASE_STORAGE_BLOCKSSTABLE_VECTOR_INDEX_OB_IVF_DDL_INPUT_H_
 #define OCEANBASE_STORAGE_BLOCKSSTABLE_VECTOR_INDEX_OB_IVF_DDL_INPUT_H_
 
+#include "storage/blocksstable/vector_index/ob_ivf_vector_ids.h"
 #include "storage/blocksstable/vector_index/ob_ivf_build_interfaces.h"
 #include "storage/blocksstable/vector_index/ob_ivf_replay_input.h"
 
@@ -14,27 +15,7 @@ namespace oceanbase
 namespace storage
 {
 class ObDDLTabletContext;
-
-struct ObIVFDDLReplayLocator final
-{
-  ObIVFDDLReplayLocator()
-    : vid_(0), source_row_idx_(-1)
-  {}
-  ObIVFDDLReplayLocator(
-      const ObIVFVectorVID vid,
-      const int64_t source_row_idx)
-    : vid_(vid), source_row_idx_(source_row_idx)
-  {}
-  bool is_valid() const
-  {
-    // Heap-table DDL can generate VID 0; the source position marks validity.
-    return source_row_idx_ >= 0;
-  }
-  TO_STRING_KV(K_(vid), K_(source_row_idx));
-
-  ObIVFVectorVID vid_;
-  int64_t source_row_idx_;
-};
+class ObIVFRawKeyStore;
 
 struct ObIVFDDLReadRequest final
 {
@@ -63,12 +44,22 @@ class ObIVFDDLInput final
 {
 public:
   explicit ObIVFDDLInput(common::ObIAllocator &allocator);
-  virtual ~ObIVFDDLInput() = default;
+  virtual ~ObIVFDDLInput();
 
   int init(
       ObDDLTabletContext &tablet_context,
       const int64_t cluster_size,
-      const share::ObVectorIndexDistAlgorithm dist_type);
+      const share::ObVectorIndexDistAlgorithm dist_type,
+      const int64_t parallelism);
+
+  bool uses_position_ids() const override { return true; }
+  int prepare_raw_output() const override;
+  int collect_raw_output_keys(
+      const share::ObVectorArray<int64_t> &positions, const common::ObIArray<ObIVFVectorVID> &vids) const override;
+  int batch_get_output_by_source(const share::ObVectorArray<int64_t> &positions, share::ObVectorMatrix &vectors,
+      common::ObIArray<ObIVFVectorVID> &vids) const override;
+  int batch_get_output(const ObIVFVectorIDView &ids, int64_t begin, int64_t end, share::ObVectorMatrix &vectors,
+      common::ObIArray<ObIVFVectorVID> &vids) const override;
 
   virtual bool is_valid() const override;
   void release_capture_metadata();
@@ -82,13 +73,13 @@ public:
   const ObIVFMergeInput &get_full_build_input() const;
 
   virtual int get_all_vids(
-      common::ObIArray<ObIVFVectorVID> &vids) const override;
+      share::ObVectorArray<ObIVFVectorVID> &vids) const override;
 
   virtual int batch_get_by_vid(
-      const common::ObIArray<ObIVFVectorVID> &vids,
+      const ObIVFVectorIDView &vids,
       const int64_t vid_begin,
       const int64_t vid_end,
-      common::ObIArray<float> &vectors) const override;
+      share::ObVectorMatrix &vectors) const override;
 
   virtual bool supports_source_order() const override;
   bool is_fully_memory_resident() const override;
@@ -96,35 +87,31 @@ public:
 
   virtual int get_source_row_idx(const int64_t vector_idx, int64_t &source_idx) const override;
 
-  virtual int batch_get_by_source(const common::ObIArray<int64_t> &vector_idxs,
-      common::ObIArray<float> &vectors) const override;
+  virtual int batch_get_by_source(const share::ObVectorArray<int64_t> &vector_idxs,
+      share::ObVectorMatrix &vectors) const override;
 
   virtual int batch_get_samples(
       const int64_t sample_begin,
       const int64_t sample_end,
       common::ObIArray<ObIVFVectorVID> &sample_vids,
-      common::ObIArray<float> &sample_vectors) const override;
+      share::ObVectorMatrix &sample_vectors) const override;
 
 private:
-  int find_locator_(
-      const ObIVFVectorVID vid,
-      const ObIVFDDLReplayLocator *&locator) const;
-
-  int resolve_locator_(
-      const ObIVFDDLReplayLocator &locator,
-      int64_t &replay_idx,
-      int64_t &row_id) const;
+  int resolve_position_(const int64_t position, int64_t &replay_idx, int64_t &row_id) const;
 
   int find_replay_idx_(
       const int64_t slice_idx,
       int64_t &replay_idx) const;
 
-  int execute_read_requests_(
-      common::ObIArray<ObIVFDDLReadRequest> &requests,
-      common::ObIArray<float> &vectors) const;
+  int execute_read_requests_(common::ObIArray<ObIVFDDLReadRequest> &requests, share::ObVectorMatrix &vectors,
+      common::ObIArray<ObIVFVectorVID> *vids = nullptr) const;
 
-  common::ObIAllocator &allocator_;
-  common::ObArray<ObIVFDDLReplayLocator, common::ObWrapperAllocator> locators_;
+  int read_positions_(const ObIVFVectorIDView &positions, int64_t begin, int64_t end, share::ObVectorMatrix &vectors,
+      common::ObIArray<ObIVFVectorVID> *vids) const;
+
+  bool vids_ordered_;
+  int64_t total_row_count_;
+  ObIVFRawKeyStore *raw_keys_;
   common::ObArray<ObIVFReplayInput *, common::ObWrapperAllocator> replay_inputs_;
   common::ObArray<int64_t, common::ObWrapperAllocator> replay_slice_idxs_;
   common::ObArray<int64_t, common::ObWrapperAllocator> replay_row_offsets_;

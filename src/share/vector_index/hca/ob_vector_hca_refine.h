@@ -28,10 +28,10 @@ public:
       const ObHcaRefineParam &param, const ObVectorNormalizeInfo *norm,
       ObHcaCenterStore &working_centers);
   // Reservoir order is immutable until reset; callers must not sort this view.
-  int get_sample_indices(const int64_t *&indices, int64_t &count) const;
+  int get_sample_indices(const share::ObVectorArray<int64_t> *&indices, int64_t &count) const;
   // Copy an epoch's deterministic permutation without advancing the trainer.
   // Storage preparation uses the same schedule, including wrapped final batches.
-  int get_epoch_sample_indices(int64_t epoch, int64_t *indices, int64_t count,
+  int get_epoch_sample_indices(int64_t epoch, share::ObVectorArray<int64_t> &indices, int64_t count,
       int64_t &batch_size) const;
   int prepare_batch(int64_t &row_count); // OB_ITER_END after the final batch
   int distance_range(int64_t begin, int64_t end);

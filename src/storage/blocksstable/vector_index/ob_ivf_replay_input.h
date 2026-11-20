@@ -6,6 +6,7 @@
 #ifndef OCEANBASE_STORAGE_BLOCKSSTABLE_VECTOR_INDEX_OB_IVF_REPLAY_INPUT_H_
 #define OCEANBASE_STORAGE_BLOCKSSTABLE_VECTOR_INDEX_OB_IVF_REPLAY_INPUT_H_
 
+#include "storage/blocksstable/vector_index/ob_ivf_vector_ids.h"
 #include "lib/allocator/ob_allocator.h"
 #include "lib/container/ob_heap.h"
 #include "lib/container/ob_array.h"
@@ -113,13 +114,13 @@ struct ObIVFSampleRefMaxCmp final
 struct ObIVFReplayReadRequest final
 {
   ObIVFReplayReadRequest()
-      : row_id_(-1), expected_vid_(0), output_idx_(-1)
+      : row_id_(-1), expected_vid_(0), output_idx_(-1), check_vid_(true)
   {}
   ObIVFReplayReadRequest(const int64_t row_id,
                         const uint64_t expected_vid,
                         const int64_t output_idx)
       : row_id_(row_id), expected_vid_(expected_vid),
-        output_idx_(output_idx)
+        output_idx_(output_idx), check_vid_(true)
   {}
 
   bool is_valid() const { return row_id_ >= 0 && output_idx_ >= 0; }
@@ -127,6 +128,7 @@ struct ObIVFReplayReadRequest final
   int64_t row_id_;
   uint64_t expected_vid_;
   int64_t output_idx_;
+  bool check_vid_;
   TO_STRING_KV(K_(row_id), K_(expected_vid), K_(output_idx));
 };
 
@@ -147,7 +149,7 @@ public:
   int init(const uint64_t tenant_id, const int64_t vector_dim,
            const int64_t memory_limit, const int64_t max_sample_count,
            const uint64_t sample_seed, const int64_t slice_idx,
-           const bool capture_vids = false, const char *label = "IVFReplay");
+           const char *label = "IVFReplay");
   int add_row(const uint64_t vid, const common::ObString &vector_bytes);
   int seal();
   virtual int rewind() override;
@@ -157,24 +159,17 @@ public:
   // batch_copy_rows() from parallel FullBuild tasks; it never exposes storage
   // owned by ObRADatumStore.
   int get_row_at(const int64_t row_id, uint64_t &vid, const float *&vector);
-  // INITIAL_BUILD captures VIDs alongside rows so locator initialization does
-  // not reread the vector payload. Available only on sealed capture-enabled inputs.
-  int get_captured_vid(const int64_t row_id, uint64_t &vid) const;
-  // Called after the DDL input has successfully built its own locator table.
-  // Sequential, sample and parallel payload readers do not use this metadata.
-  void release_captured_vids() { captured_vids_.reset(); }
   // The DDL input copies these candidates into its merged sample set. Once
   // that input is committed, retain the replay payload but retire the heap.
   void release_sample_candidates();
-  int batch_copy_rows(
-      const common::ObIArray<ObIVFReplayReadRequest> &requests,
-      const int64_t request_begin,
-      const int64_t request_end,
-      common::ObIArray<float> &vectors);
+  int batch_copy_rows(const common::ObIArray<ObIVFReplayReadRequest> &requests, const int64_t request_begin,
+      const int64_t request_end, share::ObVectorMatrix &vectors, common::ObIArray<uint64_t> *vids = nullptr);
+  int batch_copy_rows(const share::ObVectorArray<ObIVFReplayReadRequest> &requests, const int64_t request_begin,
+      const int64_t request_end, share::ObVectorMatrix &vectors, common::ObIArray<uint64_t> *vids = nullptr);
   // Copy a compact contiguous sample range with a task-private RA reader.
   // Stored VIDs carry original node ordinals and are returned with payloads.
   int copy_row_range(int64_t begin, int64_t end,
-      common::ObIArray<int64_t> &ordinals, common::ObIArray<float> &vectors);
+      common::ObIArray<int64_t> &ordinals, share::ObVectorMatrix &vectors);
   virtual int64_t get_row_count() const override { return store_.get_row_cnt(); }
   virtual int64_t get_vector_dim() const override { return vector_dim_; }
   virtual bool is_sealed() const override { return is_sealed_; }
@@ -182,6 +177,9 @@ public:
   int64_t get_file_size() const { return store_.get_file_size(); }
   int64_t get_inmemory_row_count() const { return store_.get_inmemory_rows(); }
   int64_t get_memory_limit() const { return memory_limit_; }
+  bool vids_ordered() const { return vids_ordered_; }
+  uint64_t first_vid() const { return first_vid_; }
+  uint64_t last_vid() const { return last_vid_; }
   bool is_sampling_enabled() const { return max_sample_count_ > 0; }
   int64_t get_max_sample_count() const { return max_sample_count_; }
   int64_t get_sample_scan_count() const { return sample_scan_count_; }
@@ -193,34 +191,33 @@ public:
                                     const uint64_t index_tablet_id);
   static uint64_t calc_sample_priority(const uint64_t sample_seed,
                                        const uint64_t vid);
-  TO_STRING_KV(K_(is_inited), K_(is_sealed), K_(capture_vids), K_(vector_dim), K_(memory_limit), K_(cursor),
+  TO_STRING_KV(K_(is_inited), K_(is_sealed), K_(vector_dim), K_(memory_limit), K_(cursor),
                K_(max_sample_count), K_(sample_scan_count), K_(sample_seed),
                K_(slice_idx), "row_count", get_row_count(),
                "mem_hold", get_mem_hold(), "file_size", get_file_size());
 
 private:
   int offer_sample_candidate_(const uint64_t vid, const int64_t row_id);
-  int validate_read_requests_(
-      const common::ObIArray<ObIVFReplayReadRequest> &requests,
-      const int64_t request_begin,
-      const int64_t request_end,
-      const common::ObIArray<float> &vectors) const;
-  int copy_rows_(
-      sql::ObRADatumStore::Reader &reader,
-      const common::ObIArray<ObIVFReplayReadRequest> &requests,
-      const int64_t request_begin,
-      const int64_t request_end,
-      common::ObIArray<float> &vectors) const;
-  int validate_copied_vectors_(
-      const common::ObIArray<ObIVFReplayReadRequest> &requests,
-      const int64_t request_begin,
-      const int64_t request_end,
-      const common::ObIArray<float> &vectors) const;
+  template <typename Requests>
+  int validate_read_requests_(const Requests &requests, const int64_t request_begin, const int64_t request_end,
+      const share::ObVectorMatrix &vectors) const;
+  template <typename Requests>
+  int copy_rows_(sql::ObRADatumStore::Reader &reader, const Requests &requests, const int64_t request_begin,
+      const int64_t request_end, share::ObVectorMatrix &vectors, common::ObIArray<uint64_t> *vids) const;
+  template <typename Requests>
+  int validate_copied_vectors_(const Requests &requests, const int64_t request_begin, const int64_t request_end,
+      const share::ObVectorMatrix &vectors) const;
+
+  template <typename Requests>
+  int batch_copy_rows_(const Requests &requests, int64_t begin, int64_t end, share::ObVectorMatrix &vectors,
+      common::ObIArray<uint64_t> *vids);
 
 private:
   bool is_inited_;
   bool is_sealed_;
-  bool capture_vids_;
+  bool vids_ordered_;
+  uint64_t first_vid_;
+  uint64_t last_vid_;
   int64_t vector_dim_;
   int64_t memory_limit_;
   int64_t cursor_;
@@ -230,9 +227,6 @@ private:
   int64_t slice_idx_;
   sql::ObRADatumStore store_;
   sql::ObRADatumStore::Reader reader_;
-  // Separate tenant-accounted metadata, outside the replay payload budget.
-  // The default allocator really frees old buffers during growth and reset.
-  common::ObArray<uint64_t> captured_vids_;
   common::ObArenaAllocator sample_allocator_;
   ObIVFSampleCandidateMaxCmp sample_cmp_;
   common::ObBinaryHeap<ObIVFSampleCandidate,

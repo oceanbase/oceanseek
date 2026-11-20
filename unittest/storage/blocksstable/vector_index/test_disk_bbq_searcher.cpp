@@ -472,8 +472,10 @@ TEST_F(TestIVFSSTable, parent_hgraph_parallel_add_uses_tenant_memory_and_cleans_
     seed = seed * 1664525U + 1013904223U;
     value = static_cast<float>(seed % 100003) / 100003.0F;
   }
-  const std::vector<float> original = values;
-  ObArrayWrap<float> leaves(values.data(), values.size());
+  share::ObVectorMatrix leaves;
+  ASSERT_EQ(OB_SUCCESS, leaves.set_dimension(dim));
+  ASSERT_EQ(OB_SUCCESS, leaves.resize(values.size()));
+  leaves.copy_from(0, values.data(), values.size());
   ObIVFHcaAlgorithmParam param;
   param.hgraph_m_ = 4;
   param.hgraph_ef_construction_ = 32;
@@ -527,7 +529,7 @@ TEST_F(TestIVFSSTable, parent_hgraph_parallel_add_uses_tenant_memory_and_cleans_
       }
       // This test must reach HGraph rather than silently use brute force.
       ASSERT_TRUE(saw_hgraph_add);
-      EXPECT_EQ(original, values);
+      for (int64_t i = 0; i < leaves.count(); ++i) { EXPECT_EQ(values[i], leaves.at(i)); }
     }
     EXPECT_EQ(0, memory.used());
     EXPECT_EQ(memory_before, ATOMIC_LOAD(vsag_memory));
@@ -7156,7 +7158,7 @@ TEST_F(TestIVFInsertionCentroidSource, insertion_root_uses_unified_centroid_sour
   ASSERT_EQ(OB_SUCCESS, prepare_write_env());
   ObMacroBlockWriter writer;
   ASSERT_EQ(OB_SUCCESS, open_writer(writer, 0));
-  ObArray<float> centers;
+  share::ObVectorMatrix centers;
   for (int64_t c = 0; c < nlist; ++c) {
     float row[dim] = {}; row[0] = c + 1;
     for (float value : row) { ASSERT_EQ(OB_SUCCESS, centers.push_back(value)); }
@@ -7197,13 +7199,13 @@ TEST_F(TestIVFInsertionCentroidSource, insertion_root_uses_unified_centroid_sour
     bool is_valid() const override { return true; }
     int64_t get_vector_count() const override { return 67; }
     int64_t get_dimension() const override { return 16; }
-    int get_all_vids(ObIArray<ObIVFVectorVID> &vids) const override {
+    int get_all_vids(share::ObVectorArray<ObIVFVectorVID> &vids) const override {
       int ret = OB_SUCCESS;
       for (int64_t i = 0; OB_SUCC(ret) && i < 67; ++i) { ret = vids.push_back(101 + i * 3); }
       return ret;
     }
-    int batch_get_by_vid(const ObIArray<ObIVFVectorVID> &vids, int64_t begin,
-        int64_t end, ObIArray<float> &values) const override {
+    int batch_get_by_vid(const ObIVFVectorIDView &vids, int64_t begin,
+        int64_t end, share::ObVectorMatrix &values) const override {
       int ret = OB_SUCCESS; values.reuse();
       for (int64_t i = begin; OB_SUCC(ret) && i < end; ++i) {
         for (int64_t d = 0; OB_SUCC(ret) && d < 16; ++d) {
@@ -7215,8 +7217,9 @@ TEST_F(TestIVFInsertionCentroidSource, insertion_root_uses_unified_centroid_sour
   } input;
   ObIVFVectorReader reader;
   ASSERT_EQ(OB_SUCCESS, reader.init(input));
-  ObArray<ObIVFVectorVID> vids;
-  ObArray<int64_t> offsets, candidates, assigned, reference;
+  share::ObVectorArray<ObIVFVectorVID> vids;
+  ObArray<int64_t> offsets, assigned, reference;
+  ObArray<int64_t> candidates;
   ASSERT_EQ(OB_SUCCESS, input.get_all_vids(vids));
   for (int64_t i = 0; i < vids.count(); ++i) {
     ASSERT_EQ(OB_SUCCESS, offsets.push_back(candidates.count()));

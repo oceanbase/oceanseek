@@ -7,6 +7,7 @@
 #define OCEANBASE_STORAGE_BLOCKSSTABLE_VECTOR_INDEX_OB_IVF_BUILD_INTERFACES_H_
 
 #include "lib/container/ob_se_array.h"
+#include "storage/blocksstable/vector_index/ob_ivf_vector_ids.h"
 #include "share/vector_index/ob_vector_index_common_define.h"
 #include "storage/blocksstable/vector_index/ob_ivf_dag_planner.h"
 #include "storage/blocksstable/vector_index/ob_ivf_merge_strategy.h"
@@ -122,6 +123,26 @@ class ObIVFVectorStore
 {
 public:
   virtual ~ObIVFVectorStore() = default;
+  virtual bool uses_position_ids() const { return false; }
+  virtual int prepare_raw_output() const { return OB_SUCCESS; }
+  virtual int collect_raw_output_keys(
+      const share::ObVectorArray<int64_t> &positions, const common::ObIArray<ObIVFVectorVID> &vids) const
+  { UNUSEDx(positions, vids); return OB_SUCCESS; }
+  virtual int batch_get_output_by_source(const share::ObVectorArray<int64_t> &positions, share::ObVectorMatrix &vectors,
+      common::ObIArray<ObIVFVectorVID> &vids) const
+  { UNUSEDx(positions, vectors, vids); return OB_NOT_SUPPORTED; }
+  // RAW writes use ordinal ranges of the complete input. Position-backed
+  // stores may translate output ordinals through a persistent-VID key stream.
+  virtual int batch_get_output(const ObIVFVectorIDView &ids, int64_t begin, int64_t end, share::ObVectorMatrix &vectors,
+      common::ObIArray<ObIVFVectorVID> &vids) const
+  {
+    int ret = begin < 0 || end <= begin || end > ids.count()
+        ? OB_INVALID_ARGUMENT : batch_get_by_vid(ids, begin, end, vectors);
+    vids.reuse();
+    if (OB_SUCC(ret)) { ret = vids.reserve(end - begin); }
+    for (int64_t i = begin; OB_SUCC(ret) && i < end; ++i) { ret = vids.push_back(ids.at(i)); }
+    return ret;
+  }
   // Optional sealed-source order, independent of VID order. Replay-backed
   // stores let applicable algorithm stages read active rows in physical source order.
   virtual bool supports_source_order() const { return false; }
@@ -132,10 +153,11 @@ public:
   virtual int64_t get_available_replay_memory() const { return 0; }
   virtual int get_source_row_idx(const int64_t vector_idx, int64_t &source_idx) const
   { UNUSED(vector_idx); source_idx = -1; return OB_NOT_SUPPORTED; }
-  // vector_idxs are ranks in get_all_vids(), strictly ordered by source row.
+  // vector_idxs are PosIDs for position stores, otherwise ranks in get_all_vids().
+  // They are strictly ordered by source row.
   // Read only the requested live rows, retaining task-private reader state.
-  virtual int batch_get_by_source(const common::ObIArray<int64_t> &vector_idxs,
-      common::ObIArray<float> &vectors) const
+  virtual int batch_get_by_source(const share::ObVectorArray<int64_t> &vector_idxs,
+      share::ObVectorMatrix &vectors) const
   { UNUSEDx(vector_idxs, vectors); return OB_NOT_SUPPORTED; }
   // Production adapters expose sealed replay stores captured from DDL input
   // or live IVF RAW rows. A valid store is immutable and guarantees globally unique
@@ -143,18 +165,18 @@ public:
   virtual bool is_valid() const = 0;
   virtual int64_t get_vector_count() const = 0;
   virtual int64_t get_dimension() const = 0;
-  // Returns all unique business VIDs in strictly ascending order. VID is
-  // uint64_t and is independent of ObRADatumStore's dense row_id locator.
-  virtual int get_all_vids(
-      common::ObIArray<ObIVFVectorVID> &vids) const = 0;
+  // Real-VID stores return unique uint64_t VIDs in strictly ascending order.
+  // Position stores use the implicit [0, get_vector_count()) range instead;
+  // callers must check uses_position_ids() before requesting this enumeration.
+  virtual int get_all_vids(share::ObVectorArray<ObIVFVectorVID> &vids) const = 0;
   // Implementations resolve VID through the immutable replay store and must
   // use task-local reader state. Output is copied and flattened as
   // (vid_end - vid_begin) * dimension floats.
   virtual int batch_get_by_vid(
-      const common::ObIArray<ObIVFVectorVID> &vids,
+      const ObIVFVectorIDView &vids,
       const int64_t vid_begin,
       const int64_t vid_end,
-      common::ObIArray<float> &vectors) const = 0;
+      share::ObVectorMatrix &vectors) const = 0;
 };
 
 // First-level samples are preselected locators over captured replay stores.
@@ -173,7 +195,7 @@ public:
       const int64_t sample_begin,
       const int64_t sample_end,
       common::ObIArray<ObIVFVectorVID> &sample_vids,
-      common::ObIArray<float> &sample_vectors) const = 0;
+      share::ObVectorMatrix &sample_vectors) const = 0;
 };
 
 class ObIVFVectorReader
@@ -183,11 +205,18 @@ public:
   ~ObIVFVectorReader() = default;
   int init(const ObIVFVectorStore &vector_store);
   int batch_get_by_vid(
-      const common::ObIArray<ObIVFVectorVID> &vids,
+      const ObIVFVectorIDView &vids,
       const int64_t vid_begin,
       const int64_t vid_end,
-      common::ObIArray<float> &vectors) const;
+      share::ObVectorMatrix &vectors) const;
   int64_t get_dimension() const;
+  bool uses_position_ids() const { return vector_store_ != nullptr && vector_store_->uses_position_ids(); }
+  int batch_get_output(const ObIVFVectorIDView &ids, int64_t begin, int64_t end, share::ObVectorMatrix &vectors,
+      common::ObIArray<ObIVFVectorVID> &vids) const
+  {
+    int ret = vector_store_ == nullptr ? OB_NOT_INIT : vectors.set_dimension(vector_store_->get_dimension());
+    return OB_SUCCESS != ret ? ret : vector_store_->batch_get_output(ids, begin, end, vectors, vids);
+  }
 private:
   const ObIVFVectorStore *vector_store_;
 };
@@ -228,13 +257,13 @@ struct ObIVFNeighborGraphView
   ObIVFNeighborGraphView();
   ObIVFNeighborGraphView(
       const common::ObIArray<int64_t> &offsets,
-      const common::ObIArray<int64_t> &cids,
+      const share::ObVectorArray<int64_t> &cids,
       const common::ObIArray<float> &max_intra_distances,
       const int64_t center_count);
   bool is_valid() const;
 
   const common::ObIArray<int64_t> *offsets_;
-  const common::ObIArray<int64_t> *cids_;
+  const share::ObVectorArray<int64_t> *cids_;
   const common::ObIArray<float> *max_intra_distances_;
   int64_t center_count_;
   TO_STRING_KV(KP_(offsets), KP_(cids), KP_(max_intra_distances),
@@ -286,7 +315,7 @@ public:
   virtual bool supports_loaded_quantization() const { return false; }
   virtual bool supports_loaded_posting_reuse() const { return false; }
   virtual int copy_loaded_postings(const ObIVFEncodedPostingSource &source,
-      int64_t source_cid, int64_t target_cid, const common::ObIArray<ObIVFVectorVID> &expected_vids)
+      int64_t source_cid, int64_t target_cid, const ObIVFVectorIDView &expected_vids)
   { UNUSEDx(source, source_cid, target_cid, expected_vids); return OB_NOT_SUPPORTED; }
   // Called at the SOAR barrier before center output, including when postings
   // are encoded later in QUANT. Counts include primary and secondary postings.
@@ -297,17 +326,17 @@ public:
   virtual int64_t posting_write_task_count() const { return 0; }
   virtual int write_posting_range(int64_t task_idx)
   { UNUSED(task_idx); return OB_NOT_SUPPORTED; }
-  virtual int write_loaded_centers(const common::ObIArray<float> &centers,
+  virtual int write_loaded_centers(const share::ObVectorMatrix &centers,
       int64_t dimension, int64_t begin, int64_t end)
   { UNUSEDx(centers, dimension, begin, end); return OB_NOT_SUPPORTED; }
-  virtual int quantize_loaded_vectors(const common::ObIArray<float> &centers, int64_t dimension,
-      const common::ObIArray<ObIVFVectorVID> &vids, const common::ObIArray<float> &vectors,
+  virtual int quantize_loaded_vectors(const share::ObVectorMatrix &centers, int64_t dimension,
+      const ObIVFVectorIDView &vids, const share::ObVectorMatrix &vectors,
       const common::ObIArray<int64_t> &primary, const common::ObIArray<int64_t> *secondary)
   { UNUSEDx(centers, dimension, vids, vectors, primary, secondary); return OB_NOT_SUPPORTED; }
 
   // Prepare is serial. Each task owns a contiguous CID range and closes its
   // output before the QUANT barrier. Legacy sinks keep one task per center.
-  virtual int prepare_quantization(const common::ObIArray<float> &centers,
+  virtual int prepare_quantization(const share::ObVectorMatrix &centers,
       const int64_t center_count, int64_t &task_count)
   { UNUSED(centers); task_count = center_count; return OB_SUCCESS; }
   virtual int open_quantization_range(const int64_t cid_begin, const int64_t cid_end,
@@ -318,32 +347,26 @@ public:
   virtual int close_quantization_range(ObIVFMergeQuantizer *&output, const bool success)
   { UNUSED(success); output = nullptr; return OB_SUCCESS; }
   virtual bool supports_encoded_posting_reuse() const { return false; }
-  virtual int quantize_cluster_with_reuse(
-      ObIVFVectorReader &reader, const common::ObIArray<float> &final_centers,
-      const int64_t center_count, const int64_t cid,
-      const common::ObIArray<ObIVFVectorVID> &member_vids,
-      const common::ObIArray<ObIVFVectorVID> *secondary_member_vids,
-      const ObIVFEncodedPostingSource &source, const int64_t source_center_idx,
-      const int64_t reused_prefix_count)
+  virtual int quantize_cluster_with_reuse(ObIVFVectorReader &reader, const share::ObVectorMatrix &final_centers,
+      const int64_t center_count, const int64_t cid, const ObIVFVectorIDView &member_vids,
+      const storage::ObIVFVectorIDView *secondary_member_vids, const ObIVFEncodedPostingSource &source,
+      const int64_t source_center_idx, const int64_t reused_prefix_count)
   {
     UNUSEDx(reader, final_centers, center_count, cid, member_vids,
         secondary_member_vids, source, source_center_idx, reused_prefix_count);
     return OB_NOT_SUPPORTED;
   }
-  virtual int quantize_cluster(
-      ObIVFVectorReader &reader,
-      const common::ObIArray<float> &final_centers,
-      const int64_t center_count,
-      const int64_t cid,
-      const common::ObIArray<ObIVFVectorVID> &primary_member_vids,
-      const common::ObIArray<ObIVFVectorVID> *secondary_member_vids) = 0;
+  virtual int quantize_cluster(ObIVFVectorReader &reader, const share::ObVectorMatrix &final_centers,
+      const int64_t center_count, const int64_t cid, const ObIVFVectorIDView &primary_member_vids,
+      const storage::ObIVFVectorIDView *secondary_member_vids)
+      = 0;
   virtual int finish_quantization(
       const int64_t vector_count,
       const int64_t center_count,
       const int64_t posting_count) = 0;
   virtual int write_raw_vectors(
       ObIVFVectorReader &reader,
-      const common::ObIArray<ObIVFVectorVID> &all_vids,
+      const ObIVFVectorIDView &all_vids,
       const int64_t vid_begin,
       const int64_t vid_end,
       const int64_t task_idx) = 0;
@@ -363,15 +386,15 @@ public:
   virtual int check_cluster_quality(const common::ObIArray<int64_t> &counts, bool &degenerate)
   { UNUSEDx(counts, degenerate); return OB_NOT_SUPPORTED; }
   virtual int insertion_train_centers(ObIVFVectorReader &reader,
-      const common::ObIArray<ObIVFVectorVID> &all_vids,
+      const ObIVFVectorIDView &all_vids,
       const ObIVFFirstLevelSampleSet &first_level_samples,
-      const common::ObIArray<float> &initial_centers, const int64_t center_count,
-      common::ObIArray<float> &trained_centers)
+      const share::ObVectorMatrix &initial_centers, const int64_t center_count,
+      share::ObVectorMatrix &trained_centers)
   { UNUSEDx(reader, all_vids, first_level_samples, initial_centers, center_count, trained_centers); return OB_NOT_SUPPORTED; }
 
   virtual int insertion_assign_vectors(ObIVFVectorReader &reader,
-      const common::ObIArray<ObIVFVectorVID> &vids,
-      const common::ObIArray<float> &centers,
+      const ObIVFVectorIDView &vids,
+      const share::ObVectorMatrix &centers,
       const common::ObIArray<int64_t> &offsets,
       const common::ObIArray<int64_t> &candidates,
       int64_t begin, int64_t end, common::ObIArray<int64_t> &assignments)
@@ -384,33 +407,33 @@ public:
   virtual int hca_train_loaded_samples(const int64_t vector_count,
       const int64_t cluster_size, const int64_t dimension,
       const common::ObIArray<int64_t> &ordinals,
-      const common::ObIArray<float> &vectors, int64_t &local_k,
-      common::ObIArray<float> &centers)
+      const share::ObVectorMatrix &vectors, int64_t &local_k,
+      share::ObVectorMatrix &centers)
   { UNUSEDx(vector_count, cluster_size, dimension, ordinals, vectors, local_k, centers); return OB_NOT_SUPPORTED; }
 
   virtual int hca_train_local_centers(
       const int64_t depth,
       const int64_t node_idx,
       ObIVFVectorReader &reader,
-      const common::ObIArray<ObIVFVectorVID> &node_vids,
+      const ObIVFVectorIDView &node_vids,
       const ObIVFFirstLevelSampleSet *first_level_samples,
       const int64_t cluster_size,
       int64_t &local_k,
-      common::ObIArray<float> &local_centers) = 0;
+      share::ObVectorMatrix &local_centers) = 0;
   virtual int hca_assign_vectors(
       ObIVFVectorReader &reader,
-      const common::ObIArray<ObIVFVectorVID> &node_vids,
-      const common::ObIArray<float> &local_centers,
+      const ObIVFVectorIDView &node_vids,
+      const share::ObVectorMatrix &local_centers,
       const int64_t local_k,
       const int64_t vid_begin,
       const int64_t vid_end,
       common::ObIArray<int64_t> &local_center_idxs) = 0;
   virtual bool supports_loaded_assign() const { return false; }
   virtual int hca_assign_loaded_vectors(
-      const common::ObIArray<float> &vectors,
+      const share::ObVectorMatrix &vectors,
       const common::ObIArray<int64_t> &positions,
       const int64_t begin, const int64_t end, const int64_t dimension,
-      const common::ObIArray<float> &centers, const int64_t local_k,
+      const share::ObVectorMatrix &centers, const int64_t local_k,
       common::ObIArray<int64_t> &assignments)
   {
     UNUSEDx(vectors, positions, begin, end, dimension, centers, local_k, assignments);
@@ -422,14 +445,14 @@ public:
   virtual void hca_accumulate_center_stats(float *sum, const float *vector,
       const int64_t dimension) { UNUSEDx(sum, vector, dimension); }
   virtual int hca_finalize_center_stats(const float *sum, const int64_t count,
-      const int64_t dimension, common::ObIArray<float> &center)
+      const int64_t dimension, share::ObVectorMatrix &center)
   { UNUSEDx(sum, count, dimension, center); return OB_NOT_SUPPORTED; }
   virtual int hca_compute_local_center_stats_range(
       ObIVFVectorReader &reader,
-      const common::ObIArray<ObIVFVectorVID> &member_vids,
-      const common::ObIArray<float> &local_centers,
+      const ObIVFVectorIDView &member_vids,
+      const share::ObVectorMatrix &local_centers,
       const int64_t local_center_idx,
-      common::ObIArray<float> &updated_center) = 0;
+      share::ObVectorMatrix &updated_center) = 0;
 
   // The methods below are the numerical seam for the post-Hierarchy stages.
   // Processor owns all durable buffers; implementations may retain only
@@ -437,7 +460,7 @@ public:
   // Concurrent task callbacks must be thread-safe.
   virtual int neighborhood_begin(
       const ObIVFNeighborhoodMode mode,
-      const common::ObIArray<float> &centers,
+      const share::ObVectorMatrix &centers,
       const int64_t center_count,
       const int64_t dimension)
   {
@@ -445,7 +468,7 @@ public:
     return OB_NOT_SUPPORTED;
   }
   virtual int neighborhood_add_centers(
-      const common::ObIArray<float> &centers,
+      const share::ObVectorMatrix &centers,
       const int64_t center_count,
       const int64_t dimension,
       const int64_t cid_begin,
@@ -460,7 +483,7 @@ public:
   }
   virtual int neighborhood_find_neighbors(
       const ObIVFNeighborhoodMode mode,
-      const common::ObIArray<float> &centers,
+      const share::ObVectorMatrix &centers,
       const int64_t center_count,
       const int64_t dimension,
       const int64_t cid_begin,
@@ -481,20 +504,20 @@ public:
   // indexed by the numeric uint64_t VID value.
   virtual bool supports_batched_refine_train() const { return false; }
   virtual int refine_train_prepare(ObIVFVectorReader &reader,
-      const common::ObIArray<ObIVFVectorVID> &all_vids,
-      const common::ObIArray<float> &centers, const common::ObIArray<int64_t> &assignments,
+      const ObIVFVectorIDView &all_vids,
+      const share::ObVectorMatrix &centers, const share::ObVectorArray<int64_t> &assignments,
       const ObIVFNeighborGraphView *graph, int64_t center_count, int64_t &batch_size)
   { UNUSEDx(reader, all_vids, centers, assignments, graph, center_count, batch_size); return OB_NOT_SUPPORTED; }
   virtual int refine_train_distances(int64_t begin, int64_t end)
   { UNUSEDx(begin, end); return OB_NOT_SUPPORTED; }
   virtual int refine_train(
       ObIVFVectorReader &reader,
-      const common::ObIArray<ObIVFVectorVID> &all_vids,
-      const common::ObIArray<float> &centers,
-      const common::ObIArray<int64_t> &assignments,
+      const ObIVFVectorIDView &all_vids,
+      const share::ObVectorMatrix &centers,
+      const share::ObVectorArray<int64_t> &assignments,
       const ObIVFNeighborGraphView *neighbor_graph,
       const int64_t center_count,
-      common::ObIArray<float> &working_centers)
+      share::ObVectorMatrix &working_centers)
   {
     UNUSEDx(reader, all_vids, centers, assignments, neighbor_graph,
         center_count, working_centers);
@@ -503,22 +526,22 @@ public:
   // Begin/finish run at serial plan boundaries; only distance tasks are parallel.
   virtual bool supports_parallel_refine() const { return false; }
   virtual int refine_train_begin(ObIVFVectorReader &reader,
-      const common::ObIArray<ObIVFVectorVID> &vids,
-      const common::ObIArray<float> &centers,
-      const common::ObIArray<int64_t> &assignments,
+      const ObIVFVectorIDView &vids,
+      const share::ObVectorMatrix &centers,
+      const share::ObVectorArray<int64_t> &assignments,
       const ObIVFNeighborGraphView *graph, int64_t center_count,
-      common::ObIArray<float> &working_centers)
+      share::ObVectorMatrix &working_centers)
   { return refine_train(reader, vids, centers, assignments, graph, center_count, working_centers); }
   virtual int64_t refine_train_task_count() const { return 0; }
   virtual int refine_train_distance_task(int64_t task_idx)
   { UNUSED(task_idx); return OB_NOT_SUPPORTED; }
-  virtual int refine_train_finish_batch(common::ObIArray<float> &centers, bool &finished)
+  virtual int refine_train_finish_batch(share::ObVectorMatrix &centers, bool &finished)
   { UNUSEDx(centers, finished); return OB_NOT_SUPPORTED; }
   virtual int refine_assign_vectors(
       ObIVFVectorReader &reader,
-      const common::ObIArray<ObIVFVectorVID> &all_vids,
-      const common::ObIArray<float> &working_centers,
-      const common::ObIArray<int64_t> &old_assignments,
+      const ObIVFVectorIDView &all_vids,
+      const share::ObVectorMatrix &working_centers,
+      const share::ObVectorArray<int64_t> &old_assignments,
       const ObIVFNeighborGraphView *neighbor_graph,
       const int64_t center_count,
       const int64_t vid_begin,
@@ -531,11 +554,11 @@ public:
   }
   virtual int refine_update_center(
       ObIVFVectorReader &reader,
-      const common::ObIArray<ObIVFVectorVID> &member_vids,
-      const common::ObIArray<float> &working_centers,
+      const ObIVFVectorIDView &member_vids,
+      const share::ObVectorMatrix &working_centers,
       const int64_t center_count,
       const int64_t cid,
-      common::ObIArray<float> &updated_center)
+      share::ObVectorMatrix &updated_center)
   {
     UNUSEDx(reader, member_vids, working_centers, center_count, cid,
         updated_center);
@@ -543,8 +566,8 @@ public:
   }
   virtual int soar_assign_secondary(
       ObIVFVectorReader &reader,
-      const common::ObIArray<ObIVFVectorVID> &all_vids,
-      const common::ObIArray<float> &final_centers,
+      const ObIVFVectorIDView &all_vids,
+      const share::ObVectorMatrix &final_centers,
       const common::ObIArray<int64_t> &primary_cids,
       const ObIVFNeighborGraphView *neighbor_graph,
       const int64_t center_count,

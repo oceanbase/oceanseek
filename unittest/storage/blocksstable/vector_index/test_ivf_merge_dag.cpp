@@ -19,14 +19,19 @@
 #include <cstdio>
 #include <cstdlib>
 #include <sys/resource.h>
+#include <sys/mman.h>
+#include <unistd.h>
 // The allocation regression observes the cache buffer's actual arena owner.
 #define private public
+#define protected public
 #include "lib/container/ob_se_array.h"
+#undef protected
 #undef private
 #include "common/ob_target_specific.h"
 #include "share/vector_type/ob_vector_soar_distance.h"
 #include "lib/allocator/page_arena.h"
 #include "lib/utility/ob_tracepoint.h"
+#include "lib/utility/ob_sort.h"
 #define private public
 #define protected public
 #include "lib/alloc/memory_dump.h"
@@ -76,6 +81,86 @@ using namespace storage;
 namespace
 {
 
+class BoundedLocatorAllocator final : public ObIAllocator
+{
+public:
+  BoundedLocatorAllocator() : largest_request_(0), remaining_allocations_(-1), backing_() {}
+  void *alloc(int64_t size) override
+  {
+    largest_request_ = MAX(largest_request_, size);
+    if (size <= 0 || size > (1L << 20) || remaining_allocations_ == 0) { return nullptr; }
+    if (remaining_allocations_ > 0) { --remaining_allocations_; }
+    return backing_.alloc(size);
+  }
+  void *alloc(int64_t size, const ObMemAttr &) override { return alloc(size); }
+  void free(void *pointer) override { backing_.free(pointer); }
+  int64_t used() const override { return backing_.used(); }
+  int64_t largest_request_;
+  int64_t remaining_allocations_;
+private:
+  ObIVFMergeRuntimeAllocator backing_;
+};
+
+TEST(TestIVFSourceLocators, transfers_segmented_storage_without_copy_or_double_free)
+{
+  BoundedLocatorAllocator allocator;
+  {
+    ObIVFSourceLocators source(allocator), target(allocator);
+    const int64_t count = (1L << 20) / sizeof(ObAsyncIVFSourceLocator) + 3;
+    ASSERT_EQ(OB_SUCCESS, source.prepare_allocate(count));
+    for (int64_t i = 0; i < count; ++i) {
+      source.at(i) = ObAsyncIVFSourceLocator(count - i, 0, 0, i);
+    }
+    lib::ob_sort(source.begin(), source.end(),
+        [](const auto &a, const auto &b) { return a.vid_ < b.vid_; });
+    const auto *first = &source.at(0);
+    const auto *last = &source.at(count - 1);
+    const int64_t used = allocator.used();
+    ASSERT_EQ(OB_SUCCESS, target.take_over(source));
+    EXPECT_TRUE(source.empty());
+    EXPECT_EQ(0, source.get_capacity());
+    EXPECT_EQ(count, target.count());
+    EXPECT_EQ(first, &target.at(0));
+    EXPECT_EQ(last, &target.at(count - 1));
+    EXPECT_EQ(used, allocator.used());
+    source.reset();
+    EXPECT_EQ(used, allocator.used());
+    EXPECT_EQ(1, target.at(0).vid_);
+    EXPECT_EQ(count, target.at(count - 1).vid_);
+    EXPECT_LE(allocator.largest_request_, 1L << 20);
+  }
+  EXPECT_EQ(0, allocator.used());
+}
+
+TEST(TestIVFSourceLocators, failed_growth_remains_owned_and_takeover_rejects_other_allocators)
+{
+  BoundedLocatorAllocator allocator, other_allocator;
+  {
+    ObIVFSourceLocators source(allocator), wrong_owner(other_allocator), target(allocator);
+    const int64_t block_capacity = ObIVFSourceLocators::Storage::BLOCK_CAPACITY;
+    const int64_t count = block_capacity * 2;
+    ASSERT_EQ(OB_SUCCESS, source.prepare_allocate(count));
+    source.at(0) = ObAsyncIVFSourceLocator(17, 0, 0, 0);
+    // The pointer directory is already allocated. Retain one new payload block,
+    // then fail the next block without publishing additional logical rows.
+    allocator.remaining_allocations_ = 1;
+    EXPECT_EQ(OB_ALLOCATE_MEMORY_FAILED, source.reserve(count * 2));
+    EXPECT_EQ(count, source.count());
+    EXPECT_EQ(count + block_capacity, source.get_capacity());
+    EXPECT_EQ(17, source.at(0).vid_);
+    EXPECT_EQ(OB_INVALID_ARGUMENT, wrong_owner.take_over(source));
+    EXPECT_EQ(count, source.count());
+    allocator.remaining_allocations_ = -1;
+    ASSERT_EQ(OB_SUCCESS, source.push_back(source.at(0)));
+    EXPECT_EQ(17, source.at(count).vid_);
+    ASSERT_EQ(OB_SUCCESS, target.take_over(source));
+    EXPECT_EQ(count + 1, target.count());
+    EXPECT_LE(allocator.largest_request_, 1L << 20);
+  }
+  EXPECT_EQ(0, allocator.used());
+  EXPECT_EQ(0, other_allocator.used());
+}
+
 // These tests only exercise resident stores. External sort still allocates a
 // directory during init; provide that metadata service and reject file opens.
 class ResidentTmpFileManager final : public tmp_file::ObTenantTmpFileManager
@@ -107,16 +192,16 @@ public:
   virtual bool is_valid() const override { return true; }
   virtual int64_t get_vector_count() const override { return 1; }
   virtual int64_t get_dimension() const override { return 1; }
-  virtual int get_all_vids(ObIArray<ObIVFVectorVID> &vids) const override
+  virtual int get_all_vids(share::ObVectorArray<ObIVFVectorVID> &vids) const override
   {
     vids.reset();
     return vids.push_back(VID);
   }
   virtual int batch_get_by_vid(
-      const ObIArray<ObIVFVectorVID> &vids,
+      const ObIVFVectorIDView &vids,
       const int64_t vid_begin,
       const int64_t vid_end,
-      ObIArray<float> &vectors) const override
+      share::ObVectorMatrix &vectors) const override
   {
     int ret = OB_SUCCESS;
     vectors.reset();
@@ -137,7 +222,7 @@ public:
       const int64_t sample_begin,
       const int64_t sample_end,
       ObIArray<ObIVFVectorVID> &sample_vids,
-      ObIArray<float> &sample_vectors) const override
+      share::ObVectorMatrix &sample_vectors) const override
   {
     int ret = OB_SUCCESS;
     sample_vids.reset();
@@ -166,11 +251,11 @@ public:
       const int64_t depth,
       const int64_t node_idx,
       ObIVFVectorReader &reader,
-      const ObIArray<ObIVFVectorVID> &node_vids,
+      const ObIVFVectorIDView &node_vids,
       const ObIVFFirstLevelSampleSet *first_level_samples,
       const int64_t cluster_size,
       int64_t &local_k,
-      ObIArray<float> &local_centers) override
+      share::ObVectorMatrix &local_centers) override
   {
     UNUSEDx(depth, node_idx, reader, first_level_samples);
     local_centers.reset();
@@ -182,8 +267,8 @@ public:
 
   virtual int hca_assign_vectors(
       ObIVFVectorReader &reader,
-      const ObIArray<ObIVFVectorVID> &node_vids,
-      const ObIArray<float> &local_centers,
+      const ObIVFVectorIDView &node_vids,
+      const share::ObVectorMatrix &local_centers,
       const int64_t local_k,
       const int64_t vid_begin,
       const int64_t vid_end,
@@ -200,10 +285,10 @@ public:
 
   virtual int hca_compute_local_center_stats_range(
       ObIVFVectorReader &reader,
-      const ObIArray<ObIVFVectorVID> &member_vids,
-      const ObIArray<float> &local_centers,
+      const ObIVFVectorIDView &member_vids,
+      const share::ObVectorMatrix &local_centers,
       const int64_t local_center_idx,
-      ObIArray<float> &updated_center) override
+      share::ObVectorMatrix &updated_center) override
   {
     UNUSEDx(reader, local_centers);
     updated_center.reset();
@@ -212,13 +297,9 @@ public:
         : OB_INVALID_ARGUMENT;
   }
 
-  virtual int quantize_cluster(
-      ObIVFVectorReader &reader,
-      const ObIArray<float> &final_centers,
-      const int64_t center_count,
-      const int64_t cid,
-      const ObIArray<ObIVFVectorVID> &primary_member_vids,
-      const ObIArray<ObIVFVectorVID> *secondary_member_vids) override
+  virtual int quantize_cluster(ObIVFVectorReader &reader, const share::ObVectorMatrix &final_centers,
+      const int64_t center_count, const int64_t cid, const ObIVFVectorIDView &primary_member_vids,
+      const storage::ObIVFVectorIDView *secondary_member_vids) override
   {
     UNUSED(reader);
     if (1 != center_count || 0 != cid || 1 != final_centers.count()
@@ -245,7 +326,7 @@ public:
 
   virtual int write_raw_vectors(
       ObIVFVectorReader &reader,
-      const ObIArray<ObIVFVectorVID> &all_vids,
+      const ObIVFVectorIDView &all_vids,
       const int64_t vid_begin,
       const int64_t vid_end,
       const int64_t task_idx) override
@@ -361,11 +442,11 @@ public:
       const int64_t depth,
       const int64_t node_idx,
       ObIVFVectorReader &reader,
-      const ObIArray<ObIVFVectorVID> &node_vids,
+      const ObIVFVectorIDView &node_vids,
       const ObIVFFirstLevelSampleSet *first_level_samples,
       const int64_t cluster_size,
       int64_t &local_k,
-      ObIArray<float> &local_centers) override
+      share::ObVectorMatrix &local_centers) override
   {
     UNUSEDx(depth, node_idx, reader, node_vids, first_level_samples,
         cluster_size, local_k, local_centers);
@@ -903,20 +984,24 @@ public:
   int64_t get_vector_count() const override { return n_; }
   int64_t get_dimension() const override { return dim_; }
   bool is_fully_memory_resident() const override { return resident_; }
-  int get_all_vids(ObIArray<ObIVFVectorVID> &vids) const override {
+  bool uses_position_ids() const override { return position_ids_; }
+  int get_all_vids(share::ObVectorArray<ObIVFVectorVID> &vids) const override
+  {
     int ret = OB_SUCCESS; vids.reuse();
-    for (int64_t i = 0; OB_SUCC(ret) && i < n_; ++i) { ret = vids.push_back(17 + 3 * i); }
+    for (int64_t i = 0; OB_SUCC(ret) && i < n_; ++i) { ret = vids.push_back(position_ids_ ? i : 17 + 3 * i); }
     return ret;
   }
-  int batch_get_by_vid(const ObIArray<ObIVFVectorVID> &vids, int64_t begin, int64_t end,
-      ObIArray<float> &out) const override {
+  int batch_get_by_vid(const ObIVFVectorIDView &vids, int64_t begin, int64_t end,
+      share::ObVectorMatrix &out) const override {
     if (fail_) { return OB_IO_ERROR; }
     read_rows_ += end - begin;
     int ret = OB_SUCCESS; out.reuse();
     if (OB_FAIL(out.reserve((end - begin) * dim_))) { return ret; }
     for (int64_t i = begin; OB_SUCC(ret) && i < end; ++i) {
-      const int64_t pos = (vids.at(i) - 17) / 3;
-      if (pos < 0 || pos >= n_ || vids.at(i) != 17 + 3 * pos) { return OB_INVALID_ARGUMENT; }
+      const int64_t pos = position_ids_ ? vids.at(i) : (vids.at(i) - 17) / 3;
+      if (pos < 0 || pos >= n_ || vids.at(i) != static_cast<uint64_t>(position_ids_ ? pos : 17 + 3 * pos)) {
+        return OB_INVALID_ARGUMENT;
+      }
       for (int64_t d = 0; OB_SUCC(ret) && d < dim_; ++d) { ret = out.push_back(data_[pos * dim_ + d]); }
     }
     return ret;
@@ -925,6 +1010,7 @@ public:
   std::vector<float> data_;
   bool fail_;
   bool resident_ = false;
+  bool position_ids_ = false;
   mutable std::atomic<int64_t> read_rows_{0};
 };
 
@@ -934,9 +1020,14 @@ TEST(TestIVFMergeInput, soar_secondary_matches_original_bulk4_and_preserves_cent
   for (int64_t dim : {1, 7, 64, 768}) {
     for (int64_t k : {1, 3, 128, 129}) {
       SoarArrayStore store(67, dim);
-      ObArray<float> centers, limits;
-      ObArray<int64_t> offsets, neighbors, primary, actual;
-      ObArray<ObIVFVectorVID> vids;
+      share::ObVectorMatrix centers;
+      ObArray<float> limits;
+      ObArray<int64_t> offsets;
+      share::ObVectorArray<int64_t> neighbors;
+      ObArray<int64_t> primary;
+      ObArray<int64_t> actual;
+      share::ObVectorArray<ObIVFVectorVID> vids;
+      ASSERT_EQ(OB_SUCCESS, centers.set_dimension(dim));
       for (int64_t c = 0; c < k; ++c) {
         for (int64_t d = 0; d < dim; ++d) { ASSERT_EQ(OB_SUCCESS, centers.push_back(std::sin(c * 0.3 + d * 0.7))); }
         ASSERT_EQ(OB_SUCCESS, offsets.push_back(neighbors.count()));
@@ -1023,11 +1114,14 @@ TEST(TestIVFMergeInput, soar_adapter_performance)
   ASSERT_TRUE(output == nullptr || file != nullptr);
   for (int64_t k : {3733, 36386}) {
     SoarArrayStore store(n, dim);
-    ObArray<float> centers, limits;
-    ObArray<int64_t> offsets, neighbors;
-    ObArray<ObIVFVectorVID> vids;
+    share::ObVectorMatrix centers;
+    ObArray<float> limits;
+    ObArray<int64_t> offsets;
+    share::ObVectorArray<int64_t> neighbors;
+    share::ObVectorArray<ObIVFVectorVID> vids;
     uint32_t seed = 42;
     auto random = [&]() { seed = seed * 1664525U + 1013904223U; return (static_cast<int32_t>(seed % 10001) - 5000) / 5000.0F; };
+    ASSERT_EQ(OB_SUCCESS, centers.set_dimension(dim));
     ASSERT_EQ(OB_SUCCESS, centers.reserve(k * dim));
     for (int64_t i = 0; i < k * dim; ++i) { ASSERT_EQ(OB_SUCCESS, centers.push_back(random())); }
     for (int64_t c = 0; c < k; ++c) {
@@ -1087,14 +1181,14 @@ public:
   int64_t get_vector_count() const override { return count_; }
   int64_t get_sample_count() const override { return count_; }
   int64_t get_dimension() const override { return 2; }
-  int get_all_vids(ObIArray<ObIVFVectorVID> &vids) const override
+  int get_all_vids(share::ObVectorArray<ObIVFVectorVID> &vids) const override
   {
     int ret = OB_SUCCESS; vids.reuse();
     for (int64_t i = 0; OB_SUCC(ret) && i < count_; ++i) { ret = vids.push_back(i + 1); }
     return ret;
   }
-  int batch_get_by_vid(const ObIArray<ObIVFVectorVID> &vids, int64_t begin, int64_t end,
-      ObIArray<float> &vectors) const override
+  int batch_get_by_vid(const ObIVFVectorIDView &vids, int64_t begin, int64_t end,
+      share::ObVectorMatrix &vectors) const override
   {
     int ret = OB_SUCCESS; vectors.reuse();
     ++read_calls_;
@@ -1109,7 +1203,7 @@ public:
     return ret;
   }
   int batch_get_samples(int64_t begin, int64_t end, ObIArray<ObIVFVectorVID> &vids,
-      ObIArray<float> &vectors) const override
+      share::ObVectorMatrix &vectors) const override
   {
     int ret = OB_SUCCESS; vids.reuse();
     for (int64_t i = begin; OB_SUCC(ret) && i < end; ++i) { ret = vids.push_back(i + 1); }
@@ -1136,14 +1230,14 @@ TEST(TestIVFMergeInput, refine_prefetch_reads_samples_in_batches_and_propagates_
     bool is_valid() const override { return true; }
     int64_t get_vector_count() const override { return 131; }
     int64_t get_dimension() const override { return 2; }
-    int get_all_vids(ObIArray<ObIVFVectorVID> &vids) const override {
+    int get_all_vids(share::ObVectorArray<ObIVFVectorVID> &vids) const override {
       int ret = OB_SUCCESS;
       vids.reuse();
       for (int64_t i = 0; OB_SUCC(ret) && i < get_vector_count(); ++i) { ret = vids.push_back(17 + i * 3); }
       return ret;
     }
-    int batch_get_by_vid(const ObIArray<ObIVFVectorVID> &vids, int64_t begin, int64_t end,
-        ObIArray<float> &values) const override {
+    int batch_get_by_vid(const ObIVFVectorIDView &vids, int64_t begin, int64_t end,
+        share::ObVectorMatrix &values) const override {
       int ret = OB_SUCCESS;
       values.reuse();
       ++calls_;
@@ -1161,10 +1255,10 @@ TEST(TestIVFMergeInput, refine_prefetch_reads_samples_in_batches_and_propagates_
   } store;
   ObIVFVectorReader reader;
   ASSERT_EQ(OB_SUCCESS, reader.init(store));
-  ObArray<ObIVFVectorVID> vids;
+  share::ObVectorArray<ObIVFVectorVID> vids;
   ASSERT_EQ(OB_SUCCESS, store.get_all_vids(vids));
-  ObArray<float> centers, working, repeated;
-  ObArray<int64_t> assignments;
+  share::ObVectorMatrix centers, working, repeated;
+  share::ObVectorArray<int64_t> assignments;
   for (int64_t i = 0; i < 4; ++i) {
     ASSERT_EQ(OB_SUCCESS, centers.push_back(static_cast<float>(i * 100)));
     ASSERT_EQ(OB_SUCCESS, centers.push_back(static_cast<float>(i * 100)));
@@ -1181,7 +1275,9 @@ TEST(TestIVFMergeInput, refine_prefetch_reads_samples_in_batches_and_propagates_
   ASSERT_EQ(8, working.count());
   ASSERT_EQ(OB_SUCCESS, algorithm.refine_train(reader, vids, centers, assignments, nullptr, 4, repeated));
   ASSERT_EQ(working.count(), repeated.count());
-  EXPECT_EQ(0, MEMCMP(working.get_data(), repeated.get_data(), working.count() * sizeof(float)));
+  EXPECT_EQ(0,
+      MEMCMP(
+          working.data_at(0, working.count()), repeated.data_at(0, repeated.count()), working.count() * sizeof(float)));
   // The initializing reader is task-local; subsequent batches must own a copy.
   {
     ObIVFVectorReader task_reader;
@@ -1202,7 +1298,9 @@ TEST(TestIVFMergeInput, refine_prefetch_reads_samples_in_batches_and_propagates_
   EXPECT_EQ(32, batches);
   EXPECT_EQ(0, algorithm.refine_train_task_count());
   ASSERT_EQ(working.count(), repeated.count());
-  EXPECT_EQ(0, MEMCMP(working.get_data(), repeated.get_data(), working.count() * sizeof(float)));
+  EXPECT_EQ(0,
+      MEMCMP(
+          working.data_at(0, working.count()), repeated.data_at(0, repeated.count()), working.count() * sizeof(float)));
   store.calls_ = 0;
   store.fail_call_ = 2;
   ASSERT_EQ(OB_IO_ERROR, algorithm.refine_train(reader, vids, centers, assignments, nullptr, 4, repeated));
@@ -1216,7 +1314,7 @@ TEST(TestIVFMergeInput, refine_prefetch_reads_samples_in_batches_and_propagates_
   EXPECT_EQ(OB_IO_ERROR, algorithm.refine_train_finish_batch(repeated, finished));
   EXPECT_FALSE(finished);
   // An incomplete batch must not publish mutable centers to the runtime.
-  EXPECT_EQ(0, MEMCMP((&centers.at(0)), repeated.get_data(), centers.count() * sizeof(float)));
+  EXPECT_EQ(0, MEMCMP((&centers.at(0)), repeated.data_at(0, repeated.count()), centers.count() * sizeof(float)));
   algorithm.cancel(OB_IO_ERROR); // state is retained until the owner drains tasks
 }
 
@@ -1265,11 +1363,11 @@ public:
   int64_t secondary_count_ = 0;
   int64_t raw_count_ = 0;
   int64_t clusters_ = 0;
-  ObArray<float> centers_;
+  share::ObVectorMatrix centers_;
   ObArray<ObIVFPriorPosting> primary_postings_;
   ObArray<ObIVFPriorPosting> secondary_postings_;
-  int quantize_cluster(ObIVFVectorReader &, const ObIArray<float> &centers, int64_t,
-      int64_t cid, const ObIArray<ObIVFVectorVID> &members, const ObIArray<ObIVFVectorVID> *secondary) override
+  int quantize_cluster(ObIVFVectorReader &, const share::ObVectorMatrix &centers, int64_t, int64_t cid,
+      const ObIVFVectorIDView &members, const storage::ObIVFVectorIDView *secondary) override
   {
     int ret = OB_SUCCESS;
     if (centers_.empty()) { ret = centers_.assign(centers); }
@@ -1286,7 +1384,7 @@ public:
   }
   int finish_quantization(int64_t n, int64_t k, int64_t postings) override
   { return n == primary_count_ && k == clusters_ && postings == n + secondary_count_ ? OB_SUCCESS : OB_ERR_UNEXPECTED; }
-  int write_raw_vectors(ObIVFVectorReader &, const ObIArray<ObIVFVectorVID> &, int64_t begin,
+  int write_raw_vectors(ObIVFVectorReader &, const ObIVFVectorIDView &, int64_t begin,
       int64_t end, int64_t) override { raw_count_ += end - begin; return OB_SUCCESS; }
   int finish_raw_write(int64_t n) override { return n == raw_count_ ? OB_SUCCESS : OB_ERR_UNEXPECTED; }
 };
@@ -1299,7 +1397,7 @@ public:
   int64_t begin_ = 0, end_ = 0, next_ = 0;
   bool active_ = false, closed_success_ = false;
   ObIVFMergeProcessor *processor_ = nullptr;
-  int prepare_quantization(const ObIArray<float> &, int64_t k, int64_t &tasks) override
+  int prepare_quantization(const share::ObVectorMatrix &, int64_t k, int64_t &tasks) override
   { tasks = expected_ranges_ = MIN(3L, k); return OB_SUCCESS; }
   int open_quantization_range(int64_t begin, int64_t end, int64_t,
       ObIAllocator &, ObIVFMergeQuantizer *&output) override
@@ -1308,8 +1406,8 @@ public:
     begin_ = next_ = begin; end_ = end; active_ = true; ++opened_; output = this;
     return OB_SUCCESS;
   }
-  int quantize_cluster(ObIVFVectorReader &r, const ObIArray<float> &c, int64_t k,
-      int64_t cid, const ObIArray<ObIVFVectorVID> &v, const ObIArray<ObIVFVectorVID> *s) override
+  int quantize_cluster(ObIVFVectorReader &r, const share::ObVectorMatrix &c, int64_t k, int64_t cid,
+      const ObIVFVectorIDView &v, const storage::ObIVFVectorIDView *s) override
   {
     if (!active_ || cid != next_ || cid >= end_) return OB_STATE_NOT_MATCH;
     if (mode_ == 1) return OB_IO_ERROR;
@@ -1337,7 +1435,10 @@ public:
   {
     if (error_ != OB_SUCCESS) { return error_; }
     std::vector<uint64_t> vids;
-    for (const auto &p : prior_.postings_) { if (p.centroid_idx_ == cid) { vids.push_back(p.vid_); } }
+    for (int64_t i = 0; i < prior_.postings_.count(); ++i) {
+      const auto &p = prior_.postings_.at(i);
+      if (p.centroid_idx_ == cid) { vids.push_back(p.vid_); }
+    }
     std::sort(vids.begin(), vids.end());
     if (omit_last_ && !vids.empty()) { vids.pop_back(); }
     for (const auto vid : vids) {
@@ -1365,13 +1466,13 @@ public:
   int set_centroid_layout(const blocksstable::ObIvfCentroidLayout &layout) override
   { hierarchical_ = layout.is_hierarchical(); ++layout_calls_; return OB_SUCCESS; }
   int copy_loaded_postings(const ObIVFEncodedPostingSource &source, int64_t from, int64_t to,
-      const ObIArray<ObIVFVectorVID> &expected) override
+      const ObIVFVectorIDView &expected) override
   {
     if (copy_error_ != OB_SUCCESS) { return copy_error_; }
     if (cancel_during_copy_ != nullptr) { cancel_during_copy_->cancel(OB_CANCELED); }
     class Consumer : public ObIVFEncodedPostingConsumer {
     public:
-      Consumer(ConcatCountingOutput &out, int64_t cid, const ObIArray<ObIVFVectorVID> &expected)
+      Consumer(ConcatCountingOutput &out, int64_t cid, const ObIVFVectorIDView &expected)
         : out_(out), cid_(cid), expected_(expected) {}
       int append(ObIVFVectorVID vid, const ObString &payload) override
       {
@@ -1384,7 +1485,7 @@ public:
       }
       ConcatCountingOutput &out_;
       int64_t cid_, pos_ = 0;
-      const ObIArray<ObIVFVectorVID> &expected_;
+      ObIVFVectorIDView expected_;
     } consumer(*this, to, expected);
     int ret = source.scan_postings(from, consumer);
     return ret == OB_SUCCESS && consumer.pos_ != expected.count() ? OB_INVALID_DATA : ret;
@@ -1398,10 +1499,10 @@ public:
     }
     return counts_.assign(counts);
   }
-  int write_loaded_centers(const ObIArray<float> &centers, int64_t, int64_t, int64_t) override
+  int write_loaded_centers(const share::ObVectorMatrix &centers, int64_t, int64_t, int64_t) override
   { return centers_.assign(centers); }
-  int quantize_loaded_vectors(const ObIArray<float> &, int64_t, const ObIArray<ObIVFVectorVID> &vids,
-      const ObIArray<float> &, const ObIArray<int64_t> &, const ObIArray<int64_t> *) override
+  int quantize_loaded_vectors(const share::ObVectorMatrix &, int64_t, const ObIVFVectorIDView &vids,
+      const share::ObVectorMatrix &, const common::ObIArray<int64_t> &, const common::ObIArray<int64_t> *) override
   { encoded_ += vids.count(); return OB_ERR_UNEXPECTED; }
   int finish_quantization(int64_t n, int64_t k, int64_t postings) override
   {
@@ -1422,8 +1523,8 @@ public:
   }
   int64_t trained_vectors_ = 0;
   int hca_train_local_centers(int64_t depth, int64_t node, ObIVFVectorReader &reader,
-      const ObIArray<ObIVFVectorVID> &vids, const ObIVFFirstLevelSampleSet *samples,
-      int64_t cluster_size, int64_t &k, ObIArray<float> &centers) override
+      const ObIVFVectorIDView &vids, const ObIVFFirstLevelSampleSet *samples,
+      int64_t cluster_size, int64_t &k, share::ObVectorMatrix &centers) override
   {
     trained_vectors_ += vids.count();
     return ObIVFHcaAlgorithmAdapter::hca_train_local_centers(depth, node, reader, vids, samples, cluster_size, k, centers);
@@ -1439,8 +1540,8 @@ public:
     ++insertion_finish_calls_;
     ObIVFHcaAlgorithmAdapter::finish_insertion_assign();
   }
-  int insertion_assign_vectors(ObIVFVectorReader &reader, const ObIArray<ObIVFVectorVID> &vids,
-      const ObIArray<float> &centers, const ObIArray<int64_t> &offsets,
+  int insertion_assign_vectors(ObIVFVectorReader &reader, const ObIVFVectorIDView &vids,
+      const share::ObVectorMatrix &centers, const common::ObIArray<int64_t> &offsets,
       const ObIArray<int64_t> &candidates, int64_t begin, int64_t end,
       ObIArray<int64_t> &assignments) override
   {
@@ -1454,14 +1555,14 @@ public:
     if (force_assignment_fallback_ && ret == OB_SUCCESS) { degenerate = true; }
     return ret;
   }
-  int insertion_train_centers(ObIVFVectorReader &reader, const ObIArray<ObIVFVectorVID> &vids,
-      const ObIVFFirstLevelSampleSet &samples, const ObIArray<float> &centers, int64_t k, ObIArray<float> &trained) override
+  int insertion_train_centers(ObIVFVectorReader &reader, const ObIVFVectorIDView &vids,
+      const ObIVFFirstLevelSampleSet &samples, const share::ObVectorMatrix &centers, int64_t k, share::ObVectorMatrix &trained) override
   {
     ++warm_calls_;
     return ObIVFHcaAlgorithmAdapter::insertion_train_centers(reader, vids, samples, centers, k, trained);
   }
-  int refine_assign_vectors(ObIVFVectorReader &reader, const ObIArray<ObIVFVectorVID> &vids,
-      const ObIArray<float> &centers, const ObIArray<int64_t> &assignments,
+  int refine_assign_vectors(ObIVFVectorReader &reader, const ObIVFVectorIDView &vids,
+      const share::ObVectorMatrix &centers, const share::ObVectorArray<int64_t> &assignments,
       const ObIVFNeighborGraphView *graph, int64_t k, int64_t begin, int64_t end,
       ObIArray<int64_t> &new_cids) override
   {
@@ -1472,9 +1573,9 @@ public:
     for (int64_t i = begin; OB_SUCC(ret) && i < end; ++i) { ret = new_cids.push_back(assignments.at(i)); }
     return ret;
   }
-  int refine_train_begin(ObIVFVectorReader &reader, const ObIArray<ObIVFVectorVID> &vids,
-      const ObIArray<float> &centers, const ObIArray<int64_t> &assignments,
-      const ObIVFNeighborGraphView *graph, int64_t k, ObIArray<float> &working) override
+  int refine_train_begin(ObIVFVectorReader &reader, const ObIVFVectorIDView &vids,
+      const share::ObVectorMatrix &centers, const share::ObVectorArray<int64_t> &assignments,
+      const ObIVFNeighborGraphView *graph, int64_t k, share::ObVectorMatrix &working) override
   {
     ++refine_calls_;
     return ObIVFHcaAlgorithmAdapter::refine_train_begin(reader, vids, centers, assignments, graph, k, working);
@@ -1498,7 +1599,7 @@ public:
   bool is_valid() const override { return count_ > 0 && dimension_ > 0; }
   int64_t get_vector_count() const override { return count_; }
   int64_t get_dimension() const override { return dimension_; }
-  int get_all_vids(ObIArray<ObIVFVectorVID> &vids) const override
+  int get_all_vids(share::ObVectorArray<ObIVFVectorVID> &vids) const override
   {
     int ret = OB_SUCCESS;
     vids.reuse();
@@ -1517,13 +1618,13 @@ public:
         ? rounding_values[ordinal % 7] + static_cast<float>(d % 3) * 0.03125F
         : static_cast<float>((ordinal % 5) * 10 + d);
   }
-  int batch_get_by_vid(const ObIArray<ObIVFVectorVID> &vids,
-      const int64_t begin, const int64_t end, ObIArray<float> &vectors) const override
+  int batch_get_by_vid(const ObIVFVectorIDView &vids,
+      const int64_t begin, const int64_t end, share::ObVectorMatrix &vectors) const override
   {
     int ret = OB_SUCCESS;
     ++read_calls_;
-    const auto &prefetch = static_cast<const ObSEArray<float, 16, ObWrapperAllocator> &>(vectors);
-    max_used_before_ = MAX(max_used_before_, prefetch.block_allocator_.used());
+    const ObIAllocator *owner = vectors.get_block_allocator().allocator_;
+    max_used_before_ = MAX(max_used_before_, owner == nullptr ? 0 : owner->used());
     if (begin < 0 || end <= begin || end > vids.count()) {
       ret = OB_INVALID_ARGUMENT;
     } else if (read_calls_ == failure_call_) {
@@ -1540,7 +1641,7 @@ public:
         ret = vectors.reserve(value_count);
       } else {
         vectors.reuse();
-        ret = vectors.prepare_allocate(value_count);
+        ret = vectors.resize(value_count);
       }
       for (int64_t i = begin; OB_SUCC(ret) && i < end; ++i) {
         const int64_t ordinal = (vids.at(i) - 11) / 3;
@@ -1559,7 +1660,7 @@ public:
         for (int64_t d = 0; d < dimension_; ++d) { vectors.pop_back(); }
       }
     }
-    peak_used_ = MAX(peak_used_, prefetch.block_allocator_.used());
+    peak_used_ = MAX(peak_used_, (owner == nullptr ? 0 : owner->used()));
     return ret;
   }
   void reset_observations()
@@ -1596,12 +1697,12 @@ TEST(TestIVFHcaAdapter, large_prefetch_owns_only_one_vector_buffer)
     PrefetchAllocationStore store(reset_output);
     ObIVFVectorReader reader;
     ASSERT_EQ(OB_SUCCESS, reader.init(store));
-    ObArray<ObIVFVectorVID> vids;
+    share::ObVectorArray<ObIVFVectorVID> vids;
     ASSERT_EQ(OB_SUCCESS, store.get_all_vids(vids));
     ObIVFHcaAlgorithmParam param;
     ObIVFHcaAlgorithmAdapter algorithm;
     ASSERT_EQ(OB_SUCCESS, algorithm.init(param));
-    ObArray<float> centers, updated;
+    share::ObVectorMatrix centers, updated;
     ASSERT_EQ(OB_SUCCESS, algorithm.hca_compute_local_center_stats_range(
         reader, vids, centers, 0, updated));
     ASSERT_EQ(store.get_dimension(), updated.count());
@@ -1648,7 +1749,8 @@ TEST(TestIVFHcaAdapter, streaming_center_stats_preserve_order_and_normalization_
         param.center_norm_info_ = normalize ? &norm : nullptr;
         ObIVFHcaAlgorithmAdapter algorithm;
         ASSERT_EQ(OB_SUCCESS, algorithm.init(param));
-        ObArray<float> expected, vector, centers, updated;
+        ObArray<float> expected, vector;
+        share::ObVectorMatrix centers, updated;
         ASSERT_EQ(OB_SUCCESS, expected.prepare_allocate(store.dimension_));
         ASSERT_EQ(OB_SUCCESS, vector.prepare_allocate(store.dimension_));
         for (int64_t d = 0; d < store.dimension_; ++d) { expected.at(d) = 0.0F; }
@@ -1692,12 +1794,12 @@ TEST(TestIVFHcaAdapter, streaming_center_stats_reject_failed_or_short_second_win
       store.short_call_ = injected_ret == OB_SUCCESS ? 2 : 0;
       ObIVFVectorReader reader;
       ASSERT_EQ(OB_SUCCESS, reader.init(store));
-      ObArray<ObIVFVectorVID> vids;
+      share::ObVectorArray<ObIVFVectorVID> vids;
       ASSERT_EQ(OB_SUCCESS, store.get_all_vids(vids));
       ObIVFHcaAlgorithmParam param;
       ObIVFHcaAlgorithmAdapter algorithm;
       ASSERT_EQ(OB_SUCCESS, algorithm.init(param));
-      ObArray<float> centers, updated;
+      share::ObVectorMatrix centers, updated;
       ASSERT_EQ(OB_SUCCESS, updated.push_back(999.0F));
       EXPECT_EQ(injected_ret == OB_SUCCESS ? OB_ERR_UNEXPECTED : injected_ret,
           algorithm.hca_compute_local_center_stats_range(reader, vids, centers, 0, updated));
@@ -1719,7 +1821,8 @@ TEST(TestIVFHcaAdapter, streaming_center_stats_reject_failed_or_short_second_win
 TEST(TestIVFHcaAdapter, streaming_center_stats_bound_bytes_and_read_at_least_one_row)
 {
   struct Case { int64_t count_; int64_t dimension_; int64_t max_rows_; };
-  const Case cases[] = {{257, 2048, 128}, {3, 262145, 1}};
+  const int64_t max_dimension = share::ObVectorArray<float>::BLOCK_CAPACITY;
+  const Case cases[] = {{257, 2048, 128}, {3, max_dimension, 1}, {3, max_dimension + 1, 0}};
   for (const bool reset_output : {false, true}) {
     for (const Case &test_case : cases) {
       SCOPED_TRACE(reset_output);
@@ -1727,12 +1830,20 @@ TEST(TestIVFHcaAdapter, streaming_center_stats_bound_bytes_and_read_at_least_one
       PrefetchAllocationStore store(reset_output, test_case.count_, test_case.dimension_);
       ObIVFVectorReader reader;
       ASSERT_EQ(OB_SUCCESS, reader.init(store));
-      ObArray<ObIVFVectorVID> vids;
+      share::ObVectorArray<ObIVFVectorVID> vids;
       ASSERT_EQ(OB_SUCCESS, store.get_all_vids(vids));
       ObIVFHcaAlgorithmParam param;
       ObIVFHcaAlgorithmAdapter algorithm;
       ASSERT_EQ(OB_SUCCESS, algorithm.init(param));
-      ObArray<float> centers, updated;
+      share::ObVectorMatrix centers, updated;
+      if (test_case.max_rows_ == 0) {
+        // One vector must remain contiguous within a matrix block.
+        EXPECT_EQ(OB_INVALID_ARGUMENT, algorithm.hca_compute_local_center_stats_range(
+            reader, vids, centers, 0, updated));
+        EXPECT_EQ(0, store.read_calls_);
+        EXPECT_TRUE(updated.empty());
+        continue;
+      }
       ASSERT_EQ(OB_SUCCESS, algorithm.hca_compute_local_center_stats_range(
           reader, vids, centers, 0, updated));
       ASSERT_EQ(store.dimension_, updated.count());
@@ -1756,7 +1867,7 @@ TEST(TestIVFHcaAdapter, hierarchy_assignment_batches_preserve_source_positions)
   ObIVFHcaAlgorithmParam param;
   ObIVFHcaAlgorithmAdapter algorithm;
   ASSERT_EQ(OB_SUCCESS, algorithm.init(param));
-  ObArray<float> centers;
+  share::ObVectorMatrix centers;
   for (int64_t cid = 0; cid < 8; ++cid) {
     ASSERT_EQ(OB_SUCCESS, centers.push_back(static_cast<float>(cid * 100)));
     ASSERT_EQ(OB_SUCCESS, centers.push_back(0.0F));
@@ -1812,8 +1923,8 @@ public:
   enum Scenario { MULTI_LEVEL, MIXED_LEAVES, NO_PROGRESS };
   explicit HierarchyStatsAlgorithm(const Scenario scenario) : scenario_(scenario) {}
   int hca_train_local_centers(int64_t depth, int64_t node_idx, ObIVFVectorReader &reader,
-      const ObIArray<ObIVFVectorVID> &vids, const ObIVFFirstLevelSampleSet *samples,
-      int64_t cluster_size, int64_t &local_k, ObIArray<float> &centers) override
+      const ObIVFVectorIDView &vids, const ObIVFFirstLevelSampleSet *samples,
+      int64_t cluster_size, int64_t &local_k, share::ObVectorMatrix &centers) override
   {
     UNUSEDx(node_idx, reader, vids, samples, cluster_size);
     int ret = OB_SUCCESS;
@@ -1829,7 +1940,7 @@ public:
     return ret;
   }
   int hca_assign_vectors(ObIVFVectorReader &reader,
-      const ObIArray<ObIVFVectorVID> &vids, const ObIArray<float> &centers,
+      const ObIVFVectorIDView &vids, const share::ObVectorMatrix &centers,
       int64_t local_k, int64_t begin, int64_t end, ObIArray<int64_t> &assignments) override
   {
     UNUSEDx(reader, centers);
@@ -1847,8 +1958,8 @@ public:
     return ret;
   }
   int hca_compute_local_center_stats_range(ObIVFVectorReader &reader,
-      const ObIArray<ObIVFVectorVID> &members, const ObIArray<float> &centers,
-      int64_t cid, ObIArray<float> &updated) override
+      const ObIVFVectorIDView &members, const share::ObVectorMatrix &centers,
+      int64_t cid, share::ObVectorMatrix &updated) override
   {
     ++stats_calls_;
     stats_vectors_ += members.count();
@@ -1997,8 +2108,8 @@ public:
     source = invalid_ ? count_ : count_ - 1 - (duplicate_ && idx == 2 ? 1 : idx);
     return OB_SUCCESS;
   }
-  int batch_get_by_vid(const ObIArray<ObIVFVectorVID> &vids, int64_t begin, int64_t end,
-      ObIArray<float> &values) const override
+  int batch_get_by_vid(const ObIVFVectorIDView &vids, int64_t begin, int64_t end,
+      share::ObVectorMatrix &values) const override
   {
     int ret = OB_SUCCESS;
     values.reuse();
@@ -2010,7 +2121,7 @@ public:
     }
     return ret;
   }
-  int batch_get_by_source(const ObIArray<int64_t> &idxs, ObIArray<float> &values) const override
+  int batch_get_by_source(const share::ObVectorArray<int64_t> &idxs, share::ObVectorMatrix &values) const override
   {
     ++source_calls_;
     if (cancel_on_read_ != nullptr) { cancel_on_read_->cancel(OB_CANCELED); }
@@ -2041,8 +2152,8 @@ public:
   bool update_enabled_ = false;
   bool supports_source_update() const override { return update_enabled_; }
   int hca_train_local_centers(int64_t depth, int64_t node, ObIVFVectorReader &reader,
-      const ObIArray<ObIVFVectorVID> &vids, const ObIVFFirstLevelSampleSet *samples,
-      int64_t cluster_size, int64_t &k, ObIArray<float> &centers) override
+      const ObIVFVectorIDView &vids, const ObIVFFirstLevelSampleSet *samples,
+      int64_t cluster_size, int64_t &k, share::ObVectorMatrix &centers) override
   {
     UNUSEDx(node, reader, samples, cluster_size);
     int ret = OB_SUCCESS;
@@ -2321,7 +2432,7 @@ struct SourceUpdateFixture
     int64_t total = 0;
     for (int64_t cid = 0; cid < ObIVFMergeTestPeer::get_k(processor_); ++cid) {
       ObArray<ObIVFVectorVID> vids;
-      ObArray<float> values;
+      share::ObVectorMatrix values;
       const int64_t n = ObIVFMergeTestPeer::get_member_count(processor_, cid);
       total += n;
       for (int64_t i = 0; i < n; ++i) {
@@ -2446,7 +2557,8 @@ TEST(TestIVFHcaAdapter, source_update_numeric_seam_preserves_kernel_and_normaliz
       param.center_norm_info_ = normalize ? &norm : nullptr;
       ObIVFHcaAlgorithmAdapter algorithm;
       ASSERT_EQ(OB_SUCCESS, algorithm.init(param));
-      ObArray<float> sum, expected, vector, center;
+      ObArray<float> sum, expected, vector;
+      share::ObVectorMatrix center;
       ASSERT_EQ(OB_SUCCESS, sum.prepare_allocate(dim));
       ASSERT_EQ(OB_SUCCESS, expected.prepare_allocate(dim));
       ASSERT_EQ(OB_SUCCESS, vector.prepare_allocate(dim));
@@ -2651,9 +2763,10 @@ TEST(TestIVFInitialBuildRuntime, prepared_samples_preserve_training_bits)
         ReuseVectorStore store(count, 17);
         store.jitter_ = true;
         ObIVFVectorReader reader;
-        ObArray<ObIVFVectorVID> vids, selected_vids;
+        share::ObVectorArray<ObIVFVectorVID> vids;
+        ObArray<ObIVFVectorVID> selected_vids;
         ObArray<int64_t> ordinals;
-        ObArray<float> values, old_centers, new_centers;
+        share::ObVectorMatrix values, old_centers, new_centers;
         ObVectorNormalizeInfo norm;
         ObIVFHcaAlgorithmParam param;
         param.train_param_.random_seed_ = seed;
@@ -2694,7 +2807,7 @@ TEST(TestIVFInitialBuildRuntime, prepared_samples_reject_missing_and_invalid_row
   ASSERT_EQ(OB_SUCCESS, algorithm.init(param));
   ObArray<int64_t> ids;
   ObArray<ObIVFVectorVID> vids;
-  ObArray<float> values, centers;
+  share::ObVectorMatrix values, centers;
   int64_t k = 0;
   ASSERT_EQ(OB_SUCCESS, algorithm.hca_collect_training_rows(1024, 256, ids));
   for (int64_t i = 0; i < ids.count(); ++i) { ASSERT_EQ(OB_SUCCESS, vids.push_back(ids.at(i) + 1)); }
@@ -2721,13 +2834,13 @@ TEST(TestIVFReuseMerge, root_training_consumes_captured_samples)
     int64_t get_vector_count() const override { return n_; }
     int64_t get_sample_count() const override { return MIN(n_, int64_t(256)); }
     int64_t get_dimension() const override { return 2; }
-    int get_all_vids(ObIArray<ObIVFVectorVID> &vids) const override {
+    int get_all_vids(share::ObVectorArray<ObIVFVectorVID> &vids) const override {
       int ret = OB_SUCCESS; vids.reuse();
       for (int64_t i = 0; OB_SUCC(ret) && i < n_; ++i) { ret = vids.push_back(17 + 3 * i); }
       return ret;
     }
-    int batch_get_by_vid(const ObIArray<ObIVFVectorVID> &vids, int64_t begin, int64_t end,
-        ObIArray<float> &values) const override {
+    int batch_get_by_vid(const ObIVFVectorIDView &vids, int64_t begin, int64_t end,
+        share::ObVectorMatrix &values) const override {
       int ret = OB_SUCCESS; values.reuse();
       for (int64_t i = begin; OB_SUCC(ret) && i < end; ++i) {
         const int64_t ordinal = (vids.at(i) - 17) / 3;
@@ -2739,7 +2852,7 @@ TEST(TestIVFReuseMerge, root_training_consumes_captured_samples)
       return ret;
     }
     int batch_get_samples(int64_t begin, int64_t end, ObIArray<ObIVFVectorVID> &vids,
-        ObIArray<float> &values) const override {
+        share::ObVectorMatrix &values) const override {
       int ret = sample_ret_; vids.reuse(); values.reuse();
       if (begin < 0 || end <= begin || end > get_sample_count()) { return OB_INVALID_ARGUMENT; }
       for (int64_t i = begin; OB_SUCC(ret) && i < end; ++i) {
@@ -2762,9 +2875,10 @@ TEST(TestIVFReuseMerge, root_training_consumes_captured_samples)
     SamplingStore store(n);
     ObIVFVectorReader reader;
     ASSERT_EQ(OB_SUCCESS, reader.init(store));
-    ObArray<ObIVFVectorVID> vids, first_reads;
+    share::ObVectorArray<ObIVFVectorVID> vids;
+    ObArray<ObIVFVectorVID> first_reads;
     ASSERT_EQ(OB_SUCCESS, store.get_all_vids(vids));
-    ObArray<float> centers, first_centers, second_centers;
+    share::ObVectorMatrix centers, first_centers, second_centers;
     for (int64_t c = 0; c < 4; ++c) {
       ASSERT_EQ(OB_SUCCESS, centers.push_back(static_cast<float>(c * 8)));
       ASSERT_EQ(OB_SUCCESS, centers.push_back(static_cast<float>(c * 16)));
@@ -2835,7 +2949,7 @@ TEST(TestIVFReuseMerge, refine_update_preserves_global_cid_and_exact_mean)
     ASSERT_EQ(OB_SUCCESS, algorithm.init(param));
     for (const int64_t k : {1, 4096}) {
       SCOPED_TRACE(k);
-      ObArray<float> centers, updated;
+      share::ObVectorMatrix centers, updated;
       for (int64_t i = 0; i < k; ++i) {
         ASSERT_EQ(OB_SUCCESS, centers.push_back(7.0F));
         ASSERT_EQ(OB_SUCCESS, centers.push_back(-3.0F));
@@ -2955,8 +3069,8 @@ void make_replay_merge_input(ObIVFMergeInputAdapter &replay, ReuseVectorStore &s
   replay.vector_dim_ = source.get_dimension();
   replay.dist_type_ = VIDA_L2;
   ASSERT_EQ(OB_SUCCESS, replay.row_desc_.init(IVF_SSTABLE_FORMAT_VERSION));
-  ObArray<ObIVFVectorVID> vids;
-  ObArray<float> values;
+  share::ObVectorArray<ObIVFVectorVID> vids;
+  share::ObVectorMatrix values;
   ASSERT_EQ(OB_SUCCESS, source.get_all_vids(vids));
   ASSERT_EQ(OB_SUCCESS, source.batch_get_by_vid(vids, 0, vids.count(), values));
   for (int64_t slice = 0; slice < 2; ++slice) {
@@ -3005,7 +3119,8 @@ TEST(TestIVFReuseMerge, concat_deduplicates_centers_and_relations_without_vector
     for (int64_t d = 0; d < 2; ++d) { prior.centroids_.at(32 + d) = prior.centroids_.at(d); }
     // Retain an empty source leaf, and keep merely close coordinates distinct.
     if (!all_equal) { prior.centroids_.at(4) = std::nextafter(prior.centroids_.at(0), 1.0F); }
-    for (auto &p : prior.postings_) {
+    for (int64_t i = 0; i < prior.postings_.count(); ++i) {
+      auto &p = prior.postings_.at(i);
       if (p.centroid_idx_ == 31) { p.centroid_idx_ = 30; ++prior.posting_mass_.at(30); --prior.posting_mass_.at(31); }
     }
     ConcatTestSource source(prior); prior.posting_source_ = &source;
@@ -3014,7 +3129,8 @@ TEST(TestIVFReuseMerge, concat_deduplicates_centers_and_relations_without_vector
     for (int64_t c = 0; c < prior.posting_mass_.count(); ++c) {
       centers.insert(std::string(reinterpret_cast<const char *>(&prior.centroids_.at(c * 2)), 2 * sizeof(float)));
     }
-    for (const auto &p : prior.postings_) {
+    for (int64_t i = 0; i < prior.postings_.count(); ++i) {
+      const auto &p = prior.postings_.at(i);
       expected.emplace(std::string(reinterpret_cast<const char *>(&prior.centroids_.at(p.centroid_idx_ * 2)),
           2 * sizeof(float)), p.vid_);
     }
@@ -3066,6 +3182,56 @@ TEST(TestIVFReuseMerge, concat_deduplicates_centers_and_relations_without_vector
     EXPECT_EQ(expected.size() - vectors.count_, merge.secondary_assignment_count_);
   }
   }
+}
+
+TEST(TestIVFReuseMerge, concat_preserves_contiguous_rows_across_segment_boundaries)
+{
+  const int64_t dim = 768;
+  const int64_t count = share::ObVectorArray<float>::BLOCK_CAPACITY / dim + 2;
+  class WideStore final : public ReuseVectorStore
+  {
+  public:
+    explicit WideStore(int64_t count) : ReuseVectorStore(count, 1) {}
+    int64_t get_dimension() const override { return 768; }
+  } vectors(count);
+  ObArenaAllocator allocator;
+  ObIVFMergePrior prior(allocator);
+  prior.dimension_ = dim;
+  prior.vector_count_ = prior.covered_vector_count_ = count;
+  prior.dominant_segment_ = 0;
+  ObIVFSegmentPriorInfo segment;
+  segment.provides_prior_ = true;
+  segment.live_vector_count_ = segment.centroid_count_ = count;
+  ASSERT_EQ(OB_SUCCESS, prior.segments_.push_back(segment));
+  ASSERT_EQ(OB_SUCCESS, prior.centroids_.set_dimension(dim));
+  for (int64_t c = 0; c < count; ++c) {
+    ASSERT_EQ(OB_SUCCESS, prior.old_cids_.push_back(c));
+    ASSERT_EQ(OB_SUCCESS, prior.posting_mass_.push_back(1));
+    ASSERT_EQ(OB_SUCCESS, prior.postings_.push_back(ObIVFPriorPosting(c + 1, c)));
+    for (int64_t d = 0; d < dim; ++d) {
+      ASSERT_EQ(OB_SUCCESS, prior.centroids_.push_back(static_cast<float>(c * dim + d)));
+    }
+  }
+  prior.postings_complete_ = true;
+  ConcatTestSource source(prior);
+  prior.posting_source_ = &source;
+  ObIVFMergeInput input;
+  RecordingReuseAlgorithm algorithm;
+  ConcatCountingOutput output;
+  ObIVFMergeProcessor processor;
+  ASSERT_EQ(OB_SUCCESS, input.init(vectors, vectors, 1, false, true, true, VIDA_L2));
+  ASSERT_EQ(OB_SUCCESS, algorithm.init(ObIVFHcaAlgorithmParam()));
+  ASSERT_EQ(OB_SUCCESS, processor.init(allocator, input, algorithm, output,
+      ObIVFProcessType::CONCATENATION, &prior));
+  ASSERT_EQ(OB_SUCCESS, processor.init_concat_memberships());
+  const auto &runtime = *processor.runtime_;
+  ASSERT_EQ(count, runtime.final_cluster_count_);
+  for (int64_t c = 0; c < count; ++c) {
+    const float *row = runtime.c1_->data_at(runtime.old_to_new_->at(c) * dim, dim);
+    ASSERT_NE(nullptr, row);
+    EXPECT_EQ(0, MEMCMP(prior.centroids_.data_at(c * dim, dim), row, dim * sizeof(float)));
+  }
+  EXPECT_EQ(0, vectors.read_calls_);
 }
 
 TEST(TestIVFReuseMerge, concat_rejects_incomplete_membership_before_copying)
@@ -3383,7 +3549,10 @@ TEST(TestIVFParentBuild, borrowed_centers_reuse_parallel_clustering_and_stop_aft
     value = static_cast<float>(seed % 100003) / 100003.0F;
   }
   const std::vector<float> original = values;
-  ObArrayWrap<float> leaves(values.data(), values.size());
+  share::ObVectorMatrix leaves;
+  ASSERT_EQ(OB_SUCCESS, leaves.set_dimension(dim));
+  ASSERT_EQ(OB_SUCCESS, leaves.resize(values.size(), false));
+  leaves.copy_from(0, values.data(), values.size());
   ObIVFHcaAlgorithmParam param;
   ObIVFMergeRuntimeAllocator memory;
   {
@@ -3432,6 +3601,9 @@ TEST(TestIVFParentBuild, borrowed_centers_reuse_parallel_clustering_and_stop_aft
     EXPECT_GT(plans, 5);
     EXPECT_EQ(count, layout.leaf_count());
     EXPECT_EQ(0, MEMCMP(values.data(), original.data(), values.size() * sizeof(float)));
+    for (int64_t i = 0; i < leaves.count(); ++i) {
+      EXPECT_FLOAT_EQ(original[i], leaves.at(i));
+    }
     // The compatibility entry drives exactly the same stages synchronously.
     ObArenaAllocator oracle_memory;
     blocksstable::ObIvfCentroidLayout oracle(oracle_memory);
@@ -3463,8 +3635,8 @@ TEST(TestIVFReuseMerge, parent_barriers_preserve_leaf_output_for_all_build_paths
       ++layout_calls_; leaf_count_ = layout.leaf_count();
       return OB_SUCCESS;
     }
-    int quantize_cluster(ObIVFVectorReader &r, const ObIArray<float> &c, int64_t k, int64_t cid,
-        const ObIArray<ObIVFVectorVID> &members, const ObIArray<ObIVFVectorVID> *secondary) override
+    int quantize_cluster(ObIVFVectorReader &r, const share::ObVectorMatrix &c, int64_t k, int64_t cid,
+        const ObIVFVectorIDView &members, const storage::ObIVFVectorIDView *secondary) override
     {
       return layout_calls_ != 1 || leaf_count_ != k ? OB_STATE_NOT_MATCH
           : ReuseCountingOutput::quantize_cluster(r, c, k, cid, members, secondary);
@@ -3661,20 +3833,19 @@ public:
   int64_t reused_ = 0;
   int64_t encoded_ = 0;
   bool supports_encoded_posting_reuse() const override { return true; }
-  int quantize_cluster(ObIVFVectorReader &reader, const ObIArray<float> &centers,
-      int64_t k, int64_t cid, const ObIArray<ObIVFVectorVID> &members,
-      const ObIArray<ObIVFVectorVID> *secondary) override
+  int quantize_cluster(ObIVFVectorReader &reader, const share::ObVectorMatrix &centers, int64_t k, int64_t cid,
+      const ObIVFVectorIDView &members, const storage::ObIVFVectorIDView *secondary) override
   {
     encoded_ += members.count() + (secondary == nullptr ? 0 : secondary->count());
     return ReuseCountingOutput::quantize_cluster(reader, centers, k, cid, members, secondary);
   }
-  int quantize_cluster_with_reuse(ObIVFVectorReader &reader, const ObIArray<float> &centers,
-      int64_t k, int64_t cid, const ObIArray<ObIVFVectorVID> &members,
-      const ObIArray<ObIVFVectorVID> *secondary, const ObIVFEncodedPostingSource &source,
+  int quantize_cluster_with_reuse(ObIVFVectorReader &reader, const share::ObVectorMatrix &centers,
+      int64_t k, int64_t cid, const ObIVFVectorIDView &members,
+      const storage::ObIVFVectorIDView *secondary, const ObIVFEncodedPostingSource &source,
       int64_t source_cid, int64_t prefix) override
   {
     struct Consumer final : ObIVFEncodedPostingConsumer {
-      Consumer(const ObIArray<ObIVFVectorVID> &members, int64_t prefix) : members_(members), prefix_(prefix) {}
+      Consumer(const ObIVFVectorIDView &members, int64_t prefix) : members_(members), prefix_(prefix) {}
       int append(ObIVFVectorVID vid, const ObString &bytes) override {
         uint64_t code = 0;
         if (count_ >= prefix_ || members_.at(count_) != vid || bytes.length() != sizeof(code)) {
@@ -3684,7 +3855,7 @@ public:
         if (code != vid) { return OB_INVALID_DATA; }
         ++count_; return OB_SUCCESS;
       }
-      const ObIArray<ObIVFVectorVID> &members_;
+      ObIVFVectorIDView members_;
       int64_t prefix_;
       int64_t count_ = 0;
     } consumer(members, prefix);
@@ -3709,8 +3880,8 @@ class IncrementalAlgorithm final : public RecordingReuseAlgorithm
 {
 public:
   ObArray<ObIVFVectorVID> soar_vids_;
-  int soar_assign_secondary(ObIVFVectorReader &reader, const ObIArray<ObIVFVectorVID> &vids,
-      const ObIArray<float> &centers, const ObIArray<int64_t> &primary,
+  int soar_assign_secondary(ObIVFVectorReader &reader, const ObIVFVectorIDView &vids,
+      const share::ObVectorMatrix &centers, const common::ObIArray<int64_t> &primary,
       const ObIVFNeighborGraphView *graph, int64_t k, int64_t begin, int64_t end,
       ObIArray<int64_t> &secondary) override
   {
@@ -4003,6 +4174,233 @@ TEST(TestIVFMergeMemory, retires_results_at_barriers_and_frees_all_runtime_data)
   EXPECT_EQ(0, memory.used());
 }
 
+TEST(TestIVFMergeMemory, vid_enumeration_owns_the_only_output_reservation)
+{
+  class ReservingStore final : public ReuseVectorStore
+  {
+  public:
+    explicit ReservingStore(ObIVFMergeRuntimeAllocator &memory)
+      : ReuseVectorStore(4097), memory_(memory)
+    {}
+    int get_all_vids(share::ObVectorArray<ObIVFVectorVID> &vids) const override
+    {
+      const int64_t allocations = memory_.allocation_count();
+      EXPECT_EQ(0, vids.get_capacity());
+      int ret = OB_SUCCESS;
+      vids.reuse();
+      if (OB_FAIL(vids.reserve(count_))) {
+      } else {
+        for (int64_t i = 0; OB_SUCC(ret) && i < count_; ++i) {
+          ret = vids.push_back(i + 1);
+        }
+      }
+      EXPECT_EQ(allocations + 1, memory_.allocation_count());
+      return ret;
+    }
+    ObIVFMergeRuntimeAllocator &memory_;
+  };
+  ObIVFMergeRuntimeAllocator memory;
+  ReservingStore vectors(memory);
+  ObIVFMergeInput input;
+  RecordingReuseAlgorithm algorithm;
+  ConcatCountingOutput output;
+  ASSERT_EQ(OB_SUCCESS, input.init(vectors, vectors, 16, false, true, true, VIDA_L2));
+  {
+    ObIVFMergeProcessor processor;
+    ASSERT_EQ(OB_SUCCESS, processor.init(memory, input, algorithm, output));
+    ASSERT_EQ(vectors.count_, processor.runtime_->all_vids_.count());
+    for (int64_t i = 0; i < vectors.count_; ++i) {
+      EXPECT_EQ(i + 1, processor.runtime_->all_vids_.at(i));
+    }
+  }
+  EXPECT_EQ(0, memory.used());
+}
+
+TEST(TestIVFMergeMemory, initial_build_position_ids_skip_all_vid_enumeration)
+{
+  class PositionStore final : public ReuseVectorStore
+  {
+  public:
+    PositionStore() : ReuseVectorStore(10000000) {}
+    bool uses_position_ids() const override { return true; }
+    int get_all_vids(share::ObVectorArray<ObIVFVectorVID> &) const override
+    { ADD_FAILURE() << "PosID input must not enumerate all VIDs"; return OB_ERR_UNEXPECTED; }
+  } vectors;
+  ObArenaAllocator owner;
+  ObIVFMergeInput input;
+  RecordingReuseAlgorithm algorithm;
+  ConcatCountingOutput output;
+  ASSERT_EQ(OB_SUCCESS, input.init(vectors, vectors, 16, false, true, true, VIDA_L2));
+  ObIVFMergeProcessor processor;
+  ASSERT_EQ(OB_SUCCESS, processor.init(owner, input, algorithm, output, ObIVFProcessType::INITIAL_BUILD));
+  EXPECT_EQ(10000000, processor.runtime_->all_vids_.count());
+  EXPECT_EQ(9999999, processor.runtime_->all_vids_.at(9999999));
+  EXPECT_EQ(0, processor.runtime_->all_vids_.allocated_vid_bytes());
+}
+
+TEST(TestIVFMergeMemory, initial_build_routes_ten_billion_positions_without_materializing_ids)
+{
+  constexpr int64_t vector_count = 10000000000L;
+  class PositionStore final : public ReuseVectorStore
+  {
+  public:
+    PositionStore() : ReuseVectorStore(10000000000L) {}
+    bool uses_position_ids() const override { return true; }
+    bool supports_source_order() const override { return true; }
+    int get_all_vids(share::ObVectorArray<ObIVFVectorVID> &) const override
+    {
+      ADD_FAILURE() << "Position routing must not materialize ten billion VIDs";
+      return OB_ERR_UNEXPECTED;
+    }
+    int get_source_row_idx(int64_t, int64_t &) const override
+    {
+      ADD_FAILURE() << "Identity routing must not enumerate source rows";
+      return OB_ERR_UNEXPECTED;
+    }
+  } vectors;
+  ObArenaAllocator owner;
+  ObIVFMergeInput input;
+  RecordingReuseAlgorithm algorithm;
+  ConcatCountingOutput output;
+  ASSERT_EQ(OB_SUCCESS, input.init(vectors, vectors, 384, false, true, true, VIDA_L2));
+  ObIVFMergeProcessor processor;
+  ASSERT_EQ(OB_SUCCESS, processor.init(owner, input, algorithm, output, ObIVFProcessType::INITIAL_BUILD));
+  ObIVFDDLHcaAdapter ddl_algorithm;
+  ObIVFDDLRuntime routes(owner, ddl_algorithm, 64);
+  ASSERT_EQ(OB_SUCCESS, routes.prepare_source_routes(*processor.runtime_));
+  const int64_t positions[] = {0, int64_t(UINT32_MAX) - 1, int64_t(UINT32_MAX),
+                              int64_t(UINT32_MAX) + 1, vector_count - 1};
+  for (int64_t position : positions) {
+    EXPECT_EQ(position, routes.vector_index(position));
+    EXPECT_EQ(static_cast<uint64_t>(position), processor.runtime_->all_vids_.at(position));
+  }
+  EXPECT_EQ(0, processor.runtime_->all_vids_.allocated_vid_bytes());
+  EXPECT_EQ(-1, routes.vector_index(-1));
+  EXPECT_EQ(-1, routes.vector_index(vector_count));
+  processor.runtime_->all_vids_.set_identity(vector_count - 1);
+  EXPECT_EQ(OB_STATE_NOT_MATCH, routes.prepare_source_routes(*processor.runtime_));
+  routes.release_routes();
+  EXPECT_EQ(-1, routes.vector_index(0));
+  ASSERT_EQ(OB_SUCCESS, routes.prepare_source_routes(*processor.runtime_));
+  EXPECT_EQ(vector_count - 2, routes.vector_index(vector_count - 2));
+  EXPECT_EQ(-1, routes.vector_index(vector_count - 1));
+}
+
+TEST(TestIVFMergeMemory, compact_sample_routes_preserve_positions_above_uint32)
+{
+  const int64_t high_position = 9999999999L;
+  EXPECT_EQ(3 * sizeof(int64_t), sizeof(ObIVFClusterRead));
+  share::ObVectorArray<ObIVFClusterRead> requests;
+  ASSERT_EQ(OB_SUCCESS, requests.push_back({high_position, 7, high_position - 2}));
+  ASSERT_EQ(OB_SUCCESS, requests.push_back({int64_t(UINT32_MAX) + 1, 8, high_position - 4}));
+  ASSERT_EQ(OB_SUCCESS, requests.push_back({int64_t(UINT32_MAX), 9, high_position - 6}));
+  std::sort(share::vector_array_begin(requests), share::vector_array_end(requests));
+  EXPECT_EQ(int64_t(UINT32_MAX), requests.at(0).source_);
+  EXPECT_EQ(int64_t(UINT32_MAX) + 1, requests.at(1).source_);
+  EXPECT_EQ(high_position, requests.at(2).source_);
+  EXPECT_EQ(7, requests.at(2).node_idx_);
+  EXPECT_EQ(high_position - 2, requests.at(2).ordinal_);
+}
+
+TEST(TestIVFMergeMemory, source_route_storage_is_implicit_only_for_position_ids)
+{
+  class RouteStore final : public ObIVFVectorStore
+  {
+  public:
+    explicit RouteStore(int mode) : mode_(mode) {}
+    bool is_valid() const override { return true; }
+    bool uses_position_ids() const override { return mode_ != 0; }
+    bool supports_source_order() const override { return true; }
+    int64_t get_vector_count() const override { return 9; }
+    int64_t get_dimension() const override { return 2; }
+    int get_source_row_idx(int64_t idx, int64_t &source) const override
+    {
+      source = mode_ == 1 ? idx : (2 * idx) % 9;
+      return OB_SUCCESS;
+    }
+    int get_all_vids(share::ObVectorArray<ObIVFVectorVID> &) const override { return OB_NOT_SUPPORTED; }
+    int batch_get_by_vid(const ObIVFVectorIDView &, int64_t, int64_t, share::ObVectorMatrix &) const override
+    {
+      return OB_NOT_SUPPORTED;
+    }
+    int mode_;
+  };
+  for (int mode : {0, 1, 2}) {
+    SCOPED_TRACE(mode); // VID permutation, identity PosID, invalid PosID permutation.
+    ObArenaAllocator allocator("IVFRouteUT");
+    RouteStore store(mode);
+    ObIVFMergeRuntime runtime(allocator);
+    runtime.vector_store_ = &store;
+    runtime.dimension_ = 2;
+    runtime.all_vids_.set_identity(9);
+    ObIVFHierarchyVIDList members(allocator, store.uses_position_ids());
+    for (int64_t idx : {0, 2, 5}) {
+      ASSERT_EQ(OB_SUCCESS, members.vector_idxs_.push_back(idx));
+      if (!store.uses_position_ids()) {
+        ASSERT_EQ(OB_SUCCESS, members.vids_.push_back(idx));
+      }
+    }
+    ObIVFHierarchyNodeState node(allocator, 2);
+    node.vid_list_ = &members;
+    node.local_k_ = 1;
+    ASSERT_EQ(OB_SUCCESS, node.local_centers_.resize(2));
+    ASSERT_EQ(OB_SUCCESS, runtime.current_nodes_.push_back(&node));
+    ObIVFMergeActivePlan plan(allocator);
+    struct Guard
+    {
+      ObIAllocator &allocator_;
+      ObIVFMergeActivePlan &plan_;
+      ~Guard() { free_runtime_object(allocator_, plan_.ddl_); }
+    } guard{allocator, plan};
+    const int ret = prepare_source_assign(runtime, plan, allocator);
+    ASSERT_NE(nullptr, plan.ddl_);
+    EXPECT_EQ(mode == 0 ? 9 : 0, plan.ddl_->source_vector_idxs_.count());
+    if (mode != 0) {
+      EXPECT_EQ(0, plan.ddl_->source_vector_idxs_.get_capacity());
+    }
+    if (mode == 2) {
+      EXPECT_EQ(OB_INVALID_DATA, ret);
+      continue;
+    }
+    ASSERT_EQ(OB_SUCCESS, ret);
+    ASSERT_EQ(9, plan.ddl_->source_nodes_.count());
+    ASSERT_EQ(1, plan.work_items_.count());
+    EXPECT_EQ(3, plan.work_items_.at(0).source_input_count_);
+    for (int64_t idx : {0, 2, 5}) {
+      int64_t source = -1;
+      ASSERT_EQ(OB_SUCCESS, store.get_source_row_idx(idx, source));
+      EXPECT_EQ(0, plan.ddl_->source_nodes_.at(source));
+      EXPECT_EQ(idx, plan.ddl_->source_vector_index(source));
+    }
+    EXPECT_EQ(-1, plan.ddl_->source_nodes_.at(8));
+  }
+}
+
+TEST(TestIVFMergeMemory, initial_build_returns_retired_buffers_before_runtime_destruction)
+{
+  ObArenaAllocator owner;
+  ReuseVectorStore vectors(64, 16);
+  ObIVFMergeInput input;
+  RecordingReuseAlgorithm algorithm;
+  ConcatCountingOutput output;
+  ASSERT_EQ(OB_SUCCESS, input.init(vectors, vectors, 8, false, true, true, VIDA_L2));
+  ObIVFMergeProcessor processor;
+  ASSERT_EQ(OB_SUCCESS, processor.init(owner, input, algorithm, output, ObIVFProcessType::INITIAL_BUILD));
+  ASSERT_NE(&owner, processor.allocator_);
+  const int64_t baseline = processor.runtime_allocator_.allocated();
+  for (int round = 0; round < 3; ++round) {
+    {
+      ObArray<int64_t, ObWrapperAllocator> retired;
+      retired.set_block_allocator(ObWrapperAllocator(*processor.allocator_));
+      // Exceed the FIFO page size so the measurement excludes cached pages.
+      ASSERT_EQ(OB_SUCCESS, retired.reserve(2 * OB_MALLOC_MIDDLE_BLOCK_SIZE / sizeof(int64_t)));
+      EXPECT_GT(processor.runtime_allocator_.allocated(), baseline);
+    }
+    EXPECT_EQ(baseline, processor.runtime_allocator_.allocated());
+    EXPECT_EQ(vectors.count_, processor.runtime_->all_vids_.count());
+  }
+}
+
 TEST(TestIVFMergeMemory, allocator_preserves_alignment_and_accounts_concurrent_live_bytes)
 {
   ObIVFMergeRuntimeAllocator memory;
@@ -4096,8 +4494,8 @@ TEST(TestIVFMergeMemory, cancellation_does_not_free_a_running_workers_buffers)
   {
   public:
     int hca_train_local_centers(int64_t depth, int64_t node, ObIVFVectorReader &reader,
-        const ObIArray<ObIVFVectorVID> &vids, const ObIVFFirstLevelSampleSet *samples,
-        int64_t cluster_size, int64_t &k, ObIArray<float> &centers) override
+        const ObIVFVectorIDView &vids, const ObIVFFirstLevelSampleSet *samples,
+        int64_t cluster_size, int64_t &k, share::ObVectorMatrix &centers) override
     {
       {
         std::unique_lock<std::mutex> lock(mutex_);
@@ -4187,14 +4585,14 @@ public:
     return static_cast<float>((d == 0 ? group % 16 : group / 16) * 20
         + (idx * (d == 0 ? 7 : 11) % 19)) / 3.0F;
   }
-  int get_all_vids(ObIArray<ObIVFVectorVID> &vids) const override
+  int get_all_vids(share::ObVectorArray<ObIVFVectorVID> &vids) const override
   { int ret = OB_SUCCESS; vids.reuse();
     for (int64_t i = 0; OB_SUCC(ret) && i < n_; ++i) { ret = vids.push_back(vid(i)); }
     return ret; }
   int get_source_row_idx(int64_t idx, int64_t &source) const override
   { source = (idx * 2) % n_; return idx >= 0 && idx < n_ ? OB_SUCCESS : OB_INVALID_ARGUMENT; }
-  int batch_get_by_vid(const ObIArray<ObIVFVectorVID> &vids, int64_t begin, int64_t end,
-      ObIArray<float> &values) const override
+  int batch_get_by_vid(const ObIVFVectorIDView &vids, int64_t begin, int64_t end,
+      share::ObVectorMatrix &values) const override
   {
     if (read_error_ != OB_SUCCESS) { return read_error_; }
     int ret = OB_SUCCESS; values.reuse(); vid_rows_ += end - begin;
@@ -4209,7 +4607,7 @@ public:
     }
     return ret;
   }
-  int batch_get_by_source(const ObIArray<int64_t> &idxs, ObIArray<float> &values) const override
+  int batch_get_by_source(const share::ObVectorArray<int64_t> &idxs, share::ObVectorMatrix &values) const override
   {
     if (read_error_ != OB_SUCCESS) { return read_error_; }
     int ret = OB_SUCCESS; values.reuse(); source_rows_ += idxs.count();
@@ -4233,7 +4631,7 @@ public:
     return ret;
   }
   int batch_get_samples(int64_t begin, int64_t end, ObIArray<ObIVFVectorVID> &vids,
-      ObIArray<float> &values) const override
+      share::ObVectorMatrix &values) const override
   {
     int ret = OB_SUCCESS; vids.reuse();
     for (int64_t i = begin; OB_SUCC(ret) && i < end; ++i) { ret = vids.push_back(vid(i)); }
@@ -4245,7 +4643,7 @@ public:
 class DDLShiftedRefineAdapter final : public ObIVFDDLHcaAdapter
 {
 public:
-  int finish_refine_phase(ObIArray<float> &centers, bool &finished) override
+  int finish_refine_phase(share::ObVectorMatrix &centers, bool &finished) override
   {
     int ret = ObIVFDDLHcaAdapter::finish_refine_phase(centers, finished);
     if (OB_SUCC(ret) && finished) {
@@ -4254,7 +4652,7 @@ public:
     }
     return ret;
   }
-  int refine_train_finish_batch(ObIArray<float> &centers, bool &finished) override
+  int refine_train_finish_batch(share::ObVectorMatrix &centers, bool &finished) override
   {
     int ret = ObIVFDDLHcaAdapter::refine_train_finish_batch(centers, finished);
     if (OB_SUCC(ret) && finished) {
@@ -4293,10 +4691,10 @@ public:
   bool supports_loaded_quantization() const override { return true; }
   int set_leaf_posting_counts(const ObIArray<uint32_t> &counts) override
   { return leaf_posting_counts_.assign(counts); }
-  int write_loaded_centers(const ObIArray<float> &centers, int64_t, int64_t begin, int64_t end) override
+  int write_loaded_centers(const share::ObVectorMatrix &centers, int64_t, int64_t begin, int64_t end) override
   { int ret = centers_.empty() ? centers_.assign(centers) : OB_SUCCESS; clusters_ += end - begin; return ret; }
-  int quantize_loaded_vectors(const ObIArray<float> &, int64_t dim, const ObIArray<ObIVFVectorVID> &vids,
-      const ObIArray<float> &values, const ObIArray<int64_t> &primary, const ObIArray<int64_t> *secondary) override
+  int quantize_loaded_vectors(const share::ObVectorMatrix &, int64_t dim, const ObIVFVectorIDView &vids,
+      const share::ObVectorMatrix &values, const common::ObIArray<int64_t> &primary, const common::ObIArray<int64_t> *secondary) override
   {
     std::lock_guard<std::mutex> guard(output_lock_);
     int ret = OB_SUCCESS;
@@ -4319,12 +4717,44 @@ public:
 };
 }
 
+TEST(TestIVFDDLRuntime, position_routes_accept_ten_billion_rows_without_reverse_array)
+{
+  class PositionStore final : public ObIVFVectorStore {
+  public:
+    bool is_valid() const override { return true; }
+    bool uses_position_ids() const override { return true; }
+    bool supports_source_order() const override { return true; }
+    int64_t get_vector_count() const override { return 10000000000L; }
+    int64_t get_dimension() const override { return 1024; }
+    int get_all_vids(share::ObVectorArray<ObIVFVectorVID> &) const override { return OB_NOT_SUPPORTED; }
+    int batch_get_by_vid(const ObIVFVectorIDView &, int64_t, int64_t, share::ObVectorMatrix &) const override
+    {
+      return OB_NOT_SUPPORTED;
+    }
+  } store;
+  ObArenaAllocator allocator;
+  ObIVFMergeRuntime runtime(allocator);
+  runtime.vector_store_ = &store;
+  runtime.dimension_ = store.get_dimension();
+  runtime.all_vids_.set_identity(store.get_vector_count());
+  ObIVFDDLHcaAdapter algorithm;
+  ObIVFDDLRuntime ddl(allocator, algorithm, 4);
+  ASSERT_EQ(OB_SUCCESS, ddl.prepare_source_routes(runtime));
+  EXPECT_TRUE(ddl.position_mode_);
+  EXPECT_TRUE(ddl.source_to_vector_.empty());
+  EXPECT_EQ(store.get_vector_count() - 1, ddl.vector_index(store.get_vector_count() - 1));
+  EXPECT_EQ(-1, ddl.vector_index(store.get_vector_count()));
+  const ObIVFClusterRead request = {store.get_vector_count() - 1, 0, store.get_vector_count() - 3};
+  EXPECT_EQ(9999999999L, request.source_);
+  EXPECT_EQ(9999999997L, request.ordinal_);
+}
+
 TEST(TestIVFDDLRuntime, cached_refine_matches_canonical_trainer_without_epoch_reads)
 {
   DDLCountingStore store(131);
-  ObArray<ObIVFVectorVID> vids;
-  ObArray<float> centers, expected, actual;
-  ObArray<int64_t> assignments;
+  share::ObVectorArray<ObIVFVectorVID> vids;
+  share::ObVectorMatrix centers, expected, actual;
+  share::ObVectorArray<int64_t> assignments;
   ASSERT_EQ(OB_SUCCESS, store.get_all_vids(vids));
   for (int64_t i = 0; i < 4; ++i) {
     for (int d = 0; d < 2; ++d) { ASSERT_EQ(OB_SUCCESS, centers.push_back(store.value(i, d))); }
@@ -4350,7 +4780,7 @@ TEST(TestIVFDDLRuntime, cached_refine_matches_canonical_trainer_without_epoch_re
   for (int64_t end = samples.count(); end > 0;) {
     const int64_t begin = MAX(0L, end - 13);
     ObArray<int64_t> positions;
-    ObArray<float> values;
+    share::ObVectorMatrix values;
     for (int64_t pos = end; pos-- > begin;) {
       ASSERT_EQ(OB_SUCCESS, positions.push_back(pos));
       for (int d = 0; d < 2; ++d) { ASSERT_EQ(OB_SUCCESS, values.push_back(store.value(samples.at(pos), d))); }
@@ -4389,16 +4819,21 @@ TEST(TestIVFDDLRuntime, resident_and_cached_refine_preserve_epoch_and_sample_bou
       {1003, 129, 17, 3, true}, // Variable-length neighborhood rows.
       {10003, 129, 17, 33, true},
       {53, 5, 17, 1, false}, // Sample pool smaller than a batch.
+      {10003, 1024, 768, 33, true}, // Matrix and distance blocks with non-power-of-two rows.
       {10003, 129, 1024, 33, true}}; // Large multi-epoch resident batch store.
   for (const auto &c : cases) {
     SCOPED_TRACE(::testing::Message() << c.n_ << "/" << c.k_ << "/" << c.dim_
         << "/" << c.samples_per_cluster_ << "/" << c.cosine_);
     SoarArrayStore store(c.n_, c.dim_);
     ObVectorNormalizeInfo norm;
-    ObArray<ObIVFVectorVID> vids;
-    ObArray<float> centers, limits, expected, actual;
-    ObArray<int64_t> assignments, offsets, neighbors;
+    share::ObVectorArray<ObIVFVectorVID> vids;
+    share::ObVectorMatrix centers;
+    ObArray<float> limits;
+    share::ObVectorMatrix expected, actual;
+    ObArray<int64_t> offsets;
+    share::ObVectorArray<int64_t> assignments, neighbors;
     ASSERT_EQ(OB_SUCCESS, store.get_all_vids(vids));
+    ASSERT_EQ(OB_SUCCESS, centers.set_dimension(c.dim_));
     for (int64_t i = 0; i < c.n_; ++i) {
       float *vector = &store.data_[i * c.dim_];
       for (int64_t d = 0; d < c.dim_; ++d) {
@@ -4436,15 +4871,19 @@ TEST(TestIVFDDLRuntime, resident_and_cached_refine_preserve_epoch_and_sample_bou
     ASSERT_EQ(OB_SUCCESS, reference.init(param));
     ASSERT_EQ(OB_SUCCESS, reference.refine_train(reader, vids, centers, assignments, graph_ptr, c.k_, expected));
     const int64_t sample_count = MIN(c.n_, c.k_ * c.samples_per_cluster_);
-    for (const bool resident : {false, true}) {
-      SCOPED_TRACE(resident);
+    for (int mode : {0, 1, 2}) {
+      const bool resident = mode != 0;
+      store.position_ids_ = mode == 2;
+      const ObIVFVectorIDView input_ids
+          = store.position_ids_ ? ObIVFVectorIDView::identity(c.n_) : ObIVFVectorIDView(vids);
+      SCOPED_TRACE(mode);
       ObIVFDDLHcaAdapter algorithm;
       ASSERT_EQ(OB_SUCCESS, algorithm.init(param));
       store.resident_ = resident;
       store.fail_ = !resident; // Materialized training must not read the original payload.
       const int64_t read_before = store.read_rows_.load();
       ASSERT_EQ(OB_SUCCESS, algorithm.begin_refine_samples(c.n_, c.dim_, centers, assignments,
-          graph_ptr, INT64_MAX, 1, &store, &vids));
+          graph_ptr, INT64_MAX, 1, &store, input_ids));
       EXPECT_EQ(resident, algorithm.uses_resident_refine_source());
       EXPECT_EQ(read_before, store.read_rows_.load());
       if (resident) {
@@ -4455,7 +4894,7 @@ TEST(TestIVFDDLRuntime, resident_and_cached_refine_preserve_epoch_and_sample_bou
         EXPECT_TRUE(algorithm.refine_sample_indices()->empty());
         int64_t rows = 0;
         EXPECT_EQ(OB_STATE_NOT_MATCH, algorithm.refine_train_prepare(
-            reader, vids, centers, assignments, graph_ptr, c.k_, rows));
+            reader, input_ids, centers, assignments, graph_ptr, c.k_, rows));
         EXPECT_EQ(0, rows);
       } else {
         ASSERT_EQ(OB_SUCCESS, algorithm.begin_refine_sample_shard(0));
@@ -4464,7 +4903,7 @@ TEST(TestIVFDDLRuntime, resident_and_cached_refine_preserve_epoch_and_sample_bou
         for (int64_t end = samples.count(); end > 0;) {
           const int64_t begin = MAX(0L, end - 257);
           ObArray<int64_t> positions;
-          ObArray<float> values;
+          share::ObVectorMatrix values;
           for (int64_t pos = end; pos-- > begin;) {
             ASSERT_EQ(OB_SUCCESS, positions.push_back(pos));
             for (int64_t d = 0; d < c.dim_; ++d) {
@@ -4483,7 +4922,7 @@ TEST(TestIVFDDLRuntime, resident_and_cached_refine_preserve_epoch_and_sample_bou
       while (!finished && batches < 100) {
         int64_t rows = 0;
         ASSERT_EQ(OB_SUCCESS, algorithm.refine_train_prepare(
-            reader, vids, centers, assignments, graph_ptr, c.k_, rows));
+            reader, input_ids, centers, assignments, graph_ptr, c.k_, rows));
         ASSERT_EQ(MIN(c.n_, c.k_ * 2), rows);
         std::vector<std::thread> workers;
         std::vector<int> results(4);
@@ -4502,7 +4941,11 @@ TEST(TestIVFDDLRuntime, resident_and_cached_refine_preserve_epoch_and_sample_bou
       EXPECT_EQ(3 * ((sample_count + batch_size - 1) / batch_size), batches);
       EXPECT_EQ(resident ? batch_size * batches : 0, store.read_rows_.load() - read_before);
       ASSERT_EQ(expected.count(), actual.count());
-      EXPECT_EQ(0, MEMCMP(&expected.at(0), &actual.at(0), expected.count() * sizeof(float)));
+      for (int64_t cid = 0; cid < c.k_; ++cid) {
+        EXPECT_EQ(0,
+            MEMCMP(
+                expected.data_at(cid * c.dim_, c.dim_), actual.data_at(cid * c.dim_, c.dim_), c.dim_ * sizeof(float)));
+      }
       EXPECT_EQ(nullptr, algorithm.refine_sample_indices());
       EXPECT_FALSE(algorithm.uses_resident_refine_source());
     }
@@ -4512,9 +4955,10 @@ TEST(TestIVFDDLRuntime, resident_and_cached_refine_preserve_epoch_and_sample_bou
 TEST(TestIVFDDLRuntime, cached_refine_errors_and_cancel_do_not_publish)
 {
   DDLCountingStore store(23);
-  ObArray<ObIVFVectorVID> vids;
-  ObArray<float> centers, published, values;
-  ObArray<int64_t> assignments, positions;
+  share::ObVectorArray<ObIVFVectorVID> vids;
+  share::ObVectorMatrix centers, published, values;
+  ObArray<int64_t> positions;
+  share::ObVectorArray<int64_t> assignments;
   ASSERT_EQ(OB_SUCCESS, store.get_all_vids(vids));
   for (int64_t i = 0; i < 3; ++i) {
     for (int d = 0; d < 2; ++d) { ASSERT_EQ(OB_SUCCESS, centers.push_back(store.value(i, d))); }
@@ -4579,9 +5023,9 @@ TEST(TestIVFDDLRuntime, resident_refine_read_errors_do_not_publish)
     for (int mode = 0; mode < 5; ++mode) {
       SCOPED_TRACE(::testing::Message() << after_first_batch << "/" << mode);
       DDLCountingStore store(23);
-      ObArray<ObIVFVectorVID> vids;
-      ObArray<float> centers, published;
-      ObArray<int64_t> assignments;
+      share::ObVectorArray<ObIVFVectorVID> vids;
+      share::ObVectorMatrix centers, published;
+      share::ObVectorArray<int64_t> assignments;
       ASSERT_EQ(OB_SUCCESS, store.get_all_vids(vids));
       for (int64_t i = 0; i < store.n_; ++i) {
         ASSERT_EQ(OB_SUCCESS, assignments.push_back(i % 3));
@@ -4595,7 +5039,7 @@ TEST(TestIVFDDLRuntime, resident_refine_read_errors_do_not_publish)
       ASSERT_EQ(OB_SUCCESS, reader.init(store));
       ASSERT_EQ(OB_SUCCESS, algorithm.init(ObIVFHcaAlgorithmParam()));
       ASSERT_EQ(OB_SUCCESS, algorithm.begin_refine_samples(
-          store.n_, 2, centers, assignments, nullptr, 0, 4, &store, &vids));
+          store.n_, 2, centers, assignments, nullptr, 0, 4, &store, vids));
       ASSERT_TRUE(algorithm.uses_resident_refine_source());
       ASSERT_EQ(OB_SUCCESS, algorithm.finish_refine_samples());
       int64_t rows = 0;
@@ -4627,7 +5071,7 @@ TEST(TestIVFDDLRuntime, resident_refine_read_errors_do_not_publish)
       store.short_read_ = false;
       store.invalid_value_ = 0.0F;
       ObIVFHcaAlgorithmAdapter reference;
-      ObArray<float> expected;
+      share::ObVectorMatrix expected;
       ASSERT_EQ(OB_SUCCESS, reference.init(ObIVFHcaAlgorithmParam()));
       ASSERT_EQ(OB_SUCCESS, reference.refine_train(reader, vids, centers, assignments, nullptr, 3, expected));
       // Retry the failed gather in the same session, including after an update.
@@ -4653,9 +5097,9 @@ TEST(TestIVFDDLRuntime, resident_refine_cancel_does_not_publish)
   for (int mode = 0; mode < 3; ++mode) {
     SCOPED_TRACE(mode);
     DDLCountingStore store(23);
-    ObArray<ObIVFVectorVID> vids;
-    ObArray<float> centers, published;
-    ObArray<int64_t> assignments;
+    share::ObVectorArray<ObIVFVectorVID> vids;
+    share::ObVectorMatrix centers, published;
+    share::ObVectorArray<int64_t> assignments;
     ASSERT_EQ(OB_SUCCESS, store.get_all_vids(vids));
     for (int64_t i = 0; i < store.n_; ++i) {
       ASSERT_EQ(OB_SUCCESS, assignments.push_back(i % 3));
@@ -4669,7 +5113,7 @@ TEST(TestIVFDDLRuntime, resident_refine_cancel_does_not_publish)
     ASSERT_EQ(OB_SUCCESS, reader.init(store));
     ASSERT_EQ(OB_SUCCESS, algorithm.init(ObIVFHcaAlgorithmParam()));
     ASSERT_EQ(OB_SUCCESS, algorithm.begin_refine_samples(
-        store.n_, 2, centers, assignments, nullptr, 0, 4, &store, &vids));
+        store.n_, 2, centers, assignments, nullptr, 0, 4, &store, vids));
     ASSERT_EQ(OB_SUCCESS, algorithm.finish_refine_samples());
     int64_t rows = 0;
     if (mode != 0) {
@@ -4711,7 +5155,7 @@ TEST(TestIVFDDLRuntime, configuration_rejects_output_without_loaded_quantization
 // Snapshot task results before the SOAR commit retires dense assignment state.
 // Output/readback checks below must not keep that production memory alive.
 static void snapshot_soar_assignments(const ObIVFMergeRuntime &runtime,
-    ObArray<int64_t> &primary, ObArray<int64_t> &secondary)
+    ObIArray<int64_t> &primary, ObIArray<int64_t> &secondary)
 {
   ASSERT_NE(nullptr, runtime.active_plan_);
   ASSERT_NE(nullptr, runtime.ddl_runtime_);
@@ -4977,7 +5421,7 @@ TEST(TestIVFDDLRuntime, soar_quant_matches_separate_quantization_for_single_and_
     PerfObserver observer;
     ObIVFFullBuildPlanner planner;
     planner.set_perf_observer(&observer);
-    ObArray<float> expected_centers;
+    share::ObVectorMatrix expected_centers;
     ASSERT_EQ(OB_SUCCESS, algorithm.init(ObIVFHcaAlgorithmParam()));
     ASSERT_EQ(OB_SUCCESS, input.init(store, store, single_center ? store.n_ * 2 : 64,
         false, true, soar, VIDA_L2));
@@ -5017,15 +5461,16 @@ TEST(TestIVFDDLRuntime, soar_quant_matches_separate_quantization_for_single_and_
       plan = next;
       if (step == ObIVFMergeStep::SOAR_ASSIGN) {
         ASSERT_EQ(expected_centers.count(), runtime.c1_->count());
-        EXPECT_EQ(0, MEMCMP(expected_centers.begin(), runtime.c1_->begin(),
-            expected_centers.count() * sizeof(float)));
+        for (int64_t i = 0; i < expected_centers.count(); ++i) {
+          EXPECT_EQ(0, MEMCMP(&expected_centers.at(i), &runtime.c1_->at(i), sizeof(float)));
+        }
         EXPECT_EQ(nullptr, runtime.a1_);
         EXPECT_EQ(nullptr, runtime.a2_);
         EXPECT_FALSE(runtime.ddl_runtime_->routes_ready_);
         EXPECT_EQ(store.n_, output.primary_count_);
         // Reproduce the former QUANT input using the test's snapshot. The
         // production dense assignments have already been released.
-        ObArray<float> values;
+        share::ObVectorMatrix values;
         const int64_t vid_reads_before = store.vid_rows_.load();
         ASSERT_EQ(OB_SUCCESS, store.batch_get_by_vid(runtime.all_vids_, 0, store.n_, values));
         EXPECT_EQ(store.n_, store.vid_rows_.load() - vid_reads_before);
@@ -5037,8 +5482,9 @@ TEST(TestIVFDDLRuntime, soar_quant_matches_separate_quantization_for_single_and_
     EXPECT_EQ(1, soar_steps);
     EXPECT_EQ(1, quant_steps);
     ASSERT_EQ(expected_centers.count(), output.centers_.count());
-    EXPECT_EQ(0, MEMCMP(expected_centers.begin(), output.centers_.begin(),
-        expected_centers.count() * sizeof(float)));
+    for (int64_t i = 0; i < expected_centers.count(); ++i) {
+      EXPECT_EQ(0, MEMCMP(&expected_centers.at(i), &output.centers_.at(i), sizeof(float)));
+    }
     EXPECT_EQ(store.n_, output.primary_count_);
     EXPECT_EQ(store.n_, output.raw_count_);
     if (single_center || !soar) { EXPECT_EQ(0, output.secondary_count_); }
@@ -5149,8 +5595,8 @@ public:
     drain_mask_ |= 1 << task;
     return OB_SUCCESS;
   }
-  int quantize_loaded_vectors(const ObIArray<float> &centers, int64_t dim,
-      const ObIArray<ObIVFVectorVID> &vids, const ObIArray<float> &values,
+  int quantize_loaded_vectors(const share::ObVectorMatrix &centers, int64_t dim,
+      const ObIVFVectorIDView &vids, const share::ObVectorMatrix &values,
       const ObIArray<int64_t> &primary, const ObIArray<int64_t> *secondary) override
   {
     for (int64_t i = 0; i < vids.count(); ++i) { loaded_vids_.insert(vids.at(i)); }
@@ -5161,12 +5607,12 @@ public:
     return ret;
   }
   int copy_loaded_postings(const ObIVFEncodedPostingSource &source, int64_t source_cid,
-      int64_t target_cid, const ObIArray<ObIVFVectorVID> &expected) override
+      int64_t target_cid, const ObIVFVectorIDView &expected) override
   {
     class Consumer final : public ObIVFEncodedPostingConsumer
     {
     public:
-      Consumer(LoadedIncrementalOutput &output, int64_t cid, const ObIArray<ObIVFVectorVID> &expected)
+      Consumer(LoadedIncrementalOutput &output, int64_t cid, const ObIVFVectorIDView &expected)
         : output_(output), cid_(cid), expected_(expected) {}
       int append(ObIVFVectorVID vid, const ObString &bytes) override
       {
@@ -5182,7 +5628,7 @@ public:
       }
       LoadedIncrementalOutput &output_;
       int64_t cid_;
-      const ObIArray<ObIVFVectorVID> &expected_;
+      ObIVFVectorIDView expected_;
       int64_t count_ = 0;
     } consumer(*this, target_cid, expected);
     int ret = source.scan_postings(source_cid, consumer);
@@ -5359,7 +5805,7 @@ void run_root_source_update(ObIVFProcessType type, int64_t delta_count,
     EXPECT_EQ(expected_reads, planned_reads);
     if (expected_reads == 0) {
       EXPECT_EQ(1, plan->get_task_count());
-      EXPECT_TRUE(runtime.active_plan_->ddl_->source_routes_.empty());
+      EXPECT_TRUE(runtime.active_plan_->ddl_->source_nodes_.empty());
     }
   } else {
     EXPECT_EQ(nullptr, runtime.active_plan_->source_update_);
@@ -5434,10 +5880,10 @@ class RawRecordingOutput final : public Base
 {
 public:
   std::map<uint64_t, std::pair<float, float>> raw_;
-  int write_raw_vectors(ObIVFVectorReader &reader, const ObIArray<ObIVFVectorVID> &vids,
+  int write_raw_vectors(ObIVFVectorReader &reader, const ObIVFVectorIDView &vids,
       int64_t begin, int64_t end, int64_t task) override
   {
-    ObArray<float> values;
+    share::ObVectorMatrix values;
     int ret = reader.batch_get_by_vid(vids, begin, end, values);
     if (ret == OB_SUCCESS && values.count() != (end - begin) * 2) { ret = OB_INVALID_DATA; }
     for (int64_t i = begin; ret == OB_SUCCESS && i < end; ++i) {
@@ -5473,7 +5919,7 @@ void make_global_insertion_prior(ObIVFMergePrior &prior, DDLCountingStore &store
     }
     // Real source posting streams are ordered by VID. The two old parents of
     // the same vector deliberately live in different former CID task batches.
-    lib::ob_sort(prior.postings_.begin(), prior.postings_.end(),
+    lib::ob_sort(share::vector_array_begin(prior.postings_), share::vector_array_end(prior.postings_),
         [](const ObIVFPriorPosting &a, const ObIVFPriorPosting &b) {
           return a.vid_ < b.vid_ || (a.vid_ == b.vid_ && a.centroid_idx_ < b.centroid_idx_);
         });
@@ -5623,7 +6069,8 @@ void run_global_insertion_case(const GlobalInsertionCase &test, bool loaded,
       // may survive this barrier; no second complete posting VID list remains.
       EXPECT_EQ(nullptr, processor.runtime_->soar_member_lists_);
       ASSERT_NE(nullptr, processor.runtime_->final_member_lists_);
-      for (auto *list : processor.runtime_->final_member_lists_->lists_) { EXPECT_TRUE(list->vids_.empty()); }
+      const auto &lists = processor.runtime_->final_member_lists_->lists_;
+      for (int64_t i = 0; i < lists.count(); ++i) { EXPECT_TRUE(lists.at(i)->vids_.empty()); }
     }
   }
   ASSERT_EQ(nullptr, plan);
@@ -5672,6 +6119,157 @@ void run_global_insertion_case(const GlobalInsertionCase &test, bool loaded,
 
 
 
+
+TEST(TestIVFInsertionMatrix, child_routing_preserves_rows_across_blocks)
+{
+  class Store final : public ReuseVectorStore
+  {
+  public:
+    explicit Store(int64_t target) : ReuseVectorStore(1), target_(target) {}
+    int64_t get_dimension() const override { return 3000; }
+    bool supports_source_order() const override { return true; }
+    int get_source_row_idx(int64_t idx, int64_t &source) const override
+    { source = idx; return idx == 0 ? OB_SUCCESS : OB_INVALID_ARGUMENT; }
+    int read(share::ObVectorMatrix &values) const
+    {
+      values.reuse();
+      int ret = values.set_dimension(get_dimension());
+      if (OB_SUCC(ret) && OB_SUCC(ret = values.resize(get_dimension()))) { values.at(0) = target_; }
+      return ret;
+    }
+    int batch_get_by_vid(const ObIVFVectorIDView &, int64_t, int64_t,
+        share::ObVectorMatrix &values) const override { return read(values); }
+    int batch_get_by_source(const share::ObVectorArray<int64_t> &,
+        share::ObVectorMatrix &values) const override { return read(values); }
+    int64_t target_;
+  };
+  class Algorithm final : public ObIVFDDLHcaAdapter
+  {
+  public:
+    int insertion_assign_vectors(ObIVFVectorReader &reader, const ObIVFVectorIDView &vids,
+        const share::ObVectorMatrix &centers, const ObIArray<int64_t> &offsets,
+        const ObIArray<int64_t> &candidates, int64_t begin, int64_t end, ObIArray<int64_t> &assigned) override
+    {
+      // Check before data_at(), so the regression fails cleanly in assertion builds too.
+      const int64_t dim = reader.get_dimension();
+      for (int64_t i = 0; i < centers.count(); i += dim) {
+        if (centers.contiguous_count(i) < dim) { return OB_ERR_UNEXPECTED; }
+      }
+      return ObIVFHcaAlgorithmAdapter::insertion_assign_vectors(
+          reader, vids, centers, offsets, candidates, begin, end, assigned);
+    }
+  };
+  class Output final : public ReuseCountingOutput
+  {
+  public:
+    explicit Output(bool loaded) : loaded_(loaded) {}
+    bool supports_loaded_quantization() const override { return loaded_; }
+    bool supports_loaded_posting_reuse() const override { return loaded_; }
+    int quantize_loaded_vectors(const share::ObVectorMatrix &, int64_t,
+        const ObIVFVectorIDView &, const share::ObVectorMatrix &,
+        const ObIArray<int64_t> &primary, const ObIArray<int64_t> *) override
+    { return routed_.assign(primary); }
+    bool loaded_;
+    ObArray<int64_t> routed_;
+  };
+  for (bool loaded : {false, true}) {
+    for (int64_t children : {87, 88}) {
+      SCOPED_TRACE(loaded);
+      SCOPED_TRACE(children);
+      ObArenaAllocator allocator;
+      Store store(children - 1);
+      Algorithm algorithm;
+      Output output(loaded);
+      ObIVFMergeInput input;
+      ObIVFMergePrior prior(allocator);
+      ObIVFMergeProcessor processor;
+      ASSERT_EQ(OB_SUCCESS, algorithm.init(ObIVFHcaAlgorithmParam()));
+      ASSERT_EQ(OB_SUCCESS, input.init(store, store, 384, false, true, true, VIDA_L2));
+      ASSERT_EQ(OB_SUCCESS, processor.init(allocator, input, algorithm, output));
+      auto &r = *processor.runtime_;
+      // Current INSERTION freezes leaves. Exercise its retained multi-child routing explicitly.
+      r.effective_type_ = ObIVFProcessType::INSERTION;
+      r.insertion_prior_ = &prior;
+      r.final_cluster_count_ = children + 1;
+      ASSERT_EQ(OB_SUCCESS, alloc_runtime_array(allocator, r.c1_));
+      ASSERT_EQ(OB_SUCCESS, r.c1_->set_dimension(store.get_dimension()));
+      ASSERT_EQ(OB_SUCCESS, r.c1_->resize((children + 1) * store.get_dimension()));
+      ASSERT_EQ(OB_SUCCESS, alloc_runtime_array(allocator, r.a0_));
+      ASSERT_EQ(OB_SUCCESS, r.a0_->push_back(children));
+      ASSERT_EQ(OB_SUCCESS, alloc_runtime_array(allocator, r.old_to_new_));
+      for (int64_t cid = 0; cid <= children; ++cid) {
+        r.c1_->at(cid * store.get_dimension()) = cid == children ? -1000.0F : static_cast<float>(cid);
+        ASSERT_EQ(OB_SUCCESS, r.old_to_new_->push_back(cid));
+        ASSERT_EQ(OB_SUCCESS, r.insertion_origins_.push_back(cid == children ? 0 : 1));
+        ASSERT_EQ(OB_SUCCESS, r.insertion_reuse_cids_.push_back(-1));
+        ASSERT_EQ(OB_SUCCESS, r.insertion_posting_counts_.push_back(0));
+      }
+      for (int64_t offset : {0L, 1L, children + 1}) {
+        ASSERT_EQ(OB_SUCCESS, r.insertion_child_offsets_.push_back(offset));
+      }
+      ASSERT_EQ(OB_SUCCESS, r.insertion_child_cids_.push_back(children));
+      for (int64_t cid = 0; cid < children; ++cid) {
+        ASSERT_EQ(OB_SUCCESS, r.insertion_child_cids_.push_back(cid));
+      }
+      for (int64_t offset : {0, 0, 1}) { ASSERT_EQ(OB_SUCCESS, r.insertion_source_offsets_.push_back(offset)); }
+      ASSERT_EQ(OB_SUCCESS, r.insertion_source_idxs_.push_back(0));
+      ASSERT_EQ(OB_SUCCESS, r.insertion_offsets_.push_back(0));
+      ASSERT_EQ(OB_SUCCESS, r.insertion_offsets_.push_back(2));
+      ASSERT_EQ(OB_SUCCESS, r.insertion_candidates_.push_back(0));
+      ASSERT_EQ(OB_SUCCESS, r.insertion_candidates_.push_back(1));
+      if (loaded) {
+        ASSERT_EQ(OB_SUCCESS, processor.configure_ddl_runtime(algorithm, 1));
+        ASSERT_EQ(OB_SUCCESS, r.ddl_runtime_->prepare_source_routes(r));
+      }
+      ASSERT_EQ(OB_SUCCESS, alloc_runtime_object(allocator, r.active_plan_, allocator));
+      auto &plan = *r.active_plan_;
+      plan.plan_id_ = 1;
+      plan.stage_ = ObIVFMergeStage::SOAR;
+      plan.step_ = ObIVFMergeStep::SOAR_ASSIGN;
+      ObIVFMergeWorkItem item;
+      item.vid_begin_ = 0; item.vid_end_ = 1; item.cid_begin_ = 0; item.source_input_count_ = 1;
+      ASSERT_EQ(OB_SUCCESS, plan.work_items_.push_back(item));
+      ASSERT_EQ(OB_SUCCESS, share::vector_array_resize(plan.result_slots_, 1));
+      const int ret = processor.execute_post_hierarchy_task(plan.stage_, plan.step_, 1, 0);
+      EXPECT_EQ(OB_SUCCESS, ret);
+      if (ret == OB_SUCCESS) {
+        EXPECT_TRUE(plan.result_slots_.at(0).installed_);
+        if (loaded) {
+          ASSERT_EQ(2, output.routed_.count());
+          EXPECT_EQ(children, output.routed_.at(0));
+          EXPECT_EQ(children - 1, output.routed_.at(1));
+        } else {
+          ASSERT_NE(nullptr, plan.result_slots_.at(0).center_idxs_);
+          EXPECT_EQ(children - 1, plan.result_slots_.at(0).center_idxs_->at(0));
+        }
+      }
+    }
+  }
+}
+
+TEST(TestIVFInsertionMatrix, malformed_center_layout_is_rejected_before_distance)
+{
+  const int64_t dim = 3000, count = 88;
+  SoarArrayStore store(1, dim);
+  ObIVFVectorReader reader;
+  ObIVFHcaAlgorithmAdapter algorithm;
+  share::ObVectorMatrix malformed; // Deliberately retain the default dimension of one.
+  ObArray<ObIVFVectorVID> vids;
+  ObArray<int64_t> offsets, candidates, assigned;
+  ASSERT_EQ(OB_SUCCESS, reader.init(store));
+  ASSERT_EQ(OB_SUCCESS, algorithm.init(ObIVFHcaAlgorithmParam()));
+  ASSERT_EQ(OB_SUCCESS, malformed.resize(count * dim));
+  ASSERT_LT(malformed.contiguous_count(87 * dim), dim);
+  ASSERT_EQ(OB_SUCCESS, vids.push_back(17));
+  ASSERT_EQ(OB_SUCCESS, offsets.push_back(0));
+  ASSERT_EQ(OB_SUCCESS, offsets.push_back(0));
+  EXPECT_EQ(OB_INVALID_DATA, algorithm.insertion_assign_vectors(
+      reader, vids, malformed, offsets, candidates, 0, 1, assigned));
+  ASSERT_EQ(OB_SUCCESS, candidates.push_back(87));
+  offsets.at(1) = 1;
+  EXPECT_EQ(OB_INVALID_DATA, algorithm.insertion_assign_vectors(
+      reader, vids, malformed, offsets, candidates, 0, 1, assigned));
+}
 
 TEST(TestIVFDDLRuntime, insertion_preserves_leaf_geometry_relations_codes_and_empty_leaves)
 {
@@ -5747,7 +6345,9 @@ TEST(TestIVFDDLRuntime, insertion_preserves_leaf_geometry_relations_codes_and_em
     EXPECT_EQ(prior.postings_.count(), loaded ? output.reused_ : legacy_output.reused_);
     EXPECT_EQ(delta_count + rows.secondary_count_, loaded ? output.encoded_ : legacy_output.encoded_);
     ASSERT_EQ(prior.centroids_.count(), rows.centers_.count());
-    EXPECT_EQ(0, MEMCMP(prior.centroids_.get_data(), rows.centers_.get_data(), rows.centers_.count() * sizeof(float)));
+    for (int64_t i = 0; i < rows.centers_.count(); ++i) {
+      EXPECT_EQ(0, MEMCMP(&prior.centroids_.at(i), &rows.centers_.at(i), sizeof(float)));
+    }
     std::set<std::pair<uint64_t, int64_t>> actual;
     std::vector<int64_t> counts(9, 0);
     for (const auto &p : rows.primary_postings_) {
@@ -5759,7 +6359,10 @@ TEST(TestIVFDDLRuntime, insertion_preserves_leaf_geometry_relations_codes_and_em
       EXPECT_GE(p.vid_, store.vid(old_count));
       ++counts.at(p.centroid_idx_);
     }
-    for (const auto &p : prior.postings_) { EXPECT_EQ(1, actual.count({p.vid_, p.centroid_idx_})); }
+    for (int64_t i = 0; i < prior.postings_.count(); ++i) {
+      const auto &p = prior.postings_.at(i);
+      EXPECT_EQ(1, actual.count({p.vid_, p.centroid_idx_}));
+    }
     // Independent small-K fixed-center reference, including the exact-hit
     // residual guard. SOAR chooses its loss minimum, not distance runner-up.
     for (int64_t i = old_count; i < store.n_; ++i) {
@@ -5913,20 +6516,10 @@ public:
   std::atomic<int64_t> bytes_{0};
 };
 
-class CountedNeighborhoodCenters final : public ObArrayImpl<float>
+void fill_neighborhood_centers(share::ObVectorMatrix &centers, int64_t count, int64_t dim)
 {
-public:
-  void extra_access_check() const override
-  {
-    reads_.fetch_add(1);
-    ObArrayImpl<float>::extra_access_check();
-  }
-  mutable std::atomic<int64_t> reads_{0};
-};
-
-void fill_neighborhood_centers(ObArrayImpl<float> &centers, int64_t count, int64_t dim)
-{
-  ASSERT_EQ(OB_SUCCESS, centers.prepare_allocate(count * dim));
+  ASSERT_EQ(OB_SUCCESS, centers.set_dimension(dim));
+  ASSERT_EQ(OB_SUCCESS, centers.resize(count * dim));
   for (int64_t cid = 0; cid < count; ++cid) {
     for (int64_t d = 0; d < dim; ++d) {
       centers.at(cid * dim + d) = static_cast<float>((cid * 37 + d * 17) % 101)
@@ -5935,21 +6528,55 @@ void fill_neighborhood_centers(ObArrayImpl<float> &centers, int64_t count, int64
   }
 }
 
+// Protect a page outside the requested rows. Copying the whole matrix would
+// touch it, so this guards the public adapter path without production hooks.
+class UnreadCenterPageGuard
+{
+public:
+  ~UnreadCenterPageGuard()
+  {
+    if (page_ != nullptr) { EXPECT_EQ(0, mprotect(page_, page_size_, PROT_READ | PROT_WRITE)); }
+  }
+  int protect(share::ObVectorMatrix &centers, int64_t dim, int64_t begin, int64_t end)
+  {
+    page_size_ = sysconf(_SC_PAGESIZE);
+    if (page_size_ <= 0) { return OB_ERR_UNEXPECTED; }
+    const uintptr_t data = reinterpret_cast<uintptr_t>(centers.data_at(0, centers.count()));
+    const uintptr_t limit = data + centers.count() * sizeof(float);
+    const uintptr_t read_begin = data + begin * dim * sizeof(float);
+    const uintptr_t read_end = data + end * dim * sizeof(float);
+    for (uintptr_t p = (data + page_size_ - 1) / page_size_ * page_size_;
+         p + page_size_ <= limit; p += page_size_) {
+      if (p + page_size_ <= read_begin || p >= read_end) {
+        if (mprotect(reinterpret_cast<void *>(p), page_size_, PROT_NONE) != 0) { return OB_ERR_UNEXPECTED; }
+        page_ = reinterpret_cast<void *>(p);
+        return OB_SUCCESS;
+      }
+    }
+    return OB_SIZE_OVERFLOW;
+  }
+private:
+  void *page_ = nullptr;
+  int64_t page_size_ = 0;
+};
+
 void compare_neighborhood_range(ObIVFDDLHcaAdapter &adapter,
-    CountedNeighborhoodCenters &centers, ObIVFNeighborhoodMode mode,
+    share::ObVectorMatrix &centers, ObIVFNeighborhoodMode mode,
     int64_t count, int64_t dim, int64_t begin, int64_t end)
 {
-  ObArray<int64_t> offsets, ids, expected_offsets, expected_ids;
+  ObArray<int64_t> offsets, expected_offsets;
+  ObArray<int64_t> expected_ids;
+  ObArray<int64_t> ids;
   ObArray<float> distances, expected_distances;
-  centers.reads_ = 0;
-  ASSERT_EQ(OB_SUCCESS, adapter.neighborhood_find_neighbors(
-      mode, centers, count, dim, begin, end, offsets, ids, distances));
-#ifndef NDEBUG
-  if (mode == ObIVFNeighborhoodMode::HGRAPH) {
-    // Only each query center is read. A full matrix copy would read count rows.
-    EXPECT_EQ(end - begin, centers.reads_.load());
+
+  {
+    UnreadCenterPageGuard guard;
+    if (mode == ObIVFNeighborhoodMode::HGRAPH) {
+      ASSERT_EQ(OB_SUCCESS, guard.protect(centers, dim, begin, end));
+    }
+    ASSERT_EQ(OB_SUCCESS, adapter.neighborhood_find_neighbors(
+        mode, centers, count, dim, begin, end, offsets, ids, distances));
   }
-#endif
   ASSERT_EQ(OB_SUCCESS, adapter.ObIVFHcaAlgorithmAdapter::neighborhood_find_neighbors(
       mode, centers, count, dim, begin, end, expected_offsets, expected_ids, expected_distances));
   ASSERT_EQ(end - begin + 1, offsets.count());
@@ -5973,36 +6600,42 @@ TEST(TestIVFDDLNeighborhood, concurrent_hgraph_add_borrows_centers_and_lookup_ma
 {
   ASSERT_TRUE(common::obvsag::is_init());
   const int64_t count = 512;
-  const int64_t dim = 8;
-  CountedNeighborhoodCenters centers;
+  const int64_t dim = MAX(8L, sysconf(_SC_PAGESIZE) / 512);
+  share::ObVectorMatrix centers;
   fill_neighborhood_centers(centers, count, dim);
-  std::vector<float> original(centers.get_data(), centers.get_data() + centers.count());
+  std::vector<float> original(centers.count());
+  centers.copy_to(0, centers.count(), original.data());
   NeighborhoodTestAllocator allocator;
   {
     ObIVFDDLHcaAdapter adapter;
     ObIVFHcaAlgorithmParam parameters;
     ASSERT_EQ(OB_SUCCESS, adapter.init(parameters, &allocator));
     ASSERT_EQ(OB_SUCCESS, adapter.neighborhood_begin(ObIVFNeighborhoodMode::HGRAPH, centers, count, dim));
-    centers.reads_ = 0;
+
+    {
+      UnreadCenterPageGuard guard;
+      ASSERT_EQ(OB_SUCCESS, guard.protect(centers, dim, 0, 128));
+      ASSERT_EQ(OB_SUCCESS, adapter.neighborhood_add_centers(centers, count, dim, 0, 128));
+    }
     std::atomic<int> errors{0};
     std::vector<std::thread> workers;
-    for (int64_t t = 0; t < 4; ++t) {
+    for (int64_t t = 1; t < 4; ++t) {
       workers.emplace_back([&, t] {
         if (adapter.neighborhood_add_centers(centers, count, dim, t * 128, (t + 1) * 128) != OB_SUCCESS) { ++errors; }
       });
     }
     for (auto &worker : workers) { worker.join(); }
     ASSERT_EQ(0, errors.load());
-#ifndef NDEBUG
-    EXPECT_EQ(count, centers.reads_.load()); // Prevent one full-matrix copy per task.
-#endif
     ASSERT_EQ(OB_SUCCESS, adapter.neighborhood_finish_add());
     compare_neighborhood_range(adapter, centers, ObIVFNeighborhoodMode::HGRAPH, count, dim, 37, 41);
     compare_neighborhood_range(adapter, centers, ObIVFNeighborhoodMode::HGRAPH, count, dim, count - 3, count);
-    EXPECT_EQ(0, MEMCMP(original.data(), centers.get_data(), original.size() * sizeof(float)));
+    for (int64_t i = 0; i < centers.count(); ++i) {
+      EXPECT_FLOAT_EQ(original[i], centers.at(i));
+    }
     adapter.cancel(OB_TIMEOUT);
     EXPECT_EQ(OB_TIMEOUT, adapter.neighborhood_add_centers(centers, count, dim, 0, 1));
-    ObArray<int64_t> offsets, ids;
+    ObArray<int64_t> offsets;
+    ObArray<int64_t> ids;
     ObArray<float> distances;
     EXPECT_EQ(OB_TIMEOUT, adapter.neighborhood_find_neighbors(
         ObIVFNeighborhoodMode::HGRAPH, centers, count, dim, 0, 1, offsets, ids, distances));
@@ -6015,15 +6648,17 @@ TEST(TestIVFDDLNeighborhood, brute_force_range_and_failure_preserve_centers)
 {
   const int64_t count = 256;
   const int64_t dim = 8;
-  CountedNeighborhoodCenters centers;
+  share::ObVectorMatrix centers;
   fill_neighborhood_centers(centers, count, dim);
-  std::vector<float> original(centers.get_data(), centers.get_data() + centers.count());
+  std::vector<float> original(centers.count());
+  centers.copy_to(0, centers.count(), original.data());
   ObIVFDDLHcaAdapter adapter;
   ObIVFHcaAlgorithmParam parameters;
   ASSERT_EQ(OB_SUCCESS, adapter.init(parameters));
   ASSERT_EQ(OB_SUCCESS, adapter.neighborhood_begin(ObIVFNeighborhoodMode::BRUTE_FORCE, centers, count, dim));
   compare_neighborhood_range(adapter, centers, ObIVFNeighborhoodMode::BRUTE_FORCE, count, dim, 17, 21);
-  ObArray<int64_t> offsets, ids;
+  ObArray<int64_t> offsets;
+  ObArray<int64_t> ids;
   ObArray<float> distances;
   EXPECT_EQ(OB_INVALID_ARGUMENT, adapter.neighborhood_find_neighbors(
       ObIVFNeighborhoodMode::BRUTE_FORCE, centers, count, dim, -1, 3, offsets, ids, distances));
@@ -6032,7 +6667,9 @@ TEST(TestIVFDDLNeighborhood, brute_force_range_and_failure_preserve_centers)
   EXPECT_EQ(OB_STATE_NOT_MATCH, adapter.neighborhood_find_neighbors(
       ObIVFNeighborhoodMode::HGRAPH, centers, count, dim, 0, 2, offsets, ids, distances));
   EXPECT_EQ(0, offsets.count()); EXPECT_EQ(0, ids.count()); EXPECT_EQ(0, distances.count());
-  EXPECT_EQ(0, MEMCMP(original.data(), centers.get_data(), original.size() * sizeof(float)));
+  for (int64_t i = 0; i < centers.count(); ++i) {
+    EXPECT_FLOAT_EQ(original[i], centers.at(i));
+  }
   compare_neighborhood_range(adapter, centers, ObIVFNeighborhoodMode::BRUTE_FORCE, count, dim, count - 2, count);
 }
 

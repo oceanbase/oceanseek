@@ -21,7 +21,7 @@ using namespace common;
 using namespace storage;
 using namespace share;
 
-int ObIVFBlockReuseSource::restore_centroid_layout(const ObIArray<float> &leaves,
+int ObIVFBlockReuseSource::restore_centroid_layout(const share::ObVectorMatrix &leaves,
     ObIvfCentroidLayout &layout, bool &reused) const
 {
   int ret = OB_SUCCESS;
@@ -33,8 +33,8 @@ int ObIVFBlockReuseSource::restore_centroid_layout(const ObIArray<float> &leaves
       || leaves.count() % dimension_ != 0) { return ret; }
   for (int64_t i = 0; i < centroid_count_; ++i) {
     if (old_cid(i) != meta.leaf_storage_cid(i)
-        || MEMCMP(&leaves.at(i * dimension_),
-            &leaf_coordinates_->at((centroid_begin_ + i) * dimension_),
+        || MEMCMP(leaves.data_at(i * dimension_, dimension_),
+            leaf_coordinates_->data_at((centroid_begin_ + i) * dimension_, dimension_),
             dimension_ * sizeof(float)) != 0) { return ret; }
   }
   if (!meta.is_hierarchical()) {
@@ -116,11 +116,11 @@ const float *ObIVFBlockReuseSource::coordinates(const ObIVFReuseCentroid &record
   const bool leaf = record.coordinate_idx_ >= 0;
   if (leaf && (record.coordinate_idx_ % dimension_ != 0
       || record.coordinate_idx_ / dimension_ >= centroid_count_ || !has_prior_view())) { return nullptr; }
-  const auto *values = leaf ? leaf_coordinates_ : &parent_centers_;
+  const share::ObVectorMatrix *values = leaf ? leaf_coordinates_ : &parent_centers_;
   const int64_t offset = leaf ? centroid_begin_ * dimension_ + record.coordinate_idx_
       : -record.coordinate_idx_ - 1;
   return values != nullptr && offset >= 0 && offset <= values->count() - dimension_
-      ? &values->at(offset) : nullptr;
+      ? values->data_at(offset, dimension_) : nullptr;
 }
 
 int ObIVFReuseKey::compare(const ObIVFReuseKey &other) const
@@ -559,7 +559,7 @@ int ObIVFBlockReuseWriter::append_row(const ObDatumRow &row)
   return ret;
 }
 
-int ObIVFBlockReuseWriter::try_reuse_raw_keys(const ObIArray<uint64_t> &vids,
+int ObIVFBlockReuseWriter::try_reuse_raw_keys(const ObIVFVectorIDView &vids,
     int64_t begin, int64_t end, int64_t &reused_rows, int64_t &read_end)
 {
   int ret = error_;

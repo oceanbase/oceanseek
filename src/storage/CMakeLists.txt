@@ -103,6 +103,7 @@ ob_set_subtarget(ob_storage blocksstable_vector_index
   blocksstable/vector_index/ob_ivf_dag_planner.cpp
   blocksstable/vector_index/ob_ivf_ddl_dag.cpp
   blocksstable/vector_index/ob_ivf_ddl_input.cpp
+  blocksstable/vector_index/ob_ivf_raw_key_store.cpp
   blocksstable/vector_index/ob_ivf_ddl_hca_adapter.cpp
   blocksstable/vector_index/ob_ivf_ddl_runtime.cpp
   blocksstable/vector_index/ob_ivf_merge_planner.cpp

@@ -6,6 +6,7 @@
 #define OCEANBASE_STORAGE_BLOCKSSTABLE_VECTOR_INDEX_OB_IVF_BLOCK_REUSE_SOURCE_H_
 
 #include "lib/container/ob_array.h"
+#include "share/vector_index/ob_vector_build_array.h"
 #include "storage/blocksstable/vector_index/ob_ivf_sstable_struct.h"
 
 namespace oceanbase
@@ -54,11 +55,10 @@ struct ObIVFBlockReuseSource
   explicit ObIVFBlockReuseSource(common::ObIAllocator &allocator)
     : source_slot_(-1), commit_version_(-1), centroid_begin_(0), centroid_count_(0), dimension_(0),
       table_(nullptr), read_info_(nullptr), leaf_coordinates_(nullptr), old_cids_(nullptr),
-      posting_counts_(nullptr), raw_ranges_(), centers_(), parent_centers_()
+      posting_counts_(nullptr), raw_ranges_(), centers_(), parent_centers_(share::vector_array_allocator(allocator))
   {
     raw_ranges_.set_block_allocator(common::ObWrapperAllocator(allocator));
     centers_.set_block_allocator(common::ObWrapperAllocator(allocator));
-    parent_centers_.set_block_allocator(common::ObWrapperAllocator(allocator));
   }
   int64_t local_centroid_index(int64_t prior_index) const;
   int64_t old_cid(int64_t local_index) const;
@@ -66,7 +66,7 @@ struct ObIVFBlockReuseSource
   const float *coordinates(const ObIVFReuseCentroid &record) const;
   bool has_prior_view() const;
   // Reuse the entire routing geometry only; posting counts belong to the output.
-  int restore_centroid_layout(const common::ObIArray<float> &leaves,
+  int restore_centroid_layout(const share::ObVectorMatrix &leaves,
       ObIvfCentroidLayout &layout, bool &reused) const;
   TO_STRING_KV(K_(source_slot), K_(commit_version), K_(centroid_begin), K_(centroid_count),
       K_(dimension), KP_(table), KP_(read_info),
@@ -79,11 +79,11 @@ struct ObIVFBlockReuseSource
   int64_t source_slot_, commit_version_, centroid_begin_, centroid_count_, dimension_;
   ObIvfSSTable *table_;
   const storage::ObITableReadInfo *read_info_;
-  const common::ObIArray<float> *leaf_coordinates_;
+  const share::ObVectorMatrix *leaf_coordinates_;
   const common::ObIArray<int64_t> *old_cids_, *posting_counts_;
   common::ObArray<ObIVFReuseRange, common::ObWrapperAllocator> raw_ranges_;
   common::ObArray<ObIVFReuseCentroid, common::ObWrapperAllocator> centers_;
-  common::ObArray<float, common::ObWrapperAllocator> parent_centers_;
+  share::ObVectorMatrix parent_centers_;
 };
 
 } // namespace blocksstable

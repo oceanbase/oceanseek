@@ -22,7 +22,7 @@ const int64_t ObIVFReplayInput::NO_CACHE_MEMORY_LIMIT;
 ObIVFReplayInput::ObIVFReplayInput(common::ObIAllocator &allocator)
     : is_inited_(false),
       is_sealed_(false),
-      capture_vids_(false),
+      vids_ordered_(true), first_vid_(0), last_vid_(0),
       vector_dim_(0),
       memory_limit_(0),
       cursor_(0),
@@ -34,7 +34,6 @@ ObIVFReplayInput::ObIVFReplayInput(common::ObIAllocator &allocator)
       // depend on free() in the caller's long-lived arena.
       store_(),
       reader_(store_),
-      captured_vids_(),
       sample_allocator_("IVFReplaySample"),
       sample_cmp_(),
       sample_heap_(sample_cmp_, &sample_allocator_)
@@ -44,7 +43,6 @@ ObIVFReplayInput::ObIVFReplayInput(common::ObIAllocator &allocator)
 
 ObIVFReplayInput::~ObIVFReplayInput()
 {
-  captured_vids_.reset();
   release_sample_candidates();
   reader_.reset();
   store_.reset();
@@ -189,7 +187,7 @@ int ObIVFReplayInput::init(
     const int64_t max_sample_count,
     const uint64_t sample_seed,
     const int64_t slice_idx,
-    const bool capture_vids, const char *label)
+    const char *label)
 {
   int ret = OB_SUCCESS;
   if (is_inited_) {
@@ -206,10 +204,7 @@ int ObIVFReplayInput::init(
     LOG_WARN("failed to init IVF replay store", K(ret), K(tenant_id),
              K(vector_dim), K(memory_limit));
   } else {
-    captured_vids_.set_attr(common::ObMemAttr(
-        tenant_id, "IVFReplayVid", common::ObCtxIds::DEFAULT_CTX_ID));
     sample_allocator_.set_tenant_id(tenant_id);
-    capture_vids_ = capture_vids;
     vector_dim_ = vector_dim;
     memory_limit_ = memory_limit;
     max_sample_count_ = max_sample_count;
@@ -295,11 +290,6 @@ int ObIVFReplayInput::add_row(
     ret = OB_STATE_NOT_MATCH;
     LOG_WARN("IVF replay input is not writable", K(ret), K_(is_inited),
              K_(is_sealed));
-  } else if (capture_vids_
-             && OB_UNLIKELY(captured_vids_.count() != row_id)) {
-    ret = OB_STATE_NOT_MATCH;
-    LOG_WARN("IVF replay VID metadata is incomplete", K(ret), K(row_id),
-        "captured_vid_count", captured_vids_.count(), K_(slice_idx));
   } else if (OB_UNLIKELY(vector_bytes.length()
              != vector_dim_ * static_cast<int64_t>(sizeof(float)))) {
     ret = OB_ERR_UNEXPECTED;
@@ -323,18 +313,17 @@ int ObIVFReplayInput::add_row(
     LOG_WARN("failed to append IVF vector datum", K(ret), K(vid));
   } else if (OB_FAIL(store_.add_row(datums))) {
     LOG_WARN("failed to append IVF replay row", K(ret), K(vid));
-  } else if (capture_vids_
-             && OB_FAIL(captured_vids_.push_back(vid))) {
-    // The attempt must fail after an append error. Count checks prevent a
-    // partially captured store from accepting more rows or being sealed.
-    LOG_WARN("failed to retain captured IVF replay VID", K(ret), K(vid),
-        K(row_id), K_(slice_idx));
   } else if (is_sampling_enabled()
              && OB_FAIL(offer_sample_candidate_(vid, row_id))) {
     // The replay row is already durable in the attempt-local store. Failing
     // the capture task prevents a partially sampled attempt from publishing.
     LOG_WARN("failed to sample captured IVF replay row", K(ret), K(vid),
              K(row_id), K_(slice_idx));
+  }
+  if (OB_SUCC(ret)) {
+    if (row_id == 0) { first_vid_ = vid; }
+    else { vids_ordered_ = vids_ordered_ && last_vid_ < vid; }
+    last_vid_ = vid;
   }
   return ret;
 }
@@ -345,12 +334,6 @@ int ObIVFReplayInput::seal()
   if (OB_UNLIKELY(!is_inited_ || is_sealed_)) {
     ret = OB_STATE_NOT_MATCH;
     LOG_WARN("IVF replay input cannot be sealed", K(ret), K_(is_inited), K_(is_sealed));
-  } else if (capture_vids_
-             && OB_UNLIKELY(captured_vids_.count() != store_.get_row_cnt())) {
-    ret = OB_STATE_NOT_MATCH;
-    LOG_WARN("IVF replay VID metadata is incomplete at seal", K(ret),
-        K_(slice_idx), "row_count", store_.get_row_cnt(),
-        "captured_vid_count", captured_vids_.count());
   } else if (is_sampling_enabled()
              && OB_UNLIKELY(sample_scan_count_ != store_.get_row_cnt()
                  || sample_heap_.count()
@@ -380,34 +363,9 @@ int ObIVFReplayInput::seal()
     is_sealed_ = true;
     cursor_ = 0;
     reader_.reuse();
-    LOG_INFO("[IVF_BUILD_PERF]", "event", "replay_seal", K_(slice_idx),
-        K_(vector_dim), K_(memory_limit), "row_count", store_.get_row_cnt(),
-        "inmemory_row_count", store_.get_inmemory_rows(),
-        "file_size", store_.get_file_size(), "mem_hold", store_.get_mem_hold(),
-        "all_payload_spilled", store_.get_row_cnt() > 0 && store_.is_all_dumped(),
-        "captured_vid_count", captured_vids_.count(),
-        "captured_vid_payload_bytes", captured_vids_.count() * sizeof(uint64_t));
-  }
-  return ret;
-}
-
-int ObIVFReplayInput::get_captured_vid(const int64_t row_id, uint64_t &vid) const
-{
-  int ret = OB_SUCCESS;
-  vid = 0;
-  if (OB_UNLIKELY(!is_inited_ || !is_sealed_ || !capture_vids_
-      || captured_vids_.count() != store_.get_row_cnt())) {
-    ret = OB_STATE_NOT_MATCH;
-    LOG_WARN("IVF replay VID metadata is not readable", K(ret),
-        K_(is_inited), K_(is_sealed), K_(slice_idx),
-        "row_count", store_.get_row_cnt(),
-        "captured_vid_count", captured_vids_.count());
-  } else if (OB_UNLIKELY(row_id < 0 || row_id >= captured_vids_.count())) {
-    ret = OB_INDEX_OUT_OF_RANGE;
-    LOG_WARN("invalid captured IVF replay row id", K(ret), K(row_id),
-        "captured_vid_count", captured_vids_.count());
-  } else {
-    vid = captured_vids_.at(row_id);
+    LOG_INFO("[IVF_BUILD_PERF]", "event", "replay_seal", K_(slice_idx), K_(vector_dim), K_(memory_limit), "row_count",
+        store_.get_row_cnt(), "inmemory_row_count", store_.get_inmemory_rows(), "file_size", store_.get_file_size(),
+        "mem_hold", store_.get_mem_hold(), "all_payload_spilled", store_.get_row_cnt() > 0 && store_.is_all_dumped());
   }
   return ret;
 }
@@ -481,11 +439,9 @@ int ObIVFReplayInput::get_row_at(
   return ret;
 }
 
-int ObIVFReplayInput::validate_read_requests_(
-    const common::ObIArray<ObIVFReplayReadRequest> &requests,
-    const int64_t request_begin,
-    const int64_t request_end,
-    const common::ObIArray<float> &vectors) const
+template <typename Requests>
+int ObIVFReplayInput::validate_read_requests_(const Requests &requests, const int64_t request_begin,
+    const int64_t request_end, const share::ObVectorMatrix &vectors) const
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(!is_inited_ || !is_sealed_)) {
@@ -524,12 +480,10 @@ int ObIVFReplayInput::validate_read_requests_(
   return ret;
 }
 
-int ObIVFReplayInput::copy_rows_(
-    sql::ObRADatumStore::Reader &reader,
-    const common::ObIArray<ObIVFReplayReadRequest> &requests,
-    const int64_t request_begin,
-    const int64_t request_end,
-    common::ObIArray<float> &vectors) const
+template <typename Requests>
+int ObIVFReplayInput::copy_rows_(sql::ObRADatumStore::Reader &reader, const Requests &requests,
+    const int64_t request_begin, const int64_t request_end, share::ObVectorMatrix &vectors,
+    common::ObIArray<uint64_t> *vids) const
 {
   int ret = OB_SUCCESS;
   for (int64_t i = request_begin; OB_SUCC(ret) && i < request_end; ++i) {
@@ -550,26 +504,26 @@ int ObIVFReplayInput::copy_rows_(
     } else {
       MEMCPY(&stored_vid,
              stored_row->cells()[0].get_string().ptr(), sizeof(stored_vid));
-      if (OB_UNLIKELY(stored_vid != request.expected_vid_)) {
+      if (OB_UNLIKELY(request.check_vid_ && stored_vid != request.expected_vid_)) {
         ret = OB_INVALID_DATA;
         LOG_WARN("IVF replay row VID mismatch", K(ret), K(i), K(request),
                  K(stored_vid));
       } else {
+        if ((vids != nullptr)) {
+          vids->at(request.output_idx_) = stored_vid;
+        }
         const int64_t output_offset = request.output_idx_ * vector_dim_;
-        MEMCPY(&vectors.at(output_offset),
-               stored_row->cells()[1].get_string().ptr(),
-               vector_dim_ * sizeof(float));
+        vectors.copy_from(
+            output_offset, reinterpret_cast<const float *>(stored_row->cells()[1].get_string().ptr()), vector_dim_);
       }
     }
   }
   return ret;
 }
 
-int ObIVFReplayInput::validate_copied_vectors_(
-    const common::ObIArray<ObIVFReplayReadRequest> &requests,
-    const int64_t request_begin,
-    const int64_t request_end,
-    const common::ObIArray<float> &vectors) const
+template <typename Requests>
+int ObIVFReplayInput::validate_copied_vectors_(const Requests &requests, const int64_t request_begin,
+    const int64_t request_end, const share::ObVectorMatrix &vectors) const
 {
   int ret = OB_SUCCESS;
   for (int64_t i = request_begin; OB_SUCC(ret) && i < request_end; ++i) {
@@ -586,23 +540,23 @@ int ObIVFReplayInput::validate_copied_vectors_(
   return ret;
 }
 
-int ObIVFReplayInput::batch_copy_rows(
-    const common::ObIArray<ObIVFReplayReadRequest> &requests,
-    const int64_t request_begin,
-    const int64_t request_end,
-    common::ObIArray<float> &vectors)
+template <typename Requests>
+int ObIVFReplayInput::batch_copy_rows_(const Requests &requests, const int64_t request_begin, const int64_t request_end,
+    share::ObVectorMatrix &vectors, common::ObIArray<uint64_t> *vids)
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(validate_read_requests_(
       requests, request_begin, request_end, vectors))) {
     LOG_WARN("invalid IVF replay batch read", K(ret), K(request_begin),
              K(request_end));
+  } else if ((vids != nullptr) && vids->count() != vectors.count() / vector_dim_) {
+    ret = OB_INVALID_ARGUMENT;
   } else {
     // The sealed store is stable. Each call owns its cursor and spill buffers;
     // copy rows before releasing the Reader so no store-owned pointers escape.
     sql::ObRADatumStore::Reader reader(store_);
     if (OB_FAIL(copy_rows_(
-        reader, requests, request_begin, request_end, vectors))) {
+        reader, requests, request_begin, request_end, vectors, vids))) {
       LOG_WARN("failed to copy IVF replay rows", K(ret),
                K(request_begin), K(request_end));
     }
@@ -615,8 +569,23 @@ int ObIVFReplayInput::batch_copy_rows(
   return ret;
 }
 
-int ObIVFReplayInput::copy_row_range(const int64_t begin, const int64_t end,
-    common::ObIArray<int64_t> &ordinals, common::ObIArray<float> &vectors)
+// DDL uses bounded flat microbatches; merge sorts the complete caller batch
+// before reading a slice. Both entry points share one implementation and one
+// private reader per call, preserving the existing merge I/O pattern.
+int ObIVFReplayInput::batch_copy_rows(const common::ObIArray<ObIVFReplayReadRequest> &requests, int64_t begin,
+    int64_t end, share::ObVectorMatrix &vectors, common::ObIArray<uint64_t> *vids)
+{
+  return batch_copy_rows_(requests, begin, end, vectors, vids);
+}
+
+int ObIVFReplayInput::batch_copy_rows(const share::ObVectorArray<ObIVFReplayReadRequest> &requests, int64_t begin,
+    int64_t end, share::ObVectorMatrix &vectors, common::ObIArray<uint64_t> *vids)
+{
+  return batch_copy_rows_(requests, begin, end, vectors, vids);
+}
+
+int ObIVFReplayInput::copy_row_range(
+    const int64_t begin, const int64_t end, ObIArray<int64_t> &ordinals, share::ObVectorMatrix &vectors)
 {
   int ret = OB_SUCCESS;
   ordinals.reuse();
@@ -631,7 +600,8 @@ int ObIVFReplayInput::copy_row_range(const int64_t begin, const int64_t end,
              store_.get_row_cnt());
   } else if (OB_FAIL(ordinals.prepare_allocate(end - begin))) {
     LOG_WARN("failed to allocate IVF compact sample ordinals", K(ret), K(begin), K(end));
-  } else if (OB_FAIL(vectors.prepare_allocate((end - begin) * vector_dim_))) {
+  } else if (OB_FAIL(vectors.set_dimension(vector_dim_))) {
+  } else if (OB_FAIL(vectors.resize((end - begin) * vector_dim_))) {
     LOG_WARN("failed to allocate IVF compact sample vectors", K(ret), K(begin), K(end), K_(vector_dim));
   } else {
     sql::ObRADatumStore::Reader reader(store_);

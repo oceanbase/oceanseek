@@ -5,6 +5,7 @@
 #ifndef OCEANBASE_STORAGE_BLOCKSSTABLE_VECTOR_INDEX_OB_IVF_CENTROID_LAYOUT_H_
 #define OCEANBASE_STORAGE_BLOCKSSTABLE_VECTOR_INDEX_OB_IVF_CENTROID_LAYOUT_H_
 
+#include "share/vector_index/ob_vector_build_array.h"
 #include "lib/container/ob_array.h"
 #include "lib/allocator/ob_malloc.h"
 #include "share/vector_index/hca/ob_vector_hca_common.h"
@@ -14,6 +15,7 @@ namespace oceanbase
 {
 namespace blocksstable
 {
+using share::ObVectorMatrix;
 
 // Post-processing over immutable final leaf centers. All IDs stored here are
 // zero-based work ordinals; conversion to persistent IDs happens at the writer.
@@ -23,8 +25,8 @@ public:
   explicit ObIvfCentroidLayout(common::ObIAllocator &allocator);
   void reset();
   static int64_t get_hierarchy_threshold();
-  // Borrow a contiguous leaf buffer until build() returns; never copy the full input.
-  int build(const common::ObIArrayWrap<float> &leaves, int64_t dimension,
+  // Borrow the leaf matrix until build() returns; each vector remains contiguous.
+  int build(const share::ObVectorMatrix &leaves, int64_t dimension,
       const share::ObHcaTrainParam &train_param, const share::ObHcaSoarParam &soar_param,
       const share::ObVectorNormalizeInfo *norm_info,
       int64_t threshold = get_hierarchy_threshold(),
@@ -44,7 +46,7 @@ public:
     return ret;
   }
   // Install a completed clustering result without retaining its input vectors.
-  int begin_grouped(const common::ObIArray<float> &parents, int64_t leaf_count, int64_t dimension);
+  int begin_grouped(const share::ObVectorMatrix &parents, int64_t leaf_count, int64_t dimension);
   int set_parent(int64_t leaf_idx, int64_t parent_idx, bool secondary);
   int finish_grouped();
   bool is_ready() const { return ready_; }
@@ -77,7 +79,7 @@ private:
 
 private:
   common::ObIAllocator &allocator_;
-  common::ObArray<float, common::ObWrapperAllocator> parents_;
+  share::ObVectorMatrix parents_;
   common::ObArray<int32_t, common::ObWrapperAllocator> primary_;
   common::ObArray<int32_t, common::ObWrapperAllocator> secondary_;
   common::ObArray<int64_t, common::ObWrapperAllocator> offsets_;

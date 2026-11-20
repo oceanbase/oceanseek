@@ -408,8 +408,8 @@ TEST_F(TestIvfSSTableScanIter, merge_vid_capture_filters_deleted_payloads_and_sa
   input.source_tables_.reset();
   input.read_info_ = nullptr;
   input.ls_id_.reset();
-  ObArray<storage::ObIVFVectorVID> vids;
-  ObArray<float> values;
+  ObArray<ObIVFVectorVID> vids;
+  share::ObVectorMatrix values;
   ASSERT_EQ(OB_SUCCESS, input.batch_get_samples(0, 2, vids, values));
   ASSERT_EQ(10, vids.at(0));
   ASSERT_EQ(30, vids.at(1));
@@ -429,10 +429,11 @@ TEST_F(TestIvfSSTableScanIter, merge_batch_reuses_capacity_and_preserves_request
   ASSERT_NO_FATAL_FAILURE(prepare_merge_input(ctx, input, true, false));
   ASSERT_EQ(OB_SUCCESS, input.init_source_(ctx));
   ObArenaAllocator output_allocator("IVFReadTest");
-  ObSEArray<float, 16, ObWrapperAllocator> values(OB_MALLOC_NORMAL_BLOCK_SIZE, ObWrapperAllocator(output_allocator));
-  ASSERT_EQ(OB_SUCCESS, values.prepare_allocate(65536));
-  const float *data = values.get_data();
+  share::ObVectorMatrix values(share::vector_array_allocator(output_allocator));
+  ASSERT_EQ(OB_SUCCESS, values.resize(65536));
+  const float *data = values.data_at(0, values.count());
   const int64_t used = output_allocator.used();
+  const int64_t capacity = values.get_capacity();
   ObArray<storage::ObIVFVectorVID> vids;
   for (const auto vid : {10, 30, 30}) { ASSERT_EQ(OB_SUCCESS, vids.push_back(vid)); }
   for (int round = 0; round < 3; ++round) {
@@ -441,12 +442,12 @@ TEST_F(TestIvfSSTableScanIter, merge_batch_reuses_capacity_and_preserves_request
     EXPECT_FLOAT_EQ(0.0F, values.at(1));
     EXPECT_FLOAT_EQ(1.0F, values.at(65));
     EXPECT_FLOAT_EQ(1.0F, values.at(129));
-    EXPECT_EQ(data, values.get_data());
+    EXPECT_EQ(data, values.data_at(0, values.count()));
     EXPECT_EQ(used, output_allocator.used());
     ASSERT_EQ(OB_SUCCESS, input.batch_get_by_vid(vids, 1, 2, values));
     ASSERT_EQ(64, values.count());
     EXPECT_FLOAT_EQ(1.0F, values.at(1));
-    EXPECT_EQ(data, values.get_data());
+    EXPECT_EQ(data, values.data_at(0, values.count()));
   }
   vids.reuse();
   for (const auto vid : {30, 10, 30}) { ASSERT_EQ(OB_SUCCESS, vids.push_back(vid)); }
@@ -460,14 +461,14 @@ TEST_F(TestIvfSSTableScanIter, merge_batch_reuses_capacity_and_preserves_request
     ASSERT_EQ(OB_SUCCESS, vids.push_back(missing));
     ASSERT_EQ(OB_ENTRY_NOT_EXIST, input.batch_get_by_vid(vids, 0, 2, values));
     EXPECT_EQ(0, values.count());
-    EXPECT_EQ(data, values.get_data());
+    EXPECT_EQ(capacity, values.get_capacity());
     EXPECT_EQ(used, output_allocator.used());
   }
   ASSERT_EQ(OB_INVALID_ARGUMENT, input.batch_get_by_vid(vids, INT64_MAX, INT64_MAX, values));
   EXPECT_TRUE(values.empty());
   ASSERT_EQ(OB_SUCCESS, input.batch_get_by_vid(vids, 0, 1, values));
   EXPECT_EQ(64, values.count());
-  EXPECT_EQ(data, values.get_data());
+  EXPECT_EQ(data, values.data_at(0, values.count()));
   EXPECT_EQ(used, output_allocator.used());
 }
 
@@ -528,7 +529,7 @@ TEST_F(TestIvfSSTableScanIter, parallel_capture_matches_serial_across_macro_boun
     if (mode != 2) {
       ASSERT_EQ(0, parallel.locators_.at(0).vid_);
       ObArray<storage::ObIVFVectorVID> zero_vid;
-      ObArray<float> values;
+      share::ObVectorMatrix values;
       ASSERT_EQ(OB_SUCCESS, zero_vid.push_back(0));
       ASSERT_EQ(OB_SUCCESS, parallel.batch_get_by_vid(zero_vid, 0, 1, values));
       ASSERT_EQ(64, values.count());
@@ -663,8 +664,8 @@ TEST_F(TestIvfSSTableScanIter, merge_capture_orders_interleaved_segments_and_pre
           ASSERT_EQ(0, input.get_sample_count());
           continue;
         }
-        ObArray<storage::ObIVFVectorVID> vids;
-        ObArray<float> values;
+        share::ObVectorArray<ObIVFVectorVID> vids;
+        share::ObVectorMatrix values;
         ASSERT_EQ(OB_SUCCESS, input.get_all_vids(vids));
         ASSERT_EQ(live_vids.size(), vids.count());
         ASSERT_EQ(OB_SUCCESS, input.batch_get_by_vid(vids, 0, vids.count(), values));
@@ -674,17 +675,18 @@ TEST_F(TestIvfSSTableScanIter, merge_capture_orders_interleaved_segments_and_pre
           EXPECT_FLOAT_EQ(static_cast<float>(live_sources[i]), values.at(i * 64 + 1));
           EXPECT_FLOAT_EQ(static_cast<float>(live_vids[i]), values.at(i * 64 + 2));
         }
-        ASSERT_EQ(OB_SUCCESS, input.batch_get_samples(0, input.get_sample_count(), vids, values));
-        ASSERT_EQ(MIN(sample_budget, static_cast<int64_t>(live_vids.size())), vids.count());
-        ASSERT_EQ(vids.count() * 64, values.count());
-        for (int64_t i = 0; i < vids.count(); ++i) {
-          const auto found = std::find(live_vids.begin(), live_vids.end(), vids.at(i));
+        ObArray<ObIVFVectorVID> sample_vids;
+        ASSERT_EQ(OB_SUCCESS, input.batch_get_samples(0, input.get_sample_count(), sample_vids, values));
+        ASSERT_EQ(MIN(sample_budget, static_cast<int64_t>(live_vids.size())), sample_vids.count());
+        ASSERT_EQ(sample_vids.count() * 64, values.count());
+        for (int64_t i = 0; i < sample_vids.count(); ++i) {
+          const auto found = std::find(live_vids.begin(), live_vids.end(), sample_vids.at(i));
           ASSERT_NE(live_vids.end(), found);
           const int64_t idx = found - live_vids.begin();
           EXPECT_FLOAT_EQ(static_cast<float>(live_sources[idx]), values.at(i * 64 + 1));
-          EXPECT_FLOAT_EQ(static_cast<float>(vids.at(i)), values.at(i * 64 + 2));
-          if (!parallel) { serial_samples.push_back(vids.at(i)); }
-          else { EXPECT_EQ(serial_samples[i], vids.at(i)); }
+          EXPECT_FLOAT_EQ(static_cast<float>(sample_vids.at(i)), values.at(i * 64 + 2));
+          if (!parallel) { serial_samples.push_back(sample_vids.at(i)); }
+          else { EXPECT_EQ(serial_samples[i], sample_vids.at(i)); }
         }
       }
     }
@@ -747,18 +749,19 @@ TEST_F(TestIvfSSTableScanIter, merge_capture_large_ordered_and_interleaved_input
           std::chrono::duration<double, std::milli>(sealed - scanned).count());
       ASSERT_EQ(count, input.get_vector_count());
       ASSERT_EQ(count, input.get_sample_count());
-      ObArray<storage::ObIVFVectorVID> vids;
-      ObArray<float> values;
+      share::ObVectorArray<ObIVFVectorVID> vids;
+      share::ObVectorMatrix values;
       ASSERT_EQ(OB_SUCCESS, input.get_all_vids(vids));
       ASSERT_EQ(count, vids.count());
       for (int64_t i = 0; i < count; ++i) { ASSERT_EQ(i, vids.at(i)); }
+      ObArray<ObIVFVectorVID> sample_vids;
       for (const int64_t begin : {0L, count / 2 - 4, count - 8}) {
-        ASSERT_EQ(OB_SUCCESS, input.batch_get_samples(begin, begin + 8, vids, values));
-        ASSERT_EQ(8, vids.count());
+        ASSERT_EQ(OB_SUCCESS, input.batch_get_samples(begin, begin + 8, sample_vids, values));
+        ASSERT_EQ(8, sample_vids.count());
         ASSERT_EQ(8 * 64, values.count());
         for (int64_t i = 0; i < 8; ++i) {
           const int64_t vid = begin + i;
-          EXPECT_EQ(vid, vids.at(i));
+          EXPECT_EQ(vid, sample_vids.at(i));
           EXPECT_FLOAT_EQ(static_cast<float>(interleaved ? vid % 2 : vid >= count / 2), values.at(i * 64 + 1));
           EXPECT_FLOAT_EQ(static_cast<float>(vid), values.at(i * 64 + 2));
         }
@@ -796,14 +799,14 @@ TEST_F(TestIvfSSTableScanIter, merge_replay_spills_reads_concurrently_and_releas
     input.ls_id_.reset();
     ASSERT_TRUE(input.supports_source_order());
     ASSERT_FALSE(input.is_fully_memory_resident());
-    ObArray<int64_t> source_indices;
+    share::ObVectorArray<int64_t> source_indices;
     for (int64_t i = 0; i < count; ++i) {
       int64_t source = -1;
       ASSERT_EQ(OB_SUCCESS, input.get_source_row_idx(i, source));
       ASSERT_EQ(i, source);
       ASSERT_EQ(OB_SUCCESS, source_indices.push_back(i));
     }
-    ObArray<float> source_values;
+    share::ObVectorMatrix source_values;
     ASSERT_EQ(OB_SUCCESS, input.batch_get_by_source(source_indices, source_values));
     for (int64_t i = 0; i < count; ++i) {
       EXPECT_FLOAT_EQ(captured[i], source_values.at(i * 64 + 2));
@@ -822,7 +825,7 @@ TEST_F(TestIvfSSTableScanIter, merge_replay_spills_reads_concurrently_and_releas
     for (int64_t worker = 0; worker < 4; ++worker) {
       workers.emplace_back([&] {
         share::ObTenantEnv::set_tenant(tenant);
-        ObArray<float> values;
+        share::ObVectorMatrix values;
         for (int round = 0; round < 3; ++round) {
           if (OB_SUCCESS != input.batch_get_by_vid(requested, 0, requested.count(), values)
               || values.count() != requested.count() * 64) {
@@ -844,7 +847,7 @@ TEST_F(TestIvfSSTableScanIter, merge_replay_spills_reads_concurrently_and_releas
     EXPECT_EQ(0, failures.load());
     // A corrupt locator must fail before touching a different replay row.
     input.locators_.at(0).row_id_ = count;
-    ObArray<float> values;
+    share::ObVectorMatrix values;
     EXPECT_EQ(OB_INVALID_DATA, input.batch_get_by_vid(requested, 0, 1, values));
     EXPECT_TRUE(values.empty());
   }

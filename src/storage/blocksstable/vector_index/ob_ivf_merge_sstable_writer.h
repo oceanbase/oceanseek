@@ -6,6 +6,7 @@
 #ifndef OCEANBASE_STORAGE_BLOCKSSTABLE_VECTOR_INDEX_OB_IVF_MERGE_SSTABLE_WRITER_H_
 #define OCEANBASE_STORAGE_BLOCKSSTABLE_VECTOR_INDEX_OB_IVF_MERGE_SSTABLE_WRITER_H_
 
+#include "storage/blocksstable/vector_index/ob_ivf_vector_ids.h"
 #include "lib/lock/ob_spin_lock.h"
 #include "share/vector_index/ob_vector_index_util.h"
 #include "storage/blocksstable/ob_macro_seq_generator.h"
@@ -44,21 +45,21 @@ public:
   bool supports_loaded_posting_reuse() const override { return true; }
   int copy_loaded_postings(const storage::ObIVFEncodedPostingSource &source,
       int64_t source_cid, int64_t target_cid,
-      const common::ObIArray<storage::ObIVFVectorVID> &expected_vids) override;
+      const storage::ObIVFVectorIDView &expected_vids) override;
   int prepare_loaded_output(int64_t center_count, int64_t parallelism) override;
   int64_t posting_write_task_count() const override;
   int write_posting_range(int64_t task_idx) override;
-  int write_loaded_centers(const common::ObIArray<float> &centers,
+  int write_loaded_centers(const share::ObVectorMatrix &centers,
       int64_t dimension, int64_t begin, int64_t end) override;
-  int quantize_loaded_vectors(const common::ObIArray<float> &centers, int64_t dimension,
-      const common::ObIArray<storage::ObIVFVectorVID> &vids, const common::ObIArray<float> &vectors,
+  int quantize_loaded_vectors(const share::ObVectorMatrix &centers, int64_t dimension,
+      const storage::ObIVFVectorIDView &vids, const share::ObVectorMatrix &vectors,
       const common::ObIArray<int64_t> &primary, const common::ObIArray<int64_t> *secondary) override;
   int set_centroid_layout(const ObIvfCentroidLayout &layout) override;
   int set_leaf_posting_counts(const common::ObIArray<uint32_t> &counts) override;
   int set_reuse_sources(const common::ObIArray<ObIVFBlockReuseSource *> &sources,
       bool is_full_merge = false);
   virtual bool supports_encoded_posting_reuse() const override { return true; }
-  virtual int prepare_quantization(const common::ObIArray<float> &centers,
+  virtual int prepare_quantization(const share::ObVectorMatrix &centers,
       const int64_t center_count, int64_t &task_count) override;
   virtual int open_quantization_range(const int64_t cid_begin, const int64_t cid_end,
       const int64_t task_idx, common::ObIAllocator &allocator,
@@ -66,10 +67,10 @@ public:
   virtual int close_quantization_range(storage::ObIVFMergeQuantizer *&output,
       const bool success) override;
   virtual int quantize_cluster_with_reuse(
-      storage::ObIVFVectorReader &reader, const common::ObIArray<float> &final_centers,
+      storage::ObIVFVectorReader &reader, const share::ObVectorMatrix &final_centers,
       const int64_t center_count, const int64_t cid,
-      const common::ObIArray<storage::ObIVFVectorVID> &member_vids,
-      const common::ObIArray<storage::ObIVFVectorVID> *secondary_member_vids,
+      const storage::ObIVFVectorIDView &member_vids,
+      const storage::ObIVFVectorIDView *secondary_member_vids,
       const storage::ObIVFEncodedPostingSource &source, const int64_t source_center_idx,
       const int64_t reused_prefix_count) override;
 
@@ -87,18 +88,18 @@ public:
 
   virtual int quantize_cluster(
       storage::ObIVFVectorReader &reader,
-      const common::ObIArray<float> &final_centers,
+      const share::ObVectorMatrix &final_centers,
       const int64_t center_count,
       const int64_t cid,
-      const common::ObIArray<storage::ObIVFVectorVID> &primary_member_vids,
-      const common::ObIArray<storage::ObIVFVectorVID> *secondary_member_vids) override;
+      const storage::ObIVFVectorIDView &primary_member_vids,
+      const storage::ObIVFVectorIDView *secondary_member_vids) override;
   virtual int finish_quantization(
       const int64_t vector_count,
       const int64_t center_count,
       const int64_t posting_count) override;
   virtual int write_raw_vectors(
       storage::ObIVFVectorReader &reader,
-      const common::ObIArray<storage::ObIVFVectorVID> &all_vids,
+      const storage::ObIVFVectorIDView &all_vids,
       const int64_t vid_begin,
       const int64_t vid_end,
       const int64_t task_idx) override;
@@ -121,9 +122,9 @@ private:
   class QuantizationRange;
   class ReusePostingConsumer;
   int quantize_cluster_(storage::ObIVFVectorReader &reader,
-      const common::ObIArray<float> &final_centers, const int64_t center_count,
-      const int64_t cid, const common::ObIArray<storage::ObIVFVectorVID> &member_vids,
-      const common::ObIArray<storage::ObIVFVectorVID> *secondary_member_vids,
+      const share::ObVectorMatrix &final_centers, const int64_t center_count,
+      const int64_t cid, const storage::ObIVFVectorIDView &member_vids,
+      const storage::ObIVFVectorIDView *secondary_member_vids,
       const storage::ObIVFEncodedPostingSource *source,
       const int64_t source_center_idx, const int64_t reused_prefix_count,
       QuantizationRange *range = nullptr);
@@ -148,7 +149,7 @@ private:
       const storage::ObIVFSortItem &item,
       ObDatumRow &row, ObIVFBlockReuseWriter *reuse = nullptr);
   int prepare_posting_reuse_();
-  int prepare_centroid_reuse_(const common::ObIArray<float> &centers, int64_t dimension);
+  int prepare_centroid_reuse_(const share::ObVectorMatrix &centers, int64_t dimension);
   const ObIVFBlockReuseSource *find_reuse_source_(int64_t prior_centroid_index) const;
   int normalize_reuse_ranges_(common::ObArray<ObIVFReuseRange, common::ObWrapperAllocator> &ranges);
 
@@ -172,7 +173,7 @@ private:
   int64_t output_row_count_;
   int64_t reused_posting_count_;
   // Borrowed immutable centers stay alive through the QUANT barrier.
-  const common::ObIArray<float> *quant_centers_;
+  const share::ObVectorMatrix *quant_centers_;
   common::ObArray<uint32_t, common::ObWrapperAllocator> leaf_posting_counts_;
   int64_t quant_range_count_;
   int64_t completed_quant_ranges_;

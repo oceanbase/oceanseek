@@ -469,16 +469,12 @@ TEST(TestDiskBBQBuild, ReplayInputSamplesDuringCaptureAndRewinds)
   ObIVFReplayInput replay_input(allocator);
 
   ASSERT_EQ(OB_SUCCESS,
-            replay_input.init(TEST_TENANT_ID, dim,
-                              TEST_REPLAY_MEMORY_LIMIT, max_sample_count,
-                              sample_seed, slice_idx, true /* capture_vids */));
+      replay_input.init(TEST_TENANT_ID, dim, TEST_REPLAY_MEMORY_LIMIT, max_sample_count, sample_seed, slice_idx));
   ASSERT_TRUE(replay_input.is_sampling_enabled());
   for (int64_t i = 0; i < row_count; ++i) {
     ASSERT_EQ(OB_SUCCESS,
               replay_input.add_row(vids[i], as_vector_bytes(vectors[i], dim)));
   }
-  uint64_t captured_vid = 0;
-  EXPECT_EQ(OB_STATE_NOT_MATCH, replay_input.get_captured_vid(0, captured_vid));
   ASSERT_EQ(row_count, replay_input.get_row_count());
   ASSERT_EQ(row_count, replay_input.get_sample_scan_count());
   ASSERT_EQ(max_sample_count, replay_input.get_sample_count());
@@ -512,17 +508,6 @@ TEST(TestDiskBBQBuild, ReplayInputSamplesDuringCaptureAndRewinds)
   ASSERT_EQ(OB_SUCCESS, replay_input.seal());
   ASSERT_TRUE(replay_input.is_sealed());
   ASSERT_EQ(row_count, replay_input.get_inmemory_row_count());
-  for (int64_t i = row_count - 1; i >= 0; --i) {
-    ASSERT_EQ(OB_SUCCESS, replay_input.get_captured_vid(i, captured_vid));
-    EXPECT_EQ(vids[i], captured_vid);
-  }
-  EXPECT_EQ(OB_INDEX_OUT_OF_RANGE, replay_input.get_captured_vid(-1, captured_vid));
-  EXPECT_EQ(OB_INDEX_OUT_OF_RANGE, replay_input.get_captured_vid(row_count, captured_vid));
-  // DDL discards the enumeration metadata after building its locators. Sample
-  // locators and both random and sequential payload readers must remain valid.
-  replay_input.release_captured_vids();
-  replay_input.release_captured_vids();
-  EXPECT_EQ(OB_STATE_NOT_MATCH, replay_input.get_captured_vid(0, captured_vid));
   ASSERT_EQ(max_sample_count, replay_input.get_sample_count());
   for (int64_t i = 0; i < max_sample_count; ++i) {
     uint64_t sampled_vid = 0;
@@ -576,18 +561,14 @@ TEST(TestDiskBBQBuild, ReplayInputEmptyNoCacheSealsWithoutTemporaryFile)
   EXPECT_EQ(OB_ITER_END, replay_input.get_next_row(vid, vector));
 }
 
-TEST(TestDiskBBQBuild, ReplayInputEmptyCapturedVidsHaveNoRows)
+TEST(TestDiskBBQBuild, ReplayInputEmptySampledStoreHasNoRows)
 {
   ObArenaAllocator allocator("BBQEmptyVidUT");
   ObIVFReplayInput replay_input(allocator);
   ASSERT_EQ(OB_SUCCESS, replay_input.init(
-      TEST_TENANT_ID, 3, ObIVFReplayInput::NO_CACHE_MEMORY_LIMIT, 4, 123, 7, true));
+      TEST_TENANT_ID, 3, ObIVFReplayInput::NO_CACHE_MEMORY_LIMIT, 4, 123, 7));
   ASSERT_EQ(OB_SUCCESS, replay_input.seal());
   uint64_t vid = 0;
-  EXPECT_EQ(OB_INDEX_OUT_OF_RANGE, replay_input.get_captured_vid(0, vid));
-  EXPECT_EQ(OB_INDEX_OUT_OF_RANGE, replay_input.get_captured_vid(-1, vid));
-  replay_input.release_captured_vids();
-  EXPECT_EQ(OB_INDEX_OUT_OF_RANGE, replay_input.get_captured_vid(0, vid));
   EXPECT_EQ(0, replay_input.get_sample_count());
   EXPECT_EQ(0, replay_input.get_file_size());
   const float *vector = nullptr;
@@ -614,8 +595,6 @@ TEST(TestDiskBBQBuild, ReplayInputPositiveCacheBudgetRetainsFinalRow)
   EXPECT_EQ(0, replay_input.get_file_size());
   uint64_t vid = 0;
   const float *vector = nullptr;
-  EXPECT_EQ(OB_STATE_NOT_MATCH, replay_input.get_captured_vid(0, vid));
-  replay_input.release_captured_vids();
   ASSERT_EQ(OB_SUCCESS, replay_input.get_row_at(0, vid, vector));
   EXPECT_EQ(expected_vid, vid);
   ASSERT_NE(nullptr, vector);
@@ -657,8 +636,8 @@ TEST(TestDiskBBQBuild, ReplayInputBatchCopiesAreTaskLocalInMemory)
            0 == failure_count.load() && round < repeat_count;
            ++round) {
         ObSEArray<ObIVFReplayReadRequest, batch_count> requests;
-        ObSEArray<float, batch_count * dim> vectors;
-        int ret = vectors.prepare_allocate(batch_count * dim);
+        share::ObVectorMatrix vectors;
+        int ret = vectors.resize(batch_count * dim);
         for (int64_t i = 0; OB_SUCCESS == ret && i < batch_count; ++i) {
           const int64_t row_id =
               (worker_idx * batch_count + round + i * 7) % row_count;
@@ -787,7 +766,7 @@ TEST(TestDiskBBQBuild, ReplayInputSamplingAllocationFailureFailsClosed)
             replay_input.init(TEST_TENANT_ID, dim,
                               TEST_REPLAY_MEMORY_LIMIT,
                               inline_sample_capacity + 1,
-                              0x123456789abcdef0ULL, 11, true));
+                              0x123456789abcdef0ULL, 11));
   for (int64_t i = 0; i < inline_sample_capacity; ++i) {
     ASSERT_EQ(OB_SUCCESS,
               replay_input.add_row(20000 + i,
@@ -819,13 +798,13 @@ TEST(TestDiskBBQBuild, GlobalBottomKAcrossMultipleSliceLocators)
 
   ASSERT_EQ(OB_SUCCESS,
             first_slice.init(TEST_TENANT_ID, dim, TEST_REPLAY_MEMORY_LIMIT,
-                             max_sample_count, sample_seed, 9, true));
+                             max_sample_count, sample_seed, 9));
   ASSERT_EQ(OB_SUCCESS,
             empty_slice.init(TEST_TENANT_ID, dim, TEST_REPLAY_MEMORY_LIMIT,
-                             max_sample_count, sample_seed, 4, true));
+                             max_sample_count, sample_seed, 4));
   ASSERT_EQ(OB_SUCCESS,
             second_slice.init(TEST_TENANT_ID, dim, TEST_REPLAY_MEMORY_LIMIT,
-                              max_sample_count, sample_seed, 2, true));
+                              max_sample_count, sample_seed, 2));
   for (uint64_t vid = 101; vid <= 105; ++vid) {
     const float vector[dim] = {
         static_cast<float>(vid), -static_cast<float>(vid)
@@ -867,9 +846,6 @@ TEST(TestDiskBBQBuild, GlobalBottomKAcrossMultipleSliceLocators)
 
   // Global sample references must outlive each slice's VID metadata,
   // including an empty slice in the middle of the input list.
-  for (int64_t i = 0; i < ARRAYSIZEOF(slices); ++i) {
-    slices[i]->release_captured_vids();
-  }
   const std::set<uint64_t> expected_vids = {102, 103, 104, 203};
   std::set<uint64_t> actual_vids;
   const common::ObIArray<ObIVFSampleRef> &sample_refs =

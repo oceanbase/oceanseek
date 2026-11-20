@@ -6,6 +6,7 @@
 #ifndef OCEANBASE_STORAGE_BLOCKSSTABLE_VECTOR_INDEX_OB_IVF_DDL_SSTABLE_WRITER_H_
 #define OCEANBASE_STORAGE_BLOCKSSTABLE_VECTOR_INDEX_OB_IVF_DDL_SSTABLE_WRITER_H_
 
+#include "storage/blocksstable/vector_index/ob_ivf_vector_ids.h"
 #include "lib/lock/ob_mutex.h"
 #include "share/vector_index/ob_vector_index_util.h"
 #include "share/vector_index/quantization/rabitq_quantization/ob_fht_kac_rotator.h"
@@ -78,25 +79,21 @@ public:
   int append_loaded_postings(const common::ObIArray<storage::ObIVFBuildRow> &rows);
   int64_t posting_write_task_count() const override { return posting_shard_count_; }
   int write_posting_range(int64_t task_idx) override;
-  int write_loaded_centers(const common::ObIArray<float> &centers,
-      int64_t dimension, int64_t begin, int64_t end) override;
-  int quantize_loaded_vectors(const common::ObIArray<float> &centers, int64_t dimension,
-      const common::ObIArray<storage::ObIVFVectorVID> &vids, const common::ObIArray<float> &vectors,
-      const common::ObIArray<int64_t> &primary, const common::ObIArray<int64_t> *secondary) override;
-  virtual int quantize_cluster(
-      storage::ObIVFVectorReader &reader,
-      const common::ObIArray<float> &final_centers,
-      const int64_t center_count,
-      const int64_t cid,
-      const common::ObIArray<storage::ObIVFVectorVID> &primary_member_vids,
-      const common::ObIArray<storage::ObIVFVectorVID> *secondary_member_vids) override;
+  int write_loaded_centers(
+      const share::ObVectorMatrix &centers, int64_t dimension, int64_t begin, int64_t end) override;
+  int quantize_loaded_vectors(const share::ObVectorMatrix &centers, int64_t dimension, const ObIVFVectorIDView &vids,
+      const share::ObVectorMatrix &vectors, const common::ObIArray<int64_t> &primary,
+      const common::ObIArray<int64_t> *secondary) override;
+  virtual int quantize_cluster(storage::ObIVFVectorReader &reader, const share::ObVectorMatrix &final_centers,
+      const int64_t center_count, const int64_t cid, const ObIVFVectorIDView &primary_member_vids,
+      const storage::ObIVFVectorIDView *secondary_member_vids) override;
   virtual int finish_quantization(
       const int64_t vector_count,
       const int64_t center_count,
       const int64_t posting_count) override;
   virtual int write_raw_vectors(
       storage::ObIVFVectorReader &reader,
-      const common::ObIArray<storage::ObIVFVectorVID> &all_vids,
+      const ObIVFVectorIDView &all_vids,
       const int64_t vid_begin,
       const int64_t vid_end,
       const int64_t task_idx) override;
@@ -116,7 +113,7 @@ public:
 
 private:
   int append_partitioned_rows_(const common::ObIArray<storage::ObIVFBuildRow> &rows);
-  int write_center_range_(const common::ObIArray<float> &centers, int64_t dim, int64_t begin, int64_t end);
+  int write_center_range_(const share::ObVectorMatrix &centers, int64_t dim, int64_t begin, int64_t end);
   int append_ddl_row_(storage::ObITabletSliceWriter &writer, int64_t type, int64_t cid,
       storage::ObIVFVectorVID vid, const common::ObString &payload, ObDatumRow &row);
   int finish_partitioned_output_(int64_t vector_count, int64_t center_count, int64_t posting_count);

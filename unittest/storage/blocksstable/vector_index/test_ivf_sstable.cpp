@@ -68,6 +68,10 @@
 #include <algorithm>
 #include <cmath>
 #include <thread>
+#include <chrono>
+#include <condition_variable>
+#include <future>
+#include <mutex>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -127,6 +131,7 @@
 #include "storage/blocksstable/vector_index/ob_ivf_hca_algorithm_adapter.h"
 #include "storage/blocksstable/vector_index/ob_ivf_ddl_hca_adapter.h"
 #include "storage/blocksstable/vector_index/ob_ivf_ddl_input.h"
+#include "storage/blocksstable/vector_index/ob_ivf_raw_key_store.h"
 #include "storage/blocksstable/vector_index/ob_ivf_ddl_dag.h"
 #include "storage/blocksstable/vector_index/ob_ivf_tablet_context.h"
 #include "storage/ddl/ob_ddl_tablet_context.h"
@@ -903,8 +908,8 @@ TEST_F(TestIVFSSTable, prior_reservation_rejects_overflow_before_allocating)
     int64_t centers = 0, postings = 0;
     EXPECT_EQ(expected, input.reserve_prior_arrays_(centers, postings));
     EXPECT_EQ(before, arena.used());
-    EXPECT_EQ(0, input.prior_.centroids_.get_data_size());
-    EXPECT_EQ(0, input.prior_.postings_.get_data_size());
+    EXPECT_EQ(0, input.prior_.centroids_.mem_used());
+    EXPECT_EQ(0, input.prior_.postings_.mem_used());
   }
 }
 
@@ -2890,7 +2895,7 @@ public:
   virtual int64_t get_vector_count() const override { return 2; }
   virtual int64_t get_dimension() const override { return 2; }
   virtual int get_all_vids(
-      ObIArray<storage::ObIVFVectorVID> &vids) const override
+      share::ObVectorArray<storage::ObIVFVectorVID> &vids) const override
   {
     int ret = OB_SUCCESS;
     vids.reset();
@@ -2901,10 +2906,10 @@ public:
     return ret;
   }
   virtual int batch_get_by_vid(
-      const ObIArray<storage::ObIVFVectorVID> &vids,
+      const ObIVFVectorIDView &vids,
       const int64_t vid_begin,
       const int64_t vid_end,
-      ObIArray<float> &vectors) const override
+      share::ObVectorMatrix &vectors) const override
   {
     int ret = OB_SUCCESS;
     static const float TEST_VECTORS[][2] = {
@@ -3106,8 +3111,8 @@ TEST_F(TestIVFSSTableWriter, ddl_lazy_global_sorter_serializes_first_appends)
 {
   FullRebuildWriterVectorStore store;
   ObIVFVectorReader reader;
-  ObArray<ObIVFVectorVID> vids;
-  ObArray<float> centers, vectors;
+  share::ObVectorArray<ObIVFVectorVID> vids;
+  share::ObVectorMatrix centers, vectors;
   ObArray<int64_t> primary;
   ObArray<uint32_t> counts;
   RecordingIVFDDLSliceWriter center;
@@ -3189,8 +3194,8 @@ TEST_F(TestIVFSSTableWriter, ddl_output_tasks_destroy_writers_before_phase_compl
     }
     FullRebuildWriterVectorStore store;
     ObIVFVectorReader reader;
-    ObArray<ObIVFVectorVID> vids;
-    ObArray<float> centers, vectors;
+    share::ObVectorArray<ObIVFVectorVID> vids;
+    share::ObVectorMatrix centers, vectors;
     ObArray<int64_t> primary;
     ASSERT_EQ(OB_SUCCESS, reader.init(store));
     ASSERT_EQ(OB_SUCCESS, store.get_all_vids(vids));
@@ -3243,7 +3248,7 @@ TEST_F(TestIVFSSTableWriter, ddl_output_validates_center_count_after_writer_dest
   OwnedIVFDDLWriters provider;
   provider.wrong_center_count_ = true;
   ObIVFDDLSSTableWriter writer(allocator_);
-  ObArray<float> centers, vectors;
+  share::ObVectorMatrix centers, vectors;
   ObArray<ObIVFVectorVID> vids;
   ObArray<int64_t> primary;
   ASSERT_EQ(OB_SUCCESS, centers.push_back(1.0F));
@@ -3268,8 +3273,8 @@ TEST_F(TestIVFSSTableWriter, ddl_serial_output_owns_only_its_created_writers)
   for (bool borrowed_center : {false, true}) {
     FullRebuildWriterVectorStore store;
     ObIVFVectorReader reader;
-    ObArray<ObIVFVectorVID> vids;
-    ObArray<float> centers;
+    share::ObVectorArray<ObIVFVectorVID> vids;
+    share::ObVectorMatrix centers;
     OwnedIVFDDLWriters provider;
     RecordingIVFDDLSliceWriter center;
     ObIVFDDLSSTableWriter writer(allocator_);
@@ -3319,14 +3324,14 @@ public:
   int64_t get_dimension() const override { return DIM; }
   static float value(uint64_t vid, int64_t d)
   { return static_cast<float>(vid % 997) * 0.001F + static_cast<float>(d) * 0.01F; }
-  int get_all_vids(ObIArray<ObIVFVectorVID> &vids) const override
+  int get_all_vids(share::ObVectorArray<ObIVFVectorVID> &vids) const override
   {
     int ret = vids.reserve(rows_);
     for (int64_t i = 0; OB_SUCC(ret) && i < rows_; ++i) { ret = vids.push_back(i); }
     return ret;
   }
-  int batch_get_by_vid(const ObIArray<ObIVFVectorVID> &vids,
-      int64_t begin, int64_t end, ObIArray<float> &vectors) const override
+  int batch_get_by_vid(const ObIVFVectorIDView &vids,
+      int64_t begin, int64_t end, share::ObVectorMatrix &vectors) const override
   {
     int ret = OB_SUCCESS;
     if (batches_ == 0) { baseline_ = raw_buffer_hold(); }
@@ -3335,7 +3340,7 @@ public:
     // Exercise the real DDL input's reuse/prepare_allocate contract.
     vectors.reuse();
     if (begin < 0 || end <= begin || end > vids.count()) { ret = OB_INVALID_ARGUMENT; }
-    else if (OB_FAIL(vectors.prepare_allocate((end - begin) * DIM))) {
+    else if (OB_FAIL(vectors.resize((end - begin) * DIM))) {
     } else {
       peak_extra_ = MAX(peak_extra_, raw_buffer_hold() - baseline_);
       if (peak_extra_ > 32L * 1024 * 1024) { ret = OB_ALLOCATE_MEMORY_FAILED; }
@@ -3403,7 +3408,7 @@ TEST_F(TestIVFSSTableWriter, ddl_raw_batches_have_bounded_memory_and_preserve_pa
   for (int64_t fail_batch : {-1, 5}) {
     BoundedRawVectorStore store(rows, fail_batch);
     ObIVFVectorReader reader;
-    ObArray<ObIVFVectorVID> vids;
+    share::ObVectorArray<ObIVFVectorVID> vids;
     RecordingIVFDDLSliceWriter posting;
     CountingRawProvider raw;
     ObIVFDDLSSTableWriter writer(allocator_);
@@ -3440,10 +3445,10 @@ TEST_F(TestIVFSSTableWriter, ddl_raw_batches_have_bounded_memory_and_preserve_pa
 
 static int prepare_ddl_quantization(ObIVFDDLSSTableWriter &writer,
     RecordingIVFDDLSliceWriter &posting_writer, RecordingIVFDDLRawWriters &raw_writers,
-    ObIVFVectorReader &reader, const ObIArray<ObIVFVectorVID> &vids)
+    ObIVFVectorReader &reader, const ObIVFVectorIDView &vids)
 {
   int ret = OB_SUCCESS;
-  ObSEArray<float, 2> centers;
+  share::ObVectorMatrix centers;
   if (OB_FAIL(centers.push_back(2.0F))) {
   } else if (OB_FAIL(centers.push_back(3.0F))) {
   } else if (OB_FAIL(writer.init(posting_writer, raw_writers,
@@ -3459,7 +3464,7 @@ TEST_F(TestIVFSSTableWriter, ddl_writer_streams_raw_slices_in_reverse_completion
 {
   FullRebuildWriterVectorStore store;
   ObIVFVectorReader reader;
-  ObSEArray<ObIVFVectorVID, 2> vids;
+  share::ObVectorArray<ObIVFVectorVID> vids;
   ASSERT_EQ(OB_SUCCESS, reader.init(store));
   ASSERT_EQ(OB_SUCCESS, store.get_all_vids(vids));
   RecordingIVFDDLSliceWriter posting;
@@ -3500,7 +3505,7 @@ TEST_F(TestIVFSSTableWriter, ddl_writer_rejects_empty_duplicate_and_unordered_ra
 {
   FullRebuildWriterVectorStore store;
   ObIVFVectorReader reader;
-  ObSEArray<ObIVFVectorVID, 2> vids;
+  share::ObVectorArray<ObIVFVectorVID> vids;
   ASSERT_EQ(OB_SUCCESS, reader.init(store));
   ASSERT_EQ(OB_SUCCESS, store.get_all_vids(vids));
   RecordingIVFDDLSliceWriter posting;
@@ -3525,7 +3530,7 @@ TEST_F(TestIVFSSTableWriter, ddl_writer_failed_raw_slice_cannot_publish)
   for (int failure = 0; failure < 3; ++failure) {
     FullRebuildWriterVectorStore store;
     ObIVFVectorReader reader;
-    ObSEArray<ObIVFVectorVID, 2> vids;
+    share::ObVectorArray<ObIVFVectorVID> vids;
     ASSERT_EQ(OB_SUCCESS, reader.init(store));
     ASSERT_EQ(OB_SUCCESS, store.get_all_vids(vids));
     RecordingIVFDDLSliceWriter posting;
@@ -3548,7 +3553,7 @@ TEST_F(TestIVFSSTableWriter, ddl_writer_failed_posting_close_does_not_start_raw)
 {
   FullRebuildWriterVectorStore store;
   ObIVFVectorReader reader;
-  ObSEArray<ObIVFVectorVID, 2> vids;
+  share::ObVectorArray<ObIVFVectorVID> vids;
   ASSERT_EQ(OB_SUCCESS, reader.init(store));
   ASSERT_EQ(OB_SUCCESS, store.get_all_vids(vids));
   RecordingIVFDDLSliceWriter posting;
@@ -3567,8 +3572,9 @@ TEST_F(TestIVFSSTableWriter, ddl_loaded_quantization_matches_cluster_output_with
   for (bool rotated : {false, true}) {
     FullRebuildWriterVectorStore store;
     ObIVFVectorReader reader;
-    ObArray<ObIVFVectorVID> vids, batch_vids;
-    ObArray<float> centers, values;
+    share::ObVectorArray<ObIVFVectorVID> vids;
+    ObArray<ObIVFVectorVID> batch_vids;
+    share::ObVectorMatrix centers, values;
     ObArray<int64_t> primary, secondary;
     ASSERT_EQ(OB_SUCCESS, reader.init(store));
     ASSERT_EQ(OB_SUCCESS, store.get_all_vids(vids));
@@ -3584,7 +3590,8 @@ TEST_F(TestIVFSSTableWriter, ddl_loaded_quantization_matches_cluster_output_with
       ObArray<ObIVFVectorVID> own, extra;
       ASSERT_EQ(OB_SUCCESS, own.push_back(vids.at(cid)));
       ASSERT_EQ(OB_SUCCESS, extra.push_back(vids.at(1 - cid)));
-      ASSERT_EQ(OB_SUCCESS, reference.quantize_cluster(reader, centers, 2, cid, own, &extra));
+      const ObIVFVectorIDView extra_ids(extra);
+      ASSERT_EQ(OB_SUCCESS, reference.quantize_cluster(reader, centers, 2, cid, own, &extra_ids));
     }
     ASSERT_EQ(OB_SUCCESS, reference.finish_quantization(2, 2, 4));
     // Source order deliberately differs from business VID and cluster order.
@@ -3622,8 +3629,8 @@ TEST_F(TestIVFSSTableWriter, ddl_loaded_single_center_quantization_matches_clust
   for (const bool rotated : {false, true}) {
     FullRebuildWriterVectorStore store;
     ObIVFVectorReader reader;
-    ObArray<ObIVFVectorVID> vids;
-    ObArray<float> centers, values;
+    share::ObVectorArray<ObIVFVectorVID> vids;
+    share::ObVectorMatrix centers, values;
     ObArray<int64_t> primary;
     ASSERT_EQ(OB_SUCCESS, reader.init(store));
     ASSERT_EQ(OB_SUCCESS, store.get_all_vids(vids));
@@ -3668,7 +3675,7 @@ TEST_F(TestIVFSSTableWriter, partitioned_posting_output_matches_serial_and_fails
     const int mode = variant % 6;
     const bool grouped = variant >= 6;
     const int64_t k = 5, n = 8193, workers = 3;
-    ObArray<float> centers;
+    share::ObVectorMatrix centers;
     for (int64_t i = 0; i < k * 2; ++i) { ASSERT_EQ(OB_SUCCESS, centers.push_back(float(i))); }
     RecordingIVFDDLSliceWriter expected, actual;
     RecordingIVFDDLRawWriters old_provider, provider;
@@ -3685,7 +3692,7 @@ TEST_F(TestIVFSSTableWriter, partitioned_posting_output_matches_serial_and_fails
     ASSERT_EQ(OB_SUCCESS, serial.set_centroid_layout(layout));
     ObArray<uint32_t> counts;
     ASSERT_EQ(OB_SUCCESS, counts.prepare_allocate(k));
-    MEMSET(counts.get_data(), 0, k * sizeof(uint32_t));
+    MEMSET(&counts.at(0), 0, k * sizeof(uint32_t));
     for (int64_t i = 0; i < n; ++i) {
       ++counts.at(mode == 1 ? 0 : i % k);
       if (mode != 1) { ++counts.at((i + 1) % k); }
@@ -3695,7 +3702,7 @@ TEST_F(TestIVFSSTableWriter, partitioned_posting_output_matches_serial_and_fails
     ASSERT_EQ(workers, parallel.posting_write_task_count());
     auto encode = [&](ObIVFDDLSSTableWriter &writer, int64_t begin) {
       ObArray<ObIVFVectorVID> vids;
-      ObArray<float> values;
+      share::ObVectorMatrix values;
       ObArray<int64_t> primary, secondary;
       int ret = OB_SUCCESS;
       for (int64_t i = begin; OB_SUCC(ret) && i < MIN(n, begin + 4096); ++i) {
@@ -3840,8 +3847,8 @@ TEST_F(TestIVFSSTableWriter, partitioned_macro_output_round_trip)
   ASSERT_EQ(OB_SUCCESS, output.init(*provider.slices_[0], provider,
       IVF_SNAPSHOT_VERSION, dim, VIDA_L2, true));
   if (staged) { ASSERT_EQ(OB_SUCCESS, output.prepare_loaded_output(k, workers)); }
-  ObArray<float> centers;
-  ASSERT_EQ(OB_SUCCESS, centers.prepare_allocate(k * dim));
+  share::ObVectorMatrix centers;
+  ASSERT_EQ(OB_SUCCESS, centers.resize(k * dim));
   for (int64_t i = 0; i < k * dim; ++i) { centers.at(i) = float(i % 193) / 19.0F; }
   ObTenantBase *tenant = ObTenantEnv::get_tenant();
   std::atomic<int64_t> next(0), failures(0);
@@ -3863,12 +3870,12 @@ TEST_F(TestIVFSSTableWriter, partitioned_macro_output_round_trip)
   const int64_t started = ObTimeUtility::current_time();
   run((n + 4095) / 4096, [&](int64_t task) {
     ObArray<ObIVFVectorVID> vids;
-    ObArray<float> values;
+    share::ObVectorMatrix values;
     ObArray<int64_t> primary, secondary;
     int ret = OB_SUCCESS;
     const int64_t begin = task * 4096, end = MIN(n, begin + 4096);
     if (OB_FAIL(vids.prepare_allocate(end - begin))
-        || OB_FAIL(values.prepare_allocate((end - begin) * dim))
+        || OB_FAIL(values.resize((end - begin) * dim))
         || OB_FAIL(primary.prepare_allocate(end - begin))
         || OB_FAIL(secondary.prepare_allocate(end - begin))) { return ret; }
     for (int64_t i = begin; i < end; ++i) {
@@ -3885,7 +3892,7 @@ TEST_F(TestIVFSSTableWriter, partitioned_macro_output_round_trip)
   const int64_t encoded = ObTimeUtility::current_time();
   ObArray<uint32_t> counts;
   ASSERT_EQ(OB_SUCCESS, counts.prepare_allocate(k));
-  MEMSET(counts.get_data(), 0, k * sizeof(uint32_t));
+  MEMSET(&counts.at(0), 0, k * sizeof(uint32_t));
   for (int64_t i = 0; i < n; ++i) {
     ++counts.at(i % k);
     ++counts.at((i + 1) % k);
@@ -4119,7 +4126,7 @@ public:
   int64_t get_vector_count() const override { return ROWS; }
   int64_t get_sample_count() const override { return 1; }
   int64_t get_dimension() const override { return DIM; }
-  int get_all_vids(ObIArray<ObIVFVectorVID> &vids) const override
+  int get_all_vids(share::ObVectorArray<ObIVFVectorVID> &vids) const override
   {
     int ret = OB_SUCCESS; vids.reuse();
     for (int64_t i = 0; OB_SUCC(ret) && i < ROWS; ++i) { ret = vids.push_back(i + 1); }
@@ -4128,7 +4135,7 @@ public:
   int get_source_row_idx(const int64_t idx, int64_t &source) const override
   { source = ROWS - 1 - idx; return idx >= 0 && idx < ROWS ? OB_SUCCESS : OB_INVALID_ARGUMENT; }
   static float value(const int64_t idx, const int64_t d) { return float(idx % 127) + float(d) / 1024; }
-  int batch_get_by_source(const ObIArray<int64_t> &idxs, ObIArray<float> &values) const override
+  int batch_get_by_source(const share::ObVectorArray<int64_t> &idxs, share::ObVectorMatrix &values) const override
   {
     ++reads_;
     if (fail_read_) { return OB_IO_ERROR; }
@@ -4137,7 +4144,7 @@ public:
     const float *before = values.empty() ? nullptr : &values.at(0);
     const int64_t old_count = values.count();
     values.reuse();
-    int ret = values.prepare_allocate(idxs.count() * DIM);
+    int ret = values.resize(idxs.count() * DIM);
     if (OB_SUCC(ret) && before != nullptr && old_count == values.count()
         && before != &values.at(0)) { ++buffer_changes_; }
     for (int64_t i = 0; OB_SUCC(ret) && i < idxs.count(); ++i) {
@@ -4147,9 +4154,9 @@ public:
     if (cancel_on_read_ != nullptr && reads_ >= cancel_after_reads_) { cancel_on_read_->cancel(OB_CANCELED); }
     return ret;
   }
-  int batch_get_by_vid(const ObIArray<ObIVFVectorVID> &, int64_t, int64_t, ObIArray<float> &) const override
+  int batch_get_by_vid(const ObIVFVectorIDView &, int64_t, int64_t, share::ObVectorMatrix &) const override
   { return OB_NOT_SUPPORTED; }
-  int batch_get_samples(int64_t, int64_t, ObIArray<ObIVFVectorVID> &, ObIArray<float> &) const override
+  int batch_get_samples(int64_t, int64_t, ObIArray<ObIVFVectorVID> &, share::ObVectorMatrix &) const override
   { return OB_NOT_SUPPORTED; }
 };
 
@@ -4160,8 +4167,8 @@ public:
   bool prepared_enabled_ = true;
   bool supports_prepared_cluster() const override { return prepared_enabled_; }
   int hca_train_local_centers(int64_t depth, int64_t node, ObIVFVectorReader &reader,
-      const ObIArray<ObIVFVectorVID> &vids, const ObIVFFirstLevelSampleSet *samples,
-      int64_t cluster_size, int64_t &k, ObIArray<float> &centers) override
+      const ObIVFVectorIDView &vids, const ObIVFFirstLevelSampleSet *samples,
+      int64_t cluster_size, int64_t &k, share::ObVectorMatrix &centers) override
   {
     UNUSEDx(node, reader, vids, samples, cluster_size);
     if (!hierarchy_case_ || depth != 0) { return OB_NOT_SUPPORTED; }
@@ -4173,8 +4180,8 @@ public:
     }
     return ret;
   }
-  int hca_assign_vectors(ObIVFVectorReader &reader, const ObIArray<ObIVFVectorVID> &vids,
-      const ObIArray<float> &centers, int64_t k, int64_t begin, int64_t end,
+  int hca_assign_vectors(ObIVFVectorReader &reader, const ObIVFVectorIDView &vids,
+      const share::ObVectorMatrix &centers, int64_t k, int64_t begin, int64_t end,
       ObIArray<int64_t> &cids) override
   {
     UNUSEDx(reader, centers);
@@ -4193,8 +4200,8 @@ public:
     return ret;
   }
   int hca_train_loaded_samples(const int64_t count, const int64_t, const int64_t dim,
-      const ObIArray<int64_t> &ordinals, const ObIArray<float> &values,
-      int64_t &k, ObIArray<float> &centers) override
+      const common::ObIArray<int64_t> &ordinals, const share::ObVectorMatrix &values, int64_t &k,
+      share::ObVectorMatrix &centers) override
   {
     int ret = OB_SUCCESS;
     const int64_t parity = count == (ParallelSampleStore::ROWS + 1) / 2 ? 0 : 1;
@@ -4585,12 +4592,13 @@ TEST_F(TestIVFMergeInput, merge_source_applies_major_bitmap_and_allows_inc_witho
         EXPECT_EQ(2 - filtered_count, input.get_sample_count());
         EXPECT_EQ(2 == filtered_count, input.is_empty());
         if (!input.is_empty()) {
-          ObSEArray<ObIVFVectorVID, 2> vids;
-          ObSEArray<float, 4> samples;
+          share::ObVectorArray<ObIVFVectorVID> vids;
+          share::ObVectorMatrix samples;
           ASSERT_EQ(OB_SUCCESS, input.get_all_vids(vids));
           EXPECT_EQ((filtered_count + 1) * 11, vids.at(0));
+          ObArray<ObIVFVectorVID> sample_vids;
           ASSERT_EQ(OB_SUCCESS, input.batch_get_samples(
-              0, input.get_sample_count(), vids, samples));
+              0, input.get_sample_count(), sample_vids, samples));
           EXPECT_EQ(vectors[filtered_count][0], samples.at(0));
           EXPECT_EQ(vectors[filtered_count][1], samples.at(1));
           if (filtered_count == 0) {
@@ -4676,10 +4684,7 @@ TEST_F(TestIVFMergeInput, raw_capture_matches_pipeline_bottom_k_samples)
   ASSERT_EQ(OB_SUCCESS, captured.seal());
   // REFRESH samples vectors without retaining the INITIAL_BUILD VID array.
   ASSERT_TRUE(captured.is_sampling_enabled());
-  EXPECT_EQ(0, captured.captured_vids_.count());
-  EXPECT_EQ(0, captured.captured_vids_.get_capacity());
   uint64_t captured_vid = 0;
-  EXPECT_EQ(OB_STATE_NOT_MATCH, captured.get_captured_vid(0, captured_vid));
   ASSERT_EQ(captured.get_sample_count(), input.get_sample_count());
   for (int64_t i = 0; i < captured.get_sample_count(); ++i) {
     const ObIVFSampleCandidate &candidate = captured.get_sample_candidates().at(i);
@@ -4709,8 +4714,8 @@ TEST_F(TestIVFMergeInput, raw_capture_matches_pipeline_bottom_k_samples)
             ? left.priority_ < right.priority_ : left.vid_ < right.vid_;
       });
 
-  ObSEArray<ObIVFVectorVID, 2> sample_vids;
-  ObSEArray<float, 4> sample_vectors;
+  ObArray<ObIVFVectorVID> sample_vids;
+  share::ObVectorMatrix sample_vectors;
   ASSERT_EQ(OB_SUCCESS, input.batch_get_samples(
       0, 2, sample_vids, sample_vectors));
   ASSERT_EQ(2, sample_vids.count());
@@ -5020,7 +5025,7 @@ TEST_F(TestIVFSSTableWriter, merge_global_sorter_initializes_only_for_global_row
   ASSERT_EQ(OB_SUCCESS, prepare_write_env(1, ObSSTableIndexBuilder::DISABLE));
   ObMacroSeqWindow data_window;
   ASSERT_EQ(OB_SUCCESS, ObVersionLocalMacroSeq::build_window(0, data_window));
-  ObArray<float> centers;
+  share::ObVectorMatrix centers;
   ASSERT_EQ(OB_SUCCESS, centers.push_back(1.0F));
   ASSERT_EQ(OB_SUCCESS, centers.push_back(2.0F));
   for (int mode = 0; mode < 3; ++mode) {
@@ -5084,8 +5089,8 @@ TEST_F(TestIVFSSTableWriter, merge_loaded_writers_release_buffers_before_quant_b
   ASSERT_EQ(OB_SUCCESS, prepare_write_env(1, ObSSTableIndexBuilder::DISABLE));
   FullRebuildWriterVectorStore store;
   ObIVFVectorReader reader;
-  ObArray<ObIVFVectorVID> vids;
-  ObArray<float> centers, vectors;
+  share::ObVectorArray<ObIVFVectorVID> vids;
+  share::ObVectorMatrix centers, vectors;
   ObArray<int64_t> primary;
   ASSERT_EQ(OB_SUCCESS, reader.init(store));
   ASSERT_EQ(OB_SUCCESS, store.get_all_vids(vids));
@@ -5133,8 +5138,9 @@ TEST_F(TestIVFSSTableWriter, merge_loaded_postings_match_ddl_with_empty_shard_an
   ASSERT_EQ(OB_SUCCESS, prepare_write_env(1, ObSSTableIndexBuilder::DISABLE));
   FullRebuildWriterVectorStore store(0);
   ObIVFVectorReader reader;
-  ObArray<ObIVFVectorVID> vids, inserted_vids, reused_vids;
-  ObArray<float> centers, vectors, inserted_vectors;
+  share::ObVectorArray<ObIVFVectorVID> vids;
+  ObArray<ObIVFVectorVID> inserted_vids, reused_vids;
+  share::ObVectorMatrix centers, vectors, inserted_vectors;
   ObArray<int64_t> primary, secondary, inserted_primary, inserted_secondary;
   ASSERT_EQ(OB_SUCCESS, reader.init(store));
   ASSERT_EQ(OB_SUCCESS, store.get_all_vids(vids));
@@ -5274,12 +5280,12 @@ TEST_F(TestIVFSSTableWriter, merge_loaded_runtime_without_soar_prepares_and_fini
     int64_t get_vector_count() const override { return 2; }
     int64_t get_sample_count() const override { return 2; }
     int64_t get_dimension() const override { return 2; }
-    int get_all_vids(ObIArray<ObIVFVectorVID> &vids) const override { return data_.get_all_vids(vids); }
+    int get_all_vids(share::ObVectorArray<ObIVFVectorVID> &vids) const override { return data_.get_all_vids(vids); }
     int get_source_row_idx(int64_t idx, int64_t &source) const override
     { source = idx; return idx >= 0 && idx < 2 ? OB_SUCCESS : OB_INVALID_ARGUMENT; }
-    int batch_get_by_vid(const ObIArray<ObIVFVectorVID> &vids, int64_t begin, int64_t end,
-        ObIArray<float> &values) const override { return data_.batch_get_by_vid(vids, begin, end, values); }
-    int batch_get_by_source(const ObIArray<int64_t> &idxs, ObIArray<float> &values) const override
+    int batch_get_by_vid(const ObIVFVectorIDView &vids, int64_t begin, int64_t end,
+        share::ObVectorMatrix &values) const override { return data_.batch_get_by_vid(vids, begin, end, values); }
+    int batch_get_by_source(const share::ObVectorArray<int64_t> &idxs, share::ObVectorMatrix &values) const override
     {
       ObArray<ObIVFVectorVID> vids;
       int ret = OB_SUCCESS;
@@ -5290,7 +5296,7 @@ TEST_F(TestIVFSSTableWriter, merge_loaded_runtime_without_soar_prepares_and_fini
       return OB_FAIL(ret) ? ret : data_.batch_get_by_vid(vids, 0, vids.count(), values);
     }
     int batch_get_samples(int64_t begin, int64_t end, ObIArray<ObIVFVectorVID> &vids,
-        ObIArray<float> &values) const override
+        share::ObVectorMatrix &values) const override
     {
       vids.reuse();
       int ret = begin < 0 || end > 2 || end <= begin ? OB_INVALID_ARGUMENT : OB_SUCCESS;
@@ -5393,9 +5399,9 @@ TEST_F(TestIVFSSTableWriter, merge_writer_preserves_rotated_raw_vectors)
   FullRebuildWriterVectorStore vector_store;
   storage::ObIVFVectorReader reader;
   ASSERT_EQ(OB_SUCCESS, reader.init(vector_store));
-  ObSEArray<storage::ObIVFVectorVID, 2> all_vids;
+  share::ObVectorArray<ObIVFVectorVID> all_vids;
   ASSERT_EQ(OB_SUCCESS, vector_store.get_all_vids(all_vids));
-  ObSEArray<float, 2> centers;
+  share::ObVectorMatrix centers;
   ASSERT_EQ(OB_SUCCESS, centers.push_back(2.0F));
   ASSERT_EQ(OB_SUCCESS, centers.push_back(3.0F));
 
@@ -5552,8 +5558,9 @@ TEST_F(TestIVFSSTableWriter, frozen_empty_leaf_survives_quantization_and_readbac
   ASSERT_EQ(OB_SUCCESS, prepare_write_env(1, ObSSTableIndexBuilder::DISABLE));
   FullRebuildWriterVectorStore store(0);
   ObIVFVectorReader reader;
-  ObArray<ObIVFVectorVID> vids, empty;
-  ObArray<float> centers;
+  share::ObVectorArray<ObIVFVectorVID> vids;
+  ObArray<ObIVFVectorVID> empty;
+  share::ObVectorMatrix centers;
   ASSERT_EQ(OB_SUCCESS, reader.init(store));
   ASSERT_EQ(OB_SUCCESS, store.get_all_vids(vids));
   for (float v : {2.0F, 3.0F, 100.0F, 101.0F}) { ASSERT_EQ(OB_SUCCESS, centers.push_back(v)); }
@@ -5649,9 +5656,9 @@ TEST_F(TestIVFSSTableWriter, parallel_quant_ranges_merge_interleaved_reused_vids
   FullRebuildWriterVectorStore vector_store(0 /* first_vid */);
   storage::ObIVFVectorReader reader;
   ASSERT_EQ(OB_SUCCESS, reader.init(vector_store));
-  ObSEArray<storage::ObIVFVectorVID, 2> all_vids;
+  share::ObVectorArray<ObIVFVectorVID> all_vids;
   ASSERT_EQ(OB_SUCCESS, vector_store.get_all_vids(all_vids));
-  ObSEArray<float, 4> centers;
+  share::ObVectorMatrix centers;
   ASSERT_EQ(OB_SUCCESS, centers.push_back(2.0F));
   ASSERT_EQ(OB_SUCCESS, centers.push_back(3.0F));
   ASSERT_EQ(OB_SUCCESS, centers.push_back(4.0F));
@@ -5953,7 +5960,7 @@ TEST_P(TestIVFCidMicroLayout, aggregates_normal_clusters_and_splits_large_cluste
   // Adjacent small clusters may share blocks. Known large clusters stay
   // isolated; missing, underestimated and excessive hints must preserve rows.
   const int64_t counts[] = {33, 33, 4000, 40000, 33, 33, 400, 4000, 33};
-  ObSEArray<uint32_t, ARRAYSIZEOF(counts)> count_hints;
+  ObArray<uint32_t> count_hints;
   for (int64_t i = 0; i < ARRAYSIZEOF(counts); ++i) {
     // Exercise a missing hint and an underestimated hint as well as exact counts.
     ASSERT_EQ(OB_SUCCESS, count_hints.push_back(
@@ -6134,7 +6141,7 @@ TEST_P(TestIVFCidMicroLayout, payload_bytes_pack_small_cids_and_isolate_large_ci
   const int64_t schema_target = whole_desc_.get_desc().get_micro_block_size();
   // One-bit 128D and 768D posting payload lengths, including quantizer factors.
   const int64_t sizes[] = {28, 28, 28, 108, 28, 28};
-  ObSEArray<uint32_t, clusters> hints;
+  ObArray<uint32_t> hints;
   for (int64_t c = 0; c < clusters; ++c) { ASSERT_EQ(OB_SUCCESS, hints.push_back(count)); }
   ASSERT_EQ(OB_SUCCESS, writer.set_posting_counts(hints, 1));
   auto payload_for = [&](int64_t c, int64_t vid) {
@@ -6232,7 +6239,7 @@ TEST_P(TestIVFCidMicroLayout, counts_select_target_at_first_row_and_respect_expl
   ASSERT_EQ(OB_SUCCESS, prepare_write_env(1, ObSSTableIndexBuilder::DISABLE, false, GetParam()));
   const int64_t cap = 256L * 1024;
   ObIvfMacroBlockWriter writer(cap);
-  ObSEArray<uint32_t, 4> hints;
+  ObArray<uint32_t> hints;
   ASSERT_EQ(OB_SUCCESS, hints.push_back(1));
   ASSERT_EQ(OB_SUCCESS, hints.push_back(4000));
   ASSERT_EQ(OB_SUCCESS, hints.push_back(UINT32_MAX));
@@ -6373,7 +6380,7 @@ TEST_P(TestIVFPostingEstimateFailure, wrong_compression_estimate_and_capacity_re
   } else {
     ASSERT_EQ(OB_SUCCESS, install_underestimating_encoder<ObMicroBlockCSEncoder<false>>(writer, rejections));
   }
-  ObSEArray<uint32_t, 1> hints;
+  ObArray<uint32_t> hints;
   ASSERT_EQ(OB_SUCCESS, hints.push_back(UINT32_MAX)); // Overestimation must also remain harmless.
   ASSERT_EQ(OB_SUCCESS, writer.set_posting_counts(hints, 1));
   const int64_t row_count = 4096;
@@ -6944,17 +6951,17 @@ protected:
         }
       }
     }
-    int get_all_vids(ObIArray<ObIVFVectorVID> &vids) const override
+    int get_all_vids(share::ObVectorArray<ObIVFVectorVID> &vids) const override
     {
       vids.reuse();
       int ret = vids.reserve(n_);
       for (int64_t i = 0; OB_SUCC(ret) && i < n_; ++i) { ret = vids.push_back(base_vid(i)); }
       return ret;
     }
-    int batch_get_by_vid(const ObIArray<ObIVFVectorVID> &vids, int64_t begin,
-        int64_t end, ObIArray<float> &values) const override
+    int batch_get_by_vid(const ObIVFVectorIDView &vids, int64_t begin,
+        int64_t end, share::ObVectorMatrix &values) const override
     {
-      int ret = values.prepare_allocate((end - begin) * DIM);
+      int ret = values.resize((end - begin) * DIM);
       for (int64_t i = begin; OB_SUCC(ret) && i < end; ++i) {
         const uint64_t vid = vids.at(i);
         if ((vid & 1) != 0 || vid == 0 || vid / 2 > static_cast<uint64_t>(n_)) {
@@ -6971,7 +6978,7 @@ protected:
     bool is_valid() const override { return data_.delta_ > 0; }
     int64_t get_vector_count() const override { return data_.delta_; }
     int64_t get_dimension() const override { return DIM; }
-    int get_all_vids(ObIArray<ObIVFVectorVID> &vids) const override
+    int get_all_vids(share::ObVectorArray<ObIVFVectorVID> &vids) const override
     {
       int ret = OB_SUCCESS;
       vids.reuse();
@@ -6980,10 +6987,10 @@ protected:
       }
       return ret;
     }
-    int batch_get_by_vid(const ObIArray<ObIVFVectorVID> &vids, int64_t begin,
-        int64_t end, ObIArray<float> &values) const override
+    int batch_get_by_vid(const ObIVFVectorIDView &vids, int64_t begin,
+        int64_t end, share::ObVectorMatrix &values) const override
     {
-      int ret = values.prepare_allocate((end - begin) * DIM);
+      int ret = values.resize((end - begin) * DIM);
       for (int64_t j = begin; OB_SUCC(ret) && j < end; ++j) {
         const uint64_t vid = vids.at(j);
         int64_t i = -1;
@@ -7214,10 +7221,10 @@ protected:
     ASSERT_EQ(OB_SUCCESS, reset_output(row_store_type, IVF_SNAPSHOT_VERSION,
         native_inc_sources_ && inc_source_ ? INC_MAJOR_MERGE : MAJOR_MERGE));
     base_.reset(new ObIvfSSTable()); delta_.reset(new ObIvfSSTable());
-    ObArray<float> centers;
-    ObArray<ObIVFVectorVID> all;
+    share::ObVectorMatrix centers;
+    share::ObVectorArray<ObIVFVectorVID> all;
     std::vector<std::vector<ObIVFVectorVID>> primary(data_.k_), secondary(data_.k_);
-    ASSERT_EQ(OB_SUCCESS, centers.prepare_allocate(data_.k_ * DIM));
+    ASSERT_EQ(OB_SUCCESS, centers.resize(data_.k_ * DIM));
     for (int64_t c = 0; c < data_.k_; ++c) {
       for (int64_t d = 0; d < DIM; ++d) { centers.at(c * DIM + d) = data_.center(c, d); }
     }
@@ -7240,7 +7247,7 @@ protected:
         IVF_SNAPSHOT_VERSION, DIM, VIDA_L2));
     ObIvfCentroidLayout layout(allocator_);
     if (grouped) {
-      ObArray<float> parents;
+      share::ObVectorMatrix parents;
       const int64_t half = data_.k_ / 2;
       for (int64_t p = 0; p < 2; ++p) {
         const int64_t first = p == 0 ? 0 : half, end = p == 0 ? half : data_.k_;
@@ -7273,8 +7280,10 @@ protected:
         ObArray<ObIVFVectorVID> p, s;
         for (auto vid : primary[c]) { ASSERT_EQ(OB_SUCCESS, p.push_back(vid)); }
         for (auto vid : secondary[c]) { ASSERT_EQ(OB_SUCCESS, s.push_back(vid)); }
-        const int rc = p.empty() ? range->quantize_cluster_with_reuse(reader, centers, data_.k_, c,
-            p, &s, empty, c, 0) : range->quantize_cluster(reader, centers, data_.k_, c, p, &s);
+        const ObIVFVectorIDView secondary_ids(s);
+        const int rc = p.empty()
+            ? range->quantize_cluster_with_reuse(reader, centers, data_.k_, c, p, &secondary_ids, empty, c, 0)
+            : range->quantize_cluster(reader, centers, data_.k_, c, p, &secondary_ids);
         ASSERT_EQ(OB_SUCCESS, rc);
       }
       ASSERT_EQ(OB_SUCCESS, writer.close_quantization_range(range, true));
@@ -7330,8 +7339,8 @@ protected:
       // capture rejects fabricated raw-only inputs with centroid_count == 0.
       DeltaStore delta_store(data_, duplicate_delta);
       ObIVFVectorReader delta_reader;
-      ObArray<ObIVFVectorVID> delta_vids;
-      ObArray<float> delta_center;
+      share::ObVectorArray<ObIVFVectorVID> delta_vids;
+      share::ObVectorMatrix delta_center;
       ASSERT_EQ(OB_SUCCESS, delta_reader.init(delta_store));
       ASSERT_EQ(OB_SUCCESS, delta_store.get_all_vids(delta_vids));
       for (int64_t d = 0; d < DIM; ++d) {
@@ -8076,7 +8085,7 @@ TEST_F(TestIVFInsertionStorage, route_reuse_rejects_changed_geometry_ids_and_inc
     ASSERT_FALSE(input.reuse_sources_.empty());
     auto *source = input.reuse_sources_.at(0);
     ASSERT_NE(nullptr, source); ASSERT_TRUE(source->has_prior_view());
-    ObArray<float> leaves;
+    share::ObVectorMatrix leaves;
     for (int64_t i = 0; i < data_.k_ * DIM; ++i) {
       ASSERT_EQ(OB_SUCCESS, leaves.push_back(input.prior_.centroids_.at(source->centroid_begin_ * DIM + i)));
     }
@@ -9156,8 +9165,9 @@ TEST_F(TestIVFInsertionStorage, overlapping_source_certificates_are_rejected_bef
 
 TEST_F(TestIVFSSTable, reuse_source_views_do_not_cross_into_adjacent_sources)
 {
-  ObArray<float> coordinates;
+  share::ObVectorMatrix coordinates;
   ObArray<int64_t> ids, counts;
+  ASSERT_EQ(OB_SUCCESS, coordinates.set_dimension(2));
   for (const float value : {10.F, 11.F, 20.F, 21.F, 30.F, 31.F}) { ASSERT_EQ(OB_SUCCESS, coordinates.push_back(value)); }
   for (const int64_t value : {100, 200, 300}) { ASSERT_EQ(OB_SUCCESS, ids.push_back(value)); ASSERT_EQ(OB_SUCCESS, counts.push_back(value / 10)); }
   ObIVFBlockReuseSource source(allocator_);
@@ -9371,8 +9381,8 @@ TEST_F(TestIVFInsertionStorage, raw_entry_failure_aborts_without_closing_a_draft
       bool is_valid() const override { return source_.is_valid(); }
       int64_t get_dimension() const override { return source_.get_dimension(); }
       int64_t get_vector_count() const override { return source_.get_vector_count(); }
-      int get_all_vids(ObIArray<ObIVFVectorVID> &v) const override { return source_.get_all_vids(v); }
-      int batch_get_by_vid(const ObIArray<ObIVFVectorVID> &v, int64_t begin, int64_t end, ObIArray<float> &out) const override {
+      int get_all_vids(share::ObVectorArray<ObIVFVectorVID> &v) const override { return source_.get_all_vids(v); }
+      int batch_get_by_vid(const ObIVFVectorIDView &v, int64_t begin, int64_t end, share::ObVectorMatrix &out) const override {
         if (begin >= 8192) { failed_ = true; return error_; }
         return source_.batch_get_by_vid(v, begin, end, out);
       }
@@ -9380,7 +9390,7 @@ TEST_F(TestIVFInsertionStorage, raw_entry_failure_aborts_without_closing_a_draft
     } failing(input, failure);
     ObIVFVectorReader reader;
     ASSERT_EQ(OB_SUCCESS, reader.init(failing));
-    ObArray<ObIVFVectorVID> vids;
+    share::ObVectorArray<ObIVFVectorVID> vids;
     ASSERT_EQ(OB_SUCCESS, input.get_all_vids(vids));
     ObMacroSeqWindow window;
     ASSERT_EQ(OB_SUCCESS, ObVersionLocalMacroSeq::build_window(0, window));
@@ -9669,18 +9679,20 @@ TEST_F(TestIVFInsertionStorage, single_slice_capture_transfers_locator_ownership
   ASSERT_EQ(OB_SUCCESS, capture.init(ctx, input, false));
   ASSERT_EQ(1, capture.get_task_count());
   ASSERT_EQ(OB_SUCCESS, capture.scan(0));
-  const auto *buffer = capture.slices_.at(0)->locators_.begin();
+  ASSERT_FALSE(capture.slices_.at(0)->locators_.empty());
+  const auto *buffer = &capture.slices_.at(0)->locators_.at(0);
   const int64_t hold = input.locator_allocator_.used();
   ASSERT_NE(nullptr, buffer);
   ASSERT_EQ(OB_SUCCESS, capture.finish());
-  EXPECT_EQ(buffer, input.locators_.begin());
+  ASSERT_FALSE(input.locators_.empty());
+  EXPECT_EQ(buffer, &input.locators_.at(0));
   EXPECT_EQ(hold, input.locator_allocator_.used());
   EXPECT_EQ(0, capture.get_task_count());
-  ObArray<ObIVFVectorVID> vids;
+  share::ObVectorArray<ObIVFVectorVID> vids;
   ASSERT_EQ(OB_SUCCESS, input.get_all_vids(vids));
   ASSERT_EQ(data_.n_ + data_.delta_, vids.count());
   for (int64_t i = 1; i < vids.count(); ++i) { EXPECT_LT(vids.at(i - 1), vids.at(i)); }
-  ObArray<float> values;
+  share::ObVectorMatrix values;
   ASSERT_EQ(OB_SUCCESS, input.batch_get_by_vid(vids, 0, 8, values));
   ASSERT_EQ(8 * DIM, values.count());
   float expected[DIM];
@@ -9712,17 +9724,18 @@ TEST(IVFSourceLocators, transfer_growth_failure_and_large_row_ids)
   ASSERT_EQ(OB_SUCCESS, source.reserve(1));
   ASSERT_EQ(OB_SUCCESS, source.push_back(ObAsyncIVFSourceLocator(UINT64_MAX, INT32_MAX,
       INT32_MAX, 10000000000L)));
-  const auto *original = source.begin();
+  const auto *original = &source.at(0);
   allocator.fail_ = true;
   EXPECT_EQ(OB_ALLOCATE_MEMORY_FAILED, source.push_back(source.at(0)));
-  EXPECT_EQ(original, source.begin());
-  EXPECT_EQ(1, source.count());
+  ASSERT_EQ(1, source.count());
+  EXPECT_EQ(original, &source.at(0));
   EXPECT_EQ(OB_SIZE_OVERFLOW, source.reserve(INT64_MAX));
   EXPECT_EQ(OB_INVALID_ARGUMENT, other.take_over(source));
   ASSERT_EQ(OB_SUCCESS, target.take_over(source));
   EXPECT_TRUE(source.empty());
-  EXPECT_EQ(original, target.begin());
-  EXPECT_EQ(target.get_data_size(), memory_context.mem_monitor_.get_hold_mem());
+  ASSERT_EQ(1, target.count());
+  EXPECT_EQ(original, &target.at(0));
+  EXPECT_EQ(allocator.memory_.used(), memory_context.mem_monitor_.get_hold_mem());
   EXPECT_EQ(UINT64_MAX, target.at(0).vid_);
   EXPECT_EQ(10000000000L, target.at(0).row_id_);
   source.reset();
@@ -9755,14 +9768,14 @@ TEST_F(TestIVFInsertionStorage, lazy_raw_batches_preserve_order_and_release_scra
   ASSERT_EQ(OB_SUCCESS, capture.init(ctx, input, false));
   ASSERT_EQ(OB_SUCCESS, capture.scan(0));
   ASSERT_EQ(OB_SUCCESS, capture.finish());
-  ObArray<ObAsyncIVFSourceLocator> requests;
+  share::ObVectorArray<ObAsyncIVFSourceLocator> requests;
   // Reverse order crosses both the 256-row batch and source-table boundaries.
   for (int64_t i = input.locators_.count() - 1; i >= 0; --i) {
     ASSERT_EQ(OB_SUCCESS, requests.push_back(input.locators_.at(i)));
   }
   ASSERT_EQ(OB_SUCCESS, requests.push_back(requests.at(0))); // Repeated VID.
-  ObArray<float> vectors;
-  ASSERT_EQ(OB_SUCCESS, vectors.prepare_allocate(requests.count() * DIM));
+  share::ObVectorMatrix vectors;
+  ASSERT_EQ(OB_SUCCESS, vectors.resize(requests.count() * DIM));
 #ifndef OB_USE_ASAN
   const int64_t scratch_before = get_tenant_label_used("IVFLazyRead");
   ASSERT_GE(scratch_before, 0);
@@ -10300,14 +10313,14 @@ public:
   int64_t get_dimension() const override { return DIM; }
   static float value(int64_t row, int64_t dim)
   { return static_cast<float>((row * 137 + dim * 71) % 997) / 997.0F; }
-  int get_all_vids(ObIArray<ObIVFVectorVID> &vids) const override
+  int get_all_vids(share::ObVectorArray<ObIVFVectorVID> &vids) const override
   {
     int ret = OB_SUCCESS;
     for (int64_t i = 0; OB_SUCC(ret) && i < ROWS; ++i) { ret = vids.push_back(i); }
     return ret;
   }
-  int batch_get_by_vid(const ObIArray<ObIVFVectorVID> &vids, int64_t begin, int64_t end,
-      ObIArray<float> &values) const override
+  int batch_get_by_vid(const ObIVFVectorIDView &vids, int64_t begin, int64_t end,
+      share::ObVectorMatrix &values) const override
   {
     int ret = OB_SUCCESS;
     values.reuse();
@@ -10322,9 +10335,9 @@ public:
 TEST_F(TestRADatumStoreReader, refinement_shared_budget_spill_matches_resident_training)
 {
   RefineSpillStore source;
-  ObArray<ObIVFVectorVID> vids;
-  ObArray<float> centers, expected;
-  ObArray<int64_t> assignments;
+  share::ObVectorArray<ObIVFVectorVID> vids;
+  share::ObVectorMatrix centers, expected;
+  share::ObVectorArray<int64_t> assignments;
   ASSERT_EQ(OB_SUCCESS, source.get_all_vids(vids));
   for (int64_t cid = 0; cid < source.CENTERS; ++cid) {
     for (int64_t d = 0; d < source.DIM; ++d) {
@@ -10364,7 +10377,7 @@ TEST_F(TestRADatumStoreReader, refinement_shared_budget_spill_matches_resident_t
         int ret = OB_SUCCESS;
         for (int64_t offset = begin; OB_SUCC(ret) && offset < end; offset += 97) {
           ObArray<int64_t> positions;
-          ObArray<float> values;
+          share::ObVectorMatrix values;
           for (int64_t i = offset; OB_SUCC(ret) && i < MIN(end, offset + 97); ++i) {
             // Source order deliberately reverses the trainer's vector order.
             const int64_t pos = samples.count() - 1 - i;
@@ -10435,7 +10448,7 @@ TEST_F(TestRADatumStoreReader, refinement_shared_budget_spill_matches_resident_t
         THIS_WORKER.set_timeout_ts(INT64_MAX);
         EXPECT_EQ(OB_TIMEOUT, read_ret);
       }
-      ObArray<float> actual;
+      share::ObVectorMatrix actual;
       bool finished = false;
       int batches = 0;
       for (; !finished && batches < 40; ++batches) {
@@ -10496,8 +10509,9 @@ TEST_F(TestRADatumStoreReader, refinement_batch_layout_survives_external_sort)
   const int64_t n = 8193, k = 64, dim = 2048;
   ObArray<int64_t> initial_fds, final_fds;
   ASSERT_EQ(OB_SUCCESS, FILE_MANAGER_INSTANCE_WITH_MTL_SWITCH.get_tmp_file_fds(MTL_ID(), initial_fds));
-  ObArray<float> centers, values;
-  ObArray<int64_t> assignments, positions;
+  share::ObVectorMatrix centers, values;
+  ObArray<int64_t> positions;
+  share::ObVectorArray<int64_t> assignments;
   ObIVFHcaAlgorithmParam param;
   param.refine_param_.samples_per_cluster_ = 128;
   param.refine_param_.max_iterations_ = 3;
@@ -10548,8 +10562,8 @@ TEST_F(TestRADatumStoreReader, refinement_batch_layout_survives_external_sort)
 TEST_F(TestRADatumStoreReader, refinement_spill_cancel_releases_partial_shards)
 {
   RefineSpillStore source;
-  ObArray<float> centers;
-  ObArray<int64_t> assignments;
+  share::ObVectorMatrix centers;
+  share::ObVectorArray<int64_t> assignments;
   for (int64_t i = 0; i < source.ROWS; ++i) { ASSERT_EQ(OB_SUCCESS, assignments.push_back(i % 2)); }
   for (int64_t cid = 0; cid < 2; ++cid) {
     for (int64_t d = 0; d < source.DIM; ++d) { ASSERT_EQ(OB_SUCCESS, centers.push_back(source.value(cid, d))); }
@@ -10562,7 +10576,7 @@ TEST_F(TestRADatumStoreReader, refinement_spill_cancel_releases_partial_shards)
   ASSERT_EQ(OB_SUCCESS, algorithm.begin_refine_sample_shard(0));
   const auto &samples = *algorithm.refine_sample_indices();
   ObArray<int64_t> positions;
-  ObArray<float> values;
+  share::ObVectorMatrix values;
   for (int64_t i = 0; i < samples.count() / 2; ++i) {
     ASSERT_EQ(OB_SUCCESS, positions.push_back(i));
     for (int64_t d = 0; d < source.DIM; ++d) {
@@ -10601,7 +10615,7 @@ TEST_F(TestRADatumStoreReader, ddl_resident_source_and_mixed_spill_preserve_batc
       ASSERT_NE(nullptr, slice);
       ASSERT_EQ(OB_SUCCESS, tablet.ivf_ctx_->register_slice(slice));
       const int64_t limit = spill_second_slice && slice_idx == 1 ? 1 : 64L << 20;
-      ASSERT_EQ(OB_SUCCESS, slice->replay_.init(MTL_ID(), dim, limit, 8, 123, slice_idx, true));
+      ASSERT_EQ(OB_SUCCESS, slice->replay_.init(MTL_ID(), dim, limit, 8, 123, slice_idx));
       for (int64_t row = 0; row < rows_per_slice; ++row) {
         const int64_t rank = ((slice_idx * rows_per_slice + row) * 37) % total_rows;
         const float values[] = {float(rank), float(rank) + 0.25F, -float(rank), 1.0F};
@@ -10612,7 +10626,7 @@ TEST_F(TestRADatumStoreReader, ddl_resident_source_and_mixed_spill_preserve_batc
     {
       ObIVFDDLInput unsealed(allocator);
       EXPECT_FALSE(unsealed.is_fully_memory_resident());
-      EXPECT_EQ(OB_STATE_NOT_MATCH, unsealed.init(tablet, 64, VIDA_L2));
+      EXPECT_EQ(OB_STATE_NOT_MATCH, unsealed.init(tablet, 64, VIDA_L2, 1));
       EXPECT_FALSE(unsealed.is_fully_memory_resident());
     }
     for (int64_t i = 0; i < 2; ++i) {
@@ -10627,7 +10641,7 @@ TEST_F(TestRADatumStoreReader, ddl_resident_source_and_mixed_spill_preserve_batc
       }
     }
     ObIVFDDLInput input(allocator);
-    ASSERT_EQ(OB_SUCCESS, input.init(tablet, 64, VIDA_L2));
+    ASSERT_EQ(OB_SUCCESS, input.init(tablet, 64, VIDA_L2, 1));
     ASSERT_TRUE(input.is_valid());
     EXPECT_EQ(!spill_second_slice, input.is_fully_memory_resident());
     input.release_capture_metadata();
@@ -10639,7 +10653,7 @@ TEST_F(TestRADatumStoreReader, ddl_resident_source_and_mixed_spill_preserve_batc
     // The merged references own their candidate metadata; retiring the
     // per-slice heaps must not invalidate first-level sample reads.
     ObArray<ObIVFVectorVID> sample_vids;
-    ObArray<float> sample_values;
+    share::ObVectorMatrix sample_values;
     ASSERT_GT(input.get_sample_count(), 0);
     ASSERT_GT(input.sample_allocator_.total(), 0);
     ASSERT_EQ(OB_SUCCESS, input.batch_get_samples(
@@ -10650,23 +10664,22 @@ TEST_F(TestRADatumStoreReader, ddl_resident_source_and_mixed_spill_preserve_batc
     EXPECT_EQ(0, input.get_sample_count());
     EXPECT_TRUE(input.is_valid());
     EXPECT_EQ(OB_STATE_NOT_MATCH, input.batch_get_samples(0, 1, sample_vids, sample_values));
-    ObArray<ObIVFVectorVID> vids;
-    ASSERT_EQ(OB_SUCCESS, input.get_all_vids(vids));
-    ASSERT_EQ(total_rows, vids.count());
-    for (int64_t i = 0; i < total_rows; ++i) { EXPECT_EQ(vid_of(i), vids.at(i)); }
+    share::ObVectorArray<ObIVFVectorVID> vids;
+    EXPECT_EQ(OB_NOT_SUPPORTED, input.get_all_vids(vids));
+    EXPECT_EQ(total_rows, input.get_vector_count());
     // Training may revisit one VID in a wrapped batch. Read in an order that
     // crosses slice boundaries and differs from both source and VID order.
     ObArray<ObIVFVectorVID> selected;
     const int64_t ranks[] = {129, 0, 17, 129, 65, 1};
-    for (const int64_t rank : ranks) { ASSERT_EQ(OB_SUCCESS, selected.push_back(vid_of(rank))); }
-    ObArray<float> values;
+    for (const int64_t rank : ranks) { ASSERT_EQ(OB_SUCCESS, selected.push_back(rank)); }
+    share::ObVectorMatrix values;
     for (int repeat = 0; repeat < 2; ++repeat) {
       ASSERT_EQ(OB_SUCCESS, input.batch_get_by_vid(selected, 0, selected.count(), values));
       ASSERT_EQ(selected.count() * dim, values.count());
       for (int64_t i = 0; i < selected.count(); ++i) {
-        EXPECT_FLOAT_EQ(float(ranks[i]), values.at(i * dim));
-        EXPECT_FLOAT_EQ(float(ranks[i]) + 0.25F, values.at(i * dim + 1));
-        EXPECT_FLOAT_EQ(-float(ranks[i]), values.at(i * dim + 2));
+        EXPECT_FLOAT_EQ(float(ranks[i] * 37 % total_rows), values.at(i * dim));
+        EXPECT_FLOAT_EQ(float(ranks[i] * 37 % total_rows) + 0.25F, values.at(i * dim + 1));
+        EXPECT_FLOAT_EQ(-float(ranks[i] * 37 % total_rows), values.at(i * dim + 2));
       }
       EXPECT_EQ(!spill_second_slice, input.is_fully_memory_resident());
     }
@@ -10705,7 +10718,7 @@ TEST_F(TestRADatumStoreReader, merge_samples_survive_fallback_and_release_before
       ASSERT_GT(input.sample_locator_allocator_.total(), 0);
       ASSERT_EQ(256, input.get_sample_count());
       ObArray<ObIVFVectorVID> sample_vids;
-      ObArray<float> values;
+      share::ObVectorMatrix values;
       ASSERT_EQ(OB_SUCCESS, input.batch_get_samples(0, 16, sample_vids, values));
 
       // Exercise the production retirement policy without transferring input
@@ -10752,7 +10765,7 @@ TEST_F(TestRADatumStoreReader, merge_samples_survive_fallback_and_release_before
       EXPECT_FLOAT_EQ(511.5F, values.at(1));
       EXPECT_FLOAT_EQ(0.0F, values.at(2));
       EXPECT_EQ(!spill, input.is_fully_memory_resident());
-      ObArray<int64_t> indexes;
+      share::ObVectorArray<int64_t> indexes;
       ASSERT_EQ(OB_SUCCESS, indexes.push_back(0));
       ASSERT_EQ(OB_SUCCESS, indexes.push_back(511));
       ASSERT_EQ(OB_SUCCESS, input.batch_get_by_source(indexes, values));
@@ -10767,7 +10780,7 @@ TEST_F(TestRADatumStoreReader, replay_sampling_metadata_releases_without_payload
   for (bool spill : {false, true}) {
     ObArenaAllocator allocator("IVFSampleUT");
     ObIVFReplayInput replay(allocator);
-    ASSERT_EQ(OB_SUCCESS, replay.init(MTL_ID(), 2, spill ? 1 : 64L << 20, 256, 123, 0, true));
+    ASSERT_EQ(OB_SUCCESS, replay.init(MTL_ID(), 2, spill ? 1 : 64L << 20, 256, 123, 0));
     for (int64_t row = 0; row < 512; ++row) {
       const float values[] = {float(row), float(row) + 0.5F};
       ASSERT_EQ(OB_SUCCESS, replay.add_row(row,
@@ -10782,8 +10795,6 @@ TEST_F(TestRADatumStoreReader, replay_sampling_metadata_releases_without_payload
     EXPECT_EQ(0, replay.sample_allocator_.total());
     EXPECT_EQ(512, replay.get_row_count());
     uint64_t vid = 0;
-    ASSERT_EQ(OB_SUCCESS, replay.get_captured_vid(511, vid));
-    EXPECT_EQ(511, vid);
     const float *values = nullptr;
     ASSERT_EQ(OB_SUCCESS, replay.get_row_at(511, vid, values));
     ASSERT_NE(nullptr, values);
@@ -10890,7 +10901,7 @@ TEST_F(TestRADatumStoreReader, completed_ddl_tablet_releases_input_and_quota_bef
     ASSERT_NE(nullptr, slice);
     ASSERT_EQ(OB_SUCCESS, ivf.register_slice(slice));
     ASSERT_EQ(OB_SUCCESS, slice->replay_.init(MTL_ID(), 2, mode == 1 ? 1 : 64L << 20,
-        16, 123, 0, true));
+        16, 123, 0));
     for (int64_t row = 0; row < (mode == 2 ? 0 : 128); ++row) {
       const float values[] = {float(row), float(row) + 0.25F};
       ASSERT_EQ(OB_SUCCESS, slice->replay_.add_row(row,
@@ -10905,7 +10916,7 @@ TEST_F(TestRADatumStoreReader, completed_ddl_tablet_releases_input_and_quota_bef
     void *memory = ctx.runtime_allocator_.alloc(sizeof(ObIVFDDLInput));
     ASSERT_NE(nullptr, memory);
     ctx.input_adapter_ = new (memory) ObIVFDDLInput(ctx.runtime_allocator_);
-    ASSERT_EQ(OB_SUCCESS, ctx.input_adapter_->init(*tablet, 64, VIDA_L2));
+    ASSERT_EQ(OB_SUCCESS, ctx.input_adapter_->init(*tablet, 64, VIDA_L2, 1));
     ctx.runtime_initialized_ = true;
     ctx.input_adapter_->release_capture_metadata();
     // Cancellation/incomplete publication must not free borrowed inputs.
@@ -11021,7 +11032,7 @@ TEST_F(TestRADatumStoreReader, capture_memory_chunk_owns_payload_filters_rows_an
   quantization::ObFhtKacRotator rotator;
   ASSERT_EQ(OB_SUCCESS, quantization::ObFhtKacRotator::generate(allocator, dim, rotator));
   ObIVFSliceInput input(0);
-  ASSERT_EQ(OB_SUCCESS, input.replay_.init(MTL_ID(), dim, 1L << 20, 4, 123, 0, true));
+  ASSERT_EQ(OB_SUCCESS, input.replay_.init(MTL_ID(), dim, 1L << 20, 4, 123, 0));
   ObIVFCaptureOperator capture(nullptr);
   configure_ivf_capture_for_chunk_test(capture, input, rotator, dim);
   float original[2][dim];
@@ -11124,7 +11135,7 @@ TEST_F(TestRADatumStoreReader, synchronous_capture_consumes_selected_rows_and_ow
   ASSERT_EQ(OB_SUCCESS, quantization::ObFhtKacRotator::generate(allocator, dim, rotator));
   for (const int64_t budget : {ObIVFReplayInput::NO_CACHE_MEMORY_LIMIT, 1L << 20}) {
     ObIVFSliceInput input(0);
-    ASSERT_EQ(OB_SUCCESS, input.replay_.init(MTL_ID(), dim, budget, 4, 123, 0, true));
+    ASSERT_EQ(OB_SUCCESS, input.replay_.init(MTL_ID(), dim, budget, 4, 123, 0));
     ObIVFCaptureOperator capture(nullptr);
     configure_ivf_capture_for_chunk_test(capture, input, rotator, dim);
     capture.is_cosine_ = true;
@@ -11179,35 +11190,13 @@ TEST_F(TestRADatumStoreReader, synchronous_capture_requires_initialized_state)
   EXPECT_EQ(OB_NOT_INIT, capture.seal());
 }
 
-TEST_F(TestRADatumStoreReader, replay_incomplete_captured_vids_reject_append_and_seal)
-{
-  ObArenaAllocator allocator("ReplayVidUT");
-  ObIVFReplayInput replay(allocator);
-  const float input[] = {1.0F, 2.0F};
-  const ObString bytes(sizeof(input), reinterpret_cast<const char *>(input));
-  ASSERT_EQ(OB_SUCCESS, replay.init(MTL_ID(), 2, 1L << 20, 4, 123, 0, true));
-  ASSERT_EQ(OB_SUCCESS, replay.add_row(17, bytes));
-  ASSERT_EQ(1, replay.get_row_count());
-  ASSERT_EQ(1, replay.get_sample_scan_count());
-  // Simulate an append that persisted its payload but could not retain its VID.
-  // No later append or seal may publish an incomplete locator input.
-  replay.captured_vids_.reuse();
-  EXPECT_EQ(OB_STATE_NOT_MATCH, replay.add_row(23, bytes));
-  EXPECT_EQ(1, replay.get_row_count());
-  EXPECT_EQ(1, replay.get_sample_scan_count());
-  EXPECT_NE(OB_SUCCESS, replay.seal());
-  EXPECT_FALSE(replay.is_sealed());
-  uint64_t vid = 0;
-  EXPECT_EQ(OB_STATE_NOT_MATCH, replay.get_captured_vid(0, vid));
-}
-
 TEST_F(TestRADatumStoreReader, compact_sample_ranges_memory_and_spill)
 {
   for (const int64_t budget : {1L, 64L * 1024 * 1024}) {
     ObArenaAllocator allocator("ClusterSampleUT");
     ObIVFReplayInput replay(allocator);
     ASSERT_EQ(OB_SUCCESS, replay.init(MTL_ID(), 3, budget));
-    ObArray<int64_t> ids; ObArray<float> values;
+    ObArray<int64_t> ids; share::ObVectorMatrix values;
     EXPECT_EQ(OB_STATE_NOT_MATCH, replay.copy_row_range(0, 1, ids, values));
     for (int64_t i = 0; i < 10001; ++i) {
       float payload[3] = {float(i), float(i + 1), float(i + 2)};
@@ -11223,7 +11212,7 @@ TEST_F(TestRADatumStoreReader, compact_sample_ranges_memory_and_spill)
     for (int64_t worker = 0; worker < 4; ++worker) {
       workers.emplace_back([&, worker]() {
         ObTenantEnv::set_tenant(tenant); THIS_WORKER.set_timeout_ts(INT64_MAX);
-        ObArray<int64_t> ids; ObArray<float> values;
+        ObArray<int64_t> ids; share::ObVectorMatrix values;
         const int64_t begin = worker * 2000, end = begin + 2500;
         int ret = replay.copy_row_range(begin, end, ids, values);
         if (ret != OB_SUCCESS || ids.count() != end - begin || values.count() != 3 * ids.count()) {
@@ -11254,7 +11243,7 @@ TEST_F(TestRADatumStoreReader, replay_batches_read_spilled_rows_concurrently)
   ObArenaAllocator allocator("RAReplayUT");
   ObIVFReplayInput replay(allocator);
   ASSERT_EQ(OB_SUCCESS, replay.init(MTL_ID(), dim,
-      ObIVFReplayInput::NO_CACHE_MEMORY_LIMIT, 16, 123, 7, true));
+      ObIVFReplayInput::NO_CACHE_MEMORY_LIMIT, 16, 123, 7));
   float input[dim];
   for (int64_t row_id = 0; row_id < row_count; ++row_id) {
     for (int64_t d = 0; d < dim; ++d) {
@@ -11269,25 +11258,11 @@ TEST_F(TestRADatumStoreReader, replay_batches_read_spilled_rows_concurrently)
   const int64_t baseline = replay.get_mem_hold();
   ASSERT_FALSE(replay.reader_.buf_.is_inited());
   ASSERT_FALSE(replay.reader_.idx_buf_.is_inited());
-  for (int64_t row_id = row_count - 1; row_id >= 0; --row_id) {
-    uint64_t vid = 0;
-    ASSERT_EQ(OB_SUCCESS, replay.get_captured_vid(row_id, vid));
-    EXPECT_EQ(first_vid + (row_id * 37) % row_count, vid);
-  }
-  // Enumerating VIDs must not load either RA data blocks or index blocks.
-  EXPECT_FALSE(replay.reader_.buf_.is_inited());
-  EXPECT_FALSE(replay.reader_.idx_buf_.is_inited());
-  EXPECT_EQ(baseline, replay.get_mem_hold());
-  replay.release_captured_vids();
-  EXPECT_EQ(0, replay.captured_vids_.count());
-  EXPECT_EQ(0, replay.captured_vids_.get_capacity());
-  uint64_t captured_vid = 0;
-  EXPECT_EQ(OB_STATE_NOT_MATCH, replay.get_captured_vid(0, captured_vid));
   const ObIArray<ObIVFSampleCandidate> &samples = replay.get_sample_candidates();
   ASSERT_EQ(16, samples.count());
   ObSEArray<ObIVFReplayReadRequest, 16> sample_requests;
-  ObSEArray<float, 16> sample_vectors;
-  ASSERT_EQ(OB_SUCCESS, sample_vectors.prepare_allocate(samples.count() * dim));
+  share::ObVectorMatrix sample_vectors;
+  ASSERT_EQ(OB_SUCCESS, sample_vectors.resize(samples.count() * dim));
   for (int64_t i = 0; i < samples.count(); ++i) {
     ASSERT_EQ(OB_SUCCESS, sample_requests.push_back(ObIVFReplayReadRequest(
         samples.at(i).row_id_, samples.at(i).vid_, i)));
@@ -11314,8 +11289,8 @@ TEST_F(TestRADatumStoreReader, replay_batches_read_spilled_rows_concurrently)
       }
       for (int64_t round = 0; round < 64 && 0 == failures.load(); ++round) {
         ObSEArray<ObIVFReplayReadRequest, batch_count> requests;
-        ObSEArray<float, 16> vectors;
-        int ret = vectors.prepare_allocate(batch_count * dim);
+        share::ObVectorMatrix vectors;
+        int ret = vectors.resize(batch_count * dim);
         for (int64_t i = 0; OB_SUCCESS == ret && i < batch_count; ++i) {
           const int64_t row_id = 0 == i % 4 ? 0 :
               (worker_id * 31 + round * 97 + i * 113) % row_count;
@@ -11347,6 +11322,246 @@ TEST_F(TestRADatumStoreReader, replay_batches_read_spilled_rows_concurrently)
   }
   EXPECT_EQ(0, failures.load());
   EXPECT_EQ(baseline, replay.get_mem_hold());
+}
+
+TEST_F(TestRADatumStoreReader, posid_replay_reads_and_raw_order_without_vid_mapping)
+{
+  const int64_t dim = 4;
+  const int64_t n = 130;
+  for (const bool sorted : {true, false}) {
+    SCOPED_TRACE(sorted);
+    ObArenaAllocator allocator("PosIDUT");
+    ObDDLTabletContext tablet;
+    tablet.ivf_ctx_ = OB_NEW(ObIVFTabletContext, "PosIDUT");
+    ASSERT_NE(nullptr, tablet.ivf_ctx_);
+    ASSERT_EQ(OB_SUCCESS, tablet.ivf_ctx_->init_rotator(allocator, dim));
+    for (int64_t slice_idx = 0; slice_idx < 3; ++slice_idx) {
+      auto *slice = OB_NEW(ObIVFSliceInput, "IVFSlice", slice_idx);
+      ASSERT_NE(nullptr, slice);
+      ASSERT_EQ(OB_SUCCESS, tablet.ivf_ctx_->register_slice(slice));
+      ASSERT_EQ(OB_SUCCESS, slice->replay_.init(MTL_ID(), dim, 1, 8, 123, slice_idx));
+      for (int64_t row = 0; row < (slice_idx == 1 ? 0 : n / 2); ++row) {
+        const int64_t position = (slice_idx == 2 ? n / 2 : 0) + row;
+        const int64_t rank = sorted ? position : position * 37 % n;
+        const float values[] = {float(rank), float(rank) + .25F, -float(rank), 1};
+        ASSERT_EQ(OB_SUCCESS, slice->replay_.add_row((1ULL << 48) + rank * 3,
+            ObString(sizeof(values), reinterpret_cast<const char *>(values))));
+      }
+      ASSERT_EQ(OB_SUCCESS, slice->replay_.seal());
+    }
+    ObIVFDDLInput input(allocator);
+    ASSERT_EQ(OB_SUCCESS, input.init(tablet, 64, VIDA_L2, 8));
+    EXPECT_TRUE(input.uses_position_ids());
+    EXPECT_EQ(n, input.get_vector_count());
+    EXPECT_EQ(sorted, input.vids_ordered_);
+    if (sorted) {
+      EXPECT_EQ(nullptr, input.raw_keys_);
+    } else {
+      ASSERT_NE(nullptr, input.raw_keys_);
+      EXPECT_EQ(8, input.raw_keys_->shards_.count());
+    }
+    common::ObArray<ObIVFVectorVID> actual_vids;
+    share::ObVectorMatrix values;
+    share::ObVectorArray<int64_t> positions;
+    // Repeated and cross-slice requests must preserve caller order.
+    for (const int64_t position : {129, 0, 65, 129, 17}) {
+      ASSERT_EQ(OB_SUCCESS, positions.push_back(position));
+    }
+    ASSERT_EQ(OB_SUCCESS, input.batch_get_output_by_source(positions, values, actual_vids));
+    for (int64_t i = 0; i < positions.count(); ++i) {
+      const int64_t rank = sorted ? positions.at(i) : positions.at(i) * 37 % n;
+      EXPECT_EQ((1ULL << 48) + rank * 3, actual_vids.at(i));
+      EXPECT_FLOAT_EQ(float(rank), values.at(i * dim));
+    }
+    ObArray<ObIVFVectorVID> sample_ids;
+    ASSERT_EQ(OB_SUCCESS, input.batch_get_samples(0, input.get_sample_count(), sample_ids, values));
+    for (int64_t i = 0; i < sample_ids.count(); ++i) {
+      const int64_t rank = sorted ? sample_ids.at(i) : sample_ids.at(i) * 37 % n;
+      EXPECT_FLOAT_EQ(float(rank), values.at(i * dim));
+    }
+    for (int64_t begin = 0; begin < n; begin += 17) {
+      positions.reuse();
+      for (int64_t i = begin; i < MIN(n, begin + 17); ++i) {
+        ASSERT_EQ(OB_SUCCESS, positions.push_back(i));
+      }
+      ASSERT_EQ(OB_SUCCESS, input.batch_get_output_by_source(positions, values, actual_vids));
+      ASSERT_EQ(OB_SUCCESS, input.collect_raw_output_keys(positions, actual_vids));
+    }
+    ASSERT_EQ(OB_SUCCESS, input.prepare_raw_output());
+    const auto ids = ObIVFVectorIDView::identity(n);
+    for (int64_t begin = 0; begin < n; begin += 17) {
+      const int64_t end = MIN(n, begin + 17);
+      ASSERT_EQ(OB_SUCCESS, input.batch_get_output(ids, begin, end, values, actual_vids));
+      for (int64_t i = 0; i < actual_vids.count(); ++i) {
+        EXPECT_EQ((1ULL << 48) + (begin + i) * 3, actual_vids.at(i));
+        EXPECT_FLOAT_EQ(float(begin + i), values.at(i * dim));
+      }
+    }
+  }
+}
+
+TEST(TestIVFPositionIDs, implicit_range_and_member_alias_do_not_allocate_vids)
+{
+  ObIVFVectorIDs ids;
+  ids.set_identity(10000000000L);
+  EXPECT_EQ(10000000000L, ids.count());
+  EXPECT_EQ(9999999999ULL, ids.at(9999999999L));
+  EXPECT_EQ(0, ids.allocated_vid_bytes());
+  share::ObVectorArray<int64_t> positions;
+  ObArenaAllocator allocator("PosIDUT");
+  ObIVFVectorIDs members(share::vector_array_allocator(allocator));
+  members.alias_positions(positions);
+  ASSERT_EQ(OB_SUCCESS, members.reserve(1000));
+  ASSERT_EQ(OB_SUCCESS, positions.push_back(7));
+  ASSERT_EQ(OB_SUCCESS, positions.push_back(11));
+  EXPECT_EQ(2, members.count());
+  EXPECT_EQ(11, members.at(1));
+  EXPECT_EQ(0, members.allocated_vid_bytes());
+  EXPECT_EQ(OB_STATE_NOT_MATCH, members.push_back(100));
+  EXPECT_TRUE(members.aliases_positions());
+  EXPECT_EQ(2, members.count());
+  EXPECT_EQ(0, members.allocated_vid_bytes());
+}
+
+TEST_F(TestRADatumStoreReader, posid_raw_key_blocked_append_does_not_block_other_shards)
+{
+  class BlockingAllocator final : public ObIAllocator
+  {
+  public:
+    void *alloc(int64_t size) override
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      entered_ = true;
+      condition_.notify_all();
+      condition_.wait(lock, [&] { return released_; });
+      return memory_.alloc(size);
+    }
+    void *alloc(int64_t size, const ObMemAttr &) override { return alloc(size); }
+    void free(void *ptr) override { memory_.free(ptr); }
+    bool wait_until_entered()
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      return condition_.wait_for(lock, std::chrono::seconds(5), [&] { return entered_; });
+    }
+    void release()
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      released_ = true;
+      condition_.notify_all();
+    }
+    ObIVFMergeRuntimeAllocator memory_;
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    bool entered_ = false, released_ = false;
+  } allocator;
+  ObIVFRawKeyStore keys;
+  ASSERT_EQ(OB_SUCCESS, keys.init(MTL_ID(), 2));
+  ModulePageAllocator pages(allocator);
+  ASSERT_EQ(OB_SUCCESS, keys.shards_.at(0)->sorter_.memory_sort_round_.allocator_.get_arena().init(
+      OB_MALLOC_BIG_BLOCK_SIZE, pages));
+  ObTenantBase *tenant = ObTenantEnv::get_tenant();
+  int first_ret = OB_SUCCESS, second_ret = OB_SUCCESS, seal_ret = OB_SUCCESS;
+  auto append_one = [&](int64_t pos, uint64_t vid) {
+    ObTenantEnv::set_tenant(tenant);
+    THIS_WORKER.set_timeout_ts(INT64_MAX);
+    share::ObVectorArray<int64_t> positions;
+    ObArray<uint64_t> vids;
+    int ret = positions.push_back(pos);
+    if (OB_SUCC(ret)) { ret = vids.push_back(vid); }
+    return OB_SUCCESS == ret ? keys.append(positions, vids) : ret;
+  };
+  std::thread first([&] { first_ret = append_one(1, 20); });
+  const bool entered = allocator.wait_until_entered();
+  std::promise<void> done;
+  auto future = done.get_future();
+  std::thread second([&] {
+    ObTenantEnv::set_tenant(tenant);
+    seal_ret = keys.seal(0); // Must reject the active lease without waiting for add_item.
+    second_ret = append_one(0, 10);
+    done.set_value();
+  });
+  const bool progressed = future.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+  allocator.release(); // Always unblock and join, including a regression failure.
+  first.join(); second.join();
+  ASSERT_TRUE(entered);
+  EXPECT_TRUE(progressed);
+  EXPECT_EQ(OB_STATE_NOT_MATCH, seal_ret);
+  ASSERT_EQ(OB_SUCCESS, first_ret);
+  ASSERT_EQ(OB_SUCCESS, second_ret);
+  ASSERT_EQ(OB_SUCCESS, keys.seal(2));
+  ObArray<uint64_t> positions, vids;
+  ASSERT_EQ(OB_SUCCESS, keys.read(0, 2, positions, vids));
+  EXPECT_EQ(10, vids.at(0)); EXPECT_EQ(0, positions.at(0));
+  EXPECT_EQ(20, vids.at(1)); EXPECT_EQ(1, positions.at(1));
+}
+
+TEST_F(TestRADatumStoreReader, posid_raw_key_failures_do_not_publish_partial_output)
+{
+  ObNullAllocator failing;
+  ModulePageAllocator failing_pages(failing);
+  {
+    ObIVFRawKeyStore keys;
+    ASSERT_EQ(OB_SUCCESS, keys.init(MTL_ID(), 2));
+    ASSERT_EQ(OB_SUCCESS, keys.shards_.at(0)->sorter_.memory_sort_round_.allocator_.get_arena().init(
+        OB_MALLOC_BIG_BLOCK_SIZE, failing_pages));
+    share::ObVectorArray<int64_t> positions;
+    ObArray<uint64_t> vids;
+    ASSERT_EQ(OB_SUCCESS, positions.push_back(0));
+    ASSERT_EQ(OB_SUCCESS, vids.push_back(42));
+    EXPECT_EQ(OB_ALLOCATE_MEMORY_FAILED, keys.append(positions, vids));
+    EXPECT_EQ(OB_ALLOCATE_MEMORY_FAILED, keys.append(positions, vids));
+    EXPECT_EQ(OB_ALLOCATE_MEMORY_FAILED, keys.seal(0));
+    EXPECT_FALSE(keys.sealed_);
+    EXPECT_EQ(0, keys.writers_);
+    EXPECT_EQ(keys.shards_.count(), keys.free_shards_.size());
+  }
+  {
+    ObIVFRawKeyStore keys;
+    ASSERT_EQ(OB_SUCCESS, keys.init(MTL_ID(), 2));
+    share::ObVectorArray<int64_t> positions;
+    ObArray<uint64_t> vids;
+    ASSERT_EQ(OB_SUCCESS, positions.push_back(0));
+    ASSERT_EQ(OB_SUCCESS, vids.push_back(42));
+    ASSERT_EQ(OB_SUCCESS, keys.append(positions, vids));
+    positions.at(0) = 1;
+    ASSERT_EQ(OB_SUCCESS, keys.append(positions, vids)); // Same VID in a different shard.
+    EXPECT_EQ(OB_INVALID_DATA, keys.seal(2));
+    EXPECT_EQ(OB_INVALID_DATA, keys.seal(2));
+    EXPECT_FALSE(keys.sealed_);
+  }
+}
+
+TEST_F(TestRADatumStoreReader, posid_raw_key_partial_fragment_transfer_releases_owners)
+{
+  class OnceAllocator final : public ObIAllocator
+  {
+  public:
+    void *alloc(int64_t size) override { return remaining_-- > 0 ? memory_.alloc(size) : nullptr; }
+    void *alloc(int64_t size, const ObMemAttr &) override { return alloc(size); }
+    void free(void *ptr) override { memory_.free(ptr); }
+    ObIVFMergeRuntimeAllocator memory_;
+    int64_t remaining_ = 1;
+  } allocator;
+  {
+    ObIVFRawKeyStore keys;
+    ASSERT_EQ(OB_SUCCESS, keys.init(MTL_ID(), 2));
+    share::ObVectorArray<int64_t> positions;
+    ObArray<uint64_t> vids;
+    ASSERT_EQ(OB_SUCCESS, positions.push_back(0));
+    ASSERT_EQ(OB_SUCCESS, vids.push_back(10));
+    ASSERT_EQ(OB_SUCCESS, keys.append(positions, vids));
+    positions.at(0) = 1; vids.at(0) = 20;
+    ASSERT_EQ(OB_SUCCESS, keys.append(positions, vids));
+    ObExternalSortRound<ObIVFRawOutputKey, ObIVFRawOutputKeyLess> *round = nullptr;
+    ASSERT_EQ(OB_SUCCESS, keys.sorter_.get_current_round(round));
+    ASSERT_EQ(0, round->iters_.get_capacity());
+    round->iters_.set_block_size(sizeof(void *));
+    round->iters_.set_block_allocator(ModulePageAllocator(allocator));
+    EXPECT_EQ(OB_ALLOCATE_MEMORY_FAILED, keys.seal(2));
+    EXPECT_FALSE(keys.sealed_);
+    EXPECT_LE(allocator.remaining_, -1); // The first transfer succeeded before the second allocation failed.
+  }
+  EXPECT_EQ(0, allocator.memory_.used());
 }
 
 } // namespace unittest

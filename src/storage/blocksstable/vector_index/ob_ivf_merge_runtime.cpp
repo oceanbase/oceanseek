@@ -59,6 +59,8 @@ int append_vector_ref(
   } else if (vector_idx < 0) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid IVF vector reference", K(ret), K(vid), K(vector_idx));
+  } else if (vid_list.vids_.aliases_positions() && vid == static_cast<uint64_t>(vector_idx)) {
+    ret = vid_list.vector_idxs_.push_back(vector_idx);
   } else if (OB_FAIL(vid_list.vids_.push_back(vid))) {
     LOG_WARN("failed to append IVF vector-reference VID", K(ret), K(vid),
         K(vector_idx));
@@ -179,10 +181,11 @@ static ObIVFNeighborhoodMode choose_neighborhood_mode(const int64_t k)
   return mode;
 }
 
+template <typename Array>
 static int append_filled_int_array(
     const int64_t count,
     const int64_t value,
-    common::ObIArray<int64_t> &array)
+    Array &array)
 {
   int ret = OB_SUCCESS;
   if (count < 0 || count > INT64_MAX - array.count()) {
@@ -198,8 +201,9 @@ static int append_filled_int_array(
 }
 
 
+template <typename Array>
 static bool contains_cid(
-    const common::ObIArray<int64_t> &cids,
+    const Array &cids,
     const int64_t begin,
     const int64_t end,
     const int64_t cid)
@@ -273,13 +277,15 @@ bool is_valid_ivf_merge_operation(
 
 
 
-static int copy_insertion_center(const ObIArray<float> &centers, const int64_t cid,
-    const int64_t dimension, ObIArray<float> &out)
+static int copy_insertion_center(const share::ObVectorMatrix &centers, const int64_t cid,
+    const int64_t dimension, share::ObVectorMatrix &out)
 {
   int ret = OB_SUCCESS;
   if (cid < 0 || dimension <= 0 || cid >= centers.count() / dimension) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid insertion center to copy", K(ret), K(cid), K(dimension), K(centers.count()));
+  } else if (OB_FAIL(out.set_dimension(dimension))) {
+    LOG_WARN("failed to set insertion center dimension", K(ret), K(cid), K(dimension));
   }
   for (int64_t d = 0; OB_SUCC(ret) && d < dimension; ++d) {
     ret = out.push_back(centers.at(cid * dimension + d));
@@ -294,12 +300,21 @@ static int copy_insertion_center(const ObIArray<float> &centers, const int64_t c
 // complete primary/secondary relations are copied later. Do not fetch old RAW to
 // choose between two inherited owners; only delta vectors need distance search.
 static int assign_frozen_insertion(ObIVFMergeRuntime &runtime, ObIVFMergeAlgorithm &algorithm,
-    ObIVFVectorReader &reader, const ObIArray<float> &centers, int64_t begin, int64_t end,
+    ObIVFVectorReader &reader, const share::ObVectorMatrix &centers, int64_t begin, int64_t end,
     ObIArray<int64_t> &assignments)
 {
   int ret = OB_SUCCESS;
   ObSEArray<ObIVFVectorVID, 64> delta;
-  ObSEArray<int64_t, 64> positions, offsets, candidates, delta_assignments;
+  ObSEArray<int64_t, 64> positions;
+  common::ObArray<int64_t> offsets;
+  common::ObArray<int64_t> candidates;
+  common::ObArray<int64_t> delta_assignments;
+  const ObMemAttr attr(MTL_ID(), "IVFInsertRoute", ObCtxIds::VECTOR_CTX_ID);
+  delta.set_attr(attr);
+  positions.set_attr(attr);
+  offsets.set_attr(attr);
+  candidates.set_attr(attr);
+  delta_assignments.set_attr(attr);
   if (begin < 0 || end <= begin || end > runtime.all_vids_.count()
       || runtime.insertion_offsets_.count() != runtime.all_vids_.count() + 1) {
     ret = OB_INVALID_ARGUMENT;
@@ -337,7 +352,6 @@ static int assign_frozen_insertion(ObIVFMergeRuntime &runtime, ObIVFMergeAlgorit
 static bool uses_loaded_insertion(const ObIVFMergeRuntime &runtime, const ObIVFMergeQuantizer &output)
 {
   return runtime.insertion_prior_ != nullptr && runtime.ddl_runtime_ != nullptr
-      && runtime.all_vids_.count() <= UINT32_MAX
       && output.supports_loaded_quantization() && output.supports_loaded_posting_reuse();
 }
 
@@ -346,28 +360,29 @@ static bool uses_loaded_insertion(const ObIVFMergeRuntime &runtime, const ObIVFM
 class ObIVFLoadedInsertionBatch final : public ObIVFVectorStore
 {
 public:
-  ObIVFLoadedInsertionBatch(const ObIArray<float> &vectors, int64_t dim)
+  ObIVFLoadedInsertionBatch(const share::ObVectorMatrix &vectors, int64_t dim)
       : vectors_(vectors), dim_(dim) {}
   bool is_valid() const override
   { return dim_ > 0 && !vectors_.empty() && vectors_.count() % dim_ == 0; }
   int64_t get_dimension() const override { return dim_; }
   int64_t get_vector_count() const override { return dim_ > 0 ? vectors_.count() / dim_ : 0; }
-  int get_all_vids(ObIArray<ObIVFVectorVID> &vids) const override
+  int get_all_vids(share::ObVectorArray<ObIVFVectorVID> &vids) const override
   {
     int ret = OB_SUCCESS;
     vids.reuse();
     for (int64_t i = 0; OB_SUCC(ret) && i < get_vector_count(); ++i) { ret = vids.push_back(i); }
     return ret;
   }
-  int batch_get_by_vid(const ObIArray<ObIVFVectorVID> &vids, int64_t begin, int64_t end,
-      ObIArray<float> &values) const override
+  int batch_get_by_vid(const ObIVFVectorIDView &vids, int64_t begin, int64_t end,
+      share::ObVectorMatrix &values) const override
   {
     int ret = OB_SUCCESS;
     values.reuse();
     if (!is_valid() || begin < 0 || end <= begin || end > vids.count()
         || end - begin > INT64_MAX / dim_) {
       ret = OB_INVALID_ARGUMENT;
-    } else if (OB_FAIL(values.prepare_allocate((end - begin) * dim_))) {
+    } else if (OB_FAIL(values.set_dimension(dim_))) {
+    } else if (OB_FAIL(values.resize((end - begin) * dim_))) {
       LOG_WARN("failed to allocate resident insertion batch", K(ret));
     }
     for (int64_t i = begin; OB_SUCC(ret) && i < end; ++i) {
@@ -380,7 +395,7 @@ public:
     return ret;
   }
 private:
-  const ObIArray<float> &vectors_;
+  const share::ObVectorMatrix &vectors_;
   const int64_t dim_;
 };
 
@@ -451,12 +466,11 @@ static int prepare_loaded_insertion_children(ObIVFMergeRuntime &r)
   const auto &prior = *r.insertion_prior_;
   const auto &source = prior.segments_.at(prior.dominant_segment_);
   const int64_t roots = source.centroid_count_, k = r.final_cluster_count_, n = r.all_vids_.count();
-  ObArray<int64_t> cursors;
-  cursors.set_attr(ObMemAttr(MTL_ID(), "IVFInsertPlan", ObCtxIds::VECTOR_CTX_ID));
-  if (!r.refine_finished_ || r.a0_ == nullptr || r.old_to_new_ == nullptr || r.c1_ == nullptr
-      || roots <= 0 || k <= 0 || r.dimension_ <= 0 || r.old_to_new_->count() != k
-      || r.c1_->count() != k * r.dimension_ || r.insertion_origins_.count() != k
-      || r.insertion_offsets_.count() != n + 1 || r.insertion_offsets_.at(0) != 0
+
+  common::ObArray<int64_t> cursors(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ModulePageAllocator(ObMemAttr(MTL_ID(), "IVFInsertPlan", ObCtxIds::VECTOR_CTX_ID)));
+  if (!r.refine_finished_ || r.a0_ == nullptr || r.old_to_new_ == nullptr || r.c1_ == nullptr || roots <= 0 || k <= 0
+      || r.dimension_ <= 0 || r.old_to_new_->count() != k || r.c1_->count() != k * r.dimension_
+      || r.insertion_origins_.count() != k || r.insertion_offsets_.count() != n + 1 || r.insertion_offsets_.at(0) != 0
       || r.insertion_offsets_.at(n) != r.insertion_candidates_.count()
       || r.insertion_delta_vids_.count() != n - r.insertion_old_count_) {
     ret = OB_STATE_NOT_MATCH;
@@ -500,8 +514,8 @@ static int prepare_loaded_insertion_soar(ObIVFMergeRuntime &r, ObIVFMergeActiveP
   const auto &prior = *r.insertion_prior_;
   const auto &source = prior.segments_.at(prior.dominant_segment_);
   const int64_t roots = source.centroid_count_, k = r.final_cluster_count_, n = r.all_vids_.count();
-  ObArray<int64_t> cursors;
-  cursors.set_attr(ObMemAttr(MTL_ID(), "IVFInsertPlan", ObCtxIds::VECTOR_CTX_ID));
+
+  common::ObArray<int64_t> cursors(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ModulePageAllocator(ObMemAttr(MTL_ID(), "IVFInsertPlan", ObCtxIds::VECTOR_CTX_ID)));
   if (OB_FAIL(prepare_loaded_insertion_children(r))) {
     LOG_WARN("failed to prepare insertion child lineage", K(ret), K(roots), K(k));
   }
@@ -535,7 +549,7 @@ static int prepare_loaded_insertion_soar(ObIVFMergeRuntime &r, ObIVFMergeActiveP
     ret = OB_INVALID_DATA;
     LOG_WARN("source insertion validation failed", K(ret), "operation", "prepare_loaded_insertion_soar",
         "dimension", r.dimension_, "centers", r.final_cluster_count_);
-  } else if (OB_SUCC(ret) && (OB_FAIL(r.insertion_source_idxs_.prepare_allocate(r.insertion_reused_posting_count_))
+  } else if (OB_SUCC(ret) && (OB_FAIL(share::vector_array_resize(r.insertion_source_idxs_, r.insertion_reused_posting_count_))
       || OB_FAIL(cursors.assign(r.insertion_source_offsets_)))) {
     LOG_WARN("failed to allocate reusable insertion source indexes", K(ret));
   }
@@ -645,7 +659,7 @@ static int prepare_incremental_soar(ObIVFMergeRuntime &runtime, ObIVFMergeActive
     LOG_WARN("incremental posting count mismatch or overflow", K(ret), K(posting_count),
         K(runtime.insertion_candidates_.count()));
   }
-  if (OB_SUCC(ret) && OB_FAIL(runtime.insertion_source_idxs_.prepare_allocate(posting_count))) {
+  if (OB_SUCC(ret) && OB_FAIL(share::vector_array_resize(runtime.insertion_source_idxs_, posting_count))) {
     LOG_WARN("failed to allocate incremental source indexes", K(ret), K(posting_count));
   }
   for (int64_t c = 0; OB_SUCC(ret) && c < roots; ++c) {
@@ -678,15 +692,17 @@ static int prepare_incremental_soar(ObIVFMergeRuntime &runtime, ObIVFMergeActive
     if (c < 0 || c >= roots || runtime.old_to_new_->at(cid) != cid) {
       ret = OB_INVALID_DATA;
       LOG_WARN("invalid insertion center lineage", K(ret), K(cid), K(c), K(roots));
+    } else {
+      ++runtime.insertion_child_offsets_.at(c + 1);
     }
-    else { ++runtime.insertion_child_offsets_.at(c + 1); }
   }
   for (int64_t c = 0; OB_SUCC(ret) && c < roots; ++c) {
     if (runtime.insertion_child_offsets_.at(c + 1) <= 0) {
       ret = OB_INVALID_DATA;
       LOG_WARN("insertion source center has no children", K(ret), K(c));
+    } else {
+      runtime.insertion_child_offsets_.at(c + 1) += runtime.insertion_child_offsets_.at(c);
     }
-    else { runtime.insertion_child_offsets_.at(c + 1) += runtime.insertion_child_offsets_.at(c); }
   }
   if (OB_SUCC(ret) && OB_FAIL(runtime.insertion_child_cids_.prepare_allocate(k))) {
     LOG_WARN("failed to allocate incremental child centers", K(ret), K(k));
@@ -760,18 +776,18 @@ static int execute_inherited_postings(ObIVFMergeRuntime &runtime, ObIVFMergeAlgo
     LOG_WARN("failed to initialize inherited posting targets", K(ret), K(count));
   }
   ObArenaAllocator scratch(ObMemAttr(MTL_ID(), "IVFOldRoute", ObCtxIds::VECTOR_CTX_ID));
-  ObArray<float, ObWrapperAllocator> centers;
-  centers.set_block_allocator(ObWrapperAllocator(scratch));
+  share::ObVectorMatrix centers(share::vector_array_allocator(scratch));
+
   ObSEArray<ObIVFVectorVID, 64> vids;
   vids.set_attr(ObMemAttr(MTL_ID(), "IVFOldRoute", ObCtxIds::VECTOR_CTX_ID));
   ObSEArray<int64_t, 64> positions;
   positions.set_attr(ObMemAttr(MTL_ID(), "IVFOldRoute", ObCtxIds::VECTOR_CTX_ID));
-  ObSEArray<int64_t, 64> offsets;
-  offsets.set_attr(ObMemAttr(MTL_ID(), "IVFOldRoute", ObCtxIds::VECTOR_CTX_ID));
-  ObSEArray<int64_t, 64> candidates;
-  candidates.set_attr(ObMemAttr(MTL_ID(), "IVFOldRoute", ObCtxIds::VECTOR_CTX_ID));
-  ObSEArray<int64_t, 64> local_targets;
-  local_targets.set_attr(ObMemAttr(MTL_ID(), "IVFOldRoute", ObCtxIds::VECTOR_CTX_ID));
+
+  common::ObArray<int64_t> offsets(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ModulePageAllocator(ObMemAttr(MTL_ID(), "IVFOldRoute", ObCtxIds::VECTOR_CTX_ID)));
+
+  common::ObArray<int64_t> candidates(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ModulePageAllocator(ObMemAttr(MTL_ID(), "IVFOldRoute", ObCtxIds::VECTOR_CTX_ID)));
+
+  common::ObArray<int64_t> local_targets(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ModulePageAllocator(ObMemAttr(MTL_ID(), "IVFOldRoute", ObCtxIds::VECTOR_CTX_ID)));
   int64_t left = 0, right = roots;
   while (OB_SUCC(ret) && left < right) {
     const int64_t mid = left + (right - left) / 2;
@@ -880,17 +896,20 @@ struct ObIVFInsertionRelation
 };
 
 static int route_loaded_insertion_relations(ObIVFMergeRuntime &r, ObIVFMergeAlgorithm &algorithm,
-    const ObIArray<float> &vectors, ObArray<ObIVFInsertionRelation> &relations, int64_t &routed)
+    const share::ObVectorMatrix &vectors, ObArray<ObIVFInsertionRelation> &relations, int64_t &routed)
 {
   int ret = OB_SUCCESS;
   routed = 0;
   const int64_t dim = r.dimension_;
   const ObMemAttr attr(MTL_ID(), "IVFInsertSource", ObCtxIds::VECTOR_CTX_ID);
-  ObArray<int64_t> offsets, candidates, local_targets, positions;
+
+  common::ObArray<int64_t> offsets(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ModulePageAllocator(attr));
+  common::ObArray<int64_t> candidates(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ModulePageAllocator(attr));
+  common::ObArray<int64_t> local_targets(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ModulePageAllocator(attr));
+  ObArray<int64_t> positions;
   ObArray<ObIVFVectorVID> routing_rows;
-  ObArray<float> centers;
-  offsets.set_attr(attr); candidates.set_attr(attr); local_targets.set_attr(attr);
-  positions.set_attr(attr); routing_rows.set_attr(attr); centers.set_attr(attr);
+  share::ObVectorMatrix centers(attr);
+  positions.set_attr(attr); routing_rows.set_attr(attr);
   if (dim <= 0 || vectors.count() % dim != 0) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("source insertion validation failed", K(ret), "operation", "route_loaded_insertion_relations",
@@ -956,7 +975,7 @@ static int route_loaded_insertion_relations(ObIVFMergeRuntime &r, ObIVFMergeAlgo
 }
 
 static int assign_loaded_insertion_secondary(ObIVFMergeRuntime &r,
-    const ObIArray<float> &vectors, const ObIArray<int64_t> &primary_cids,
+    const share::ObVectorMatrix &vectors, const common::ObIArray<int64_t> &primary_cids,
     ObIArray<int64_t> &secondary, int64_t &secondary_count)
 {
   int ret = OB_SUCCESS;
@@ -1005,7 +1024,7 @@ static int assign_loaded_insertion_secondary(ObIVFMergeRuntime &r,
 }
 
 static int gather_loaded_insertion_relations(ObIVFMergeRuntime &r, const ObIVFMergeWorkItem &item,
-    ObIArray<int64_t> &indices, ObIArray<float> &vectors, ObIArray<int64_t> &delta_rows,
+    share::ObVectorArray<int64_t> &indices, share::ObVectorMatrix &vectors, ObIArray<int64_t> &delta_rows,
     ObIArray<ObIVFInsertionRelation> &relations)
 {
   int ret = OB_SUCCESS;
@@ -1078,14 +1097,16 @@ static int execute_loaded_insertion_source(ObIVFMergeRuntime &r, ObIVFMergeAlgor
   const int64_t dim = r.dimension_, k = r.final_cluster_count_;
   const int64_t batch_rows = ObIVFDDLRuntime::batch_rows(dim);
   const ObMemAttr attr(MTL_ID(), "IVFInsertSource", ObCtxIds::VECTOR_CTX_ID);
-  ObArray<int64_t> indices, delta_rows;
+
+  share::ObVectorArray<int64_t> indices(attr);
+  ObArray<int64_t> delta_rows;
   ObArray<ObIVFVectorVID> encoded_vids;
-  ObArray<float> vectors, encoded_vectors;
-  ObArray<int64_t> encoded_cids, secondary;
+  share::ObVectorMatrix vectors(attr);
+  share::ObVectorMatrix encoded_vectors(attr);
+  common::ObArray<int64_t> encoded_cids(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ModulePageAllocator(attr));
+  common::ObArray<int64_t> secondary(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ModulePageAllocator(attr));
   ObArray<ObIVFInsertionRelation> relations;
-  indices.set_attr(attr); delta_rows.set_attr(attr); encoded_vids.set_attr(attr);
-  vectors.set_attr(attr); encoded_vectors.set_attr(attr); encoded_cids.set_attr(attr);
-  secondary.set_attr(attr); relations.set_attr(attr);
+  delta_rows.set_attr(attr); encoded_vids.set_attr(attr); relations.set_attr(attr);
   if (OB_FAIL(gather_loaded_insertion_relations(r, item, indices, vectors, delta_rows, relations))) {
     LOG_WARN("failed to gather source insertion relations", K(ret), K(item));
   }
@@ -1098,7 +1119,8 @@ static int execute_loaded_insertion_source(ObIVFMergeRuntime &r, ObIVFMergeAlgor
   for (int64_t begin = 0; OB_SUCC(ret) && begin < relations.count(); begin += batch_rows) {
     const int64_t end = MIN(relations.count(), begin + batch_rows);
     encoded_vids.reuse(); encoded_cids.reuse(); encoded_vectors.reuse();
-    if (OB_FAIL(encoded_vectors.prepare_allocate((end - begin) * dim))) {
+    if (OB_FAIL(encoded_vectors.set_dimension(dim))) {
+    } else if (OB_FAIL(encoded_vectors.resize((end - begin) * dim))) {
       LOG_WARN("failed to allocate inherited encoding batch", K(ret));
     }
     for (int64_t i = begin; OB_SUCC(ret) && i < end; ++i) {
@@ -1128,7 +1150,8 @@ static int execute_loaded_insertion_source(ObIVFMergeRuntime &r, ObIVFMergeAlgor
   int64_t secondary_count = 0;
   if (OB_SUCC(ret) && !delta_rows.empty()) {
     encoded_vids.reuse(); encoded_cids.reuse(); encoded_vectors.reuse();
-    if (OB_FAIL(encoded_vectors.prepare_allocate(delta_rows.count() * dim))) {
+    if (OB_FAIL(encoded_vectors.set_dimension(dim))) {
+    } else if (OB_FAIL(encoded_vectors.resize(delta_rows.count() * dim))) {
       LOG_WARN("failed to allocate insertion delta encoding batch", K(ret));
     }
     for (int64_t i = 0; OB_SUCC(ret) && i < delta_rows.count(); ++i) {
@@ -1179,8 +1202,8 @@ static int execute_loaded_insertion_copy(ObIVFMergeRuntime &r, const ObIVFMergeW
     ObIVFMergeResultSlot &slot, ObIVFMergeQuantizer &output)
 {
   int ret = OB_SUCCESS;
-  ObArray<ObIVFVectorVID> expected;
-  expected.set_attr(ObMemAttr(MTL_ID(), "IVFReuseCodes", ObCtxIds::VECTOR_CTX_ID));
+
+  share::ObVectorArray<ObIVFVectorVID> expected(ObMemAttr(MTL_ID(), "IVFReuseCodes", ObCtxIds::VECTOR_CTX_ID));
   int64_t copied = 0;
   if (item.cid_begin_ < 0 || item.cid_end_ <= item.cid_begin_ || item.cid_end_ > r.final_cluster_count_
       || item.vid_begin_ >= 0 || item.source_input_count_ != 0) { ret = OB_INVALID_ARGUMENT; }
@@ -1236,18 +1259,18 @@ int ObIVFVectorReader::init(const ObIVFVectorStore &vector_store)
 }
 
 int ObIVFVectorReader::batch_get_by_vid(
-    const common::ObIArray<ObIVFVectorVID> &vids,
+    const ObIVFVectorIDView &vids,
     const int64_t vid_begin,
     const int64_t vid_end,
-    common::ObIArray<float> &vectors) const
+    share::ObVectorMatrix &vectors) const
 {
   int ret = OB_SUCCESS;
   if (OB_ISNULL(vector_store_)) {
     ret = OB_NOT_INIT;
   } else if (vid_begin < 0 || vid_end <= vid_begin || vid_end > vids.count()) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_FAIL(vector_store_->batch_get_by_vid(
-      vids, vid_begin, vid_end, vectors))) {
+  } else if (OB_FAIL(vectors.set_dimension(vector_store_->get_dimension()))) {
+  } else if (OB_FAIL(vector_store_->batch_get_by_vid(vids, vid_begin, vid_end, vectors))) {
     LOG_WARN("failed to read IVF vector batch", K(ret), K(vid_begin),
         K(vid_end), "vid_count", vids.count());
   } else if (vectors.count()
@@ -1332,14 +1355,14 @@ bool ObIVFMergeInput::is_valid() const
 }
 
 ObIVFNeighborGraphView::ObIVFNeighborGraphView()
-  : offsets_(nullptr), cids_(nullptr), max_intra_distances_(nullptr),
+  : offsets_(), cids_(), max_intra_distances_(),
     center_count_(0)
 {
 }
 
 ObIVFNeighborGraphView::ObIVFNeighborGraphView(
     const common::ObIArray<int64_t> &offsets,
-    const common::ObIArray<int64_t> &cids,
+    const share::ObVectorArray<int64_t> &cids,
     const common::ObIArray<float> &max_intra_distances,
     const int64_t center_count)
   : offsets_(&offsets), cids_(&cids),
@@ -1596,10 +1619,13 @@ int ObIVFMergeProcessor::init_merge_runtime(
     runtime_->vector_store_ = merge_input.vector_store_;
     runtime_->cluster_size_ = merge_input.cluster_size_;
     runtime_->dimension_ = merge_input.vector_store_->get_dimension();
+    ret = runtime_->c0_.set_dimension(runtime_->dimension_);
     runtime_->enable_soar_ = merge_input.enable_soar_;
     runtime_->first_level_samples_ = merge_input.first_level_samples_;
     const int64_t vector_count = runtime_->vector_store_->get_vector_count();
-    if (process_type == ObIVFProcessType::CONCATENATION
+    if (OB_FAIL(ret)) {
+      LOG_WARN("failed to set IVF runtime centroid dimension", K(ret), "dimension", runtime_->dimension_);
+    } else if (process_type == ObIVFProcessType::CONCATENATION
         && (!prior->can_concatenate() || !physical_output.supports_loaded_posting_reuse()
             || !physical_output.supports_loaded_quantization())) {
       ret = OB_NOT_SUPPORTED;
@@ -1609,11 +1635,10 @@ int ObIVFMergeProcessor::init_merge_runtime(
       LOG_WARN("insertion requires a complete encoded posting source", K(ret));
     } else if (prior != nullptr && OB_FAIL(prior->validate())) {
       LOG_WARN("invalid IVF runtime prior", K(ret));
-    } else if (process_type == ObIVFProcessType::INITIAL_BUILD
-        && OB_FAIL(runtime_->all_vids_.reserve(vector_count))) {
-      LOG_WARN("failed to reserve initial build VIDs", K(ret), K(vector_count));
-    } else if (OB_FAIL(
-        runtime_->vector_store_->get_all_vids(runtime_->all_vids_))) {
+    } else if (runtime_->vector_store_->uses_position_ids()
+        && FALSE_IT(runtime_->all_vids_.set_identity(vector_count))) {
+    } else if (!runtime_->vector_store_->uses_position_ids() && OB_FAIL(
+        runtime_->vector_store_->get_all_vids(runtime_->all_vids_.mutable_array()))) {
       LOG_WARN("fail to enumerate IVF full rebuild VIDs", K(ret));
     } else if (runtime_->all_vids_.count()
         != vector_count) {
@@ -1632,7 +1657,7 @@ int ObIVFMergeProcessor::init_merge_runtime(
     }
     if (OB_SUCC(ret) && process_type != ObIVFProcessType::CONCATENATION) {
       if (OB_FAIL(alloc_runtime_object(
-          *allocator_, root_node, *allocator_))) {
+          *allocator_, root_node, *allocator_, runtime_->dimension_))) {
         LOG_WARN("failed to allocate IVF root hierarchy node", K(ret));
       } else if (OB_FAIL(runtime_->current_nodes_.push_back(root_node))) {
         LOG_WARN("failed to append IVF root hierarchy node", K(ret));
@@ -1808,9 +1833,9 @@ int ObIVFMergeProcessor::prepare_centroid_index_step(ObIVFMergeStep step, int64_
     LOG_WARN("[DISK_BBQ] failed to allocate centroid index task plan", K(ret), K(plan_id));
   } else if (OB_FAIL(runtime_->parent_builder_->prepare(plan_id, task_count))) {
     LOG_WARN("[DISK_BBQ] failed to prepare centroid index work", K(ret), K(step), K(depth), K(plan_id));
-  } else if (OB_FAIL(plan->work_items_.prepare_allocate(task_count))) {
+  } else if (OB_FAIL(share::vector_array_resize(plan->work_items_, task_count))) {
     LOG_WARN("[DISK_BBQ] failed to allocate centroid index work items", K(ret), K(plan_id), K(task_count));
-  } else if (OB_FAIL(plan->result_slots_.prepare_allocate(task_count))) {
+  } else if (OB_FAIL(share::vector_array_resize(plan->result_slots_, task_count))) {
     LOG_WARN("[DISK_BBQ] failed to allocate centroid index result slots", K(ret), K(plan_id), K(task_count));
   } else {
     plan->plan_id_ = plan_id;
@@ -1978,10 +2003,9 @@ int ObIVFMergeProcessor::init_insertion_memberships()
   const ObIVFMergePrior &prior = *runtime_->prior_;
   const ObIVFSegmentPriorInfo &segment = prior.segments_.at(prior.dominant_segment_);
   ObArenaAllocator allocator(ObMemAttr(MTL_ID(), "IVFInsertRefs", ObCtxIds::VECTOR_CTX_ID));
-  ObArray<ObIVFPriorPosting, ObWrapperAllocator> postings;
-  ObArray<int64_t, ObWrapperAllocator> masses;
-  postings.set_block_allocator(ObWrapperAllocator(allocator));
-  masses.set_block_allocator(ObWrapperAllocator(allocator));
+  share::ObVectorArray<ObIVFPriorPosting> postings(share::vector_array_allocator(allocator));
+  common::ObArray<int64_t, common::ObWrapperAllocator> masses(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ObWrapperAllocator(allocator));
+
   if (!prior.postings_complete_ || !segment.provides_prior_ || segment.centroid_count_ < 2) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("insertion requires complete dominant postings", K(ret), K(segment));
@@ -2033,7 +2057,7 @@ int ObIVFMergeProcessor::init_insertion_memberships()
     }
   }
   if (OB_SUCC(ret) && !postings.empty()) {
-    lib::ob_sort(postings.begin(), postings.end(), [](const ObIVFPriorPosting &a, const ObIVFPriorPosting &b) {
+    lib::ob_sort(share::vector_array_begin(postings), share::vector_array_end(postings), [](const ObIVFPriorPosting &a, const ObIVFPriorPosting &b) {
       return a.vid_ < b.vid_ || (a.vid_ == b.vid_ && a.centroid_idx_ < b.centroid_idx_);
     });
   }
@@ -2111,16 +2135,16 @@ int ObIVFMergeProcessor::init_concat_memberships()
   const auto &prior = *r.prior_;
   const int64_t sources = prior.posting_mass_.count();
   const int64_t postings = prior.postings_.count();
-  ObArray<int64_t, ObWrapperAllocator> centers;
-  centers.set_block_allocator(ObWrapperAllocator(*allocator_));
-  if (OB_FAIL(alloc_runtime_array(*allocator_, r.old_to_new_))
-      || OB_FAIL(alloc_runtime_array(*allocator_, r.c1_))
+  common::ObArray<int64_t, common::ObWrapperAllocator> centers(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ObWrapperAllocator(*allocator_));
+
+  if (OB_FAIL(alloc_runtime_array(*allocator_, r.old_to_new_)) || OB_FAIL(alloc_runtime_array(*allocator_, r.c1_))
+      || OB_FAIL(r.c1_->set_dimension(r.dimension_))
       || OB_FAIL(append_filled_int_array(sources, -1, *r.old_to_new_))
       || OB_FAIL(append_filled_int_array(sources + 1, 0, r.concat_offsets_))
       || OB_FAIL(centers.reserve(sources))
       || OB_FAIL(r.c1_->reserve(prior.centroids_.count()))
-      || OB_FAIL(r.concat_postings_.prepare_allocate(postings))
-      || OB_FAIL(r.concat_keep_.prepare_allocate(postings))) {
+      || OB_FAIL(share::vector_array_resize(r.concat_postings_, postings))
+      || OB_FAIL(share::vector_array_resize(r.concat_keep_, postings))) {
     LOG_WARN("failed to allocate concat mapping", K(ret), K(sources), K(postings));
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < sources; ++i) { ret = centers.push_back(i); }
@@ -2153,7 +2177,7 @@ int ObIVFMergeProcessor::init_concat_memberships()
   }
   if (OB_SUCC(ret)) {
     // VID-first order checks complete RAW coverage and deduplicates (CID, VID).
-    lib::ob_sort(r.concat_postings_.begin(), r.concat_postings_.end(), [&](int64_t a, int64_t b) {
+    lib::ob_sort(share::vector_array_begin(r.concat_postings_), share::vector_array_end(r.concat_postings_), [&](int64_t a, int64_t b) {
       const auto &x = prior.postings_.at(a), &y = prior.postings_.at(b);
       const int64_t cx = r.old_to_new_->at(x.centroid_idx_), cy = r.old_to_new_->at(y.centroid_idx_);
       return x.vid_ != y.vid_ ? x.vid_ < y.vid_ : cx != cy ? cx < cy : x.centroid_idx_ < y.centroid_idx_;
@@ -2180,7 +2204,7 @@ int ObIVFMergeProcessor::init_concat_memberships()
   }
   if (OB_SUCC(ret) && vector_pos != r.all_vids_.count()) { ret = OB_INVALID_DATA; }
   if (OB_SUCC(ret)) {
-    lib::ob_sort(r.concat_postings_.begin(), r.concat_postings_.end(), [&](int64_t a, int64_t b) {
+    lib::ob_sort(share::vector_array_begin(r.concat_postings_), share::vector_array_end(r.concat_postings_), [&](int64_t a, int64_t b) {
       const auto &x = prior.postings_.at(a), &y = prior.postings_.at(b);
       return x.centroid_idx_ != y.centroid_idx_ ? x.centroid_idx_ < y.centroid_idx_ : x.vid_ < y.vid_;
     });
@@ -2289,7 +2313,7 @@ int ObIVFMergeProcessor::prepare_prior_step(const int64_t plan_id, int64_t &task
         }
       }
       if (OB_SUCC(ret)) {
-        ret = plan->result_slots_.prepare_allocate(task_count);
+        ret = share::vector_array_resize(plan->result_slots_, task_count);
         if (OB_FAIL(ret)) {
           LOG_WARN("IVF merge operation failed", K(ret), "operation", "plan->result_slots_.prepare_allocate",
               K(plan_id));
@@ -2317,8 +2341,8 @@ int ObIVFMergeProcessor::execute_prior_task(const int64_t plan_id, const int64_t
     ret = OB_STATE_NOT_MATCH;
   } else if (runtime_->effective_type_ == ObIVFProcessType::CONCATENATION) {
     ObIVFConcatPostingSource source(*runtime_);
-    ObArray<ObIVFVectorVID> expected;
-    expected.set_attr(ObMemAttr(MTL_ID(), "IVFConcatCopy", ObCtxIds::VECTOR_CTX_ID));
+
+    share::ObVectorArray<ObIVFVectorVID> expected(ObMemAttr(MTL_ID(), "IVFConcatCopy", ObCtxIds::VECTOR_CTX_ID));
     const auto &item = plan->work_items_.at(task_idx);
     auto &slot = plan->result_slots_.at(task_idx);
     for (int64_t cid = item.cid_begin_; OB_SUCC(ret) && cid < item.cid_end_; ++cid) {
@@ -2456,7 +2480,6 @@ int ObIVFMergeProcessor::prepare_hierarchy_step(
     } else if (ObIVFMergeStep::HIERARCHY_ASSIGN == step
         && depth > 0
         && runtime_->vector_store_->supports_source_order() && algorithm_->supports_loaded_assign()
-        && runtime_->all_vids_.count() <= UINT32_MAX
         && runtime_->current_nodes_.count() <= INT32_MAX) {
       ret = prepare_source_assign(*runtime_, *active_plan, *allocator_);
     } else if (ObIVFMergeStep::HIERARCHY_ASSIGN == step) {
@@ -2561,7 +2584,6 @@ int ObIVFMergeProcessor::prepare_hierarchy_step(
     LOG_WARN("IVF merge failed", K(ret), "operation", "ret");
   } else if (step == ObIVFMergeStep::HIERARCHY_UPDATE
       && runtime_->vector_store_->supports_source_order() && algorithm_->supports_source_update()
-      && runtime_->all_vids_.count() <= UINT32_MAX
       && active_plan->work_items_.count() <= INT32_MAX) {
     ret = prepare_source_update(*runtime_, *active_plan, *allocator_);
   }
@@ -2570,7 +2592,7 @@ int ObIVFMergeProcessor::prepare_hierarchy_step(
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("IVF hierarchy task plan has no work items", K(ret),
         K(stage), K(step), K(depth), K(plan_id));
-  } else if (OB_FAIL(active_plan->result_slots_.prepare_allocate(
+  } else if (OB_FAIL(share::vector_array_resize(active_plan->result_slots_,
       active_plan->work_items_.count()))) {
     LOG_WARN("failed to allocate IVF hierarchy result slots", K(ret),
         K(stage), K(step), K(plan_id),
@@ -2979,6 +3001,8 @@ int ObIVFMergeProcessor::prepare_post_hierarchy_step(
             (nullptr == runtime_) ? -1 : static_cast<int64_t>(runtime_->merge_finished_), "runtime_all_vids_count",
             (nullptr == runtime_) ? -1 : static_cast<int64_t>(runtime_->all_vids_.count()));
         ret = OB_STATE_NOT_MATCH;
+      } else if (OB_FAIL(runtime_->vector_store_->prepare_raw_output())) {
+        LOG_WARN("failed to prepare IVF RAW output order", K(ret));
       } else {
         const int64_t vector_count = runtime_->all_vids_.count();
         const int64_t raw_task_count = MIN(
@@ -3015,7 +3039,7 @@ int ObIVFMergeProcessor::prepare_post_hierarchy_step(
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("IVF post-hierarchy task plan has no work items", K(ret),
         K(stage), K(step), K(plan_id));
-  } else if (OB_FAIL(active_plan->result_slots_.prepare_allocate(
+  } else if (OB_FAIL(share::vector_array_resize(active_plan->result_slots_,
       active_plan->work_items_.count()))) {
     LOG_WARN("failed to allocate IVF post-hierarchy result slots", K(ret),
         K(stage), K(step), K(plan_id),
@@ -3122,7 +3146,7 @@ int ObIVFMergeProcessor::execute_hierarchy_task(
       LOG_WARN("failed to initialize IVF hierarchy vector reader", K(ret),
           K(stage), K(step), K(depth), K(task_idx), K(work_item));
     } else if (ObIVFMergeStep::HIERARCHY_CLUSTER == step || ObIVFMergeStep::HIERARCHY_WARM_START == step) {
-      ObArray<float, ObWrapperAllocator> *centers = nullptr;
+      share::ObVectorMatrix *centers = nullptr;
       int64_t local_k = 0;
       if (OB_FAIL(alloc_runtime_array(*allocator_, centers))) {
         LOG_WARN("failed to allocate IVF hierarchy centers", K(ret),
@@ -3224,7 +3248,7 @@ int ObIVFMergeProcessor::execute_hierarchy_task(
       }
       free_runtime_object(*allocator_, local_center_idxs);
     } else if (ObIVFMergeStep::HIERARCHY_UPDATE == step) {
-      ObArray<float, ObWrapperAllocator> *updated_center = nullptr;
+      share::ObVectorMatrix *updated_center = nullptr;
       ObIVFHierarchyVIDList *member_list = node->member_lists_->lists_.at(work_item.local_center_idx_);
       const bool update_center = runtime_->insertion_prior_ == nullptr || depth != 0;
       const int64_t member_count = member_list->vids_.count();
@@ -3347,14 +3371,15 @@ int ObIVFMergeProcessor::execute_post_hierarchy_task(
       ObArray<int64_t, ObWrapperAllocator> *neighbor_cids = nullptr;
       ObArray<float, ObWrapperAllocator> *neighbor_max_distances = nullptr;
       const int64_t row_count = work_item.cid_end_ - work_item.cid_begin_;
-      if (OB_FAIL(alloc_runtime_array(*allocator_, neighbor_offsets))) {
+      if (OB_FAIL(alloc_runtime_object(*allocator_, neighbor_offsets,
+          OB_MALLOC_NORMAL_BLOCK_SIZE, ObWrapperAllocator(*allocator_)))) {
         LOG_WARN("failed to allocate IVF neighbor offsets", K(ret),
             K(task_idx), K(work_item));
       } else if (OB_FAIL(alloc_runtime_array(*allocator_, neighbor_cids))) {
         LOG_WARN("failed to allocate IVF neighbor CIDs", K(ret),
             K(task_idx), K(work_item));
-      } else if (OB_FAIL(alloc_runtime_array(
-          *allocator_, neighbor_max_distances))) {
+      } else if (OB_FAIL(alloc_runtime_object(*allocator_, neighbor_max_distances,
+          OB_MALLOC_NORMAL_BLOCK_SIZE, ObWrapperAllocator(*allocator_)))) {
         LOG_WARN("failed to allocate IVF neighbor distances", K(ret),
             K(task_idx), K(work_item));
       } else if (OB_FAIL(algorithm_->neighborhood_find_neighbors(
@@ -3453,7 +3478,7 @@ int ObIVFMergeProcessor::execute_post_hierarchy_task(
         slot.installed_ = true;
       }
     } else if (ObIVFMergeStep::REFINE_TRAIN == step) {
-      ObArray<float, ObWrapperAllocator> *working_centers = nullptr;
+      share::ObVectorMatrix *working_centers = nullptr;
       ObIVFNeighborGraphView graph_view;
       const ObIVFNeighborGraphView *graph = nullptr;
       if (OB_NOT_NULL(runtime_->g0_offsets_)
@@ -3574,7 +3599,7 @@ int ObIVFMergeProcessor::execute_post_hierarchy_task(
       }
       free_runtime_object(*allocator_, new_cids);
     } else if (ObIVFMergeStep::REFINE_UPDATE == step) {
-      ObArray<float, ObWrapperAllocator> *updated_center = nullptr;
+      share::ObVectorMatrix *updated_center = nullptr;
       const int64_t cid = work_item.local_center_idx_;
       ObIVFHierarchyVIDList *member_list =
           runtime_->refined_member_lists_->lists_.at(cid);
@@ -3626,10 +3651,8 @@ int ObIVFMergeProcessor::execute_post_hierarchy_task(
         LOG_WARN("failed to execute inherited IVF postings", K(ret), K(task_idx), K(work_item));
       }
     } else if (ObIVFMergeStep::SOAR_ASSIGN == step) {
-      const ObIArray<int64_t> *old_assignments = runtime_->refine_skipped_
-          ? static_cast<const ObIArray<int64_t> *>(runtime_->a0_)
-          : static_cast<const ObIArray<int64_t> *>(
-              runtime_->refined_assignments_);
+      const share::ObVectorArray<int64_t> *old_assignments
+          = runtime_->refine_skipped_ ? runtime_->a0_ : runtime_->refined_assignments_;
       const int64_t final_k = runtime_->final_member_lists_->lists_.count();
       const int64_t work_item_count =
           work_item.vid_end_ - work_item.vid_begin_;
@@ -3698,8 +3721,8 @@ int ObIVFMergeProcessor::execute_post_hierarchy_task(
         } else if (OB_FAIL(algorithm_->soar_assign_secondary(
             reader,
             runtime_->insertion_prior_ != nullptr
-                ? static_cast<const ObIArray<ObIVFVectorVID> &>(runtime_->insertion_delta_vids_)
-                : static_cast<const ObIArray<ObIVFVectorVID> &>(runtime_->all_vids_),
+                ? static_cast<const ObIVFVectorIDView &>(runtime_->insertion_delta_vids_)
+                : static_cast<const ObIVFVectorIDView &>(runtime_->all_vids_),
             *runtime_->c1_,
             *primary_cids,
             graph,
@@ -3787,8 +3810,9 @@ int ObIVFMergeProcessor::execute_post_hierarchy_task(
       }
       for (int64_t cid = work_item.cid_begin_; OB_SUCC(ret) && cid < work_item.cid_end_; ++cid) {
         const auto *primary = runtime_->final_member_lists_->lists_.at(cid);
-        const auto *secondary = runtime_->soar_member_lists_ == nullptr ? nullptr
+        auto *secondary = runtime_->soar_member_lists_ == nullptr ? nullptr
             : runtime_->soar_member_lists_->lists_.at(cid);
+        const ObIVFVectorIDView secondary_vids = secondary == nullptr ? ObIVFVectorIDView() : secondary->vids_;
         if (is_runtime_canceled(*runtime_)) {
           ret = OB_CANCELED;
           LOG_WARN("IVF quantization task canceled", K(ret), K(cid));
@@ -3800,7 +3824,7 @@ int ObIVFMergeProcessor::execute_post_hierarchy_task(
             && runtime_->insertion_reuse_cids_.at(cid) >= 0) {
           const int64_t source_cid = runtime_->insertion_reuse_cids_.at(cid);
           ret = range_output->quantize_cluster_with_reuse(reader, *runtime_->c1_, final_k, cid,
-              primary->vids_, secondary == nullptr ? nullptr : &secondary->vids_,
+              primary->vids_, secondary == nullptr ? nullptr : &secondary_vids,
               *runtime_->insertion_prior_->posting_source_, source_cid,
               runtime_->insertion_prior_->posting_mass_.at(source_cid));
           if (OB_FAIL(ret)) {
@@ -3809,7 +3833,7 @@ int ObIVFMergeProcessor::execute_post_hierarchy_task(
           }
         } else {
           ret = range_output->quantize_cluster(reader, *runtime_->c1_, final_k, cid,
-              primary->vids_, secondary == nullptr ? nullptr : &secondary->vids_);
+              primary->vids_, secondary == nullptr ? nullptr : &secondary_vids);
           if (OB_FAIL(ret)) {
             LOG_WARN("failed to quantize IVF cluster", K(ret), K(cid), K(task_idx));
           }
@@ -4035,12 +4059,10 @@ int ObIVFMergeProcessor::finish_hierarchy_step(
   } else if (ObIVFMergeStep::HIERARCHY_ASSIGN == step) {
     ObArenaAllocator count_allocator(
         "IVFHierCounts", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
-    ObArray<ObIVFHierarchyMemberLists *, ObWrapperAllocator> staging;
-    ObArray<int64_t, ObWrapperAllocator> node_cid_offsets;
-    ObArray<int64_t, ObWrapperAllocator> member_counts;
-    staging.set_block_allocator(ObWrapperAllocator(*allocator_));
-    node_cid_offsets.set_block_allocator(ObWrapperAllocator(count_allocator));
-    member_counts.set_block_allocator(ObWrapperAllocator(count_allocator));
+    common::ObArray<ObIVFHierarchyMemberLists *, common::ObWrapperAllocator> staging(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ObWrapperAllocator(*allocator_));
+    common::ObArray<int64_t, common::ObWrapperAllocator> node_cid_offsets(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ObWrapperAllocator(count_allocator));
+    common::ObArray<int64_t, common::ObWrapperAllocator> member_counts(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ObWrapperAllocator(count_allocator));
+
     int64_t total_local_k = 0;
     if (OB_FAIL(staging.reserve(runtime_->current_nodes_.count()))) {
       LOG_WARN("failed to reserve staged IVF hierarchy member lists", K(ret),
@@ -4076,7 +4098,8 @@ int ObIVFMergeProcessor::finish_hierarchy_step(
            OB_SUCC(ret) && local_idx < node->local_k_;
            ++local_idx) {
         ObIVFHierarchyVIDList *vid_list = nullptr;
-        if (OB_FAIL(alloc_runtime_object(*allocator_, vid_list, *allocator_))) {
+        if (OB_FAIL(alloc_runtime_object(*allocator_, vid_list, *allocator_,
+            runtime_->vector_store_->uses_position_ids()))) {
           LOG_WARN("failed to allocate IVF hierarchy member VID list", K(ret),
               K(depth), K(plan_id), K(node_idx), K(local_idx));
         } else if (OB_FAIL(member_lists->lists_.push_back(vid_list))) {
@@ -4179,7 +4202,7 @@ int ObIVFMergeProcessor::finish_hierarchy_step(
          OB_SUCC(ret) && !plan->source_assign_ && task_idx < plan->work_items_.count();
          ++task_idx) {
       const ObIVFMergeWorkItem &work_item = plan->work_items_.at(task_idx);
-      const ObArray<int64_t, ObWrapperAllocator> &center_idxs =
+      const common::ObIArray<int64_t> &center_idxs =
           *plan->result_slots_.at(task_idx).center_idxs_;
       const ObIVFHierarchyNodeState *node =
           runtime_->current_nodes_.at(work_item.node_idx_);
@@ -4244,19 +4267,17 @@ int ObIVFMergeProcessor::finish_hierarchy_step(
         ? plan->work_items_ : plan->source_update_->items_;
     auto &update_results = nullptr == plan->source_update_
         ? plan->result_slots_ : plan->source_update_->results_;
-    ObArray<ObIVFHierarchyPendingLeaf, ObWrapperAllocator> pending_leaves;
-    ObArray<ObIVFHierarchyNodeState *, ObWrapperAllocator> pending_next_nodes;
-    ObArray<ObIVFHierarchyNodeState *, ObWrapperAllocator> old_nodes;
-    pending_leaves.set_block_allocator(ObWrapperAllocator(*allocator_));
-    pending_next_nodes.set_block_allocator(ObWrapperAllocator(*allocator_));
-    old_nodes.set_block_allocator(ObWrapperAllocator(*allocator_));
+    common::ObArray<ObIVFHierarchyPendingLeaf, common::ObWrapperAllocator> pending_leaves(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ObWrapperAllocator(*allocator_));
+    common::ObArray<ObIVFHierarchyNodeState *, common::ObWrapperAllocator> pending_next_nodes(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ObWrapperAllocator(*allocator_));
+    common::ObArray<ObIVFHierarchyNodeState *, common::ObWrapperAllocator> old_nodes(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ObWrapperAllocator(*allocator_));
+
     const int64_t old_center_value_count = runtime_->c0_.count();
     const int64_t old_member_list_count = runtime_->initial_member_lists_.count();
     int64_t no_progress_leaf_delta = 0;
     int64_t no_progress_member_delta = 0;
     int64_t update_task_idx = 0;
     bool next_nodes_committed = false;
-    ObArray<int64_t, ObWrapperAllocator> *pending_a0 = nullptr;
+    share::ObVectorArray<int64_t> *pending_a0 = nullptr;
     for (int64_t node_idx = 0;
          OB_SUCC(ret) && node_idx < runtime_->current_nodes_.count();
          ++node_idx) {
@@ -4317,7 +4338,7 @@ int ObIVFMergeProcessor::finish_hierarchy_step(
                 (nullptr == plan) ? -1 : static_cast<int64_t>(update_items.count()), K(node_idx), K(local_idx));
             ret = OB_ERR_UNEXPECTED;
           } else {
-            ObArray<float, ObWrapperAllocator> *updated_center =
+            share::ObVectorMatrix *updated_center =
                 update_results.at(update_task_idx).center_values_;
             if (runtime_->insertion_prior_ != nullptr || member_list->vids_.count() <= runtime_->cluster_size_
                 || no_progress) {
@@ -4344,7 +4365,7 @@ int ObIVFMergeProcessor::finish_hierarchy_step(
             } else {
               ObIVFHierarchyNodeState *next_node = nullptr;
               if (OB_FAIL(alloc_runtime_object(
-                  *allocator_, next_node, *allocator_))) {
+                  *allocator_, next_node, *allocator_, runtime_->dimension_))) {
                 LOG_WARN("failed to allocate next IVF hierarchy node", K(ret),
                     K(depth), K(plan_id), K(node_idx), K(local_idx));
               } else {
@@ -4439,8 +4460,8 @@ int ObIVFMergeProcessor::finish_hierarchy_step(
            ++cid) {
         ObIVFHierarchyVIDList *member_list =
             runtime_->initial_member_lists_.at(cid);
-        const ObIArray<ObIVFVectorVID> &member_vids = member_list->vids_;
-        const ObIArray<int64_t> &member_vector_idxs = member_list->vector_idxs_;
+        const ObIVFVectorIDView &member_vids = member_list->vids_;
+        const share::ObVectorArray<int64_t> &member_vector_idxs = member_list->vector_idxs_;
         if (member_vector_idxs.count() != member_vids.count()) {
           LOG_WARN("unexpected IVF merge state", "ret", OB_ERR_UNEXPECTED, "operation",
               "ObIVFMergeProcessor::finish_hierarchy_step", K(plan_id), K(stage), K(step), K(depth),
@@ -4470,8 +4491,8 @@ int ObIVFMergeProcessor::finish_hierarchy_step(
         const int64_t cid = old_member_list_count + pending_idx;
         ObIVFHierarchyVIDList *member_list =
             pending_leaves.at(pending_idx).vid_list_;
-        const ObIArray<ObIVFVectorVID> &member_vids = member_list->vids_;
-        const ObIArray<int64_t> &member_vector_idxs = member_list->vector_idxs_;
+        const ObIVFVectorIDView &member_vids = member_list->vids_;
+        const share::ObVectorArray<int64_t> &member_vector_idxs = member_list->vector_idxs_;
         if (member_vector_idxs.count() != member_vids.count()) {
           LOG_WARN("unexpected IVF merge state", "ret", OB_ERR_UNEXPECTED, "operation",
               "ObIVFMergeProcessor::finish_hierarchy_step", K(plan_id), K(stage), K(step), K(depth),
@@ -4612,8 +4633,12 @@ int ObIVFMergeProcessor::finish_hierarchy_step(
     }
     else {
       ObIVFHierarchyNodeState *root = runtime_->current_nodes_.at(0);
+
       ObArray<int64_t> counts;
       counts.set_attr(ObMemAttr(MTL_ID(), "IVFHcaQuality", ObCtxIds::VECTOR_CTX_ID));
+      if (OB_FAIL(counts.reserve(root->local_k_))) {
+        LOG_WARN("failed to reserve IVF cluster quality counts", K(ret), "center_count", root->local_k_);
+      }
       for (int64_t cid = 0; OB_SUCC(ret) && cid < root->local_k_; ++cid) {
         ret = counts.push_back(root->member_lists_->lists_.at(cid)->vids_.count());
         if (OB_FAIL(ret)) {
@@ -4667,7 +4692,8 @@ int ObIVFMergeProcessor::finish_hierarchy_step(
 static int alloc_empty_member_lists(
     ObIAllocator &allocator,
     const int64_t count,
-    ObIVFHierarchyMemberLists *&member_lists)
+    ObIVFHierarchyMemberLists *&member_lists,
+    const bool use_position_ids = false)
 {
   int ret = OB_SUCCESS;
   member_lists = nullptr;
@@ -4684,7 +4710,7 @@ static int alloc_empty_member_lists(
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
     ObIVFHierarchyVIDList *vid_list = nullptr;
-    if (OB_FAIL(alloc_runtime_object(allocator, vid_list, allocator))) {
+    if (OB_FAIL(alloc_runtime_object(allocator, vid_list, allocator, use_position_ids))) {
       LOG_WARN("failed to allocate empty IVF member VID list", K(ret),
           K(count), K(i));
     } else if (OB_FAIL(member_lists->lists_.push_back(vid_list))) {
@@ -4718,8 +4744,8 @@ static int reserve_member_lists_from_plan(
   int ret = OB_SUCCESS;
   ObArenaAllocator count_allocator(
       "IVFMemberCount", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
-  ObArray<int64_t, ObWrapperAllocator> member_counts;
-  member_counts.set_block_allocator(ObWrapperAllocator(count_allocator));
+  common::ObArray<int64_t, common::ObWrapperAllocator> member_counts(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ObWrapperAllocator(count_allocator));
+
   const int64_t center_count = member_lists.lists_.count();
   if (center_count <= 0) {
     ret = OB_INVALID_ARGUMENT;
@@ -4828,8 +4854,8 @@ static int finish_loaded_insertion_soar(ObIVFMergeRuntime &r, ObIAllocator &allo
         K(old_postings), K(delta_count), K(r.insertion_source_input_count_), K(r.insertion_reused_posting_count_));
   }
   int64_t total = 0;
-  ObArray<uint32_t, ObWrapperAllocator> counts;
-  counts.set_block_allocator(ObWrapperAllocator(allocator));
+  common::ObArray<uint32_t, common::ObWrapperAllocator> counts(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ObWrapperAllocator(allocator));
+
   if (OB_SUCC(ret) && primary > INT64_MAX - secondary) { ret = OB_SIZE_OVERFLOW; }
   if (OB_SUCC(ret) && OB_FAIL(counts.prepare_allocate(k))) {
     LOG_WARN("failed to allocate insertion final posting counts", K(ret), K(k));
@@ -5067,7 +5093,7 @@ int ObIVFMergeProcessor::finish_post_hierarchy_step(
     }
   } else if (ObIVFMergeStep::NEIGHBORHOOD_BUILD == step) {
     ObArray<int64_t, ObWrapperAllocator> *g0_offsets = nullptr;
-    ObArray<int64_t, ObWrapperAllocator> *g0_cids = nullptr;
+    share::ObVectorArray<int64_t> *g0_cids = nullptr;
     ObArray<float, ObWrapperAllocator> *g0_max_distances = nullptr;
     const int64_t k = runtime_->hierarchy_k_;
     int64_t expected_cid_begin = 0;
@@ -5171,7 +5197,7 @@ int ObIVFMergeProcessor::finish_post_hierarchy_step(
   } else if (ObIVFMergeStep::REFINE_TRAIN == step
       && ((runtime_->ddl_runtime_ != nullptr || runtime_->selected_type_ == ObIVFProcessType::INITIAL_BUILD)
           && algorithm_->supports_batched_refine_train())) {
-    ObArray<float, ObWrapperAllocator> *centers = nullptr;
+    share::ObVectorMatrix *centers = nullptr;
     if (OB_FAIL(alloc_runtime_array(*allocator_, centers))) {
     } else if (OB_FAIL(runtime_->ddl_runtime_ != nullptr
         ? runtime_->ddl_runtime_->finish_refine_phase(*centers, refine_train_finished)
@@ -5209,7 +5235,7 @@ int ObIVFMergeProcessor::finish_post_hierarchy_step(
   } else if (ObIVFMergeStep::REFINE_ASSIGN == step) {
     const int64_t k = runtime_->hierarchy_k_;
     const int64_t n = runtime_->all_vids_.count();
-    ObArray<int64_t, ObWrapperAllocator> *refined_assignments = nullptr;
+    share::ObVectorArray<int64_t> *refined_assignments = nullptr;
     ObArray<uint8_t, ObWrapperAllocator> *changed_cids = nullptr;
     ObIVFHierarchyMemberLists *refined_member_lists = nullptr;
     int64_t changed_center_count = 0;
@@ -5222,7 +5248,8 @@ int ObIVFMergeProcessor::finish_post_hierarchy_step(
         n, -1, *refined_assignments))) {
       LOG_WARN("failed to initialize reduced IVF refined assignments", K(ret),
           K(plan_id), K(n));
-    } else if (OB_FAIL(alloc_runtime_array(*allocator_, changed_cids))) {
+    } else if (OB_FAIL(alloc_runtime_object(*allocator_, changed_cids,
+        OB_MALLOC_NORMAL_BLOCK_SIZE, ObWrapperAllocator(*allocator_)))) {
       LOG_WARN("failed to allocate reduced IVF changed-center set", K(ret),
           K(plan_id), K(k));
     } else if (OB_FAIL(append_filled_byte_array(
@@ -5230,7 +5257,7 @@ int ObIVFMergeProcessor::finish_post_hierarchy_step(
       LOG_WARN("failed to initialize reduced IVF changed-center set", K(ret),
           K(plan_id), K(k));
     } else if (OB_FAIL(alloc_empty_member_lists(
-        *allocator_, k, refined_member_lists))) {
+        *allocator_, k, refined_member_lists, runtime_->vector_store_->uses_position_ids()))) {
       LOG_WARN("failed to allocate reduced IVF refined member lists", K(ret),
           K(plan_id), K(k));
     } else if (OB_FAIL(reserve_member_lists_from_plan(
@@ -5317,13 +5344,13 @@ int ObIVFMergeProcessor::finish_post_hierarchy_step(
     free_runtime_object(*allocator_, changed_cids);
     release_member_lists(*allocator_, refined_member_lists, false);
   } else if (ObIVFMergeStep::REFINE_UPDATE == step) {
-    ObArray<float, ObWrapperAllocator> *updated_working_centers = nullptr;
+    share::ObVectorMatrix *updated_working_centers = nullptr;
     if (OB_FAIL(alloc_runtime_array(
         *allocator_, updated_working_centers))) {
       LOG_WARN("failed to allocate reduced IVF working centers", K(ret),
           K(plan_id));
-    } else if (OB_FAIL(updated_working_centers->reserve(
-        runtime_->working_centers_->count()))) {
+    } else if (OB_FAIL(updated_working_centers->set_dimension(runtime_->dimension_))) {
+    } else if (OB_FAIL(updated_working_centers->reserve(runtime_->working_centers_->count()))) {
       LOG_WARN("failed to reserve reduced IVF working centers", K(ret),
           K(plan_id),
           "center_value_count", runtime_->working_centers_->count());
@@ -5344,7 +5371,7 @@ int ObIVFMergeProcessor::finish_post_hierarchy_step(
          ++task_idx) {
       const int64_t cid =
           plan->work_items_.at(task_idx).local_center_idx_;
-      ObArray<float, ObWrapperAllocator> *updated_center =
+      share::ObVectorMatrix *updated_center =
           plan->result_slots_.at(task_idx).center_values_;
       if (OB_ISNULL(updated_center)
           || updated_center->count() != runtime_->dimension_) {
@@ -5366,19 +5393,18 @@ int ObIVFMergeProcessor::finish_post_hierarchy_step(
     }
     free_runtime_object(*allocator_, updated_working_centers);
   } else if (ObIVFMergeStep::REFINE_COMPACT == step) {
-    const ObIArray<float> *source_centers = runtime_->refine_skipped_
-        ? static_cast<const ObIArray<float> *>(&runtime_->c0_)
-        : static_cast<const ObIArray<float> *>(runtime_->working_centers_);
+    const share::ObVectorMatrix &source_centers
+        = runtime_->refine_skipped_ ? (runtime_->c0_) : (*runtime_->working_centers_);
     ObIVFHierarchyMemberLists *source_member_lists =
         runtime_->refine_skipped_ ? nullptr : runtime_->refined_member_lists_;
     const int64_t old_k = runtime_->refine_skipped_
         ? runtime_->initial_member_lists_.count()
         : source_member_lists->lists_.count();
     ObArray<int64_t, ObWrapperAllocator> *old_to_new = nullptr;
-    ObArray<float, ObWrapperAllocator> *c1 = nullptr;
+    share::ObVectorMatrix *c1 = nullptr;
     ObIVFHierarchyMemberLists *final_member_lists = nullptr;
     ObArray<int64_t, ObWrapperAllocator> *g1_offsets = nullptr;
-    ObArray<int64_t, ObWrapperAllocator> *g1_cids = nullptr;
+    share::ObVectorArray<int64_t> *g1_cids = nullptr;
     ObArray<float, ObWrapperAllocator> *g1_max_distances = nullptr;
     if (OB_FAIL(alloc_runtime_array(*allocator_, old_to_new))) {
       LOG_WARN("failed to allocate compacted IVF CID mapping", K(ret),
@@ -5388,8 +5414,8 @@ int ObIVFMergeProcessor::finish_post_hierarchy_step(
           K(plan_id), K(old_k));
     } else if (OB_FAIL(alloc_runtime_array(*allocator_, c1))) {
       LOG_WARN("failed to allocate compacted IVF centers", K(ret), K(plan_id));
-    } else if (OB_FAIL(alloc_runtime_object(
-        *allocator_, final_member_lists, *allocator_))) {
+    } else if (OB_FAIL(c1->set_dimension(runtime_->dimension_))) {
+    } else if (OB_FAIL(alloc_runtime_object(*allocator_, final_member_lists, *allocator_))) {
       LOG_WARN("failed to allocate compacted IVF member lists", K(ret),
           K(plan_id));
     }
@@ -5401,7 +5427,7 @@ int ObIVFMergeProcessor::finish_post_hierarchy_step(
         old_to_new->at(old_cid) = final_member_lists->lists_.count();
         for (int64_t d = 0; OB_SUCC(ret) && d < runtime_->dimension_; ++d) {
           ret = c1->push_back(
-              source_centers->at(old_cid * runtime_->dimension_ + d));
+              source_centers.at(old_cid * runtime_->dimension_ + d));
           if (OB_FAIL(ret)) {
             LOG_WARN("IVF merge operation failed", K(ret), "operation", "c1->push_back", K(plan_id), K(stage), K(step),
                 K(d), "runtime_dimension", (nullptr == runtime_) ? -1 : static_cast<int64_t>(runtime_->dimension_));
@@ -5558,17 +5584,17 @@ int ObIVFMergeProcessor::finish_post_hierarchy_step(
         && physical_output_->supports_loaded_quantization();
     const int64_t n = runtime_->all_vids_.count();
     const int64_t k = runtime_->final_member_lists_->lists_.count();
-    ObArray<uint32_t, ObWrapperAllocator> leaf_posting_counts;
-    leaf_posting_counts.set_block_allocator(ObWrapperAllocator(*allocator_));
-    ObArray<int64_t, ObWrapperAllocator> *a1 = nullptr;
-    ObArray<int64_t, ObWrapperAllocator> *a2 = nullptr;
+    common::ObArray<uint32_t, common::ObWrapperAllocator> leaf_posting_counts(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ObWrapperAllocator(*allocator_));
+
+    share::ObVectorArray<int64_t> *a1 = nullptr;
+    share::ObVectorArray<int64_t> *a2 = nullptr;
     ObIVFHierarchyMemberLists *soar_member_lists = nullptr;
     int64_t expected_vid_begin = 0;
     int64_t secondary_count = 0;
     if (loaded_quant && OB_FAIL(leaf_posting_counts.prepare_allocate(k))) {
       LOG_WARN("failed to allocate DDL leaf posting counts", K(ret), K(k));
     } else if (loaded_quant) {
-      MEMSET(leaf_posting_counts.get_data(), 0, k * sizeof(uint32_t));
+      std::fill_n(leaf_posting_counts.get_data(), leaf_posting_counts.count(), 0);
     }
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(alloc_runtime_array(*allocator_, a1))) {
@@ -5586,7 +5612,7 @@ int ObIVFMergeProcessor::finish_post_hierarchy_step(
         LOG_WARN("failed to initialize final IVF secondary assignments", K(ret),
             K(plan_id), K(n));
       } else if (!loaded_quant && OB_FAIL(alloc_empty_member_lists(
-          *allocator_, k, soar_member_lists))) {
+          *allocator_, k, soar_member_lists, runtime_->vector_store_->uses_position_ids()))) {
         LOG_WARN("failed to allocate final IVF SOAR member lists", K(ret),
             K(plan_id), K(k));
       } else if (!loaded_quant && OB_FAIL(reserve_member_lists_from_plan(
@@ -5668,9 +5694,9 @@ int ObIVFMergeProcessor::finish_post_hierarchy_step(
     }
     int64_t primary_member_count = 0;
     for (int64_t cid = 0; OB_SUCC(ret) && cid < k; ++cid) {
-      const ObIArray<ObIVFVectorVID> &member_vids =
+      const ObIVFVectorIDView &member_vids =
           runtime_->final_member_lists_->lists_.at(cid)->vids_;
-      const ObIArray<int64_t> &member_vector_idxs =
+      const share::ObVectorArray<int64_t> &member_vector_idxs =
           runtime_->final_member_lists_->lists_.at(cid)->vector_idxs_;
       primary_member_count += member_vids.count();
       if (loaded_quant && OB_FAIL(blocksstable::ObIvfCentroidPayload::add_child_count(

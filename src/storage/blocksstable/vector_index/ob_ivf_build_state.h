@@ -6,6 +6,7 @@
 #ifndef OCEANBASE_STORAGE_BLOCKSSTABLE_VECTOR_INDEX_OB_IVF_BUILD_STATE_H_
 #define OCEANBASE_STORAGE_BLOCKSSTABLE_VECTOR_INDEX_OB_IVF_BUILD_STATE_H_
 
+#include "storage/blocksstable/vector_index/ob_ivf_vector_ids.h"
 #include "storage/blocksstable/vector_index/ob_ivf_build_interfaces.h"
 #include "lib/container/ob_array.h"
 #include "lib/container/ob_2d_array.h"
@@ -25,46 +26,43 @@ using common::ObFixedArray;
 
 struct ObIVFHierarchyVIDList
 {
-  explicit ObIVFHierarchyVIDList(ObIAllocator &allocator)
-    : vids_(), vector_idxs_(), identity_(false), sealed_(false)
+  explicit ObIVFHierarchyVIDList(ObIAllocator &allocator, bool use_position_ids = false)
+      : vids_(share::vector_array_allocator(allocator)), vector_idxs_(share::vector_array_allocator(allocator)),
+        identity_(false), sealed_(false)
   {
-    vids_.set_block_allocator(ObWrapperAllocator(allocator));
-    vector_idxs_.set_block_allocator(ObWrapperAllocator(allocator));
+    if (use_position_ids) { vids_.alias_positions(vector_idxs_); }
   }
-  ObArray<ObIVFVectorVID, ObWrapperAllocator> vids_;
-  ObArray<int64_t, ObWrapperAllocator> vector_idxs_;
+  ObIVFVectorIDs vids_;
+  share::ObVectorArray<int64_t> vector_idxs_;
   // The root covers all_vids_[0, N) in identity order. Keeping that relation
   // implicit avoids materializing another VID array and another dense-index
-  // array for every vector. Child/member lists remain normally owned arrays.
+  // array for every vector. PosID member lists own only vector_idxs_; their
+  // numerical IDs alias those positions rather than owning a second array.
   bool identity_;
   bool sealed_;
-  TO_STRING_KV(K_(vids), K_(vector_idxs), K_(identity), K_(sealed));
+  TO_STRING_KV(K_(vids), "vector_idx_count", vector_idxs_.count(), K_(identity), K_(sealed));
 };
 
 struct ObIVFHierarchyMemberLists
 {
-  explicit ObIVFHierarchyMemberLists(ObIAllocator &allocator)
-    : lists_()
-  {
-    lists_.set_block_allocator(ObWrapperAllocator(allocator));
-  }
+  explicit ObIVFHierarchyMemberLists(ObIAllocator &allocator) : lists_(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ObWrapperAllocator(allocator)) {}
   ObArray<ObIVFHierarchyVIDList *, ObWrapperAllocator> lists_;
-  TO_STRING_KV(K_(lists));
+  TO_STRING_KV("list_count", lists_.count());
 };
 
 struct ObIVFHierarchyNodeState
 {
-  explicit ObIVFHierarchyNodeState(ObIAllocator &allocator)
-    : vid_list_(nullptr),
-      local_k_(0),
-      local_centers_(),
+  explicit ObIVFHierarchyNodeState(ObIAllocator &allocator, int64_t dimension = 1)
+      : vid_list_(nullptr), local_k_(0), local_centers_(share::vector_array_allocator(allocator)),
       member_lists_(nullptr), origin_cid_(-1)
   {
-    local_centers_.set_block_allocator(ObWrapperAllocator(allocator));
+
+    const int rc = local_centers_.set_dimension(dimension);
+    OB_ASSERT(rc == OB_SUCCESS);
   }
   ObIVFHierarchyVIDList *vid_list_;
   int64_t local_k_;
-  ObArray<float, ObWrapperAllocator> local_centers_;
+  share::ObVectorMatrix local_centers_;
   ObIVFHierarchyMemberLists *member_lists_;
   int64_t origin_cid_; // Dominant prior-local parent; inherited by split children.
   TO_STRING_KV(KP_(vid_list), K_(local_k), K_(local_centers),
@@ -111,7 +109,7 @@ struct ObIVFMergeResultSlot
   int64_t primary_posting_count_;
   int64_t secondary_posting_count_;
   int64_t local_k_;
-  ObArray<float, ObWrapperAllocator> *center_values_;
+  share::ObVectorMatrix *center_values_;
   // One CID per vector in the corresponding work-item range. VID and the
   // dense vector index are derivable from that range, so retaining a 24-byte
   // {cid, vid, vector_idx} tuple per row is unnecessary.
@@ -131,20 +129,19 @@ struct ObIVFDDLPlan;
 struct ObIVFMergeActivePlan
 {
   explicit ObIVFMergeActivePlan(ObIAllocator &allocator)
-    : plan_id_(-1), started_at_us_(0), stage_(ObIVFMergeStage::INVALID),
-      step_(ObIVFMergeStep::INVALID), depth_(IVF_MERGE_INVALID_DEPTH),
-      source_assign_(false), source_update_(nullptr), ddl_(nullptr)
+      : plan_id_(-1), started_at_us_(0), stage_(ObIVFMergeStage::INVALID), step_(ObIVFMergeStep::INVALID),
+        depth_(IVF_MERGE_INVALID_DEPTH), work_items_(share::vector_array_allocator(allocator)),
+        result_slots_(share::vector_array_allocator(allocator)), source_assign_(false), source_update_(nullptr),
+        ddl_(nullptr)
   {
-    work_items_.set_block_allocator(ObWrapperAllocator(allocator));
-    result_slots_.set_allocator(&allocator);
   }
   int64_t plan_id_;
   int64_t started_at_us_;
   ObIVFMergeStage stage_;
   ObIVFMergeStep step_;
   int64_t depth_;
-  ObArray<ObIVFMergeWorkItem, ObWrapperAllocator> work_items_;
-  ObFixedArray<ObIVFMergeResultSlot, ObIAllocator> result_slots_;
+  share::ObVectorArray<ObIVFMergeWorkItem> work_items_;
+  share::ObVectorArray<ObIVFMergeResultSlot> result_slots_;
   bool source_assign_;
   ObIVFSourceUpdate *source_update_;
   ObIVFDDLPlan *ddl_; // Present only for INITIAL_BUILD source-order operations.
@@ -155,7 +152,7 @@ struct ObIVFHierarchyPendingLeaf
   ObIVFHierarchyPendingLeaf()
     : center_values_(nullptr), vid_list_(nullptr), origin_cid_(-1)
   {}
-  ObArray<float, ObWrapperAllocator> *center_values_;
+  share::ObVectorMatrix *center_values_;
   ObIVFHierarchyVIDList *vid_list_;
   int64_t origin_cid_;
   TO_STRING_KV(KP_(center_values), KP_(vid_list), K_(origin_cid));
@@ -176,15 +173,18 @@ int alloc_runtime_object(ObIAllocator &allocator, T *&object, Args&&... args)
 }
 
 template <typename T>
-int alloc_runtime_array(
-    ObIAllocator &allocator,
-    ObArray<T, ObWrapperAllocator> *&array)
+int alloc_runtime_array(ObIAllocator &allocator, ObArray<T, ObWrapperAllocator> *&array)
 {
   int ret = alloc_runtime_object(allocator, array);
   if (OB_SUCC(ret)) {
     array->set_block_allocator(ObWrapperAllocator(allocator));
   }
   return ret;
+}
+
+template <typename Array> int alloc_runtime_array(ObIAllocator &allocator, Array *&array)
+{
+  return alloc_runtime_object(allocator, array, share::vector_array_allocator(allocator));
 }
 
 template <typename T>
@@ -197,16 +197,16 @@ void free_runtime_object(ObIAllocator &allocator, T *&object)
   }
 }
 
-inline const ObIArray<ObIVFVectorVID> &get_vector_vids(
+inline ObIVFVectorIDView get_vector_vids(
     const ObIVFHierarchyVIDList &vid_list,
-    const ObIArray<ObIVFVectorVID> &all_vids)
+    const ObIVFVectorIDView &all_vids)
 {
   return vid_list.identity_ ? all_vids : vid_list.vids_;
 }
 
 inline int64_t get_vector_ref_count(
     const ObIVFHierarchyVIDList &vid_list,
-    const ObIArray<ObIVFVectorVID> &all_vids)
+    const ObIVFVectorIDView &all_vids)
 {
   return get_vector_vids(vid_list, all_vids).count();
 }
@@ -223,7 +223,7 @@ inline bool can_skip_hierarchy_center_stats(
 
 inline bool is_valid_vector_ref_list(
     const ObIVFHierarchyVIDList &vid_list,
-    const ObIArray<ObIVFVectorVID> &all_vids)
+    const ObIVFVectorIDView &all_vids)
 {
   return vid_list.identity_
       ? vid_list.vids_.empty() && vid_list.vector_idxs_.empty()
@@ -233,13 +233,13 @@ inline bool is_valid_vector_ref_list(
 
 inline int get_vector_ref(
     const ObIVFHierarchyVIDList &vid_list,
-    const ObIArray<ObIVFVectorVID> &all_vids,
+    const ObIVFVectorIDView &all_vids,
     const int64_t offset,
     ObIVFVectorVID &vid,
     int64_t &vector_idx)
 {
   int ret = OB_SUCCESS;
-  const ObIArray<ObIVFVectorVID> &vids = get_vector_vids(vid_list, all_vids);
+  const ObIVFVectorIDView &vids = get_vector_vids(vid_list, all_vids);
   if (!is_valid_vector_ref_list(vid_list, all_vids)
       || offset < 0 || offset >= vids.count()) {
     ret = OB_INVALID_ARGUMENT;
@@ -256,7 +256,7 @@ inline int get_vector_ref(
   return ret;
 }
 
-inline bool are_finite_center_values(const common::ObIArray<float> &values)
+inline bool are_finite_center_values(const share::ObVectorMatrix &values)
 {
   bool are_finite = true;
   for (int64_t i = 0; are_finite && i < values.count(); ++i) {
@@ -280,17 +280,22 @@ struct ObIVFMergeRuntime
       cluster_size_(0),
       dimension_(0),
       enable_soar_(true),
-      all_vids_(), insertion_offsets_(), insertion_candidates_(),
+      all_vids_(share::vector_array_allocator(allocator)),
+      concat_postings_(share::vector_array_allocator(allocator)),
+      concat_keep_(share::vector_array_allocator(allocator)),
+      concat_offsets_(),
+      concat_counts_(),
+      insertion_offsets_(share::vector_array_allocator(allocator)), insertion_candidates_(share::vector_array_allocator(allocator)),
       insertion_prior_(nullptr), insertion_old_count_(0), insertion_routed_vectors_(0),
       insertion_source_input_count_(0), insertion_reused_posting_count_(0),
-      insertion_delta_vids_(), insertion_delta_idxs_(), insertion_origins_(),
-      insertion_source_offsets_(), insertion_source_idxs_(),
+      insertion_delta_vids_(share::vector_array_allocator(allocator)), insertion_delta_idxs_(share::vector_array_allocator(allocator)), insertion_origins_(),
+      insertion_source_offsets_(), insertion_source_idxs_(share::vector_array_allocator(allocator)),
       insertion_child_offsets_(), insertion_child_cids_(), insertion_reuse_cids_(), insertion_posting_counts_(),
       first_level_samples_(nullptr),
       current_nodes_(),
       active_plan_(nullptr),
       cluster_sample_plan_(nullptr),
-      c0_(),
+      c0_(share::vector_array_allocator(allocator)),
       initial_member_lists_(),
       a0_(nullptr),
       neighborhood_mode_(ObIVFNeighborhoodMode::INVALID),
@@ -332,25 +337,16 @@ struct ObIVFMergeRuntime
       no_progress_member_count_(0),
       canceled_(0)
   {
-    all_vids_.set_block_allocator(ObWrapperAllocator(allocator));
-    concat_postings_.set_block_allocator(ObWrapperAllocator(allocator));
-    concat_keep_.set_block_allocator(ObWrapperAllocator(allocator));
+    initial_member_lists_.set_block_allocator(ObWrapperAllocator(allocator));
     concat_offsets_.set_block_allocator(ObWrapperAllocator(allocator));
     concat_counts_.set_block_allocator(ObWrapperAllocator(allocator));
-    insertion_offsets_.set_block_allocator(ObWrapperAllocator(allocator));
-    insertion_candidates_.set_block_allocator(ObWrapperAllocator(allocator));
-    insertion_delta_vids_.set_block_allocator(ObWrapperAllocator(allocator));
-    insertion_delta_idxs_.set_block_allocator(ObWrapperAllocator(allocator));
     insertion_origins_.set_block_allocator(ObWrapperAllocator(allocator));
     insertion_source_offsets_.set_block_allocator(ObWrapperAllocator(allocator));
-    insertion_source_idxs_.set_block_allocator(ObWrapperAllocator(allocator));
     insertion_child_offsets_.set_block_allocator(ObWrapperAllocator(allocator));
     insertion_child_cids_.set_block_allocator(ObWrapperAllocator(allocator));
     insertion_reuse_cids_.set_block_allocator(ObWrapperAllocator(allocator));
     insertion_posting_counts_.set_block_allocator(ObWrapperAllocator(allocator));
     current_nodes_.set_block_allocator(ObWrapperAllocator(allocator));
-    c0_.set_block_allocator(ObWrapperAllocator(allocator));
-    initial_member_lists_.set_block_allocator(ObWrapperAllocator(allocator));
   }
 
   ObIVFDDLRuntime *ddl_runtime_;
@@ -364,25 +360,25 @@ struct ObIVFMergeRuntime
   int64_t cluster_size_;
   int64_t dimension_;
   bool enable_soar_;
-  ObArray<ObIVFVectorVID, ObWrapperAllocator> all_vids_;
+  ObIVFVectorIDs all_vids_;
   // Indices into prior_->postings_, sorted by source CID/VID after output-key
   // deduplication. Copy tasks validate every input relation, including losers.
-  ObArray<int64_t, ObWrapperAllocator> concat_postings_;
-  ObArray<uint8_t, ObWrapperAllocator> concat_keep_;
+  share::ObVectorArray<int64_t> concat_postings_;
+  share::ObVectorArray<uint8_t> concat_keep_;
   ObArray<int64_t, ObWrapperAllocator> concat_offsets_;
   ObArray<uint32_t, ObWrapperAllocator> concat_counts_;
-  ObArray<int64_t, ObWrapperAllocator> insertion_offsets_;
-  ObArray<int64_t, ObWrapperAllocator> insertion_candidates_;
+  share::ObVectorArray<int64_t> insertion_offsets_;
+  share::ObVectorArray<int64_t> insertion_candidates_;
   const ObIVFMergePrior *insertion_prior_; // Separate from the retired PRIOR step state.
   int64_t insertion_old_count_;
   int64_t insertion_routed_vectors_;
   int64_t insertion_source_input_count_;
   int64_t insertion_reused_posting_count_;
-  ObArray<ObIVFVectorVID, ObWrapperAllocator> insertion_delta_vids_;
-  ObArray<int64_t, ObWrapperAllocator> insertion_delta_idxs_;
+  share::ObVectorArray<ObIVFVectorVID> insertion_delta_vids_;
+  share::ObVectorArray<int64_t> insertion_delta_idxs_;
   ObArray<int64_t, ObWrapperAllocator> insertion_origins_;
   ObArray<int64_t, ObWrapperAllocator> insertion_source_offsets_;
-  ObArray<int64_t, ObWrapperAllocator> insertion_source_idxs_;
+  share::ObVectorArray<int64_t> insertion_source_idxs_;
   ObArray<int64_t, ObWrapperAllocator> insertion_child_offsets_;
   ObArray<int64_t, ObWrapperAllocator> insertion_child_cids_;
   ObArray<int64_t, ObWrapperAllocator> insertion_reuse_cids_;
@@ -391,25 +387,25 @@ struct ObIVFMergeRuntime
   ObArray<ObIVFHierarchyNodeState *, ObWrapperAllocator> current_nodes_;
   ObIVFMergeActivePlan *active_plan_;
   ObIVFMergeActivePlan *cluster_sample_plan_;
-  ObArray<float, ObWrapperAllocator> c0_;
+  share::ObVectorMatrix c0_;
   ObArray<ObIVFHierarchyVIDList *, ObWrapperAllocator> initial_member_lists_;
-  ObArray<int64_t, ObWrapperAllocator> *a0_;
+  share::ObVectorArray<int64_t> *a0_;
   ObIVFNeighborhoodMode neighborhood_mode_;
   bool neighborhood_started_;
   bool neighborhood_add_finished_;
   bool neighborhood_finished_;
   ObArray<int64_t, ObWrapperAllocator> *g0_offsets_;
-  ObArray<int64_t, ObWrapperAllocator> *g0_cids_;
+  share::ObVectorArray<int64_t> *g0_cids_;
   ObArray<float, ObWrapperAllocator> *g0_max_distances_;
-  ObArray<float, ObWrapperAllocator> *working_centers_;
-  ObArray<int64_t, ObWrapperAllocator> *refined_assignments_;
+  share::ObVectorMatrix *working_centers_;
+  share::ObVectorArray<int64_t> *refined_assignments_;
   ObIVFHierarchyMemberLists *refined_member_lists_;
   ObArray<uint8_t, ObWrapperAllocator> *changed_cids_;
   bool refine_skipped_;
   bool refine_has_changes_;
   bool refine_finished_;
   ObArray<int64_t, ObWrapperAllocator> *old_to_new_;
-  ObArray<float, ObWrapperAllocator> *c1_;
+  share::ObVectorMatrix *c1_;
   blocksstable::ObIvfCentroidLayout centroid_layout_;
   bool centroid_route_reused_;
   ObIVFParentCentroidBuilder *parent_builder_;
@@ -417,10 +413,10 @@ struct ObIVFMergeRuntime
   int64_t parent_threshold_;
   ObIVFHierarchyMemberLists *final_member_lists_;
   ObArray<int64_t, ObWrapperAllocator> *g1_offsets_;
-  ObArray<int64_t, ObWrapperAllocator> *g1_cids_;
+  share::ObVectorArray<int64_t> *g1_cids_;
   ObArray<float, ObWrapperAllocator> *g1_max_distances_;
-  ObArray<int64_t, ObWrapperAllocator> *a1_;
-  ObArray<int64_t, ObWrapperAllocator> *a2_;
+  share::ObVectorArray<int64_t> *a1_;
+  share::ObVectorArray<int64_t> *a2_;
   ObIVFHierarchyMemberLists *soar_member_lists_;
   int64_t final_cluster_count_;
   int64_t secondary_assignment_count_;

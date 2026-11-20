@@ -33,10 +33,218 @@
 #include <queue>
 #include <thread>
 #include <vector>
+#include <unordered_map>
+#include <sys/mman.h>
 
 namespace oceanbase {
 namespace share {
 namespace {
+
+// Reserve address space without committing the entire logical payload. The
+// allocator rejects every large contiguous request, including directory growth.
+class BoundedBuildTestAllocator final : public common::ObIAllocator
+{
+public:
+  int64_t largest_request_ = 0;
+  int64_t remaining_allocations_ = -1;
+  std::unordered_map<void *, int64_t> allocations_;
+  void *alloc(const int64_t size) override
+  {
+    largest_request_ = std::max(largest_request_, size);
+    if (size <= 0 || size > (1L << 20) || remaining_allocations_ == 0) { return nullptr; }
+    if (remaining_allocations_ > 0) { --remaining_allocations_; }
+    void *p = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) { return nullptr; }
+    allocations_[p] = size;
+    return p;
+  }
+  void *alloc(const int64_t size, const common::ObMemAttr &) override { return alloc(size); }
+  void free(void *p) override
+  {
+    if (p != nullptr) {
+      auto it = allocations_.find(p);
+      ASSERT_NE(allocations_.end(), it);
+      EXPECT_EQ(0, munmap(p, it->second));
+      allocations_.erase(it);
+    }
+  }
+};
+
+TEST(TestVectorBuildArray, scalar_index_exceeds_uint32_with_bounded_allocations)
+{
+  BoundedBuildTestAllocator allocator;
+  {
+    share::ObVectorArray<int64_t> values(share::vector_array_allocator(allocator));
+    const int64_t count = static_cast<int64_t>(UINT32_MAX) + 17;
+    ASSERT_EQ(common::OB_SUCCESS, share::vector_array_resize(values, count, false));
+    ASSERT_EQ(count, values.count());
+    values.at(0) = 11;
+    values.at((1L << 29) - 1) = 22; // Immediately below the 4 GiB byte boundary.
+    values.at(1L << 29) = 33;
+    values.at(static_cast<int64_t>(UINT32_MAX) + 1) = 44;
+    values.at(count - 1) = 55;
+    const share::ObVectorArray<int64_t> &view(values);
+    EXPECT_EQ(11, view.at(0));
+    EXPECT_EQ(22, view.at((1L << 29) - 1));
+    EXPECT_EQ(33, view.at(1L << 29));
+    EXPECT_EQ(44, view.at(static_cast<int64_t>(UINT32_MAX) + 1));
+    EXPECT_EQ(55, view.at(count - 1));
+    EXPECT_LE(allocator.largest_request_, 1L << 20);
+  }
+  EXPECT_TRUE(allocator.allocations_.empty());
+}
+
+TEST(TestVectorBuildArray, allocator_binding_and_failed_reserve_preserve_owned_state)
+{
+  BoundedBuildTestAllocator allocator;
+  {
+    share::ObVectorArray<int64_t> values(share::vector_array_allocator(allocator));
+
+    ASSERT_EQ(common::OB_SUCCESS, share::vector_array_resize(values, 300000));
+    share::vector_array_fill(values, 31);
+    EXPECT_EQ(31, values.at(299999));
+    share::ObVectorArray<int64_t> source(share::vector_array_allocator(allocator));
+    ASSERT_EQ(common::OB_SUCCESS, share::vector_array_resize(source, 500000));
+    share::vector_array_fill(source, 47);
+    allocator.remaining_allocations_ = 0;
+    EXPECT_EQ(common::OB_ALLOCATE_MEMORY_FAILED, values.reserve(source.count()));
+    ASSERT_EQ(300000, values.count());
+    EXPECT_EQ(31, values.at(0)); EXPECT_EQ(31, values.at(299999));
+    allocator.remaining_allocations_ = -1;
+    ASSERT_EQ(common::OB_SUCCESS, values.assign(source));
+    EXPECT_EQ(500000, values.count()); EXPECT_EQ(47, values.at(499999));
+  }
+  EXPECT_TRUE(allocator.allocations_.empty());
+}
+
+TEST(TestVectorBuildArray, vectors_remain_contiguous_above_four_gib)
+{
+  BoundedBuildTestAllocator allocator;
+  {
+    share::ObVectorMatrix matrix(share::vector_array_allocator(allocator));
+    const int64_t dim = 768; // A block must end on a row, not a power-of-two float boundary.
+    const int64_t rows = (1L << 32) / (dim * sizeof(float)) + 3;
+    ASSERT_EQ(common::OB_SUCCESS, matrix.set_dimension(dim));
+    ASSERT_EQ(common::OB_SUCCESS, matrix.resize(rows * dim, false));
+    const int64_t block_rows = (1L << 20) / (dim * sizeof(float));
+    for (int64_t row : {0L, block_rows - 1, block_rows, rows - 1}) {
+      float *v = matrix.data_at(row * dim, dim);
+      for (int64_t d = 0; d < dim; ++d) { v[d] = static_cast<float>(d + row % 1000); }
+      for (int64_t d = 0; d < dim; ++d) { EXPECT_FLOAT_EQ(v[d], matrix.at(row * dim + d)); }
+    }
+    EXPECT_LE(allocator.largest_request_, 1L << 20);
+  }
+  EXPECT_TRUE(allocator.allocations_.empty());
+}
+
+TEST(TestVectorBuildArray, failed_growth_preserves_values_and_can_retry)
+{
+  BoundedBuildTestAllocator allocator;
+  {
+    share::ObVectorArray<int64_t> values(share::vector_array_allocator(allocator));
+    ASSERT_EQ(common::OB_SUCCESS, values.push_back(17));
+    ASSERT_EQ(common::OB_SUCCESS, values.push_back(values.at(0)));
+    allocator.remaining_allocations_ = 1; // Grow the first block, then fail the next allocation.
+    EXPECT_EQ(common::OB_ALLOCATE_MEMORY_FAILED, values.reserve(300000));
+    ASSERT_EQ(2, values.count());
+    EXPECT_EQ(17, values.at(0)); EXPECT_EQ(17, values.at(1));
+    allocator.remaining_allocations_ = -1;
+    ASSERT_EQ(common::OB_SUCCESS, share::vector_array_resize(values, 300000));
+    EXPECT_EQ(17, values.at(0)); EXPECT_EQ(17, values.at(1));
+    values.at(299999) = 19;
+    EXPECT_EQ(19, values.at(299999));
+  }
+  EXPECT_TRUE(allocator.allocations_.empty());
+}
+
+TEST(TestVectorBuildArray, copy_and_sort_cross_block_boundaries)
+{
+  share::ObVectorArray<int64_t> values;
+  ASSERT_EQ(common::OB_SUCCESS, share::vector_array_resize(values, 150000));
+  for (int64_t i = 0; i < values.count(); ++i) { values.at(i) = values.count() - i; }
+  lib::ob_sort(share::vector_array_begin(values), share::vector_array_end(values));
+  EXPECT_EQ(1, values.at(0)); EXPECT_EQ(150000, values.at(149999));
+  common::ObArray<int64_t> flat;
+  for (int64_t i = 0; i < values.count(); ++i) {
+    ASSERT_EQ(common::OB_SUCCESS, flat.push_back(values.at(i)));
+  }
+  ASSERT_EQ(values.count(), flat.count());
+  for (int64_t i : {0L, 131071L, 131072L, 149999L}) { EXPECT_EQ(values.at(i), flat.at(i)); }
+  share::ObVectorArray<int64_t> copy;
+  ASSERT_EQ(common::OB_SUCCESS, copy.assign((flat)));
+  ASSERT_EQ(common::OB_SUCCESS, copy.assign((copy)));
+  EXPECT_EQ(values.count(), copy.count()); EXPECT_EQ(150000, copy.at(149999));
+}
+
+TEST(TestVectorBuildArray, row_padding_copy_and_reuse)
+{
+  BoundedBuildTestAllocator allocator;
+  for (const int64_t dim : {3L, 768L, 1024L, 1536L, 4096L}) {
+    {
+      share::ObVectorMatrix values{share::vector_array_allocator(allocator)};
+      const int64_t block_rows = (1L << 20) / (dim * sizeof(float));
+      const int64_t n = (block_rows + 2) * dim;
+      ASSERT_EQ(common::OB_SUCCESS, values.set_dimension(dim));
+      ASSERT_EQ(common::OB_SUCCESS, values.resize(n, false));
+      std::vector<float> input(n), output(n);
+      for (int64_t i = 0; i < n; ++i) {
+        input[i] = i % 257;
+      }
+      share::ObVectorMatrix &ref(values);
+      ref.copy_from(0, input.data(), n);
+      ((values)).copy_to(0, n, output.data());
+      EXPECT_EQ(input, output);
+      for (const int64_t row : {0L, block_rows - 1, block_rows, block_rows + 1}) {
+        const float *vector = values.data_at(row * dim, dim);
+        EXPECT_EQ(0, MEMCMP(vector, input.data() + row * dim, dim * sizeof(float)));
+      }
+      EXPECT_EQ(common::OB_STATE_NOT_MATCH, values.set_dimension(dim + 1));
+      values.reuse();
+      ASSERT_EQ(common::OB_SUCCESS, values.resize(dim * 2));
+      for (int64_t i = 0; i < values.count(); ++i) {
+        EXPECT_FLOAT_EQ(0, values.at(i));
+      }
+      values.reset();
+      EXPECT_EQ(common::OB_SUCCESS, values.set_dimension(dim + 1));
+    }
+    EXPECT_TRUE(allocator.allocations_.empty());
+  }
+  EXPECT_LE(allocator.largest_request_, 1L << 20);
+}
+
+struct BuildArrayTrackedValue
+{
+  static int64_t live_;
+  BuildArrayTrackedValue() : value_(0) { ++live_; }
+  explicit BuildArrayTrackedValue(int64_t value) : value_(value) { ++live_; }
+  BuildArrayTrackedValue(const BuildArrayTrackedValue &other) : value_(other.value_) { ++live_; }
+  ~BuildArrayTrackedValue() { --live_; }
+  TO_STRING_KV(K_(value));
+  int64_t value_;
+};
+int64_t BuildArrayTrackedValue::live_ = 0;
+
+TEST(TestVectorBuildArray, nontrivial_values_are_destroyed_once)
+{
+  {
+    share::ObVectorArray<BuildArrayTrackedValue> values;
+    ASSERT_EQ(common::OB_SUCCESS, share::vector_array_resize(values, 6));
+    EXPECT_EQ(6, BuildArrayTrackedValue::live_);
+    values.at(0).value_ = 19;
+    ASSERT_EQ(common::OB_SUCCESS, values.reserve(100));
+    EXPECT_EQ(6, BuildArrayTrackedValue::live_);
+    EXPECT_EQ(19, values.at(0).value_);
+    ASSERT_EQ(common::OB_SUCCESS, share::vector_array_resize(values, 2));
+    EXPECT_EQ(2, BuildArrayTrackedValue::live_);
+    values.reuse();
+    EXPECT_EQ(0, BuildArrayTrackedValue::live_);
+    ASSERT_EQ(common::OB_SUCCESS, values.push_back(BuildArrayTrackedValue(23)));
+    EXPECT_EQ(1, BuildArrayTrackedValue::live_);
+    EXPECT_EQ(23, values.at(0).value_);
+  }
+  EXPECT_EQ(0, BuildArrayTrackedValue::live_);
+}
 
 enum class TestDistanceType {
   L2,
@@ -1689,10 +1897,11 @@ TEST(TestVectorHcaEndToEnd, RefinePrefetchPreservesTrainingAndPropagatesErrors) 
     mutable int64_t batches_ = 0;
     mutable int64_t reads_ = 0;
     int error_ = OB_SUCCESS;
-    int prefetch_vectors(const int64_t *indices, int64_t count) const override {
+    int prefetch_vectors(const share::ObVectorArray<int64_t> &indices, int64_t count) const override
+    {
       ++batches_;
       for (int64_t i = 0; i < count; ++i) {
-        if (indices[i] < 0 || indices[i] >= this->count() || (i && indices[i] < indices[i - 1])) {
+        if (indices.at(i) < 0 || indices.at(i) >= this->count() || (i && indices.at(i) < indices.at(i - 1))) {
           return OB_INVALID_ARGUMENT;
         }
       }

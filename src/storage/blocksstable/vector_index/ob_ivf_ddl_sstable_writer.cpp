@@ -82,7 +82,7 @@ int ObIVFDDLSSTableWriter::prepare_loaded_output(int64_t center_count, int64_t p
   } else if (OB_FAIL(leaf_posting_counts_.prepare_allocate(center_count))) {
     LOG_WARN("[DISK_BBQ] failed to allocate loaded leaf posting counts", K(ret), K(center_count));
   } else {
-    MEMSET(leaf_posting_counts_.get_data(), 0, center_count * sizeof(uint32_t));
+    std::fill_n(leaf_posting_counts_.get_data(), leaf_posting_counts_.count(), 0);
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
     void *memory = allocator_.alloc(sizeof(ObIVFPostingShard));
@@ -202,7 +202,7 @@ int ObIVFDDLSSTableWriter::append_ddl_row_(ObITabletSliceWriter &writer, int64_t
   return writer.append_row(row);
 }
 
-int ObIVFDDLSSTableWriter::write_center_range_(const ObIArray<float> &centers,
+int ObIVFDDLSSTableWriter::write_center_range_(const share::ObVectorMatrix &centers,
     int64_t dim, int64_t begin, int64_t end)
 {
   int ret = ATOMIC_LOAD(&loaded_write_error_);
@@ -424,7 +424,7 @@ ObIVFDDLSSTableWriter::ObIVFDDLSSTableWriter(
     posting_shards_(),
     posting_shard_count_(0),
     posting_center_count_(0),
-    leaf_posting_counts_(),
+    leaf_posting_counts_(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ObWrapperAllocator(allocator)),
     centers_started_(false), centers_finished_(false),
     raw_ranges_(),
     snapshot_version_(0),
@@ -448,7 +448,6 @@ ObIVFDDLSSTableWriter::ObIVFDDLSSTableWriter(
     quantization_finished_(false),
     raw_write_finished_(false)
 {
-  leaf_posting_counts_.set_block_allocator(ObWrapperAllocator(allocator));
 }
 
 int ObIVFDDLSSTableWriter::set_leaf_posting_counts(const ObIArray<uint32_t> &counts)
@@ -691,13 +690,9 @@ int ObIVFDDLSSTableWriter::append_sort_row_(
   return ret;
 }
 
-int ObIVFDDLSSTableWriter::quantize_cluster(
-    ObIVFVectorReader &reader,
-    const ObIArray<float> &final_centers,
-    const int64_t center_count,
-    const int64_t cid,
-    const ObIArray<ObIVFVectorVID> &primary_member_vids,
-    const ObIArray<ObIVFVectorVID> *secondary_member_vids)
+int ObIVFDDLSSTableWriter::quantize_cluster(ObIVFVectorReader &reader, const share::ObVectorMatrix &final_centers,
+    const int64_t center_count, const int64_t cid, const ObIVFVectorIDView &primary_member_vids,
+    const storage::ObIVFVectorIDView *secondary_member_vids)
 {
   int ret = OB_SUCCESS;
   ObArenaAllocator task_allocator(
@@ -707,8 +702,7 @@ int ObIVFDDLSSTableWriter::quantize_cluster(
   ObArray<ObIVFVectorVID, ObWrapperAllocator> posting_vids;
   // Both the writer and reader reuse this buffer. Retain its capacity because
   // the task arena only frees old allocations when the entire range finishes.
-  ObSEArray<float, 16, ObWrapperAllocator> vectors(
-      OB_MALLOC_NORMAL_BLOCK_SIZE, ObWrapperAllocator(task_allocator));
+  share::ObVectorMatrix vectors(share::vector_array_allocator(task_allocator));
   char *one_bit_codes = nullptr;
   const float *center = nullptr;
   float *rotated_center = nullptr;
@@ -935,7 +929,7 @@ int ObIVFDDLSSTableWriter::append_loaded_rows_(const ObIArray<ObIVFBuildRow> &ro
   return ret;
 }
 
-int ObIVFDDLSSTableWriter::write_loaded_centers(const ObIArray<float> &centers,
+int ObIVFDDLSSTableWriter::write_loaded_centers(const share::ObVectorMatrix &centers,
     int64_t dim, int64_t begin, int64_t end)
 {
   if (posting_shard_count_ > 0) { return write_center_range_(centers, dim, begin, end); }
@@ -990,8 +984,8 @@ int ObIVFDDLSSTableWriter::write_loaded_centers(const ObIArray<float> &centers,
   return ret;
 }
 
-int ObIVFDDLSSTableWriter::quantize_loaded_vectors(const ObIArray<float> &centers, int64_t dim,
-    const ObIArray<ObIVFVectorVID> &vids, const ObIArray<float> &vectors,
+int ObIVFDDLSSTableWriter::quantize_loaded_vectors(const share::ObVectorMatrix &centers, int64_t dim,
+    const ObIVFVectorIDView &vids, const share::ObVectorMatrix &vectors,
     const ObIArray<int64_t> &primary, const ObIArray<int64_t> *secondary)
 {
   int ret = OB_SUCCESS;
@@ -1194,7 +1188,7 @@ int ObIVFDDLSSTableWriter::finish_quantization(
 
 int ObIVFDDLSSTableWriter::write_raw_vectors(
     ObIVFVectorReader &reader,
-    const ObIArray<ObIVFVectorVID> &all_vids,
+    const ObIVFVectorIDView &all_vids,
     const int64_t vid_begin,
     const int64_t vid_end,
     const int64_t task_idx)
@@ -1204,11 +1198,14 @@ int ObIVFDDLSSTableWriter::write_raw_vectors(
       ObMemAttr(MTL_ID(), "IVFRawWrite", ObCtxIds::VECTOR_CTX_ID));
   // Both the writer and reader reuse this buffer. Retain its capacity because
   // the task arena only frees old allocations when the entire range finishes.
-  ObSEArray<float, 16, ObWrapperAllocator> vectors(
-      OB_MALLOC_NORMAL_BLOCK_SIZE, ObWrapperAllocator(task_allocator));
+  share::ObVectorMatrix vectors(share::vector_array_allocator(task_allocator));
   ObDatumRow row;
   ObITabletSliceWriter *writer = nullptr;
   ObIVFDDLWriterGuard writer_guard(raw_writer_provider_, writer);
+  ObArray<ObIVFVectorVID, ObWrapperAllocator> output_vids(
+      IVF_DDL_QUANTIZE_BATCH_SIZE * sizeof(ObIVFVectorVID), ObWrapperAllocator(task_allocator));
+  bool have_previous_vid = false;
+  uint64_t previous_vid = 0;
   int64_t written_row_count = 0;
   const int64_t physical_column_count = row_desc_.payload_col_idx_ + 1;
   if (!is_inited_ || OB_ISNULL(raw_writer_provider_)
@@ -1260,9 +1257,10 @@ int ObIVFDDLSSTableWriter::write_raw_vectors(
        batch_begin += IVF_DDL_QUANTIZE_BATCH_SIZE) {
     const int64_t batch_end = MIN(vid_end, batch_begin + IVF_DDL_QUANTIZE_BATCH_SIZE);
     vectors.reuse();
-    if (OB_FAIL(reader.batch_get_by_vid(all_vids, batch_begin, batch_end, vectors))) {
+    if (OB_FAIL(reader.batch_get_output(all_vids, batch_begin, batch_end, vectors, output_vids))) {
       LOG_WARN("failed to read IVF DDL RAW batch", K(ret), K(batch_begin), K(batch_end));
-    } else if (vectors.count() != (batch_end - batch_begin) * vector_dim_) {
+    } else if (vectors.count() != (batch_end - batch_begin) * vector_dim_
+        || output_vids.count() != batch_end - batch_begin) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected IVF DDL RAW batch size", K(ret), K(batch_begin), K(batch_end));
     }
@@ -1271,7 +1269,10 @@ int ObIVFDDLSSTableWriter::write_raw_vectors(
       if (!input_vectors_are_rotated_ && OB_FAIL(rotator_.rotate(vector_dim_, vector))) {
         LOG_WARN("failed to rotate IVF DDL RAW vector", K(ret), K(i));
       } else {
-        row.storage_datums_[row_desc_.vector_id_col_idx_].set_uint(all_vids.at(i));
+        const uint64_t vid = output_vids.at(i - batch_begin);
+        if (have_previous_vid && previous_vid >= vid) { ret = OB_INVALID_DATA; break; }
+        have_previous_vid = true; previous_vid = vid;
+        row.storage_datums_[row_desc_.vector_id_col_idx_].set_uint(vid);
         row.storage_datums_[row_desc_.payload_col_idx_].set_string(ObString(
             static_cast<int32_t>(vector_dim_ * sizeof(float)),
             reinterpret_cast<const char *>(vector)));

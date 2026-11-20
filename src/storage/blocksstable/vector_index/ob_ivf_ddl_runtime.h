@@ -6,6 +6,7 @@
 #ifndef OCEANBASE_STORAGE_BLOCKSSTABLE_VECTOR_INDEX_OB_IVF_DDL_RUNTIME_H_
 #define OCEANBASE_STORAGE_BLOCKSSTABLE_VECTOR_INDEX_OB_IVF_DDL_RUNTIME_H_
 
+#include "storage/blocksstable/vector_index/ob_ivf_vector_ids.h"
 #include "storage/blocksstable/vector_index/ob_ivf_build_state.h"
 #include "storage/blocksstable/vector_index/ob_ivf_replay_input.h"
 #include "lib/lock/ob_spin_lock.h"
@@ -21,23 +22,16 @@ using common::ObMemAttr;
 using common::Ob2DArray;
 using common::ObSpinLock;
 
-struct ObIVFSourceRoute
-{
-  ObIVFSourceRoute() : vector_idx_(0), node_idx_(-1) {}
-  uint32_t vector_idx_;
-  int32_t node_idx_;
-  TO_STRING_KV(K_(vector_idx), K_(node_idx));
-};
-
 // Each worker owns a disjoint interval of the source-sorted sample requests.
+// The vector index is recovered from the existing node member/sample list.
+// PosID input uses source_ directly; neither path needs another index field.
 struct ObIVFClusterRead
 {
-  uint32_t source_;
-  uint32_t vector_idx_;
-  uint32_t node_idx_;
-  uint32_t ordinal_;
+  int64_t source_;
+  int64_t node_idx_;
+  int64_t ordinal_;
   bool operator<(const ObIVFClusterRead &other) const { return source_ < other.source_; }
-  TO_STRING_KV(K_(source), K_(vector_idx), K_(node_idx), K_(ordinal));
+  TO_STRING_KV(K_(source), K_(node_idx), K_(ordinal));
 };
 
 struct ObIVFClusterSampleRange
@@ -51,10 +45,9 @@ struct ObIVFClusterSampleRange
 struct ObIVFClusterSampleShard
 {
   ObIVFClusterSampleShard()
-    : allocator_(ObMemAttr(MTL_ID(), "IVFClusterStore", common::ObCtxIds::VECTOR_CTX_ID)),
-      samples_(allocator_)
+      : allocator_(ObMemAttr(MTL_ID(), "IVFClusterStore", common::ObCtxIds::VECTOR_CTX_ID)), samples_(allocator_),
+        ranges_(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ModulePageAllocator(ObMemAttr(MTL_ID(), "IVFClusterRoute", common::ObCtxIds::VECTOR_CTX_ID)))
   {
-    ranges_.set_attr(ObMemAttr(MTL_ID(), "IVFClusterRoute", common::ObCtxIds::VECTOR_CTX_ID));
   }
   void reset()
   {
@@ -66,7 +59,7 @@ struct ObIVFClusterSampleShard
   ObArenaAllocator allocator_;
   ObIVFReplayInput samples_;
   ObArray<ObIVFClusterSampleRange> ranges_;
-  TO_STRING_KV(K_(ranges));
+  TO_STRING_KV("range_count", ranges_.count());
 };
 
 struct ObIVFUpdateLock
@@ -79,15 +72,14 @@ struct ObIVFSourceUpdate
 {
   explicit ObIVFSourceUpdate(ObIAllocator &allocator)
     : allocator_(ObMemAttr(MTL_ID(), "IVFUpdateStats", common::ObCtxIds::VECTOR_CTX_ID)),
-      items_(), sums_(ObWrapperAllocator(allocator_)), counts_(ObWrapperAllocator(allocator_))
+        items_(share::vector_array_allocator(allocator)), results_(share::vector_array_allocator(allocator)),
+        sums_(ObWrapperAllocator(allocator_)), counts_(ObWrapperAllocator(allocator_))
   {
-    items_.set_block_allocator(ObWrapperAllocator(allocator));
-    results_.set_allocator(&allocator);
   }
   ObArenaAllocator allocator_;
   // Original center order is retained for the existing hierarchy commit.
-  ObArray<ObIVFMergeWorkItem, ObWrapperAllocator> items_;
-  ObFixedArray<ObIVFMergeResultSlot, ObIAllocator> results_;
+  share::ObVectorArray<ObIVFMergeWorkItem> items_;
+  share::ObVectorArray<ObIVFMergeResultSlot> results_;
   Ob2DArray<float *, OB_MALLOC_BIG_BLOCK_SIZE, ObWrapperAllocator> sums_;
   Ob2DArray<int64_t, OB_MALLOC_BIG_BLOCK_SIZE, ObWrapperAllocator> counts_;
   // Protect only in-memory SIMD addition; no read, allocation or yield under
@@ -99,11 +91,11 @@ struct ObIVFSourceUpdate
 struct ObIVFDDLPlan
 {
   ObIVFDDLPlan()
-    : source_allocator_(ObMemAttr(MTL_ID(), "IVFSourcePlan", common::ObCtxIds::VECTOR_CTX_ID)),
-      source_routes_(ObWrapperAllocator(source_allocator_)),
-      source_cids_(ObWrapperAllocator(source_allocator_))
+      : cluster_requests_(ObMemAttr(MTL_ID(), "IVFClusterRoute", common::ObCtxIds::VECTOR_CTX_ID)),
+        source_allocator_(ObMemAttr(MTL_ID(), "IVFSourcePlan", common::ObCtxIds::VECTOR_CTX_ID)),
+        source_nodes_(ObWrapperAllocator(source_allocator_)),
+        source_vector_idxs_(ObWrapperAllocator(source_allocator_)), source_cids_(ObWrapperAllocator(source_allocator_))
   {
-    cluster_requests_.set_attr(ObMemAttr(MTL_ID(), "IVFClusterRoute", common::ObCtxIds::VECTOR_CTX_ID));
     cluster_shards_.set_attr(ObMemAttr(MTL_ID(), "IVFClusterRoute", common::ObCtxIds::VECTOR_CTX_ID));
   }
   ~ObIVFDDLPlan()
@@ -115,12 +107,18 @@ struct ObIVFDDLPlan
       }
     }
   }
-  ObArray<ObIVFClusterRead> cluster_requests_;
+  int64_t source_vector_index(int64_t source) const
+  {
+    return source_vector_idxs_.empty() ? source : source_vector_idxs_.at(source);
+  }
+  share::ObVectorArray<ObIVFClusterRead> cluster_requests_;
   ObArray<ObIVFClusterSampleShard *> cluster_shards_;
   ObArenaAllocator source_allocator_;
   // No growing arrays during execution. Workers own disjoint source ranges
   // and global CID entries; finish reads them only after all slots install.
-  Ob2DArray<ObIVFSourceRoute, OB_MALLOC_BIG_BLOCK_SIZE, ObWrapperAllocator> source_routes_;
+  Ob2DArray<int32_t, OB_MALLOC_BIG_BLOCK_SIZE, ObWrapperAllocator> source_nodes_;
+  // Only VID-based merge inputs need the source-to-vector permutation.
+  Ob2DArray<int64_t, OB_MALLOC_BIG_BLOCK_SIZE, ObWrapperAllocator> source_vector_idxs_;
   Ob2DArray<int32_t, OB_MALLOC_BIG_BLOCK_SIZE, ObWrapperAllocator> source_cids_;
 };
 
@@ -132,7 +130,7 @@ int gather_cluster_samples(ObIVFMergeRuntime &runtime, ObIVFMergeActivePlan &pla
     const int64_t task_idx);
 int train_cluster_samples(ObIVFMergeRuntime &runtime, ObIVFMergeAlgorithm &algorithm,
     ObIVFMergeActivePlan &samples, const ObIVFMergeWorkItem &item,
-    int64_t &local_k, ObIArray<float> &centers);
+    int64_t &local_k, share::ObVectorMatrix &centers);
 int prepare_source_assign(ObIVFMergeRuntime &runtime, ObIVFMergeActivePlan &plan, ObIAllocator &allocator);
 int prepare_source_update(ObIVFMergeRuntime &runtime, ObIVFMergeActivePlan &plan,
     ObIAllocator &allocator);
@@ -186,7 +184,7 @@ public:
   ObIVFRefinePhase refine_train_phase() const;
   int prepare_refine_phase(int64_t &count);
   int execute_refine_phase(int64_t begin, int64_t end);
-  int finish_refine_phase(ObIArray<float> &centers, bool &finished);
+  int finish_refine_phase(share::ObVectorMatrix &centers, bool &finished);
   bool handles(const ObIVFMergeRuntime &runtime, ObIVFMergeStep step,
       const ObIVFMergeQuantizer &output) const;
   int prepare(ObIVFMergeRuntime &runtime, ObIVFMergeActivePlan &plan,
@@ -194,8 +192,8 @@ public:
   int execute(ObIVFMergeRuntime &runtime, ObIVFMergeActivePlan &plan,
       int64_t task_idx, ObIVFMergeQuantizer &output);
   int finish_samples();
-  int assign_loaded_secondary(const ObIArray<float> &vectors, int64_t dimension,
-      const ObIArray<float> &centers, const ObIArray<int64_t> &primary,
+  int assign_loaded_secondary(const share::ObVectorMatrix &vectors, int64_t dimension,
+      const share::ObVectorMatrix &centers, const common::ObIArray<int64_t> &primary,
       const ObIVFNeighborGraphView *graph, ObIArray<int64_t> &secondary);
   int posting_error() const { return ATOMIC_LOAD(&soar_quant_error_); }
   void fail_postings(int ret) { if (ret != OB_SUCCESS) { (void)ATOMIC_BCAS(&soar_quant_error_, OB_SUCCESS, ret); } }
@@ -206,14 +204,16 @@ public:
 private:
   int prepare_routes(const ObIVFMergeRuntime &runtime);
   int prepare_refine_stats(const ObIVFMergeRuntime &runtime);
-  int read_batch(const ObIVFMergeRuntime &runtime, int64_t begin, int64_t end,
-      ObIArray<int64_t> &indices, ObIArray<float> &vectors, bool load_payload);
+  int read_batch(const ObIVFMergeRuntime &runtime, int64_t begin, int64_t end, share::ObVectorArray<int64_t> &indices,
+      share::ObVectorMatrix &vectors, bool load_payload, common::ObIArray<ObIVFVectorVID> *output_vids = nullptr);
   ObIAllocator &allocator_;
   ObIVFDDLHcaAdapter &algorithm_;
   const int64_t parallelism_;
   ObArenaAllocator route_allocator_;
-  Ob2DArray<uint32_t, OB_MALLOC_BIG_BLOCK_SIZE, ObWrapperAllocator> source_to_vector_;
+  share::ObVectorArray<int64_t> source_to_vector_;
   bool routes_ready_;
+  bool position_mode_;
+  int64_t source_count_;
   ObIVFSourceUpdate *refine_stats_;
   int soar_quant_error_;
   DISALLOW_COPY_AND_ASSIGN(ObIVFDDLRuntime);

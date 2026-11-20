@@ -31,8 +31,7 @@ bool needs_cluster_samples(const ObIVFMergeRuntime &runtime,
     const ObIVFMergeAlgorithm &algorithm, const int64_t depth)
 {
   return depth > 0 && runtime.vector_store_->supports_source_order() && !runtime.vector_store_->is_fully_memory_resident()
-      && algorithm.supports_prepared_cluster()
-      && runtime.all_vids_.count() <= UINT32_MAX && runtime.current_nodes_.count() <= UINT32_MAX;
+      && algorithm.supports_prepared_cluster();
 }
 
 int prepare_cluster_samples(ObIVFMergeRuntime &runtime, ObIVFMergeAlgorithm &algorithm,
@@ -44,10 +43,11 @@ int prepare_cluster_samples(ObIVFMergeRuntime &runtime, ObIVFMergeAlgorithm &alg
     return ret;
   }
   const int64_t started = ObTimeUtility::current_time();
-  ObArray<ObIVFClusterRead> &requests = plan.ddl_->cluster_requests_;
+  share::ObVectorArray<ObIVFClusterRead> &requests = plan.ddl_->cluster_requests_;
   // Unlike an arena, this allocator releases large ObArray::reuse() buffers.
-  ObArray<int64_t> ordinals;
-  ordinals.set_attr(ObMemAttr(MTL_ID(), "IVFClusterPrep", ObCtxIds::VECTOR_CTX_ID));
+
+  ObArray<int64_t> ordinals(
+      OB_MALLOC_NORMAL_BLOCK_SIZE, ModulePageAllocator(ObMemAttr(MTL_ID(), "IVFClusterPrep", ObCtxIds::VECTOR_CTX_ID)));
   int64_t sample_count = 0;
   for (int pass = 0; OB_SUCC(ret) && pass < 2; ++pass) {
     if (pass == 1 && OB_FAIL(requests.reserve(sample_count))) {
@@ -81,7 +81,7 @@ int prepare_cluster_samples(ObIVFMergeRuntime &runtime, ObIVFMergeAlgorithm &alg
         for (int64_t j = 0; OB_SUCC(ret) && j < ordinals.count(); ++j) {
           ObIVFVectorVID vid = 0;
           int64_t idx = -1, source = -1;
-          if (ordinals.at(j) < 0 || ordinals.at(j) > UINT32_MAX
+          if (ordinals.at(j) < 0
               || (j > 0 && ordinals.at(j - 1) >= ordinals.at(j))) {
             ret = OB_INVALID_DATA;
             LOG_WARN("invalid IVF cluster sample ordinal", K(ret), K(n), K(j), "ordinal", ordinals.at(j));
@@ -94,9 +94,7 @@ int prepare_cluster_samples(ObIVFMergeRuntime &runtime, ObIVFMergeAlgorithm &alg
             ret = OB_INVALID_DATA;
             LOG_WARN("invalid IVF cluster sample source", K(ret), K(n), K(idx), K(source));
           } else {
-            const ObIVFClusterRead request = {static_cast<uint32_t>(source),
-                static_cast<uint32_t>(idx), static_cast<uint32_t>(n),
-                static_cast<uint32_t>(ordinals.at(j))};
+            const ObIVFClusterRead request = {source, n, ordinals.at(j)};
             if (OB_FAIL(requests.push_back(request))) {
               LOG_WARN("failed to append IVF cluster sample request", K(ret), K(n), K(j), K(source));
             }
@@ -105,7 +103,9 @@ int prepare_cluster_samples(ObIVFMergeRuntime &runtime, ObIVFMergeAlgorithm &alg
       }
     }
   }
-  if (OB_SUCC(ret)) { lib::ob_sort(requests.begin(), requests.end()); }
+  if (OB_SUCC(ret)) {
+    lib::ob_sort(share::vector_array_begin(requests), share::vector_array_end(requests));
+  }
   // DDL workers or merge capture parallelism bound the shards. Cap concurrent sort
   // and read buffers to 1.5 GiB; a shard has a 32 MiB sorter plus 16 MiB input.
   const int64_t workers = runtime.ddl_runtime_ == nullptr
@@ -148,17 +148,20 @@ int gather_cluster_samples(ObIVFMergeRuntime &runtime, ObIVFMergeActivePlan &pla
   int ret = OB_SUCCESS;
   const int64_t started = ObTimeUtility::current_time();
   const int64_t dim = runtime.dimension_;
+  const bool position_ids = runtime.vector_store_->uses_position_ids();
   const int64_t rows_per_batch = MAX(1L, MIN(IVF_DDL_VECTORS_PER_TASK,
       (16L * 1024 * 1024 / sizeof(float)) / dim));
   const ObIVFMergeWorkItem &work = plan.work_items_.at(task_idx);
   ObIVFClusterSampleShard &shard = *plan.ddl_->cluster_shards_.at(task_idx);
-  const ObArray<ObIVFClusterRead> &requests = plan.ddl_->cluster_requests_;
+  const share::ObVectorArray<ObIVFClusterRead> &requests = plan.ddl_->cluster_requests_;
   // Keep capacity across caller/callee reuse(). If a large request exceeds
   // this block size, its allocation is still freed by ObArray's heap allocator.
-  ObArray<int64_t> idxs(IVF_DDL_VECTORS_PER_TASK * sizeof(int64_t));
-  ObArray<float> values(16L * 1024 * 1024);
-  idxs.set_attr(ObMemAttr(MTL_ID(), "IVFClusterPrep", ObCtxIds::VECTOR_CTX_ID));
-  values.set_attr(ObMemAttr(MTL_ID(), "IVFClusterPrep", ObCtxIds::VECTOR_CTX_ID));
+
+  share::ObVectorArray<int64_t> idxs(ObMemAttr(MTL_ID(), "IVFClusterPrep", ObCtxIds::VECTOR_CTX_ID));
+  share::ObVectorMatrix values(ObMemAttr(MTL_ID(), "IVFClusterPrep", ObCtxIds::VECTOR_CTX_ID));
+  if (OB_FAIL(values.set_dimension(dim))) {
+    return ret;
+  }
   ObIVFClusterSampleCompare compare;
   ObExternalSort<ObIVFSortItem, ObIVFClusterSampleCompare> sorter;
   // Borrow only unused bytes in this build's already-reserved quota. The
@@ -183,7 +186,20 @@ int gather_cluster_samples(ObIVFMergeRuntime &runtime, ObIVFMergeActivePlan &pla
         ret = OB_INVALID_DATA;
         LOG_WARN("unordered IVF cluster sample source", K(ret), K(task_idx), K(i), "source", requests.at(i).source_);
       } else {
-        if (OB_FAIL(idxs.push_back(requests.at(i).vector_idx_))) {
+        const auto &request = requests.at(i);
+        int64_t vector_idx = request.source_;
+        if (!position_ids) {
+          const ObIVFHierarchyNodeState *node = nullptr;
+          ObIVFVectorVID vid = 0;
+          if (request.node_idx_ < 0 || request.node_idx_ >= runtime.current_nodes_.count()
+              || nullptr == (node = runtime.current_nodes_.at(request.node_idx_)) || node->vid_list_ == nullptr) {
+            ret = OB_INVALID_DATA;
+            LOG_WARN("invalid IVF sample member node", K(ret), K(request));
+          } else if (OB_FAIL(get_vector_ref(*node->vid_list_, runtime.all_vids_, request.ordinal_, vid, vector_idx))) {
+            LOG_WARN("failed to recover IVF sample member index", K(ret), K(request));
+          }
+        }
+        if (OB_SUCC(ret) && OB_FAIL(idxs.push_back(vector_idx))) {
           LOG_WARN("failed to append IVF cluster sample index", K(ret), K(task_idx), K(i));
         }
       }
@@ -228,7 +244,7 @@ int gather_cluster_samples(ObIVFMergeRuntime &runtime, ObIVFMergeActivePlan &pla
         LOG_WARN("failed to read sorted IVF cluster sample", K(ret), K(task_idx));
       }
     } else if (OB_ISNULL(item) || item->cid_ < 0 || item->cid_ < previous_node
-        || item->cid_ >= shard.ranges_.count() || item->vid_ > UINT32_MAX
+        || item->cid_ >= shard.ranges_.count() || item->vid_ > INT64_MAX
         || (item->cid_ == previous_node && item->vid_ <= previous_ordinal)) {
       ret = OB_INVALID_DATA;
       LOG_WARN("invalid sorted IVF cluster sample", K(ret), K(task_idx), KP(item), K(previous_node),
@@ -279,24 +295,27 @@ int gather_cluster_samples(ObIVFMergeRuntime &runtime, ObIVFMergeActivePlan &pla
 
 int train_cluster_samples(ObIVFMergeRuntime &runtime, ObIVFMergeAlgorithm &algorithm,
     ObIVFMergeActivePlan &samples, const ObIVFMergeWorkItem &item,
-    int64_t &local_k, ObIArray<float> &centers)
+    int64_t &local_k, share::ObVectorMatrix &centers)
 {
   int ret = OB_SUCCESS;
   const int64_t dim = runtime.dimension_;
   const int64_t vector_count = get_vector_ref_count(
       *runtime.current_nodes_.at(item.node_idx_)->vid_list_, runtime.all_vids_);
-  ObArray<int64_t> ordinals, shard_ordinals;
-  ObArray<float> values, shard_values;
-  ObArray<uint8_t> seen;
+
   const ObMemAttr attr(MTL_ID(), "IVFClusterRead", ObCtxIds::VECTOR_CTX_ID);
-  ordinals.set_attr(attr); shard_ordinals.set_attr(attr);
-  values.set_attr(attr); shard_values.set_attr(attr); seen.set_attr(attr);
+  share::ObVectorMatrix shard_values(attr);
+
+  ObArray<int64_t> ordinals(OB_MALLOC_NORMAL_BLOCK_SIZE, ModulePageAllocator(attr));
+  ObArray<int64_t> shard_ordinals(OB_MALLOC_NORMAL_BLOCK_SIZE, ModulePageAllocator(attr));
+  share::ObVectorMatrix values(attr);
+  ObArray<uint8_t> seen(OB_MALLOC_NORMAL_BLOCK_SIZE, ModulePageAllocator(attr));
   if (OB_FAIL(algorithm.hca_collect_training_rows(vector_count, runtime.cluster_size_, ordinals))) {
     LOG_WARN("failed to collect IVF training sample ordinals", K(ret), K(vector_count), K(item.node_idx_));
   } else if (ordinals.empty() || ordinals.count() > INT64_MAX / dim) {
     ret = OB_INVALID_DATA;
     LOG_WARN("invalid IVF training sample count", K(ret), K(dim), "ordinals", ordinals.count());
-  } else if (OB_FAIL(values.prepare_allocate(ordinals.count() * dim))) {
+  } else if (OB_FAIL(values.set_dimension(dim))) {
+  } else if (OB_FAIL(values.resize(ordinals.count() * dim))) {
     LOG_WARN("failed to allocate IVF training sample vectors", K(ret), K(dim), "ordinals", ordinals.count());
   } else if (OB_FAIL(append_filled_byte_array(ordinals.count(), 0, seen))) {
     LOG_WARN("failed to allocate IVF training sample presence flags", K(ret), "ordinals", ordinals.count());
@@ -319,7 +338,7 @@ int train_cluster_samples(ObIVFMergeRuntime &runtime, ObIVFMergeAlgorithm &algor
       // Shards are disjoint in source order. Restore original node ordinals
       // before calling the unchanged deterministic training kernel.
       for (int64_t i = 0; OB_SUCC(ret) && i < shard_ordinals.count(); ++i) {
-        const int64_t *pos = std::lower_bound(ordinals.begin(), ordinals.end(), shard_ordinals.at(i));
+        const auto pos = std::lower_bound(ordinals.begin(), ordinals.end(), shard_ordinals.at(i));
         const int64_t idx = pos - ordinals.begin();
         if (idx >= ordinals.count() || ordinals.at(idx) != shard_ordinals.at(i) || seen.at(idx)) {
           ret = OB_INVALID_DATA;
@@ -349,6 +368,18 @@ int train_cluster_samples(ObIVFMergeRuntime &runtime, ObIVFMergeAlgorithm &algor
   return ret;
 }
 
+static int allocate_source_routes(const ObIVFMergeRuntime &runtime, ObIVFDDLPlan &plan, int64_t count)
+{
+  int ret = OB_SUCCESS;
+  if (runtime.current_nodes_.count() > INT32_MAX) {
+    ret = OB_SIZE_OVERFLOW;
+    LOG_WARN("IVF source node index exceeds int32", K(ret), "nodes", runtime.current_nodes_.count());
+  } else if (OB_FAIL(plan.source_nodes_.prepare_allocate(count))) {
+  } else if (!runtime.vector_store_->uses_position_ids() && OB_FAIL(plan.source_vector_idxs_.prepare_allocate(count))) {
+  }
+  return ret;
+}
+
 int prepare_source_assign(ObIVFMergeRuntime &runtime, ObIVFMergeActivePlan &plan, ObIAllocator &allocator)
 {
   int ret = OB_SUCCESS;
@@ -357,16 +388,17 @@ int prepare_source_assign(ObIVFMergeRuntime &runtime, ObIVFMergeActivePlan &plan
     return ret;
   }
   const int64_t count = runtime.all_vids_.count();
+  const bool position_ids = runtime.vector_store_->uses_position_ids();
   // Bound payload to 16 MiB (or one vector) independently of dimension.
   const int64_t rows_per_task = MAX(1L, MIN(IVF_DDL_VECTORS_PER_TASK,
       (16L * 1024 * 1024 / sizeof(float)) / runtime.dimension_));
-  if (OB_FAIL(plan.ddl_->source_routes_.prepare_allocate(count))) {
+  if (OB_FAIL(allocate_source_routes(runtime, *plan.ddl_, count))) {
     LOG_WARN("failed to allocate IVF source routes", K(ret), K(count));
   } else if (OB_FAIL(plan.ddl_->source_cids_.prepare_allocate(count))) {
     LOG_WARN("failed to allocate IVF source assignments", K(ret), K(count));
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
-    plan.ddl_->source_routes_.at(i) = ObIVFSourceRoute();
+    plan.ddl_->source_nodes_.at(i) = -1;
     plan.ddl_->source_cids_.at(i) = -1;
     if (i % IVF_DDL_VECTORS_PER_TASK == 0) {
       ret = is_runtime_canceled(runtime) ? OB_CANCELED : share::dag_yield();
@@ -393,12 +425,15 @@ int prepare_source_assign(ObIVFMergeRuntime &runtime, ObIVFMergeActivePlan &plan
         LOG_WARN("invalid IVF source member", K(ret), K(n), K(j));
       } else if (OB_FAIL(runtime.vector_store_->get_source_row_idx(idx, source))) {
         LOG_WARN("failed to locate IVF source member", K(ret), K(idx));
-      } else if (source < 0 || source >= count || plan.ddl_->source_routes_.at(source).node_idx_ >= 0) {
+      } else if (source < 0 || source >= count || plan.ddl_->source_nodes_.at(source) >= 0
+          || (position_ids && source != idx)) {
         ret = OB_INVALID_DATA;
         LOG_WARN("invalid or duplicate IVF source membership", K(ret), K(source), K(idx));
       } else {
-        plan.ddl_->source_routes_.at(source).vector_idx_ = static_cast<uint32_t>(idx);
-        plan.ddl_->source_routes_.at(source).node_idx_ = static_cast<int32_t>(n);
+        if (!plan.ddl_->source_vector_idxs_.empty()) {
+          plan.ddl_->source_vector_idxs_.at(source) = idx;
+        }
+        plan.ddl_->source_nodes_.at(source) = static_cast<int32_t>(n);
       }
     }
   }
@@ -407,7 +442,7 @@ int prepare_source_assign(ObIVFMergeRuntime &runtime, ObIVFMergeActivePlan &plan
     item.vid_begin_ = begin;
     item.vid_end_ = MIN(count, begin + rows_per_task);
     for (int64_t i = begin; i < item.vid_end_; ++i) {
-      item.source_input_count_ += plan.ddl_->source_routes_.at(i).node_idx_ >= 0 ? 1 : 0;
+      item.source_input_count_ += plan.ddl_->source_nodes_.at(i) >= 0 ? 1 : 0;
     }
     if (is_runtime_canceled(runtime)) {
       ret = OB_CANCELED;
@@ -471,6 +506,11 @@ int prepare_source_update(ObIVFMergeRuntime &runtime, ObIVFMergeActivePlan &plan
     ObIAllocator &allocator)
 {
   int ret = OB_SUCCESS;
+  if (plan.work_items_.count() > INT32_MAX) {
+    ret = OB_SIZE_OVERFLOW;
+    LOG_WARN("IVF source update index exceeds int32", K(ret), "tasks", plan.work_items_.count());
+    return ret;
+  }
   if (OB_FAIL(alloc_runtime_object(allocator, plan.ddl_))) {
     LOG_WARN("failed to allocate IVF source update plan", K(ret));
     return ret;
@@ -478,10 +518,11 @@ int prepare_source_update(ObIVFMergeRuntime &runtime, ObIVFMergeActivePlan &plan
   int64_t input_count = 0;
   int64_t leaf_count = 0;
   const int64_t count = runtime.all_vids_.count();
+  const bool position_ids = runtime.vector_store_->uses_position_ids();
   const int64_t dim = runtime.dimension_;
   const bool inherited_root = runtime.insertion_prior_ != nullptr && plan.depth_ == 0;
-  ObArray<ObIVFSourceUpdateMode> modes;
-  modes.set_attr(ObMemAttr(MTL_ID(), "IVFUpdatePlan", ObCtxIds::VECTOR_CTX_ID));
+
+  common::ObArray<ObIVFSourceUpdateMode> modes(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ModulePageAllocator(ObMemAttr(MTL_ID(), "IVFUpdatePlan", ObCtxIds::VECTOR_CTX_ID)));
   if (OB_FAIL(modes.prepare_allocate(plan.work_items_.count()))) {
     LOG_WARN("failed to allocate IVF source update classifications", K(ret));
   }
@@ -514,17 +555,17 @@ int prepare_source_update(ObIVFMergeRuntime &runtime, ObIVFMergeActivePlan &plan
     LOG_WARN("failed to allocate IVF source update", K(ret));
   } else if (OB_FAIL(plan.source_update_->items_.assign(plan.work_items_))) {
     LOG_WARN("failed to copy IVF source update work items", K(ret));
-  } else if (OB_FAIL(plan.source_update_->results_.prepare_allocate(plan.work_items_.count()))) {
+  } else if (OB_FAIL(share::vector_array_resize(plan.source_update_->results_, plan.work_items_.count()))) {
     LOG_WARN("failed to allocate IVF source update results", K(ret), "count", plan.work_items_.count());
   } else if (OB_FAIL(plan.source_update_->sums_.prepare_allocate(plan.work_items_.count()))) {
     LOG_WARN("failed to allocate IVF source update sum pointers", K(ret), "count", plan.work_items_.count());
   } else if (OB_FAIL(plan.source_update_->counts_.prepare_allocate(plan.work_items_.count()))) {
     LOG_WARN("failed to allocate IVF source update counts", K(ret), "count", plan.work_items_.count());
-  } else if (input_count > 0 && OB_FAIL(plan.ddl_->source_routes_.prepare_allocate(count))) {
+  } else if (input_count > 0 && OB_FAIL(allocate_source_routes(runtime, *plan.ddl_, count))) {
     LOG_WARN("failed to allocate IVF update routes", K(ret), K(count));
   }
-  for (int64_t i = 0; OB_SUCC(ret) && i < plan.ddl_->source_routes_.count(); ++i) {
-    plan.ddl_->source_routes_.at(i) = ObIVFSourceRoute();
+  for (int64_t i = 0; OB_SUCC(ret) && i < plan.ddl_->source_nodes_.count(); ++i) {
+    plan.ddl_->source_nodes_.at(i) = -1;
     if (i % IVF_DDL_VECTORS_PER_TASK == 0) {
       ret = is_runtime_canceled(runtime) ? OB_CANCELED : share::dag_yield();
     }
@@ -548,7 +589,7 @@ int prepare_source_update(ObIVFMergeRuntime &runtime, ObIVFMergeActivePlan &plan
         ret = OB_INVALID_DATA;
       } else if (OB_FAIL(alloc_runtime_array(allocator, slot.center_values_))) {
         LOG_WARN("failed to allocate inherited source update center", K(ret), K(cid));
-      } else if (OB_FAIL(slot.center_values_->prepare_allocate(dim))) {
+      } else if (OB_FAIL(slot.center_values_->resize(dim))) {
         LOG_WARN("failed to allocate inherited source center values", K(ret), K(cid));
       } else {
         MEMCPY(&slot.center_values_->at(0), &node.local_centers_.at(item.local_center_idx_ * dim),
@@ -573,12 +614,15 @@ int prepare_source_update(ObIVFMergeRuntime &runtime, ObIVFMergeActivePlan &plan
           LOG_WARN("failed to resolve IVF source update member", K(ret), K(cid), K(j));
         } else if (OB_FAIL(runtime.vector_store_->get_source_row_idx(idx, source))) {
           LOG_WARN("failed to locate IVF source update member", K(ret), K(cid), K(idx));
-        } else if (source < 0 || source >= count || plan.ddl_->source_routes_.at(source).node_idx_ >= 0) {
+        } else if (source < 0 || source >= count || plan.ddl_->source_nodes_.at(source) >= 0
+            || (position_ids && source != idx)) {
           ret = OB_INVALID_DATA;
           LOG_WARN("invalid or duplicate IVF source update route", K(ret), K(cid), K(idx), K(source), K(count));
         } else {
-          plan.ddl_->source_routes_.at(source).vector_idx_ = static_cast<uint32_t>(idx);
-          plan.ddl_->source_routes_.at(source).node_idx_ = static_cast<int32_t>(cid);
+          if (!plan.ddl_->source_vector_idxs_.empty()) {
+            plan.ddl_->source_vector_idxs_.at(source) = idx;
+          }
+          plan.ddl_->source_nodes_.at(source) = static_cast<int32_t>(cid);
         }
       }
     }
@@ -589,7 +633,7 @@ int prepare_source_update(ObIVFMergeRuntime &runtime, ObIVFMergeActivePlan &plan
     item.vid_begin_ = begin;
     item.vid_end_ = MIN(count, begin + rows_per_task);
     for (int64_t i = begin; i < item.vid_end_; ++i) {
-      item.source_input_count_ += plan.ddl_->source_routes_.at(i).node_idx_ >= 0 ? 1 : 0;
+      item.source_input_count_ += plan.ddl_->source_nodes_.at(i) >= 0 ? 1 : 0;
     }
     if (is_runtime_canceled(runtime)) {
       ret = OB_CANCELED;
@@ -626,7 +670,7 @@ int execute_source_update(ObIVFMergeRuntime &runtime, ObIVFMergeAlgorithm &algor
   const int64_t dim = runtime.dimension_;
   if (item.source_input_count_ == 0) {
     if (runtime.insertion_prior_ == nullptr || plan.depth_ != 0 || plan.ddl_ == nullptr
-        || !plan.ddl_->source_routes_.empty() || plan.work_items_.count() != 1
+        || !plan.ddl_->source_nodes_.empty() || plan.work_items_.count() != 1
         || item.vid_begin_ != 0 || item.vid_end_ != 0 || plan.result_slots_.at(task_idx).installed_) {
       ret = OB_INVALID_DATA;
     } else if (is_runtime_canceled(runtime)) {
@@ -635,19 +679,22 @@ int execute_source_update(ObIVFMergeRuntime &runtime, ObIVFMergeAlgorithm &algor
     return ret;
   }
   const ObMemAttr attr(MTL_ID(), "IVFUpdateRead", ObCtxIds::VECTOR_CTX_ID);
-  ObArray<int64_t> idxs, cids, positions;
-  ObArray<float> vectors;
-  idxs.set_attr(attr); cids.set_attr(attr); positions.set_attr(attr); vectors.set_attr(attr);
+
+  share::ObVectorArray<int64_t> idxs(attr);
+  common::ObArray<int64_t> cids(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ModulePageAllocator(attr));
+  ObArray<int64_t> positions;
+  share::ObVectorMatrix vectors(attr);
+  positions.set_attr(attr);
   for (int64_t i = item.vid_begin_; OB_SUCC(ret) && i < item.vid_end_; ++i) {
-    const auto &route = plan.ddl_->source_routes_.at(i);
-    if (route.node_idx_ < 0) {
-    } else if (route.node_idx_ >= update.sums_.count()
-        || nullptr == update.sums_.at(route.node_idx_)) {
+    const int64_t node_idx = plan.ddl_->source_nodes_.at(i);
+    if (node_idx < 0) {
+    } else if (node_idx >= update.sums_.count()
+        || nullptr == update.sums_.at(node_idx)) {
       ret = OB_INVALID_DATA;
-      LOG_WARN("invalid IVF source update sum route", K(ret), K(task_idx), K(i), K(route.node_idx_));
-    } else if (OB_FAIL(idxs.push_back(route.vector_idx_))) {
+      LOG_WARN("invalid IVF source update sum route", K(ret), K(task_idx), K(i), K(node_idx));
+    } else if (OB_FAIL(idxs.push_back(plan.ddl_->source_vector_index(i)))) {
       LOG_WARN("failed to retain IVF source update vector index", K(ret), K(task_idx), K(i));
-    } else if (OB_FAIL(cids.push_back(route.node_idx_))) {
+    } else if (OB_FAIL(cids.push_back(node_idx))) {
       LOG_WARN("failed to retain IVF source update center index", K(ret), K(task_idx), K(i));
     } else {
       if (OB_FAIL(positions.push_back(positions.count()))) {
@@ -663,6 +710,7 @@ int execute_source_update(ObIVFMergeRuntime &runtime, ObIVFMergeAlgorithm &algor
   } else if (is_runtime_canceled(runtime)) {
     ret = OB_CANCELED;
   } else if (OB_FAIL(share::dag_yield())) {
+  } else if (OB_FAIL(vectors.set_dimension(runtime.dimension_))) {
   } else if (OB_FAIL(runtime.vector_store_->batch_get_by_source(idxs, vectors))) {
     LOG_WARN("failed to read IVF source update", K(ret), K(task_idx));
   } else if (vectors.count() != idxs.count() * dim || !are_finite_center_values(vectors)) {
@@ -709,7 +757,7 @@ int finish_source_update(ObIVFMergeRuntime &runtime, ObIVFMergeAlgorithm &algori
     const auto &item = update.items_.at(cid);
     const auto &node = *runtime.current_nodes_.at(item.node_idx_);
     const int64_t expected = node.member_lists_->lists_.at(item.local_center_idx_)->vids_.count();
-    ObArray<float, ObWrapperAllocator> *center = nullptr;
+    share::ObVectorMatrix *center = nullptr;
     ObIVFSourceUpdateMode mode;
     if (cid % 64 == 0 && is_runtime_canceled(runtime)) {
       ret = OB_CANCELED;
@@ -772,22 +820,18 @@ int execute_source_assign(ObIVFMergeRuntime &runtime, ObIVFMergeAlgorithm &algor
   int ret = OB_SUCCESS;
   const ObIVFMergeWorkItem &item = plan.work_items_.at(task_idx);
   ObArenaAllocator allocator(ObMemAttr(MTL_ID(), "IVFSourceAssign", ObCtxIds::VECTOR_CTX_ID));
-  ObArray<int64_t, ObWrapperAllocator> idxs;
-  ObArray<int64_t, ObWrapperAllocator> nodes;
-  ObArray<int64_t, ObWrapperAllocator> positions;
-  ObArray<int64_t, ObWrapperAllocator> cids;
-  ObArray<float, ObWrapperAllocator> vectors;
-  idxs.set_block_allocator(ObWrapperAllocator(allocator));
-  nodes.set_block_allocator(ObWrapperAllocator(allocator));
-  positions.set_block_allocator(ObWrapperAllocator(allocator));
-  cids.set_block_allocator(ObWrapperAllocator(allocator));
-  vectors.set_block_allocator(ObWrapperAllocator(allocator));
+  share::ObVectorArray<int64_t> idxs(share::vector_array_allocator(allocator));
+  ObArray<int64_t, ObWrapperAllocator> nodes(OB_MALLOC_NORMAL_BLOCK_SIZE, ObWrapperAllocator(allocator));
+  ObArray<int64_t, ObWrapperAllocator> positions(OB_MALLOC_NORMAL_BLOCK_SIZE, ObWrapperAllocator(allocator));
+  ObArray<int64_t, ObWrapperAllocator> cids(OB_MALLOC_NORMAL_BLOCK_SIZE, ObWrapperAllocator(allocator));
+  share::ObVectorMatrix vectors(share::vector_array_allocator(allocator));
+
   for (int64_t i = item.vid_begin_; OB_SUCC(ret) && i < item.vid_end_; ++i) {
-    const ObIVFSourceRoute &route = plan.ddl_->source_routes_.at(i);
-    if (route.node_idx_ < 0) {
+    const int64_t node_idx = plan.ddl_->source_nodes_.at(i);
+    if (node_idx < 0) {
       // This row belongs to a leaf completed at an earlier depth.
-    } else if (OB_FAIL(idxs.push_back(route.vector_idx_))) {
-    } else if (OB_FAIL(nodes.push_back(route.node_idx_))) {
+    } else if (OB_FAIL(idxs.push_back(plan.ddl_->source_vector_index(i)))) {
+    } else if (OB_FAIL(nodes.push_back(node_idx))) {
     } else if (OB_FAIL(positions.push_back(positions.count()))) {
     } else {
       if (OB_FAIL(cids.push_back(-1))) {
@@ -801,6 +845,7 @@ int execute_source_assign(ObIVFMergeRuntime &runtime, ObIVFMergeAlgorithm &algor
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("IVF source assignment batch count mismatch", K(ret), K(task_idx), "actual", idxs.count(), "expected",
              item.source_input_count_);
+  } else if (OB_FAIL(vectors.set_dimension(runtime.dimension_))) {
   } else if (OB_FAIL(runtime.vector_store_->batch_get_by_source(idxs, vectors))) {
     LOG_WARN("failed to read IVF source batch", K(ret), K(task_idx));
   } else if (vectors.count() != idxs.count() * runtime.dimension_) {
@@ -850,8 +895,8 @@ ObIVFDDLRuntime::ObIVFDDLRuntime(ObIAllocator &allocator,
     ObIVFDDLHcaAdapter &algorithm, int64_t parallelism)
   : allocator_(allocator), algorithm_(algorithm), parallelism_(parallelism),
     route_allocator_(ObMemAttr(MTL_ID(), "IVFDDLRoute", ObCtxIds::VECTOR_CTX_ID)),
-    source_to_vector_(ObWrapperAllocator(route_allocator_)), routes_ready_(false), refine_stats_(nullptr),
-    soar_quant_error_(OB_SUCCESS)
+      source_to_vector_(share::vector_array_allocator(route_allocator_)), routes_ready_(false), position_mode_(false),
+      source_count_(0), refine_stats_(nullptr), soar_quant_error_(OB_SUCCESS)
 {}
 ObIVFDDLRuntime::~ObIVFDDLRuntime() { release_stats(); }
 int64_t ObIVFDDLRuntime::batch_rows(int64_t dim)
@@ -861,12 +906,13 @@ void ObIVFDDLRuntime::release_routes()
 {
   source_to_vector_.reset();
   route_allocator_.reset();
-  routes_ready_ = false;
+  routes_ready_ = false; position_mode_ = false; source_count_ = 0;
 }
 int64_t ObIVFDDLRuntime::vector_index(int64_t source) const
 {
-  return routes_ready_ && source >= 0 && source < source_to_vector_.count()
-      ? source_to_vector_.at(source) : -1;
+  return routes_ready_ && source >= 0 && source < source_count_
+      ? (position_mode_
+      ? source : source_to_vector_.at(source)) : -1;
 }
 bool ObIVFDDLRuntime::handles(const ObIVFMergeRuntime &runtime, ObIVFMergeStep step,
     const ObIVFMergeQuantizer &output) const
@@ -885,29 +931,33 @@ int ObIVFDDLRuntime::prepare_routes(const ObIVFMergeRuntime &r)
   int ret = OB_SUCCESS;
   const int64_t n = r.all_vids_.count();
   if (routes_ready_) {
-    if (source_to_vector_.count() != n) {
+    if (source_count_ != n) {
       ret = OB_STATE_NOT_MATCH;
       LOG_WARN("IVF source route count changed", K(ret), K(n), "routes", source_to_vector_.count());
     }
-  } else if (n <= 0 || n > UINT32_MAX || !r.vector_store_->supports_source_order()) {
+  } else if (n <= 0 || !r.vector_store_->supports_source_order()) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("unsupported IVF source routing input", K(ret), K(n));
-  } else if (OB_FAIL(source_to_vector_.prepare_allocate(n))) {
+  } else if (r.vector_store_->uses_position_ids()) {
+    source_count_ = n; position_mode_ = true; routes_ready_ = true;
+    LOG_INFO("[IVF_BUILD_PERF]", "event", "position_id_routes", "rows", n,
+        "all_vid_bytes", r.all_vids_.allocated_vid_bytes(), "source_reverse_bytes", 0);
+  } else if (OB_FAIL(share::vector_array_resize(source_to_vector_, n))) {
     LOG_WARN("failed to allocate IVF source routes", K(ret), K(n));
   } else {
-    for (int64_t i = 0; i < n; ++i) { source_to_vector_.at(i) = UINT32_MAX; }
+    for (int64_t i = 0; i < n; ++i) { source_to_vector_.at(i) = -1; }
     for (int64_t i = 0; OB_SUCC(ret) && i < n; ++i) {
       int64_t source = -1;
       if (i % 4096 == 0 && is_runtime_canceled(r)) { ret = OB_CANCELED; }
       else if (i % 4096 == 0 && OB_FAIL(share::dag_yield())) {
       } else if (OB_FAIL(r.vector_store_->get_source_row_idx(i, source))) {
         LOG_WARN("failed to locate IVF vector source", K(ret), K(i));
-      } else if (source < 0 || source >= n || source_to_vector_.at(source) != UINT32_MAX) {
+      } else if (source < 0 || source >= n || source_to_vector_.at(source) != -1) {
         ret = OB_INVALID_DATA;
         LOG_WARN("invalid or duplicate IVF vector source", K(ret), K(i), K(source), K(n));
-      } else { source_to_vector_.at(source) = static_cast<uint32_t>(i); }
+      } else { source_to_vector_.at(source) = static_cast<int64_t>(i); }
     }
-    if (OB_SUCC(ret)) { routes_ready_ = true; }
+    if (OB_SUCC(ret)) { routes_ready_ = true; source_count_ = n; }
     else { release_routes(); }
   }
   return ret;
@@ -987,7 +1037,7 @@ int ObIVFDDLRuntime::prepare(ObIVFMergeRuntime &r, ObIVFMergeActivePlan &plan,
       ret = algorithm_.begin_refine_samples(n, dim, r.c0_, *r.a0_,
           graph.is_valid() ? &graph : nullptr,
           MAX(0L, r.vector_store_->get_available_replay_memory()), parallelism_,
-          r.vector_store_, &r.all_vids_);
+          r.vector_store_, r.all_vids_);
     }
     if (OB_SUCC(ret) && algorithm_.uses_resident_refine_source()) {
       // Keep the initialization barrier but do not gather or materialize samples.
@@ -995,28 +1045,31 @@ int ObIVFDDLRuntime::prepare(ObIVFMergeRuntime &r, ObIVFMergeActivePlan &plan,
         LOG_WARN("failed to append resident IVF refinement initialization task", K(ret));
       }
     } else if (OB_SUCC(ret)) {
-      const auto &indices = *algorithm_.refine_sample_indices();
+      const auto indices = algorithm_.refine_sample_indices();
       auto &requests = plan.ddl_->cluster_requests_;
-      if (OB_FAIL(requests.reserve(indices.count()))) {
-        LOG_WARN("failed to reserve IVF refinement sample requests", K(ret), "count", indices.count());
+      if (indices == nullptr) {
+        ret = OB_STATE_NOT_MATCH;
+      } else if (OB_FAIL(requests.reserve(indices->count()))) {
+        LOG_WARN("failed to reserve IVF refinement sample requests", K(ret), "count", indices->count());
       }
-      for (int64_t i = 0; OB_SUCC(ret) && i < indices.count(); ++i) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < indices->count(); ++i) {
         int64_t source = -1;
         if (i % 4096 == 0 && is_runtime_canceled(r)) { ret = OB_CANCELED; }
         else if (i % 4096 == 0 && OB_FAIL(share::dag_yield())) {
-        } else if (OB_FAIL(r.vector_store_->get_source_row_idx(indices.at(i), source))) {
-          LOG_WARN("failed to locate IVF refinement sample source", K(ret), K(i), "index", indices.at(i));
-        } else if (source < 0 || source >= n || n > UINT32_MAX) {
+        } else if (OB_FAIL(r.vector_store_->get_source_row_idx(indices->at(i), source))) {
+          LOG_WARN("failed to locate IVF refinement sample source", K(ret), K(i), "index", indices->at(i));
+        } else if (source < 0 || source >= n) {
           ret = OB_INVALID_DATA;
           LOG_WARN("invalid IVF refinement sample source", K(ret), K(i), K(source), K(n));
         } else {
-          if (OB_FAIL(requests.push_back({static_cast<uint32_t>(source), static_cast<uint32_t>(indices.at(i)), 0,
-                                          static_cast<uint32_t>(i)}))) {
+          if (OB_FAIL(requests.push_back({source, 0, i}))) {
             LOG_WARN("failed to append IVF refinement sample request", K(ret), K(i), K(source));
           }
         }
       }
-      if (OB_SUCC(ret)) { lib::ob_sort(requests.begin(), requests.end()); }
+      if (OB_SUCC(ret)) {
+        lib::ob_sort(share::vector_array_begin(requests), share::vector_array_end(requests));
+      }
       // Each task owns a store and scans one source-ordered range in bounded
       // batches. The previous hierarchy sample stores have already retired;
       // refinement borrows the same unused Replay reservation, not a new quota.
@@ -1124,15 +1177,17 @@ int ObIVFDDLRuntime::prepare(ObIVFMergeRuntime &r, ObIVFMergeActivePlan &plan,
   return ret;
 }
 int ObIVFDDLRuntime::read_batch(const ObIVFMergeRuntime &r, int64_t begin, int64_t end,
-    ObIArray<int64_t> &indices, ObIArray<float> &vectors, bool load_payload)
+    share::ObVectorArray<int64_t> &indices, share::ObVectorMatrix &vectors, bool load_payload,
+    common::ObIArray<ObIVFVectorVID> *output_vids)
 {
   int ret = OB_SUCCESS;
   indices.reuse(); vectors.reuse();
-  if (!routes_ready_ || begin < 0 || end <= begin || end > source_to_vector_.count() ||
+  if (!routes_ready_ || begin < 0 || end <= begin || end > source_count_ ||
       end - begin > batch_rows(r.dimension_)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid IVF DDL batch range", K(ret), K_(routes_ready), K(begin), K(end), "routes",
              source_to_vector_.count());
+  } else if (OB_FAIL(vectors.set_dimension(r.dimension_))) {
   } else if (OB_FAIL(indices.reserve(end - begin))) {
     LOG_WARN("failed to reserve IVF DDL batch indices", K(ret), K(begin), K(end));
   }
@@ -1141,10 +1196,14 @@ int ObIVFDDLRuntime::read_batch(const ObIVFMergeRuntime &r, int64_t begin, int64
       LOG_WARN("failed to append IVF DDL batch vector index", K(ret), K(i), K(begin), K(end));
     }
   }
-  if (OB_SUCC(ret) && load_payload && OB_FAIL(r.vector_store_->batch_get_by_source(indices, vectors))) {
+  if (OB_SUCC(ret) && load_payload
+      && OB_FAIL((output_vids != nullptr) ? r.vector_store_->batch_get_output_by_source(indices, vectors, *output_vids)
+      : r.vector_store_->batch_get_by_source(indices, vectors))) {
     LOG_WARN("failed to read IVF DDL source batch", K(ret), K(begin), K(end));
-  } else if (OB_SUCC(ret) && load_payload &&
-             (vectors.count() != indices.count() * r.dimension_ || !are_finite_center_values(vectors))) {
+  } else if (OB_SUCC(ret) && load_payload
+      && (vectors.count() != indices.count() * r.dimension_
+          || ((output_vids != nullptr) && output_vids->count() != indices.count())
+                 || !are_finite_center_values(vectors))) {
     ret = OB_INVALID_DATA;
     LOG_WARN("invalid IVF DDL batch vectors", K(ret), K(begin), K(end), K(r.dimension_), "values", vectors.count());
   }
@@ -1159,11 +1218,13 @@ int ObIVFDDLRuntime::execute(ObIVFMergeRuntime &r, ObIVFMergeActivePlan &plan,
   const int64_t dim = r.dimension_;
   const auto step = plan.step_;
   const ObMemAttr attr(MTL_ID(), "IVFDDLBatch", ObCtxIds::VECTOR_CTX_ID);
-  ObArray<int64_t> indices, positions;
-  ObArray<float> vectors;
-  indices.set_attr(attr); positions.set_attr(attr); vectors.set_attr(attr);
+
+  share::ObVectorArray<int64_t> indices(attr);
+  common::ObArray<int64_t> positions(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ModulePageAllocator(attr));
+  share::ObVectorMatrix vectors(attr);
+  common::ObArray<ObIVFVectorVID> output_vids(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ModulePageAllocator(attr));
   ObArray<int64_t, ObWrapperAllocator> *primary = nullptr, *secondary = nullptr;
-  ObArray<float, ObWrapperAllocator> *center = nullptr;
+  share::ObVectorMatrix *center = nullptr;
   ObIVFNeighborGraphView graph;
   if (slot.installed_ || plan.ddl_ == nullptr) {
     ret = OB_STATE_NOT_MATCH;
@@ -1179,10 +1240,13 @@ int ObIVFDDLRuntime::execute(ObIVFMergeRuntime &r, ObIVFMergeActivePlan &plan,
     // Reuse one gather buffer across this shard's batches, sized for the actual
     // dimension. Other stages retain their existing task-local allocation policy.
     const int64_t rows = MAX(1L, MIN(batch_rows(dim), item.vid_end_ - item.vid_begin_));
-    indices.set_block_size(rows * sizeof(int64_t));
-    positions.set_block_size(rows * sizeof(int64_t));
-    vectors.set_block_size(rows * dim * sizeof(float));
-    if (OB_FAIL(algorithm_.begin_refine_sample_shard(task_idx))) {
+
+    const auto *sample_indices = algorithm_.refine_sample_indices();
+    const bool position_ids = r.vector_store_->uses_position_ids();
+    if (sample_indices == nullptr) {
+      ret = OB_STATE_NOT_MATCH;
+      LOG_WARN("missing IVF refinement sample indices", K(ret), K(task_idx));
+    } else if (OB_FAIL(algorithm_.begin_refine_sample_shard(task_idx))) {
       LOG_WARN("failed to start IVF refinement sample shard", K(ret), K(task_idx));
     }
     for (int64_t begin = item.vid_begin_; OB_SUCC(ret) && begin < item.vid_end_; begin += batch_rows(dim)) {
@@ -1191,7 +1255,12 @@ int ObIVFDDLRuntime::execute(ObIVFMergeRuntime &r, ObIVFMergeActivePlan &plan,
       positions.reuse();
       for (int64_t i = begin; OB_SUCC(ret) && i < end; ++i) {
         const auto &request = plan.ddl_->cluster_requests_.at(i);
-        if (OB_FAIL(indices.push_back(request.vector_idx_))) {
+        if (request.ordinal_ < 0 || request.ordinal_ >= sample_indices->count()) {
+          ret = OB_INVALID_DATA;
+          LOG_WARN("invalid IVF refinement sample ordinal", K(ret), K(request));
+        } else if (OB_FAIL(indices.push_back(position_ids
+                           ? request.source_
+                           : sample_indices->at(request.ordinal_)))) {
           LOG_WARN("failed to append IVF refinement sample index", K(ret), K(i));
         } else if (OB_FAIL(positions.push_back(request.ordinal_))) {
           LOG_WARN("failed to append IVF refinement sample position", K(ret), K(i));
@@ -1200,6 +1269,7 @@ int ObIVFDDLRuntime::execute(ObIVFMergeRuntime &r, ObIVFMergeActivePlan &plan,
       if (OB_FAIL(ret)) {
       } else if (is_runtime_canceled(r)) { ret = OB_CANCELED;
       } else if (OB_FAIL(share::dag_yield())) {
+      } else if (OB_FAIL(vectors.set_dimension(dim))) {
       } else if (OB_FAIL(r.vector_store_->batch_get_by_source(indices, vectors))) {
         LOG_WARN("failed to read IVF refinement sample batch", K(ret), K(task_idx), K(begin), K(end));
       } else if (!are_finite_center_values(vectors)) {
@@ -1227,7 +1297,10 @@ int ObIVFDDLRuntime::execute(ObIVFMergeRuntime &r, ObIVFMergeActivePlan &plan,
     ret = output.write_loaded_centers(*r.c1_, dim, item.cid_begin_, item.cid_end_);
   } else if (OB_FAIL(
                  read_batch(r, item.vid_begin_, item.vid_end_, indices, vectors,
-                            step != ObIVFMergeStep::SOAR_ASSIGN || quantize_during_soar(r)))) {
+                            step != ObIVFMergeStep::SOAR_ASSIGN || quantize_during_soar(r),
+                            r.vector_store_->uses_position_ids()
+                                && (step == ObIVFMergeStep::SOAR_ASSIGN || step == ObIVFMergeStep::QUANT)
+                                ? &output_vids : nullptr))) {
   } else if (step == ObIVFMergeStep::REFINE_ASSIGN) {
     if (r.g0_offsets_ != nullptr) {
       graph = ObIVFNeighborGraphView(*r.g0_offsets_, *r.g0_cids_, *r.g0_max_distances_, r.hierarchy_k_);
@@ -1292,30 +1365,31 @@ int ObIVFDDLRuntime::execute(ObIVFMergeRuntime &r, ObIVFMergeActivePlan &plan,
     // A single center skips secondary assignment, but still needs the loaded
     // vectors to encode its primary postings in this batch.
     if (OB_SUCC(ret) && quantize_during_soar(r)) {
-      ObArray<ObIVFVectorVID> vids;
-      vids.set_attr(attr);
-      for (int64_t i = 0; OB_SUCC(ret) && i < indices.count(); ++i) {
-        if (OB_FAIL(vids.push_back(r.all_vids_.at(indices.at(i))))) {
+      for (int64_t i = 0; OB_SUCC(ret) && !r.vector_store_->uses_position_ids() && i < indices.count(); ++i) {
+        if (OB_FAIL(output_vids.push_back(r.all_vids_.at(indices.at(i))))) {
           LOG_WARN("failed to retain IVF SOAR quantization VID", K(ret), K(task_idx), K(i));
         }
       }
       if (OB_FAIL(ret)) {
       } else if (is_runtime_canceled(r)) {
         ret = OB_CANCELED;
-      } else if (OB_FAIL(output.quantize_loaded_vectors(*r.c1_, dim, vids, vectors, *primary, secondary))) {
+      } else if (OB_FAIL(output.quantize_loaded_vectors(*r.c1_, dim, output_vids, vectors, *primary, secondary))) {
         // A sink may have appended part of this batch. Prevent an explicit
         // task retry from duplicating that prefix, including for custom sinks.
         LOG_WARN("failed to quantize IVF SOAR batch", K(ret), K(task_idx), "rows", indices.count());
         (void)ATOMIC_BCAS(&soar_quant_error_, OB_SUCCESS, ret);
+      } else if (r.vector_store_->uses_position_ids()
+          && OB_FAIL(r.vector_store_->collect_raw_output_keys(indices, output_vids))) {
+        (void)ATOMIC_BCAS(&soar_quant_error_, OB_SUCCESS, ret);
       }
     }
   } else if (step == ObIVFMergeStep::QUANT) {
-    ObArray<ObIVFVectorVID> vids;
-    ObArray<int64_t> a1, a2;
-    vids.set_attr(attr); a1.set_attr(attr); a2.set_attr(attr);
+
+    common::ObArray<int64_t> a1(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ModulePageAllocator(attr));
+    common::ObArray<int64_t> a2(OB_MALLOC_NORMAL_BLOCK_SIZE, common::ModulePageAllocator(attr));
     for (int64_t i = 0; OB_SUCC(ret) && i < indices.count(); ++i) {
       const int64_t idx = indices.at(i);
-      if (OB_FAIL(vids.push_back(r.all_vids_.at(idx)))) {
+      if (!r.vector_store_->uses_position_ids() && OB_FAIL(output_vids.push_back(r.all_vids_.at(idx)))) {
         LOG_WARN("failed to retain IVF quantization VID", K(ret), K(task_idx), K(idx));
       } else if (OB_FAIL(a1.push_back(r.a1_->at(idx)))) {
         LOG_WARN("failed to retain IVF quantization primary CID", K(ret), K(task_idx), K(idx));
@@ -1325,8 +1399,12 @@ int ObIVFDDLRuntime::execute(ObIVFMergeRuntime &r, ObIVFMergeActivePlan &plan,
         }
       }
     }
-    if (OB_SUCC(ret)) { ret = output.quantize_loaded_vectors(*r.c1_, dim, vids, vectors,
-        a1, r.a2_ == nullptr ? nullptr : &a2); }
+    if (OB_SUCC(ret)) {
+      ret = output.quantize_loaded_vectors(*r.c1_, dim, output_vids, vectors, a1, r.a2_ == nullptr ? nullptr : &a2);
+    }
+    if (OB_SUCC(ret) && r.vector_store_->uses_position_ids()) {
+      ret = r.vector_store_->collect_raw_output_keys(indices, output_vids);
+    }
   } else {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("unsupported IVF DDL task step", K(ret), K(step), K(task_idx));
@@ -1367,12 +1445,12 @@ int ObIVFDDLRuntime::prepare_refine_phase(int64_t &count)
 { return algorithm_.prepare_refine_phase(count); }
 int ObIVFDDLRuntime::execute_refine_phase(int64_t begin, int64_t end)
 { return algorithm_.execute_refine_phase(begin, end); }
-int ObIVFDDLRuntime::finish_refine_phase(ObIArray<float> &centers, bool &finished)
+int ObIVFDDLRuntime::finish_refine_phase(share::ObVectorMatrix &centers, bool &finished)
 { return algorithm_.finish_refine_phase(centers, finished); }
 int ObIVFDDLRuntime::finish_samples() { return algorithm_.finish_refine_samples(); }
 
-int ObIVFDDLRuntime::assign_loaded_secondary(const ObIArray<float> &vectors, int64_t dimension,
-    const ObIArray<float> &centers, const ObIArray<int64_t> &primary,
+int ObIVFDDLRuntime::assign_loaded_secondary(const share::ObVectorMatrix &vectors, int64_t dimension,
+    const share::ObVectorMatrix &centers, const common::ObIArray<int64_t> &primary,
     const ObIVFNeighborGraphView *graph, ObIArray<int64_t> &secondary)
 {
   return algorithm_.soar_assign_loaded(vectors, dimension, centers, primary, graph, secondary);
