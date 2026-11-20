@@ -83,6 +83,7 @@ public:
   
   /* dml cg Begin */
   static int check_has_domain_index(
+      share::schema::ObSchemaGetterGuard &schema_guard,
       const void *table_schema,
       ObIArray<int64_t> &domain_types,
       ObIArray<uint64_t> &domain_tids);

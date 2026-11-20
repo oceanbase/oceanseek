@@ -1317,7 +1317,11 @@ int ObTableFtsUtil::check_domain_index(const ObTableCtx &ctx,
   if (OB_ISNULL(table_schema)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("table schema is null", K(ret), K(table_schema));
-  } else if (OB_FAIL(ObDomainIdUtils::check_has_domain_index(table_schema, domain_types, domain_tids))) {
+  } else if (OB_ISNULL(ctx.get_schema_guard())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("schema guard is null", K(ret));
+  } else if (OB_FAIL(ObDomainIdUtils::check_has_domain_index(
+      *ctx.get_schema_guard(), table_schema, domain_types, domain_tids))) {
     LOG_WARN("failed to check has domain index", K(ret));
   } else if (domain_types.count() != domain_tids.count()) {
     ret = OB_ERR_UNEXPECTED;

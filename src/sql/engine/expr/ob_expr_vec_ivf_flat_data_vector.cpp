@@ -61,7 +61,7 @@ int ObExprVecIVFFlatDataVector::cg_expr(
   int ret = OB_SUCCESS;
   UNUSED(raw_expr);
   UNUSED(expr_cg_ctx);
-  if (OB_UNLIKELY(rt_expr.arg_cnt_ != 2) || OB_ISNULL(rt_expr.args_)) {
+  if (OB_UNLIKELY(rt_expr.arg_cnt_ != 1 && rt_expr.arg_cnt_ != 2) || OB_ISNULL(rt_expr.args_)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", K(rt_expr.arg_cnt_), KP(rt_expr.args_), K(rt_expr.type_));
   } else {
@@ -79,9 +79,12 @@ int ObExprVecIVFFlatDataVector::generate_data_vector(
 
   common::ObArenaAllocator tmp_allocator("IVFFlatExprVec", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
   ObExpr *calc_vector_expr = expr.args_[0];
-  ObExpr *calc_distance_algo_expr = expr.args_[1];
+  ObExpr *calc_distance_algo_expr = expr.arg_cnt_ == 1 ? nullptr : expr.args_[1];
   ObDatum *res = nullptr;
-  if (OB_ISNULL(calc_vector_expr) || OB_ISNULL(calc_distance_algo_expr)) {
+  if (expr.arg_cnt_ == 1) {
+    // DROP can leave this generated column after its index parameters are gone.
+    expr_datum.set_null();
+  } else if (OB_ISNULL(calc_vector_expr) || OB_ISNULL(calc_distance_algo_expr)) {
     ret = OB_ERR_NULL_VALUE;
     LOG_WARN("invalid null exprs", K(ret), KP(calc_vector_expr), KP(calc_distance_algo_expr));
   } else {

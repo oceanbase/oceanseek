@@ -538,33 +538,16 @@ int64_t ObDomainIdUtils::get_domain_type_by_col_expr(const void *col_expr, ObInd
   return type;
 }
 
-int ObDomainIdUtils::check_has_domain_index(const void *table_schema, ObIArray<int64_t> &domain_types, ObIArray<uint64_t> &domain_tids)
+int ObDomainIdUtils::check_has_domain_index(ObSchemaGetterGuard &schema_guard,
+                                           const void *table_schema,
+                                           ObIArray<int64_t> &domain_types,
+                                           ObIArray<uint64_t> &domain_tids)
 {
   int ret = OB_SUCCESS;
   const schema::ObTableSchema *table = reinterpret_cast<const schema::ObTableSchema*>(table_schema);
   if (OB_ISNULL(table)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get null table schema ptr", K(ret), KPC(table));
-  } else if (table->is_logic_table()) {
-    // Only collect IVFFLAT rowkey_cid domain indexes for logical tables.
-    ObSEArray<ObAuxTableMetaInfo, 16> simple_index_infos;
-    if (OB_FAIL(table->get_simple_index_infos(simple_index_infos))) {
-      LOG_WARN("get simple_index_infos failed", K(ret));
-    }
-    for (int64_t i = 0; OB_SUCC(ret) && i < simple_index_infos.count(); ++i) {
-      int64_t domain_type = ObDomainIDType::MAX;
-      uint64_t domain_tid = simple_index_infos.at(i).table_id_;
-      if (is_vec_ivfflat_rowkey_cid_index(simple_index_infos.at(i).index_type_)) {
-        domain_type = ObDomainIDType::IVFFLAT_CID;
-      }
-      if (OB_SUCC(ret) && ObDomainIDType::IVFFLAT_CID == domain_type) {
-        if (OB_FAIL(domain_types.push_back(domain_type))) {
-          LOG_WARN("failed to push back domain type", K(ret), K(domain_type));
-        } else if (OB_FAIL(domain_tids.push_back(domain_tid))) {
-          LOG_WARN("failed to push back domain tid", K(ret), K(domain_tid));
-        }
-      }
-    }
   } else {
     ObSEArray<ObAuxTableMetaInfo, 16> simple_index_infos;
     const ObSimpleTableSchemaV2 *index_schema = NULL;
@@ -575,7 +558,9 @@ int ObDomainIdUtils::check_has_domain_index(const void *table_schema, ObIArray<i
     for (int64_t i = 0; OB_SUCC(ret) && i < simple_index_infos.count(); ++i) {
       int64_t domain_type = ObDomainIDType::MAX;
       uint64_t domain_tid = simple_index_infos.at(i).table_id_;
-      if (is_rowkey_doc_aux(simple_index_infos.at(i).index_type_)) {
+      if (table->is_logic_table() && !is_vec_ivfflat_rowkey_cid_index(simple_index_infos.at(i).index_type_)) {
+        // Only IVFFLAT domain merge is supported for logical tables.
+      } else if (is_rowkey_doc_aux(simple_index_infos.at(i).index_type_)) {
         for (int64_t j = 0; OB_SUCC(ret) && j < simple_index_infos.count(); ++j) {
           const ObIndexType index_type = simple_index_infos.at(j).index_type_;
           if (schema::is_fts_or_multivalue_index(index_type) && !schema::is_rowkey_doc_aux(index_type)) {
@@ -594,10 +579,17 @@ int ObDomainIdUtils::check_has_domain_index(const void *table_schema, ObIArray<i
         domain_type = ObDomainIDType::EMB_VEC; // not only one
       }
       if (OB_SUCC(ret) && (ObDomainIDType::DOC_ID <= domain_type && domain_type < ObDomainIDType::MAX)) {
-        if (OB_FAIL(domain_types.push_back(domain_type))) {
+        if (OB_FAIL(schema_guard.get_simple_table_schema(tenant_id, domain_tid, index_schema))) {
+          LOG_WARN("failed to get domain index schema", K(ret), K(tenant_id), K(domain_tid));
+        } else if (OB_ISNULL(index_schema)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("domain index schema is null", K(ret), K(tenant_id), K(domain_tid));
+        } else if (index_schema->is_final_invalid_index()) {
+          // Match get_can_write_index_array(), which supplies the related tablet locations.
+        } else if (OB_FAIL(domain_types.push_back(domain_type))) {
           LOG_WARN("failed to push back domain type", K(ret), K(domain_type));
         } else if (OB_FAIL(domain_tids.push_back(domain_tid))) {
-        LOG_WARN("failed to push back domain tid", K(ret), K(domain_tid));
+          LOG_WARN("failed to push back domain tid", K(ret), K(domain_tid));
         }
       }
     }

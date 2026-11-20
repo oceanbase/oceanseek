@@ -153,6 +153,11 @@ int ObDropIndexTask::update_index_status(const ObIndexStatus new_status)
       LOG_WARN("update index status failed", K(ret), K(arg));
     } else {
       LOG_INFO("notify index status changed finish", K(new_status), K(target_object_id_));
+      if (INDEX_STATUS_UNUSABLE == new_status &&
+          (index_schema->is_vec_rowkey_vid_type() || index_schema->is_vec_ivfflat_rowkey_cid_index() ||
+           index_schema->is_vec_ivfsq8_rowkey_cid_index() || index_schema->is_vec_ivfpq_rowkey_cid_index())) {
+        DEBUG_SYNC(DROP_VECTOR_DOMAIN_INDEX_SET_UNUSABLE);
+      }
     }
   }
   return ret;

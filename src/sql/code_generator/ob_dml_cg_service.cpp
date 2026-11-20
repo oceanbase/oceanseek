@@ -5417,7 +5417,7 @@ int ObDmlCgService::check_need_domain_id_merge_iter(
   } else if (OB_ISNULL(table_schema)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("table schema is null", K(ret), K(table_schema));
-  } else if (OB_FAIL(ObDomainIdUtils::check_has_domain_index(table_schema, domain_types, domain_tids))) {
+  } else if (OB_FAIL(ObDomainIdUtils::check_has_domain_index(*schema_guard, table_schema, domain_types, domain_tids))) {
     LOG_WARN("failed to check has domain index", K(ret));
   } else if (domain_types.count() != domain_tids.count()) {
     ret = OB_ERR_UNEXPECTED;
