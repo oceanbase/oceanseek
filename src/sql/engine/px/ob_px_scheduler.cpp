@@ -886,7 +886,7 @@ int ObPxCoordInfo::complete_outtable_lob_control_keys(ObExecContext &ctx)
     } else if (OB_FAIL(control_ctx.complete(ctx))) {
       LOG_WARN("failed to complete px outtable lob control rows", K(ret));
     } else {
-      outtable_lob_control_keys_->reuse();
+      outtable_lob_control_keys_->reset();
     }
   }
   if (OB_FAIL(ret)) {
