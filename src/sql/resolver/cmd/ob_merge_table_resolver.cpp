@@ -154,7 +154,7 @@ static int check_merge_column_compatibility(const ObColumnSchemaV2 &lhs,
   bool is_same_type = false;
   is_same = false;
   if (lhs.get_column_name_str() != rhs.get_column_name_str()) {
-    // Columns are paired in schema order and referenced by name in the inner SQL.
+    // Columns are paired in logical column order and referenced by name in the inner SQL.
   } else if (lhs.get_rowkey_position() != rhs.get_rowkey_position()
              || lhs.is_heap_table_primary_key_column() != rhs.is_heap_table_primary_key_column()) {
     // Both tables must identify a row with the same key, including HEAP logical keys.
@@ -185,12 +185,21 @@ static int check_merge_column_compatibility(const ObColumnSchemaV2 &lhs,
 static int get_user_columns(const ObTableSchema &table, ObIArray<const ObColumnSchemaV2 *> &cols)
 {
   int ret = OB_SUCCESS;
-  for (ObTableSchema::const_column_iterator it = table.column_begin();
-       OB_SUCC(ret) && it != table.column_end(); ++it) {
-    if (OB_ISNULL(*it)) {
+  // DDL can change logical column order without rearranging the schema array.
+  ObColumnIterByPrevNextID iter(table);
+  const ObColumnSchemaV2 *column_schema = NULL;
+  while (OB_SUCC(ret)) {
+    if (OB_FAIL(iter.next(column_schema))) {
+      if (OB_ITER_END == ret) {
+        ret = OB_SUCCESS;
+      } else {
+        LOG_WARN("failed to iterate columns in logical order", K(ret));
+      }
+      break;
+    } else if (OB_ISNULL(column_schema)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("column schema is null", K(ret));
-    } else if (!(*it)->is_hidden() && OB_FAIL(cols.push_back(*it))) {
+    } else if (!column_schema->is_hidden() && OB_FAIL(cols.push_back(column_schema))) {
       LOG_WARN("failed to push column", K(ret));
     }
   }
@@ -246,18 +255,35 @@ int ObMergeTableResolver::resolve_table_names_and_strategy_(const ParseNode &par
 {
   int ret = OB_SUCCESS;
   const ParseNode *strategy_node = parse_tree.children_[STRATEGY_NODE];
+  const ParseNode *inc_table_node = parse_tree.children_[INCOMING_TABLE_NODE];
+  const ParseNode *cur_table_node = parse_tree.children_[CURRENT_TABLE_NODE];
   ObString inc_table_name;
   ObString inc_db_name;
   ObString cur_table_name;
   ObString cur_db_name;
-  if (OB_ISNULL(strategy_node)) {
+  bool inc_has_dblink = false;
+  bool cur_has_dblink = false;
+  // Check explicit links before resolving names, which may require a default database.
+  if (OB_ISNULL(strategy_node) || OB_ISNULL(inc_table_node) || OB_ISNULL(cur_table_node)) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("strategy node is NULL", K(ret));
-  } else if (OB_FAIL(resolve_table_relation_node(parse_tree.children_[INCOMING_TABLE_NODE],
-                                                 inc_table_name, inc_db_name))) {
+    LOG_WARN("merge table node is NULL", K(ret), KP(strategy_node), KP(inc_table_node), KP(cur_table_node));
+  } else if (OB_UNLIKELY(T_RELATION_FACTOR != inc_table_node->type_
+                        || T_RELATION_FACTOR != cur_table_node->type_
+                        || inc_table_node->num_child_ < 2 || cur_table_node->num_child_ < 2)
+             || OB_ISNULL(inc_table_node->children_) || OB_ISNULL(cur_table_node->children_)
+             || OB_ISNULL(inc_table_node->children_[1]) || OB_ISNULL(cur_table_node->children_[1])) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid merge table relation node", K(ret), KP(inc_table_node), KP(cur_table_node));
+  } else if (OB_FAIL(resolve_dblink_info(inc_table_node, NULL, NULL, &inc_has_dblink))
+             || OB_FAIL(resolve_dblink_info(cur_table_node, NULL, NULL, &cur_has_dblink))) {
+    LOG_WARN("failed to resolve merge table database links", K(ret));
+  } else if (inc_has_dblink || cur_has_dblink) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "MERGE TABLE with database links");
+    LOG_WARN("merge table does not support database links", K(ret), K(inc_has_dblink), K(cur_has_dblink));
+  } else if (OB_FAIL(resolve_table_relation_node(inc_table_node, inc_table_name, inc_db_name))) {
     LOG_WARN("failed to resolve incoming table", K(ret));
-  } else if (OB_FAIL(resolve_table_relation_node(parse_tree.children_[CURRENT_TABLE_NODE],
-                                                 cur_table_name, cur_db_name))) {
+  } else if (OB_FAIL(resolve_table_relation_node(cur_table_node, cur_table_name, cur_db_name))) {
     LOG_WARN("failed to resolve current table", K(ret));
   } else if (strategy_node->value_ < static_cast<int64_t>(ObMergeTableStrategy::FAIL)
              || strategy_node->value_ >= static_cast<int64_t>(ObMergeTableStrategy::MAX)) {
