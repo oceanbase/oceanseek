@@ -453,9 +453,10 @@ int ObMediumCompactionScheduleFunc::schedule_next_medium_primary_cluster(
     ret = decide_medium_snapshot(schedule_major_snapshot, medium_clog_submitted);
   }
 
-  // 主表和异步索引相互独立：先提交主表合并，再推进异步索引。
-  // 携带租户合并目标时按目标推进异步索引，否则按普通策略调度。
+  // Schedule async indexes by ordinary policy without forwarding the tenant target.
   if (OB_SUCC(ret)
+      && ObAdaptiveMergePolicy::TENANT_MAJOR != merge_reason_
+      && !ObAdaptiveMergePolicy::is_window_merge_reason(merge_reason_)
       && ObAdaptiveMergePolicy::ASYNC_INDEX_FORCE_MERGE != merge_reason_
       && ObAdaptiveMergePolicy::USER_REQUEST != merge_reason_) {
     int async_index_ret = OB_SUCCESS;
@@ -463,10 +464,7 @@ int ObMediumCompactionScheduleFunc::schedule_next_medium_primary_cluster(
     if (OB_SUCCESS != (async_index_ret = tablet->get_has_async_index(has_async_index))) {
       LOG_WARN("failed to get authoritative async-index membership", KR(async_index_ret), K(tablet->get_tablet_id()));
     } else if (has_async_index) {
-      // 0 表示不携带租户 major 目标，按普通异步索引流程调度。
-      async_index_ret = schedule_major_snapshot > 0
-          ? schedule_async_index_with_major_snapshot_(schedule_major_snapshot)
-          : schedule_async_index();
+      async_index_ret = schedule_async_index();
       if (OB_EAGAIN == async_index_ret) {
         if (REACH_TIME_INTERVAL(10_s)) {
           LOG_INFO("wait to retry async index scheduling", K(schedule_major_snapshot), KPC(tablet));

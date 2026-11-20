@@ -232,6 +232,8 @@ bool ObMajorMergeProgressChecker::should_ignore_cur_table(const ObSimpleTableSch
     // table deleted
   } else if (!simple_schema->has_tablet()) {
     // table has not tablet, should not put into table_id_map
+  } else if (simple_schema->is_async_index()) {
+    // Async indexes do not participate in the tenant compaction target.
   } else if (simple_schema->is_index_table() && !simple_schema->can_read_index()) {
     // not ready index
   } else {
