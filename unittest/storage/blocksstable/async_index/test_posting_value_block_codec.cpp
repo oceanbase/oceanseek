@@ -662,6 +662,39 @@ TEST_F(TestPostingValueBlockCodec, row_index_byte_width)
   verify_value_block_header(desc, true, false, large_row_cnt);
 }
 
+TEST_F(TestPostingValueBlockCodec, estimated_size_matches_built_block)
+{
+  init_param_nested_key_only();
+  ASSERT_EQ(OK, writer_.init(param_, allocator_));
+
+  ObDatumRow row;
+  const char small_value[] = {1};
+  ASSERT_EQ(OK, make_value_row(row, 1, nullptr, 0, small_value, sizeof(small_value)));
+  int64_t row_size = 0;
+  int64_t estimated_size = 0;
+  ASSERT_EQ(OK, writer_.estimate_row_size(row, row_size));
+  ASSERT_EQ(OK, writer_.estimate_size_after_append(row_size, estimated_size));
+  ASSERT_EQ(OK, writer_.append_row(row));
+  ObPostingValueBlockDesc desc;
+  ASSERT_EQ(OK, writer_.build_block(desc));
+  EXPECT_EQ(estimated_size, desc.size_);
+
+  writer_.reuse();
+  char large_value[12000];
+  MEMSET(large_value, 1, sizeof(large_value));
+  for (int64_t i = 0; i < 7; ++i) {
+    ASSERT_EQ(OK, make_value_row(row, 1, nullptr, 0, large_value, sizeof(large_value)));
+    ASSERT_EQ(OK, writer_.estimate_row_size(row, row_size));
+    ASSERT_EQ(OK, writer_.estimate_size_after_append(row_size, estimated_size));
+    ASSERT_EQ(OK, writer_.append_row(row));
+  }
+  ASSERT_EQ(OK, writer_.build_block(desc));
+  EXPECT_EQ(estimated_size, desc.size_);
+  const ObPostingValueBlockHeader *header =
+      reinterpret_cast<const ObPostingValueBlockHeader *>(desc.buf_);
+  EXPECT_EQ(4, header->row_idx_byte_width_);
+}
+
 TEST_F(TestPostingValueBlockCodec, col_idx_byte_width_large_row)
 {
   init_param(false);

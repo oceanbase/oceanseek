@@ -593,7 +593,8 @@ protected:
   // (COL_IDX, PATH, VALUE, DOC_ID, NESTED_KEY) and manually sets index_type_ = SEARCH
   // and nested_key_col_idx_ after init(), simulating a correctly filled row desc
   // (schema layer has no is_async_search_index / nested_key flag yet).
-  int prepare_search_open_env(const char *compress_name = "none");
+  int prepare_search_open_env(const char *compress_name = "none",
+                              const int64_t cluster_version = DATA_VERSION_4_6_0_0);
   // Variant of prepare_open_env for search text index: builds the COL_IDX/PATH/TOKEN/DOC_ID
   // rowkey schema with MATCH/PHRASE index types, so the row desc comes from the
   // production init_search_text() path.
@@ -749,7 +750,8 @@ int ObInvIdxMacroBlockWriterTest::open_writer(
       macro_seq_param_, pre_warm_param, cleaner, nullptr /*callback*/);
 }
 
-int ObInvIdxMacroBlockWriterTest::prepare_search_open_env(const char *compress_name)
+int ObInvIdxMacroBlockWriterTest::prepare_search_open_env(
+    const char *compress_name, const int64_t cluster_version)
 {
   int ret = OB_SUCCESS;
 
@@ -770,7 +772,6 @@ int ObInvIdxMacroBlockWriterTest::prepare_search_open_env(const char *compress_n
   } else {
     share::SCN end_scn;
     share::SCN reorganization_scn;
-    const int64_t cluster_version = DATA_VERSION_4_6_0_0;
     end_scn.convert_for_tx(100);
     reorganization_scn.set_min();
     if (OB_FAIL(static_desc_.init(
@@ -3047,6 +3048,95 @@ TEST_F(ObInvIdxMacroBlockWriterTest, search_index_append_row)
   ASSERT_EQ(OB_SUCCESS, writer.close());
   EXPECT_NE(nullptr, writer.index_block_builder_.index_tree_root_ctx_->data_write_ctx_);
   EXPECT_EQ(1, writer.index_block_builder_.index_tree_root_ctx_->data_write_ctx_->get_macro_block_count());
+  writer.reset();
+}
+
+TEST_F(ObInvIdxMacroBlockWriterTest, search_index_large_nested_value_keeps_old_split_policy)
+{
+  ObInvIdxMacroBlockWriter writer;
+  ObSSTablePrivateObjectCleaner cleaner;
+  ASSERT_EQ(OB_SUCCESS, prepare_search_open_env("none", DATA_VERSION_4_6_3_0));
+  ASSERT_EQ(OB_SUCCESS, open_writer(writer, cleaner));
+
+  char nested_value[12001];
+  MEMSET(nested_value, 1, sizeof(nested_value) - 1);
+  nested_value[sizeof(nested_value) - 1] = '\0';
+  ObDatumRow row;
+  for (int64_t i = 1; i <= 5; ++i) {
+    ASSERT_EQ(OB_SUCCESS, make_search_idx_row(row, inv_idx_row_desc_, mv_col_cnt_,
+        "1", "$.a", "val_a", static_cast<uint64_t>(i), nested_value));
+    ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+  }
+  EXPECT_EQ(5, writer.posting_encoder_.get_doc_count());
+  EXPECT_TRUE(writer.posting_micro_writer_.is_empty());
+  ASSERT_EQ(OB_SUCCESS, writer.close());
+  writer.reset();
+}
+
+TEST_F(ObInvIdxMacroBlockWriterTest, search_index_large_nested_value_splits_before_row_limit)
+{
+  ObInvIdxMacroBlockWriter writer;
+  ObSSTablePrivateObjectCleaner cleaner;
+  ASSERT_EQ(OB_SUCCESS, prepare_search_open_env("none", DATA_VERSION_4_6_3_1));
+  ASSERT_EQ(OB_SUCCESS, open_writer(writer, cleaner));
+
+  char nested_value[12001];
+  MEMSET(nested_value, 1, sizeof(nested_value) - 1);
+  nested_value[sizeof(nested_value) - 1] = '\0';
+  ObDatumRow row;
+  for (int64_t i = 1; i <= 4; ++i) {
+    ASSERT_EQ(OB_SUCCESS, make_search_idx_row(row, inv_idx_row_desc_, mv_col_cnt_,
+        "1", "$.a", "val_a", static_cast<uint64_t>(i), nested_value));
+    ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+  }
+  EXPECT_EQ(4, writer.posting_encoder_.get_doc_count());
+  EXPECT_TRUE(writer.posting_micro_writer_.is_empty());
+
+  for (int64_t i = 5; i <= 175; ++i) {
+    ASSERT_EQ(OB_SUCCESS, make_search_idx_row(row, inv_idx_row_desc_, mv_col_cnt_,
+        "1", "$.a", "val_a", static_cast<uint64_t>(i), nested_value));
+    ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+    if (5 == i) {
+      ASSERT_EQ(1, writer.pending_term_group_.logical_block_metas_.count());
+      EXPECT_EQ(4, writer.pending_term_group_.logical_block_metas_.at(0).doc_count_);
+      EXPECT_EQ(1, writer.posting_encoder_.get_doc_count());
+      EXPECT_EQ(1, writer.posting_value_writer_.get_row_count());
+    }
+  }
+
+  ASSERT_EQ(OB_SUCCESS, writer.close());
+  EXPECT_EQ(175, writer.get_merge_block_info().total_row_count_);
+  EXPECT_EQ(175ul, writer.get_seg_inv_meta().get_stats().max_doc_id_);
+  writer.reset();
+}
+
+TEST_F(ObInvIdxMacroBlockWriterTest, search_index_single_large_value_exceeds_soft_limit)
+{
+  ObInvIdxMacroBlockWriter writer;
+  ObSSTablePrivateObjectCleaner cleaner;
+  ASSERT_EQ(OB_SUCCESS, prepare_search_open_env("none", DATA_VERSION_4_6_3_1));
+  ASSERT_EQ(OB_SUCCESS, open_writer(writer, cleaner));
+
+  char nested_value[60001];
+  MEMSET(nested_value, 1, sizeof(nested_value) - 1);
+  nested_value[sizeof(nested_value) - 1] = '\0';
+  ObDatumRow row;
+  ASSERT_EQ(OB_SUCCESS, make_search_idx_row(row, inv_idx_row_desc_, mv_col_cnt_,
+      "1", "$.a", "val_a", 1, nested_value));
+  ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+  EXPECT_EQ(1, writer.posting_encoder_.get_doc_count());
+  EXPECT_EQ(1, writer.posting_value_writer_.get_row_count());
+
+  ASSERT_EQ(OB_SUCCESS, make_search_idx_row(row, inv_idx_row_desc_, mv_col_cnt_,
+      "1", "$.a", "val_a", 2, "small"));
+  ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+  ASSERT_EQ(1, writer.pending_term_group_.logical_block_metas_.count());
+  EXPECT_EQ(1, writer.pending_term_group_.logical_block_metas_.at(0).doc_count_);
+  EXPECT_EQ(1, writer.posting_encoder_.get_doc_count());
+  EXPECT_EQ(1, writer.posting_value_writer_.get_row_count());
+
+  ASSERT_EQ(OB_SUCCESS, writer.close());
+  EXPECT_EQ(2, writer.get_merge_block_info().total_row_count_);
   writer.reset();
 }
 

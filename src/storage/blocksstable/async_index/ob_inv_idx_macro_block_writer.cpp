@@ -7,6 +7,7 @@
 
 #include "storage/blocksstable/async_index/ob_inv_idx_macro_block_writer.h"
 
+#include "common/ob_version_def.h"
 #include "lib/checksum/ob_crc64.h"
 #include "lib/container/ob_se_array.h"
 #include "share/schema/ob_column_schema.h"
@@ -443,6 +444,30 @@ int ObInvIdxMacroBlockWriter::inner_append_row(const ObDatumRow &row)
         if (OB_FAIL(flush_logical_block())) {
           STORAGE_LOG(WARN, "fail to flush inverted index logical block before append row",
               K(ret), K(term), K_(current_term), K(cmp_ret));
+        }
+      } else if (has_posting_value()
+          && data_store_desc_->get_major_working_cluster_version() >= DATA_VERSION_4_6_3_1
+          && posting_value_writer_.get_row_count() > 0) {
+        int64_t row_size = 0;
+        int64_t logical_block_size = 0;
+        const int64_t posting_micro_block_size_limit = MIN(
+            data_store_desc_->get_micro_block_size(),
+            data_store_desc_->get_macro_block_size()
+                * POSTING_MICRO_BLOCK_SIZE_LIMIT_PERCENT / PERCENT_BASE);
+        const int64_t posting_value_micro_block_size_limit
+            = posting_micro_block_size_limit * POSTING_VALUE_MICRO_BLOCK_SIZE_LIMIT_FACTOR;
+        const int64_t value_block_size_limit = MIN(
+            posting_value_micro_block_size_limit, OB_DEFAULT_MACRO_BLOCK_SIZE)
+            - sizeof(ObInvIdxMicroBlockPayloadHeader)
+            - 2 * ObInvIdxMicroBlockPayloadHeader::BLOCK_OFFSET_SIZE;
+        if (OB_FAIL(posting_value_writer_.estimate_row_size(row, row_size))) {
+          STORAGE_LOG(WARN, "fail to estimate posting value row size", K(ret), K(row));
+        } else if (OB_FAIL(posting_value_writer_.estimate_size_after_append(
+            row_size, logical_block_size))) {
+          STORAGE_LOG(WARN, "fail to estimate posting value block size", K(ret), K(row_size));
+        } else if (logical_block_size > value_block_size_limit && OB_FAIL(flush_logical_block())) {
+          STORAGE_LOG(WARN, "fail to flush oversized posting value logical block",
+              K(ret), K(logical_block_size), K(value_block_size_limit));
         }
       }
     }

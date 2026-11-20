@@ -27,6 +27,8 @@ public:
   int init(const ObPostingValueBlockWriteParam &param, common::ObIAllocator &allocator);
 
   int append_row(const ObDatumRow &row);
+  int estimate_row_size(const ObDatumRow &row, int64_t &row_size) const;
+  int estimate_size_after_append(const int64_t row_size, int64_t &logical_block_size) const;
 
   int append_batch(
       const ObBatchDatumRows &batch,
@@ -50,13 +52,19 @@ public:
 private:
   typedef common::ObFixedArray<int64_t, common::ObIAllocator> RowOffsetArray;
 
+  int prepare_row(
+      const ObDatumRow &row,
+      const char *(&col_ptrs)[2],
+      int64_t (&col_lens)[2],
+      uint8_t &col_idx_byte_width,
+      int64_t &row_size) const;
   int build_row_index();
   int append_binary_col(
       const ObDatumRow &row,
       const int16_t col_idx,
       const bool null_as_empty,
       const char *&ptr,
-      int64_t &len);
+      int64_t &len) const;
   int reserve_block_header_if_needed();
   OB_INLINE ObPostingValueBlockHeader *get_header()
   {

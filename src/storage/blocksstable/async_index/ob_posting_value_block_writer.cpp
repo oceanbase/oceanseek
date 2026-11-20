@@ -20,7 +20,7 @@ int ObPostingValueBlockWriter::append_binary_col(
     const int16_t col_idx,
     const bool null_as_empty,
     const char *&ptr,
-    int64_t &len)
+    int64_t &len) const
 {
   int ret = OB_SUCCESS;
   ptr = nullptr;
@@ -101,21 +101,30 @@ int ObPostingValueBlockWriter::init(
   return ret;
 }
 
-int ObPostingValueBlockWriter::append_row(const ObDatumRow &row)
+int ObPostingValueBlockWriter::prepare_row(
+    const ObDatumRow &row,
+    const char *(&col_ptrs)[2],
+    int64_t (&col_lens)[2],
+    uint8_t &col_idx_byte_width,
+    int64_t &row_size) const
 {
   int ret = OB_SUCCESS;
+  col_idx_byte_width = 0;
+  row_size = 0;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     STORAGE_LOG(WARN, "posting value block writer not inited", K(ret));
-  } else if (OB_UNLIKELY(is_full())) {
-    ret = OB_BUF_NOT_ENOUGH;
-  } else if (OB_FAIL(reserve_block_header_if_needed())) {
-    STORAGE_LOG(WARN, "failed to reserve value block header before append row", K(ret));
+  } else if (OB_UNLIKELY(param_->get_column_cnt() <= 0
+      || param_->get_column_cnt() > ARRAYSIZEOF(col_ptrs))) {
+    ret = OB_INVALID_ARGUMENT;
+    STORAGE_LOG(WARN, "invalid posting value column count", K(ret), K(param_->get_column_cnt()));
   } else {
     const int64_t col_cnt = param_->get_column_cnt();
-    const char *col_ptrs[2] = {nullptr, nullptr};
-    int64_t col_lens[2] = {0, 0};
     int64_t col_idx = 0;
+    for (int64_t i = 0; i < col_cnt; ++i) {
+      col_ptrs[i] = nullptr;
+      col_lens[i] = 0;
+    }
     if (param_->has_position_list()
         && OB_FAIL(append_binary_col(
             row, param_->position_list_col_idx_, false /* null */, col_ptrs[col_idx], col_lens[col_idx]))) {
@@ -130,21 +139,91 @@ int ObPostingValueBlockWriter::append_row(const ObDatumRow &row)
         STORAGE_LOG(WARN, "failed to get nested_key column", K(ret));
       }
     }
-
-    int64_t data_len = 0;
-    for (int64_t i = 0; OB_SUCC(ret) && i < col_cnt; ++i) {
-      data_len += col_lens[i];
+    if (OB_SUCC(ret)) {
+      int64_t data_len = 0;
+      for (int64_t i = 0; i < col_cnt; ++i) {
+        data_len += col_lens[i];
+      }
+      col_idx_byte_width = static_cast<uint8_t>(
+          get_byte_packed_int_size(static_cast<uint64_t>(data_len)));
+      row_size = sizeof(ObPostingValueRowHeader) + (col_cnt + 1) * col_idx_byte_width + data_len;
     }
+  }
+  return ret;
+}
 
-    const int64_t col_idx_cnt = col_cnt + 1;
-    uint64_t max_col_offset = static_cast<uint64_t>(data_len);
-    const uint8_t col_idx_byte_width = static_cast<uint8_t>(get_byte_packed_int_size(max_col_offset));
-    const int64_t row_size = sizeof(ObPostingValueRowHeader)
-        + col_idx_cnt * col_idx_byte_width + data_len;
+int ObPostingValueBlockWriter::estimate_row_size(const ObDatumRow &row, int64_t &row_size) const
+{
+  int ret = OB_SUCCESS;
+  const char *col_ptrs[2];
+  int64_t col_lens[2];
+  uint8_t col_idx_byte_width = 0;
+  if (OB_FAIL(prepare_row(row, col_ptrs, col_lens, col_idx_byte_width, row_size))) {
+    STORAGE_LOG(WARN, "failed to estimate posting value row size", K(ret));
+  }
+  return ret;
+}
+
+int ObPostingValueBlockWriter::estimate_size_after_append(
+    const int64_t row_size,
+    int64_t &logical_block_size) const
+{
+  int ret = OB_SUCCESS;
+  logical_block_size = 0;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    STORAGE_LOG(WARN, "posting value block writer not inited", K(ret));
+  } else if (OB_UNLIKELY(row_size <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    STORAGE_LOG(WARN, "invalid posting value row size", K(ret), K(row_size));
+  } else if (is_full()) {
+    ret = OB_BUF_NOT_ENOUGH;
+    STORAGE_LOG(WARN, "posting value block is full", K(ret), K(row_offsets_.count()));
+  } else {
+    const int64_t header_size = sizeof(ObPostingValueBlockHeader);
+    const int64_t current_size = has_header_reserved_ ? data_buffer_.length() : header_size;
+    const int64_t row_count = row_offsets_.count() + 1;
+    if (OB_UNLIKELY(current_size < header_size || row_count <= 0)) {
+      ret = OB_ERR_UNEXPECTED;
+      STORAGE_LOG(WARN, "invalid posting value block state", K(ret), K(current_size), K(row_count));
+    } else {
+      const int64_t row_offset = current_size - header_size;
+      const int64_t row_idx_byte_width
+          = get_byte_packed_int_size(static_cast<uint64_t>(row_offset));
+      if (OB_UNLIKELY(row_count > (INT64_MAX - current_size) / row_idx_byte_width
+          || row_size > INT64_MAX - current_size - row_count * row_idx_byte_width)) {
+        ret = OB_SIZE_OVERFLOW;
+        STORAGE_LOG(WARN, "posting value block size overflows",
+            K(ret), K(current_size), K(row_size), K(row_count));
+      } else {
+        logical_block_size = current_size + row_size + row_count * row_idx_byte_width;
+      }
+    }
+  }
+  return ret;
+}
+
+int ObPostingValueBlockWriter::append_row(const ObDatumRow &row)
+{
+  int ret = OB_SUCCESS;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    STORAGE_LOG(WARN, "posting value block writer not inited", K(ret));
+  } else if (OB_UNLIKELY(is_full())) {
+    ret = OB_BUF_NOT_ENOUGH;
+  } else if (OB_FAIL(reserve_block_header_if_needed())) {
+    STORAGE_LOG(WARN, "failed to reserve value block header before append row", K(ret));
+  } else {
+    const int64_t col_cnt = param_->get_column_cnt();
+    const char *col_ptrs[2] = {nullptr, nullptr};
+    int64_t col_lens[2] = {0, 0};
+    uint8_t col_idx_byte_width = 0;
+    int64_t row_size = 0;
     const int64_t row_data_base = sizeof(ObPostingValueBlockHeader);
     const int64_t row_offset = data_buffer_.length() - row_data_base;
 
-    if (OB_FAIL(ret)) {
+    if (OB_FAIL(prepare_row(row, col_ptrs, col_lens, col_idx_byte_width, row_size))) {
+      STORAGE_LOG(WARN, "failed to prepare posting value row", K(ret));
     } else if (OB_FAIL(data_buffer_.ensure_space(row_size))) {
       STORAGE_LOG(WARN, "failed to ensure space for value row", K(ret), K(row_size));
     } else if (OB_FAIL(row_offsets_.push_back(row_offset))) {
@@ -154,7 +233,7 @@ int ObPostingValueBlockWriter::append_row(const ObDatumRow &row)
       ObPostingValueRowHeader *row_header = reinterpret_cast<ObPostingValueRowHeader *>(row_buf);
       row_header->col_idx_byte_width_ = col_idx_byte_width;
       char *col_idx_buf = row_buf + sizeof(ObPostingValueRowHeader);
-      char *col_data_buf = col_idx_buf + col_idx_cnt * col_idx_byte_width;
+      char *col_data_buf = col_idx_buf + (col_cnt + 1) * col_idx_byte_width;
 
       ObIntegerArrayGenerator col_idx_gen;
       if (OB_FAIL(col_idx_gen.init(col_idx_buf, col_idx_byte_width))) {
