@@ -74,6 +74,13 @@ private:
 class ObOuttableLobControlOperator final
 {
 public:
+  enum class LockMode
+  {
+    NO_LOCK = 0,
+    FOR_UPDATE,
+    FOR_UPDATE_NOWAIT
+  };
+
   static constexpr int64_t MAX_MACRO_ID_LENGTH = 128;
   static const char EMPTY_INFO[];
 
@@ -114,7 +121,7 @@ public:
       const uint64_t tenant_id,
       const blocksstable::MacroBlockId &macro_id,
       const uint64_t hash,
-      const bool for_update,
+      const LockMode lock_mode,
       common::ObIAllocator &allocator,
       int64_t &row_scn,
       ObOuttableLobControlRow &row);
@@ -124,7 +131,7 @@ public:
       const uint64_t tenant_id,
       const blocksstable::MacroBlockId &macro_id,
       const uint64_t hash,
-      const bool for_update,
+      const LockMode lock_mode,
       common::ObIAllocator &allocator,
       int64_t &row_scn,
       ObOuttableLobControlRow &row);
@@ -160,7 +167,7 @@ private:
   static int build_select_sql_(
       const blocksstable::MacroBlockId &macro_id,
       const uint64_t hash,
-      const bool for_update,
+      const LockMode lock_mode,
       common::ObSqlString &sql);
 
   static int parse_select_result_(

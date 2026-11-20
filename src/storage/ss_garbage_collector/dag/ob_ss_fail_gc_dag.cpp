@@ -7,6 +7,7 @@
 
 #include "storage/ss_garbage_collector/dag/ob_ss_fail_gc_dag.h"
 #include "storage/ss_garbage_collector/dag/ob_ss_gc_dag_util.h"
+#include "common/ob_timeout_ctx.h"
 #include "lib/allocator/page_arena.h"
 #include "lib/allocator/ob_malloc.h"
 #include "lib/atomic/ob_atomic.h"
@@ -17,6 +18,7 @@
 #include "observer/omt/ob_tenant_config_mgr.h"
 #include "share/ob_all_server_tracer.h"
 #include "share/ob_cluster_version.h"
+#include "share/location_cache/ob_location_struct.h"
 #include "share/ob_share_util.h"
 #include "share/scheduler/ob_dag_warning_history_mgr.h"
 #include "share/rc/ob_tenant_base.h"
@@ -848,13 +850,19 @@ int ObSSLobCtrlFailGCTask::process_lob_ctrl_fail_gc_(ObSSFailGCDagCtx &ctx)
         continue_scan = false;
         LOG_INFO("stop lob ctrl fail gc after tenant role changed", K_(ctx.tenant_id));
       } else if (OUTTABLE_LOB_CONTROL_DOING == row.status_) {
+        ObTimeoutCtx timeout_ctx;
         row.status_ = OUTTABLE_LOB_CONTROL_FAIL;
-        if (OB_FAIL(manager.update_fail(row))) {
-          if (OB_STATE_NOT_MATCH == ret || OB_ENTRY_NOT_EXIST == ret) {
+        if (OB_FAIL(timeout_ctx.set_timeout(ctx.sql_timeout_us_))) {
+          LOG_WARN("fail to set lob ctrl update deadline", KR(ret), K_(ctx.sql_timeout_us));
+        } else if (OB_FAIL(manager.update_fail(row))) {
+          LOG_WARN("fail to mark expired lob ctrl row as failed",
+              KR(ret), K_(ctx.tenant_id), K(row));
+          // Defer row errors, including transaction completion failures, to the next round.
+          if (OB_CANCELED != ret && OB_SERVICE_STOPPED != ret) {
             ret = OB_SUCCESS;
-          } else {
-            LOG_WARN("fail to mark expired lob ctrl row as failed",
-                KR(ret), K_(ctx.tenant_id), K(row));
+            if (OB_FAIL(ObSSGCDagUtil::check_if_stopped(*this))) {
+              LOG_INFO("stop lob ctrl fail gc after row error", KR(ret), K(row));
+            }
           }
         }
       } else if (OB_FAIL(delete_expired_fail_row_(ctx, manager, row, continue_scan))) {
@@ -874,37 +882,86 @@ int ObSSLobCtrlFailGCTask::delete_expired_fail_row_(
     bool &continue_scan)
 {
   int ret = OB_SUCCESS;
-  bool is_primary = false;
-  ObMySQLTransaction trans;
-  if (OB_FAIL(trans.start(GCTX.sql_proxy_, ctx.tenant_id_))) {
-    LOG_WARN("fail to start lob ctrl delete transaction", KR(ret), K_(ctx.tenant_id));
-  } else {
-    if (OB_FAIL(ObShareUtil::mtl_check_if_tenant_role_is_primary(
+  constexpr int64_t RETRY_INTERVAL_US = 100 * 1000;
+  constexpr int64_t MAX_ROW_PROCESS_TIME_US = 3 * 1000 * 1000;
+  constexpr int64_t MAX_ROW_RETRY_COUNT = 2;
+  ObTimeoutCtx timeout_ctx;
+  bool need_retry = true;
+  int64_t retry_count = 0;
+  if (OB_UNLIKELY(OUTTABLE_LOB_CONTROL_FAIL != row.status_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid lob ctrl fail gc status", KR(ret), K(row));
+  } else if (OB_FAIL(timeout_ctx.set_timeout(MIN(ctx.sql_timeout_us_, MAX_ROW_PROCESS_TIME_US)))) {
+    LOG_WARN("fail to set lob ctrl row deadline", KR(ret), K_(ctx.sql_timeout_us));
+  }
+  while (OB_SUCC(ret) && need_retry && continue_scan) {
+    need_retry = false;
+    bool is_primary = false;
+    ObMySQLTransaction trans;
+    if (OB_FAIL(check_if_stopped_or_failed())) {
+      LOG_INFO("stop processing expired lob ctrl row", KR(ret), K(row));
+    } else if (timeout_ctx.is_timeouted()) {
+      // No transaction is active here; an exhausted row budget must not stop the scan.
+      LOG_WARN_RET(OB_TIMEOUT, "defer lob ctrl deletion after row deadline", K(row));
+    } else if (OB_FAIL(ObShareUtil::mtl_check_if_tenant_role_is_primary(
         ctx.tenant_id_, is_primary))) {
-      LOG_WARN("fail to recheck tenant role before deleting lob ctrl row",
-          KR(ret), K_(ctx.tenant_id), K(row));
+      LOG_WARN("fail to recheck tenant role for lob ctrl row", KR(ret), K_(ctx.tenant_id));
     } else if (!is_primary) {
       continue_scan = false;
-      LOG_INFO("skip deleting lob ctrl row after tenant role changed", K_(ctx.tenant_id), K(row));
-    } else if (OB_FAIL(manager.delete_fail_row(trans, row.key_.macro_id_, row.key_.hash_))) {
-      if (OB_STATE_NOT_MATCH != ret && OB_ENTRY_NOT_EXIST != ret) {
+      LOG_INFO("stop lob ctrl fail gc after tenant role changed", K_(ctx.tenant_id));
+    } else if (OB_FAIL(trans.start(GCTX.sql_proxy_, ctx.tenant_id_))) {
+      LOG_WARN("fail to start lob ctrl fail gc transaction", KR(ret), K_(ctx.tenant_id));
+    } else {
+      if (OB_FAIL(manager.delete_fail_row(trans, row.key_.macro_id_, row.key_.hash_))) {
         LOG_WARN("fail to delete expired lob ctrl row", KR(ret), K_(ctx.tenant_id), K(row));
       }
-    }
-    const bool can_skip = OB_STATE_NOT_MATCH == ret || OB_ENTRY_NOT_EXIST == ret;
-    const bool commit = OB_SUCCESS == ret && is_primary;
-    const int end_ret = trans.end(commit);
-    if (OB_SUCCESS != end_ret) {
-      LOG_WARN("fail to end lob ctrl delete transaction",
-          K(end_ret), K(commit), KR(ret), K_(ctx.tenant_id));
-      if (OB_SUCCESS == ret || can_skip) {
-        ret = end_ret;
+      const bool commit = OB_SUCCESS == ret;
+      int tmp_ret = OB_SUCCESS;
+      if (OB_TMP_FAIL(trans.end(commit))) {
+        LOG_WARN("fail to end lob ctrl fail gc transaction", KR(tmp_ret), KR(ret), K(commit));
+        if (OB_SUCCESS == ret) {
+          ret = tmp_ret;
+        }
       }
-    } else if (can_skip) {
-      ret = OB_SUCCESS;
+    }
+    if (OB_FAIL(ret)) {
+      const int row_ret = ret;
+      if (!continue_scan || OB_CANCELED == ret || OB_SERVICE_STOPPED == ret) {
+        // Do not retry after cancellation or a tenant role change.
+      } else {
+        ret = OB_SUCCESS;
+        if (OB_FAIL(ObSSGCDagUtil::check_if_stopped(*this))) {
+          LOG_INFO("stop lob ctrl deletion after row error", KR(ret), K(row));
+        } else {
+          const int64_t remain_us = timeout_ctx.get_timeout();
+          if (is_retryable_row_error_(row_ret) && remain_us > 0
+              && retry_count < MAX_ROW_RETRY_COUNT) {
+            // Bound all attempts, including transaction completion, by one row deadline.
+            ++retry_count;
+            LOG_INFO("retry lob ctrl row transaction",
+                KR(row_ret), K(row), K(remain_us), K(retry_count));
+            ob_usleep(MIN(RETRY_INTERVAL_US, remain_us));
+            need_retry = true;
+          } else {
+            // The page iterator has advanced; defer this row without blocking later candidates.
+            LOG_WARN("defer failed lob ctrl deletion to next round",
+                KR(row_ret), K(row), K(retry_count));
+          }
+        }
+      }
     }
   }
   return ret;
+}
+
+bool ObSSLobCtrlFailGCTask::is_retryable_row_error_(const int ret)
+{
+  return OB_EAGAIN == ret || OB_NOT_MASTER == ret || OB_LS_NOT_EXIST == ret
+      || OB_TABLET_NOT_EXIST == ret || OB_GET_LOCATION_TIME_OUT == ret
+      || OB_TIMEOUT == ret || OB_TRANS_TIMEOUT == ret || OB_TRANS_STMT_TIMEOUT == ret
+      || OB_TRANS_RPC_TIMEOUT == ret || OB_TRANS_UNKNOWN == ret
+      || OB_TRANS_COMMIT_TOO_MUCH_TIME == ret
+      || OB_TRANSACTION_SET_VIOLATION == ret || share::is_location_service_renew_error(ret);
 }
 
 ObSSFailGCScheduleTask::ObSSFailGCScheduleTask()

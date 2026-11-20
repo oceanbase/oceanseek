@@ -70,6 +70,7 @@ private:
       common::ObMySQLTransaction &trans,
       const blocksstable::MacroBlockId &macro_id,
       const uint64_t hash,
+      const ObOuttableLobControlOperator::LockMode lock_mode,
       common::ObIAllocator &allocator,
       ObOuttableLobControlRow &row);
 

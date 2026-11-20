@@ -243,6 +243,7 @@ private:
       ObOuttableLobControlManager &manager,
       const ObOuttableLobControlRow &row,
       bool &continue_scan);
+  bool is_retryable_row_error_(const int ret);
 
 private:
   bool is_inited_;

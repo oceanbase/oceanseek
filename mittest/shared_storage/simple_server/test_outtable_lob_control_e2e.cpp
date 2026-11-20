@@ -490,8 +490,8 @@ void TestOuttableLobControlE2E::check_remote_owner_complete_(const bool commit)
   ObOuttableLobControlRow selected_row;
   int64_t row_scn = 0;
   ASSERT_EQ(OB_ENTRY_NOT_EXIST, ObOuttableLobControlOperator::select(*connection, tenant_id_,
-      doing_row.key_.macro_id_, doing_row.key_.hash_, false /*for_update*/,
-      row_allocator, row_scn, selected_row));
+      doing_row.key_.macro_id_, doing_row.key_.hash_,
+      ObOuttableLobControlOperator::LockMode::NO_LOCK, row_allocator, row_scn, selected_row));
   transaction::ObTxDesc *tx_desc = session.get_tx_desc();
   ASSERT_NE(nullptr, tx_desc);
   ASSERT_TRUE(tx_desc->is_in_tx());
@@ -569,14 +569,14 @@ void TestOuttableLobControlE2E::check_remote_owner_complete_(const bool commit)
   ASSERT_EQ(1, statuses.count());
   EXPECT_EQ(OUTTABLE_LOB_CONTROL_COMPLETE, statuses.at(0));
   ASSERT_EQ(OB_SUCCESS, ObOuttableLobControlOperator::select(inner_proxy(), tenant_id_,
-      doing_row.key_.macro_id_, doing_row.key_.hash_, false /*for_update*/,
-      row_allocator, row_scn, selected_row));
+      doing_row.key_.macro_id_, doing_row.key_.hash_,
+      ObOuttableLobControlOperator::LockMode::NO_LOCK, row_allocator, row_scn, selected_row));
   EXPECT_EQ(OUTTABLE_LOB_CONTROL_DOING, selected_row.status_);
   ASSERT_EQ(OB_SUCCESS, commit ? connection->commit() : connection->rollback());
   trans_started = false;
   ASSERT_EQ(OB_SUCCESS, ObOuttableLobControlOperator::select(inner_proxy(), tenant_id_,
-      doing_row.key_.macro_id_, doing_row.key_.hash_, false /*for_update*/,
-      row_allocator, row_scn, selected_row));
+      doing_row.key_.macro_id_, doing_row.key_.hash_,
+      ObOuttableLobControlOperator::LockMode::NO_LOCK, row_allocator, row_scn, selected_row));
   EXPECT_EQ(doing_row.key_.macro_id_, selected_row.key_.macro_id_);
   EXPECT_EQ(doing_row.key_.hash_, selected_row.key_.hash_);
   EXPECT_EQ(commit ? OUTTABLE_LOB_CONTROL_COMPLETE : OUTTABLE_LOB_CONTROL_DOING,
@@ -979,7 +979,8 @@ void TestOuttableLobControlE2E::check_gc_candidates_(
     ObOuttableLobControlRow row;
     int64_t row_scn = 0;
     ASSERT_EQ(OB_SUCCESS, ObOuttableLobControlOperator::select(inner_proxy(), tenant_id_,
-        keys.at(i).macro_id_, keys.at(i).hash_, false, allocator, row_scn, row));
+        keys.at(i).macro_id_, keys.at(i).hash_, ObOuttableLobControlOperator::LockMode::NO_LOCK,
+        allocator, row_scn, row));
     ASSERT_EQ(OUTTABLE_LOB_CONTROL_COMPLETE, row.status_);
     ASSERT_EQ(OB_SUCCESS, row_scns.push_back(row_scn));
     ASSERT_EQ(OB_SUCCESS, current_versions_found.push_back(false));
@@ -1142,7 +1143,8 @@ TEST_F(TestOuttableLobControlE2E, shared_versions_to_complete_row_gc)
     ObOuttableLobControlRow row;
     int64_t row_scn = 0;
     ASSERT_EQ(OB_SUCCESS, ObOuttableLobControlOperator::select(inner_proxy(), tenant_id_,
-        late_keys.at(i).macro_id_, late_keys.at(i).hash_, false, allocator, row_scn, row));
+        late_keys.at(i).macro_id_, late_keys.at(i).hash_,
+        ObOuttableLobControlOperator::LockMode::NO_LOCK, allocator, row_scn, row));
     ASSERT_GT(row_scn, meta_checkpoint.get_val_for_tx());
   }
   ASSERT_NO_FATAL_FAILURE(check_physical_keys_(ctx.lob_meta_scan_inputs_, live_keys, true));
@@ -1263,8 +1265,8 @@ TEST_F(TestOuttableLobControlE2E, cold_empty_control_checkpoints_do_not_pin_gc)
   ObOuttableLobControlRow orphan_row;
   int64_t orphan_row_scn = 0;
   ASSERT_EQ(OB_SUCCESS, ObOuttableLobControlOperator::select(inner_proxy(), tenant_id_,
-      orphan_keys.at(0).macro_id_, orphan_keys.at(0).hash_, false,
-      row_allocator, orphan_row_scn, orphan_row));
+      orphan_keys.at(0).macro_id_, orphan_keys.at(0).hash_,
+      ObOuttableLobControlOperator::LockMode::NO_LOCK, row_allocator, orphan_row_scn, orphan_row));
   ASSERT_EQ(OUTTABLE_LOB_CONTROL_COMPLETE, orphan_row.status_);
   ASSERT_GT(orphan_row_scn, SCN::base_scn().get_val_for_tx());
 

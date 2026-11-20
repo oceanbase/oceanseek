@@ -791,7 +791,8 @@ TEST_F(ObSSLocalMinorWatermarkTest, lob_columns_real_ctrl_history)
   ObOuttableLobControlRow selected_row;
   int64_t row_scn = 0;
   ASSERT_EQ(OB_ENTRY_NOT_EXIST, ObOuttableLobControlOperator::select(proxy, OB_SYS_TENANT_ID,
-      rolled_back, hash, false, rollback_allocator, row_scn, selected_row));
+      rolled_back, hash, ObOuttableLobControlOperator::LockMode::NO_LOCK,
+      rollback_allocator, row_scn, selected_row));
   // Add one committed row to guarantee this Mini has data even if rollback removes its node.
   value.key_.macro_id_ = object_a;
   value.status_ = OUTTABLE_LOB_CONTROL_FAIL; // Force a real change, even if repeated SQL UPDATEs are optimized.

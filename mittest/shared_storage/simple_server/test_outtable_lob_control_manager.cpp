@@ -239,7 +239,7 @@ TEST_F(TestOuttableLobControlManager, sys_tenant_sql_round_trip)
   ObOuttableLobControlRow selected_row;
   int64_t row_scn = 0;
   ASSERT_EQ(OB_SUCCESS, ObOuttableLobControlOperator::select(
-      trans, tenant_id, macro_id, hash, true /*for_update*/,
+      trans, tenant_id, macro_id, hash, ObOuttableLobControlOperator::LockMode::FOR_UPDATE,
       allocator, row_scn, selected_row));
   ASSERT_EQ(OUTTABLE_LOB_CONTROL_DOING, selected_row.status_);
   ASSERT_EQ(sizeof(info_buf), selected_row.info_.length());
@@ -272,7 +272,7 @@ TEST_F(TestOuttableLobControlManager, sys_tenant_sql_round_trip)
   allocator.reuse();
   selected_row.reset();
   ASSERT_EQ(OB_SUCCESS, ObOuttableLobControlOperator::select(
-      sql_proxy(), tenant_id, macro_id, hash, false /*for_update*/,
+      sql_proxy(), tenant_id, macro_id, hash, ObOuttableLobControlOperator::LockMode::NO_LOCK,
       allocator, row_scn, selected_row));
   selected_row.status_ = OUTTABLE_LOB_CONTROL_FAIL;
   ASSERT_EQ(OB_SUCCESS, manager.update_fail(selected_row));
@@ -312,7 +312,7 @@ TEST_F(TestOuttableLobControlManager, delete_complete_row_checks_row_scn)
   ObOuttableLobControlRow selected_row;
   int64_t row_scn = 0;
   ASSERT_EQ(OB_SUCCESS, ObOuttableLobControlOperator::select(
-      sql_proxy(), tenant_id, macro_id, hash, false /*for_update*/,
+      sql_proxy(), tenant_id, macro_id, hash, ObOuttableLobControlOperator::LockMode::NO_LOCK,
       allocator, row_scn, selected_row));
   ASSERT_GT(row_scn, 0);
   ASSERT_EQ(OUTTABLE_LOB_CONTROL_COMPLETE, selected_row.status_);
@@ -329,7 +329,7 @@ TEST_F(TestOuttableLobControlManager, delete_complete_row_checks_row_scn)
   ASSERT_EQ(OB_SUCCESS, delete_trans.end(true /*commit*/));
 
   EXPECT_EQ(OB_ENTRY_NOT_EXIST, ObOuttableLobControlOperator::select(
-      sql_proxy(), tenant_id, macro_id, hash, false /*for_update*/,
+      sql_proxy(), tenant_id, macro_id, hash, ObOuttableLobControlOperator::LockMode::NO_LOCK,
       allocator, row_scn, selected_row));
 }
 
@@ -340,7 +340,8 @@ int TestOuttableLobControlManager::read_gc_candidate_(
 {
   ObArenaAllocator allocator("LobGCTest");
   const int ret = ObOuttableLobControlOperator::select(sql_proxy(), OB_SYS_TENANT_ID,
-      candidate.macro_id_, candidate.hash_, false /*for_update*/, allocator, row_scn, row);
+      candidate.macro_id_, candidate.hash_, ObOuttableLobControlOperator::LockMode::NO_LOCK,
+      allocator, row_scn, row);
   // Only the fixed-size row fields escape this helper's allocator.
   row.info_.reset();
   return ret;
@@ -578,7 +579,7 @@ TEST_F(TestOuttableLobControlManager, batch_insert_commits_independently_and_rol
   // T2 is already visible to another connection while T1 is still uncommitted.
   ASSERT_EQ(OB_SUCCESS, ObOuttableLobControlOperator::select(
       sql_proxy(), tenant_id, keys.at(0).macro_id_, keys.at(0).hash_,
-      false /*for_update*/, allocator, row_scn, selected_row));
+      ObOuttableLobControlOperator::LockMode::NO_LOCK, allocator, row_scn, selected_row));
   EXPECT_EQ(OUTTABLE_LOB_CONTROL_DOING, selected_row.status_);
   ASSERT_EQ(OB_SUCCESS, outer_trans.end(false /*rollback*/));
 
@@ -586,13 +587,13 @@ TEST_F(TestOuttableLobControlManager, batch_insert_commits_independently_and_rol
   selected_row.reset();
   ASSERT_EQ(OB_ENTRY_NOT_EXIST, ObOuttableLobControlOperator::select(
       sql_proxy(), tenant_id, marker_row.key_.macro_id_, marker_row.key_.hash_,
-      false /*for_update*/, allocator, row_scn, selected_row));
+      ObOuttableLobControlOperator::LockMode::NO_LOCK, allocator, row_scn, selected_row));
   for (int64_t i = 0; i < keys.count(); ++i) {
     allocator.reuse();
     selected_row.reset();
     ASSERT_EQ(OB_SUCCESS, ObOuttableLobControlOperator::select(
         sql_proxy(), tenant_id, keys.at(i).macro_id_, keys.at(i).hash_,
-        false /*for_update*/, allocator, row_scn, selected_row));
+        ObOuttableLobControlOperator::LockMode::NO_LOCK, allocator, row_scn, selected_row));
     EXPECT_EQ(OUTTABLE_LOB_CONTROL_DOING, selected_row.status_);
     EXPECT_EQ(nullptr, selected_row.info_.ptr());
     EXPECT_EQ(0, selected_row.info_.length());
@@ -610,7 +611,7 @@ TEST_F(TestOuttableLobControlManager, batch_insert_commits_independently_and_rol
     selected_row.reset();
     EXPECT_EQ(OB_ENTRY_NOT_EXIST, ObOuttableLobControlOperator::select(
         sql_proxy(), tenant_id, keys.at(i).macro_id_, keys.at(i).hash_,
-        false /*for_update*/, allocator, row_scn, selected_row));
+        ObOuttableLobControlOperator::LockMode::NO_LOCK, allocator, row_scn, selected_row));
   }
 }
 
@@ -681,7 +682,7 @@ TEST_F(TestOuttableLobControlManager, batch_complete_deduplicates_preserves_info
     EXPECT_EQ(OB_ENTRY_NOT_EXIST, manager.update_complete(*trans.get_connection(), keys));
     ASSERT_EQ(OB_SUCCESS, ObOuttableLobControlOperator::select(
         *trans.get_connection(), tenant_id, keys.at(0).macro_id_, keys.at(0).hash_,
-        false /*for_update*/, allocator, row_scn, selected_row));
+        ObOuttableLobControlOperator::LockMode::NO_LOCK, allocator, row_scn, selected_row));
     EXPECT_EQ(OUTTABLE_LOB_CONTROL_COMPLETE, selected_row.status_);
     ASSERT_EQ(OB_SUCCESS, trans.end(false /*rollback*/));
   }
@@ -711,7 +712,7 @@ TEST_F(TestOuttableLobControlManager, batch_complete_deduplicates_preserves_info
     selected_row.reset();
     ASSERT_EQ(OB_SUCCESS, ObOuttableLobControlOperator::select(
         sql_proxy(), tenant_id, keys.at(0).macro_id_, keys.at(0).hash_,
-        false /*for_update*/, allocator, row_scn, selected_row));
+        ObOuttableLobControlOperator::LockMode::NO_LOCK, allocator, row_scn, selected_row));
     EXPECT_EQ(OUTTABLE_LOB_CONTROL_DOING, selected_row.status_);
   }
 
@@ -749,7 +750,7 @@ TEST_F(TestOuttableLobControlManager, batch_complete_deduplicates_preserves_info
     selected_row.reset();
     ASSERT_EQ(OB_SUCCESS, ObOuttableLobControlOperator::select(
         sql_proxy(), tenant_id, stored_keys.at(i).macro_id_, stored_keys.at(i).hash_,
-        false /*for_update*/, allocator, row_scn, selected_row));
+        ObOuttableLobControlOperator::LockMode::NO_LOCK, allocator, row_scn, selected_row));
     // The final row combines a requested macro_id and hash but was not requested.
     EXPECT_EQ((i < requested_count) ? OUTTABLE_LOB_CONTROL_COMPLETE : OUTTABLE_LOB_CONTROL_DOING,
         selected_row.status_);
@@ -866,7 +867,7 @@ void TestOuttableLobControlManager::check_complete_reads_t2_row_in_earlier_t1_(
   ObOuttableLobControlRow selected_row;
   int64_t row_scn = 0;
   ASSERT_EQ(OB_ENTRY_NOT_EXIST, ObOuttableLobControlOperator::select(
-      *connection, tenant_id, macro_id, hash, false /*for_update*/,
+      *connection, tenant_id, macro_id, hash, ObOuttableLobControlOperator::LockMode::NO_LOCK,
       allocator, row_scn, selected_row));
   transaction::ObTxDesc *tx_desc = inner_connection->get_session().get_tx_desc();
   ASSERT_NE(nullptr, tx_desc);
@@ -893,7 +894,7 @@ void TestOuttableLobControlManager::check_complete_reads_t2_row_in_earlier_t1_(
   allocator.reuse();
   selected_row.reset();
   ASSERT_EQ(fixed_snapshot ? OB_ENTRY_NOT_EXIST : OB_SUCCESS, ObOuttableLobControlOperator::select(
-      *connection, tenant_id, macro_id, hash, false /*for_update*/,
+      *connection, tenant_id, macro_id, hash, ObOuttableLobControlOperator::LockMode::NO_LOCK,
       allocator, row_scn, selected_row));
 
   // An active transaction keeps its isolation even if the session setting changes.
@@ -915,7 +916,7 @@ void TestOuttableLobControlManager::check_complete_reads_t2_row_in_earlier_t1_(
   allocator.reuse();
   selected_row.reset();
   ASSERT_EQ(OB_SUCCESS, ObOuttableLobControlOperator::select(
-      sql_proxy(), tenant_id, macro_id, hash, false /*for_update*/,
+      sql_proxy(), tenant_id, macro_id, hash, ObOuttableLobControlOperator::LockMode::NO_LOCK,
       allocator, row_scn, selected_row));
   EXPECT_EQ(OUTTABLE_LOB_CONTROL_COMPLETE, selected_row.status_);
   for (int64_t i = 0; i < batch_keys.count(); ++i) {
@@ -923,7 +924,7 @@ void TestOuttableLobControlManager::check_complete_reads_t2_row_in_earlier_t1_(
     selected_row.reset();
     ASSERT_EQ(OB_SUCCESS, ObOuttableLobControlOperator::select(
         sql_proxy(), tenant_id, batch_keys.at(i).macro_id_, batch_keys.at(i).hash_,
-        false /*for_update*/, allocator, row_scn, selected_row));
+        ObOuttableLobControlOperator::LockMode::NO_LOCK, allocator, row_scn, selected_row));
     EXPECT_EQ(OUTTABLE_LOB_CONTROL_COMPLETE, selected_row.status_);
     ASSERT_EQ(sizeof(batch_info), selected_row.info_.length());
     EXPECT_EQ(0, MEMCMP(batch_info, selected_row.info_.ptr(), sizeof(batch_info)));
@@ -1101,7 +1102,8 @@ TEST_F(TestOuttableLobControlManager, page_iterator_uses_primary_key_cursor)
       ObOuttableLobControlRow selected_row;
       int64_t row_scn = 0;
       ASSERT_EQ(OB_SUCCESS, ObOuttableLobControlOperator::select(
-          sql_proxy(), tenant_id, row.key_.macro_id_, row.key_.hash_, false /*for_update*/,
+          sql_proxy(), tenant_id, row.key_.macro_id_, row.key_.hash_,
+          ObOuttableLobControlOperator::LockMode::NO_LOCK,
           select_allocator, row_scn, selected_row));
       EXPECT_EQ(row.key_.macro_id_, selected_row.key_.macro_id_);
       EXPECT_EQ(row.key_.hash_, selected_row.key_.hash_);

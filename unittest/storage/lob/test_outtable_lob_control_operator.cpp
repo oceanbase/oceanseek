@@ -455,6 +455,7 @@ TEST(TestOuttableLobControlOperator, delete_row)
 
 TEST(TestOuttableLobControlOperator, select_controls_for_update)
 {
+  using LockMode = ObOuttableLobControlOperator::LockMode;
   const uint64_t tenant_id = 1005;
   const blocksstable::MacroBlockId macro_id(4, 10, 0);
   RecordingSQLClient client;
@@ -463,7 +464,7 @@ TEST(TestOuttableLobControlOperator, select_controls_for_update)
   int64_t row_scn = 0;
 
   EXPECT_EQ(OB_NOT_SUPPORTED, ObOuttableLobControlOperator::select(
-      client, tenant_id, macro_id, 43, false /*for_update*/, allocator, row_scn, row));
+      client, tenant_id, macro_id, 43, LockMode::NO_LOCK, allocator, row_scn, row));
   EXPECT_EQ(std::string::npos, client.sql_.find(" FOR UPDATE"));
   EXPECT_NE(std::string::npos,
       client.sql_.find("WHERE hash = 43 AND macro_id = X'"
@@ -474,13 +475,27 @@ TEST(TestOuttableLobControlOperator, select_controls_for_update)
       client.sql_.find("FROM internal.oceanbase.__all_outtable_lob_control"));
 
   EXPECT_EQ(OB_NOT_SUPPORTED, ObOuttableLobControlOperator::select(
-      client, tenant_id, macro_id, 43, true /*for_update*/, allocator, row_scn, row));
+      client, tenant_id, macro_id, 43, LockMode::FOR_UPDATE, allocator, row_scn, row));
   EXPECT_NE(std::string::npos, client.sql_.find(" FOR UPDATE"));
+  EXPECT_EQ(std::string::npos, client.sql_.find(" NOWAIT"));
   EXPECT_EQ(0, row_scn);
+
+  EXPECT_EQ(OB_NOT_SUPPORTED, ObOuttableLobControlOperator::select(client, tenant_id, macro_id, 43,
+      LockMode::FOR_UPDATE_NOWAIT, allocator, row_scn, row));
+  EXPECT_NE(std::string::npos, client.sql_.find(" FOR UPDATE NOWAIT"));
+
+  const int64_t call_count = client.call_count_;
+  EXPECT_EQ(OB_INVALID_ARGUMENT, ObOuttableLobControlOperator::select(client, tenant_id, macro_id,
+      43, static_cast<LockMode>(-1), allocator, row_scn, row));
+  EXPECT_EQ(call_count, client.call_count_);
+  EXPECT_EQ(OB_INVALID_ARGUMENT, ObOuttableLobControlOperator::select(client, tenant_id, macro_id,
+      43, static_cast<LockMode>(3), allocator, row_scn, row));
+  EXPECT_EQ(call_count, client.call_count_);
 }
 
 TEST(TestOuttableLobControlOperator, single_row_connection_uses_internal_catalog)
 {
+  using LockMode = ObOuttableLobControlOperator::LockMode;
   const uint64_t tenant_id = 1005;
   ObOuttableLobControlRow row;
   row.key_.macro_id_ = blocksstable::MacroBlockId(4, 10, 0);
@@ -497,12 +512,26 @@ TEST(TestOuttableLobControlOperator, single_row_connection_uses_internal_catalog
   // Qualify the catalog for connections bound to a session using an external catalog.
   EXPECT_EQ(OB_NOT_SUPPORTED, ObOuttableLobControlOperator::select(
       connection, tenant_id, row.key_.macro_id_, row.key_.hash_,
-      true /*for_update*/, allocator, row_scn, selected_row));
+      LockMode::FOR_UPDATE, allocator, row_scn, selected_row));
   EXPECT_NE(std::string::npos,
       connection.sql_.find("FROM internal.oceanbase.__all_outtable_lob_control WHERE"));
   EXPECT_NE(std::string::npos, connection.sql_.find(" FOR UPDATE"));
   EXPECT_EQ(tenant_id, connection.tenant_id_);
   EXPECT_EQ(1, connection.read_count_);
+
+  EXPECT_EQ(OB_NOT_SUPPORTED, ObOuttableLobControlOperator::select(
+      connection, tenant_id, row.key_.macro_id_, row.key_.hash_,
+      LockMode::NO_LOCK, allocator, row_scn, selected_row));
+  EXPECT_EQ(std::string::npos, connection.sql_.find(" FOR UPDATE"));
+  EXPECT_EQ(OB_NOT_SUPPORTED, ObOuttableLobControlOperator::select(
+      connection, tenant_id, row.key_.macro_id_, row.key_.hash_,
+      LockMode::FOR_UPDATE_NOWAIT, allocator, row_scn, selected_row));
+  EXPECT_NE(std::string::npos, connection.sql_.find(" FOR UPDATE NOWAIT"));
+  EXPECT_EQ(3, connection.read_count_);
+  EXPECT_EQ(OB_INVALID_ARGUMENT, ObOuttableLobControlOperator::select(
+      connection, tenant_id, row.key_.macro_id_, row.key_.hash_,
+      static_cast<LockMode>(-1), allocator, row_scn, selected_row));
+  EXPECT_EQ(3, connection.read_count_);
 
   ASSERT_EQ(OB_SUCCESS,
       ObOuttableLobControlOperator::update(connection, tenant_id, row, affected_rows));

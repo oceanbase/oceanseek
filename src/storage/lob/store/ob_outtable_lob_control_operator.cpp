@@ -214,7 +214,7 @@ int ObOuttableLobControlOperator::select(
     const uint64_t tenant_id,
     const blocksstable::MacroBlockId &macro_id,
     const uint64_t hash,
-    const bool for_update,
+    const LockMode lock_mode,
     common::ObIAllocator &allocator,
     int64_t &row_scn,
     ObOuttableLobControlRow &row)
@@ -227,14 +227,14 @@ int ObOuttableLobControlOperator::select(
   if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id) || !macro_id.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument for selecting outtable lob control row",
-        K(ret), K(tenant_id), K(macro_id), K(hash), K(for_update));
+        K(ret), K(tenant_id), K(macro_id), K(hash), K(lock_mode));
   } else {
     HEAP_VAR(ObISQLClient::ReadResult, read_result) {
-      if (OB_FAIL(build_select_sql_(macro_id, hash, for_update, sql))) {
+      if (OB_FAIL(build_select_sql_(macro_id, hash, lock_mode, sql))) {
         LOG_WARN("failed to build outtable lob control select sql", K(ret), K(macro_id), K(hash));
       } else if (OB_FAIL(sql_client.read(read_result, tenant_id, sql.ptr()))) {
         LOG_WARN("failed to query outtable lob control row",
-            K(ret), K(tenant_id), K(macro_id), K(hash), K(for_update));
+            K(ret), K(tenant_id), K(macro_id), K(hash), K(lock_mode));
       } else if (OB_FAIL(parse_select_result_(
           read_result, macro_id, hash, allocator, row_scn, row))) {
         LOG_WARN("failed to parse outtable lob control row",
@@ -255,7 +255,7 @@ int ObOuttableLobControlOperator::select(
     const uint64_t tenant_id,
     const blocksstable::MacroBlockId &macro_id,
     const uint64_t hash,
-    const bool for_update,
+    const LockMode lock_mode,
     common::ObIAllocator &allocator,
     int64_t &row_scn,
     ObOuttableLobControlRow &row)
@@ -268,14 +268,14 @@ int ObOuttableLobControlOperator::select(
   if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id) || !macro_id.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument for selecting outtable lob control row",
-        K(ret), K(tenant_id), K(macro_id), K(hash), K(for_update));
+        K(ret), K(tenant_id), K(macro_id), K(hash), K(lock_mode));
   } else {
     HEAP_VAR(ObISQLClient::ReadResult, read_result) {
-      if (OB_FAIL(build_select_sql_(macro_id, hash, for_update, sql))) {
+      if (OB_FAIL(build_select_sql_(macro_id, hash, lock_mode, sql))) {
         LOG_WARN("failed to build outtable lob control select sql", K(ret), K(macro_id), K(hash));
       } else if (OB_FAIL(sql_connection.execute_read(tenant_id, sql.string(), read_result))) {
         LOG_WARN("failed to query outtable lob control row",
-            K(ret), K(tenant_id), K(macro_id), K(hash), K(for_update));
+            K(ret), K(tenant_id), K(macro_id), K(hash), K(lock_mode));
       } else if (OB_FAIL(parse_select_result_(
           read_result, macro_id, hash, allocator, row_scn, row))) {
         LOG_WARN("failed to parse outtable lob control row",
@@ -487,11 +487,15 @@ int ObOuttableLobControlOperator::build_update_sql_(
 int ObOuttableLobControlOperator::build_select_sql_(
     const blocksstable::MacroBlockId &macro_id,
     const uint64_t hash,
-    const bool for_update,
+    const LockMode lock_mode,
     common::ObSqlString &sql)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(sql.assign_fmt(
+  if (OB_UNLIKELY(LockMode::NO_LOCK != lock_mode && LockMode::FOR_UPDATE != lock_mode
+      && LockMode::FOR_UPDATE_NOWAIT != lock_mode)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid control row lock mode", K(ret), K(lock_mode));
+  } else if (OB_FAIL(sql.assign_fmt(
       "SELECT ORA_ROWSCN AS row_scn, status, last_modify_time, info "
       "FROM %s.%s.%s WHERE hash = %lu AND macro_id = ",
       OB_INTERNAL_CATALOG_NAME, OB_SYS_DATABASE_NAME,
@@ -499,8 +503,11 @@ int ObOuttableLobControlOperator::build_select_sql_(
     LOG_WARN("failed to build select sql", K(ret), K(hash));
   } else if (OB_FAIL(ObOuttableLobControlUtil::append_macro_id_literal(macro_id, sql))) {
     LOG_WARN("failed to append macro id", K(ret), K(macro_id));
-  } else if (for_update && OB_FAIL(sql.append(" FOR UPDATE"))) {
+  } else if (LockMode::FOR_UPDATE == lock_mode && OB_FAIL(sql.append(" FOR UPDATE"))) {
     LOG_WARN("failed to append for update", K(ret));
+  } else if (LockMode::FOR_UPDATE_NOWAIT == lock_mode
+      && OB_FAIL(sql.append(" FOR UPDATE NOWAIT"))) {
+    LOG_WARN("failed to append for update nowait", K(ret));
   }
   return ret;
 }

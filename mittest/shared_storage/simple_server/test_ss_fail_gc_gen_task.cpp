@@ -47,6 +47,7 @@
 #include "storage/incremental/ss_meta_ctrl/ob_ss_meta_ctrl_define.h"
 #include "storage/incremental/ss_meta_ctrl/ob_ss_meta_ctrl_table_operator.h"
 #include "storage/lob/store/ob_outtable_lob_control_operator.h"
+#include "storage/lob/store/ob_outtable_lob_control_manager.h"
 #include "simple_server/env/ob_simple_cluster_test_base.h"
 
 namespace oceanbase
@@ -2925,11 +2926,18 @@ TEST_F(TestSSFailGCGenTask, lob_ctrl_fail_gc_processes_expired_rows)
           20261004, 0, 0, 0),
       blocksstable::MacroBlockId(blocksstable::MacroBlockId::DEFAULT_FIRST_ID,
           20261005, 0, 0, 0),
+      // These two locked rows sort before the unlocked candidates above.
+      blocksstable::MacroBlockId(blocksstable::MacroBlockId::DEFAULT_FIRST_ID,
+          20260999, 0, 0, 0),
+      blocksstable::MacroBlockId(blocksstable::MacroBlockId::DEFAULT_FIRST_ID,
+          20261000, 0, 0, 0),
   };
   const int64_t statuses[] = {
       OUTTABLE_LOB_CONTROL_DOING,
       OUTTABLE_LOB_CONTROL_FAIL,
       OUTTABLE_LOB_CONTROL_COMPLETE,
+      OUTTABLE_LOB_CONTROL_DOING,
+      OUTTABLE_LOB_CONTROL_FAIL,
       OUTTABLE_LOB_CONTROL_DOING,
       OUTTABLE_LOB_CONTROL_FAIL,
   };
@@ -2965,7 +2973,7 @@ TEST_F(TestSSFailGCGenTask, lob_ctrl_fail_gc_processes_expired_rows)
 
   ObSqlString update_sql;
   for (int64_t i = 0; i < ARRAYSIZEOF(macro_ids); ++i) {
-    const int64_t last_modify_time = i < 3 ? old_ts_us : recent_ts_us;
+    const int64_t last_modify_time = (i < 3 || i >= 5) ? old_ts_us : recent_ts_us;
     ASSERT_EQ(OB_SUCCESS, update_sql.assign_fmt(
         "UPDATE %s SET last_modify_time = usec_to_time(%ld) WHERE ",
         OB_ALL_OUTTABLE_LOB_CONTROL_TNAME, last_modify_time));
@@ -2997,7 +3005,75 @@ TEST_F(TestSSFailGCGenTask, lob_ctrl_fail_gc_processes_expired_rows)
     task = task->get_next();
   }
   ASSERT_NE(nullptr, lob_ctrl_task);
-  ASSERT_EQ(OB_SUCCESS, lob_ctrl_task->process());
+
+  const int retryable_errors[] = {OB_EAGAIN, OB_TIMEOUT, OB_TRANS_TIMEOUT, OB_TRANS_STMT_TIMEOUT,
+      OB_TRANS_RPC_TIMEOUT, OB_TRANS_UNKNOWN, OB_TRANS_COMMIT_TOO_MUCH_TIME};
+  for (int64_t i = 0; i < ARRAYSIZEOF(retryable_errors); ++i) {
+    ASSERT_TRUE(lob_ctrl_task->is_retryable_row_error_(retryable_errors[i]));
+  }
+  const int skipped_errors[] = {OB_ERR_EXCLUSIVE_LOCK_CONFLICT, OB_TRY_LOCK_ROW_CONFLICT,
+      OB_ERR_EXCLUSIVE_LOCK_CONFLICT_NOWAIT, OB_ENTRY_NOT_EXIST, OB_STATE_NOT_MATCH,
+      OB_CANCELED, OB_SERVICE_STOPPED};
+  for (int64_t i = 0; i < ARRAYSIZEOF(skipped_errors); ++i) {
+    ASSERT_FALSE(lob_ctrl_task->is_retryable_row_error_(skipped_errors[i]));
+  }
+
+  // A non-lock row operation error must also be isolated after a successful rollback.
+  ObOuttableLobControlManager uninitialized_manager;
+  ObOuttableLobControlRow failed_row;
+  failed_row.key_.macro_id_ = macro_ids[1];
+  failed_row.key_.hash_ = first_hash + 1;
+  failed_row.status_ = OUTTABLE_LOB_CONTROL_FAIL;
+  bool continue_scan = true;
+  ASSERT_EQ(OB_SUCCESS, lob_ctrl_task->delete_expired_fail_row_(
+      *ctx, uninitialized_manager, failed_row, continue_scan));
+  ASSERT_TRUE(continue_scan);
+
+  // A transaction start timeout must exhaust only this row's retry budget, not stop the scan.
+  {
+    const int64_t saved_sql_timeout_us = ctx->sql_timeout_us_;
+    DEFER(ctx->sql_timeout_us_ = saved_sql_timeout_us);
+    ctx->sql_timeout_us_ = 100 * 1000;
+    lib::WorkerTimeoutGuard worker_timeout_guard(ObTimeUtility::current_time() - 1);
+    ObMySQLTransaction trans;
+    ASSERT_EQ(OB_TIMEOUT, trans.start(&sql_proxy, tenant_id));
+    ASSERT_EQ(OB_SUCCESS, lob_ctrl_task->delete_expired_fail_row_(
+        *ctx, uninitialized_manager, failed_row, continue_scan));
+    ASSERT_TRUE(continue_scan);
+  }
+
+  // Persistent fast failures must stop at the retry limit, even with a large SQL timeout.
+  {
+    const int64_t saved_sql_timeout_us = ctx->sql_timeout_us_;
+    DEFER(ctx->sql_timeout_us_ = saved_sql_timeout_us);
+    ctx->sql_timeout_us_ = 60L * 1000L * 1000L;
+    lib::WorkerTimeoutGuard worker_timeout_guard(ObTimeUtility::current_time() - 1);
+    const int64_t start_us = ObTimeUtility::current_time();
+    ASSERT_EQ(OB_SUCCESS, lob_ctrl_task->delete_expired_fail_row_(
+        *ctx, uninitialized_manager, failed_row, continue_scan));
+    const int64_t elapsed_us = ObTimeUtility::current_time() - start_us;
+    ASSERT_LT(elapsed_us, 3L * 1000L * 1000L);
+    ASSERT_TRUE(continue_scan);
+  }
+
+  ObMySQLTransaction lock_trans;
+  ASSERT_EQ(OB_SUCCESS, lock_trans.start(&sql_proxy, tenant_id));
+  DEFER({
+    if (lock_trans.is_started()) {
+      EXPECT_EQ(OB_SUCCESS, lock_trans.end(false /*rollback*/));
+    }
+  });
+  ObArenaAllocator lock_allocator("LobCtrlLock");
+  ObOuttableLobControlRow locked_row;
+  int64_t locked_row_scn = 0;
+  for (int64_t i = 5; i < ARRAYSIZEOF(macro_ids); ++i) {
+    ASSERT_EQ(OB_SUCCESS, ObOuttableLobControlOperator::select(
+        lock_trans, tenant_id, macro_ids[i], first_hash + i,
+        ObOuttableLobControlOperator::LockMode::FOR_UPDATE,
+        lock_allocator, locked_row_scn, locked_row));
+  }
+  // Check the business result directly; process() deliberately isolates business failures.
+  ASSERT_EQ(OB_SUCCESS, lob_ctrl_task->process_lob_ctrl_fail_gc_(*ctx));
 
   ObArenaAllocator allocator("LobCtrlVerify");
   ObOuttableLobControlRow selected_row;
@@ -3007,7 +3083,7 @@ TEST_F(TestSSFailGCGenTask, lob_ctrl_fail_gc_processes_expired_rows)
     selected_row.reset();
     const int select_ret = ObOuttableLobControlOperator::select(
         sql_proxy, tenant_id, macro_ids[i], first_hash + i,
-        false /*for_update*/, allocator, row_scn, selected_row);
+        ObOuttableLobControlOperator::LockMode::NO_LOCK, allocator, row_scn, selected_row);
     if (1 == i) {
       ASSERT_EQ(OB_ENTRY_NOT_EXIST, select_ret);
     } else {
@@ -3016,11 +3092,31 @@ TEST_F(TestSSFailGCGenTask, lob_ctrl_fail_gc_processes_expired_rows)
       ASSERT_EQ(expected_status, selected_row.status_);
       if (0 == i) {
         ASSERT_GT(selected_row.last_modify_time_, cutoff_ts_us);
-      } else if (2 == i) {
+      } else if (2 == i || i >= 5) {
         ASSERT_EQ(old_ts_us, selected_row.last_modify_time_);
       } else {
         ASSERT_EQ(recent_ts_us, selected_row.last_modify_time_);
       }
+    }
+  }
+  // Rechecking a deletion that already committed must finish without retrying a missing row.
+  ObOuttableLobControlManager manager;
+  ASSERT_EQ(OB_SUCCESS, manager.init(tenant_id));
+  ASSERT_EQ(OB_SUCCESS, lob_ctrl_task->delete_expired_fail_row_(
+      *ctx, manager, failed_row, continue_scan));
+  ASSERT_TRUE(continue_scan);
+
+  ASSERT_EQ(OB_SUCCESS, lock_trans.end(false /*rollback*/));
+  ASSERT_EQ(OB_SUCCESS, lob_ctrl_task->process_lob_ctrl_fail_gc_(*ctx));
+  for (int64_t i = 5; i < ARRAYSIZEOF(macro_ids); ++i) {
+    const int select_ret = ObOuttableLobControlOperator::select(
+        sql_proxy, tenant_id, macro_ids[i], first_hash + i,
+        ObOuttableLobControlOperator::LockMode::NO_LOCK, allocator, row_scn, selected_row);
+    if (5 == i) {
+      ASSERT_EQ(OB_SUCCESS, select_ret);
+      ASSERT_EQ(OUTTABLE_LOB_CONTROL_FAIL, selected_row.status_);
+    } else {
+      ASSERT_EQ(OB_ENTRY_NOT_EXIST, select_ret);
     }
   }
 }

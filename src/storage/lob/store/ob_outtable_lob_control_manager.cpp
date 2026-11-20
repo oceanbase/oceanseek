@@ -136,7 +136,8 @@ int ObOuttableLobControlManager::update_complete(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid row for completing outtable lob control", K(ret), K(row));
   } else if (OB_FAIL(select_for_update_(
-      trans, row.key_.macro_id_, row.key_.hash_, allocator, current_row))) {
+      trans, row.key_.macro_id_, row.key_.hash_, ObOuttableLobControlOperator::LockMode::FOR_UPDATE,
+      allocator, current_row))) {
     LOG_WARN("failed to lock outtable lob control row", K(ret), K(tenant_id_), K(row));
   } else if (OUTTABLE_LOB_CONTROL_DOING != current_row.status_) {
     ret = OB_STATE_NOT_MATCH;
@@ -280,7 +281,8 @@ int ObOuttableLobControlManager::update_fail(const ObOuttableLobControlRow &row)
       LOG_WARN("failed to start outtable lob control fail transaction", K(ret), K(tenant_id_));
     } else {
       if (OB_FAIL(select_for_update_(
-          trans, row.key_.macro_id_, row.key_.hash_, allocator, current_row))) {
+          trans, row.key_.macro_id_, row.key_.hash_,
+          ObOuttableLobControlOperator::LockMode::FOR_UPDATE_NOWAIT, allocator, current_row))) {
         LOG_WARN("failed to lock outtable lob control row", K(ret), K(tenant_id_), K(row));
       } else if (OUTTABLE_LOB_CONTROL_DOING != current_row.status_
           || current_row.last_modify_time_ != row.last_modify_time_) {
@@ -323,7 +325,9 @@ int ObOuttableLobControlManager::delete_fail_row(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument for deleting outtable lob control row",
         K(ret), K(tenant_id_), K(macro_id), K(hash));
-  } else if (OB_FAIL(select_for_update_(trans, macro_id, hash, allocator, current_row))) {
+  } else if (OB_FAIL(select_for_update_(
+      trans, macro_id, hash, ObOuttableLobControlOperator::LockMode::FOR_UPDATE_NOWAIT,
+      allocator, current_row))) {
     LOG_WARN("failed to lock outtable lob control row",
         K(ret), K(tenant_id_), K(macro_id), K(hash));
   } else if (OUTTABLE_LOB_CONTROL_FAIL != current_row.status_) {
@@ -358,8 +362,8 @@ int ObOuttableLobControlManager::delete_complete_row(
     LOG_WARN("invalid argument for deleting complete outtable lob control row",
         K(ret), K(tenant_id_), K(macro_id), K(hash), K(expected_row_scn));
   } else if (OB_FAIL(ObOuttableLobControlOperator::select(
-      trans, tenant_id_, macro_id, hash, true /*for_update*/, allocator,
-      current_row_scn, current_row))) {
+      trans, tenant_id_, macro_id, hash, ObOuttableLobControlOperator::LockMode::FOR_UPDATE,
+      allocator, current_row_scn, current_row))) {
     LOG_WARN("failed to lock outtable lob control row",
         K(ret), K(tenant_id_), K(macro_id), K(hash));
   } else if (OUTTABLE_LOB_CONTROL_COMPLETE != current_row.status_
@@ -379,6 +383,7 @@ int ObOuttableLobControlManager::select_for_update_(
     common::ObMySQLTransaction &trans,
     const blocksstable::MacroBlockId &macro_id,
     const uint64_t hash,
+    const ObOuttableLobControlOperator::LockMode lock_mode,
     common::ObIAllocator &allocator,
     ObOuttableLobControlRow &row)
 {
@@ -388,8 +393,12 @@ int ObOuttableLobControlManager::select_for_update_(
   if (!is_inited_) {
     ret = OB_NOT_INIT;
     LOG_WARN("outtable lob control manager is not initialized", K(ret));
+  } else if (ObOuttableLobControlOperator::LockMode::FOR_UPDATE != lock_mode
+      && ObOuttableLobControlOperator::LockMode::FOR_UPDATE_NOWAIT != lock_mode) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("control row requires a locking read", K(ret), K(lock_mode));
   } else if (OB_FAIL(ObOuttableLobControlOperator::select(
-      trans, tenant_id_, macro_id, hash, true /*for_update*/, allocator, row_scn, row))) {
+      trans, tenant_id_, macro_id, hash, lock_mode, allocator, row_scn, row))) {
     LOG_WARN("failed to lock outtable lob control row",
         K(ret), K(tenant_id_), K(macro_id), K(hash));
   }
@@ -410,7 +419,8 @@ int ObOuttableLobControlManager::select_for_update_(
     ret = OB_NOT_INIT;
     LOG_WARN("outtable lob control manager is not initialized", K(ret));
   } else if (OB_FAIL(ObOuttableLobControlOperator::select(
-      sql_connection, tenant_id_, macro_id, hash, true /*for_update*/, allocator, row_scn, row))) {
+      sql_connection, tenant_id_, macro_id, hash,
+      ObOuttableLobControlOperator::LockMode::FOR_UPDATE, allocator, row_scn, row))) {
     LOG_WARN("failed to lock outtable lob control row",
         K(ret), K(tenant_id_), K(macro_id), K(hash));
   }
