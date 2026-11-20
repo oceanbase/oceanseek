@@ -193,6 +193,9 @@ int ObDASVecIndexDriverIter::inner_init(ObDASIterParam &param)
       param.set_mem_attr(MTL_ID(), "VECSEARCH", ObCtxIds::DEFAULT_CTX_ID);
       if (OB_FAIL(CURRENT_CONTEXT->CREATE_CONTEXT(mem_context_, param))) {
         LOG_WARN("failed to create vector search memory context", K(ret));
+      } else if (ObVectorIndexAlgorithmType::VIAT_DISK_BBQ == vec_index_driver_ctdef_->algorithm_type_) {
+        // Release each round's candidate VIDs when the bitmap converts to Roaring or resets.
+        bitmap_.set_allocator(&mem_context_->get_malloc_allocator());
       } else {
         bitmap_.set_allocator(&mem_context_->get_arena_allocator());
       }

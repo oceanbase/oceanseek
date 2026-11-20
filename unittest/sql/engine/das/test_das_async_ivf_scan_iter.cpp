@@ -857,6 +857,48 @@ public:
   bool opened_ = false;
 };
 
+TEST_F(TestDASAsyncIVFScanIter, hybrid_disk_bbq_candidate_bitmap_releases_round_memory)
+{
+  ObExecContext exec_ctx(allocator_);
+  ObEvalCtx eval_ctx(exec_ctx);
+  ObExpr rowkey, query, limit, distance;
+  const float query_vector[] = {1.0F, 0.0F};
+  ASSERT_EQ(OB_SUCCESS, init_vector_lookup_exprs(eval_ctx, query_vector, sizeof(query_vector),
+                                                rowkey, query, limit, distance));
+  ObDASScanOp scan_op(allocator_);
+  ObDASSearchCtx search_ctx(allocator_, scan_op);
+  ObDASVecIndexDriverCtDef ctdef(allocator_);
+  ctdef.algorithm_type_ = VIAT_DISK_BBQ;
+  ObDASVecIndexDriverRtDef rtdef;
+  rtdef.eval_ctx_ = &eval_ctx;
+  ObDASVecIndexAsyncIVFScanIter scan;
+  ObDASVecIndexDriverIterParam param;
+  param.vec_index_driver_ctdef_ = &ctdef;
+  param.vec_index_driver_rtdef_ = &rtdef;
+  param.vec_index_scan_iter_ = &scan;
+  param.search_ctx_ = &search_ctx;
+  param.sort_expr_ = &distance;
+  param.limit_expr_ = &limit;
+  ObDASVecIndexDriverIter driver;
+  ASSERT_EQ(OB_SUCCESS, driver.init(param));
+  DEFER(EXPECT_EQ(OB_SUCCESS, driver.release()));
+
+  const int64_t arena_used = driver.mem_context_->arena_used();
+  const int64_t malloc_used = driver.mem_context_->malloc_used();
+  for (int64_t vid = 1; vid <= 32; ++vid) {
+    ASSERT_EQ(OB_SUCCESS, driver.bitmap_.init(vid, vid, driver.get_bitmap_init_size()));
+    ASSERT_EQ(OB_SUCCESS, driver.bitmap_.add_vid(vid));
+    if (vid % 2 == 0) {
+      ASSERT_EQ(OB_SUCCESS, driver.bitmap_.upgrade_to_roaring_bitmap());
+      ASSERT_TRUE(driver.bitmap_.test(vid));
+      ASSERT_FALSE(driver.bitmap_.test(vid - 1));
+    }
+    driver.bitmap_.reset();
+    ASSERT_EQ(arena_used, driver.mem_context_->arena_used());
+    ASSERT_EQ(malloc_used, driver.mem_context_->malloc_used());
+  }
+}
+
 TEST_F(TestDASAsyncIVFScanIter, hybrid_pre_filter_partition_lifecycle)
 {
   // Exercise both a first partition that skips the ordinary PRE tree and one
