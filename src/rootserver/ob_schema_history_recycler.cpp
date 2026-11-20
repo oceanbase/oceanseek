@@ -630,9 +630,11 @@ int ObSchemaHistoryRecycler::update_recycle_schema_versions(
                                 "recycle_schema_version", new_value,
                                 "last_recycle_schema_version", old_value);
         } else if (new_value < old_value) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_ERROR("[SCHEMA_RECYCLE] can't fallback recycle schema version",
-                    KR(ret), K(tenant_id), K(new_value), K(old_value));
+          // a larger expire time legitimately lowers the candidate; keep the advanced watermark.
+          if (REACH_TIME_INTERVAL(10_min)) {
+            LOG_WARN("[SCHEMA_RECYCLE] can't fallback recycle schema version",
+                     K(tenant_id), K(new_value), K(old_value));
+          }
         } else {}
       }
     }
