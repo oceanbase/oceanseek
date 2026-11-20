@@ -19366,6 +19366,7 @@ def_table_schema(**gen_iterate_virtual_table_def(
 # 12642: __all_virtual_fts_dictionary_reference
 # 14983: __idx_12641_all_virtual_fts_dictionary_word_i1
 # 14984: __idx_12642_all_virtual_fts_dictionary_reference_i1
+# 12643: __all_virtual_replay_queue_stat
 
 # 余留位置（此行之前占位）
 # 本区域占位建议：采用真实表名进行占位
