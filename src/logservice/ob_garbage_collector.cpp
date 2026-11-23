@@ -2173,8 +2173,9 @@ int ObGarbageCollector::inner_check_ss_ls_mark_deleted_(
     CLOG_LOG(INFO, "ls creation is not committed, skip shared deletion check", K(ls_id));
   } else if (OB_FAIL(ls.get_migration_status(migration_status))) {
     CLOG_LOG(WARN, "get migration status failed", KR(ret), K(ls_id));
-  } else if (ObMigrationStatusHelper::check_is_running_migration(migration_status)) {
-    CLOG_LOG(INFO, "ls is migrating, skip shared deletion check", K(ls_id), K(migration_status));
+  } else if (!ObMigrationStatusHelper::check_migration_status_is_fail(migration_status)) {
+    // Normal replicas finish shared user-tablet deletion through Tablet GC.
+    CLOG_LOG(TRACE, "skip shared deletion cleanup for migration status", K(ls_id), K(migration_status));
   } else if (OB_SUCCESS == (tmp_ret = get_ls_status_from_table(ls_id, ls_status))) {
     // WAIT_GC precedes deletion of __all_ls_status. Keep its last replica alive
     // until the normal GC state machine has removed that entry.
@@ -2201,7 +2202,7 @@ int ObGarbageCollector::inner_check_ss_ls_mark_deleted_(
 #endif
   } else {
     // The LS lock row is marked deleted atomically with the terminal WAIT_GC update.
-    // A lagging local replica need not replay tablet deletions or wait for LS_META GC.
+    // Failed HA replicas leave shared user-tablet cleanup to normal replicas.
     GCCandidate candidate;
     candidate.ls_id_ = ls_id;
     candidate.ls_status_ = LSStatus::LS_NEED_GC;

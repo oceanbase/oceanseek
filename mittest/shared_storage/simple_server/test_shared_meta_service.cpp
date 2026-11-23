@@ -489,18 +489,22 @@ TEST_F(TestSharedMetaService, create_ls_bootstrap_mode_uses_ss_rec_scn)
   LOG_INFO("[TEST CASE END] create_ls_bootstrap_mode_uses_ss_rec_scn");
 }
 
-TEST_F(TestSharedMetaService, shared_gc_mark_deleted_ls_without_leader)
+static void check_shared_gc_mark_deleted_failed_ls_without_leader(
+    TestSharedMetaService &fixture,
+    const uint64_t tenant_id,
+    const ObLSID &ls_id,
+    const ObMigrationStatus running_status,
+    const ObMigrationStatus failed_status)
 {
   using logservice::ObGarbageCollector;
   share::ObTenantSwitchGuard tenant_guard;
-  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(run_ctx_.tenant_id_));
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(tenant_id));
   ObLSService *ls_svr = MTL(ObLSService *);
   ObSSMetaService *meta_svr = MTL(ObSSMetaService *);
   ObGarbageCollector *gc = MTL(ObGarbageCollector *);
   ASSERT_NE(nullptr, ls_svr);
   ASSERT_NE(nullptr, meta_svr);
   ASSERT_NE(nullptr, gc);
-  const ObLSID ls_id(1096);
   ObCreateLSArg arg;
   ASSERT_EQ(OB_SUCCESS, gen_create_ls_arg(MTL_ID(), ls_id, arg));
   ASSERT_EQ(OB_SUCCESS, ls_svr->create_ls(arg));
@@ -513,7 +517,7 @@ TEST_F(TestSharedMetaService, shared_gc_mark_deleted_ls_without_leader)
     } else {
       EXPECT_EQ(OB_LS_NOT_EXIST, get_ret);
     }
-    wait_ls_safe_destroy(ls_svr, id);
+    fixture.wait_ls_safe_destroy(ls_svr, id);
   });
   ASSERT_EQ(OB_SUCCESS, meta_svr->create_ls(arg, ObSSLSCreateMode::NORMAL_CREATE));
   ObLSHandle handle;
@@ -531,7 +535,7 @@ TEST_F(TestSharedMetaService, shared_gc_mark_deleted_ls_without_leader)
   ObCreateTabletSchema create_schema;
   ASSERT_EQ(OB_SUCCESS, create_schema.init(allocator, table_schema,
       lib::Worker::CompatMode::MYSQL, false /*skip_column_info*/, data_version));
-  const ObTabletID tablet_id(9901096);
+  const ObTabletID tablet_id(9900000 + ls_id.id());
   ObTabletHandle tablet;
   ASSERT_EQ(OB_SUCCESS, ls->get_tablet_svr()->create_tablet(
       ls_id, tablet_id, tablet_id, SCN::base_scn(), 1 /*snapshot_version*/, create_schema,
@@ -573,15 +577,15 @@ TEST_F(TestSharedMetaService, shared_gc_mark_deleted_ls_without_leader)
   ObSSLSMeta shared_meta;
   SCN meta_scn;
   bool marked_deleted = false;
-  ASSERT_EQ(OB_SUCCESS, get_complete_ls_meta(ls_id, shared_meta, meta_scn, marked_deleted));
+  ASSERT_EQ(OB_SUCCESS, fixture.get_complete_ls_meta(ls_id, shared_meta, meta_scn, marked_deleted));
   ASSERT_TRUE(marked_deleted);
 
   ASSERT_EQ(OB_SUCCESS, ls->set_migration_status(
-      OB_MIGRATION_STATUS_MIGRATE, ls->get_rebuild_seq(), false /*write_slog*/));
+      running_status, ls->get_rebuild_seq(), false /*write_slog*/));
   ASSERT_EQ(OB_SUCCESS, gc->inner_check_ss_ls_mark_deleted_(*ls, candidates));
   ASSERT_EQ(0, candidates.count());
   ASSERT_EQ(OB_SUCCESS, ls->set_migration_status(
-      OB_MIGRATION_STATUS_MIGRATE_FAIL, ls->get_rebuild_seq(), false /*write_slog*/));
+      failed_status, ls->get_rebuild_seq(), false /*write_slog*/));
 
   // A committed delete must not collect an incompletely created local LS.
   const ObLSPersistentState saved_state = ls->ls_meta_.get_persistent_state();
@@ -646,8 +650,20 @@ TEST_F(TestSharedMetaService, shared_gc_mark_deleted_ls_without_leader)
   gc->execute_gc_(candidates);
   EXPECT_EQ(OB_LS_NOT_EXIST, ls_svr->get_ls(ls_id, handle, ObLSGetMod::STORAGE_MOD));
   // Local removal must leave the shared tombstone readable for shared-storage GC.
-  ASSERT_EQ(OB_SUCCESS, get_complete_ls_meta(ls_id, shared_meta, meta_scn, marked_deleted));
+  ASSERT_EQ(OB_SUCCESS, fixture.get_complete_ls_meta(ls_id, shared_meta, meta_scn, marked_deleted));
   EXPECT_TRUE(marked_deleted);
+}
+
+TEST_F(TestSharedMetaService, shared_gc_mark_deleted_ls_without_leader)
+{
+  check_shared_gc_mark_deleted_failed_ls_without_leader(*this, run_ctx_.tenant_id_, ObLSID(1096),
+      OB_MIGRATION_STATUS_MIGRATE, OB_MIGRATION_STATUS_MIGRATE_FAIL);
+}
+
+TEST_F(TestSharedMetaService, shared_gc_mark_deleted_add_failed_ls_without_leader)
+{
+  check_shared_gc_mark_deleted_failed_ls_without_leader(*this, run_ctx_.tenant_id_, ObLSID(1100),
+      OB_MIGRATION_STATUS_ADD, OB_MIGRATION_STATUS_ADD_FAIL);
 }
 
 TEST_F(TestSharedMetaService, shared_gc_requires_committed_shared_delete)
@@ -704,7 +720,7 @@ TEST_F(TestSharedMetaService, shared_gc_requires_committed_shared_delete)
   ASSERT_EQ(0, candidates.count());
 }
 
-TEST_F(TestSharedMetaService, shared_gc_waits_for_transfer_dependency)
+TEST_F(TestSharedMetaService, shared_gc_preserves_normal_source_after_transfer)
 {
   using logservice::ObGarbageCollector;
   share::ObTenantSwitchGuard tenant_guard;
@@ -787,6 +803,18 @@ TEST_F(TestSharedMetaService, shared_gc_waits_for_transfer_dependency)
     ctx.single_log_commit(transfer_scn, transfer_scn);
     committed = true;
   }
+  const SCN shared_reorg_scn = tablets[0].get_obj()->get_reorganization_scn();
+  ASSERT_EQ(OB_SUCCESS, meta_svr->create_tablet(
+      ls_ids[0], tablet_id, shared_reorg_scn, true /*check_lease*/));
+  auto cleanup_shared_tablet = MAKE_SCOPE(shared_reorg_scn, [&](const SCN &reorg_scn) {
+    EXPECT_EQ(OB_SUCCESS, meta_svr->mark_tablet_deleted(
+        ls_ids[0], tablet_id, reorg_scn, transfer_scn));
+  });
+  bool tablet_marked_deleted = true;
+  ASSERT_EQ(OB_SUCCESS, meta_svr->check_tablet_mark_deleted(
+      ls_ids[0], tablet_id, shared_reorg_scn, tablet_marked_deleted));
+  ASSERT_FALSE(tablet_marked_deleted);
+
   ASSERT_EQ(OB_SUCCESS, tablets[1].get_obj()->tablet_meta_.transfer_info_.init(
       ls_ids[0], transfer_scn, 5 /*transfer_seq*/, 5 /*private_transfer_epoch*/, SCN::min_scn()));
   ObArray<ObTabletID> tablet_ids;
@@ -807,31 +835,76 @@ TEST_F(TestSharedMetaService, shared_gc_waits_for_transfer_dependency)
   share::ObLSStatus ls_status = share::OB_LS_NORMAL;
   ASSERT_EQ(OB_ENTRY_NOT_EXIST, gc->get_ls_status_from_table(ls_ids[0], ls_status));
 
-  // Shared deletion must not bypass a nonfailed source LS's local dependency.
+  // Normal replicas retain their tablets while shared tablet deletion is pending.
   ObGarbageCollector::ObGCCandidateArray candidates;
   ASSERT_EQ(OB_SUCCESS, gc->inner_check_ss_ls_mark_deleted_(*src_ls, candidates));
   ASSERT_EQ(0, candidates.count());
   ObMigrationStatus migration_status;
   ASSERT_EQ(OB_SUCCESS, src_ls->get_migration_status(migration_status));
-  ASSERT_EQ(OB_MIGRATION_STATUS_GC, migration_status);
-  ObLSHandle remaining;
-  ASSERT_EQ(OB_SUCCESS, ls_svr->get_ls(ls_ids[0], remaining, ObLSGetMod::STORAGE_MOD));
-  remaining.reset();
+  EXPECT_EQ(OB_MIGRATION_STATUS_NONE, migration_status);
 
-  // Backfill completion releases the dependency without removing the destination.
+  // Completing backfill releases the transfer dependency, while the shared
+  // tablet still needs Tablet GC to mark it deleted.
   ASSERT_EQ(OB_SUCCESS, tablets[1].get_obj()->tablet_meta_.reset_transfer_table());
   ASSERT_FALSE(tablets[1].get_obj()->get_tablet_meta().has_transfer_table());
+  bool wait_tablet_gc = false;
+  ASSERT_EQ(OB_SUCCESS, gc->check_tablet_gc_(*src_ls, wait_tablet_gc));
+  ASSERT_TRUE(wait_tablet_gc);
   ASSERT_EQ(OB_SUCCESS, gc->inner_check_ss_ls_mark_deleted_(*src_ls, candidates));
-  ASSERT_EQ(1, candidates.count());
-  EXPECT_EQ(ls_ids[0], candidates.at(0).ls_id_);
-  EXPECT_EQ(ObGarbageCollector::SHARED_LS_MARK_DELETED, candidates.at(0).gc_reason_);
-  EXPECT_EQ(ObGarbageCollector::LS_NEED_GC, candidates.at(0).ls_status_);
-  tablets[0].reset();
-  handles[0].reset();
+  ASSERT_EQ(0, candidates.count());
+  ASSERT_EQ(OB_SUCCESS, src_ls->get_migration_status(migration_status));
+  ASSERT_EQ(OB_MIGRATION_STATUS_NONE, migration_status);
+
+  // A normal replica already moved to GC by another check must also wait.
+  bool allow_gc = false;
+  ASSERT_EQ(OB_SUCCESS, src_ls->set_ls_migration_gc(allow_gc));
+  ASSERT_TRUE(allow_gc);
+  ASSERT_EQ(OB_SUCCESS, src_ls->get_migration_status(migration_status));
+  ASSERT_EQ(OB_MIGRATION_STATUS_GC, migration_status);
+  ASSERT_EQ(OB_SUCCESS, gc->gc_check_ls_mark_deleted_(candidates));
+  ASSERT_EQ(0, candidates.count());
   gc->execute_gc_(candidates);
-  EXPECT_EQ(OB_LS_NOT_EXIST, ls_svr->get_ls(ls_ids[0], remaining, ObLSGetMod::STORAGE_MOD));
+
+  ObLSHandle remaining;
+  ASSERT_EQ(OB_SUCCESS, ls_svr->get_ls(ls_ids[0], remaining, ObLSGetMod::STORAGE_MOD));
+  ObTabletHandle src_tablet;
+  ASSERT_EQ(OB_SUCCESS, remaining.get_ls()->ha_get_tablet(tablet_id, src_tablet));
+  ASSERT_EQ(OB_SUCCESS, meta_svr->check_tablet_mark_deleted(
+      ls_ids[0], tablet_id, shared_reorg_scn, tablet_marked_deleted));
+  EXPECT_FALSE(tablet_marked_deleted);
   ASSERT_EQ(OB_SUCCESS, ls_svr->get_ls(ls_ids[1], remaining, ObLSGetMod::STORAGE_MOD));
   ObTabletHandle dest_tablet;
+  ASSERT_EQ(OB_SUCCESS, remaining.get_ls()->ha_get_tablet(tablet_id, dest_tablet));
+  EXPECT_FALSE(dest_tablet.get_obj()->get_tablet_meta().has_transfer_table());
+
+  ASSERT_EQ(OB_SUCCESS, meta_svr->mark_tablet_deleted(
+      ls_ids[0], tablet_id, shared_reorg_scn, transfer_scn));
+  ASSERT_EQ(OB_SUCCESS, meta_svr->check_tablet_mark_deleted(
+      ls_ids[0], tablet_id, shared_reorg_scn, tablet_marked_deleted));
+  ASSERT_TRUE(tablet_marked_deleted);
+
+  // Simulate Tablet GC's local cleanup to verify the ordinary LS GC path.
+  src_tablet.reset();
+  tablets[0].reset();
+  ASSERT_EQ(OB_SUCCESS, src_ls->get_tablet_svr()->remove_tablets(tablet_ids));
+  ObArray<ObTabletID> remaining_tablet_ids;
+  ASSERT_EQ(OB_SUCCESS, src_ls->get_tablet_svr()->get_all_tablet_ids(
+      true /*except_ls_inner_tablet*/, remaining_tablet_ids));
+  ASSERT_EQ(0, remaining_tablet_ids.count());
+
+  candidates.reset();
+  ASSERT_EQ(OB_SUCCESS, gc->gc_check_ls_status_(*src_ls, candidates));
+  ASSERT_EQ(1, candidates.count());
+  EXPECT_EQ(ls_ids[0], candidates.at(0).ls_id_);
+  EXPECT_EQ(ObGarbageCollector::LS_STATUS_ENTRY_NOT_EXIST, candidates.at(0).gc_reason_);
+  EXPECT_EQ(ObGarbageCollector::LS_NEED_GC, candidates.at(0).ls_status_);
+  handles[0].reset();
+  gc->execute_gc_(candidates);
+  EXPECT_EQ(OB_LS_NOT_EXIST, ls_svr->get_ls(ls_ids[0], handles[0], ObLSGetMod::STORAGE_MOD));
+
+  remaining.reset();
+  dest_tablet.reset();
+  ASSERT_EQ(OB_SUCCESS, ls_svr->get_ls(ls_ids[1], remaining, ObLSGetMod::STORAGE_MOD));
   ASSERT_EQ(OB_SUCCESS, remaining.get_ls()->ha_get_tablet(tablet_id, dest_tablet));
   EXPECT_FALSE(dest_tablet.get_obj()->get_tablet_meta().has_transfer_table());
 }
