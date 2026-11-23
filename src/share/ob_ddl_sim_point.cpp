@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX SHARE
 #include "share/ob_ddl_sim_point.h"
+#include "share/ob_debug_sync.h"
 
 using namespace oceanbase::common;
 using namespace oceanbase::share;
@@ -97,7 +98,8 @@ class TenantContextUpdater
 {
 public:
   TenantContextUpdater(const ObTenantDDLSimContext &tenant_context, const ObIArray<int64_t> &fixed_points_array)
-    : new_context_(tenant_context), fixed_point_array_(fixed_points_array) {}
+    : new_context_(tenant_context), fixed_point_array_(fixed_points_array),
+      fixed_points_applied_(false) {}
   ~TenantContextUpdater() = default;
   int operator() (hash::HashMapPair<uint64_t, ObTenantDDLSimContext> &entry) {
     int ret = OB_SUCCESS;
@@ -127,12 +129,14 @@ public:
       const int64_t point_id = fixed_point_array_.at(i);
       entry.second.fixed_points_[point_id] = true;
     }
+    fixed_points_applied_ = OB_SUCC(ret);
     LOG_INFO("update tenant param of ddl sim point success", K(new_context_), K(fixed_point_array_), K(entry.second));
     return OB_SUCCESS;
   }
 public:
   const ObTenantDDLSimContext &new_context_;
   const ObIArray<int64_t> &fixed_point_array_;
+  bool fixed_points_applied_;
 };
 
 int ObDDLSimPointMgr::set_tenant_param(const uint64_t tenant_id, const ObConfigIntListItem &rand_param, const ObConfigIntListItem &fixed_param)
@@ -179,6 +183,22 @@ int ObDDLSimPointMgr::set_tenant_param(const uint64_t tenant_id, const ObConfigI
       TenantContextUpdater updater(tenant_context, fixed_point_array);
       if (OB_FAIL(tenant_map_.atomic_refactored(tenant_id, updater))) {
         LOG_WARN("update tenant context failed", K(ret), K(tenant_id), K(tenant_context));
+      }
+      // The map does not propagate the callback result; only signal applied fixed points.
+      if (OB_SUCC(ret) && updater.fixed_points_applied_ && 1 == fixed_point_array.count()) {
+        switch (fixed_point_array.at(0)) {
+          case DDL_SCHEDULER_STOPPED:
+            DEBUG_SYNC(AFTER_DDL_SCHEDULER_STOPPED_SIM_APPLIED);
+            break;
+          case PUSH_TASK_INTO_QUEUE_FAILED:
+            DEBUG_SYNC(AFTER_DDL_QUEUE_PUSH_FAILED_SIM_APPLIED);
+            break;
+          case DDL_SCHEDULER_ADD_SYS_TASK_FAILED:
+            DEBUG_SYNC(AFTER_DDL_SYS_TASK_FAILED_SIM_APPLIED);
+            break;
+          default:
+            break;
+        }
       }
     }
   }
