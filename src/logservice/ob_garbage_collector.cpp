@@ -32,6 +32,10 @@ using namespace palf;
 namespace logservice
 {
 ERRSIM_POINT_DEF(EN_PAUSE_SHARED_LS_MARK_DELETED_GC);
+#ifdef ERRSIM
+ERRSIM_POINT_DEF(EN_PAUSE_LOCAL_LS_REPLICA_GC,
+    "Skip local replica GC for the configured tenant and LS");
+#endif
 
 class ObGarbageCollector::InsertLSFunctor
 {
@@ -2249,6 +2253,14 @@ void ObGarbageCollector::execute_gc_(ObGCCandidateArray &gc_candidates)
       tmp_ret = OB_ERR_UNEXPECTED;
       CLOG_LOG(ERROR, "gc_handler is NULL", K(tmp_ret), K(id));
     } else if (is_need_gc_ls_status_(ls_status)) {
+#ifdef ERRSIM
+      if (MTL_ID() == GCONF.errsim_tenant_id
+          && id.id() == GCONF.errsim_migration_ls_id
+          && OB_TMP_FAIL(EN_PAUSE_LOCAL_LS_REPLICA_GC)) {
+        CLOG_LOG(INFO, "pause local ls replica gc", KR(tmp_ret), K(id), K(gc_reason));
+        continue;
+      }
+#endif
       //this replica  may not be able to synchornize complete logs
       if (GCReason::LS_STATUS_ENTRY_NOT_EXIST == gc_reason
           || GCReason::SHARED_LS_MARK_DELETED == gc_reason) {

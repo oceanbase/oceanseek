@@ -9,6 +9,7 @@
 #include "share/scheduler/ob_dag_scheduler_config.h"
 #include "storage/high_availability/ob_storage_ha_utils.h"
 #include "storage/ls/ob_ls.h"
+#include "storage/tx/ob_trans_service.h"
 #include "storage/tablet/ob_tablet_iterator.h"
 #include "storage/reorganization_info_table/ob_tablet_reorg_info_table_operation.h"
 #include "storage/tx_storage/ob_ls_service.h"
@@ -20,6 +21,10 @@ namespace oceanbase {
 namespace storage
 {
 ERRSIM_POINT_DEF(EN_SKIP_SS_TRANSFER_BACKFILL_TX);
+#ifdef ERRSIM
+ERRSIM_POINT_DEF(EN_SS_TRANSFER_REORG_SCAN_FAILED,
+    "Fail transfer reorg scans for the specified LS after the readability precheck");
+#endif
 
 ObSSTransferBackfillTaskPair::ObSSTransferBackfillTaskPair()
   : backfill_scn_(),
@@ -123,7 +128,25 @@ int ObSSTransferWorkerMgr::get_transfer_info_(
     LOG_WARN("ss transfer worker mgr do not init", K(ret));
   } else if (OB_FAIL(ls_->check_allow_read(allow_read))) {
     LOG_WARN("failed to check ls allow read", K(ret), KPC(ls_));
-  } 
+  } else if (allow_read) {
+    transaction::ObTransService *tx_service = MTL(transaction::ObTransService *);
+    if (OB_ISNULL(tx_service)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("transaction service should not be NULL", K(ret), K(ls_id_));
+    } else if (OB_FAIL(tx_service->check_ls_status(ls_id_))) {
+      if (OB_PARTITION_IS_BLOCKED == ret) {
+        LOG_INFO("ls transaction is blocked, get transfer info from local tablet", K(ret), K(ls_id_));
+        // A migrated replica can be NONE while restore replays GC BLOCK.
+        allow_read = false;
+        ret = OB_SUCCESS;
+      } else {
+        LOG_WARN("failed to check transaction ls status", K(ret), K(ls_id_));
+      }
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+  }
   // if ls is not allow read, get transfer info by iterating local tablet meta
   else if (!allow_read) {
     if (OB_FAIL(get_transfer_info_from_local_tablet_(all_tablet_info_array))) {
@@ -132,7 +155,15 @@ int ObSSTransferWorkerMgr::get_transfer_info_(
   } 
   // otherwise, get transfer info by reading reorg table
   else if (OB_FAIL(get_transfer_info_from_reorg_table_(all_tablet_info_array))) {
-    LOG_WARN("failed to get transfer info from reorg table", K(ret), K(ls_id_));
+    if (OB_PARTITION_IS_BLOCKED == ret) {
+      LOG_INFO("ls blocked during reorg scan, get transfer info from local tablet", K(ret), K(ls_id_));
+      // GC can block reads after the precheck. Local enumeration resets partial results.
+      if (OB_FAIL(get_transfer_info_from_local_tablet_(all_tablet_info_array))) {
+        LOG_WARN("failed to get transfer info from local tablet after ls blocked", K(ret), K(ls_id_));
+      }
+    } else {
+      LOG_WARN("failed to get transfer info from reorg table", K(ret), K(ls_id_));
+    }
   }
 
   if (OB_SUCC(ret)) {
@@ -283,6 +314,10 @@ int ObSSTransferWorkerMgr::get_transfer_info_from_reorg_table_(
   if (!is_inited_) {
     ret = OB_NOT_INIT;
     LOG_WARN("ss transfer worker mgr do not init", K(ret));
+#ifdef ERRSIM
+  } else if (OB_FAIL(EVENT_CALL(EN_SS_TRANSFER_REORG_SCAN_FAILED, ls_id_.id()))) {
+    LOG_INFO("[ERRSIM] fail transfer reorg scan", K(ret), K(ls_id_));
+#endif
   } else if (OB_FAIL(iter.init(tenant_id_, ls_id_, start_type, end_type))) {
     LOG_WARN("failed to init transfer info iterator", K(ret), K(tenant_id_), K(ls_id_));
   } else {
