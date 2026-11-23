@@ -20,6 +20,9 @@ using namespace oceanbase;
 using namespace share;
 using namespace storage;
 
+ERRSIM_POINT_DEF(EN_REORG_INFO_GC_FAST_SCHEDULE);
+ERRSIM_POINT_DEF(EN_REORG_GC_TEST_SCN);
+
 ObTabletReorgInfoTableService::ObTabletReorgInfoTableService()
   : is_inited_(false),
     thread_cond_(),
@@ -141,6 +144,11 @@ void ObTabletReorgInfoTableService::run1()
       if (OB_SERVER_IS_INIT == tmp_ret) {
         wait_time_ms = WAIT_SERVER_IN_SERVICE_TIME_MS;
       }
+#ifdef ERRSIM
+      if (EN_REORG_INFO_GC_FAST_SCHEDULE) {
+        wait_time_ms = 1000;
+      }
+#endif
       ObBKGDSessInActiveGuard inactive_guard;
       thread_cond_.wait(wait_time_ms);
     }
@@ -177,6 +185,7 @@ int ObTabletReorgInfoTableService::calc_ls_max_recycle_scn_(const share::ObLSID 
   share::SCN max_recycle_scn(share::SCN::min_scn());
   share::SCN min_unrecycle_scn(share::SCN::max_scn());
   share::SCN recycle_scn;
+  share::SCN max_decided_scn;
   ObLSHandle ls_handle;
   ObLS *ls = nullptr;
   bool can_recycle = false;
@@ -192,9 +201,21 @@ int ObTabletReorgInfoTableService::calc_ls_max_recycle_scn_(const share::ObLSID 
   } else if (OB_ISNULL(ls = ls_handle.get_ls())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ls should not be NULL", K(ret), K(ls_id), K(ls_handle));
+  } else if (OB_FAIL(ls->get_max_decided_scn(max_decided_scn))) {
+    LOG_WARN("failed to get local replay progress for reorg gc", K(ret), K(ls_id));
+#ifdef ERRSIM
+  } else if (static_cast<int64_t>(MTL_ID()) == EN_REORG_GC_TEST_SCN.item_.cond_
+      && OB_FAIL(max_decided_scn.convert_for_inner_table_field(EVENT_CODE(EN_REORG_GC_TEST_SCN)))) {
+    LOG_WARN("failed to inject reorg gc test progress", K(ret));
+#endif
+  } else if (!max_decided_scn.is_valid_and_not_min() || max_decided_scn.is_max()) {
+    ret = OB_EAGAIN;
+    LOG_INFO("local replay progress is not ready for reorg gc", K(ret), K(ls_id), K(max_decided_scn));
   } else if (OB_FAIL(read_op.init(tenant_id, ls_id, timeout_us))) {
     LOG_WARN("failed to init read operator", K(ret), K(tenant_id), K(ls_id));
   } else {
+    // Treat local progress as an exclusive recycle boundary.
+    min_unrecycle_scn = max_decided_scn;
     ObTabletReorgInfoData data;
     share::SCN commit_scn;
     while (OB_SUCC(ret)) {
@@ -207,6 +228,13 @@ int ObTabletReorgInfoTableService::calc_ls_max_recycle_scn_(const share::ObLSID 
         } else {
           LOG_WARN("failed to get next data", K(ret), K(tenant_id), K(ls_id));
         }
+      } else if (!commit_scn.is_valid_and_not_min() || commit_scn.is_max()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid reorg row commit scn", K(ret), K(ls_id), K(commit_scn), K(data));
+      } else if (commit_scn > max_decided_scn) {
+        // Skip rows ahead of local replay/apply progress without inspecting tablets.
+        // Keep scanning: rows are ordered by rowkey, not by commit SCN.
+        LOG_DEBUG("skip reorg row ahead of local progress", K(ls_id), K(commit_scn), K(max_decided_scn));
       } else if (OB_FAIL(check_can_recycle_(*ls, data, can_recycle))) {
         LOG_WARN("failed to check can recycle", K(ret), K(data));
       } else if (can_recycle) {

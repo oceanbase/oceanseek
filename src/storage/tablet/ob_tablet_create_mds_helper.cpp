@@ -28,6 +28,7 @@ namespace storage
 {
 
 ERRSIM_POINT_DEF(EN_CREATE_TABLET_FAILED);
+ERRSIM_POINT_DEF(EN_FORK_TABLE_BLOCK_CREATE_REPLAY);
 
 int ObTabletCreateMdsHelper::register_process(
     const ObBatchCreateTabletArg &arg,
@@ -112,61 +113,70 @@ int ObTabletCreateMdsHelper::replay_process(
 {
   MDS_TG(1_s);
   int ret = OB_SUCCESS;
-  common::ObSArray<ObTabletID> creating_tablet_id_array;
-  common::ObSArray<ObTabletID> empty_mds_tablet_id_array;
   const ObLSID &ls_id = arg.id_;
-  ObLSHandle ls_handle;
-  ObLS *ls = nullptr;
-  share::SCN tablet_change_ckpt_scn;
-  if (CLICK_FAIL(creating_tablet_id_array.reserve(arg.get_tablet_count()))) {
-    LOG_WARN("failed to reserve memory", K(ret), "capacity", arg.get_tablet_count());
-  } else if (CLICK_FAIL(get_ls(ls_id, ls_handle))) {
-    LOG_WARN("failed to get ls", K(ret), K(ls_id));
-  } else if (OB_ISNULL(ls = ls_handle.get_ls())) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("ls is null", K(ret), K(ls_id), K(ls_handle));
-  } else if (FALSE_IT(tablet_change_ckpt_scn = ls->get_tablet_change_checkpoint_scn())) {
-  } else if (scn <= tablet_change_ckpt_scn) {
-    // Guarded by ObLSMeta::tablet_change_checkpoint_scn_ invariant: tablet meta
-    // for any create at scn <= water is SLOG-persisted AND the MDS row is in
-    // LS_MDS_TABLET sstable — safe to skip this create log replay.
-    LOG_INFO("current scn is smaller than tablet_change_checkpoint_scn, log replaying can be skipped",
-        K(ret), K(scn), K(tablet_change_ckpt_scn));
-  } else if (CLICK_FAIL(create_tablets(arg, true/*for_replay*/, scn, ctx, creating_tablet_id_array, empty_mds_tablet_id_array))) {
-    LOG_WARN("failed to create tablets", K(ret), K(arg), K(scn));
-  } else if (!arg.set_binding_info_outside_create() && CLICK_FAIL(ObTabletBindingHelper::modify_tablet_binding_for_new_mds_create(arg, scn, ctx))) {
-    LOG_WARN("failed to modify tablet binding", K(ret));
-  } else if (CLICK_FAIL(ObTabletCreateDeleteMdsUserData::set_tablet_gc_trigger(ls_id))) {
-    LOG_WARN("failed to trigger tablet gc task", K(ret));
-  } else {
-    mds::ObTabletCreateMdsCtx &mds_ctx = static_cast<mds::ObTabletCreateMdsCtx&>(ctx);
-    mds_ctx.set_ls_id(ls_id);
-    // Replay path: only record tablet_ids_; mark_unpersisted is done once in
-    // ObTabletCreateMdsCtx::on_redo (same as leader). A replay-time mark here
-    // plus on_redo would run twice under multi-source replay and the second
-    // mark_unpersisted hits EDIAG (tablet has already been persisted).
-    for (int64_t i = 0; OB_SUCC(ret) && i < creating_tablet_id_array.count(); ++i) {
-      if (CLICK_FAIL(mds_ctx.add_tablet_id(creating_tablet_id_array.at(i)))) {
-        LOG_WARN("failed to record tablet id on ctx", K(ret),
-            K(creating_tablet_id_array.at(i)));
+#ifdef ERRSIM
+  // Keep the destination absent while later independent transactions replay.
+  if (ObTabletMdsUserDataType::START_FORK_DST == arg.create_type_
+      && OB_SUCCESS != EVENT_CALL(EN_FORK_TABLE_BLOCK_CREATE_REPLAY, ls_id.id())) {
+    ret = OB_EAGAIN;
+  }
+#endif
+  if (OB_SUCC(ret)) {
+    common::ObSArray<ObTabletID> creating_tablet_id_array;
+    common::ObSArray<ObTabletID> empty_mds_tablet_id_array;
+    ObLSHandle ls_handle;
+    ObLS *ls = nullptr;
+    share::SCN tablet_change_ckpt_scn;
+    if (CLICK_FAIL(creating_tablet_id_array.reserve(arg.get_tablet_count()))) {
+      LOG_WARN("failed to reserve memory", K(ret), "capacity", arg.get_tablet_count());
+    } else if (CLICK_FAIL(get_ls(ls_id, ls_handle))) {
+      LOG_WARN("failed to get ls", K(ret), K(ls_id));
+    } else if (OB_ISNULL(ls = ls_handle.get_ls())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("ls is null", K(ret), K(ls_id), K(ls_handle));
+    } else if (FALSE_IT(tablet_change_ckpt_scn = ls->get_tablet_change_checkpoint_scn())) {
+    } else if (scn <= tablet_change_ckpt_scn) {
+      // Guarded by ObLSMeta::tablet_change_checkpoint_scn_ invariant: tablet meta
+      // for any create at scn <= water is SLOG-persisted AND the MDS row is in
+      // LS_MDS_TABLET sstable — safe to skip this create log replay.
+      LOG_INFO("current scn is smaller than tablet_change_checkpoint_scn, log replaying can be skipped",
+          K(ret), K(scn), K(tablet_change_ckpt_scn));
+    } else if (CLICK_FAIL(create_tablets(arg, true/*for_replay*/, scn, ctx, creating_tablet_id_array, empty_mds_tablet_id_array))) {
+      LOG_WARN("failed to create tablets", K(ret), K(arg), K(scn));
+    } else if (!arg.set_binding_info_outside_create() && CLICK_FAIL(ObTabletBindingHelper::modify_tablet_binding_for_new_mds_create(arg, scn, ctx))) {
+      LOG_WARN("failed to modify tablet binding", K(ret));
+    } else if (CLICK_FAIL(ObTabletCreateDeleteMdsUserData::set_tablet_gc_trigger(ls_id))) {
+      LOG_WARN("failed to trigger tablet gc task", K(ret));
+    } else {
+      mds::ObTabletCreateMdsCtx &mds_ctx = static_cast<mds::ObTabletCreateMdsCtx&>(ctx);
+      mds_ctx.set_ls_id(ls_id);
+      // Replay path: only record tablet_ids_; mark_unpersisted is done once in
+      // ObTabletCreateMdsCtx::on_redo (same as leader). A replay-time mark here
+      // plus on_redo would run twice under multi-source replay and the second
+      // mark_unpersisted hits EDIAG (tablet has already been persisted).
+      for (int64_t i = 0; OB_SUCC(ret) && i < creating_tablet_id_array.count(); ++i) {
+        if (CLICK_FAIL(mds_ctx.add_tablet_id(creating_tablet_id_array.at(i)))) {
+          LOG_WARN("failed to record tablet id on ctx", K(ret),
+              K(creating_tablet_id_array.at(i)));
+        }
       }
     }
-  }
 
-  if (CLICK_FAIL(ret)) {
-    // roll back
-    int tmp_ret = OB_SUCCESS;
-    if (CLICK() && OB_TMP_FAIL(ObTabletCreateDeleteHelper::rollback_is_written(ls_id, empty_mds_tablet_id_array))) {
-      LOG_ERROR("failed to rollback_is_written", K(tmp_ret));
-      ob_usleep(1 * 1000 * 1000);
-      ob_abort();
-    } else if (CLICK() && OB_TMP_FAIL(rollback_remove_tablets(ls_id, creating_tablet_id_array))) {
-      LOG_ERROR("failed to roll back remove tablets", K(tmp_ret));
-      ob_usleep(1 * 1000 * 1000);
-      ob_abort();
+    if (CLICK_FAIL(ret)) {
+      // roll back
+      int tmp_ret = OB_SUCCESS;
+      if (CLICK() && OB_TMP_FAIL(ObTabletCreateDeleteHelper::rollback_is_written(ls_id, empty_mds_tablet_id_array))) {
+        LOG_ERROR("failed to rollback_is_written", K(tmp_ret));
+        ob_usleep(1 * 1000 * 1000);
+        ob_abort();
+      } else if (CLICK() && OB_TMP_FAIL(rollback_remove_tablets(ls_id, creating_tablet_id_array))) {
+        LOG_ERROR("failed to roll back remove tablets", K(tmp_ret));
+        ob_usleep(1 * 1000 * 1000);
+        ob_abort();
+      }
     }
+    LOG_INFO("create tablet replay", KR(ret), K(scn), "arg", PRETTY_ARG(arg));
   }
-  LOG_INFO("create tablet replay", KR(ret), K(scn), "arg", PRETTY_ARG(arg));
   return ret;
 }
 
