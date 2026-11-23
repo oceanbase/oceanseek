@@ -41,6 +41,27 @@ void TestPLParser::TearDown()
 {
 }
 
+TEST_F(TestPLParser, direct_load_stream_create_package)
+{
+  // Quote the reserved CREATE name in both the package declaration and body.
+  set_compat_mode(oceanbase::lib::Worker::CompatMode::MYSQL);
+  ObPLParser parser(allocator_, ObCharsets4Parser(), DEFAULT_MYSQL_MODE);
+  const char *queries[] = {
+    "CREATE OR REPLACE PACKAGE dbms_direct_load_stream AUTHID CURRENT_USER "
+    "FUNCTION `create`(IN target_table VARCHAR(65535), IN ttl_seconds BIGINT) RETURN BIGINT; "
+    "END dbms_direct_load_stream;",
+    "CREATE OR REPLACE PACKAGE BODY dbms_direct_load_stream "
+    "FUNCTION `create`(IN target_table VARCHAR(65535), IN ttl_seconds BIGINT) RETURN BIGINT; "
+    "PRAGMA INTERFACE(C, DBMS_DIRECT_LOAD_STREAM_CREATE); END dbms_direct_load_stream;"
+  };
+  for (int64_t i = 0; i < ARRAYSIZEOF(queries); ++i) {
+    ParseResult parse_result{};
+    ObString query = ObString::make_string(queries[i]);
+    ASSERT_EQ(OB_SUCCESS, parser.parse(query, query, parse_result, false)) << queries[i];
+    ASSERT_NE(nullptr, parse_result.result_tree_);
+  }
+}
+
 TEST_F(TestPLParser, basic_test)
 {
   ObPLParser parser(allocator_, ObCharsets4Parser());

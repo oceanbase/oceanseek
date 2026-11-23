@@ -19,7 +19,7 @@ public:
   ObDBMSDirectLoadStream() {}
   virtual ~ObDBMSDirectLoadStream() {}
 
-  static int create_table(sql::ObExecContext &ctx, sql::ParamStore &params, common::ObObj &result);
+  static int create(sql::ObExecContext &ctx, sql::ParamStore &params, common::ObObj &result);
   static int close(sql::ObExecContext &ctx, sql::ParamStore &params, common::ObObj &result);
 };
 

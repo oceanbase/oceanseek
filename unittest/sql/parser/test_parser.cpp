@@ -500,6 +500,120 @@ TEST_F(TestParser, search_index_schema_only_ddl)
   }
 }
 
+TEST_F(TestParser, direct_load_stream_create_call)
+{
+  // Qualified CREATE calls must parse without requiring client-side quoting.
+  set_compat_mode(oceanbase::lib::Worker::CompatMode::MYSQL);
+  ObParser parser(allocator_, DEFAULT_MYSQL_MODE, ObCharsets4Parser(), nullptr);
+  const char *queries[] = {
+    "SELECT DBMS_DIRECT_LOAD_STREAM.CREATE('target_table', 3600) AS stream_id",
+    "SELECT dbms_direct_load_stream.`create`('target_table', 3600) AS stream_id",
+    "SET @stream_id = dbms_direct_load_stream.create('target_table', 3600)",
+    // Quoting the package must not require quoting the function name.
+    "SELECT `dbms_direct_load_stream`.create('target_table', 3600) AS stream_id",
+    // Whitespace around the qualifier must preserve the same function call.
+    "SELECT dbms_direct_load_stream . create('target_table', 3600) AS stream_id"
+  };
+  for (int64_t i = 0; i < ARRAYSIZEOF(queries); ++i) {
+    SCOPED_TRACE(queries[i]);
+    ParseResult parse_result{};
+    ObString query = ObString::make_string(queries[i]);
+    ASSERT_EQ(OB_SUCCESS,
+              parser.parse(query, parse_result, STD_MODE, false, false, false, false, false))
+        << queries[i];
+    ParseNode *call_node = find_parse_node(parse_result.result_tree_, T_OBJ_ACCESS_REF);
+    ASSERT_NE(nullptr, call_node);
+    ASSERT_EQ(2, call_node->num_child_);
+    ASSERT_NE(nullptr, call_node->children_[0]);
+    EXPECT_STRCASEEQ("dbms_direct_load_stream", call_node->children_[0]->str_value_);
+    // The resolver requires the function inside the right object-access node.
+    ParseNode *member_node = call_node->children_[1];
+    ASSERT_NE(nullptr, member_node);
+    ASSERT_EQ(T_OBJ_ACCESS_REF, member_node->type_);
+    ASSERT_EQ(2, member_node->num_child_);
+    EXPECT_EQ(nullptr, member_node->children_[1]);
+    ParseNode *function_node = member_node->children_[0];
+    ASSERT_NE(nullptr, function_node);
+    ASSERT_EQ(T_FUN_SYS, function_node->type_);
+    ASSERT_EQ(2, function_node->num_child_);
+    ASSERT_NE(nullptr, function_node->children_[0]);
+    EXPECT_STRCASEEQ("create", function_node->children_[0]->str_value_);
+    ParseNode *params_node = function_node->children_[1];
+    ASSERT_NE(nullptr, params_node);
+    ASSERT_EQ(T_EXPR_LIST, params_node->type_);
+    ASSERT_EQ(2, params_node->num_child_);
+    // Target table and TTL must retain their values and argument positions.
+    ASSERT_NE(nullptr, params_node->children_[0]);
+    EXPECT_EQ(T_VARCHAR, params_node->children_[0]->type_);
+    EXPECT_STREQ("target_table", params_node->children_[0]->str_value_);
+    ASSERT_NE(nullptr, params_node->children_[1]);
+    EXPECT_EQ(T_INT, params_node->children_[1]->type_);
+    EXPECT_EQ(3600, params_node->children_[1]->value_);
+    parser.free_result(parse_result);
+  }
+}
+
+TEST_F(TestParser, direct_load_stream_create_keyword_boundary)
+{
+  // Qualified calls must not change CREATE statement parsing.
+  set_compat_mode(oceanbase::lib::Worker::CompatMode::MYSQL);
+  ObParser parser(allocator_, DEFAULT_MYSQL_MODE, ObCharsets4Parser(), nullptr);
+  const struct {
+    const char *query_;
+    ObItemType stmt_type_;
+  } ddl_cases[] = {
+    {"CREATE TABLE target_table (id INT)", T_CREATE_TABLE},
+    {"CREATE DATABASE stream_db", T_CREATE_DATABASE},
+    {"CREATE INDEX idx ON target_table (id)", T_CREATE_INDEX}
+  };
+  for (int64_t i = 0; i < ARRAYSIZEOF(ddl_cases); ++i) {
+    SCOPED_TRACE(ddl_cases[i].query_);
+    ParseResult parse_result{};
+    ObString query = ObString::make_string(ddl_cases[i].query_);
+    ASSERT_EQ(OB_SUCCESS,
+              parser.parse(query, parse_result, STD_MODE, false, false, false, false, false));
+    EXPECT_NE(nullptr, find_parse_node(parse_result.result_tree_, ddl_cases[i].stmt_type_));
+    parser.free_result(parse_result);
+  }
+
+  // Without parentheses, a qualified CREATE remains a legal column reference.
+  {
+    ParseResult parse_result{};
+    ObString query = ObString::make_string("SELECT t . CREATE FROM t");
+    ASSERT_EQ(OB_SUCCESS,
+              parser.parse(query, parse_result, STD_MODE, false, false, false, false, false));
+    ParseNode *select_node = find_parse_node(parse_result.result_tree_, T_SELECT);
+    ASSERT_NE(nullptr, select_node);
+    ASSERT_GT(select_node->num_child_, PARSE_SELECT_SELECT);
+    ParseNode *projection_node = select_node->children_[PARSE_SELECT_SELECT];
+    ASSERT_NE(nullptr, projection_node);
+    ASSERT_EQ(T_PROJECT_LIST, projection_node->type_);
+    ASSERT_EQ(1, projection_node->num_child_);
+    ParseNode *column_node = find_parse_node(projection_node->children_[0], T_COLUMN_REF);
+    ASSERT_NE(nullptr, column_node);
+    ASSERT_EQ(3, column_node->num_child_);
+    ASSERT_NE(nullptr, column_node->children_[1]);
+    ASSERT_NE(nullptr, column_node->children_[2]);
+    EXPECT_STREQ("t", column_node->children_[1]->str_value_);
+    EXPECT_STREQ("CREATE", column_node->children_[2]->str_value_);
+    parser.free_result(parse_result);
+  }
+
+  // CREATE stays reserved outside the qualified function-name position.
+  const char *invalid_queries[] = {
+    "SELECT create('target_table', 3600)",
+    "CREATE TABLE create (id INT)"
+  };
+  for (int64_t i = 0; i < ARRAYSIZEOF(invalid_queries); ++i) {
+    SCOPED_TRACE(invalid_queries[i]);
+    ParseResult parse_result{};
+    ObString query = ObString::make_string(invalid_queries[i]);
+    EXPECT_EQ(OB_ERR_PARSE_SQL,
+              parser.parse(query, parse_result, STD_MODE, false, false, false, false, false));
+    parser.free_result(parse_result);
+  }
+}
+
 TEST_F(TestParser, direct_load_stream_insert_target)
 {
   // Stream 目标只接受正整数；参数化后 ID 保留字面量，VALUES 仍产生普通参数。

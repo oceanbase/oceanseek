@@ -628,20 +628,20 @@ private:
     int status = OB_SUCCESS;
     pl::ObPLInterfaceService interface_service;
     ObString interface_name =
-        ObString::make_string("DBMS_DIRECT_LOAD_STREAM_CREATE_TABLE");
+        ObString::make_string("DBMS_DIRECT_LOAD_STREAM_CREATE");
     pl::PL_C_INTERFACE_t entry = nullptr;
     stream_id = OB_INVALID_ID;
     table_name_param.set_varchar(ObString::make_string(table_name));
     ttl_param.set_int(60);
     if (OB_FAIL(params.push_back(table_name_param))) {
-      LOG_WARN("fail to push CREATE_TABLE name parameter", KR(ret));
+      LOG_WARN("fail to push CREATE name parameter", KR(ret));
     } else if (OB_FAIL(params.push_back(ttl_param))) {
-      LOG_WARN("fail to push CREATE_TABLE ttl parameter", KR(ret));
+      LOG_WARN("fail to push CREATE ttl parameter", KR(ret));
     } else if (OB_FAIL(interface_service.init())) {
       LOG_WARN("fail to init PL interface service", KR(ret));
     } else if (OB_ISNULL(entry = interface_service.get_entry(interface_name))) {
       ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("fail to get CREATE_TABLE interface", KR(ret), K(interface_name));
+      LOG_WARN("fail to get CREATE interface", KR(ret), K(interface_name));
     } else {
       pl::ObPLExecCtx pl_exec_ctx(&allocator_,
                                   &allocator_,
@@ -659,7 +659,7 @@ private:
         LOG_WARN("fail to create direct load stream through PL interface", KR(ret), K(table_name));
       } else if (OB_UNLIKELY(!result.is_int())) {
         ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unexpected CREATE_TABLE result", KR(ret), K(result));
+        LOG_WARN("unexpected CREATE result", KR(ret), K(result));
       } else {
         stream_id = result.get_int();
       }
@@ -694,7 +694,7 @@ private:
 };
 
 // 正常表通过全部前置门禁后，应到达 S8 topology 依赖，并在缺少依赖时无副作用失败。
-TEST_F(TestDirectLoadStreamPrepareCtx, create_table_passes_precreate_gates_before_topology)
+TEST_F(TestDirectLoadStreamPrepareCtx, create_passes_precreate_gates_before_topology)
 {
   do_create_table("create table dls_target(c1 int, c2 varchar(32))");
   reset_query_ctx_schema_guard();
@@ -708,7 +708,7 @@ TEST_F(TestDirectLoadStreamPrepareCtx, create_table_passes_precreate_gates_befor
 }
 
 // 用户缺少目标表 INSERT 权限时，CREATE 应在产生 stream 副作用前返回权限错误。
-TEST_F(TestDirectLoadStreamPrepareCtx, create_table_without_insert_has_no_stream_side_effect)
+TEST_F(TestDirectLoadStreamPrepareCtx, create_without_insert_has_no_stream_side_effect)
 {
   do_create_table("create table dls_target(c1 int)");
   reset_query_ctx_schema_guard();
@@ -727,7 +727,7 @@ TEST_F(TestDirectLoadStreamPrepareCtx, create_table_without_insert_has_no_stream
 }
 
 // 受限用户拥有目标列 INSERT 权限时，应越过权限门禁并到达 S8 topology 依赖。
-TEST_F(TestDirectLoadStreamPrepareCtx, create_table_user_column_insert_reaches_topology_gate)
+TEST_F(TestDirectLoadStreamPrepareCtx, create_user_column_insert_reaches_topology_gate)
 {
   do_create_table("create table dls_target(c1 int)");
   reset_query_ctx_schema_guard();
@@ -748,7 +748,7 @@ TEST_F(TestDirectLoadStreamPrepareCtx, create_table_user_column_insert_reaches_t
 }
 
 // 角色列级 INSERT 权限仅在启用后生效，启用后应到达 S8 topology 依赖。
-TEST_F(TestDirectLoadStreamPrepareCtx, create_table_role_column_insert_reaches_topology_gate)
+TEST_F(TestDirectLoadStreamPrepareCtx, create_role_column_insert_reaches_topology_gate)
 {
   do_create_table("create table dls_target(c1 int)");
   reset_query_ctx_schema_guard();
@@ -775,7 +775,7 @@ TEST_F(TestDirectLoadStreamPrepareCtx, create_table_role_column_insert_reaches_t
 }
 
 // 仅有目标列 SELECT 权限不能替代 INSERT 权限，CREATE 应拒绝且不创建 stream。
-TEST_F(TestDirectLoadStreamPrepareCtx, create_table_rejects_select_only_column_privilege)
+TEST_F(TestDirectLoadStreamPrepareCtx, create_rejects_select_only_column_privilege)
 {
   do_create_table("create table dls_target(c1 int)");
   reset_query_ctx_schema_guard();
@@ -795,7 +795,7 @@ TEST_F(TestDirectLoadStreamPrepareCtx, create_table_rejects_select_only_column_p
 }
 
 // 视图不支持增量旁路导入，CREATE 应在创建 stream 前返回 OB_NOT_SUPPORTED。
-TEST_F(TestDirectLoadStreamPrepareCtx, create_table_rejects_unsupported_view_without_stream)
+TEST_F(TestDirectLoadStreamPrepareCtx, create_rejects_unsupported_view_without_stream)
 {
   do_create_table("create table dls_base(c1 int)");
   ObStmt *stmt = nullptr;
@@ -923,7 +923,7 @@ TEST_F(TestDirectLoadStreamPrepareCtx, owner_mismatch_is_rejected_before_claim)
   EXPECT_EQ(OB_SUCCESS, meta.result_code_);
 }
 
-// schema version 必须严格等于 CREATE_TABLE 时记录的版本，漂移时在 claim 后锁后校验并收敛失败。
+// Schema drift from the CREATE-time version must fail validation after claim and locking.
 TEST_F(TestDirectLoadStreamPrepareCtx, schema_mismatch_is_finished_after_claim)
 {
   do_create_table("create table dls_target(c1 int)");

@@ -2,7 +2,7 @@
 #author:cw403059
 
 CREATE OR REPLACE PACKAGE dbms_direct_load_stream AUTHID CURRENT_USER
-  FUNCTION create_table(
+  FUNCTION `create`(
     IN target_table          VARCHAR(65535),
     IN ttl_seconds           BIGINT) RETURN BIGINT;
 

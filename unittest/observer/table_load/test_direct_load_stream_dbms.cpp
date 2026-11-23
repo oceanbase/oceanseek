@@ -324,11 +324,6 @@ TEST_F(TestDirectLoadStreamDbms, close_rejects_owner_mismatch)
   session.destroy(true);
 }
 
-// 完整 PL CREATE_TABLE 需要 schema guard 和真实目标表环境，归 Step 9/集成门禁补齐。
-TEST_F(TestDirectLoadStreamDbms, DISABLED_create_table_returns_stream_id_with_local_queue)
-{
-}
-
 // 验证 DBMS CLOSE 在 owner 校验通过后会 seal 本地 queue。
 TEST_F(TestDirectLoadStreamDbms, close_seals_queue_after_owner_check)
 {

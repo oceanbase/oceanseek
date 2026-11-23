@@ -498,6 +498,7 @@ END_P SET_VAR DELIMITER
 %type <node> alter_column_behavior opt_set opt_position_column
 %type <node> alter_system_stmt alter_system_set_parameter_actions alter_system_settp_actions settp_option alter_system_set_parameter_action server_info_list server_info opt_bootstrap_info bootstrap_info opt_logservice_access_point logservice_access_point opt_shared_storage_info shared_storage_info alter_system_reset_parameter_actions alter_system_reset_parameter_action
 %type <node> opt_comment opt_as
+%type <node> qualified_function_name
 %type <node> column_name relation_name relation_name_list opt_relation_name function_name column_label var_name relation_name_or_string refresh_fulltext_dict_dst row_format_option compression_name merge_engine_types
 %type <node> audit_stmt audit_clause op_audit_tail_clause audit_operation_clause audit_all_shortcut_list audit_all_shortcut auditing_on_clause auditing_by_user_clause audit_user_list audit_user audit_user_with_host_name
 %type <node> opt_hint_list hint_option select_with_opt_hint update_with_opt_hint delete_with_opt_hint merge_with_opt_hint merge_table_with_opt_hint hint_list_with_end global_hint transform_hint optimize_hint
@@ -3612,7 +3613,7 @@ MOD '(' expr ',' expr ')'
     store_pl_ref_object_symbol($$, result, REF_FUNC);
   }
 }
-| relation_name '.' function_name '(' opt_expr_as_list ')'
+| relation_name '.' qualified_function_name '(' opt_expr_as_list ')'
 {
   ParseNode *params = NULL;
   ParseNode *function = NULL;
@@ -27066,6 +27067,18 @@ ID_DOT_ID_DOT_ID { $$ = $1; }
   ParseNode* tb_node = $3->children_[0];
   ParseNode* col_node = $3->children_[1];
   malloc_non_terminal_node($$, result->malloc_pool_, T_IDENT, 3, db_node, tb_node, col_node);
+}
+;
+
+qualified_function_name:
+function_name
+{
+  $$ = $1;
+}
+| CREATE
+{
+  make_name_node($$, result->malloc_pool_, "create");
+  setup_token_pos_info($$, @1.first_column - 1, @1.last_column - @1.first_column + 1);
 }
 ;
 

@@ -223,7 +223,7 @@ int check_stream_owner(ObExecContext &ctx, const ObDirectLoadStreamMeta &meta)
 }
 } // namespace
 
-int ObDBMSDirectLoadStream::create_table(ObExecContext &ctx, ParamStore &params, ObObj &result)
+int ObDBMSDirectLoadStream::create(ObExecContext &ctx, ParamStore &params, ObObj &result)
 {
   int ret = OB_SUCCESS;
   ObDirectLoadStreamCreateParam create_param;
@@ -236,7 +236,7 @@ int ObDBMSDirectLoadStream::create_table(ObExecContext &ctx, ParamStore &params,
     LOG_WARN("Stream Direct Load is disabled", KR(ret));
   } else if (OB_UNLIKELY(2 != params.count())) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument count for direct load stream create table", KR(ret), K(params.count()));
+    LOG_WARN("invalid argument count for direct load stream create", KR(ret), K(params.count()));
   } else if (OB_FAIL(get_string_param(params, 0, table_name))) {
     LOG_WARN("fail to get target table name", KR(ret));
   } else if (OB_FAIL(get_positive_int64_param(params, 1, ttl_seconds))) {
