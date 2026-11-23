@@ -85,7 +85,7 @@ For more detailed information, please refer to [Customer Cases](https://www.ocea
 
 # System architecture
 
-[System Architecture Introduction](https://www.oceanbase.com/docs/common-oceanseek-1000000007251078)
+[System Architecture Introduction](https://docs.oceanbase.com/oceanbase-ai-database/system-architecture)
 
 # Contributing
 
