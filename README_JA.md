@@ -1,149 +1,91 @@
 <p align="center">
-    <a href="https://github.com/oceanbase/oceanbase">
+    <a href="https://github.com/oceanbase/oceanseek">
         <img alt="OceanBase Logo" src="images/logo.svg" width="50%" />
     </a>
 </p>
 
 <p align="center">
-    <a href="https://en.oceanbase.com/docs/oceanbase-database">
-        <img alt="English doc" src="https://img.shields.io/badge/docs-English-blue" />
-    </a>
-    <a href="https://www.oceanbase.com/docs/oceanbase-database-cn">
+    <a href="https://www.oceanbase.com/docs/oceanseek">
         <img alt="Chinese doc" src="https://img.shields.io/badge/文档-简体中文-blue" />
     </a>
-    <a href="https://github.com/oceanbase/oceanbase/commits/master">
-        <img alt="last commit" src="https://img.shields.io/github/last-commit/oceanbase/oceanbase/master" />
+    <a href="https://en.oceanbase.com/docs/oceanseek">
+        <img alt="English doc" src="https://img.shields.io/badge/docs-English-blue" />
     </a>
-    <a href="https://github.com/oceanbase/oceanbase">
-        <img alt="stars" src="https://img.shields.io/badge/dynamic/json?color=blue&label=stars&query=stargazers_count&url=https%3A%2F%2Fapi.github.com%2Frepos%2Foceanbase%2Foceanbase" />
+    <a href="https://github.com/oceanbase/oceanseek/commits/master">
+        <img alt="last commit" src="https://img.shields.io/github/last-commit/oceanbase/oceanseek/master" />
     </a>
-    <a href="https://github.com/oceanbase/oceanbase/actions/workflows/compile.yml">
-        <img alt="building status" src="https://img.shields.io/github/actions/workflow/status/oceanbase/oceanbase/compile.yml?branch=master" />
+    <a href="https://github.com/oceanbase/oceanseek">
+        <img alt="stars" src="https://img.shields.io/badge/dynamic/json?color=blue&label=stars&query=stargazers_count&url=https%3A%2F%2Fapi.github.com%2Frepos%2Foceanbase%2Foceanseek" />
     </a>
-    <a href="https://github.com/oceanbase/oceanbase/blob/master/LICENSE">
+    <a href="https://github.com/oceanbase/oceanseek/blob/master/LICENSE">
         <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-blue" />
     </a>
 </p>
 
 <p align="center">
     <a href="https://discord.gg/74cF8vbNEs">
-        <img alt="Support" src="https://img.shields.io/badge/Disord-Join%20Oceanbase-brightgreen?logo=discord" />
+        <img alt="Support" src="https://img.shields.io/badge/Discord-Join%20Oceanbase-brightgreen?logo=discord" />
     </a>
     <a href="https://stackoverflow.com/questions/tagged/oceanbase">
         <img alt="Stack Overflow" src="https://img.shields.io/badge/Stack-Stack%20Overflow-brightgreen?logo=stackoverflow" />
-    </a>
-    <a href="https://www.youtube.com/@OceanBaseDB">
-        <img alt="Static Badge" src="https://img.shields.io/badge/YouTube-red?logo=youtube">
-    </a>
-    <a href="https://www.linkedin.com/company/oceanbase" target="_blank">
-        <img src="https://custom-icon-badges.demolab.com/badge/LinkedIn-0A66C2?logo=linkedin-white&logoColor=fff" alt="follow on LinkedIn">
-    </a>
-    <a href="https://en.oceanbase.com/">
-        <img alt="Static Badge" src="https://img.shields.io/badge/OceanBase-Official%20Website-blue">
-    </a>
-    <a href="https://oceanbase.github.io/docs/blogs/users/1st-financial">
-        <img alt="Static Badge" src="https://img.shields.io/badge/OceanBase-Official%20Blog-blue">
-    </a>
-    <a href="https://x.com/OceanBaseDB">
-        <img alt="Static Badge" src="https://img.shields.io/badge/Follow-%40OceanBaseDB-white?logo=x&labelColor=black">
-    </a>
-    <a href="https://github.com/oceanbase/oceanbase/graphs/commit-activity" target="_blank">
-        <img alt="Static Badge" src="https://img.shields.io/badge/commit%20activity%201020%2Fmonth-yellow">
     </a>
 </p>
 
 [English](README.md) | [中文版](README_CN.md) | 日本語版
 
-**OceanBase** は分散リレーショナルデータベースです。Ant Group によって開発されています。OceanBase は、汎用的なサーバークラスター上に構築されています。 OceanBase は、[Paxos](https://lamport.azurewebsites.net/pubs/lamport-paxos.pdf) プロトコルとその分散構造に基づいて、高可用性と線形スケーラビリティを実現します。OceanBase は、特定のハードウェア アーキテクチャに依存しません。また、ベクトルデータベース機能をサポートしており、AI や大規模検索シナリオ向けに高効率なベクトル検索能力を提供します。
+**OceanSeek** は、OceanBase AI Database のオープンソース版です。**複数のデータモデルを扱える分散データベースで、データレイクとデータベースの機能を一つの基盤に統合しています。**
 
-# 主な特徴
+OceanSeek は、大規模な本番環境で検証された OceanBase の分散基盤上に構築されています。リレーショナルテーブル、ワイドカラムテーブル、ベクトル、JSON、テキスト、空間データを扱い、トランザクション、アクセス権限、バージョン、データのライフサイクルを、どのモデルでも同じ仕組みで管理できます。AI アプリケーションや AI エージェントのデータ管理、マルチモーダルデータの処理、RAG、セマンティック検索、レイクハウスでの分析などに利用できます。
 
-- **ベクトル検索**: ベクトルインデックスと高効率なクエリをサポートし、AI アプリケーション、レコメンデーションシステム、セマンティック検索に適しています。高スループットかつ低遅延のベクトル検索機能を提供します。
-- **透過的なスケーラビリティ**: 1 つのクラスターに 1,500 ノード、PB データ、1 兆行のレコード。
-- **超高速パフォーマンス**: TPC-C 7 億 700 万 tmpC、TPC-H 1526 万 QphH @30000GB。
-- **コスト効率**: ストレージ コストを 70%～90% 削減。
-- **リアルタイム分析**: 追加コストなしで HTAP をサポート。
-- **継続的可用性**: RPO = 0 (データ損失ゼロ)、RTO < 8 秒 (リカバリ時間)
-- **MySQL 互換**: MySQL から簡単に移行できます。
+OceanSeek は、コンピュート、ログ、ストレージを分離した 3 層構成を採用しています。各層を独立して改良・拡張できるため、性能と可用性を確保しながら、負荷に応じてリソースやコストを調整できます。[ログサービス](https://github.com/oceanbase/oblogservice)が Paxos による 3 レプリカ構成でデータの永続性を保証するため、コンピュート層は単一レプリカ構成でも RPO（目標復旧時点）ゼロの高可用性を実現できます。コンピュート層を冗長化するコストを抑えながら、ノードの追加に応じて処理能力を線形に拡張できます。
 
-詳細については、[主な機能](https://en.oceanbase.com/product/opensource)も参照してください。
+# 主な特長
 
-# クイック スタート
+- **マルチモデル対応**：リレーショナルテーブル、ワイドカラムテーブルのほか、ベクトル、JSON ドキュメント、テキスト、空間データ、配列、マップをネイティブにサポートします。構造化データの列、JSON 列、ベクトル列、テキスト列を同じテーブルに定義し、型をまたいでクエリを実行できます。クエリの高速化には、データに応じてセカンダリインデックス、ベクトルインデックス（HNSW、IVF）、JSON インデックス、多値インデックス、全文インデックス（BM25）、GIS インデックス、検索インデックスを利用できます。
+- **ハイブリッド検索**：ベクトル検索、全文検索、スカラー値による検索を組み合わせ、非構造化・半構造化・構造化データから 1 つの SQL 文で候補を取得できます。検索結果を統合して順位を付けるためのアルゴリズムとして、`RRF`、`MINMAX_NORMALIZER`、`WEIGHT_SUM` を備えています。
+- **AI エージェントのデータ管理**：テナント、データベース、名前空間、テーブル、行・列の 5 つのレベルでデータを分離でき、数百万から数千万規模のエージェントに対応します。エージェントのメモリから関連する情報を取り出す処理も、1 つの SQL 文で実行できます。Fork Table と Fork Database はコピーオンライト方式を採用しており、テーブルやデータベースから数秒で検証用のサンドボックスを作成できます。元のデータは共有され、サンドボックスでの変更は分離されるため、検証に失敗しても本番データに影響を与えずにサンドボックスを破棄できます。
+- **データベース内で完結する RAG パイプライン**：ドキュメントの解析・分割から、テキストのベクトル化、インデックスの構築、ハイブリッド検索、検索結果の統合とランキング、モデルによる推論までをデータベース内で実行できます。組み込みの AI 関数に加え、Python のユーザー定義関数（UDF）で独自の AI 処理を追加できます。ドキュメントを取り込んでから回答を得るまで、システム間でデータを移す必要はありません。
+- **リアルタイムデータウェアハウス**：ストリーム処理とバッチ処理の両方に対応し、高頻度のリアルタイム書き込みにも、大量データの一括取り込みにも利用できます。マテリアライズドビューは差分更新と全件更新に対応します。データの格納形式は行形式、列形式、行・列の混在形式から選択できます。クエリの処理には、ベクトル化実行エンジンとネイティブの大規模並列処理（MPP）を利用できます。
+- **データレイク、データウェアハウス、データベースの統合**：同じデータとメタデータを共有し、SQL の動作も共通化することで、データレイクの低コスト、データウェアハウスの分析機能、データベースのトランザクション処理を一つの基盤で実現します。Iceberg、Hive、Paimon と連携でき、Parquet、ORC、CSV 形式に対応します。CatalogSync を使ってデータベース内のテーブル情報を Hive Metastore（HMS）に同期し、メタデータを一元管理できます。
+- **コンピュートとストレージの分離**：コンピュート、ログ、ストレージの各層を個別にデプロイし、拡張できます。コンピュートノードはステートレスなので、ノードを増減してもデータの移行は不要です。アクセス頻度の高いデータはローカル SSD にキャッシュし、アクセス頻度の低いデータはオブジェクトストレージに保持します。データの配置はアクセス頻度に応じて自動的に調整されます。
+- **運用コストの削減**：OceanBase と同等のデータ圧縮性能を維持しつつ、コンピュートノードを単一レプリカ構成で運用することで、計算リソースのコストを抑えられます。各ノードがオブジェクトストレージ上のデータを共有するため、ストレージコストも削減できます。
+- **MySQL・KV 互換**：MySQL モードと KV モード（OBKV-Table、OBKV-HBase）に対応します。ODP や MySQL 対応ドライバーのほか、OCP、ODC、OMS などの既存ツールを引き続き利用できます。
+- **オープンなエコシステム**：S3 互換のオブジェクトストレージ、Iceberg や Paimon などのオープンなテーブルフォーマット、共通のカタログに対応します。データの複製やフォーマット変換を減らし、特定のシステムへの依存を抑えられます。
 
-詳細については、[クイック エクスペリエンス](https://en.oceanbase.com/docs/community-observer-en-10000000000829647)
+詳しくは、[OceanBase AI Database の製品ページ](https://www.oceanbase.com/product/ai-database)をご覧ください。
 
-## 🔥 オールインワンな環境から始める
+# クイックスタート
 
-次のコマンドを使用すると、スタンドアロンの OceanBase をすぐにデプロイして試すことができます。
+セットアップの手順は、[OceanSeek クイックスタート](https://open.oceanbase.com/oceanseek-quickstart)をご覧ください。
 
-**注記**: Linuxのみ
-
-```shell
-# オールインワンパッケージをダウンロードしてインストールします（インターネット接続が必要です）
-bash -c "$(curl -s https://obbusiness-private.oss-cn-shanghai.aliyuncs.com/download-center/opensource/oceanbase-all-in-one/installer.sh)"
-source ~/.oceanbase-all-in-one/bin/env.sh
-
-# OceanBaseデータベースを迅速に導入
-obd demo
-```
+**事前準備**：OceanSeek はすべてのデータをオブジェクトストレージに永続化します。デプロイする前に、**S3 互換のオブジェクトストレージ**を用意し、**データ用バケット**と**ログ用バケット**を作成してください。バケットは個別に設定でき、データ用とログ用で異なる種類のストレージを使うこともできます。オブジェクトストレージには、S3 との互換性、高可用性、アクセス認証情報のローテーション、帯域幅の調整という 4 つの要件があります。
 
 ## 🐳 Dockerで始める
 
-**注記**: [dockerhub](https://hub.docker.com/r/oceanbase/oceanbase-ce/tags)、[quay.io](https://quay.io/repository/oceanbase/oceanbase-ce?tab=tags)、[ghcr.io](https://github.com/oceanbase/docker-images/pkgs/container/oceanbase-ce) でイメージを提供しています。dockerhub からイメージを取得できない場合は、他の 2 つのレジストリを試してください。
+[OceanSeek の Docker イメージ](https://github.com/oceanbase/docker-images/tree/main/oceanseek)を使うと、Docker Compose で コマンドを 1 つ実行するだけで OceanSeek インスタンスを起動できます。手順は [Docker クイックスタート](https://open.oceanbase.com/oceanseek-quickstart)をご覧ください。
 
-1. OceanBase インスタンスを起動します。
+## ☸️ Kubernetes にデプロイする
 
-    ```shell
-    # ミニ・スタンドアロンインスタンスをデプロイします。
-    docker run -p 2881:2881 --name oceanbase-ce -e MODE=mini -d oceanbase/oceanbase-ce
+[ob-operator](https://github.com/oceanbase/ob-operator) を使うと、Kubernetes 上で OceanSeek インスタンスをデプロイ・管理できます。手順は [ob-operator クイックスタート](https://open.oceanbase.com/oceanseek-quickstart)をご覧ください。
 
-    # quay.io のイメージを使用してミニ・スタ​​ンドアロンインスタンスをデプロイします。
-    # docker run -p 2881:2881 --name oceanbase-ce -e MODE=mini -d quay.io/oceanbase/oceanbase-ce
+# 導入事例
 
-    # ghcr.io のイメージを使用してミニ・スタ​​ンドアロンインスタンスをデプロイします。
-    # docker run -p 2881:2881 --name oceanbase-ce -e MODE=mini -d ghcr.io/oceanbase/oceanbase-ce
-    ```
+OceanSeek と OceanBase は、同じ分散基盤を採用しています。OceanBase は金融、通信、小売、インターネットサービスなど、幅広い業種の 2,000 社以上のお客様に利用されています。
 
-2. OceanBase インスタンスに接続します。
-
-    ```shell
-    docker exec -it oceanbase-ce obclient -h127.0.0.1 -P2881 -uroot # sys テナントの root ユーザーに接続します。
-    ```
-
-詳細については、[Docker Readme](https://github.com/oceanbase/docker-images/blob/main/oceanbase-ce/README.md)も参照してください。
-
-## ☸️ Kubernetesから始める
-
-[ob-operator](https://github.com/oceanbase/ob-operator)を使用すると、OceanBase DatabaseインスタンスをKubernetesクラスターに素早くデプロイして管理できます。詳細については、[ob-operatorのクイックスタート](https://oceanbase.github.io/ob-operator)のドキュメントを参照してください。
-
-## 👨‍💻 開発を始める
-手動でオブザーバーをコンパイルしてデプロイする方法については、[OceanBase 開発者ドキュメント](https://oceanbase.github.io/oceanbase/build-and-run)を参照してください。
-
-# ロードマップ
-
-今後の計画については、[製品のイテレーションの進捗状況](https://github.com/oceanbase/oceanbase/issues/1839)を参照してください。詳細については、[OceanBase ロードマップ](https://github.com/orgs/oceanbase/projects/4)も参照してください。
-
-# ケーススタディ
-
-OceanBase は 2,000 社を超える顧客にサービスを提供しており、金融サービス、通信、小売、インターネットなど、さまざまな業界のデータベースをアップグレードしてきました。
-
-詳細については、[成功事例](https://en.oceanbase.com/customer/home) と [OceanBase のユーザー](https://github.com/oceanbase/oceanbase/issues/1301) もご覧ください。
+詳しくは、[OceanBase の導入事例](https://jp.oceanbase.com/customer)をご覧ください。
 
 # システムアーキテクチャ
 
-[システムアーキテクチャの概要](https://en.oceanbase.com/docs/community-observer-en-10000000000829641)
+OceanSeek では、コンピュート、ログ、ストレージが独立しています。ステートレスなコンピュートノードが処理を担い、独立したログサービスが複数のレプリカでトランザクションログを保護します。すべてのデータはオブジェクトストレージに永続化されます。詳しくは、[システムアーキテクチャの概要](https://www.oceanbase.com/docs/common-oceanseek-1000000007251078)をご覧ください。
 
-# 貢献する
+# コントリビューション
 
-貢献を心より歓迎します。開始するには、[開発ガイド](https://oceanbase.github.io/oceanbase)をお読みください。
+OceanSeek では、コミュニティの皆さんからのコントリビューションを歓迎しています。開発環境の準備、ビルド、ローカルでの実行手順は、[開発・ビルドガイド（中国語）](docs/docs/en/build-and-run.md)をご覧ください。Issue やプルリクエストを作成する前に、ガイドのコーディング規約と投稿時のルールをご確認ください。
 
 # ライセンス
 
-OceanBase は、Apache License 2.0 に基づいてライセンスされています。詳細については、[LICENSE](LICENSE) ファイルを参照してください。
+OceanSeek は Apache License 2.0 の下で提供されています。詳細は [LICENSE](LICENSE) をご覧ください。
 
-# コミュニティ
+## コミュニティ
 
-OceanBase コミュニティにぜひご参加ください！
-
-* [Discord](https://discord.gg/74cF8vbNEs): ご質問の投稿、フィードバックの共有、最新情報の取得、および他のOceanBaseユーザーとの交流が可能です。
-* [GitHub Issues](https://github.com/oceanbase/oceanbase/issues): ご報告いただける内容には、OceanBaseのご利用中に遭遇した不具合や、新たな機能に関するご要望が含まれます。
+- [GitHub Issues](https://github.com/oceanbase/oceanseek/issues)：OceanSeek の不具合報告や改善提案を受け付けています。

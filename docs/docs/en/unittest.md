@@ -2,7 +2,7 @@
 
 ## How to build and run all unittest?
 
-[OceanBase](https://github.com/oceanbase/oceanbase) has two unittest directories.
+[OceanBase](https://github.com/oceanbase/oceanseek) has two unittest directories.
 
 - `unittest` . These are the main unittest cases, and it tests the code in the `src` directory.
 
@@ -33,7 +33,7 @@ find . -name "test_chunk_row_store"
 
 ## How to write unittest
 
-As a C++ project, [OceanBase](https://github.com/oceanbase/oceanbase) uses [google test](https://github.com/google/googletest) as the unittest framework. 
+As a C++ project, [OceanBase](https://github.com/oceanbase/oceanseek) uses [google test](https://github.com/google/googletest) as the unittest framework.
 
 OceanBase use `test_xxx.cpp` as the unittest file name. You can create a `test_xxx.cpp` file and add the file name into the specific `CMakeLists.txt` file.
 

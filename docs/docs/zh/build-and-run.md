@@ -9,12 +9,12 @@
 把代码clone到本地：
 
 ```shell
-git clone https://github.com/oceanbase/oceanbase.git
+git clone https://github.com/oceanbase/oceanseek.git
 ```
 
 ## 构建
 
-构建debug或release版本的OceanBase源码：
+构建debug或release版本的OceanSeek源码：
 
 ### Debug 模式
 
@@ -30,7 +30,7 @@ bash build.sh release --init --make
 
 ## 运行
 
-`observer` 二进制文件已经编译出来了，可以使用 `obd.sh` 工具部署一个 OceanBase 实例：
+`observer` 二进制文件已经编译出来了，可以使用 `obd.sh` 工具部署一个 OceanSeek 实例：
 
 ```shell
 ./tools/deploy/obd.sh prepare -p /tmp/obtest

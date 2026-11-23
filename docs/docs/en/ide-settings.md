@@ -134,7 +134,7 @@ C/C++ plugin can automatically code completion and syntax highlighting, but this
 
 ## Usage
 
-1. git clone the source code from [https://github.com/oceanbase/oceanbase](https://github.com/oceanbase/oceanbase)
+1. git clone the source code from [https://github.com/oceanbase/oceanseek](https://github.com/oceanbase/oceanseek)
 2. Run the command below to generate `compile_commands.json`
 
    ```bash

@@ -2,7 +2,7 @@
 
 ## 如何编译及运行所有单元测试
 
-[OceanBase](https://github.com/oceanbase/oceanbase) 有两个单元测试目录。
+[OceanBase](https://github.com/oceanbase/oceanseek) 有两个单元测试目录。
 
 - `unittest` ：这是主要的单元测试用例，它测试 `src` 目录中的代码。
 
@@ -33,7 +33,7 @@ find . -name "test_chunk_row_store"
 
 ## 编写单元测试
 
-作为一个 C++ 项目，[OceanBase](https://github.com/oceanbase/oceanbase)使用[google test](https://github.com/google/googletest)作为单元测试框架。
+作为一个 C++ 项目，[OceanBase](https://github.com/oceanbase/oceanseek)使用[google test](https://github.com/google/googletest)作为单元测试框架。
 
 OceanBase 使用 `test_xxx.cpp` 作为单元测试文件名。你可以创建一个 `test_xxx.cpp` 文件，并将文件名添加到特定的 `CMakeLists.txt` 文件中。
 

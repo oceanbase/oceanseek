@@ -1,6 +1,6 @@
 <!--
 Thank you for contributing to **OceanBase**! 
-Please read the [How to Contribute](https://github.com/oceanbase/oceanbase/wiki/how_to_contribute) document **BEFORE** filling this PR.
+Please read the [How to Contribute](https://github.com/oceanbase/oceanseek/wiki/how_to_contribute) document **BEFORE** filling this PR.
 
 **If this pull request have a significant impact, please make sure you have discussed with OceanBase group.**
 -->

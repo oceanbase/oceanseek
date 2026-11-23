@@ -4,7 +4,7 @@ OceanBase 社区热情欢迎每一位对数据库技术热爱的开发者，期�
 
 ## 如何找到一个合适issue
 
-* 通过[good first issue](https://github.com/oceanbase/oceanbase/issues?q=is%3Aopen+is%3Aissue+label%3A%22good+first+issue%22)标签可以找到适合新手入门的issue
+* 通过[good first issue](https://github.com/oceanbase/oceanseek/issues)标签可以找到适合新手入门的issue
 * 通过`bug`/`new feature`找到当前版本的bug和建议添加的功能
   找到合适的issue之后，可以在issue下回复`/assign` 将issue分配给自己
 
@@ -14,7 +14,7 @@ OceanBase 社区热情欢迎每一位对数据库技术热爱的开发者，期�
 
 ### 1. Fork 项目仓库
 
-1. 访问项目的 [GitHub 地址](https://github.com/oceanbase/oceanbase)。 
+1. 访问项目的 [GitHub 地址](https://github.com/oceanbase/oceanseek)。
 2. 点击 Fork 按钮创建远程分支。 
 
 ### 2. 配置本地环境变量
@@ -35,7 +35,7 @@ git clone git@github.com:$user/oceanbase.git
 # 添加上游分支
 cd $working_dir/oceanbase
 git remote add upstream git@github.com:oceanbase/oceanbase.git
-# 或: git remote add upstream https://github.com/oceanbase/oceanbase
+# 或: git remote add upstream https://github.com/oceanbase/oceanseek
 
 # 为上游分支设置 no_push
 git remote set-url --push upstream no_push
