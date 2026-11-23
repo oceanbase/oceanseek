@@ -115,6 +115,7 @@ private:
 
 private:
   ObArenaAllocator allocator_;
+  ObArenaAllocator batch_allocator_;
   ObTableLoadStoreCtx *store_ctx_;
   ObTableLoadStoreTrans *trans_;
   ObTableLoadTransStoreWriter *writer_;

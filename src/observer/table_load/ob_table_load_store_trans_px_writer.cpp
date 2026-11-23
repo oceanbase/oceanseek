@@ -28,6 +28,7 @@ using namespace table;
 
 ObTableLoadStoreTransPXWriter::ObTableLoadStoreTransPXWriter()
   : allocator_("TLD_PXWriter"),
+    batch_allocator_("TLD_PXKeyBatch"),
     store_ctx_(nullptr),
     trans_(nullptr),
     writer_(nullptr),
@@ -44,6 +45,7 @@ ObTableLoadStoreTransPXWriter::ObTableLoadStoreTransPXWriter()
     is_inited_(false)
 {
   allocator_.set_tenant_id(MTL_ID());
+  batch_allocator_.set_tenant_id(MTL_ID());
 }
 
 ObTableLoadStoreTransPXWriter::~ObTableLoadStoreTransPXWriter()
@@ -81,6 +83,7 @@ void ObTableLoadStoreTransPXWriter::reset()
   is_single_part_ = false;
   is_vectorized_ = false;
   use_rich_format_ = false;
+  batch_allocator_.reset();
   allocator_.reset();
 }
 int ObTableLoadStoreTransPXWriter::init(ObTableLoadStoreCtx *store_ctx,
@@ -314,8 +317,8 @@ int ObTableLoadStoreTransPXWriter::write_vector(ObIVector *tablet_id_vector,
         } else {
           ObDirectLoadVector *hidden_pk_vector = batch_vectors.at(hidden_pk_idx);
           if (OB_FAIL(share::ObHeapTableUtil::fill_hidden_clustering_key_for_vector(
-                        allocator_, hidden_pk_vector, batch_ctx_->tablet_id_vector_, is_single_part_,
-                        single_tablet_id_, /*row_start=*/0, brs.size_))) {
+                        batch_allocator_, hidden_pk_vector, batch_ctx_->tablet_id_vector_,
+                        is_single_part_, single_tablet_id_, /*row_start=*/0, brs.size_))) {
             LOG_WARN("fail to fill hidden clustering key", KR(ret), K(brs.size_));
           }
         }
@@ -362,8 +365,8 @@ int ObTableLoadStoreTransPXWriter::write_vector(ObIVector *tablet_id_vector,
           } else {
             ObDirectLoadVector *hidden_pk_vector = batch_vectors.at(hidden_pk_idx);
             if (OB_FAIL(share::ObHeapTableUtil::fill_hidden_clustering_key_for_vector(
-                          allocator_, hidden_pk_vector, batch_ctx_->tablet_id_vector_, is_single_part_,
-                          single_tablet_id_, batch_idx, append_size))) {
+                          batch_allocator_, hidden_pk_vector, batch_ctx_->tablet_id_vector_,
+                          is_single_part_, single_tablet_id_, batch_idx, append_size))) {
               LOG_WARN("fail to fill hidden clustering key", KR(ret), K(batch_idx), K(append_size));
             }
           }
@@ -439,8 +442,8 @@ int ObTableLoadStoreTransPXWriter::write_batch(const ObDatumVector &tablet_id_da
         } else {
           ObDirectLoadVector *hidden_pk_vector = vectors.at(hidden_pk_idx);
           if (OB_FAIL(share::ObHeapTableUtil::fill_hidden_clustering_key_for_vector(
-                        allocator_, hidden_pk_vector, batch_ctx_->tablet_id_vector_, is_single_part_,
-                        single_tablet_id_, /*row_start=*/0, brs.size_))) {
+                        batch_allocator_, hidden_pk_vector, batch_ctx_->tablet_id_vector_,
+                        is_single_part_, single_tablet_id_, /*row_start=*/0, brs.size_))) {
             LOG_WARN("fail to fill hidden clustering key", KR(ret), K(brs.size_));
           }
         }
@@ -488,8 +491,8 @@ int ObTableLoadStoreTransPXWriter::write_batch(const ObDatumVector &tablet_id_da
           } else {
             ObDirectLoadVector *hidden_pk_vector = vectors.at(hidden_pk_idx);
             if (OB_FAIL(share::ObHeapTableUtil::fill_hidden_clustering_key_for_vector(
-                          allocator_, hidden_pk_vector, batch_ctx_->tablet_id_vector_, is_single_part_,
-                          single_tablet_id_, batch_idx, append_size))) {
+                          batch_allocator_, hidden_pk_vector, batch_ctx_->tablet_id_vector_,
+                          is_single_part_, single_tablet_id_, batch_idx, append_size))) {
               LOG_WARN("fail to fill hidden clustering key", KR(ret), K(batch_idx), K(append_size));
             }
           }
@@ -530,20 +533,19 @@ int ObTableLoadStoreTransPXWriter::write_row(const ObTabletID &tablet_id, const 
     const int64_t batch_idx = batch_ctx_->batch_rows_.size();
     batch_ctx_->datum_row_.storage_datums_ = row.storage_datums_;
     batch_ctx_->datum_row_.count_ = row.count_;
-     // if the table is clustering key table, set the hidden clustering key value
+    ObDatum hidden_pk_datum;
+    int64_t hidden_pk_idx = -1;
      if (store_ctx_->ctx_->schema_.is_table_with_hidden_pk_column_ && !store_ctx_->ctx_->schema_.is_table_without_pk_) {
       // hidden clustering key column is at rowkey_column_count_ - 1
-      int64_t hidden_pk_idx = store_ctx_->ctx_->schema_.rowkey_column_count_ - 1;
+      hidden_pk_idx = store_ctx_->ctx_->schema_.rowkey_column_count_ - 1;
       if (OB_UNLIKELY(hidden_pk_idx < 0 || hidden_pk_idx >= row.count_)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("invalid hidden pk index", K(ret), K(hidden_pk_idx), 
                  K(store_ctx_->ctx_->schema_.rowkey_column_count_), K(row.count_));
       } else {
-        ObStorageDatum &hidden_pk_datum = batch_ctx_->datum_row_.storage_datums_[hidden_pk_idx];
-        ObDatum temp_datum;
-        if (OB_FAIL(share::ObHeapTableUtil::handle_hidden_clustering_key_column(allocator_, tablet_id, temp_datum))) {
+        if (OB_FAIL(share::ObHeapTableUtil::handle_hidden_clustering_key_column(
+                      batch_allocator_, tablet_id, hidden_pk_datum))) {
           LOG_WARN("fail to handle hidden clustering key column", KR(ret), K(tablet_id));
-        } else if (OB_FALSE_IT(hidden_pk_datum.shallow_copy_from_datum(temp_datum))) {
         }
       }
     }
@@ -557,8 +559,20 @@ int ObTableLoadStoreTransPXWriter::write_row(const ObTabletID &tablet_id, const 
       LOG_WARN("fail to append datum", KR(ret));
     } else if (OB_FAIL(batch_ctx_->batch_rows_.append_row(batch_ctx_->datum_row_))) {
       LOG_WARN("fail to append row", KR(ret));
-    } else if (OB_FAIL(flush_buffer_if_need())) {
-      LOG_WARN("fail to flush buffer", KR(ret));
+    } else {
+      if (hidden_pk_idx >= 0) {
+        ObDirectLoadVector *hidden_pk_vector =
+          batch_ctx_->batch_rows_.get_batch_rows().get_vectors().at(hidden_pk_idx);
+        if (OB_ISNULL(hidden_pk_vector)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("unexpected null hidden pk vector", KR(ret), K(hidden_pk_idx), K(batch_idx));
+        } else if (OB_FAIL(hidden_pk_vector->set_datum(batch_idx, hidden_pk_datum))) {
+          LOG_WARN("fail to set hidden clustering key", KR(ret), K(batch_idx));
+        }
+      }
+      if (OB_SUCC(ret) && OB_FAIL(flush_buffer_if_need())) {
+        LOG_WARN("fail to flush buffer", KR(ret));
+      }
     }
   }
   return ret;
@@ -686,6 +700,8 @@ int ObTableLoadStoreTransPXWriter::flush_buffer()
   if (OB_SUCC(ret)) {
     row_count_ += batch_rows.size();
     batch_ctx_->batch_rows_.reuse();
+    // Downstream writers have copied the generated keys before returning success.
+    batch_allocator_.reuse();
     if (OB_FAIL(check_status())) {
       LOG_WARN("fail to check status", KR(ret));
     }
@@ -703,6 +719,9 @@ int ObTableLoadStoreTransPXWriter::close()
     LOG_WARN("fail to flush buffer", KR(ret));
   } else if (nullptr != pre_sort_writer_ && OB_FAIL(pre_sort_writer_->close())) {
     LOG_WARN("fail to push chunk", KR(ret));
+  }
+  if (OB_SUCC(ret)) {
+    batch_allocator_.reset();
   }
   return ret;
 }

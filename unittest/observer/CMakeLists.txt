@@ -16,6 +16,8 @@ ob_unittest(test_obkv_config tableapi/test_obkv_config.cpp)
 storage_unittest(test_share_storage_net_throt_manager net/test_share_storage_net_throt_manager.cpp)
 storage_unittest(test_table_load_table_op_trans_param
   table_load/test_table_load_table_op_trans_param.cpp)
+ob_unittest(test_table_load_store_trans_px_writer
+  table_load/test_table_load_store_trans_px_writer.cpp)
 ob_unittest(test_uniq_task_queue)
 ob_unittest(test_table_connection tableapi/test_table_connection.cpp)
 ob_unittest(test_check_os_params test_check_os_params.cpp)
