@@ -18,3 +18,4 @@
 - 禁止直接使用make, 必须使用ob-make 编译。
 - 禁止访问oceanbase/oceanbase.git。
 - 禁止关闭gitlab中别人的意见。
+
