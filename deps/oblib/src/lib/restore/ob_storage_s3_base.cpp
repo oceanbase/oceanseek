@@ -1527,7 +1527,8 @@ int ObStorageS3Reader::pread_(char *buf,
         OB_LOG(WARN, "failed to read object from s3",
             K(ret), K_(bucket), K_(object), K(range_read));
       } else if (FALSE_IT(read_size = outcome.GetResult().GetContentLength())) {
-      } else if (OB_UNLIKELY(has_meta_ && read_size != get_data_size)) {
+      } else if (OB_UNLIKELY(read_size < 0 || read_size > get_data_size
+          || (has_meta_ && read_size != get_data_size))) {
         ret = OB_OBJECT_STORAGE_IO_ERROR;
         OB_LOG(WARN, "returned data size is not equal to expected", K(ret),
             K(read_size), K(get_data_size),
