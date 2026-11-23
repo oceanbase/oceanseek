@@ -100,6 +100,7 @@ bool ObTabletDDLCompleteMdsUserData::is_valid() const
               && storage_schema_.is_valid());
 }
 
+// Preserve original defaults: replay may publish this schema to the user tablet.
 int ObTabletDDLCompleteMdsUserData::set_storage_schema(const ObStorageSchema &other, common::ObIAllocator &allocator)
 {
   int ret = OB_SUCCESS;
@@ -108,11 +109,6 @@ int ObTabletDDLCompleteMdsUserData::set_storage_schema(const ObStorageSchema &ot
     LOG_WARN("invalid argument", K(ret), K(other));
   } else if (OB_FAIL(storage_schema_.assign(allocator, other))) {
     LOG_WARN("failed to assign storage schema", K(ret));
-  } else{
-    for (int64_t i = 0; OB_SUCC(ret) && i < storage_schema_.column_array_.count(); ++i) {
-      ObStorageColumnSchema &cs = storage_schema_.column_array_.at(i);
-      cs.orig_default_value_.reset();
-    }
   }
   return ret;
 }

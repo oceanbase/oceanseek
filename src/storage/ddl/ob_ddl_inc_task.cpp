@@ -66,6 +66,9 @@ int ObDDLIncStartTask::process()
   const std::pair<share::ObLSID, ObTabletID> &ls_tablet_id = dag->get_ls_tablet_ids().at(tablet_idx_);
   if (OB_FAIL(ObDDLIncLoadUtil::start_inc_major_direct_load(*dag, ls_tablet_id.first, ls_tablet_id.second))) {
     LOG_WARN("fail to start inc major direct load", KR(ret), "ls_id", ls_tablet_id.first, "tablet_id", ls_tablet_id.second);
+  } else if (is_incremental_major_direct_load(dag->get_direct_load_type())) {
+    // Keep the START MDS committed while the shared user tablet is still unchanged.
+    DEBUG_SYNC(AFTER_INC_MAJOR_START_MDS);
   }
   return ret;
 }

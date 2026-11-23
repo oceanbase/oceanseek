@@ -311,6 +311,14 @@ protected:
     return ret;
   }
 
+  int record_replay_start(RecEndContext &ctx, const int64_t tx_id)
+  {
+    // These fixtures build END directly. Replay reads its committed START by transaction ID.
+    return ObDDLIncLoadUtil::record_inc_major_start_info_to_mds(*ctx.schema_,
+        ctx.tablet_id_, ctx.ls_id_, ObTransID(tx_id), DATA_VERSION_4_6_3_0,
+        ctx.local_.get_obj()->get_snapshot_version(), SCN::scn_dec(ctx.rec_scn_), ctx.allocator_);
+  }
+
   int inc_major_count(const ObTabletHandle &tablet, int64_t &count)
   {
     int ret = OB_SUCCESS;
@@ -582,6 +590,7 @@ TEST_F(TestDliEndRecCheckpoint, dump_checkpoint_does_not_skip_final_publication)
       installed_dumps, ObTransID(77001), ObTxSEQ::from_seq(1)));
   ASSERT_EQ(1, installed_dumps.count());
   ObDDLIncMajorCommitReplayExecutor executor;
+  ASSERT_EQ(OB_SUCCESS, record_replay_start(ctx, 77001));
   ASSERT_EQ(OB_SUCCESS, init_executor(ctx, final_table, 77001, 1, executor, true));
   RecEndRoleGuard role_guard;
   MTL_SET_TENANT_ROLE_CACHE(share::ObTenantRole::STANDBY_TENANT);
@@ -887,6 +896,7 @@ TEST_F(TestDliEndRecCheckpoint, old_format_end_maintains_shared_and_local_progre
   ASSERT_EQ(OB_SUCCESS, build_rec_end_sstable(ctx.allocator_, ctx.tablet_id_,
       ctx.rec_scn_, 77305, 1, table, ObITable::INC_MAJOR_SSTABLE, INT64_MAX, false));
   ObDDLIncMajorCommitReplayExecutor executor;
+  ASSERT_EQ(OB_SUCCESS, record_replay_start(ctx, 77305));
   ASSERT_EQ(OB_SUCCESS, init_executor(ctx, table, 77305, 1, executor,
       false));
   RecEndRoleGuard role_guard;
@@ -1182,6 +1192,7 @@ TEST_F(TestDliEndRecCheckpoint, missing_result_retries_and_role_change_can_resum
   ASSERT_EQ(OB_SUCCESS, build_rec_end_sstable(ctx.allocator_, ctx.tablet_id_,
       ctx.rec_scn_, 77005, 5, table));
   ObDDLIncMajorCommitReplayExecutor executor;
+  ASSERT_EQ(OB_SUCCESS, record_replay_start(ctx, 77005));
   ASSERT_EQ(OB_SUCCESS, init_executor(ctx, table, 77005, 5, executor, true));
   RecEndRoleGuard role_guard;
   MTL_SET_TENANT_ROLE_CACHE(share::ObTenantRole::STANDBY_TENANT);
@@ -1356,11 +1367,13 @@ TEST_F(TestDliEndRecCheckpoint, first_shared_creation_requires_writer_and_comple
   ASSERT_EQ(OB_SUCCESS, tenant.switch_to(run_ctx_.tenant_id_));
   RecEndContext ctx;
   ASSERT_EQ(OB_SUCCESS, prepare("rec_end_first", ctx, false));
+  const int64_t tx_id = 77020;
+  ASSERT_EQ(OB_SUCCESS, record_replay_start(ctx, tx_id));
   ObSSTable table;
   ASSERT_EQ(OB_SUCCESS, build_rec_end_sstable(ctx.allocator_, ctx.tablet_id_,
-      ctx.rec_scn_, 77020, 1, table));
+      ctx.rec_scn_, tx_id, 1, table));
   ObDDLIncMajorCommitReplayExecutor executor;
-  ASSERT_EQ(OB_SUCCESS, init_executor(ctx, table, 77020, 1, executor, true));
+  ASSERT_EQ(OB_SUCCESS, init_executor(ctx, table, tx_id, 1, executor, true));
   RecEndRoleGuard role_guard;
   bool publish_needed = false;
   mock_is_sswriter = false;

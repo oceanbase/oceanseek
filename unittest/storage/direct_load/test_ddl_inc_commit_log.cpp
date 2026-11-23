@@ -7,10 +7,14 @@
 
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
+#include <string>
 #define private public
 #define protected public
 #include "storage/ddl/ob_ddl_inc_clog.h"
 #include "storage/ddl/ob_direct_load_type.h"
+#include "storage/tablet/ob_tablet_ddl_complete_mds_data.h"
+#include "storage/tablet/ob_tablet_ddl_complete_mds_helper.h"
+#include "storage/test_schema_prepare.h"
 #include "storage/lob/common/ob_lob_util.h"
 #include "storage/tx/ob_trans_id.h"
 #include "storage/tx/ob_tx_seq.h"
@@ -514,6 +518,174 @@ public:
 protected:
   ObArenaAllocator allocator_;
 };
+
+TEST_F(TestDDLIncCommitLog, test_mds_schema_preserves_original_defaults)
+{
+  share::schema::ObTableSchema table_schema;
+  TestSchemaPrepare::prepare_schema(table_schema, 1 /* rowkey count */, 4 /* column count */);
+  const std::string text_default(8192, 'd');
+  ObObj text_value;
+  text_value.set_varchar(ObString(text_default.length(), text_default.data()));
+  share::schema::ObColumnSchemaV2 *text_column = table_schema.get_column_schema_by_idx(1);
+  share::schema::ObColumnSchemaV2 *number_column = table_schema.get_column_schema_by_idx(2);
+  ASSERT_NE(nullptr, text_column);
+  ASSERT_NE(nullptr, number_column);
+  text_column->set_data_length(static_cast<int64_t>(text_default.length()));
+  ASSERT_SUCC(text_column->set_orig_default_value(text_value));
+  ObObj number_value;
+  number_value.set_int(7);
+  ASSERT_SUCC(number_column->set_orig_default_value(number_value));
+  ObArenaAllocator schema_allocator;
+  ObStorageSchema source_schema;
+  ASSERT_SUCC(source_schema.init(schema_allocator, table_schema, lib::Worker::CompatMode::MYSQL));
+
+  ObTabletDDLCompleteArg arg;
+  arg.has_complete_ = true;
+  arg.ls_id_ = ObLSID(1);
+  arg.tablet_id_ = ObTabletID(100001);
+  arg.direct_load_type_ = ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR;
+  arg.trans_id_ = ObTransID(1001);
+  arg.start_scn_.convert_for_logservice(100);
+  arg.data_format_version_ = DATA_CURRENT_VERSION;
+  ASSERT_SUCC(arg.set_storage_schema(source_schema));
+  // The argument must own variable-length defaults after the input schema is released.
+  source_schema.reset();
+  schema_allocator.reset();
+
+  const int64_t arg_size = arg.get_serialize_size();
+  char *arg_buf = static_cast<char *>(allocator_.alloc(arg_size));
+  ASSERT_NE(nullptr, arg_buf);
+  int64_t pos = 0;
+  ASSERT_SUCC(arg.serialize(arg_buf, arg_size, pos));
+  ASSERT_EQ(arg_size, pos);
+  ObTabletDDLCompleteArg decoded_arg;
+  pos = 0;
+  ASSERT_SUCC(decoded_arg.deserialize(arg_buf, arg_size, pos));
+  ASSERT_EQ(arg_size, pos);
+
+  // Exercise the second setter through the same conversion as MDS registration/replay.
+  ObTabletDDLCompleteMdsUserData mds_data;
+  ASSERT_SUCC(mds_data.set_with_merge_arg(decoded_arg, allocator_));
+  const int64_t mds_size = mds_data.get_serialize_size();
+  char *mds_buf = static_cast<char *>(allocator_.alloc(mds_size));
+  ASSERT_NE(nullptr, mds_buf);
+  pos = 0;
+  ASSERT_SUCC(mds_data.serialize(mds_buf, mds_size, pos));
+  ASSERT_EQ(mds_size, pos);
+  ObTabletDDLCompleteMdsUserData restored;
+  pos = 0;
+  ASSERT_SUCC(restored.deserialize(allocator_, mds_buf, mds_size, pos));
+  ASSERT_EQ(mds_size, pos);
+
+  ObTabletDDLCompleteMdsUserData copied;
+  ASSERT_SUCC(copied.assign(allocator_, restored));
+  ObTabletDDLCompleteArg finish_arg;
+  ASSERT_SUCC(finish_arg.from_mds_user_data(copied));
+  const ObStorageSchema *schemas[] = {
+      arg.get_storage_schema(), decoded_arg.get_storage_schema(), &mds_data.storage_schema_,
+      &restored.storage_schema_, &copied.storage_schema_, finish_arg.get_storage_schema()};
+  for (const ObStorageSchema *schema : schemas) {
+    ASSERT_NE(nullptr, schema);
+    ASSERT_FALSE(schema->is_column_info_simplified());
+    ASSERT_EQ(4, schema->get_column_count());
+    const ObObj &text = schema->column_array_.at(1).orig_default_value_;
+    ASSERT_TRUE(text.is_varchar());
+    ASSERT_EQ(text_default.length(), text.get_string_len());
+    ASSERT_EQ(0, MEMCMP(text_default.data(), text.get_string_ptr(), text_default.length()));
+    const ObObj &number = schema->column_array_.at(2).orig_default_value_;
+    ASSERT_TRUE(number.is_int());
+    ASSERT_EQ(7, number.get_int());
+    ASSERT_TRUE(schema->column_array_.at(3).orig_default_value_.is_null());
+  }
+}
+
+TEST_F(TestDDLIncCommitLog, test_mds_schema_version_survives_restore_and_finish)
+{
+  share::schema::ObTableSchema table_schema;
+  TestSchemaPrepare::prepare_schema(table_schema, 1 /* rowkey count */, 4 /* column count */);
+  ObObj default_value;
+  default_value.set_int(7);
+  ASSERT_SUCC(table_schema.get_column_schema_by_idx(2)->set_orig_default_value(default_value));
+  ObStorageSchema source_schema;
+  ASSERT_SUCC(source_schema.init(allocator_, table_schema, lib::Worker::CompatMode::MYSQL));
+
+  struct TestCase {
+    uint64_t data_version_;
+    bool clear_defaults_;
+  };
+  const TestCase cases[] = {
+      {DATA_VERSION_4_6_3_0, true},
+      {DATA_VERSION_4_6_3_1, true},
+      // Keeping defaults in a newer writer must not change the recorded START version.
+      {DATA_VERSION_4_6_3_1, false},
+      {DATA_VERSION_4_6_3_1 + 1, false},
+  };
+  for (const TestCase &test_case : cases) {
+    ObTabletDDLCompleteArg start_arg;
+    start_arg.has_complete_ = true;
+    start_arg.ls_id_ = ObLSID(1);
+    start_arg.tablet_id_ = ObTabletID(100001);
+    start_arg.direct_load_type_ = ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR;
+    start_arg.trans_id_ = ObTransID(1001);
+    start_arg.start_scn_.convert_for_logservice(100);
+    start_arg.data_format_version_ = test_case.data_version_;
+    ASSERT_SUCC(start_arg.set_storage_schema(source_schema));
+    if (test_case.clear_defaults_) {
+      // Reproduce the old setter without changing the schema layout or validity.
+      for (int64_t i = 0; i < start_arg.storage_schema_->column_array_.count(); ++i) {
+        start_arg.storage_schema_->column_array_.at(i).orig_default_value_.reset();
+      }
+    }
+    ObTabletDDLCompleteMdsUserData start_data;
+    ASSERT_SUCC(start_data.set_with_merge_arg(start_arg, allocator_));
+    const int64_t size = start_data.get_serialize_size();
+    char *buf = static_cast<char *>(allocator_.alloc(size));
+    ASSERT_NE(nullptr, buf);
+    int64_t pos = 0;
+    ASSERT_SUCC(start_data.serialize(buf, size, pos));
+    ASSERT_EQ(size, pos);
+    ObTabletDDLCompleteMdsUserData restored;
+    pos = 0;
+    ASSERT_SUCC(restored.deserialize(allocator_, buf, size, pos));
+    ASSERT_EQ(size, pos);
+    ObTabletDDLCompleteMdsUserData copied;
+    ASSERT_SUCC(copied.assign(allocator_, restored));
+
+    // END is written by the current code but must retain START's data version.
+    copied.inc_major_commit_scn_.convert_for_logservice(200);
+    ObTabletDDLCompleteArg finish_arg;
+    ASSERT_SUCC(finish_arg.from_mds_user_data(copied));
+    ASSERT_EQ(test_case.data_version_, finish_arg.data_format_version_);
+    const int64_t finish_size = finish_arg.get_serialize_size();
+    char *finish_buf = static_cast<char *>(allocator_.alloc(finish_size));
+    ASSERT_NE(nullptr, finish_buf);
+    pos = 0;
+    ASSERT_SUCC(finish_arg.serialize(finish_buf, finish_size, pos));
+    ASSERT_EQ(finish_size, pos);
+    ObTabletDDLCompleteArg decoded_finish_arg;
+    pos = 0;
+    ASSERT_SUCC(decoded_finish_arg.deserialize(finish_buf, finish_size, pos));
+    ASSERT_EQ(finish_size, pos);
+    ObTabletDDLCompleteMdsUserData finish_data;
+    ASSERT_SUCC(finish_data.set_with_merge_arg(decoded_finish_arg, allocator_));
+    const ObTabletDDLCompleteMdsUserData *records[] = {
+        &start_data, &restored, &copied, &finish_data};
+    for (const ObTabletDDLCompleteMdsUserData *record : records) {
+      ASSERT_EQ(test_case.data_version_, record->data_format_version_);
+      ASSERT_TRUE(record->is_valid());
+      ASSERT_EQ(4, record->storage_schema_.get_column_count());
+      const ObObj &number = record->storage_schema_.column_array_.at(2).orig_default_value_;
+      if (test_case.clear_defaults_) {
+        ASSERT_TRUE(number.is_null());
+      } else {
+        ASSERT_TRUE(number.is_int());
+        ASSERT_EQ(7, number.get_int());
+      }
+      // A genuine NULL default is valid on the new-format path.
+      ASSERT_TRUE(record->storage_schema_.column_array_.at(3).orig_default_value_.is_null());
+    }
+  }
+}
 
 // ==================== ObDDLIncLogBasic 测试 ====================
 

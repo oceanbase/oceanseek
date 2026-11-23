@@ -16,6 +16,7 @@
 #ifdef OB_BUILD_SHARED_STORAGE
 #include "storage/compaction_v2/ob_ss_compact_helper.h"
 #include "storage/ddl/ob_ss_ddl_util.h"
+#include "storage/tablet/ob_tablet_ddl_complete_mds_data.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable.h"
 #include "storage/blocksstable/vector_index/ob_ivf_sstable.h"
 #include "storage/incremental/ob_shared_meta_service.h"
@@ -1957,7 +1958,11 @@ int ObDDLIncMajorCommitReplayExecutor::deserialize_and_update_ss_inc_major(
     ObIvfSSTable ivf_sstable;
     ObSSTable *inc_major_ptr = &sstable;
     bool can_skip_shared_add = false;
-    ObStorageSchema *storage_schema = nullptr;
+    ObStorageSchema *local_schema = nullptr;
+    ObTabletDDLCompleteMdsUserData user_data;
+    // START may precede the restored LS checkpoint while the shared tablet schema
+    // is older. Read committed START/END MDS for this transaction; an END-time
+    // snapshot may already have been reclaimed from the MDS tablet.
     if (is_co_sstable_) {
       inc_major_ptr = &co_sstable;
     } else if (ObITable::is_ivf_sstable(table_type_)) {
@@ -1996,23 +2001,61 @@ int ObDDLIncMajorCommitReplayExecutor::deserialize_and_update_ss_inc_major(
       if (OB_FAIL(ret)) {
       } else if (can_skip_shared_add) {
         // An existing result of this batch is sufficient, even in a long-running transaction.
-      } else if (OB_FAIL(tablet_handle.get_obj()->load_storage_schema(allocator, storage_schema))) {
-        LOG_WARN("fail to load storage schema", KR(ret));
-      } else if (OB_ISNULL(storage_schema)) {
+      } else if (OB_FAIL(tablet_handle.get_obj()->get_inc_major_direct_load_info(
+          SCN::max_scn(), allocator, ObTabletDDLCompleteMdsUserDataKey(trans_id_), user_data))) {
+        LOG_WARN("failed to get inc major start info for shared replay",
+            KR(ret), K_(tablet_id), K_(trans_id), K_(start_scn), K_(scn));
+      } else if (OB_UNLIKELY(!is_incremental_major_direct_load(user_data.direct_load_type_)
+          || user_data.trans_id_ != trans_id_
+          || user_data.start_scn_ != start_scn_
+          || !user_data.storage_schema_.is_valid())) {
         ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unexpected null storage schema", KR(ret));
-      } else if (OB_FAIL(ObSSDDLUtil::update_shared_tablet_table_store(*ls_, *inc_major_ptr,
-          *storage_schema, data_format_version_, tablet_handle.get_obj()->get_reorganization_scn(),
-          need_check_ddl_checkpoint_ /* check_lease */, scn_, need_check_ddl_checkpoint_))) {
-        LOG_WARN("fail to update shared tablet table store", KR(ret));
-      } else if (OB_FAIL(MTL(observer::ObTabletTableUpdater*)->submit_tablet_update_task(
-          ls_->get_ls_id(), tablet_handle.get_obj()->get_tablet_id()))) {
-        LOG_WARN("fail to submit tablet update task", KR(ret),
-                 "ls_id", ls_->get_ls_id(), "tablet_id", tablet_handle.get_obj()->get_tablet_id());
+        LOG_WARN("mismatched inc major start info for shared replay",
+            KR(ret), K_(tablet_id), K_(trans_id), K_(start_scn), K_(scn), K(user_data));
+      } else {
+        // START MDS from 4.6.3.1 and earlier may omit original defaults.
+        const bool use_mds_schema = user_data.data_format_version_ > DATA_VERSION_4_6_3_1;
+        const ObStorageSchema *storage_schema = nullptr;
+        if (use_mds_schema) {
+          storage_schema = &user_data.storage_schema_;
+        } else if (OB_FAIL(tablet_handle.get_obj()->load_storage_schema(allocator, local_schema))) {
+          LOG_WARN("failed to load local schema for legacy inc major replay",
+              KR(ret), K_(tablet_id), K_(trans_id), K_(scn), K(user_data.data_format_version_));
+        } else if (OB_ISNULL(local_schema)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("unexpected null local schema for legacy inc major replay", KR(ret), K_(tablet_id));
+        } else {
+          storage_schema = local_schema;
+        }
+
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(ObSSDDLUtil::update_shared_tablet_table_store(*ls_, *inc_major_ptr,
+            *storage_schema,
+            data_format_version_, tablet_handle.get_obj()->get_reorganization_scn(),
+            need_check_ddl_checkpoint_ /* check_lease */, scn_, need_check_ddl_checkpoint_))) {
+          LOG_WARN("fail to update shared tablet table store", KR(ret));
+        } else if (OB_FAIL(MTL(observer::ObTabletTableUpdater*)->submit_tablet_update_task(
+            ls_->get_ls_id(), tablet_handle.get_obj()->get_tablet_id()))) {
+          LOG_WARN("fail to submit tablet update task", KR(ret),
+                   "ls_id", ls_->get_ls_id(), "tablet_id", tablet_handle.get_obj()->get_tablet_id());
+        } else {
+          if (use_mds_schema) {
+            LOG_INFO("replay shared inc major with schema from start MDS",
+                K_(tablet_id), K_(trans_id), K_(start_scn), K_(scn),
+                "mds_data_format_version", user_data.data_format_version_,
+                "schema_version", user_data.storage_schema_.get_schema_version(),
+                "mds_end_scn", user_data.inc_major_commit_scn_);
+          } else {
+            LOG_INFO("replay shared inc major with local schema for legacy MDS",
+                K_(tablet_id), K_(trans_id), K_(start_scn), K_(scn),
+                "mds_data_format_version", user_data.data_format_version_,
+                "schema_version", local_schema->get_schema_version());
+          }
+        }
       }
     }
-    if (OB_NOT_NULL(storage_schema)) {
-      ObTabletObjLoadHelper::free(allocator, storage_schema);
+    if (OB_NOT_NULL(local_schema)) {
+      ObTabletObjLoadHelper::free(allocator, local_schema);
     }
   }
   return ret;
