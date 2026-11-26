@@ -24,7 +24,7 @@
 
 <p align="center">
     <a href="https://discord.gg/74cF8vbNEs">
-        <img alt="Support" src="https://img.shields.io/badge/Discord-Join%20Oceanbase-brightgreen?logo=discord" />
+        <img alt="Support" src="https://img.shields.io/badge/Discord-Join%20OceanBase-brightgreen?logo=discord" />
     </a>
     <a href="https://stackoverflow.com/questions/tagged/oceanbase">
         <img alt="Stack Overflow" src="https://img.shields.io/badge/Stack-Stack%20Overflow-brightgreen?logo=stackoverflow" />
@@ -35,71 +35,71 @@ English | [中文版](README_CN.md) | [日本語版](README_JA.md)
 
 **OceanSeek** is the open-source distribution of the OceanBase AI database.
 
-OceanSeek is a next-generation distributed database with multi-modal convergence and integrated lake-repository architecture, separating storage and computation. Built on OceanBase's large-scale, production-proven distributed platform, it caters to AI applications, agent data management, multimodal data processing, RAG/semantic search, and lake repository analysis. It unifies various data models, including relational, wide table, vector, JSON, text, and spatial models, under a single set of transaction, permission, version, and lifecycle mechanisms.
+OceanSeek is a next-generation distributed database featuring an integrated lakehouse architecture with disaggregated storage and compute. Built on OceanBase's large-scale, production-proven distributed platform, it is designed for AI applications, agent data management, multimodal data processing, RAG and semantic search, and lakehouse analytics. It unifies multiple data models, including relational, wide-column, vector, JSON, text, and spatial data, under a single set of transaction, access control, versioning, and lifecycle management mechanisms.
 
-Architecturally, OceanSeek decouples the traditional database's computation, logging, and storage capabilities into three independently evolving layers. Each layer has clear responsibilities and can be extended independently, collectively providing high-performance, highly available, low-cost, and elastically scalable database services. The key benefits of this architecture are: the compute layer can be deployed with a single replica, while data persistence is independently guaranteed by three Paxos replicas of the LogService, achieving high availability with RPO=0, while maintaining the linear scalability of the compute layer—eliminating the need to incur the cost of multiple replicas at the compute layer for reliability.
+Architecturally, OceanSeek decouples the traditional database's compute, logging, and storage capabilities into three independently evolving layers. Each layer has clear responsibilities and can be extended independently, together providing high-performance, highly available, cost-effective, and elastically scalable database services. A key benefit of this architecture is that the compute layer can be deployed with a single replica, while data durability is independently guaranteed by three Paxos-backed replicas of the LogService. This delivers high availability with RPO = 0, preserves the linear scalability of the compute layer, and avoids the cost of deploying multiple compute replicas solely for reliability.
 
 # Key Features
 
-- **Multi-Model Integration**: Natively supports relational tables, wide tables, vectors, JSON documents, text, spatial data, arrays/mappings, and other data types. A single table can simultaneously contain structured columns, JSON columns, vector columns, and text columns, and queries can cross data types. Each type has a matching index acceleration path: secondary index, vector index (HNSW/IVF), JSON index, multi-value index, full-text index (BM25), GIS index, and search index.
+- **Multi-Model Integration**: Natively supports relational tables, wide-column tables, vectors, JSON documents, text, spatial data, arrays, maps, and more. A single table can contain structured columns, JSON columns, vector columns, and text columns, and queries can span multiple data types. Each data type has a corresponding indexing path, including secondary indexes, vector indexes (HNSW/IVF), JSON indexes, multi-value indexes, full-text indexes (BM25), GIS indexes, and search indexes.
 
-- **Hybrid Search**: Vector + Full-text + Scalar search, unstructured + semi-structured + structured data; a single SQL statement completes multi-path retrieval; built-in fusion ranking algorithms such as RRF, MINMAX_NORMALIZER, and WEIGHT_SUM.
+- **Hybrid Search**: Combines vector, full-text, and scalar search across unstructured, semi-structured, and structured data. A single SQL statement can perform multi-path retrieval, with built-in rank-fusion algorithms such as RRF, MINMAX_NORMALIZER, and WEIGHT_SUM.
 
-- **Native Agent**: Provides five layers of isolation: tenant-level, database-level, namespace-level, table-level, and row/column-level, supporting data isolation for millions/tens of millions of agents; supports single SQL statement for memory-based retrieval; Fork Table/Database uses Copy-on-Write to achieve second-level data sandboxing, sharing baseline data, isolating incremental changes, and discarding failed attempts without polluting production data.
+- **Agent-Native Architecture**: Provides five layers of isolation—tenant, database, namespace, table, and row/column level—to support data isolation for millions to tens of millions of agents. Memory retrieval can be completed with a single SQL statement. Forked tables and databases use copy-on-write to enable sandbox provisioning in seconds, allowing baseline data to be shared, incremental changes to remain isolated, and failed experiments to be discarded without affecting production data.
 
-- **RAG Pipeline in DB**: Document parsing, document segmentation, text vectorization, index building, hybrid search, fusion ranking, and model inference are all completed within the library. AI functions are provided, supporting AI operators extended via Python UDFs. Documents are added to the database, and answers are retrieved without transferring data between multiple systems.
+- **RAG Pipeline in DB**: Document parsing, document chunking, text vectorization, index building, hybrid search, rank fusion, and model inference are all completed inside the database. OceanSeek provides AI functions and supports extending AI operators through Python UDFs. Documents are ingested and answers are retrieved without moving data across multiple systems.
 
-- **Real-time Data Warehouse:** Enables integrated stream and batch processing, supporting both high-frequency real-time writes and large-volume batch imports; supports incremental/full refresh materialized views; flexible definition of row-based, column-based, and mixed row-column storage; vectorized execution engine and native MPP execute in parallel.
+- **Real-time Data Warehouse**: Unifies stream and batch processing, supporting both high-frequency real-time writes and large-scale batch imports. It supports materialized views with incremental or full refresh, flexible row-based, column-based, and hybrid row-column storage layouts, and parallel execution through a vectorized engine and native MPP.
 
-- **Lake-Warehouse-Repository Integration:** Based on the same data, metadata, and SQL semantics, it simultaneously meets the low cost of a lake, the analytical capabilities of a warehouse, and the transactional requirements of a repository. Supports Iceberg/Hive/Paimon integration, Parquet/ORC/CSV adaptation, and synchronizes database table information to HMS via CatalogSync for unified metadata management.
+- **Lakehouse Integration**: Based on unified data, metadata, and SQL semantics, OceanSeek combines the low cost of a data lake, the analytical power of a data warehouse, and the transactional capabilities of a database. It supports integration with Iceberg, Hive, and Paimon, adapts to Parquet, ORC, and CSV formats, and synchronizes table metadata to HMS through CatalogSync for unified metadata management.
 
-- **Storage-Compute Separation:** Compute, logs, and storage are deployed and scaled independently; compute nodes are stateless, allowing for elastic scaling without data migration; hot data is cached on local SSDs, while cold data is stored in object storage, with the system automatically identifying access frequency and migrating accordingly.
+- **Storage-Compute Separation**: Compute, logs, and storage can be deployed and scaled independently. Compute nodes are stateless, enabling elastic scaling without data migration. Hot data is cached on local SSDs, while cold data is stored in object storage, and the system automatically migrates data based on access patterns.
 
-- **Low Cost:** Maintaining data compression capabilities equivalent to OceanBase, compute nodes support single-replica deployment to reduce computational costs; shared data storage in object storage reduces storage costs.
+- **Low Cost**: OceanSeek delivers data compression efficiency comparable to OceanBase. Compute nodes support single-replica deployment to reduce compute costs, while shared object storage reduces storage costs.
 
-- **MySQL/KV Compatibility:** Supports both MySQL and KV modes (OBKV-Table, OBKV-HBase), utilizing the ODP and MySQL ecosystem drivers, as well as toolchains such as OCP, ODC, and OMS.
+- **MySQL/KV Compatibility**: Supports both MySQL and KV modes (OBKV-Table and OBKV-HBase), and works with ODP, MySQL ecosystem drivers, and toolchains such as OCP, ODC, and OMS.
 
-- **Open Ecosystem:** Supports S3 protocol object storage, Iceberg/Paimon open table formats, and a unified catalog, reducing data replication, format conversion, and system locking.
+- **Open Ecosystem**: Supports S3-compatible object storage, open table formats such as Iceberg and Paimon, and a unified catalog, reducing data duplication, format conversion, and vendor lock-in.
 
-For more information, please refer to [OceanBase AI Product](https://www.oceanbase.com/product/ai-database)
+For more information, please refer to [OceanBase AI Product](https://www.oceanbase.com/product/ai-database).
 
 # Quick Start
 
 For more information, please refer to [Quick Start Guide to OceanSeek](https://open.oceanbase.com/oceanseek-quickstart).
 
-**Prerequisites**: OceanSeek uses object storage as the persistent foundation for all data. Before deployment, you need to prepare an object storage system that is **S3 protocol compatible**, and create **data buckets** and **log buckets** (heterogeneous media are acceptable, and they can be configured independently). The object storage system must meet four requirements: S3 compatibility, high availability, access credential rotation, and adjustable bandwidth.
+**Prerequisites**: OceanSeek uses object storage as the persistent storage layer for all data. Before deployment, you need to prepare an **S3-compatible** object storage system and create separate **data buckets** and **log buckets**. Different storage media are supported and can be configured independently. The object storage system must meet four requirements: S3 compatibility, high availability, access credential rotation, and adjustable bandwidth.
 
-## 🐳 Start with docker
+## 🐳 Start with Docker
 
-The OceanSeek instance can be launched with a single click in a Docker Compose environment using the [docker image](https://github.com/oceanbase/docker-images/tree/main/oceanseek). For detailed usage instructions, please refer to the documentation [docker quick start](https://open.oceanbase.com/oceanseek-quickstart).
+You can start an OceanSeek instance in a Docker Compose environment by using the [Docker image](https://github.com/oceanbase/docker-images/tree/main/oceanseek). For more information, please refer to the [Docker Quick Start](https://open.oceanbase.com/oceanseek-quickstart).
 
 ## ☸️ Start with Kubernetes
 
-You can use [ob-operator](https://github.com/oceanbase/ob-operator) to quickly deploy and manage OceanSeek instances in a Kubernetes environment. For specific usage instructions, please refer to the documentation [ob-operator quick start](https://open.oceanbase.com/oceanseek-quickstart).
+You can use [ob-operator](https://github.com/oceanbase/ob-operator) to quickly deploy and manage OceanSeek in a Kubernetes environment. For more information, please refer to the [ob-operator Quick Start](https://open.oceanbase.com/oceanseek-quickstart).
 
-# Case study
+# Case Studies
 
-OceanBase serves over 2,000 clients across various industries, including financial services, telecommunications, retail, and internet. OceanSeek shares the same distributed infrastructure as OceanBase.
+OceanBase serves over 2,000 clients across a wide range of industries, including financial services, telecommunications, retail, and the internet sector. OceanSeek shares the same distributed foundation as OceanBase.
 
-For more detailed information, please refer to [Customer Cases](https://www.oceanbase.com/customer).
+For more information, please refer to [Customer Cases](https://www.oceanbase.com/customer).
 
-# System architecture
+# System Architecture
 
-[System Architecture Introduction](https://docs.oceanbase.com/oceanbase-ai-database/system-architecture)
+OceanSeek decouples compute, log, and storage into three layers: stateless compute nodes, a replicated LogService for transaction durability, and object storage for persistent data. For more information, please refer to the [System Architecture Introduction](https://docs.oceanbase.com/oceanbase-ai-database/system-architecture).
 
 # Contributing
 
-Community contributions are highly welcome. For development, compilation, and local execution instructions, please refer to the [Development and Build Guide](docs/docs/en/build-and-run.md). Before submitting an Issue or PR, it is recommended to read the code style guide and submission conventions.
+Community contributions are highly welcome. For development, compilation, and local execution instructions, please refer to the [Development and Build Guide](docs/docs/en/build-and-run.md). Before submitting an issue or pull request, it is recommended to read the code style guide and contribution conventions.
 
 # License
 
-OceanSeek is licensed under the Apache License, Version 2.0. See the [LICENSE](LICENSE) file for more info.
+OceanSeek is licensed under the Apache License, Version 2.0. For more information, please refer to the [LICENSE](LICENSE) file.
 
 # Community
 
 Join the OceanBase community via:
 
-* [Discord](https://discord.gg/74cF8vbNEs): Best for: asking questions, sharing feedback, getting the latest news, and connecting with other OceanBase users.
-* [GitHub Issues](https://github.com/oceanbase/oceanseek/issues): Best for: addressing bugs encountered while using OceanBase, as well as submitting feature proposals.
-* [Chinese User Forum](https://ask.oceanbase.com/): Only for Chinese users, best for: asking questions, sharing feedback, getting the latest news, and connecting with other OceanBase users.
-* WeChat Group (Add the assistant with WeChat ID: OBCE666): Only for Chinese users, best for: getting the latest news and connecting with other OceanBase users.
+* [Discord](https://discord.gg/74cF8vbNEs): Best for asking questions, sharing feedback, getting the latest news, and connecting with other OceanBase users.
+* [GitHub Issues](https://github.com/oceanbase/oceanseek/issues): Best for reporting bugs, requesting features, and tracking project issues.
+* [Chinese User Forum](https://ask.oceanbase.com/): For Chinese users who want to ask questions, share feedback, get the latest news, and connect with other OceanBase users.
+* WeChat Group (add the assistant with WeChat ID: OBCE666): For Chinese users who want to get the latest news and connect with other OceanBase users.
