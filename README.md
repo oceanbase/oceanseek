@@ -24,7 +24,7 @@
 
 <p align="center">
     <a href="https://discord.gg/74cF8vbNEs">
-        <img alt="Support" src="https://img.shields.io/badge/Discord-Join%20OceanBase-brightgreen?logo=discord" />
+        <img alt="Support" src="https://img.shields.io/badge/Discord-Join%20Oceanbase-brightgreen?logo=discord" />
     </a>
     <a href="https://stackoverflow.com/questions/tagged/oceanbase">
         <img alt="Stack Overflow" src="https://img.shields.io/badge/Stack-Stack%20Overflow-brightgreen?logo=stackoverflow" />
@@ -102,4 +102,3 @@ Join the OceanBase community via:
 * [Discord](https://discord.gg/74cF8vbNEs): Best for asking questions, sharing feedback, getting the latest news, and connecting with other OceanBase users.
 * [GitHub Issues](https://github.com/oceanbase/oceanseek/issues): Best for reporting bugs, requesting features, and tracking project issues.
 * [Chinese User Forum](https://ask.oceanbase.com/): For Chinese users who want to ask questions, share feedback, get the latest news, and connect with other OceanBase users.
-* WeChat Group (add the assistant with WeChat ID: OBCE666): For Chinese users who want to get the latest news and connect with other OceanBase users.
